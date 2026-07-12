@@ -199,10 +199,16 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   Fits/loads a Procrustes alignment and writes the target's `from-<safe_src>`
   **manifold** tensor via `transfer_manifold` — one transfer path (the old
   vector-side transfer bridge is gone). The runner materializes the target's
-  proven neutral cache once and builds the whitener from those resident rows. A
-  cached alignment loads no model; if the map alone is missing/corrupt and both
+  proven neutral cache only for source-tensor layers and builds the whitener from
+  those resident rows. A cached alignment loads no model; if requested map layers
+  are missing and both
   neutral-cache source identities remain proven, the runner fits and saves the
-  map offline from those cached matrices. Transferred shares are re-baked in the
+  missing factors offline from those selected cached matrices, carrying forward
+  the other immutable factor shards. The per-model neutral single-flight lock is
+  acquired before model construction, so distinct concurrent alignments sharing
+  a cold model do not duplicate that model load. `-f` recomputes the requested
+  alignment factors and target transfer but reuses exact neutral caches; it does
+  not force the 90-prompt neutral capture. Transferred shares are re-baked in the
   target Mahalanobis metric;
   **mandatory** — a missing/unusable target cache raises `WhitenerError` (the runner
   exits 1 with a regenerate-neutrals hint), there is no Euclidean rebake.

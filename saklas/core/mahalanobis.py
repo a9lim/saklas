@@ -21,7 +21,8 @@ activation covariance:
   to plain Gram-Schmidt projection when ``Σ = I``.
 
 Storage discipline: **no new persistent cache.**  :class:`LayerWhitener`
-is built from the ``neutral_activations.safetensors`` cache under
+is built from the immutable per-layer shards selected by the
+``neutral_activations.json`` cache pointer under
 ``~/.saklas/models/<id>/`` (the per-layer centering mean is derived from
 those neutrals as ``X.mean(0)`` — there is no separate ``layer_means`` cache).
 The 90 neutral statements give ``X ∈ ℝ^(N=90, D)`` per layer; ``Σ`` is
@@ -262,11 +263,11 @@ class LayerWhitener:
         ridge_scale: float = DEFAULT_RIDGE_SCALE,
         expected_identity: dict[str, Any] | None = None,
     ) -> "LayerWhitener":
-        """Load a whitener from ``neutral_activations.safetensors`` alone (no model load).
+        """Load a whitener from the neutral-activation pointer (no model load).
 
         The single offline whitener loader — used by ``manifold compare`` and
         the cross-model transfer rebake.  Reads only
-        ``neutral_activations.safetensors`` from ``~/.saklas/models/<safe_id>/``
+        ``neutral_activations.json`` from ``~/.saklas/models/<safe_id>/``
         and derives the per-layer centering mean from the activations
         themselves (``X.mean(0)``): the neutral mean *is* the probe-centering
         baseline (same corpus, same pooling), so there is no separate
@@ -281,11 +282,11 @@ class LayerWhitener:
         from saklas.io.alignment import load_validated_neutral_cache
 
         md = model_dir(model_id)
-        acts_path = md / "neutral_activations.safetensors"
-        if not acts_path.is_file():
+        pointer_path = md / "neutral_activations.json"
+        if not pointer_path.is_file():
             raise WhitenerError(
                 f"whitener cache missing for {model_id} "
-                f"(expected {acts_path.name} under {md}); populate via any flow "
+                f"(expected {pointer_path.name} under {md}); populate via any flow "
                 f"that loads the model + neutral activations (e.g. run any "
                 f"session-level extract on this model, or prepare a transfer "
                 f"that targets {model_id})"

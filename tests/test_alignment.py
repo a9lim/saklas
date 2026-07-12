@@ -472,8 +472,13 @@ class TestAlignmentCache:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         import saklas.io.alignment as alignment_mod
 
+        calls = 0
+
         def _fail_fsync(_folder: Path) -> None:
-            raise OSError("simulated directory fsync failure")
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("simulated directory fsync failure")
 
         monkeypatch.setattr(alignment_mod, "fsync_directory", _fail_fsync)
         with pytest.raises(OSError, match="fsync failure"):
@@ -492,6 +497,129 @@ class TestAlignmentCache:
         )
         assert loaded is not None
         assert torch.equal(loaded[0][0].to_dense(), 2 * torch.eye(4))
+
+    def test_payload_directory_barrier_precedes_alignment_pointer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        import saklas.io.alignment as alignment_mod
+
+        events: list[str] = []
+        real_write = alignment_mod.write_json_atomic
+
+        def record_write(path: Path, payload: object) -> None:
+            events.append("pointer")
+            real_write(path, payload)
+
+        monkeypatch.setattr(alignment_mod, "write_json_atomic", record_write)
+        monkeypatch.setattr(
+            alignment_mod, "fsync_directory",
+            lambda _path: events.append("barrier"),
+        )
+        save_alignment_map(
+            {0: torch.eye(4)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+        )
+        assert events[0:3] == ["barrier", "pointer", "barrier"]
+
+    def test_exception_after_pointer_replace_preserves_new_generation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        import saklas.io.alignment as alignment_mod
+
+        real_write = alignment_mod.write_json_atomic
+
+        def write_then_fail(path: Path, payload: object) -> None:
+            real_write(path, payload)
+            raise OSError("after alignment pointer replace")
+
+        monkeypatch.setattr(alignment_mod, "write_json_atomic", write_then_fail)
+        with pytest.raises(OSError, match="after alignment pointer"):
+            save_alignment_map(
+                {0: 3 * torch.eye(4)}, "a/b", "c/d",
+                source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+            )
+
+        loaded = load_alignment_map(
+            "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID,
+        )
+        assert loaded is not None
+        assert torch.equal(loaded[0][0].to_dense(), 3 * torch.eye(4))
+
+    def test_alignment_top_up_reuses_unrequested_generation_without_reading_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        save_alignment_map(
+            {0: torch.eye(4)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+            quality_per_layer={0: 0.8},
+        )
+        import saklas.io.alignment as alignment_mod
+
+        anchor, pointer = alignment_mod._alignment_anchor_paths("a/b", "c/d")
+        prior = json.loads(pointer.read_text())
+        prior_file = prior["tensor_files"]["0"]
+        real_read = Path.read_bytes
+
+        def reject_old_read(path: Path) -> bytes:
+            if path.name == prior_file:
+                raise AssertionError("top-up reread unrelated factor payload")
+            return real_read(path)
+
+        monkeypatch.setattr(Path, "read_bytes", reject_old_read)
+        save_alignment_map(
+            {5: 2 * torch.eye(4)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+            quality_per_layer={5: 0.9}, extend=True,
+        )
+        current = json.loads(pointer.read_text())
+        assert current["shared_layers"] == [0, 5]
+        assert current["tensor_files"]["0"] == prior_file
+        assert (anchor.parent / prior_file).exists()
+
+    def test_corrupt_requested_factor_repair_preserves_unrequested_generation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        import saklas.io.alignment as alignment_mod
+
+        save_alignment_map(
+            {0: torch.eye(4), 5: torch.eye(4)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+            quality_per_layer={0: 0.8, 5: 0.7},
+        )
+        anchor, pointer = alignment_mod._alignment_anchor_paths("a/b", "c/d")
+        before = json.loads(pointer.read_text())
+        layer0_name = before["tensor_files"]["0"]
+        corrupt = anchor.parent / before["tensor_files"]["5"]
+        payload = bytearray(corrupt.read_bytes())
+        payload[-1] ^= 0x01
+        corrupt.write_bytes(payload)
+
+        partial = load_alignment_map(
+            "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID, requested_layers=[5],
+        )
+        assert partial is not None and partial[0] == {}
+        save_alignment_map(
+            {5: 2 * torch.eye(4)}, "a/b", "c/d",
+            source_identity=self._SRC_ID, target_identity=self._TGT_ID,
+            quality_per_layer={5: 0.9}, extend=True,
+        )
+
+        after = json.loads(pointer.read_text())
+        assert after["shared_layers"] == [0, 5]
+        assert after["tensor_files"]["0"] == layer0_name
+        assert (anchor.parent / layer0_name).exists()
+        loaded = load_alignment_map(
+            "a/b", "c/d", source_identity=self._SRC_ID,
+            target_identity=self._TGT_ID,
+        )
+        assert loaded is not None and set(loaded[0]) == {0, 5}
+        assert torch.equal(loaded[0][5].to_dense(), 2 * torch.eye(4))
 
 
 # ---------------------------------------------------------------------------

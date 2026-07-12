@@ -30,7 +30,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,7 +42,6 @@ from safetensors.torch import (
     load as load_safetensors,
     load_file,
     save as save_safetensors,
-    save_file,
 )
 
 from saklas.core.errors import SaklasError
@@ -55,7 +53,8 @@ from saklas.io.packs import hash_file
 log = logging.getLogger(__name__)
 
 _NEUTRAL_ACTS_NAME = "neutral_activations"
-_NEUTRAL_CACHE_FORMAT_VERSION = 2
+_NEUTRAL_CACHE_FORMAT_VERSION = 3
+_LEGACY_NEUTRAL_CACHE_FORMAT_VERSION = 2
 _NEUTRAL_CAPTURE_VERSION = 1
 _ALIGNMENT_CACHE_FORMAT_VERSION = 4
 
@@ -162,12 +161,70 @@ def _as_layer_alignment(value: AlignmentLike) -> LayerAlignment:
 
 
 def _neutral_acts_paths(model_id: str) -> tuple[Path, Path]:
-    """Return ``(safetensors_path, sidecar_path)`` for cached activations."""
+    """Return the stable legacy/lock anchor and atomic pointer sidecar."""
     md = model_dir(model_id)
     return (
         md / f"{_NEUTRAL_ACTS_NAME}.safetensors",
         md / f"{_NEUTRAL_ACTS_NAME}.json",
     )
+
+
+def _neutral_generation_path(anchor: Path, layer: int) -> Path:
+    return anchor.with_name(
+        f"{anchor.stem}.layer-{int(layer)}.gen-{uuid.uuid4().hex}{anchor.suffix}",
+    )
+
+
+def _neutral_shard_paths(
+    anchor: Path, sidecar: Mapping[str, Any], layers: list[int],
+) -> dict[int, Path]:
+    files = sidecar.get("tensor_files")
+    if not isinstance(files, Mapping):
+        raise ValueError("neutral activation cache has no tensor shard map")
+    if {str(layer) for layer in layers} != {str(key) for key in files}:
+        raise ValueError("neutral tensor shard keys do not match layers")
+    out: dict[int, Path] = {}
+    for layer in layers:
+        filename = files.get(str(layer))
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+        ):
+            raise ValueError(f"invalid neutral shard for layer {layer}")
+        out[layer] = anchor.parent / filename
+    return out
+
+
+def _json_pointer_matches(path: Path, payload: Mapping[str, Any]) -> bool:
+    """Whether an exception escaped after this exact pointer was replaced."""
+    try:
+        with open(path) as handle:
+            current = json.load(handle)
+        return current == payload
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+
+
+def _cleanup_neutral_generations(
+    anchor: Path, sidecar: Mapping[str, Any],
+) -> None:
+    files = sidecar.get("tensor_files")
+    keep = (
+        {str(filename) for filename in files.values() if isinstance(filename, str)}
+        if isinstance(files, Mapping) else set()
+    )
+    for path in (
+        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors"),
+        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors.tmp"),
+        anchor,
+        anchor.with_suffix(anchor.suffix + ".tmp"),
+    ):
+        if path.name not in keep:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("could not remove old neutral generation %s: %s", path, exc)
 
 
 @contextmanager
@@ -180,7 +237,9 @@ def neutral_fit_lock(model_id: str) -> Iterator[None]:
         yield
 
 
-def validate_neutral_cache_metadata(model_id: str) -> dict[str, Any]:
+def validate_neutral_cache_metadata(
+    model_id: str, *, verify_payload: bool = True,
+) -> dict[str, Any]:
     """Validate a neutral cache's identity and tensor header without paging data.
 
     The payload digest proves bytes, while ``safe_open`` checks the declared
@@ -192,59 +251,124 @@ def validate_neutral_cache_metadata(model_id: str) -> dict[str, Any]:
 
     ts_path, _ = _neutral_acts_paths(model_id)
     with artifact_lock(ts_path):
-        return _validate_neutral_cache_metadata_locked(model_id)
+        return _validate_neutral_cache_metadata_locked(
+            model_id, verify_payload=verify_payload,
+        )
 
 
-def _validate_neutral_cache_metadata_locked(model_id: str) -> dict[str, Any]:
+def _validate_neutral_cache_metadata_locked(
+    model_id: str, *, verify_payload: bool = True,
+) -> dict[str, Any]:
     """Header/digest validation with the neutral pair lock already held."""
     ts_path, sc_path = _neutral_acts_paths(model_id)
-    if not ts_path.exists() or not sc_path.exists():
+    if not sc_path.exists():
         raise FileNotFoundError(f"neutral activation cache missing for {model_id}")
     with open(sc_path) as handle:
         sidecar = json.load(handle)
+    version = sidecar.get("format_version")
     if (
-        sidecar.get("format_version") != _NEUTRAL_CACHE_FORMAT_VERSION
+        version not in {
+            _NEUTRAL_CACHE_FORMAT_VERSION,
+            _LEGACY_NEUTRAL_CACHE_FORMAT_VERSION,
+        }
         or sidecar.get("capture_version") != _NEUTRAL_CAPTURE_VERSION
-        or sidecar.get("tensor_sha256") != hash_file(ts_path)
     ):
-        raise ValueError("neutral activation cache identity or payload digest mismatch")
+        raise ValueError("neutral activation cache identity mismatch")
     layers = sidecar.get("layers")
     schema = sidecar.get("tensor_schema")
     if not isinstance(layers, list) or not isinstance(schema, dict):
         raise ValueError("neutral activation cache sidecar has no layer schema")
-    expected_keys = {f"layer_{int(layer)}" for layer in layers}
+    normalized_layers = sorted(int(layer) for layer in layers)
     expected_n = int(sidecar.get("n_prompts", -1))
-    with safe_open(str(ts_path), framework="pt", device="cpu") as tensors:
-        if set(tensors.keys()) != expected_keys:
-            raise ValueError("neutral activation cache layer keys do not match sidecar")
-        for key in tensors.keys():
-            layer = int(key.split("_", 1)[1])
-            spec = schema.get(str(layer), {})
-            view = tensors.get_slice(key)
-            shape = list(view.get_shape())
+    if version == _LEGACY_NEUTRAL_CACHE_FORMAT_VERSION:
+        if not ts_path.exists():
+            raise FileNotFoundError(f"neutral activation cache missing for {model_id}")
+        if verify_payload and sidecar.get("tensor_sha256") != hash_file(ts_path):
+            raise ValueError("neutral activation cache payload digest mismatch")
+        grouped = {ts_path: normalized_layers}
+    else:
+        paths = _neutral_shard_paths(ts_path, sidecar, normalized_layers)
+        digests = sidecar.get("tensor_sha256")
+        if not isinstance(digests, Mapping):
+            raise ValueError("neutral activation cache has no tensor digests")
+        grouped = {path: [layer] for layer, path in paths.items()}
+        for layer, path in paths.items():
+            digest = digests.get(str(layer))
             if (
-                view.get_dtype() != "F32"
-                or spec.get("dtype") != "torch.float32"
-                or shape != spec.get("shape")
-                or len(shape) != 2
-                or shape[0] != expected_n
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or not path.exists()
             ):
-                raise ValueError(
-                    f"neutral activation cache layer {layer} header failed validation"
-                )
+                raise ValueError(f"invalid neutral shard for layer {layer}")
+            if verify_payload and hash_file(path) != digest:
+                raise ValueError("neutral activation cache payload digest mismatch")
+    for path, path_layers in grouped.items():
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            path_keys = {f"layer_{layer}" for layer in path_layers}
+            if set(tensors.keys()) != path_keys:
+                raise ValueError("neutral activation cache layer keys do not match sidecar")
+            for key in tensors.keys():
+                layer = int(key.split("_", 1)[1])
+                spec = schema.get(str(layer), {})
+                view = tensors.get_slice(key)
+                shape = list(view.get_shape())
+                if (
+                    view.get_dtype() != "F32"
+                    or spec.get("dtype") != "torch.float32"
+                    or shape != spec.get("shape")
+                    or len(shape) != 2
+                    or shape[0] != expected_n
+                ):
+                    raise ValueError(
+                        f"neutral activation cache layer {layer} header failed validation"
+                    )
     return sidecar
 
 
 def load_validated_neutral_cache(
     model_id: str,
+    *,
+    requested_layers: Iterable[int] | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Materialize and fully validate a neutral cache without loading the model."""
     from saklas.io.atomic import artifact_lock
 
     ts_path, _ = _neutral_acts_paths(model_id)
     with artifact_lock(ts_path):
-        sidecar = _validate_neutral_cache_metadata_locked(model_id)
-        tensors = load_file(str(ts_path))
+        sidecar = _validate_neutral_cache_metadata_locked(
+            model_id, verify_payload=False,
+        )
+        all_layers = sorted(int(layer) for layer in sidecar["layers"])
+        selected = (
+            all_layers if requested_layers is None else sorted(
+                set(all_layers) & {int(layer) for layer in requested_layers}
+            )
+        )
+        version = sidecar.get("format_version")
+        if version == _LEGACY_NEUTRAL_CACHE_FORMAT_VERSION:
+            if sidecar.get("tensor_sha256") != hash_file(ts_path):
+                raise ValueError("neutral activation cache payload digest mismatch")
+            loaded = load_file(str(ts_path))
+            tensors = {
+                key: value for key, value in loaded.items()
+                if int(key.split("_", 1)[1]) in selected
+            }
+        else:
+            paths = _neutral_shard_paths(ts_path, sidecar, all_layers)
+            digests = sidecar["tensor_sha256"]
+            tensors: dict[str, torch.Tensor] = {}
+            for layer in selected:
+                payload = paths[layer].read_bytes()
+                if hashlib.sha256(payload).hexdigest() != digests[str(layer)]:
+                    raise ValueError("neutral activation cache payload digest mismatch")
+                shard = load_safetensors(payload)
+                tensors[f"layer_{layer}"] = shard[f"layer_{layer}"]
+        if version == _NEUTRAL_CACHE_FORMAT_VERSION:
+            # Reap superseded generations preserved by a signal immediately
+            # after pointer replacement. This runs under the pair lock, so the
+            # live pointer cannot change while its references are collected.
+            _cleanup_neutral_generations(ts_path, sidecar)
+            fsync_directory(ts_path.parent)
     out: dict[int, torch.Tensor] = {}
     schema = sidecar["tensor_schema"]
     expected_n = int(sidecar.get("n_prompts", -1))
@@ -271,7 +395,10 @@ def neutral_cache_identity(sidecar: dict[str, Any]) -> dict[str, Any]:
         "capture_sha256", "tensor_sha256", "layers", "tensor_schema",
         "n_prompts",
     )
-    return {key: sidecar.get(key) for key in keys}
+    identity = {key: sidecar.get(key) for key in keys}
+    if sidecar.get("format_version") == _NEUTRAL_CACHE_FORMAT_VERSION:
+        identity["tensor_files"] = sidecar.get("tensor_files")
+    return identity
 
 
 def load_or_compute_neutral_activations(
@@ -366,7 +493,7 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
     )
     expected_layers = list(range(len(layers)))
 
-    if not force and ts_path.exists() and sc_path.exists():
+    if not force and sc_path.exists():
         try:
             out, sc = load_validated_neutral_cache(model_id)
             identity_matches = (
@@ -400,13 +527,28 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
     # fp32 carries the exponent range fp16 lacked (gemma-3's late layers exceed
     # the fp16 max of 65504 and overflowed to ±inf) without bf16's input loss,
     # at ~2× disk on this one cache.
-    fp32 = {f"layer_{idx}": t.contiguous().to(torch.float32).cpu() for idx, t in activations.items()}
+    fp32 = {
+        int(idx): t.contiguous().to(torch.float32).cpu()
+        for idx, t in activations.items()
+    }
     from saklas.io.atomic import artifact_lock
 
     with artifact_lock(ts_path):
-        tmp_path = ts_path.with_suffix(ts_path.suffix + ".tmp")
-        save_file(fp32, str(tmp_path))
-        os.replace(tmp_path, ts_path)
+        tensor_files: dict[str, str] = {}
+        tensor_sha256: dict[str, str] = {}
+        created: list[Path] = []
+        try:
+            for idx, tensor in sorted(fp32.items()):
+                path = _neutral_generation_path(ts_path, idx)
+                payload = save_safetensors({f"layer_{idx}": tensor})
+                write_bytes_atomic(path, payload)
+                created.append(path)
+                tensor_files[str(idx)] = path.name
+                tensor_sha256[str(idx)] = hashlib.sha256(payload).hexdigest()
+        except BaseException:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
         sidecar: dict[str, Any] = {
             "method": "neutral_activations",
             "format_version": _NEUTRAL_CACHE_FORMAT_VERSION,
@@ -414,7 +556,8 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
             "capture_sha256": capture_sha,
             "model_fingerprint": model_fingerprint,
             "model_source_fingerprint": model_source_fingerprint,
-            "tensor_sha256": hash_file(ts_path),
+            "tensor_sha256": tensor_sha256,
+            "tensor_files": tensor_files,
             "layers": sorted(activations),
             "tensor_schema": {
                 str(idx): {"shape": list(t.shape), "dtype": str(t.dtype)}
@@ -425,7 +568,23 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
             ),
             "n_layers": len(activations),
         }
-        write_json_atomic(sc_path, sidecar)
+        try:
+            # Persist every new directory entry before publishing the pointer.
+            # A crash can therefore expose either the complete old generation
+            # or the complete new one, never a pointer to absent shards.
+            fsync_directory(sc_path.parent)
+            write_json_atomic(sc_path, sidecar)
+        except BaseException:
+            if not _json_pointer_matches(sc_path, sidecar):
+                for path in created:
+                    path.unlink(missing_ok=True)
+            raise
+        # The pointer rename is now authoritative. Preserve its generations if
+        # this durability barrier itself fails; deleting them would break the
+        # successfully replaced pointer immediately.
+        fsync_directory(sc_path.parent)
+        _cleanup_neutral_generations(ts_path, sidecar)
+        fsync_directory(sc_path.parent)
     return activations, sidecar
 
 
@@ -446,6 +605,8 @@ def fit_alignment(
     tgt_acts: dict[int, torch.Tensor],
     *,
     min_shared_layers: int = 10,
+    requested_layers: Iterable[int] | None = None,
+    available_shared_layers: Iterable[int] | None = None,
 ) -> dict[int, LayerAlignment]:
     """Per-layer compact affine mapping ``A_L : ℝ^D_src → ℝ^D_tgt``.
 
@@ -466,12 +627,23 @@ def fit_alignment(
     ``min_shared_layers`` layers are common to both models — partial
     alignment under that threshold tends to produce noisy transfers.
     """
-    shared = sorted(set(src_acts.keys()) & set(tgt_acts.keys()))
-    if len(shared) < min_shared_layers:
+    materialized_shared = set(src_acts.keys()) & set(tgt_acts.keys())
+    available = (
+        materialized_shared if available_shared_layers is None
+        else {int(layer) for layer in available_shared_layers}
+    )
+    if len(available) < min_shared_layers:
         raise AlignmentError(
             f"alignment requires >= {min_shared_layers} shared layers; "
             f"src={sorted(src_acts.keys())}, tgt={sorted(tgt_acts.keys())}"
         )
+    shared = sorted(
+        materialized_shared if requested_layers is None else (
+            materialized_shared & {int(layer) for layer in requested_layers}
+        )
+    )
+    if not shared:
+        raise AlignmentError("alignment has no requested layers shared by both models")
 
     out: dict[int, LayerAlignment] = {}
     for layer in shared:
@@ -770,6 +942,7 @@ def save_alignment_map(
     source_identity: dict[str, Any],
     target_identity: dict[str, Any],
     quality_per_layer: dict[int, float] | None = None,
+    extend: bool = False,
 ) -> Path:
     """Persist a fitted alignment map.
 
@@ -788,6 +961,68 @@ def save_alignment_map(
     with artifact_lock(anchor):
         tensor_files: dict[str, str] = {}
         tensor_sha256: dict[str, str] = {}
+        tensor_schema: dict[str, Any] = {}
+        merged_quality: dict[str, float] = {}
+        if extend and sc_path.exists():
+            try:
+                with open(sc_path) as handle:
+                    current = json.load(handle)
+                if (
+                    current.get("format_version") == _ALIGNMENT_CACHE_FORMAT_VERSION
+                    and current.get("method") == "sharded_factorized_affine_alignment"
+                    and current.get("source_model_id") == src_model_id
+                    and current.get("target_model_id") == tgt_model_id
+                    and current.get("source_neutral_identity") == source_identity
+                    and current.get("target_neutral_identity") == target_identity
+                ):
+                    current_layers = sorted(
+                        int(layer) for layer in current.get("shared_layers", [])
+                    )
+                    current_paths = _alignment_shard_paths(
+                        anchor, current, current_layers,
+                    )
+                    current_digests = current.get("tensor_sha256")
+                    current_schema = current.get("tensor_schema")
+                    if not isinstance(current_digests, Mapping) or not isinstance(
+                        current_schema, Mapping,
+                    ):
+                        raise ValueError("alignment pointer has no shard metadata")
+                    for layer in current_layers:
+                        try:
+                            digest = current_digests.get(str(layer))
+                            spec = current_schema.get(str(layer))
+                            path = current_paths[layer]
+                            if (
+                                not isinstance(digest, str) or len(digest) != 64
+                                or not isinstance(spec, Mapping) or not path.exists()
+                            ):
+                                continue
+                            # Header-only proof is enough here: this writer is
+                            # under the artifact lock and carries the immutable
+                            # generation forward byte-for-byte. The newly fitted
+                            # mapping below replaces a damaged requested layer.
+                            with safe_open(
+                                str(path), framework="pt", device="cpu",
+                            ) as shard:
+                                if set(shard.keys()) != {"left", "right", "offset"}:
+                                    continue
+                            tensor_files[str(layer)] = path.name
+                            tensor_sha256[str(layer)] = digest
+                            tensor_schema[str(layer)] = dict(spec)
+                        except (OSError, RuntimeError, ValueError, KeyError):
+                            continue
+                    raw_quality = current.get("quality_per_layer") or {}
+                    if isinstance(raw_quality, Mapping):
+                        merged_quality.update({
+                            str(layer): float(value)
+                            for layer, value in raw_quality.items()
+                        })
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                log.warning("could not extend current alignment generation: %s", exc)
+                tensor_files.clear()
+                tensor_sha256.clear()
+                tensor_schema.clear()
+                merged_quality.clear()
         created: list[Path] = []
         try:
             for idx, alignment in sorted(normalized.items()):
@@ -801,6 +1036,11 @@ def save_alignment_map(
                 created.append(path)
                 tensor_files[str(idx)] = path.name
                 tensor_sha256[str(idx)] = hashlib.sha256(payload).hexdigest()
+                tensor_schema[str(idx)] = {
+                    "left": list(alignment.left.shape),
+                    "right": list(alignment.right.shape),
+                    "offset": list(alignment.offset.shape),
+                }
         except BaseException:
             for path in created:
                 path.unlink(missing_ok=True)
@@ -810,30 +1050,27 @@ def save_alignment_map(
             "method": "sharded_factorized_affine_alignment",
             "source_model_id": src_model_id,
             "target_model_id": tgt_model_id,
-            "shared_layers": sorted(normalized),
-            "tensor_schema": {
-                str(layer): {
-                    "left": list(alignment.left.shape),
-                    "right": list(alignment.right.shape),
-                    "offset": list(alignment.offset.shape),
-                }
-                for layer, alignment in sorted(normalized.items())
-            },
+            "shared_layers": sorted(int(layer) for layer in tensor_files),
+            "tensor_schema": tensor_schema,
             "source_neutral_identity": source_identity,
             "target_neutral_identity": target_identity,
             "tensor_files": tensor_files,
             "tensor_sha256": tensor_sha256,
         }
         if quality_per_layer:
-            sidecar["quality_per_layer"] = {
+            merged_quality.update({
                 str(layer): round(float(q), 6)
                 for layer, q in quality_per_layer.items()
-            }
+            })
+        if merged_quality:
+            sidecar["quality_per_layer"] = merged_quality
         try:
+            fsync_directory(sc_path.parent)
             write_json_atomic(sc_path, sidecar)
         except BaseException:
-            for path in created:
-                path.unlink(missing_ok=True)
+            if not _json_pointer_matches(sc_path, sidecar):
+                for path in created:
+                    path.unlink(missing_ok=True)
             raise
         # The pointer is now authoritative. If directory fsync itself fails,
         # preserve the generations it names; deleting them here would turn a
@@ -841,7 +1078,7 @@ def save_alignment_map(
         fsync_directory(sc_path.parent)
         _cleanup_alignment_generations(anchor, sidecar)
         fsync_directory(sc_path.parent)
-    return anchor.parent / tensor_files[str(min(normalized))]
+    return anchor.parent / tensor_files[str(min(int(layer) for layer in tensor_files))]
 
 
 def load_alignment_map(
@@ -886,9 +1123,10 @@ def load_alignment_map(
             digests = sidecar.get("tensor_sha256")
             if not isinstance(digests, Mapping):
                 return None
-            # Validate every declared shard header before any tensor payload is
-            # materialized. Payload digests are checked only for selected layers
-            # so a narrow request never reads unrelated full shards.
+            # Validate declared headers independently before payload materialization.
+            # One damaged layer must remain repairable without discarding the
+            # pointer metadata for unrelated immutable factors.
+            valid_headers: set[int] = set()
             for layer in all_layers:
                 spec = schema.get(str(layer), {})
                 digest = digests.get(str(layer))
@@ -898,19 +1136,22 @@ def load_alignment_map(
                     or len(digest) != 64
                     or not paths[layer].exists()
                 ):
-                    return None
-                with safe_open(
-                    str(paths[layer]), framework="pt", device="cpu",
-                ) as shard:
-                    if set(shard.keys()) != {"left", "right", "offset"}:
-                        return None
-                    for part in ("left", "right", "offset"):
-                        view = shard.get_slice(part)
-                        if (
-                            list(view.get_shape()) != spec.get(part)
-                            or view.get_dtype() != "F32"
+                    continue
+                try:
+                    with safe_open(
+                        str(paths[layer]), framework="pt", device="cpu",
+                    ) as shard:
+                        if set(shard.keys()) != {"left", "right", "offset"}:
+                            continue
+                        if any(
+                            list(shard.get_slice(part).get_shape()) != spec.get(part)
+                            or shard.get_slice(part).get_dtype() != "F32"
+                            for part in ("left", "right", "offset")
                         ):
-                            return None
+                            continue
+                    valid_headers.add(layer)
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    continue
             selected = (
                 all_layers if requested_layers is None else sorted(
                     set(all_layers) & {int(layer) for layer in requested_layers}
@@ -918,21 +1159,29 @@ def load_alignment_map(
             )
             M: dict[int, LayerAlignment] = {}
             for layer in selected:
-                payload = paths[layer].read_bytes()
-                if hashlib.sha256(payload).hexdigest() != digests[str(layer)]:
-                    return None
-                tensors = load_safetensors(payload)
-                left = tensors["left"]
-                right = tensors["right"]
-                offset = tensors["offset"]
-                if (
-                    left.ndim != 2 or right.ndim != 2 or offset.ndim != 1
-                    or left.shape[1] != right.shape[0]
-                    or left.shape[0] != offset.shape[0]
-                    or not all(bool(torch.isfinite(t).all()) for t in (left, right, offset))
-                ):
-                    return None
-                M[layer] = LayerAlignment(left, right, offset)
+                if layer not in valid_headers:
+                    continue
+                try:
+                    payload = paths[layer].read_bytes()
+                    if hashlib.sha256(payload).hexdigest() != digests[str(layer)]:
+                        continue
+                    tensors = load_safetensors(payload)
+                    left = tensors["left"]
+                    right = tensors["right"]
+                    offset = tensors["offset"]
+                    if (
+                        left.ndim != 2 or right.ndim != 2 or offset.ndim != 1
+                        or left.shape[1] != right.shape[0]
+                        or left.shape[0] != offset.shape[0]
+                        or not all(
+                            bool(torch.isfinite(t).all())
+                            for t in (left, right, offset)
+                        )
+                    ):
+                        continue
+                    M[layer] = LayerAlignment(left, right, offset)
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    continue
             _cleanup_alignment_generations(anchor, sidecar)
             return M, sidecar
         except Exception as e:

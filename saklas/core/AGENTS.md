@@ -86,9 +86,11 @@ payload is paged; a farther self-contained checkpoint wins without first
 materializing the older durable lens (and any superseded resident/device stack
 is evicted before the checkpoint load). A checkpoint that passes header
 preflight but fails full digest/finite validation falls back to the durable
-prefix after the failed payload is released. Cadence never fractures a healthy prompt microbatch. When the
-terminal checkpoint is already the complete lens, finalization fsyncs its
-immutable per-layer tensor generations and atomically repoints the durable sidecar instead
+prefix after the failed payload is released. Cadence never fractures a healthy
+prompt microbatch. Checkpoint payload files and their directory entries are
+durable before the checkpoint pointer is published. When the terminal checkpoint
+is already the complete lens, finalization defensively re-fsyncs its immutable
+per-layer tensor generations for legacy compatibility and atomically repoints the durable sidecar instead
 of converting/writing the same artifact again. Each checkpoint stamps the
 token-id hash of the prefix actually consumed, so a later corpus extension can
 resume honestly from that prefix. Successful loads/writes also yield an
@@ -233,7 +235,10 @@ a 2-node `pca` manifold). Dependencies via the `ModelHandle` protocol (`model` /
 satisfies it implicitly. Cache-hit on the sidecar `nodes_sha256` (folds in labels, corpus
 + `{domain, node_coords}` authored / `{fit_mode, hyperparams}` discover),
 `sae_revision`, token-exact capture identity (baseline prompts + tokenizer
-render included), loaded-model fingerprint, and fitted-layer set. Else pools the complete
+render included), loaded-model fingerprint, and fitted-layer set. A mandatory
+Mahalanobis whitener is resolved after that final fitted-tensor fast path but
+before any activation capture, so a missing or partial neutral cache cannot
+waste a full model pass. Else pools the complete
 roster through `compute_manifold_node_stats`: one row stream crosses node
 boundaries so short template nodes fill shared forward batches; OOM halves the
 active batch and a clean run grows it back. Centroid-only fits reduce by node on
@@ -243,10 +248,16 @@ the whole roster in fp32 RAM. A token-exact per-model capture cache lets domain,
 topology, and smoothing refits skip model forwards; its identity includes node
 boundaries, and its digest metadata validates centroid payloads plus exact
 per-layer row tensors; subset fits map/hash only requested row layers and validate
-only requested centroid/row layers. Capture-cache format v4 persists one
-safetensors shard per layer, so a disjoint top-up writes only the new shards
-instead of copying/replacing a multi-GiB container; v3 monoliths are safely
-recaptured and replaced on first use. Cached and freshly captured disjoint
+only requested centroid/row layers. Capture-cache format v4 persists immutable
+generation-named safetensors shards, one per layer, so a disjoint top-up writes
+only the new shards instead of copying/replacing a multi-GiB container; v3
+monoliths are safely recaptured and replaced on first use. Publication fsyncs
+shard payloads and their directory entries, writes a recovery journal, atomically
+replaces and directory-fsyncs the authoritative JSON pointer, and only then
+garbage-collects superseded generations. A failed publication therefore
+preserves the prior good pointer, while the next fit adopts a complete crash-left
+journal under the capture-stem lock without rerunning model capture. Cached and
+freshly captured disjoint
 layer stores combine by view (ownership is transferred to the composite), so
 the sigma covariance pass does not copy the full row roster into a third mmap.
 Each row shard validates independently, so one damaged layer recaptures only
@@ -401,7 +412,8 @@ validated before a release becomes resident.
 inverse `K_L = (NλI + XXᵀ)⁻¹`; `apply_inv(layer, v) = (1/λ)(v − Xᵀ K X v)` in
 O(ND), no D×D. Ridge `λ_L = (‖X_L‖²_F / (N·D)) · ridge_scale`. Built lazily via
 `from_neutral_activations` (in-memory) or `from_cache(model_id)` (the single
-offline loader — reads `neutral_activations.safetensors` alone, no model load, and
+offline loader — resolves the atomic `neutral_activations.json` pointer to its
+immutable per-layer fp32 shards, no model load, and
 derives the per-layer centering mean from the cached neutrals as `X.mean(0)`;
 backs `manifold compare` + the cross-model transfer rebake); neutrals cached
 **fp32** (the project-wide

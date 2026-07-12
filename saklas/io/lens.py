@@ -81,6 +81,16 @@ def _proof_matches(
     return proof == _lens_payload_proof(anchor, sidecar) if proof is not None else False
 
 
+def _json_pointer_matches(path: Path, payload: Mapping[str, Any]) -> bool:
+    """Whether an exception escaped after this exact pointer was replaced."""
+    try:
+        with open(path) as handle:
+            current = json.load(handle)
+        return current == payload
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+
+
 def _lens_anchor_paths(model_id: str) -> tuple[Path, Path]:
     """Stable lock/legacy paths for the durable lens pointer."""
     md = model_dir(model_id)
@@ -253,8 +263,8 @@ def _new_layer_generation(anchor: Path, layer: int) -> Path:
     )
 
 
-def _referenced_tensor_names(model_folder: Path) -> set[str]:
-    """Read both atomic pointers so shared promoted generations stay live."""
+def _referenced_tensor_names(model_folder: Path) -> set[str] | None:
+    """Read both pointers, failing closed if an existing pointer is unreadable."""
     out: set[str] = set()
     for sidecar_path, legacy_name in (
         (model_folder / f"{_LENS_NAME}.json", f"{_LENS_NAME}.safetensors"),
@@ -263,9 +273,13 @@ def _referenced_tensor_names(model_folder: Path) -> set[str]:
             f"{_LENS_CHECKPOINT_NAME}.safetensors",
         ),
     ):
+        if not sidecar_path.exists():
+            continue
         try:
             with open(sidecar_path) as handle:
                 sidecar = json.load(handle)
+            if not isinstance(sidecar, dict):
+                return None
             shard_files = sidecar.get("tensor_files")
             filenames = (
                 shard_files.values()
@@ -276,13 +290,17 @@ def _referenced_tensor_names(model_folder: Path) -> set[str]:
                 if isinstance(filename, str) and Path(filename).name == filename:
                     out.add(filename)
         except (OSError, TypeError, json.JSONDecodeError):
-            continue
+            return None
     return out
 
 
 def _cleanup_unreferenced_generations(model_folder: Path) -> None:
     """Remove unreferenced generations and crash-left streaming temporaries."""
     keep = _referenced_tensor_names(model_folder)
+    if keep is None:
+        # A transient pointer read failure cannot authorize deletion of any
+        # potentially live multi-GiB generation.
+        return
     candidates = (
         list(model_folder.glob("jlens*.gen-*.safetensors"))
         + list(model_folder.glob("jlens*.gen-*.safetensors.tmp"))
@@ -486,7 +504,7 @@ def save_lens_checkpoint(
             dim_batch=dim_batch,
             skip_first=skip_first,
             corpus_hash_kind=corpus_hash_kind,
-            durable=False,
+            durable=True,
             raw_corpus_sha256=raw_corpus_sha256,
             raw_prompt_count=raw_prompt_count,
             usable_prompt_count=usable_prompt_count,
@@ -546,7 +564,7 @@ def save_lens_checkpoint_accumulator(
             dim_batch=dim_batch,
             skip_first=skip_first,
             corpus_hash_kind=corpus_hash_kind,
-            durable=False,
+            durable=True,
             raw_corpus_sha256=raw_corpus_sha256,
             raw_prompt_count=raw_prompt_count,
             usable_prompt_count=usable_prompt_count,
@@ -751,10 +769,14 @@ def _save_lens_components(
         # Every immutable layer generation is complete before this one atomic
         # pointer switch. A sidecar failure leaves the prior pointer and tensor
         # untouched, and the failed new generations are simply discarded.
+        fsync_directory(sc_path.parent)
         write_json_atomic(sc_path, sidecar)
     except BaseException:
-        for path in created:
-            path.unlink(missing_ok=True)
+        # A signal may unwind just after the atomic replace. Never delete
+        # immutable generations the live pointer already names.
+        if not _json_pointer_matches(sc_path, sidecar):
+            for path in created:
+                path.unlink(missing_ok=True)
         raise
     # Make the new pointer rename durable before deleting any generation the
     # previous pointer named. Otherwise power loss can roll the directory back
@@ -862,7 +884,7 @@ def _load_lens_verified(
 ) -> tuple[JacobianLens, dict[str, Any], _LensPayloadProof] | None:
     """Load a durable lens plus a proof reusable under the fit transaction."""
     anchor, sc_path = _lens_anchor_paths(model_id)
-    with artifact_lock(anchor):
+    with lens_fit_lock(model_id), artifact_lock(anchor):
         sidecar = _load_sidecar_at(
             model_id, anchor, sc_path, label="jlens cache",
         )
@@ -872,6 +894,7 @@ def _load_lens_verified(
         if loaded is None:
             return None
         lens, verified_sidecar = loaded
+        _cleanup_unreferenced_generations(anchor.parent)
         return lens, verified_sidecar, _lens_payload_proof(
             anchor, verified_sidecar,
         )
@@ -880,13 +903,16 @@ def _load_lens_verified(
 def load_lens_checkpoint(model_id: str) -> tuple[JacobianLens, dict[str, Any]] | None:
     """Load a resumable partial lens shard, or ``None`` when absent/unusable."""
     anchor, sc_path = _checkpoint_anchor_paths(model_id)
-    with artifact_lock(anchor):
+    with lens_fit_lock(model_id), artifact_lock(anchor):
         sidecar = _load_sidecar_at(
             model_id, anchor, sc_path, label="jlens checkpoint",
         )
-        return _load_lens_at(
+        loaded = _load_lens_at(
             model_id, anchor, sc_path, sidecar, label="jlens checkpoint",
         )
+        if loaded is not None:
+            _cleanup_unreferenced_generations(anchor.parent)
+        return loaded
 
 
 def promote_lens_checkpoint(
@@ -937,11 +963,16 @@ def promote_lens_checkpoint(
             checkpoint_anchor, sidecar,
             [int(layer) for layer in sidecar["source_layers"]],
         ).values())
-        # The checkpoint writer deliberately skips fsync because most generations
-        # are temporary. A promoted terminal generation becomes durable here.
+        # Current checkpoint writers already make payloads durable before their
+        # pointer. Re-fsync here also safely promotes legacy checkpoints written
+        # before that guarantee existed.
         for checkpoint_ts in checkpoint_tensors:
             with open(checkpoint_ts, "rb") as handle:
                 os.fsync(handle.fileno())
+        # Legacy checkpoint writers may have fsynced file contents without
+        # persisting their directory entries. The final pointer must come after
+        # both kinds of durability barrier.
+        fsync_directory(final_sc.parent)
         durable_sidecar = dict(sidecar)
         for key in ("checkpoint", "base_n_prompts", "partial_n_prompts"):
             durable_sidecar.pop(key, None)

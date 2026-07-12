@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -638,7 +639,7 @@ def test_remove_lens_reaps_crash_left_streaming_temp() -> None:
     assert not orphan.exists()
 
 
-def test_pointer_directory_barrier_precedes_generation_gc(
+def test_payload_and_pointer_directory_barriers_precede_generation_gc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import saklas.io.lens as lens_io
@@ -666,7 +667,133 @@ def test_pointer_directory_barrier_precedes_generation_gc(
 
     _save(_lens())
 
-    assert events.index("pointer") < events.index("barrier") < events.index("gc")
+    assert events[0:3] == ["barrier", "pointer", "barrier"]
+    assert events.index("barrier", 2) < events.index("gc")
+
+
+def test_checkpoint_payload_is_durable_before_pointer_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    events: list[str] = []
+    real_payload = lens_io._save_fp16_square_safetensors_atomic
+    real_pointer = lens_io.write_json_atomic
+
+    def record_payload(*args: object, **kwargs: object) -> str:
+        assert kwargs.get("durable") is True
+        digest = real_payload(*args, **kwargs)  # type: ignore[arg-type]
+        events.append("payload")
+        return digest
+
+    def record_pointer(path: Path, payload: object) -> None:
+        events.append("pointer")
+        real_pointer(path, payload)
+
+    monkeypatch.setattr(
+        lens_io, "_save_fp16_square_safetensors_atomic", record_payload,
+    )
+    monkeypatch.setattr(lens_io, "write_json_atomic", record_pointer)
+    save_lens_checkpoint(
+        _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="test-corpus", corpus_sha256="abc123", seq_len=128,
+        dim_batch=8, skip_first=16,
+    )
+    assert events == ["payload", "payload", "pointer"]
+
+
+def test_exception_after_lens_pointer_replace_preserves_new_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    _save(_lens(n_layers=2, n_prompts=3))
+    anchor, pointer = lens_io._lens_anchor_paths(_MODEL)
+    prior_files = set(json.loads(pointer.read_text())["tensor_files"].values())
+    real_write = lens_io.write_json_atomic
+
+    def write_then_fail(path: Path, payload: object) -> None:
+        real_write(path, payload)
+        raise OSError("after lens pointer replace")
+
+    monkeypatch.setattr(lens_io, "write_json_atomic", write_then_fail)
+    with pytest.raises(OSError, match="after lens pointer"):
+        _save(_lens(n_layers=2, n_prompts=11))
+
+    monkeypatch.setattr(lens_io, "write_json_atomic", real_write)
+    loaded = load_lens(_MODEL)
+    assert loaded is not None
+    assert loaded[0].n_prompts == 11
+    assert not any((anchor.parent / name).exists() for name in prior_files)
+
+
+def test_lens_generation_gc_fails_closed_on_transient_pointer_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+    import saklas.io.lens as lens_io
+
+    _save(_lens(n_layers=2))
+    anchor, pointer = lens_io._lens_anchor_paths(_MODEL)
+    live_files = set(json.loads(pointer.read_text())["tensor_files"].values())
+    orphan = anchor.parent / f"{anchor.stem}.layer-99.gen-orphan.safetensors"
+    orphan.write_bytes(b"orphan")
+    real_open = builtins.open
+
+    def fail_pointer(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(path) == pointer:
+            raise OSError("transient pointer read")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fail_pointer)
+    lens_io._cleanup_unreferenced_generations(anchor.parent)
+
+    assert orphan.exists()
+    assert all((anchor.parent / name).exists() for name in live_files)
+
+
+def test_legacy_checkpoint_promotion_directory_barrier_precedes_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    checkpoint = _lens(n_layers=2, n_prompts=5)
+    save_lens_checkpoint(
+        checkpoint, _MODEL, base_n_prompts=0,
+        corpus_spec="new", corpus_sha256="new-sha",
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    _final_anchor, final_pointer = lens_io._lens_anchor_paths(_MODEL)
+    events: list[str] = []
+    real_fsync = lens_io.os.fsync
+    real_write = lens_io.write_json_atomic
+
+    def record_fsync(fd: int) -> None:
+        events.append("file")
+        real_fsync(fd)
+
+    def record_dir(path: Path) -> None:
+        events.append("dir")
+        del path
+
+    def record_pointer(path: Path, payload: object) -> None:
+        if path == final_pointer:
+            events.append("pointer")
+        real_write(path, payload)
+
+    monkeypatch.setattr(lens_io.os, "fsync", record_fsync)
+    monkeypatch.setattr(lens_io, "fsync_directory", record_dir)
+    monkeypatch.setattr(lens_io, "write_json_atomic", record_pointer)
+
+    assert promote_lens_checkpoint(
+        _MODEL, n_prompts=5, source_layers=[0, 1],
+        corpus_sha256="new-sha", corpus_hash_kind="token_ids_v1",
+        seq_len=128, d_model=_D, model_fingerprint="weights",
+    )
+    pointer_index = events.index("pointer")
+    assert "file" in events[:pointer_index]
+    assert events[pointer_index - 1] == "dir"
 
 
 def test_remove_unpublishes_before_best_effort_tensor_gc(

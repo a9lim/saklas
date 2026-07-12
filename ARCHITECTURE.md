@@ -124,7 +124,8 @@ and port pre-4.0 packs.)
     <safe_model>_from-<safe_src>.safetensors       # cross-model transfer
     <safe_model>_role-<slug>.safetensors           # reserved; role fits validate the canonical tensor
   models/<safe_model>/
-    neutral_activations.{safetensors,json}         # neutral corpus × layers, fp32
+    neutral_activations.json                       # atomic neutral-cache shard pointer
+    neutral_activations.layer-L.gen-*.safetensors # neutral corpus × one layer, fp32
     alignments/<safe_src>.json                     # atomic factorized-affine shard pointer
     alignments/<safe_src>.layer-L.gen-*.safetensors # one bounded factor shard per layer
   vectors/<ns>/<concept>/                          # LEGACY (pre-4.0) only — ported on touch
@@ -186,10 +187,17 @@ Centroid-only fits reduce by node before transfer. Raw curved fits write
 source-dtype rows to a layer-major mmap spool; sigma covariance projects that
 spool layer-major in bounded chunks, so it needs neither a second model pass, a
 resident fp32 hidden roster, nor one small hidden-dimension GEMM per node; token-exact per-model centroid/row
-caches include baseline/tokenizer-render identity and node boundaries. Format v4
-stores independently digested per-layer centroid and row shards: scoped fits
-verify/map only requested layers, disjoint top-ups write only missing shards, and
-legacy v3 monoliths are replaced on first use. Coverage is unioned for
+caches include baseline/tokenizer-render identity and node boundaries. The final
+fitted-tensor cache remains the first fast path; after it misses, the mandatory
+Mahalanobis whitener is checked before this expensive capture begins. Format v4
+stores independently digested, immutable generation-named per-layer centroid
+and row shards: scoped fits verify/map only requested layers, disjoint top-ups
+write only missing shards, and legacy v3 monoliths are replaced on first use.
+Each generation fsyncs its payloads before a recovery journal and atomic pointer;
+the pointer directory is fsynced before superseded generations are collected.
+The prior pointer remains authoritative on failure, and a complete orphaned
+generation is adopted under the stem lock on the next fit without another model
+pass. Coverage is unioned for
 subset/top-up reuse; cached and newly captured row stores compose as zero-copy
 layer views for the covariance pass. Forced subset fits recapture only their
 selected layers and carry all other v4 pointers forward. The exclusive stem lock

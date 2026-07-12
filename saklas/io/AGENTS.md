@@ -392,23 +392,32 @@ Cross-model probe alignment via per-layer Procrustes.
 (the neutral corpus × layers, **fp32** — the project-wide invariant; exact loaded
 model + rendered-token + layer-schema identity, payload-digest verified; self-heals
 legacy bf16/fp16/non-finite caches). These are what the Mahalanobis whitener builds its
-covariance from. `validate_neutral_cache_metadata` checks the digest plus
-safetensors key/shape/dtype header without paging payloads for an exact-repeat
-preflight; the materializing loader additionally checks finiteness. A stable
-per-model neutral-fit lock spans cache recheck, capture, and publication, while
+covariance from. Cache v3 is an atomic JSON pointer to one immutable fp32 shard
+per layer; every shard and its directory entry are durable before pointer
+publication, and old generations are collected only after the new pointer is
+durable. Legacy v2 fixed monoliths remain readable and migrate on recompute.
+`validate_neutral_cache_metadata` normally checks every digest plus the
+safetensors key/shape/dtype headers; exact-transfer preflight may request the
+header-only source proof, while `load_validated_neutral_cache(...,
+requested_layers=...)` digests/materializes only the selected shards and checks
+finiteness. A stable per-model neutral-fit lock spans cache recheck, **model
+construction**, capture, and publication, while
 the directional source→target alignment-fit lock spans both model loads and the
 second cache recheck; concurrent cold transfer commands never duplicate the
-exact neutral forwards or Procrustes fit. The alignment workflow uses the
+shared model load, neutral forwards, or directional Procrustes fit. The alignment workflow uses the
 metadata-returning neutral loader, so each materialized cache also supplies its
 already-validated identity without a second payload hash. On a cold/stale
 alignment, the target whitener is built from those same resident target rows;
-the model-free preflight materializes the target cache once for either a cached-map
-whitener or an offline map fit. When the map is missing/corrupt but both neutral
+the model-free preflight materializes only requested target layers once for either a cached-map
+whitener or an offline map fit. When requested factors are missing but both neutral
 identities still match their pre-load-verifiable model sources, it materializes
-the source cache too and runs `fit_alignment`/quality/save without loading either
-model. Transfer therefore never re-digests/refactors the target neutral artifact
-after alignment prep.
-`fit_alignment(src, tgt, *, min_shared_layers=10) → {layer: LayerAlignment}`
+the same source layers and runs `fit_alignment`/quality/save without loading either
+model. Existing factor pointers are carried forward and only missing requested
+layers are fitted/written; `-f` recomputes alignment/transfer output but does not
+recapture an exact neutral cache. A narrow transfer therefore does not digest,
+materialize, fit, or whiten unrelated layers.
+`fit_alignment(src, tgt, *, min_shared_layers=10, requested_layers=...,
+available_shared_layers=...) → {layer: LayerAlignment}`
 (row-space orthogonal Procrustes for matched dim, rectangular minimum-norm
 least-squares otherwise; both retained as low-rank factors), plus the fitted
 translation `b_L = mean_tgt - M_L mean_src`; `alignment_quality` is per-layer
@@ -456,7 +465,9 @@ checkpoints use the same generation-pointer scheme under `jlens.partial.json`:
 the estimator writes a self-contained averaged checkpoint directly from raw sums,
 merging a prior prefix one layer at a time during fp16 conversion. This avoids a
 second full fp32 lens at checkpoint cadence and makes repeated interruptions
-independent of an older full artifact (`base_n_prompts=0`). Finalization promotes
+independent of an older full artifact (`base_n_prompts=0`). Every checkpoint
+payload is fsynced and its directory entry made durable before the checkpoint
+pointer is published. Finalization promotes
 an already-complete terminal checkpoint by atomically pointing the durable sidecar
 at its immutable tensor generations, without moving or rewriting them; a pointer-write
 failure therefore preserves both the prior full artifact and the checkpoint.

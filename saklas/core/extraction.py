@@ -31,7 +31,7 @@ from contextlib import nullcontext
 from typing import Any, Callable, Protocol, runtime_checkable
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file, save as serialize_safetensors, save_file
 
 from saklas.core.events import EventBus, ManifoldExtracted
 from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
@@ -252,10 +252,24 @@ def _row_tensor_matches_cache_metadata(
 
 
 def _save_safetensors_atomic(
-    tensors: dict[str, torch.Tensor], path: pathlib.Path,
-) -> None:
-    """Publish safetensors through a unique same-directory staging file."""
+    tensors: dict[str, torch.Tensor], path: pathlib.Path, *, digest: bool = False,
+) -> str | None:
+    """Publish one fsynced safetensors shard through a unique staging file.
+
+    Directory-entry durability is deliberately a transaction-level concern:
+    callers write every shard in one generation, then fsync the directory once
+    before publishing that generation's recovery journal/pointer.  The optional
+    digest path serializes in memory and hashes those exact bytes, avoiding a
+    second read of bounded centroid shards; large row shards stay streaming.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    if digest:
+        from saklas.io.atomic import write_bytes_atomic
+
+        payload = serialize_safetensors(tensors)
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        write_bytes_atomic(path, payload)
+        return payload_sha256
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
     )
@@ -263,21 +277,254 @@ def _save_safetensors_atomic(
     tmp = pathlib.Path(tmp_name)
     try:
         save_file(tensors, str(tmp))
+        with open(tmp, "rb") as handle:
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+    return None
 
 
 def _centroid_shard_path(
-    folder: pathlib.Path, stem: str, layer: int,
+    folder: pathlib.Path, stem: str, layer: int, *, generation: str | None = None,
 ) -> pathlib.Path:
-    return folder / f"{stem}.centroids.layer_{int(layer)}.safetensors"
+    gen = f".gen-{generation}" if generation is not None else ""
+    return folder / f"{stem}{gen}.centroids.layer_{int(layer)}.safetensors"
 
 
 def _row_shard_path(
-    folder: pathlib.Path, stem: str, layer: int,
+    folder: pathlib.Path, stem: str, layer: int, *, generation: str | None = None,
 ) -> pathlib.Path:
-    return folder / f"{stem}.rows.layer_{int(layer)}.safetensors"
+    gen = f".gen-{generation}" if generation is not None else ""
+    return folder / f"{stem}{gen}.rows.layer_{int(layer)}.safetensors"
+
+
+def _capture_shard_name_matches(
+    filename: object, stem: str, kind: str, layer: int,
+) -> bool:
+    """Whether a pointer names the legacy or immutable-generation shard."""
+    if not isinstance(filename, str) or pathlib.Path(filename).name != filename:
+        return False
+    suffix = f".{kind}.layer_{int(layer)}.safetensors"
+    return (
+        filename == f"{stem}{suffix}"
+        or (filename.startswith(f"{stem}.gen-") and filename.endswith(suffix))
+    )
+
+
+def _capture_pending_path(
+    folder: pathlib.Path, stem: str, generation: str,
+) -> pathlib.Path:
+    return folder / f"{stem}.pending-{generation}.json"
+
+
+def _capture_pointer_sha256(path: pathlib.Path) -> str | None:
+    if not path.exists():
+        return None
+    from saklas.io.packs import hash_file
+
+    return hash_file(path)
+
+
+def _capture_payload_files(payload: Mapping[str, object]) -> set[str]:
+    keep: set[str] = set()
+    for field in ("centroid_files", "row_files"):
+        mapping = payload.get(field, {})
+        if isinstance(mapping, Mapping):
+            keep.update(
+                str(filename)
+                for filename in mapping.values()
+                if isinstance(filename, str)
+            )
+    return keep
+
+
+def _gc_capture_generations(
+    capture_dir: pathlib.Path, cache_stem: str, cache_meta: pathlib.Path,
+    payload: Mapping[str, object],
+) -> None:
+    """Remove non-authoritative generations only after pointer durability."""
+    from saklas.io.atomic import fsync_directory
+
+    keep = {cache_meta.name, *_capture_payload_files(payload)}
+    for path in _capture_group_paths(capture_dir, cache_stem):
+        if path.name not in keep:
+            path.unlink(missing_ok=True)
+    fsync_directory(capture_dir)
+
+
+def _commit_capture_generation(
+    capture_dir: pathlib.Path,
+    cache_stem: str,
+    cache_meta: pathlib.Path,
+    payload: dict[str, object],
+    *,
+    generation: str,
+    parent_pointer_sha256: str | None,
+) -> None:
+    """Durably journal then atomically publish one immutable cache generation.
+
+    The journal is the recovery record for the narrow crash window between
+    completing/fsyncing expensive shards and replacing the authoritative JSON
+    pointer.  It is intentionally retained on every pre-pointer failure.
+    """
+    from saklas.io.atomic import fsync_directory, write_json_atomic
+
+    # All shard file data and directory entries must precede either JSON record.
+    fsync_directory(capture_dir)
+    pending = _capture_pending_path(capture_dir, cache_stem, generation)
+    write_json_atomic(pending, {
+        "journal_version": 1,
+        "capture_sha256": cache_stem,
+        "parent_pointer_sha256": parent_pointer_sha256,
+        "created_ns": time.time_ns(),
+        "payload": payload,
+    })
+    fsync_directory(capture_dir)
+    write_json_atomic(cache_meta, payload)
+    fsync_directory(capture_dir)
+    # Only the now-durable pointer authorizes removal of older generations and
+    # the recovery journal itself.
+    _gc_capture_generations(capture_dir, cache_stem, cache_meta, payload)
+
+
+def _capture_generation_is_complete(
+    capture_dir: pathlib.Path,
+    cache_stem: str,
+    payload: object,
+    node_sizes: list[int],
+) -> bool:
+    """Validate every shard named by a crash-left generation journal."""
+    if not isinstance(payload, dict):
+        return False
+    try:
+        if (
+            int(payload.get("format_version", 0))
+            != _CAPTURE_CACHE_FORMAT_VERSION
+            or payload.get("capture_sha256") != cache_stem
+            or [int(x) for x in payload.get("node_sizes", [])] != node_sizes
+        ):
+            return False
+        centroid_layers = {int(x) for x in payload.get("centroid_layers", [])}
+        row_layers = {int(x) for x in payload.get("row_layers", [])}
+        centroid_files = dict(payload.get("centroid_files", {}))
+        row_files = dict(payload.get("row_files", {}))
+        centroid_shapes = dict(payload.get("centroid_shapes", {}))
+        row_shapes = dict(payload.get("row_shapes", {}))
+        row_dtypes = dict(payload.get("row_dtypes", {}))
+        row_digests = dict(payload.get("row_tensor_sha256", {}))
+        files = dict(payload.get("files", {}))
+    except (TypeError, ValueError):
+        return False
+    if not row_layers <= centroid_layers:
+        return False
+    for idx in centroid_layers:
+        key = str(idx)
+        filename = centroid_files.get(key)
+        if (
+            not _capture_shard_name_matches(
+                filename, cache_stem, "centroids", idx,
+            )
+            or filename not in files
+            or key not in centroid_shapes
+        ):
+            return False
+    from saklas.io.packs import verify_integrity
+
+    if files and not verify_integrity(capture_dir, files)[0]:
+        return False
+    if row_layers:
+        from saklas.core.manifold import ActivationRowStore
+
+        for idx in sorted(row_layers):
+            key = str(idx)
+            filename = row_files.get(key)
+            if (
+                not _capture_shard_name_matches(filename, cache_stem, "rows", idx)
+                or key not in row_shapes
+                or key not in row_dtypes
+                or key not in row_digests
+            ):
+                return False
+            store: ActivationRowStore | None = None
+            try:
+                store = ActivationRowStore.load_shards(
+                    {idx: capture_dir / str(filename)}, node_sizes,
+                )
+                if not _row_tensor_matches_cache_metadata(
+                    capture_dir / str(filename), idx, store.flat_rows(idx),
+                    expected_shape=row_shapes[key],
+                    expected_dtype=row_dtypes[key],
+                    expected_digest=row_digests[key],
+                ):
+                    return False
+            except (OSError, RuntimeError, ValueError, KeyError):
+                return False
+            finally:
+                if store is not None:
+                    store.close()
+    return True
+
+
+def _recover_capture_generation(
+    capture_dir: pathlib.Path,
+    cache_stem: str,
+    cache_meta: pathlib.Path,
+    node_sizes: list[int],
+) -> bool:
+    """Adopt the newest complete journal whose parent is the live pointer."""
+    if not capture_dir.exists():
+        return False
+    parent = _capture_pointer_sha256(cache_meta)
+    live_payload: dict[str, object] | None = None
+    if cache_meta.exists():
+        try:
+            with open(cache_meta) as handle:
+                parsed_live = json.load(handle)
+            if isinstance(parsed_live, dict):
+                live_payload = parsed_live
+        except (OSError, json.JSONDecodeError):
+            return False
+    candidates: list[tuple[int, pathlib.Path, dict[str, object]]] = []
+    already_committed: list[tuple[int, pathlib.Path, dict[str, object]]] = []
+    for journal in capture_dir.glob(f"{cache_stem}.pending-*.json"):
+        try:
+            with open(journal) as handle:
+                record = json.load(handle)
+            if (
+                not isinstance(record, dict)
+                or int(record.get("journal_version", 0)) != 1
+                or record.get("capture_sha256") != cache_stem
+                or not _capture_generation_is_complete(
+                    capture_dir, cache_stem, record.get("payload"), node_sizes,
+                )
+            ):
+                continue
+            payload = record["payload"]
+            assert isinstance(payload, dict)
+            item = (int(record.get("created_ns", 0)), journal, payload)
+            if live_payload is not None and payload == live_payload:
+                already_committed.append(item)
+            elif record.get("parent_pointer_sha256") == parent:
+                candidates.append(item)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    if already_committed:
+        _created, _journal, payload = max(
+            already_committed, key=lambda item: item[0],
+        )
+        # Pointer replacement succeeded; only post-commit GC was interrupted.
+        _gc_capture_generations(capture_dir, cache_stem, cache_meta, payload)
+        return True
+    if not candidates:
+        return False
+    _created, journal, payload = max(candidates, key=lambda item: item[0])
+    from saklas.io.atomic import fsync_directory, write_json_atomic
+
+    write_json_atomic(cache_meta, payload)
+    fsync_directory(capture_dir)
+    _gc_capture_generations(capture_dir, cache_stem, cache_meta, payload)
+    return True
 
 
 def _capture_group_paths(
@@ -301,9 +548,15 @@ def _publish_deferred_row_shards(
 ) -> None:
     """Top up auto-curved row shards in a short stem transaction."""
 
-    from saklas.io.atomic import artifact_lock, write_json_atomic
+    from saklas.io.atomic import artifact_lock
 
     with artifact_lock(capture_dir / cache_stem):
+        # A prior process may have completed this exact generation but died
+        # before replacing the pointer. Promote it before planning new I/O.
+        _recover_capture_generation(
+            capture_dir, cache_stem, cache_meta, node_sizes,
+        )
+        parent_pointer_sha256 = _capture_pointer_sha256(cache_meta)
         with open(cache_meta) as handle:
             payload = json.load(handle)
         if (
@@ -331,8 +584,11 @@ def _publish_deferred_row_shards(
             row_digests[key] = current_digests[key]
         row_layers.update(current_layers)
         newly_durable = sorted(set(retained_rows.layer_indices) - current_layers)
+        generation = uuid.uuid4().hex
         for idx in newly_durable:
-            row_path = _row_shard_path(capture_dir, cache_stem, idx)
+            row_path = _row_shard_path(
+                capture_dir, cache_stem, idx, generation=generation,
+            )
             rows = retained_rows.flat_rows(idx)
             _save_safetensors_atomic({f"layer_{idx}": rows}, row_path)
             row_files[str(idx)] = row_path.name
@@ -348,7 +604,11 @@ def _publish_deferred_row_shards(
         payload["row_tensor_sha256"] = {
             str(i): row_digests[str(i)] for i in durable
         }
-        write_json_atomic(cache_meta, payload)
+        _commit_capture_generation(
+            capture_dir, cache_stem, cache_meta, payload,
+            generation=generation,
+            parent_pointer_sha256=parent_pointer_sha256,
+        )
 
 
 def _prune_manifold_capture_cache(
@@ -794,6 +1054,7 @@ class ManifoldExtractionPipeline:
         _node_groups_snapshot: list[tuple[str, list[str]]] | None = None,
         _baseline_prompts_snapshot: list[str | list[dict[str, str]]] | None = None,
         _release_capture_lock: Callable[[], None] | None = None,
+        _resolved_whitener: Any | None = None,
     ):
         """Fit (or load from cache) a manifold for the session's model.
 
@@ -1024,6 +1285,26 @@ class ManifoldExtractionPipeline:
                 pathlib.Path(folder), tensor_path,
                 _authoring_revision or nodes_sha,
             )
+            # A process may have replaced the capture pointer and then died
+            # before generation GC. The fitted tensor fast path normally never
+            # enters the capture transaction, so opportunistically finish only
+            # when a recovery journal is actually present.
+            if capture_sha is not None:
+                capture_dir = (
+                    model_dir(self._handle.model_id) / "manifold_capture"
+                )
+                try:
+                    if any(capture_dir.glob(f"{capture_sha}.pending-*.json")):
+                        from saklas.io.atomic import artifact_lock
+
+                        with artifact_lock(capture_dir / capture_sha):
+                            _recover_capture_generation(
+                                capture_dir, capture_sha,
+                                capture_dir / f"{capture_sha}.json",
+                                [len(responses) for _label, responses in node_groups],
+                            )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    _progress(f"Activation capture cache cleanup skipped: {exc}")
             _progress(f"Loaded cached manifold '{mf.name}'.")
             self._events.emit(ManifoldExtracted(
                 name=mf.name, manifold=cached_manifold,
@@ -1056,6 +1337,21 @@ class ManifoldExtractionPipeline:
         else:
             fit_layers = requested_fit_layers
             feature_space = "raw"
+
+        # The Mahalanobis metric is mandatory for every activation-space fit.
+        # Resolve/gate it only after the fitted-tensor fast path and SAE coverage
+        # checks, but before entering the capture-cache transaction: otherwise a
+        # missing/partial neutral cache fails only after the dominant model pass
+        # has already pooled every manifold response.
+        maha_whitener = _resolved_whitener
+        if maha_whitener is None:
+            maha_whitener = getattr(self._handle, "whitener", None)
+        if maha_whitener is None or not maha_whitener.covers_all(fit_layers):
+            raise WhitenerError(
+                f"manifold {mf.name!r}: the Mahalanobis whitener must cover "
+                f"every fit layer (regenerate the neutral activation cache "
+                f"for {self._handle.model_id!r})"
+            )
 
         # Capture payloads are shared per model and token identity, not per
         # manifold folder. Re-enter once with an explicitly releasable stem
@@ -1096,6 +1392,7 @@ class ManifoldExtractionPipeline:
                     _node_groups_snapshot=_node_groups_snapshot,
                     _baseline_prompts_snapshot=_baseline_prompts_snapshot,
                     _release_capture_lock=transaction.release,
+                    _resolved_whitener=maha_whitener,
                 )
             finally:
                 # The inner cache stage normally releases early. Reacquire before
@@ -1166,6 +1463,11 @@ class ManifoldExtractionPipeline:
         cached_row_shapes: dict[str, object] = {}
         cached_row_dtypes: dict[str, object] = {}
         cached_row_digests: dict[str, object] = {}
+        if cache_meta is not None:
+            assert cache_stem is not None
+            _recover_capture_generation(
+                capture_dir, cache_stem, cache_meta, node_sizes,
+            )
         # Always read a valid v4 pointer, including on force.  Force invalidates
         # only the selected fit layers; unselected immutable shards remain part
         # of the durable union and must not be silently unlinked by a scoped fit.
@@ -1205,18 +1507,20 @@ class ManifoldExtractionPipeline:
                     str(idx) not in cached_centroid_files
                     or str(idx) not in cached_centroid_shapes
                     or cached_centroid_files.get(str(idx)) not in cache_files
-                    or cached_centroid_files.get(str(idx)) != _centroid_shard_path(
-                        capture_dir, cache_stem, idx,
-                    ).name
+                    or not _capture_shard_name_matches(
+                        cached_centroid_files.get(str(idx)),
+                        cache_stem, "centroids", idx,
+                    )
                     for idx in centroid_layers
                 ) or any(
                     str(idx) not in cached_row_files
                     or str(idx) not in cached_row_shapes
                     or str(idx) not in cached_row_dtypes
                     or str(idx) not in cached_row_digests
-                    or cached_row_files.get(str(idx)) != _row_shard_path(
-                        capture_dir, cache_stem, idx,
-                    ).name
+                    or not _capture_shard_name_matches(
+                        cached_row_files.get(str(idx)),
+                        cache_stem, "rows", idx,
+                    )
                     for idx in row_layers
                 ):
                     raise ValueError("capture cache metadata omits layer shards")
@@ -1384,12 +1688,11 @@ class ManifoldExtractionPipeline:
                 new_rows = None
 
         if capture_layers and cache_stem is not None and cache_meta is not None:
-            from saklas.io.atomic import write_json_atomic
-            from saklas.io.packs import hash_file
-
             try:
                 capture_dir.mkdir(parents=True, exist_ok=True)
                 persist_rows_now = mf.fit_mode != "auto"
+                parent_pointer_sha256 = _capture_pointer_sha256(cache_meta)
+                generation = uuid.uuid4().hex
                 files = {
                     cached_centroid_files[str(idx)]: cached_file_digests[
                         cached_centroid_files[str(idx)]
@@ -1401,19 +1704,25 @@ class ManifoldExtractionPipeline:
                     )
                 }
                 for idx in capture_layers:
-                    centroid_path = _centroid_shard_path(capture_dir, cache_stem, idx)
-                    _save_safetensors_atomic(
-                        {f"layer_{idx}": stacks_cached[idx]}, centroid_path,
+                    centroid_path = _centroid_shard_path(
+                        capture_dir, cache_stem, idx, generation=generation,
                     )
+                    digest = _save_safetensors_atomic(
+                        {f"layer_{idx}": stacks_cached[idx]}, centroid_path,
+                        digest=True,
+                    )
+                    assert digest is not None
                     cached_centroid_files[str(idx)] = centroid_path.name
                     cached_centroid_shapes[str(idx)] = list(
                         stacks_cached[idx].shape,
                     )
-                    files[centroid_path.name] = hash_file(centroid_path)
+                    files[centroid_path.name] = digest
 
                 if persist_rows_now and retained_rows is not None:
                     for idx in sorted(captured_row_layers):
-                        row_path = _row_shard_path(capture_dir, cache_stem, idx)
+                        row_path = _row_shard_path(
+                            capture_dir, cache_stem, idx, generation=generation,
+                        )
                         rows = retained_rows.flat_rows(idx)
                         _save_safetensors_atomic({f"layer_{idx}": rows}, row_path)
                         cached_row_files[str(idx)] = row_path.name
@@ -1425,7 +1734,7 @@ class ManifoldExtractionPipeline:
                     sorted(row_layers) if persist_rows_now
                     else sorted(loaded_row_layers)
                 )
-                write_json_atomic(cache_meta, {
+                payload: dict[str, object] = {
                     "format_version": _CAPTURE_CACHE_FORMAT_VERSION,
                     "capture_sha256": capture_sha,
                     "node_sizes": node_sizes,
@@ -1456,18 +1765,12 @@ class ManifoldExtractionPipeline:
                         for idx in metadata_row_layers
                     },
                     "files": files,
-                })
-                keep_names = {
-                    cache_meta.name,
-                    *files,
-                    *(
-                        cached_row_files[str(idx)]
-                        for idx in metadata_row_layers
-                    ),
                 }
-                for old_path in _capture_group_paths(capture_dir, cache_stem):
-                    if old_path.name not in keep_names:
-                        old_path.unlink(missing_ok=True)
+                _commit_capture_generation(
+                    capture_dir, cache_stem, cache_meta, payload,
+                    generation=generation,
+                    parent_pointer_sha256=parent_pointer_sha256,
+                )
             except (OSError, RuntimeError, ValueError) as exc:
                 # The fit result is already in memory and remains valid. A cache
                 # write failure must not turn successful model work into a
@@ -1507,15 +1810,7 @@ class ManifoldExtractionPipeline:
                     f"available; regenerate the neutral corpus so layer_means "
                     f"can build"
                 )
-            _wh = getattr(self._handle, "whitener", None)
-            if _wh is None or not _wh.covers_all(fit_layers):
-                raise WhitenerError(
-                    f"monopolar manifold {mf.name!r}: the Mahalanobis "
-                    f"whitener must cover every fit layer to bake the share "
-                    f"(regenerate the neutral activation cache for "
-                    f"{self._handle.model_id!r})"
-                )
-            maha = _wh
+            maha = maha_whitener
             concept_label = node_groups[0][0]
             directions: dict[int, torch.Tensor] = {}
             for idx in fit_layers:
@@ -1590,30 +1885,7 @@ class ManifoldExtractionPipeline:
             )
             return manifold
 
-        # 2. Resolve the Mahalanobis whitener once.  It is mandatory for an
-        #    activation-space fit — without it the basis, mean, and steering
-        #    direction get dominated by rogue (massive-activation) channels —
-        #    and it now also drives the layer-agnostic coordinate derivation
-        #    below, so the discover-coord consensus and the per-layer fit share
-        #    one resolution.  Resolved *after* the cache-hit return and the
-        #    fail-fast SAE/role checks since ``handle.whitener`` can trigger a
-        #    lazy neutral-activation build.  It must cover *every* fit layer (so
-        #    the cross-layer-normalized share — and the consensus Gram — compare
-        #    like with like); partial coverage or a handle without a whitener is
-        #    a hard error, not a Euclidean fallback.  The basis is model-space
-        #    for both raw and SAE fits (centroids are decoded back before the
-        #    fit), so the residual-stream whitener applies to the SAE variant
-        #    unchanged.
-        _whitener = getattr(self._handle, "whitener", None)
-        if _whitener is None or not _whitener.covers_all(fit_layers):
-            raise WhitenerError(
-                f"manifold {mf.name!r}: the Mahalanobis whitener must cover "
-                f"every fit layer (regenerate the neutral activation cache "
-                f"for {self._handle.model_id!r})"
-            )
-        maha_whitener = _whitener
-
-        # 2b. Stack per-node centroids per layer once (SAE-reconstructed when a
+        # 2. Stack per-node centroids per layer once (SAE-reconstructed when a
         #     backend is set), shared by the consensus-Gram coord derivation and
         #     the per-layer subspace fit so the SAE round-trip runs a single
         #     time.  (K, D) fp32 on CPU per layer.

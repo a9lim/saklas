@@ -24,6 +24,7 @@ from safetensors.torch import load_file, save_file
 from saklas.core.mahalanobis import LayerWhitener, WhitenerError
 from saklas.io.alignment import (
     _neutral_acts_paths,
+    load_validated_neutral_cache,
     load_or_compute_neutral_activations,
     load_or_compute_neutral_activations_with_metadata,
     validate_neutral_cache_metadata,
@@ -101,11 +102,13 @@ def test_store_is_fp32(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     _compute()
 
-    ts_path, _ = _neutral_acts_paths(MODEL_ID)
-    on_disk = load_file(str(ts_path))
-    assert on_disk, "expected neutral-activation tensors on disk"
-    for k, t in on_disk.items():
-        assert t.dtype == torch.float32, f"{k} stored {t.dtype}, expected fp32"
+    anchor, pointer = _neutral_acts_paths(MODEL_ID)
+    sidecar = json.loads(pointer.read_text())
+    assert not anchor.exists(), "v3 must not publish a destructive fixed monolith"
+    for layer, filename in sidecar["tensor_files"].items():
+        on_disk = load_file(str(anchor.parent / filename))
+        tensor = on_disk[f"layer_{layer}"]
+        assert tensor.dtype == torch.float32
 
 
 def test_metadata_preflight_does_not_materialize_tensor_payload(
@@ -170,8 +173,12 @@ def test_metadata_returning_load_reuses_the_single_payload_digest(
     )
 
     assert set(acts) == {0, 1, 2}
-    assert sidecar["tensor_sha256"] == real_hash(_neutral_acts_paths(MODEL_ID)[0])
-    assert hashed == [_neutral_acts_paths(MODEL_ID)[0]]
+    anchor, _ = _neutral_acts_paths(MODEL_ID)
+    assert sidecar["tensor_sha256"] == {
+        layer: real_hash(anchor.parent / filename)
+        for layer, filename in sidecar["tensor_files"].items()
+    }
+    assert hashed == []
 
 
 def test_concurrent_cold_neutral_cache_is_single_flight(
@@ -258,10 +265,12 @@ def test_legacy_bf16_cache_invalidated(tmp_path: Path, monkeypatch: pytest.Monke
     # In-memory result is fp32 ...
     for layer, t in out.items():
         assert t.dtype == torch.float32, f"layer {layer} returned {t.dtype}"
-    # ... and the on-disk store was rewritten fp32.
-    on_disk = load_file(str(ts_path))
-    for k, t in on_disk.items():
-        assert t.dtype == torch.float32, f"{k} rewritten as {t.dtype}, expected fp32"
+    # ... and the fixed legacy monolith was replaced by fp32 v3 shards.
+    assert not ts_path.exists()
+    sidecar = json.loads(sc_path.read_text())
+    for layer, filename in sidecar["tensor_files"].items():
+        tensor = load_file(str(ts_path.parent / filename))[f"layer_{layer}"]
+        assert tensor.dtype == torch.float32
 
 
 def test_sidecar_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -295,13 +304,121 @@ def test_from_cache_rejects_legacy_bf16(tmp_path: Path, monkeypatch: pytest.Monk
     _compute()
     md = model_dir(MODEL_ID)
 
-    save_file(
-        {f"layer_{i}": t.contiguous().to(torch.bfloat16).cpu() for i, t in acts.items()},
-        str(md / "neutral_activations.safetensors"),
-    )
+    pointer = json.loads((md / "neutral_activations.json").read_text())
+    shard = md / pointer["tensor_files"]["0"]
+    save_file({"layer_0": acts[0].to(torch.bfloat16)}, str(shard))
 
     with pytest.raises(WhitenerError, match="corrupt|legacy"):
         LayerWhitener.from_cache(MODEL_ID)
+
+
+def test_selective_load_reads_only_requested_neutral_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_home(tmp_path, monkeypatch)
+    _patch_compute(monkeypatch, _deterministic_acts())
+    _compute()
+    real_read = Path.read_bytes
+    read_names: list[str] = []
+
+    def counted_read(path: Path) -> bytes:
+        read_names.append(path.name)
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read)
+    rows, _ = load_validated_neutral_cache(MODEL_ID, requested_layers=[1, 99])
+    assert set(rows) == {1}
+    assert len(read_names) == 1 and ".layer-1." in read_names[0]
+
+
+def test_failed_neutral_pointer_publication_preserves_prior_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_home(tmp_path, monkeypatch)
+    acts = _deterministic_acts()
+    _patch_compute(monkeypatch, acts)
+    _compute()
+    anchor, pointer = _neutral_acts_paths(MODEL_ID)
+    prior_pointer = pointer.read_bytes()
+    prior_files = set(json.loads(prior_pointer)["tensor_files"].values())
+
+    import saklas.io.alignment as alignment
+
+    monkeypatch.setattr(
+        alignment, "write_json_atomic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("pointer failure")),
+    )
+    with pytest.raises(OSError, match="pointer failure"):
+        load_or_compute_neutral_activations_with_metadata(
+            MODEL, TOKENIZER, [0, 1, 2], model_id=MODEL_ID, force=True,
+        )
+    assert pointer.read_bytes() == prior_pointer
+    assert {
+        path.name for path in anchor.parent.glob(
+            f"{anchor.stem}.layer-*.gen-*.safetensors"
+        )
+    } == prior_files
+
+
+def test_neutral_exception_after_pointer_replace_preserves_new_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_home(tmp_path, monkeypatch)
+    _patch_compute(monkeypatch, _deterministic_acts())
+    import saklas.io.alignment as alignment
+
+    _compute()
+    anchor, pointer = _neutral_acts_paths(MODEL_ID)
+    prior_files = set(json.loads(pointer.read_text())["tensor_files"].values())
+    real_write = alignment.write_json_atomic
+
+    def write_then_fail(path: Path, payload: object) -> None:
+        real_write(path, payload)
+        raise OSError("after neutral pointer replace")
+
+    monkeypatch.setattr(alignment, "write_json_atomic", write_then_fail)
+    with pytest.raises(OSError, match="after neutral pointer"):
+        load_or_compute_neutral_activations_with_metadata(
+            MODEL, TOKENIZER, [0, 1, 2], model_id=MODEL_ID, force=True,
+        )
+
+    monkeypatch.setattr(alignment, "write_json_atomic", real_write)
+    rows, sidecar = load_validated_neutral_cache(MODEL_ID)
+    assert set(rows) == {0, 1, 2}
+    assert json.loads(pointer.read_text()) == sidecar
+    assert all(
+        (anchor.parent / name).is_file()
+        for name in sidecar["tensor_files"].values()
+    )
+    assert not any((anchor.parent / name).exists() for name in prior_files)
+
+
+def test_neutral_directory_barriers_bracket_pointer_and_precede_gc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_home(tmp_path, monkeypatch)
+    _patch_compute(monkeypatch, _deterministic_acts())
+    import saklas.io.alignment as alignment
+
+    events: list[str] = []
+    real_write = alignment.write_json_atomic
+    real_cleanup = alignment._cleanup_neutral_generations
+
+    def record_write(path: Path, payload: object) -> None:
+        events.append("pointer")
+        real_write(path, payload)
+
+    def record_cleanup(anchor: Path, sidecar: object) -> None:
+        events.append("gc")
+        real_cleanup(anchor, sidecar)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(alignment, "write_json_atomic", record_write)
+    monkeypatch.setattr(
+        alignment, "fsync_directory", lambda _path: events.append("barrier"),
+    )
+    monkeypatch.setattr(alignment, "_cleanup_neutral_generations", record_cleanup)
+    _compute()
+    assert events == ["barrier", "pointer", "barrier", "gc", "barrier"]
 
 
 def test_from_cache_builds_without_layer_means(

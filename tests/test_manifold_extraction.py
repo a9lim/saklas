@@ -820,9 +820,9 @@ def test_disjoint_layer_top_up_preserves_existing_row_cache(
         scopes.append(list(kwargs["layer_indices"]))
         return _stub_encoder_batch(*args, **kwargs)
 
-    def _tracked_save(tensors: Any, path: Path) -> None:
+    def _tracked_save(tensors: Any, path: Path, **kwargs: Any) -> Any:
         persisted.append(Path(path).name)
-        real_save(tensors, path)
+        return real_save(tensors, path, **kwargs)
 
     monkeypatch.setattr(V, "_encode_and_capture_all_batch", _counting)
     monkeypatch.setattr(extraction_module, "_save_safetensors_atomic", _tracked_save)
@@ -845,9 +845,206 @@ def test_disjoint_layer_top_up_preserves_existing_row_cache(
     )
     row_paths = sorted(capture_dir.glob("*.rows.layer_*.safetensors"))
     assert len(row_paths) == 2
-    for idx, row_path in enumerate(row_paths):
+    seen_keys: set[str] = set()
+    for row_path in row_paths:
         with safe_open(str(row_path), framework="pt", device="cpu") as tensors:
-            assert set(tensors.keys()) == {f"layer_{idx}"}
+            keys = set(tensors.keys())
+            assert len(keys) == 1
+            seen_keys.update(keys)
+    assert seen_keys == {"layer_0", "layer_1"}
+
+
+def test_capture_generation_pointer_failure_recovers_without_recapture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete crash-left top-up is adopted over the prior good pointer."""
+    from saklas.core import extraction as extraction_module
+    from saklas.io import atomic
+    from saklas.io.paths import model_dir
+
+    folder_a = _author_manifold(tmp_path / "a")
+    folder_b = _author_manifold(tmp_path / "b")
+    handle = _Handle()
+    ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder_a, layer_indices=[0],
+    )
+    capture_dir = model_dir("stub-model") / "manifold_capture"
+    pointer, = [
+        path for path in capture_dir.glob("*.json")
+        if ".pending-" not in path.name
+    ]
+    prior_pointer = pointer.read_bytes()
+    prior_payload = json.loads(prior_pointer)
+    prior_layer_zero = prior_payload["centroid_files"]["0"]
+
+    real_write_json = atomic.write_json_atomic
+    real_publish = extraction_module._publish_fit_if_current
+    pointer_failed = False
+
+    def fail_pointer(path: Path, payload: Any, **kwargs: Any) -> None:
+        nonlocal pointer_failed
+        if Path(path) == pointer and not pointer_failed:
+            pointer_failed = True
+            raise OSError("injected capture pointer failure")
+        real_write_json(path, payload, **kwargs)
+
+    def simulate_crash(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("simulated crash before fitted publication")
+
+    scopes: list[list[int]] = []
+
+    def count_capture(*args: Any, **kwargs: Any) -> Any:
+        scopes.append(list(kwargs["layer_indices"]))
+        return _stub_encoder_batch(*args, **kwargs)
+
+    monkeypatch.setattr(atomic, "write_json_atomic", fail_pointer)
+    monkeypatch.setattr(extraction_module, "_publish_fit_if_current", simulate_crash)
+    monkeypatch.setattr(V, "_encode_and_capture_all_batch", count_capture)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ManifoldExtractionPipeline(handle, EventBus()).fit(
+            folder_b, layer_indices=[1],
+        )
+
+    assert scopes == [[1]]
+    assert pointer.read_bytes() == prior_pointer
+    assert (capture_dir / prior_layer_zero).is_file()
+    pending = list(capture_dir.glob("*.pending-*.json"))
+    assert len(pending) == 1
+    assert list(capture_dir.glob("*.gen-*.centroids.layer_1.safetensors"))
+
+    monkeypatch.setattr(atomic, "write_json_atomic", real_write_json)
+    monkeypatch.setattr(extraction_module, "_publish_fit_if_current", real_publish)
+    monkeypatch.setattr(
+        V, "_encode_and_capture_all_batch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "complete orphan generation was not adopted"
+        ),
+    )
+    fitted = ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder_b, layer_indices=[1],
+    )
+
+    assert sorted(fitted.layers) == [1]
+    recovered = json.loads(pointer.read_text())
+    assert recovered["centroid_layers"] == [0, 1]
+    assert recovered["row_layers"] == [0, 1]
+    assert recovered["centroid_files"]["0"] == prior_layer_zero
+    assert not list(capture_dir.glob("*.pending-*.json"))
+
+
+def test_capture_post_pointer_exception_is_cleaned_on_fitted_cache_hit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live pointer plus old-parent journal is recognized as committed."""
+    from saklas.io import atomic
+    from saklas.io.paths import model_dir
+
+    folder = _author_manifold(tmp_path)
+    handle = _Handle()
+    ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder, layer_indices=[0],
+    )
+    capture_dir = model_dir("stub-model") / "manifold_capture"
+    pointer, = [
+        path for path in capture_dir.glob("*.json")
+        if ".pending-" not in path.name
+    ]
+    prior = json.loads(pointer.read_text())
+    prior_files = {
+        *prior["centroid_files"].values(), *prior["row_files"].values(),
+    }
+    real_write = atomic.write_json_atomic
+    failed = False
+
+    def write_then_fail(path: Path, payload: Any, **kwargs: Any) -> None:
+        nonlocal failed
+        real_write(path, payload, **kwargs)
+        if Path(path) == pointer and not failed:
+            failed = True
+            raise OSError("after capture pointer replace")
+
+    monkeypatch.setattr(atomic, "write_json_atomic", write_then_fail)
+    fitted = ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder, layer_indices=[0], force=True,
+    )
+    assert sorted(fitted.layers) == [0]
+    assert list(capture_dir.glob("*.pending-*.json"))
+    assert any((capture_dir / name).exists() for name in prior_files)
+
+    monkeypatch.setattr(atomic, "write_json_atomic", real_write)
+    monkeypatch.setattr(
+        V, "_encode_and_capture_all_batch",
+        lambda *_args, **_kwargs: pytest.fail("fitted cache hit recaptured"),
+    )
+    cached = ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder, layer_indices=[0],
+    )
+
+    assert sorted(cached.layers) == [0]
+    assert not list(capture_dir.glob("*.pending-*.json"))
+    assert not any((capture_dir / name).exists() for name in prior_files)
+
+
+def test_capture_generation_fsyncs_before_pointer_and_gc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Payload entries and recovery journal are durable before pointer GC."""
+    from saklas.io import atomic
+    from saklas.io.paths import model_dir
+
+    folder = _author_manifold(tmp_path)
+    capture_dir = model_dir("stub-model") / "manifold_capture"
+    events: list[str] = []
+    real_write_json = atomic.write_json_atomic
+    real_fsync_directory = atomic.fsync_directory
+
+    def track_write(path: Path, payload: Any, **kwargs: Any) -> None:
+        resolved = Path(path)
+        if resolved.parent == capture_dir:
+            events.append(
+                "write-pending" if ".pending-" in resolved.name else "write-pointer"
+            )
+        real_write_json(resolved, payload, **kwargs)
+
+    def track_fsync(path: Path) -> None:
+        if Path(path) == capture_dir:
+            events.append("fsync-dir")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(atomic, "write_json_atomic", track_write)
+    monkeypatch.setattr(atomic, "fsync_directory", track_fsync)
+    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+
+    assert events[:5] == [
+        "fsync-dir", "write-pending", "fsync-dir", "write-pointer", "fsync-dir",
+    ]
+    assert events[-1] == "fsync-dir"  # generation GC durability barrier
+
+
+def test_capture_shard_fsync_precedes_atomic_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core import extraction as extraction_module
+
+    events: list[str] = []
+    real_fsync = extraction_module.os.fsync
+    real_replace = extraction_module.os.replace
+
+    def track_fsync(fd: int) -> None:
+        events.append("fsync-file")
+        real_fsync(fd)
+
+    def track_replace(src: Any, dst: Any) -> None:
+        events.append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(extraction_module.os, "fsync", track_fsync)
+    monkeypatch.setattr(extraction_module.os, "replace", track_replace)
+    extraction_module._save_safetensors_atomic(
+        {"layer_0": torch.ones(2, 3)}, tmp_path / "shard.safetensors",
+    )
+
+    assert events == ["fsync-file", "replace"]
 
 
 def test_concurrent_deferred_row_topups_merge_latest_pointer(
@@ -1146,6 +1343,67 @@ def test_fit_cache_hit_skips_forward_passes(tmp_path: Path, monkeypatch: pytest.
     manifold = pipe.fit(folder)  # second call — corpus unchanged
     assert calls["n"] == 0       # cache hit, no pooling
     assert manifold.name == "mood"
+
+
+def test_fitted_cache_hit_ignores_capture_journal_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
+    first = pipe.fit(folder)
+    real_glob = Path.glob
+
+    def fail_pending_scan(path: Path, pattern: str):
+        if path.name == "manifold_capture" and ".pending-" in pattern:
+            raise OSError("transient capture directory read")
+        return real_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", fail_pending_scan)
+    monkeypatch.setattr(
+        V, "_encode_and_capture_all_batch",
+        lambda *_args, **_kwargs: pytest.fail("fitted cache hit captured"),
+    )
+
+    second = pipe.fit(folder)
+
+    assert torch.allclose(first.node_coords, second.node_coords)
+
+
+def test_missing_whitener_fails_before_manifold_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.mahalanobis import WhitenerError
+
+    folder = _author_manifold(tmp_path)
+    handle = _Handle()
+    setattr(handle, "whitener", None)
+    monkeypatch.setattr(
+        V, "_encode_and_capture_all_batch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "mandatory-whitener failure ran manifold capture"
+        ),
+    )
+
+    with pytest.raises(WhitenerError, match="must cover every fit layer"):
+        ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
+
+
+def test_fitted_tensor_hit_does_not_resolve_whitener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _author_manifold(tmp_path)
+    handle = _Handle()
+    pipe = ManifoldExtractionPipeline(handle, EventBus())
+    first = pipe.fit(folder)
+    setattr(handle, "whitener", None)
+    monkeypatch.setattr(
+        V, "_encode_and_capture_all_batch",
+        lambda *_args, **_kwargs: pytest.fail("fitted tensor hit captured"),
+    )
+
+    second = pipe.fit(folder)
+
+    assert torch.allclose(first.node_coords, second.node_coords)
 
 
 def test_fit_rebuilds_tampered_requested_tensor_from_capture_cache(
