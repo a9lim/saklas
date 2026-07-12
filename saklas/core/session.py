@@ -3189,7 +3189,7 @@ class SaklasSession:
         if not raw_ids:
             raise InvalidNodeOperationError(
                 f"jlens_token_readout: {node_id!r} has no raw token record "
-                f"(legacy or transcript-loaded node)"
+                f"(transcript-loaded node)"
             )
         if not 0 <= raw_index < len(raw_ids):
             raise InvalidNodeOperationError(
@@ -6908,7 +6908,7 @@ class SaklasSession:
         if not raw:
             raise InvalidNodeOperationError(
                 f"fork_from_token: {node_id!r} has no raw token record "
-                f"(legacy or transcript-loaded node — not forkable)"
+                f"(transcript-loaded node — not forkable)"
             )
         if not 0 <= raw_index < len(raw):
             raise InvalidNodeOperationError(

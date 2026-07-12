@@ -107,6 +107,40 @@ class MutationDuringGenerationError(RuntimeError, LoomTreeError):
         return (409, str(self) or self.__class__.__name__)
 
 
+def _require_fields(
+    data: dict[str, Any],
+    required: frozenset[str],
+    label: str,
+    *,
+    optional: frozenset[str] = frozenset(),
+) -> None:
+    missing = sorted(required - data.keys())
+    if missing:
+        raise LoomTreeError(f"{label} is missing required fields: {', '.join(missing)}")
+    unknown = sorted(data.keys() - required - optional)
+    if unknown:
+        raise LoomTreeError(f"{label} has unknown fields: {', '.join(unknown)}")
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+_CAST_MEMBER_FIELDS = frozenset({"recipe", "notes"})
+_NODE_FIELDS = frozenset({
+    "id", "parent_id", "role", "text", "role_label", "thinking_text",
+    "recipe", "aggregate_readings", "applied_steering", "finish_reason",
+    "starred", "notes", "created_at", "edited_at", "edit_count",
+    "mean_logprob", "mean_surprise",
+})
+_TOKEN_FIELDS = frozenset({"tokens", "thinking_tokens", "raw_token_ids"})
+_NODE_FIELDS_WITH_TOKENS = _NODE_FIELDS | _TOKEN_FIELDS
+_TREE_FIELDS = frozenset({
+    "tree_format", "saklas_version", "model_id", "session_id", "name", "rev",
+    "root_id", "active_node_id", "nodes", "children_of", "cast",
+})
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -352,19 +386,22 @@ class CastMember:
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        if self.recipe is not None:
-            out["recipe"] = self.recipe.to_dict()
-        if self.notes:
-            out["notes"] = self.notes
-        return out
+        return {
+            "recipe": self.recipe.to_dict() if self.recipe is not None else None,
+            "notes": self.notes,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CastMember":
+        _require_fields(data, _CAST_MEMBER_FIELDS, "cast member")
         recipe = None
-        if data.get("recipe") is not None:
+        if data["recipe"] is not None:
+            if not isinstance(data["recipe"], dict):
+                raise LoomTreeError("cast member field 'recipe' must be an object or null")
             recipe = Recipe.from_dict(data["recipe"])
-        return cls(recipe=recipe, notes=str(data.get("notes", "")))
+        if not isinstance(data["notes"], str):
+            raise LoomTreeError("cast member field 'notes' must be a string")
+        return cls(recipe=recipe, notes=data["notes"])
 
 
 Role = Literal["user", "assistant", "system"]
@@ -430,9 +467,11 @@ class LoomNode:
     # ``thinking_tokens`` suppress, and with partial-UTF-8 bytes
     # unmerged.  Stamped at :meth:`LoomTree.finalize_assistant` from the
     # engine's ``generated_ids``.  This is the forceable prefix a logit
-    # fork replays; ``None`` for legacy / transcript-loaded nodes, where
+    # fork replays; ``None`` for transcript-loaded nodes, where
     # the fork affordance falls back to disabled.  Persisted in the token
     # sidecar alongside ``tokens`` (bulky, per-decode-step granularity).
+    # ``None`` remains a legitimate current value for transcript-imported
+    # turns, and is persisted explicitly rather than inferred from absence.
     raw_token_ids: list[int] | None = None
 
     def to_dict(self, *, include_tokens: bool = False) -> dict[str, Any]:
@@ -453,9 +492,8 @@ class LoomNode:
             "edit_count": self.edit_count,
             "mean_logprob": self.mean_logprob,
             "mean_surprise": self.mean_surprise,
+            "recipe": self.recipe.to_dict() if self.recipe is not None else None,
         }
-        if self.recipe is not None:
-            out["recipe"] = self.recipe.to_dict()
         if include_tokens:
             out["tokens"] = self.tokens
             out["thinking_tokens"] = self.thinking_tokens
@@ -464,29 +502,82 @@ class LoomNode:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LoomNode":
+        required = _NODE_FIELDS_WITH_TOKENS if "tokens" in data else _NODE_FIELDS
+        _require_fields(data, required, "loom node")
         recipe = None
-        if data.get("recipe") is not None:
+        if data["recipe"] is not None:
+            if not isinstance(data["recipe"], dict):
+                raise LoomTreeError("loom node field 'recipe' must be an object or null")
             recipe = Recipe.from_dict(data["recipe"])
+        if data["role"] not in ("user", "assistant", "system"):
+            raise LoomTreeError(f"invalid loom node role {data['role']!r}")
+        if not isinstance(data["id"], str) or not data["id"]:
+            raise LoomTreeError("loom node field 'id' must be a non-empty string")
+        if data["parent_id"] is not None and not isinstance(data["parent_id"], str):
+            raise LoomTreeError("loom node field 'parent_id' must be a string or null")
+        for field_name in ("text", "notes"):
+            if not isinstance(data[field_name], str):
+                raise LoomTreeError(f"loom node field {field_name!r} must be a string")
+        for field_name in ("role_label", "thinking_text", "applied_steering", "finish_reason"):
+            value = data[field_name]
+            if value is not None and not isinstance(value, str):
+                raise LoomTreeError(
+                    f"loom node field {field_name!r} must be a string or null"
+                )
+        if not isinstance(data["aggregate_readings"], dict) or any(
+            not isinstance(name, str) or not _is_number(value)
+            for name, value in data["aggregate_readings"].items()
+        ):
+            raise LoomTreeError(
+                "loom node field 'aggregate_readings' must map strings to numbers"
+            )
+        if not isinstance(data["starred"], bool):
+            raise LoomTreeError("loom node field 'starred' must be a boolean")
+        if not _is_number(data["created_at"]):
+            raise LoomTreeError("loom node field 'created_at' must be a number")
+        if data["edited_at"] is not None and not _is_number(data["edited_at"]):
+            raise LoomTreeError("loom node field 'edited_at' must be a number or null")
+        if (not isinstance(data["edit_count"], int) or isinstance(data["edit_count"], bool)
+                or data["edit_count"] < 0):
+            raise LoomTreeError("loom node field 'edit_count' must be a non-negative integer")
+        for field_name in ("mean_logprob", "mean_surprise"):
+            value = data[field_name]
+            if value is not None and not _is_number(value):
+                raise LoomTreeError(
+                    f"loom node field {field_name!r} must be a number or null"
+                )
+        for field_name in _TOKEN_FIELDS & data.keys():
+            value = data[field_name]
+            if value is not None and not isinstance(value, list):
+                raise LoomTreeError(
+                    f"loom node field {field_name!r} must be a list or null"
+                )
+        raw_token_ids = data.get("raw_token_ids")
+        if raw_token_ids is not None and any(
+            not isinstance(token_id, int) or isinstance(token_id, bool)
+            for token_id in raw_token_ids
+        ):
+            raise LoomTreeError("loom node raw_token_ids must contain integers")
         return cls(
             id=data["id"],
-            parent_id=data.get("parent_id"),
+            parent_id=data["parent_id"],
             role=data["role"],
-            text=data.get("text", ""),
-            role_label=data.get("role_label"),
-            thinking_text=data.get("thinking_text"),
+            text=data["text"],
+            role_label=data["role_label"],
+            thinking_text=data["thinking_text"],
             tokens=data.get("tokens"),
             thinking_tokens=data.get("thinking_tokens"),
             recipe=recipe,
-            aggregate_readings=dict(data.get("aggregate_readings", {})),
-            applied_steering=data.get("applied_steering"),
-            finish_reason=data.get("finish_reason"),
-            starred=bool(data.get("starred", False)),
-            notes=data.get("notes", ""),
-            created_at=float(data.get("created_at", time.time())),
-            edited_at=data.get("edited_at"),
-            edit_count=int(data.get("edit_count", 0)),
-            mean_logprob=data.get("mean_logprob"),
-            mean_surprise=data.get("mean_surprise"),
+            aggregate_readings=dict(data["aggregate_readings"]),
+            applied_steering=data["applied_steering"],
+            finish_reason=data["finish_reason"],
+            starred=data["starred"],
+            notes=data["notes"],
+            created_at=float(data["created_at"]),
+            edited_at=data["edited_at"],
+            edit_count=data["edit_count"],
+            mean_logprob=data["mean_logprob"],
+            mean_surprise=data["mean_surprise"],
             raw_token_ids=data.get("raw_token_ids"),
         )
 
@@ -579,10 +670,11 @@ def derive_seed_schedule(base_seed: int | None, n: int) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-# Format version for ``tree.json``.  Bumps follow the pack-format pattern
-# in ``saklas/io/packs.py``: loader raises on a future version it doesn't
-# understand, and writes always emit the current version.
-TREE_FORMAT_VERSION = 1
+# Exact format versions for ``tree.json`` and its optional token sidecar.
+# Current-only loaders require these versions and every field written by the
+# corresponding schema; there is no implicit v1 or additive-field migration.
+TREE_FORMAT_VERSION = 2
+TOKEN_SIDECAR_FORMAT_VERSION = 2
 
 
 # Hook signature used by the session to enforce gen-lock conflicts.  The
@@ -1290,13 +1382,9 @@ class LoomTree:
                 ],
                 "children_of": {k: list(v) for k, v in self.children_of.items()},
             }
-            # Additive optional key (still tree_format 1): older loaders
-            # ignore it, an empty roster keeps the payload byte-identical
-            # to pre-cast builds.
-            if self.cast:
-                out["cast"] = {
-                    label: m.to_dict() for label, m in self.cast.items()
-                }
+            out["cast"] = {
+                label: member.to_dict() for label, member in self.cast.items()
+            }
             return out
 
     @classmethod
@@ -1307,7 +1395,10 @@ class LoomTree:
         events: Any | None = None,
         conflict_check: ConflictChecker | None = None,
     ) -> "LoomTree":
-        version = data.get("tree_format", 1)
+        _require_fields(
+            data, _TREE_FIELDS, "loom tree", optional=frozenset({"token_sidecar"})
+        )
+        version = data["tree_format"]
         if version != TREE_FORMAT_VERSION:
             raise LoomTreeError(
                 f"unsupported tree_format {version!r} "
@@ -1317,27 +1408,96 @@ class LoomTree:
         tree._lock = threading.RLock()
         tree._events = events
         tree._conflict_check = conflict_check or _noop_conflict_check
-        tree.model_id = data.get("model_id")
-        tree.session_id = data.get("session_id")
-        tree.name = data.get("name")
-        tree.rev = int(data.get("rev", 0))
+        if not isinstance(data["saklas_version"], str):
+            raise LoomTreeError("loom tree field 'saklas_version' must be a string")
+        for field_name in ("model_id", "session_id", "name"):
+            value = data[field_name]
+            if value is not None and not isinstance(value, str):
+                raise LoomTreeError(
+                    f"loom tree field {field_name!r} must be a string or null"
+                )
+        tree.model_id = data["model_id"]
+        tree.session_id = data["session_id"]
+        tree.name = data["name"]
+        if (not isinstance(data["rev"], int) or isinstance(data["rev"], bool)
+                or data["rev"] < 0):
+            raise LoomTreeError("loom tree field 'rev' must be non-negative")
+        tree.rev = data["rev"]
+        raw_nodes = data["nodes"]
+        raw_children = data["children_of"]
+        raw_cast = data["cast"]
+        if not isinstance(raw_nodes, list):
+            raise LoomTreeError("loom tree field 'nodes' must be a list")
+        if not isinstance(raw_children, dict):
+            raise LoomTreeError("loom tree field 'children_of' must be an object")
+        if not isinstance(raw_cast, dict):
+            raise LoomTreeError("loom tree field 'cast' must be an object")
         tree.nodes = {}
-        for raw in data.get("nodes", []):
+        for raw in raw_nodes:
+            if not isinstance(raw, dict):
+                raise LoomTreeError("loom tree nodes must be objects")
             node = LoomNode.from_dict(raw)
+            if node.id in tree.nodes:
+                raise LoomTreeError(f"duplicate loom node id {node.id!r}")
             tree.nodes[node.id] = node
-        tree.children_of = {
-            k: list(v) for k, v in data.get("children_of", {}).items()
-        }
-        # Ensure every node has a children_of entry (empty for leaves).
-        for nid in tree.nodes:
-            tree.children_of.setdefault(nid, [])
+        if any(
+            not isinstance(k, str)
+            or not isinstance(v, list)
+            or any(not isinstance(child, str) for child in v)
+            for k, v in raw_children.items()
+        ):
+            raise LoomTreeError("children_of must map node ids to lists")
+        tree.children_of = {k: list(v) for k, v in raw_children.items()}
+        if not isinstance(data["root_id"], str) or not isinstance(data["active_node_id"], str):
+            raise LoomTreeError("root_id and active_node_id must be strings")
         tree.root_id = data["root_id"]
-        tree.active_node_id = data.get("active_node_id", tree.root_id)
-        tree.cast = {
-            str(label): CastMember.from_dict(dict(raw))
-            for label, raw in (data.get("cast") or {}).items()
-        }
+        tree.active_node_id = data["active_node_id"]
+        tree.cast = {}
+        from saklas.core.role_templates import _validate_role
+        for label, raw in raw_cast.items():
+            if not isinstance(label, str) or not isinstance(raw, dict):
+                raise LoomTreeError("cast must map string labels to member objects")
+            _validate_role(label)
+            tree.cast[label] = CastMember.from_dict(raw)
+        tree._validate_structure()
         return tree
+
+    def _validate_structure(self) -> None:
+        node_ids = set(self.nodes)
+        if set(self.children_of) != node_ids:
+            raise LoomTreeError("children_of keys must exactly match loom node ids")
+        if self.root_id not in node_ids:
+            raise LoomTreeError("root_id does not identify a loom node")
+        if self.active_node_id not in node_ids:
+            raise LoomTreeError("active_node_id does not identify a loom node")
+        root = self.nodes[self.root_id]
+        if root.parent_id is not None or root.role != "system":
+            raise LoomTreeError("loom root must be a parentless system node")
+
+        seen_children: set[str] = set()
+        for parent_id, children in self.children_of.items():
+            if len(children) != len(set(children)):
+                raise LoomTreeError(f"children_of[{parent_id!r}] contains duplicates")
+            for child_id in children:
+                if child_id not in node_ids:
+                    raise LoomTreeError(f"children_of references unknown node {child_id!r}")
+                if child_id in seen_children:
+                    raise LoomTreeError(f"loom node {child_id!r} has multiple parents")
+                if self.nodes[child_id].parent_id != parent_id:
+                    raise LoomTreeError(f"loom node {child_id!r} disagrees with children_of")
+                seen_children.add(child_id)
+        if seen_children != node_ids - {self.root_id}:
+            raise LoomTreeError("every non-root loom node must appear under its parent")
+        reachable: set[str] = set()
+        stack = [self.root_id]
+        while stack:
+            node_id = stack.pop()
+            if node_id in reachable:
+                raise LoomTreeError("loom tree contains a cycle")
+            reachable.add(node_id)
+            stack.extend(self.children_of[node_id])
+        if reachable != node_ids:
+            raise LoomTreeError("all loom nodes must be reachable from root_id")
 
     def save(self, path: Any) -> None:
         """Atomic write of the tree to ``path`` as JSON.
@@ -1356,17 +1516,17 @@ class LoomTree:
             data = self.to_dict(include_tokens=False)
             token_nodes: dict[str, dict[str, Any]] = {}
             for node in self.nodes.values():
-                if node.tokens or node.thinking_tokens or node.raw_token_ids:
+                if node.tokens or node.thinking_tokens or node.raw_token_ids is not None:
                     token_nodes[node.id] = {
-                        "tokens": node.tokens or [],
-                        "thinking_tokens": node.thinking_tokens or [],
-                        "raw_token_ids": node.raw_token_ids or [],
+                        "tokens": node.tokens,
+                        "thinking_tokens": node.thinking_tokens,
+                        "raw_token_ids": node.raw_token_ids,
                     }
             token_payload = None
             if token_nodes:
                 data["token_sidecar"] = sidecar.name
                 token_payload = {
-                    "token_sidecar_format": 1,
+                    "token_sidecar_format": TOKEN_SIDECAR_FORMAT_VERSION,
                     "nodes": token_nodes,
                 }
 
@@ -1400,9 +1560,25 @@ class LoomTree:
         in_path = Path(path)
         with open(in_path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise LoomTreeError("loom tree file must contain an object")
+        _require_fields(
+            data, _TREE_FIELDS, "loom tree", optional=frozenset({"token_sidecar"})
+        )
+        if data["tree_format"] != TREE_FORMAT_VERSION:
+            raise LoomTreeError(
+                f"unsupported tree_format {data['tree_format']!r} "
+                f"(this build supports {TREE_FORMAT_VERSION})"
+            )
         sidecar_name = data.get("token_sidecar")
-        if sidecar_name:
-            sidecar = in_path.parent / str(sidecar_name)
+        if sidecar_name is not None:
+            expected_sidecar_name = f"{in_path.stem}.tokens.json.gz"
+            if sidecar_name != expected_sidecar_name:
+                raise LoomTreeError(
+                    f"token_sidecar must be {expected_sidecar_name!r}, "
+                    f"got {sidecar_name!r}"
+                )
+            sidecar = in_path.parent / sidecar_name
             try:
                 with gzip.open(sidecar, "rt", encoding="utf-8") as f:
                     token_payload = json.load(f)
@@ -1410,23 +1586,32 @@ class LoomTree:
                 raise LoomTreeError(
                     f"token sidecar declared but missing: {sidecar}"
                 ) from e
-            if token_payload.get("token_sidecar_format") != 1:
+            if not isinstance(token_payload, dict):
+                raise LoomTreeError("token sidecar must contain an object")
+            _require_fields(token_payload, frozenset({"token_sidecar_format", "nodes"}), "token sidecar")
+            if token_payload["token_sidecar_format"] != TOKEN_SIDECAR_FORMAT_VERSION:
                 raise LoomTreeError(
                     f"unsupported token_sidecar_format "
-                    f"{token_payload.get('token_sidecar_format')!r}"
+                    f"{token_payload['token_sidecar_format']!r}"
                 )
-            by_id = dict(token_payload.get("nodes", {}))
-            for raw in data.get("nodes", []):
-                node_tokens = by_id.get(raw.get("id"))
+            by_id = token_payload["nodes"]
+            if not isinstance(by_id, dict):
+                raise LoomTreeError("token sidecar field 'nodes' must be an object")
+            main_by_id = {raw["id"]: raw for raw in data["nodes"]}
+            for node_id, node_tokens in by_id.items():
+                if node_id not in main_by_id:
+                    raise LoomTreeError(f"token sidecar references unknown node {node_id!r}")
                 if not isinstance(node_tokens, dict):
-                    continue
-                raw["tokens"] = list(node_tokens.get("tokens") or [])
-                raw["thinking_tokens"] = list(
-                    node_tokens.get("thinking_tokens") or []
-                )
-                rti = node_tokens.get("raw_token_ids")
-                if rti:
-                    raw["raw_token_ids"] = list(rti)
+                    raise LoomTreeError(f"token sidecar node {node_id!r} must be an object")
+                _require_fields(node_tokens, _TOKEN_FIELDS, f"token sidecar node {node_id!r}")
+                for field_name in ("tokens", "thinking_tokens", "raw_token_ids"):
+                    value = node_tokens[field_name]
+                    if value is not None and not isinstance(value, list):
+                        raise LoomTreeError(
+                            f"token sidecar node {node_id!r} field {field_name!r} "
+                            "must be a list or null"
+                        )
+                    main_by_id[node_id][field_name] = value
         return cls.from_dict(data, events=events)
 
 

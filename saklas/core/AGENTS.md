@@ -1199,9 +1199,11 @@ block (committed or decoded-at-finalize), plain-string, main-JSON persisted.
 **Cast roster** (phase 3): `tree.cast: dict[label, CastMember]` —
 `set_cast_member`/`remove_cast_member` are decoration-tier (no conflict check),
 validate the label as a role slug, emit `LoomMutated(op="cast")` (no node ids —
-clients refetch the roster), and ride `to_dict`/`save` as an additive `cast`
-key (`tree_format` stays 1; empty roster emits nothing, so pre-cast payloads
-are byte-identical). Composition at generation is the session's
+clients refetch the roster), and ride `to_dict`/`save` as the required `cast`
+key (`tree_format` is exactly 2; an empty roster emits `{}`). Tree, node, cast,
+and v2 token-sidecar readers require the complete current writer shape; they do
+not infer defaults from omitted legacy fields. Explicit nullable values such as
+transcript-imported `raw_token_ids=None` round-trip as null. Composition at generation is the session's
 `_apply_cast_defaults` — the weakest tier, before regen overrides. Per-node
 token blobs live in memory during streaming; `to_dict` omits them, `save`
 writes a gzip sidecar. Mutators raise `MutationDuringGenerationError` (409) on

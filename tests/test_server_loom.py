@@ -367,7 +367,9 @@ class TestTreeGet:
         resp = client.get("/saklas/v1/sessions/default/tree")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["tree_format"] == 1
+        from saklas.core.loom import TREE_FORMAT_VERSION
+
+        assert data["tree_format"] == TREE_FORMAT_VERSION
         assert data["root_id"] == session.tree.root_id
         assert data["active_node_id"] == session.tree.root_id
         assert len(data["nodes"]) == 1

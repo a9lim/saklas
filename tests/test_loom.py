@@ -24,7 +24,7 @@ from saklas import (
     UnknownNodeError,
     derive_seed_schedule,
 )
-from saklas.core.loom import TREE_FORMAT_VERSION
+from saklas.core.loom import TOKEN_SIDECAR_FORMAT_VERSION, TREE_FORMAT_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +778,7 @@ def test_save_load_round_trips_token_sidecar(tmp_path: Path):
     sidecar = path.with_name("tree.tokens.json.gz")
     with gzip.open(sidecar, "rt", encoding="utf-8") as f:
         token_payload = json.load(f)
-    assert token_payload["token_sidecar_format"] == 1
+    assert token_payload["token_sidecar_format"] == TOKEN_SIDECAR_FORMAT_VERSION
     assert token_payload["nodes"][aid]["tokens"][0]["token_id"] == 42
 
     t2 = LoomTree.load(path)
@@ -991,6 +991,39 @@ def test_load_refuses_future_format(tmp_path: Path):
         LoomTree.load(path)
 
 
+def test_load_refuses_missing_tree_format(tmp_path: Path):
+    raw = _seed_tree().to_dict()
+    del raw["tree_format"]
+    path = tmp_path / "tree.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(Exception, match="tree_format"):
+        LoomTree.load(path)
+
+
+def test_load_refuses_structurally_inconsistent_tree(tmp_path: Path):
+    raw = _seed_tree().to_dict()
+    child = next(node for node in raw["nodes"] if node["id"] != raw["root_id"])
+    child["parent_id"] = "not-the-parent"
+    path = tmp_path / "tree.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(Exception, match="disagrees with children_of"):
+        LoomTree.load(path)
+
+
+def test_sidecar_preserves_explicit_null_raw_token_ids(tmp_path: Path):
+    tree = _seed_tree()
+    node = tree.nodes[tree.active_node_id]
+    node.tokens = [{"token_id": 7, "text": "x"}]
+    node.raw_token_ids = None
+    path = tmp_path / "tree.json"
+    tree.save(path)
+
+    with gzip.open(tmp_path / "tree.tokens.json.gz", "rt", encoding="utf-8") as f:
+        payload = json.load(f)
+    assert payload["nodes"][node.id]["raw_token_ids"] is None
+    assert LoomTree.load(path).nodes[node.id].raw_token_ids is None
+
+
 # ---------------------------------------------------------------------------
 # Per-turn role labels (roleplay scaffold)
 # ---------------------------------------------------------------------------
@@ -1042,10 +1075,10 @@ def test_cast_member_round_trip():
     d = full.to_dict()
     back = CastMember.from_dict(d)
     assert back == full
-    # A bare named label serializes to an empty dict and round-trips.
+    # A bare named label still emits the exact current member shape.
     bare = CastMember()
-    assert bare.to_dict() == {}
-    assert CastMember.from_dict({}) == bare
+    assert bare.to_dict() == {"recipe": None, "notes": ""}
+    assert CastMember.from_dict(bare.to_dict()) == bare
 
 
 def test_cast_roster_crud_and_events():
@@ -1099,10 +1132,10 @@ def test_cast_rides_save_load(tmp_path: Path):
     from saklas import CastMember
 
     t = _seed_tree()
-    # Empty roster: no "cast" key — pre-cast payloads stay byte-identical.
+    # The current schema always carries the cast roster, including empty.
     path = tmp_path / "tree.json"
     t.save(path)
-    assert "cast" not in json.loads(path.read_text())
+    assert json.loads(path.read_text())["cast"] == {}
 
     t.set_cast_member(
         "deer", CastMember(recipe=Recipe(steering="0.5 skittish"))
