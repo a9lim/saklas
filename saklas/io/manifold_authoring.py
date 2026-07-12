@@ -416,9 +416,7 @@ def create_discover_manifold_folder(
     folder path.
 
     Current A2 conversational corpora use the bundled global baseline prompts,
-    not per-manifold scenario lists. Legacy ``scenarios.json`` writing is kept
-    behind :func:`port_legacy_vector_folder` so old vector packs can be ported
-    faithfully without re-exposing scenario provenance on new authoring paths.
+    not per-manifold scenario lists.
 
     Coords are derived per-model at fit time
     (:func:`saklas.core.manifold.discover_coords` runs over the per-node
@@ -457,14 +455,9 @@ def _create_discover_manifold_folder(
     node_roles: Optional[dict[str, str | None]] = None,
     node_kinds: Optional[dict[str, str | None]] = None,
     template_ref: Optional[str] = None,
-    legacy_scenarios: Optional[list[str]] = None,
     target_folder: Path | None = None,
 ) -> Path:
-    """Internal discover writer.
-
-    ``legacy_scenarios`` exists only for legacy vector-folder migration. New
-    discover authoring must not write per-manifold scenario provenance.
-    """
+    """Internal discover writer."""
     _validate_ns_name(namespace, name)
     if fit_mode not in _FIT_MODES_DISCOVER:
         raise ManifoldFormatError(
@@ -531,8 +524,6 @@ def _create_discover_manifold_folder(
     if template_ref is not None:
         payload["template_ref"] = template_ref
     write_json_atomic(folder / "manifold.json", payload)
-    if legacy_scenarios is not None:
-        write_manifold_scenarios(folder, legacy_scenarios)
     return folder
 
 
@@ -745,115 +736,6 @@ def save_baked_manifold_tensor(
         folder, verify_manifest=False,
     ).update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
     return tensor_path
-
-
-def port_legacy_vector_folder(
-    vector_folder: Path,
-    *,
-    namespace: str = "local",
-    name: Optional[str] = None,
-    force: bool = False,
-    _target_folder: Path | None = None,
-) -> tuple[Path, "ManifoldFolder"]:
-    """Port a legacy ``vectors/<ns>/<c>/`` folder to a 2-node ``pca`` manifold.
-
-    The 4.0 back-compat primitive (step 6b detect-on-load, step 6e bulk
-    upgrade): a steering vector is the ``K = 2`` case of a flat affine
-    subspace, so a legacy concept folder's ``statements.json`` (a list of
-    ``{positive, negative}`` pairs) + ``scenarios.json`` reconstruct the
-    equivalent manifold authoring — node 0 = the positive corpus, node 1 = the
-    negative — under ``manifolds/<namespace>/<name>/``.  **No tensors are
-    carried**: the per-model subspace re-fits lazily on first steer / probe,
-    so a ported folder never ships a stale or cross-shape baked tensor.
-
-    Labels follow the convert convention: a bipolar name ``pos.neg`` splits to
-    ``(pos, neg)``; a monopolar name ``c`` becomes ``(c, c_neg)``.  ``tags``
-    and ``description`` are carried from the legacy ``pack.json`` when present.
-
-    ``name`` defaults to ``vector_folder.name`` (the in-cache layout) but can be
-    overridden when the source folder isn't named for the concept — e.g. an HF
-    snapshot dir (a commit-SHA path) being imported via ``manifold install``.
-
-    Returns ``(manifold_folder_path, ManifoldFolder)``.  Raises
-    :class:`FileNotFoundError` when the source has no ``statements.json`` and
-    :class:`FileExistsError` when the target manifold already exists and
-    ``force`` is ``False``.
-    """
-    vector_folder = Path(vector_folder)
-    if name is None:
-        name = vector_folder.name
-    stmts_path = vector_folder / "statements.json"
-    if not stmts_path.exists():
-        raise FileNotFoundError(
-            f"legacy vector folder {vector_folder} has no statements.json to port"
-        )
-    pairs = json.loads(stmts_path.read_text())
-    if not isinstance(pairs, list) or not pairs:
-        raise ManifoldFormatError(
-            f"legacy vector folder {vector_folder}: statements.json is not a "
-            f"non-empty list of {{positive, negative}} pairs"
-        )
-    pos_corpus = [p["positive"] for p in pairs]
-    neg_corpus = [p["negative"] for p in pairs]
-
-    if "." in name:
-        pos_label, neg_label = name.split(".", 1)
-    else:
-        pos_label, neg_label = name, f"{name}_neg"
-
-    description = f"Ported steering vector {name} as a 2-node pca subspace."
-    tags: list[str] = []
-    pack_path = vector_folder / "pack.json"
-    if pack_path.exists():
-        try:
-            pack = json.loads(pack_path.read_text())
-            description = pack.get("description", description)
-            tags = [str(t) for t in pack.get("tags", [])]
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    scenarios: list[str] | None = None
-    scn_path = vector_folder / "scenarios.json"
-    if scn_path.exists():
-        try:
-            raw_scn = json.loads(scn_path.read_text())
-            # Vector extraction writes the dict form ``{"scenarios": [...]}``
-            # (``core/extraction.py``); a bare list is tolerated too.
-            if isinstance(raw_scn, dict):
-                raw_scn = raw_scn.get("scenarios")
-            if isinstance(raw_scn, list):
-                scenarios = [str(s) for s in raw_scn]
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    target = (
-        Path(_target_folder) if _target_folder is not None
-        else manifold_dir(namespace, name)
-    )
-    from saklas.io.manifold_folder import _locked_manifest
-
-    with _locked_manifest(target):
-        if target.exists():
-            if not force:
-                raise FileExistsError(
-                    f"manifold {namespace}/{name} already exists; pass "
-                    "force=True to re-port"
-                )
-            reset_manifold_folder(target)
-
-        _create_discover_manifold_folder(
-            namespace, name, description,
-            fit_mode="pca",
-            node_corpora={pos_label: pos_corpus, neg_label: neg_corpus},
-            hyperparams={"max_dim": 1, "var_threshold": 0.70},
-            legacy_scenarios=scenarios,
-            target_folder=target,
-        )
-        mf = ManifoldFolder.load(target)
-        if tags:
-            mf.tags = tags
-            mf.write_metadata(files=mf.files)
-        return target, mf
 
 
 @_lock_folder_arg

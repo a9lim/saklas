@@ -151,8 +151,7 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
         raise ProfileError(
             f"pack format is from saklas < 2.0 "
             f"(sidecar {meta_path} format_version={fmt_ver!r}, "
-            f"need >= {PACK_FORMAT_VERSION}); "
-            f"run `python scripts/upgrade_packs.py {path.parent}` to migrate"
+            f"need >= {PACK_FORMAT_VERSION}); regenerate it with current saklas"
         )
 
     profile = {int(key.split("_", 1)[1]): tensor for key, tensor in tensors.items()}

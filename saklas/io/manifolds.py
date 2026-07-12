@@ -27,8 +27,7 @@ statements — placed at authoring coordinates on a :class:`ManifoldDomain`
 cylinder, a torus, a sphere, or an explicit immersion).  Fitting a
 manifold against a model produces a per-model RBF artifact (see
 :mod:`saklas.core.manifold`).  Manifolds live under their own root,
-``~/.saklas/manifolds/<ns>/<name>/``, parallel to the legacy ``vectors/``
-port root.
+``~/.saklas/manifolds/<ns>/<name>/``.
 """
 from __future__ import annotations
 
@@ -70,7 +69,6 @@ from saklas.io.manifold_authoring import (
     iter_manifold_folders,
     merge_discover_manifolds,
     plan_discover_generation,
-    port_legacy_vector_folder,
     read_manifold_scenarios,
     save_baked_manifold_tensor,
     update_manifold_folder,
@@ -411,7 +409,6 @@ __all__ = [
     "create_discover_manifold_folder",
     "create_baked_manifold_folder",
     "save_baked_manifold_tensor",
-    "port_legacy_vector_folder",
     "init_discover_manifold_folder",
     "append_discover_manifold_node",
     "write_manifold_scenarios",

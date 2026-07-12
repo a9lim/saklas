@@ -6,7 +6,7 @@ format and `hf_manifolds.py` the HF distribution path. The old pack
 format/distribution surface (`PackMetadata`/`ConceptFolder`/`pull_pack`/the
 `cache_ops` install layer/`datasource.py`) is gone; `packs.py` / `cache_ops.py` /
 `hf.py` are thin shared-primitive remnants. Everything lives under
-`~/.saklas/manifolds/`; `vectors/` is read only to port pre-4.0 packs.
+`~/.saklas/manifolds/`.
 
 ## paths.py
 
@@ -16,8 +16,7 @@ Helpers: `manifolds_dir`, `manifold_dir(ns, name)`, `templates_dir`, `models_dir
 baseline user prompts; falls back to bundled `saklas/data/baseline_prompts.json`),
 `safe_model_id` (ordinary Hub ids preserve `/` → `__`; ambiguous/local ids use
 a reversible `_z` base64url tier), `ensure_within(root, *parts)` (path-traversal
-barrier). `vectors_dir` / `concept_dir` survive only for the legacy-port scan — no
-current writer targets them.
+barrier).
 
 `sae.py` owns the small live-runtime metadata cache under
 `models/<safe>/sae/`: one release/layer identity sidecar plus the lazily
@@ -51,11 +50,8 @@ Shared pack-format *primitives* only — the format/distribution surface is gone
 What remains: `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` (manifolds reuse it),
 `hash_file` / `hash_folder_files` / `verify_integrity` (the sha256 integrity
 helpers behind the neutral/layer-means/alignment caches and the manifold integrity
-manifest), `PackFormatError`, and `PACK_FORMAT_VERSION = 3` — the *legacy-vector
-migration sentinel*: a `vectors/` pack whose `pack.json.format_version` is below it
-is legacy and ported to a 2-node `pca` manifold on touch
-(`scripts/upgrade_packs.py` / `SteeringComposer.port_stale_legacy_vector`). Also stamped
-onto the profile-cache sidecars `profile.save_profile` writes
+manifest), `PackFormatError`, and `PACK_FORMAT_VERSION = 3`, stamped onto the
+profile-cache sidecars `profile.save_profile` writes
 (`vectors.save_profile` remains a compatibility alias).
 
 ## manifolds.py
@@ -125,8 +121,6 @@ merge` target — one fitted tensor per model, all sharing one `manifold.json`);
 each baked pair records its manifest proof before the call returns, and an
 ordinary identical producer retry replaces an unproven first/later pair left by
 a crash between pair publication and the manifest update.
-`port_legacy_vector_folder` ports a stale `vectors/<ns>/<name>/` pack to a 2-node
-`pca` discover folder (file-only — no tensors carried; they re-fit lazily).
 Streaming companions for big rosters (a crash keeps finished nodes):
 `init_discover_manifold_folder` (also takes `node_kinds=`) +
 `append_discover_manifold_node`; `plan_discover_generation → DiscoverGenerationPlan`

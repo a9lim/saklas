@@ -936,10 +936,8 @@ at most one kind per file (no `pca` suffix). `tensor_filename` /
 `parse_tensor_filename` in `io/paths.py` round-trip these (plus a `_role-<slug>`
 form that isn't emitted yet — `extract --role` bakes the role into the corpus and
 writes the canonical tensor).
-`materialize_bundled_manifolds()` is copy-on-miss. A pre-4.0 `vectors/` pack
-(`pack.json.format_version < PACK_FORMAT_VERSION = 3`) is *legacy*: ported to a
-2-node `pca` manifold on first steer touch (`_port_stale_legacy_vector` /
-`scripts/upgrade_packs.py`) and re-fit lazily.
+`materialize_bundled_manifolds()` is copy-on-miss. Current artifacts live only
+under `manifolds/`; pre-manifold vector folders are not read or migrated.
 
 ## Performance invariants
 

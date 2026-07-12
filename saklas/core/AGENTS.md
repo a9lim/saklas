@@ -1022,10 +1022,7 @@ fitted Jacobian lens (raising `LensNotFittedError`/`MultiTokenWordError`, never
 falling through to extraction); (2) a fitted
 2-node `pca` manifold on disk — `try_fold_manifold` → `ensure_manifold_loaded`
 (load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
-memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
-`vectors/<ns>/<name>/` folder — `port_stale_legacy_vector` ports it to a 2-node
-manifold file-only (no tensor yet) and raises with the exact `manifold fit` command
-to run. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
+memoized into `_profiles`. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
 probe-roster bootstrap — one pass, two tiers. **Tagged concept axes**: for each
 `default/` manifold tagged in a requested category, fit-or-load the 2-node
 `Manifold` and hand it to the `Monitor` (rank-1 coordinate, no fold; replaces the

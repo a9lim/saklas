@@ -1,5 +1,4 @@
-"""Shared pack-format primitives: name validation, integrity, and the
-legacy-format version sentinel.
+"""Shared artifact primitives: name validation, integrity, and profile versioning.
 
 The 4.0 collapse retired the pack *format/distribution* surface
 (``PackMetadata`` / ``ConceptFolder`` / ``Sidecar`` / ``enumerate_variants`` /
@@ -11,12 +10,8 @@ infrastructure several layers still share:
 - ``hash_file`` / ``hash_folder_files`` / ``verify_integrity`` — the sha256
   integrity helpers (the neutral/layer-means/alignment caches + the manifold
   format's own integrity manifest build on these);
-- ``PACK_FORMAT_VERSION`` — the legacy-vector-folder migration sentinel: a v2
-  ``vectors/`` pack (``format_version`` below this) is *legacy*, ported to a
-  2-node ``pca`` manifold on first touch
-  (:meth:`saklas.core.steering_composer.SteeringComposer.port_stale_legacy_vector` /
-  ``scripts/upgrade_packs.py``).  Also stamped onto the profile-cache sidecars
-  written by :func:`saklas.core.vectors.save_profile`.
+- ``PACK_FORMAT_VERSION`` — the current profile-cache sidecar version written by
+  :func:`saklas.core.vectors.save_profile`.
 """
 from __future__ import annotations
 
@@ -30,17 +25,12 @@ from saklas.io.paths import ensure_within
 
 NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 
-# Current on-disk pack format version.  v3 (4.0): a steering vector *is* the
-# K=2 case of a flat affine subspace, so the canonical artifact for a concept
-# is now a 2-node ``pca`` manifold under ``manifolds/``, not a baked DiM tensor
-# under ``vectors/``.  v2 vector packs are legacy: ``scripts/upgrade_packs.py``
-# (and ``SteeringComposer.port_stale_legacy_vector``) port statements-bearing
-# folders to manifolds on touch.
+# Current profile-cache sidecar format version.
 PACK_FORMAT_VERSION = 3
 
 
 class PackFormatError(ValueError, SaklasError):
-    """Raised when a (legacy) pack folder or pack.json is malformed."""
+    """Raised when an artifact manifest or sidecar is malformed."""
 
     def user_message(self) -> tuple[int, str]:
         return (400, str(self) or self.__class__.__name__)

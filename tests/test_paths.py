@@ -19,14 +19,8 @@ def test_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 def test_subdirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    assert paths.vectors_dir() == tmp_path / "vectors"
     assert paths.models_dir() == tmp_path / "models"
     assert paths.neutral_statements_path() == tmp_path / "neutral_statements.json"
-
-
-def test_concept_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    assert paths.concept_dir("default", "happy") == tmp_path / "vectors" / "default" / "happy"
 
 
 def test_model_dir_flattens_slashes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

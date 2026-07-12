@@ -107,8 +107,7 @@ embeddable topology works without touching the kernel.
 
 ### On-disk layout (`~/.saklas/`, override `$SAKLAS_HOME`)
 
-There is **one** artifact root: `manifolds/`. (`vectors/` is read only to detect
-and port pre-4.0 packs.)
+There is **one** artifact root: `manifolds/`.
 
 ```
 ~/.saklas/
@@ -128,7 +127,6 @@ and port pre-4.0 packs.)
     neutral_activations.layer-L.gen-*.safetensors # neutral corpus × one layer, fp32
     alignments/<safe_src>.json                     # atomic factorized-affine shard pointer
     alignments/<safe_src>.layer-L.gen-*.safetensors # one bounded factor shard per layer
-  vectors/<ns>/<concept>/                          # LEGACY (pre-4.0) only — ported on touch
 ```
 
 Tensor-filename variants (`io/paths.py`) are `raw` (canonical), `sae-<release>`,
@@ -547,10 +545,7 @@ composes the unified backend:
 already in `_profiles` (ad-hoc `extract`/`merge`/projection results); (2) a
 fitted 2-node `pca` manifold on disk — `_try_fold_manifold` loads it
 (`_ensure_manifold_loaded`) and folds via `folded_vector_directions`, memoizing the
-result; (3) a stale (`< PACK_FORMAT_VERSION`) legacy `vectors/<ns>/<name>/` folder
-— ported to a 2-node manifold file-only (`_port_stale_legacy_vector`), then the
-call raises with the exact `manifold fit` command (porting carries no tensor; it
-re-fits lazily because fitting can't re-enter the generation lock from dispatch).
+result. Pre-manifold vector folders are not part of the current runtime format.
 
 **Folding to a push fragment.** `fold_directions_to_subspace(name, directions,
 neutral_means)` (`core/vectors.py`) folds a resolved per-layer direction into a

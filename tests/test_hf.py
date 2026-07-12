@@ -471,32 +471,19 @@ def test_push_manifold_freezes_candidates_before_staging(
     assert new_tensor.with_suffix(".json").name not in staged_manifest["files"]
 
 
-# ========================================================== legacy-pack port ===
-#
-# 4.0 back-compat: `manifold install` ports a published/local legacy
-# saklas-pack (statements-bearing, no manifold.json) to a 2-node `pca`
-# manifold. A bare control-vector repo (no statements, no manifest) is refused.
-
-
-def test_install_manifold_ports_local_legacy_pack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_install_manifold_requires_current_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     from saklas.io.hf_manifolds import install_manifold
-    from saklas.io.manifolds import ManifoldFolder
-    from saklas.io.paths import manifold_dir
 
-    # A legacy v2 vector folder: statements.json of {positive, negative} pairs.
-    legacy = tmp_path / "legacy" / "happy.sad"
-    legacy.mkdir(parents=True)
-    (legacy / "statements.json").write_text(json.dumps([
+    source = tmp_path / "source" / "happy.sad"
+    source.mkdir(parents=True)
+    (source / "statements.json").write_text(json.dumps([
         {"positive": "what a wonderful day", "negative": "everything is bleak"},
-        {"positive": "i feel great", "negative": "i feel hopeless"},
     ]))
-
-    dst = install_manifold(str(legacy))
-    assert dst == manifold_dir("local", "happy.sad")
-    mf = ManifoldFolder.load(dst)
-    assert mf.fit_mode == "pca"
-    assert sorted(mf.node_labels) == ["happy", "sad"]
+    with pytest.raises(ValueError, match="not a manifold"):
+        install_manifold(str(source))
 
 
 def test_install_manifold_refuses_bare_control_vector_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -508,7 +495,7 @@ def test_install_manifold_refuses_bare_control_vector_folder(tmp_path: Path, mon
     bare = tmp_path / "bare" / "control"
     bare.mkdir(parents=True)
     (bare / "model.safetensors").write_bytes(b"not a real tensor")
-    with pytest.raises(ValueError, match="statements.json"):
+    with pytest.raises(ValueError, match="not a manifold"):
         install_manifold(str(bare))
 
 

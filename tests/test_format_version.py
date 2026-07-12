@@ -32,7 +32,7 @@ def test_load_profile_rejects_missing_format_version(tmp_path: Path):
     data.pop("format_version", None)
     sc_path.write_text(json.dumps(data))
 
-    with pytest.raises(ProfileError, match="upgrade_packs"):
+    with pytest.raises(ProfileError, match="regenerate"):
         load_profile(str(path))
 
 

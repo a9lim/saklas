@@ -63,10 +63,6 @@ def saklas_home() -> Path:
     return Path.home() / ".saklas"
 
 
-def vectors_dir() -> Path:
-    return saklas_home() / "vectors"
-
-
 def models_dir() -> Path:
     return saklas_home() / "models"
 
@@ -74,9 +70,7 @@ def models_dir() -> Path:
 def manifolds_dir() -> Path:
     """Root of the manifold-steering artifact tree.
 
-    Parallel to :func:`vectors_dir` — a manifold is its own artifact kind
-    (labeled nodes placed on an n-dimensional domain), not a concept
-    folder, so it lives under its own root.
+    A manifold is a labeled-node artifact placed on an n-dimensional domain.
     """
     return saklas_home() / "manifolds"
 
@@ -175,10 +169,6 @@ def unsafe_model_id(safe_id: str) -> str:
         ).decode("utf-8")
     except (ValueError, UnicodeDecodeError) as exc:
         raise ValueError(f"invalid encoded safe model id {safe_id!r}") from exc
-
-
-def concept_dir(namespace: str, concept: str) -> Path:
-    return ensure_within(vectors_dir(), namespace, concept)
 
 
 def model_dir(model_id: str) -> Path:
