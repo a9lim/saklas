@@ -8105,7 +8105,7 @@ class SaklasSession:
         )
 
     def _snapshot_steering_alphas(self) -> dict[str, float]:
-        """Flatten the active steering stack for ``GenerationResult.vectors``."""
+        """Flatten the active steering stack for result receipts."""
         return self._get_steering_composer().snapshot_steering_alphas()
 
     def _start_loom_assistant(
@@ -9409,7 +9409,7 @@ class SaklasSession:
             tok_per_sec=tok_per_sec,
             elapsed=elapsed,
             readings=readings,
-            vectors=vector_snapshot,
+            steering_alphas=vector_snapshot,
             prompt_tokens=prompt_tokens,
             finish_reason=finish_reason,
             logprobs=None,

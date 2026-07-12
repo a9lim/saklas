@@ -39,7 +39,7 @@ def to_dataframe(
 
     Accepted shapes:
 
-    * :class:`saklas.core.results.RunSet` — delegates to its own
+    * :class:`saklas.core.results.RunSet` — converts its explicit results through
       ``to_dataframe`` so ``grid`` and ``node_ids`` are preserved.
     * :class:`saklas.core.results.ResultCollector` — delegates to its own
       ``to_dataframe`` (the single source of truth for column naming).

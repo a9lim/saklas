@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from saklas.core.results import GenerationResult, TokenEvent
+from saklas.core.results import GenerationResult, RunSet, TokenEvent
 from saklas.core.session import ConcurrentGenerationError, VectorNotRegisteredError
 
 
@@ -53,6 +53,10 @@ def _mock_session():
     # FastAPI test client's event loop.
     session.lock = asyncio.Lock()
     return session
+
+
+def _single_run(**kwargs: Any) -> RunSet:
+    return RunSet([GenerationResult(**kwargs)])
 
 
 @pytest.fixture
@@ -190,7 +194,7 @@ class TestChatCompletions:
             text="Hello there!", tokens=[1, 2, 3], token_count=3,
             tok_per_sec=10.0, elapsed=0.3,
         )
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/v1/chat/completions", json={
             "model": "test/model",
@@ -211,7 +215,7 @@ class TestChatCompletions:
 
     def test_with_steering_string(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="Ok", tokens=[1], token_count=1,
             tok_per_sec=5.0, elapsed=0.2,
         )
@@ -294,7 +298,7 @@ class TestChatCompletions:
 
     def test_sampling_overrides_ride_on_sampling_config(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="x", tokens=[1], token_count=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -323,7 +327,7 @@ class TestChatCompletions:
 class TestCompletions:
     def test_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="42", tokens=[1], token_count=1,
             tok_per_sec=5.0, elapsed=0.2,
         )
@@ -469,7 +473,7 @@ class TestOllamaApi:
 
     def test_chat_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="Hello there!", tokens=[1, 2, 3], token_count=3, prompt_tokens=2,
             tok_per_sec=10.0, elapsed=0.3,
         )
@@ -496,7 +500,7 @@ class TestOllamaApi:
     def test_chat_non_streaming_done_reason_comes_from_result(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.generation_state.finish_reason = "length"
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="Hello there!", tokens=[1, 2, 3], token_count=3, prompt_tokens=2,
             tok_per_sec=10.0, elapsed=0.3, finish_reason="stop",
         )
@@ -510,7 +514,7 @@ class TestOllamaApi:
 
     def test_chat_with_system_field(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, prompt_tokens=5,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -526,7 +530,7 @@ class TestOllamaApi:
 
     def test_chat_options_passthrough(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, prompt_tokens=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -585,7 +589,7 @@ class TestOllamaApi:
         import math
 
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, prompt_tokens=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -670,7 +674,7 @@ class TestOllamaApi:
 
     def test_generate_non_streaming(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="42", tokens=[1], token_count=1, prompt_tokens=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -692,7 +696,7 @@ class TestOllamaApi:
 
     def test_generate_raw_mode(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="x", tokens=[1], token_count=1, prompt_tokens=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -706,7 +710,7 @@ class TestOllamaApi:
 
     def test_generate_with_system_uses_chat_template(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="arrr", tokens=[1], token_count=1, prompt_tokens=2,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -824,7 +828,7 @@ class TestOllamaApi:
 class TestLangChainCompat:
     def test_empty_tools_accepted(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="hi", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         resp = client.post("/v1/chat/completions", json={
@@ -854,7 +858,7 @@ class TestLangChainCompat:
 
     def test_response_format_text_accepted(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="hi", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         resp = client.post("/v1/chat/completions", json={
@@ -883,7 +887,7 @@ class TestLangChainCompat:
 class TestNativeSteeringField:
     def test_top_level_steering_expression(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         # ``myvec.baseline`` is a synthetic name outside the bundled-probe
@@ -901,7 +905,7 @@ class TestNativeSteeringField:
 
     def test_steering_projection_term(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         resp = client.post("/v1/chat/completions", json={
@@ -920,7 +924,7 @@ class TestNativeSteeringField:
         from saklas.server import create_app
         from saklas.core.steering import Steering
         session = _mock_session()
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         app = create_app(session, default_steering=Steering(alphas={"base": 0.2}))
@@ -937,7 +941,7 @@ class TestNativeSteeringField:
         from saklas.server import create_app
         from saklas.core.steering import Steering
         session = _mock_session()
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         # Use a key outside the bundled-probe vocabulary so resolve_pole
@@ -956,7 +960,7 @@ class TestNativeSteeringField:
         from saklas.server import create_app
         from saklas.core.steering import Steering
         session = _mock_session()
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         app = create_app(session, default_steering=Steering(alphas={"base": 0.2}))
@@ -975,7 +979,7 @@ class TestNativeSteeringField:
 
     def test_thinking_field_default_is_none_auto(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         resp = client.post("/v1/chat/completions", json={
@@ -987,7 +991,7 @@ class TestNativeSteeringField:
 
     def test_thinking_explicit_false(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="ok", tokens=[1], token_count=1, tok_per_sec=1.0, elapsed=0.1,
         )
         resp = client.post("/v1/chat/completions", json={

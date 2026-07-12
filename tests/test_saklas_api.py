@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from saklas.core.results import GenerationResult
+from saklas.core.results import GenerationResult, RunSet
 from saklas.server.ws_models import WSSamplingParams, build_sampling
 
 
@@ -561,7 +561,7 @@ class TestWebSocket:
             }
             session.last_per_token_scores = per_token
             session.last_per_token_scores = per_token
-            return result
+            return RunSet([result])
 
         session.generate.side_effect = _gen
 
@@ -615,7 +615,7 @@ class TestWebSocket:
             session.last_result = result
             session.last_per_token_scores = {}
             session.last_per_token_scores = {}
-            return result
+            return RunSet([result])
 
         session.generate.side_effect = _gen
 
@@ -699,7 +699,7 @@ class TestWebSocket:
             session.last_result = result
             session.last_per_token_scores = {}
             session.last_per_token_scores = {}
-            return result
+            return RunSet([result])
 
         session.generate.side_effect = _gen
 

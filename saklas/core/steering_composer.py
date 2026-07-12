@@ -1127,7 +1127,7 @@ class SteeringComposer:
         self.install_composed_steering()
 
     def snapshot_steering_alphas(self) -> dict[str, float]:
-        """Flatten the active steering stack for ``GenerationResult.vectors``.
+        """Flatten the active steering stack for result steering receipts.
 
         For a plain vector entry, ``entry[0]`` is the additive alpha (the
         strength coefficient, typically in ``[0, 1]``).

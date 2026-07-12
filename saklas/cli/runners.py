@@ -2960,7 +2960,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
     def _score(steer: str | None) -> tuple[str, float, float]:
         result = session.generate(
             args.prompt, steering=steer, sampling=sampling,
-        )
+        ).first
         text = result.text
         traj = compute_trajectory_distributions(
             session.model, session.tokenizer, session.device, text,
@@ -3177,13 +3177,13 @@ def _run_transcript_run(args: argparse.Namespace) -> None:
                 steering=steering,
                 sampling=sampling,
                 stateless=True,
-            )
+            ).first
         except Exception as e:
             print(f"  replay failed: {e}")
             continue
         print(f"assistant: {result.text[:120]}")
         if expected is not None and expected.readings:
-            actual = {n: r.mean for n, r in result.readings.items()}
+            actual = {n: r.mean[0] for n, r in result.readings.items()}
             deltas = []
             for name, expected_v in expected.readings.items():
                 actual_v = actual.get(name, 0.0)

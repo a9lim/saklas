@@ -54,7 +54,7 @@ from saklas import SaklasSession
 
 with SaklasSession.from_pretrained("google/gemma-4-31b-it") as s:
     name, profile = s.extract("formal.casual")       # a bundled bipolar concept
-    print(s.generate("What makes a good day?", steering=f"0.3 {name}").text)
+    print(s.generate("What makes a good day?", steering=f"0.3 {name}").first.text)
 ```
 
 ---
@@ -286,17 +286,16 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
         "What makes a good day?",
         steering=f"0.3 {name}",
         sampling=SamplingConfig(temperature=0.7, max_tokens=256, seed=42),
-    )
-    # generate() returns a RunSet. Single-run attributes delegate to .first.
+    ).first
     print(result.text)
     print(result.readings)                          # live probe readings
     print(result.applied_steering)                  # canonical expression receipt
 
     # Scoped steering with pole and manifold-label resolution
     with session.steering("0.4 casual"):            # bare pole resolves to formal.casual at -0.4
-        print(session.generate("Describe a rainy afternoon.").text)
+        print(session.generate("Describe a rainy afternoon.").first.text)
     with session.steering("0.5 pirate"):            # bare label resolves to personas%pirate
-        print(session.generate("Describe a forest.").text)
+        print(session.generate("Describe a forest.").first.text)
 
     # Compare concepts
     other_name, other_profile = session.extract("warm.clinical")

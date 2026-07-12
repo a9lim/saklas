@@ -194,7 +194,7 @@ def finalize_generation(
     result = GenerationResult(
         text=text, tokens=list(generated_ids), token_count=token_count,
         tok_per_sec=tok_per_sec, elapsed=elapsed,
-        readings=readings, vectors=vector_snapshot,
+        readings=readings, steering_alphas=vector_snapshot,
         prompt_tokens=prompt_tokens,
         finish_reason=session._gen_state.finish_reason,
         logprobs=logprobs_list,

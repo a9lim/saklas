@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from saklas.core.events import EventBus
 from saklas.core.loom import LoomTree
-from saklas.core.results import GenerationResult
+from saklas.core.results import GenerationResult, RunSet
 
 # ---------------------------------------------------------------------------
 # Test session factory
@@ -209,7 +209,7 @@ class _StubSession:
                 self.last_result = result
             finally:
                 self._active_gen_reservation = None
-        return results[0] if n == 1 else results
+        return RunSet(results)
 
     # ----- answer-prefill entry point ----------------------------------
     def prefill_assistant(self, node_id: Any, text: Any, *, steering: Any = None,

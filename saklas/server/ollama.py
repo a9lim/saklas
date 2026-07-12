@@ -561,7 +561,7 @@ def register_ollama_routes(app: FastAPI) -> None:
                     },
                 )
             try:
-                result = session.generate(input_payload, raw=raw, **gen_kwargs)
+                result = session.generate(input_payload, raw=raw, **gen_kwargs).first
             except ConcurrentGenerationError as e:
                 raise HTTPException(
                     status_code=409, detail="Generation already in progress",

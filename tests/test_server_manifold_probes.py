@@ -34,8 +34,13 @@ from fastapi.testclient import TestClient
 from saklas.core.results import (
     GenerationResult,
     ProbeReading,
+    RunSet,
     TokenEvent,
 )
+
+
+def _single_run(**kwargs: Any) -> RunSet:
+    return RunSet([GenerationResult(**kwargs)])
 
 # The single session id the native tree resolves to.
 _SID = "default"
@@ -515,7 +520,7 @@ class TestOpenAIProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Hi"}],
@@ -531,7 +536,7 @@ class TestOpenAIProbeExtension:
 
     def test_chat_completion_absent_when_no_probes(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="hi", tokens=[1], token_count=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -548,7 +553,7 @@ class TestOpenAIProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/v1/completions", json={"prompt": "x"})
         assert resp.status_code == 200
@@ -609,7 +614,7 @@ class TestOllamaProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/api/chat", json={
             "model": "test/model",
@@ -624,7 +629,7 @@ class TestOllamaProbeExtension:
 
     def test_chat_non_streaming_absent_when_no_probes(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="hi", tokens=[1], token_count=1, prompt_tokens=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -639,7 +644,7 @@ class TestOllamaProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/api/generate", json={
             "prompt": "x",
@@ -765,7 +770,7 @@ class TestWebSocketProbeReadings:
             session.last_result = result
             session.last_per_token_scores = None
             session.last_per_token_scores = None
-            return result
+            return RunSet([result])
 
         session.generate.side_effect = _gen
 

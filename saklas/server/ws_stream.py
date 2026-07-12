@@ -650,7 +650,7 @@ async def _ws_handle_generate(
                             gen_kwargs["recipe_override"] = _recipe_override
                         if msg.generate_seat is not None:
                             gen_kwargs["gen_seat"] = msg.generate_seat
-                        result = session.generate(msg.input, **gen_kwargs)
+                        result = session.generate(msg.input, **gen_kwargs).first
                     _result_holder.append(result)
                 except BaseException as e:
                     _error_holder.append(e)

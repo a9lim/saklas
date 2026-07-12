@@ -649,7 +649,7 @@ def _register_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 return _error(503, "Server busy", "server_error")
-            return session.generate(prompt_or_messages, raw=raw, **gen_kwargs)
+            return session.generate(prompt_or_messages, raw=raw, **gen_kwargs).first
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):

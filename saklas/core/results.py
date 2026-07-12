@@ -47,15 +47,6 @@ class ProbeReadings:
         return asdict(self)
 
 
-def _stat_tuple(value: Any) -> tuple[Any, ...]:
-    """Normalize current tuple stats and legacy scalar stats to one shape."""
-    if isinstance(value, tuple):
-        return value
-    if isinstance(value, list):
-        return tuple(value)
-    return (value,)
-
-
 @dataclass
 class ProbeReading:
     """Subspace-probe reading for one attached fit (flat or curved).
@@ -180,12 +171,8 @@ class GenerationResult:
     tok_per_sec: float
     elapsed: float
     readings: dict[str, ProbeReadings] = field(default_factory=dict)
-    # Active-steering alpha map at generation time: name -> coefficient.
-    # Legacy field name — "vectors" is a misnomer (these are per-term
-    # coefficients, not direction tensors).  See :attr:`steering_alphas`
-    # for the canonical public accessor.  The field and its ``to_dict()``
-    # key ("vectors") are kept unchanged for wire / CSV compatibility.
-    vectors: dict[str, float] = field(default_factory=dict)
+    # Active-steering coefficient map at generation time: term -> coefficient.
+    steering_alphas: dict[str, float] = field(default_factory=dict)
     prompt_tokens: int = 0
     finish_reason: str = "stop"
     # Per-completion-token ``(token_id, logprob, top_alts)`` — populated
@@ -218,18 +205,6 @@ class GenerationResult:
     # nested mapping.
     probe_readings: dict[str, "ProbeReading"] = field(default_factory=dict)
 
-    @property
-    def steering_alphas(self) -> "dict[str, float]":
-        """Active-steering coefficient map at generation time.
-
-        Canonical public name for :attr:`vectors`.  Per-term coefficients
-        (the ``along`` slide fraction for a :class:`ManifoldTerm`, the
-        additive alpha for a plain vector term) keyed by term name.  The
-        backing :attr:`vectors` field and its ``to_dict()`` key are kept
-        unchanged for wire / CSV compatibility.
-        """
-        return self.vectors
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "text": self.text,
@@ -238,7 +213,7 @@ class GenerationResult:
             "tok_per_sec": self.tok_per_sec,
             "elapsed": self.elapsed,
             "readings": {k: v.to_dict() for k, v in self.readings.items()},
-            "vectors": dict(self.vectors),
+            "steering_alphas": dict(self.steering_alphas),
             "prompt_tokens": self.prompt_tokens,
             "finish_reason": self.finish_reason,
             "applied_steering": self.applied_steering,
@@ -251,11 +226,8 @@ class GenerationResult:
 class RunSet(list[GenerationResult]):
     """Ordered set of generation results plus experiment metadata.
 
-    ``RunSet`` is intentionally list-like: existing batch/sweep callers
-    can still iterate, index, and take ``len(...)``.  Single-run callers
-    get one stable shape too, while ``.first`` and the small ``__getattr__``
-    compatibility shim keep common ``session.generate(...).text`` code
-    readable during the transition.
+    ``RunSet`` is intentionally list-like: batch/sweep callers can iterate,
+    index, and take ``len(...)``. Single-run callers use :attr:`first`.
     """
 
     def __init__(
@@ -294,18 +266,6 @@ class RunSet(list[GenerationResult]):
     @property
     def node_id(self) -> str | None:
         return self.node_ids[0] if self.node_ids else None
-
-    def __getattr__(self, name: str) -> Any:
-        """Delegate common single-run attribute access to ``.first``.
-
-        This keeps old ``session.generate(...).text`` snippets working
-        while the public shape settles on an always-run-set return.
-        """
-        try:
-            first = self.first
-        except IndexError as e:
-            raise AttributeError(name) from e
-        return getattr(first, name)
 
     def to_collector(self) -> "ResultCollector":
         collector = ResultCollector()
@@ -419,14 +379,13 @@ class ResultCollector:
                 "delta": readings.delta_per_gen,
             }
             for stat_name, vec in stats.items():
-                vec = _stat_tuple(vec)
                 if len(vec) == 1:
                     row[f"probe_{probe_name}_{stat_name}"] = vec[0]
                 else:
                     for k, val in enumerate(vec):
                         row[f"probe_{probe_name}_{stat_name}_{k}"] = val
-        for vec_name, alpha in result.vectors.items():
-            row[f"vector_{vec_name}_alpha"] = alpha
+        for term_name, alpha in result.steering_alphas.items():
+            row[f"steering_{term_name}_alpha"] = alpha
         row.update(tags)
         self._rows.append(row)
 

@@ -67,7 +67,7 @@ class _SweepStub:
         return GenerationResult(
             text=f"r{len(self.calls)}",
             tokens=[], token_count=0, tok_per_sec=0.0, elapsed=0.001,
-            readings={}, vectors={},
+            readings={}, steering_alphas={},
             applied_steering=str(steering) if steering else None,
         )
 
