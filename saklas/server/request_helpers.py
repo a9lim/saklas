@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import suppress
-from typing import Any, cast
+from typing import Any
 
 from saklas.core.errors import SaklasError
 from saklas.core.sampling import SamplingConfig
@@ -44,25 +44,6 @@ def flatten_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     return str(content)
-
-
-def probe_reading_dict(
-    session: Any,
-    readings: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Per-attached-probe wire dict from a readings mapping or session state."""
-    monitor_names = set(session.monitor.probe_names)
-    if readings is None:
-        result = getattr(session, "last_result", None)
-        readings = getattr(result, "readings", None) if result is not None else None
-    if readings is None:
-        readings = cast(dict[str, Any], session.build_readings())
-    out: dict[str, Any] = {}
-    for name, reading in readings.items():
-        if name not in monitor_names:
-            continue
-        out[name] = reading.to_dict()
-    return out
 
 
 def probe_reading_aggregate(

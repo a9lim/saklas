@@ -31,7 +31,6 @@ from saklas.server.request_helpers import (
     merge_steering as _merge_steering,
     parse_request_steering as _parse_req_steering,
     probe_reading_aggregate as _probe_reading_aggregate,
-    probe_reading_dict as _probe_reading_dict,
     probe_token_readings as _probe_token_readings,
     strict_model_enabled as _strict_model_enabled,
 )
@@ -474,10 +473,6 @@ async def _stream_generation(
         }
         if mf_agg:
             final_choice["x-saklas-probe-readings"] = mf_agg
-        compat_probe_readings = _probe_reading_dict(
-            session,
-            readings=getattr(last_result, "readings", None) if last_result is not None else None,
-        )
         final = {
             "id": rid,
             "object": object_type,
@@ -485,8 +480,6 @@ async def _stream_generation(
             "model": model_id,
             "choices": [final_choice],
         }
-        if compat_probe_readings:
-            final["probe_readings"] = compat_probe_readings
         yield f"data: {json.dumps(final)}\n\n"
 
         if include_usage and usage is not None:
@@ -704,9 +697,6 @@ def _register_routes(app: FastAPI) -> None:
             "choices": [chat_choice],
             "usage": _usage_dict(result),
         }
-        compat_probe_readings = _probe_reading_dict(session, readings=result.readings)
-        if compat_probe_readings:
-            body["probe_readings"] = compat_probe_readings
         return body
 
     # -----------------------------------------------------------------------
@@ -758,7 +748,4 @@ def _register_routes(app: FastAPI) -> None:
             "choices": [completion_choice],
             "usage": _usage_dict(result),
         }
-        compat_probe_readings = _probe_reading_dict(session, readings=result.readings)
-        if compat_probe_readings:
-            body["probe_readings"] = compat_probe_readings
         return body
