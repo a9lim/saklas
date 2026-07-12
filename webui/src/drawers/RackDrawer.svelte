@@ -201,8 +201,7 @@
 
   /** The family discriminator — subspace admits every flat affine fit
    *  (pca / baked), manifold admits curved fits only (spectral /
-   *  authored).  ``fit_mode`` defaults to ``authored`` (curved) when a
-   *  legacy server omits it.
+   *  authored).
    *
    *  An ``auto`` discover folder resolves its geometry per-model at fit
    *  time, so route it by ``resolved_fit_mode`` once fitted; while it's
@@ -210,7 +209,7 @@
    *  belongs to *both* families until a fit pins it — otherwise an
    *  unfitted auto manifold (personas / emotions) shows in neither drawer. */
   function inFamily(m: ManifoldInfo): boolean {
-    let fm: string = m.fit_mode ?? "authored";
+    let fm: string = m.fit_mode;
     if (fm === "auto") {
       const resolved = m.resolved_fit_mode;
       if (resolved == null) return true; // unresolved → show in both drawers
@@ -575,8 +574,7 @@
                 ? `${key} is already racked`
                 : `rack ${key} for steering`}
             >+steer</button>
-            {#if !probeRack.unavailable}
-              <button
+            <button
                 type="button"
                 class="act probe"
                 disabled={busy || isProbed(m)}
@@ -584,8 +582,7 @@
                 title={isProbed(m)
                   ? `${key} is already attached as a probe`
                   : `attach ${key} as a read-side probe`}
-              >+probe</button>
-            {/if}
+            >+probe</button>
             <button
               type="button"
               class="act fit"
@@ -718,7 +715,7 @@
       <span class="build-hint">{launcherHint}</span>
     </button>
 
-    {#if !steerRack.unavailable && familyTotal > 0}
+    {#if familyTotal > 0}
       <div class="search-row">
         <input
           type="search"
@@ -746,12 +743,7 @@
       <p class="error" role="alert">{steerRack.error}</p>
     {/if}
 
-    {#if steerRack.unavailable}
-      <p class="muted">
-        this server doesn't expose the manifold API — update saklas to
-        author and fit steering {title === "manifold" ? "manifolds" : "subspaces"}.
-      </p>
-    {:else if steerRack.loading && familyTotal === 0}
+    {#if steerRack.loading && familyTotal === 0}
       <p class="muted">loading…</p>
     {:else if familyTotal === 0}
       <p class="muted">

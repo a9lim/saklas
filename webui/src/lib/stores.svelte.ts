@@ -99,10 +99,9 @@ export async function refreshSession(): Promise<void> {
     sessionState.error = null;
     _hydrateSamplingFromInfo();
     // Rehydrate the PROBE-section toggles from server state (both are
-    // session-side, so a page reload must not read as "off"/"on" while
-    // the server disagrees).  Older servers omit the fields.
-    lensState.layers = info.live_lens_layers ?? null;
-    saeState.live = info.live_sae ?? false;
+    // session-side, so a page reload must reflect the server exactly.
+    lensState.layers = info.live_lens_layers;
+    saeState.live = info.live_sae;
     // Feature ids (and their metadata) belong to the resident release —
     // reset the discovery/metadata state when it changes.
     const release = info.sae_info?.release ?? null;
@@ -113,7 +112,7 @@ export async function refreshSession(): Promise<void> {
       saeState.meta.clear();
       _saeMetaRequested.clear();
     }
-    probesLiveState.enabled = info.live_probe_scores ?? true;
+    probesLiveState.enabled = info.live_probe_scores;
   } catch (e) {
     sessionState.error = e instanceof Error ? e.message : String(e);
   }
@@ -585,9 +584,7 @@ export function roleGlyphLetter(
  *  destroying every existing branch.  Earlier conversation paths stay
  *  reachable from the sidebar.
  *
- *  Falls back to the destructive ``apiSessions.clear()`` only when the
- *  server has no loom (legacy/unavailable) — without that branch the
- *  button would be a no-op there. */
+ */
 export async function resetChatToRoot(): Promise<void> {
   const root = loomTree.root_id;
   if (root !== null) {
@@ -598,11 +595,7 @@ export async function resetChatToRoot(): Promise<void> {
     await loomNavigate(root);
     return;
   }
-  if (loomTree.unavailable) {
-    await apiSessions.clear();
-    await refreshSession();
-    chatLog.turns = [];
-  }
+  throw new Error("Cannot clear chat before the tree root is loaded");
 }
 
 /** Clear the chat back to root.  Lifted out of Chat.svelte so the
@@ -650,7 +643,7 @@ export async function rewindSession(): Promise<void> {
 // ``subspaceAlong`` master (the merged affine subspace slides once); manifold
 // (curved) terms keep their per-card along/onto.  The sidecars live here too:
 // ``profiles`` + ``correlation`` (vector metadata) and ``catalog`` +
-// ``unavailable`` / ``loading`` / ``error`` (the manifold HTTP surface).
+// ``loading`` / ``error`` (the required manifold HTTP surface).
 
 /** Default shared subspace-along master — the ~0.5 coherent sweet spot
  *  (matches the engine's ``_SUBSPACE_GAIN`` calibration so a freshly
@@ -673,12 +666,8 @@ export interface SteerRack {
   profiles: Map<string, VectorInfo>;
   /** Cosine matrix from GET /correlation; refreshed after each generation. */
   correlation: CorrelationData | null;
-  /** Server-side catalog of available manifolds — refreshed by
-   *  ``refreshManifoldList``.  Empty (and ``unavailable`` true) on servers
-   *  that pre-date the manifold HTTP surface. */
+  /** Server-side catalog of available manifolds. */
   catalog: ManifoldInfo[];
-  /** True when the manifold list route 404s — older server. */
-  unavailable: boolean;
   loading: boolean;
   error: string | null;
 }
@@ -694,7 +683,6 @@ export const steerRack: SteerRack = $state({
   profiles: new SvelteMap(),
   correlation: null,
   catalog: [],
-  unavailable: false,
   loading: false,
   error: null,
 });
@@ -842,22 +830,16 @@ export function currentSteeringExpression(): string {
 
 // ------------------------------------------------------ manifold catalog
 
-/** Fetch the manifold catalog.  Tolerates a 404 from an older server —
- *  flips ``unavailable`` and leaves the catalog empty. */
+/** Fetch the manifold catalog. */
 export async function refreshManifoldList(): Promise<void> {
   steerRack.loading = true;
   try {
     const r = await apiManifolds.list();
     steerRack.catalog = r.manifolds;
-    steerRack.unavailable = false;
     steerRack.error = null;
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) {
-      steerRack.unavailable = true;
-      steerRack.catalog = [];
-    } else {
-      steerRack.error = e instanceof Error ? e.message : String(e);
-    }
+    steerRack.catalog = [];
+    steerRack.error = e instanceof Error ? e.message : String(e);
   } finally {
     steerRack.loading = false;
   }
@@ -1104,8 +1086,6 @@ export interface ProbeRackState {
   sortMode: ProbeSortMode;
   /** Attached probe names (every listed probe is attached/active). */
   active: string[];
-  /** True when the server's probe route 404s (pre-read-side server). */
-  unavailable: boolean;
   loading: boolean;
   error: string | null;
 }
@@ -1116,7 +1096,6 @@ export const probeRack: ProbeRackState = $state({
   // value / change is a dropdown opt-in.
   sortMode: "name",
   active: [],
-  unavailable: false,
   loading: false,
   error: null,
 });
@@ -1227,8 +1206,7 @@ export function activeProbeNames(): string[] {
   return arr;
 }
 
-/** Fetch the attached-probe catalog.  Tolerates a 404 from an older server
- *  — flips ``unavailable`` and leaves the rack empty. */
+/** Fetch the attached-probe catalog. */
 export async function refreshProbeList(): Promise<void> {
   probeRack.loading = true;
   try {
@@ -1249,16 +1227,11 @@ export async function refreshProbeList(): Promise<void> {
       if (!seen.has(name)) probeRack.entries.delete(name);
     }
     probeRack.active = r.probes.map((p) => p.name);
-    probeRack.unavailable = false;
     probeRack.error = null;
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) {
-      probeRack.unavailable = true;
-      probeRack.entries.clear();
-      probeRack.active = [];
-    } else {
-      probeRack.error = e instanceof Error ? e.message : String(e);
-    }
+    probeRack.entries.clear();
+    probeRack.active = [];
+    probeRack.error = e instanceof Error ? e.message : String(e);
   } finally {
     probeRack.loading = false;
   }
@@ -1456,13 +1429,8 @@ export const chatLog: ChatLogState = $state({
 // from the active path via ``syncChatLogFromTree`` whenever ``loomTree``
 // changes (rev-driven).
 //
-// Until the server exposes /tree (a saklas server older than v2.3 will
-// 404 on the bootstrap fetch), ``loomTree.rev`` stays at 0 and the
-// legacy non-loom write paths in ``handleWsMessage`` continue to own
-// ``chatLog.turns``.  Once rev > 0 the sidebar is the truth and
-// ``handleWsMessage`` is a no-op for tree-shape concerns; we still keep
-// the legacy writers for streaming-token append (the token deltas
-// arrive as ``token`` events, not as ``tree_mutated`` deltas).
+// The current server tree is authoritative.  ``chatLog.turns`` is a
+// projection of its active path; token deltas enrich that projection.
 
 export interface LoomTreeState {
   root_id: string | null;
@@ -1472,8 +1440,7 @@ export interface LoomTreeState {
   nodes: Map<string, LoomNodeJSON>;
   /** parent_id → ordered child ids.  Same SvelteMap pattern. */
   children_of: Map<string, string[]>;
-  /** Monotonic revision cursor.  0 means "no server tree fetched yet"
-   *  — the UI falls back to legacy single-path rendering until > 0. */
+  /** Monotonic revision cursor.  0 means no tree has been fetched yet. */
   rev: number;
   /** Pending in-flight gen target id (when known).  Reflects the
    *  ``started`` / ``node_created`` event's ``node_id`` field; null
@@ -1485,9 +1452,6 @@ export interface LoomTreeState {
   /** Last seen server-side model id; used to invalidate cache across
    *  model swaps. */
   modelId: string | null;
-  /** Set when the server tree fetch fails 404 or otherwise — UI hides
-   *  the loom sidebar toggle when the server doesn't support loom. */
-  unavailable: boolean;
   /** Last fetch error message; surfaced in the sidebar. */
   error: string | null;
 }
@@ -1501,7 +1465,6 @@ export const loomTree: LoomTreeState = $state({
   pendingNodeId: null,
   activePath: [],
   modelId: null,
-  unavailable: false,
   error: null,
 });
 
@@ -1737,29 +1700,15 @@ function syncChatLogFromTree(): void {
   chatLog.pendingIndex = pendingIdx;
 }
 
-/** Replace the in-memory tree with a freshly fetched server snapshot.
- *  Drops stale per-node entries; resets activePath; sync chat log.
- *
- *  ``snap.nodes`` is a flat list (server's ``LoomTree.to_dict`` shape).
- *  We pivot to id-keyed for the in-memory cache.  Tolerant of older or
- *  alternative shapes that pass a record keyed by id — phase-2 server
- *  is the list shape; v1 migration in this file produces the dict shape
- *  on disk for legacy snapshots, which is also accepted. */
+/** Replace the in-memory tree with a current server snapshot. */
 function applyTreeSnapshot(snap: LoomTreeJSON): void {
   loomTree.root_id = snap.root_id;
   loomTree.active_node_id = snap.active_node_id;
   loomTree.rev = snap.rev;
   loomTree.modelId = snap.model_id ?? loomTree.modelId;
-  loomTree.unavailable = false;
   loomTree.error = null;
   loomTree.nodes.clear();
-  if (Array.isArray(snap.nodes)) {
-    for (const n of snap.nodes) loomTree.nodes.set(n.id, n);
-  } else if (snap.nodes && typeof snap.nodes === "object") {
-    for (const [id, n] of Object.entries(snap.nodes as Record<string, LoomNodeJSON>)) {
-      loomTree.nodes.set(id, n);
-    }
-  }
+  for (const n of snap.nodes) loomTree.nodes.set(n.id, n);
   loomTree.children_of.clear();
   for (const [pid, ids] of Object.entries(snap.children_of)) {
     loomTree.children_of.set(pid, [...ids]);
@@ -1842,20 +1791,14 @@ function applyTreeDelta(ev: {
   return true;
 }
 
-/** Bootstrap fetch of the tree.  Tolerates a 404 — older servers don't
- *  ship loom; the UI falls back to legacy linear-path rendering. */
+/** Bootstrap fetch of the required tree surface. */
 export async function refreshLoomTree(): Promise<void> {
   try {
     const snap = await apiTree.get();
     applyTreeSnapshot(snap);
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) {
-      // Server pre-loom — disable the sidebar quietly.
-      loomTree.unavailable = true;
-      loomTree.rev = 0;
-      return;
-    }
     loomTree.error = e instanceof Error ? e.message : String(e);
+    pushToast(`Tree API failed: ${loomTree.error}`, { kind: "error" });
   }
 }
 
@@ -2686,13 +2629,8 @@ function handleWsMessage(msg: WSServerMessage): void {
         chatLog.pendingIndex = null;
         syncChatLogFromTree();
       } else {
-        // Normal (pre-loom) run: append a fresh assistant turn so
-        // streamed tokens have a home.
-        chatLog.turns = [
-          ...chatLog.turns,
-          { role: "assistant", text: "", tokens: [], thinkingTokens: [] },
-        ];
-        chatLog.pendingIndex = chatLog.turns.length - 1;
+        loomTree.error = "Generation started before the required tree was loaded";
+        pushToast(loomTree.error, { kind: "error" });
       }
       return;
     }
@@ -3458,54 +3396,26 @@ async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
 
 // =================================================== persistence ========
 //
-// v2 (loom):
+// Current loom cache:
 //   localStorage is a *cache* of the server's loom tree.  On bootstrap we
 //   fetch from the server and reconcile (server wins) — this retires the
-//   v1 "server-restart guard" hack that dropped the local snapshot when
-//   server-side history was empty.  The server tree is now the only
-//   authority; localStorage is for first-paint while the fetch is in
-//   flight.
-//
-// v1 → v2 migration:
-//   The v1 snapshot stored a flat ChatTurn[].  On load we hydrate it as
-//   a single-branch tree (root → user_1 → assistant_1 → user_2 → ...)
-//   so the sidebar renders immediately even before the server tree
-//   fetch returns.  When the server tree lands (rev > 0) it overwrites
-//   the hydrated shape — no data loss either way.
+//   authority; localStorage is only a first-paint cache while the fetch
+//   is in flight.  Older cache versions are ignored.
 //
 // We persist on a debounced effect rather than synchronously per
 // mutation so token-streaming gens don't write hundreds of times per
 // turn — once per ~250 ms is enough to survive an unplanned reload.
 
-const PERSIST_VERSION = 2;
+const PERSIST_VERSION = 3;
 const PERSIST_KEY_PREFIX = "saklas.chat.v" + PERSIST_VERSION + ".";
-/** Legacy v1 key prefix — used for the migration read on load. */
-const PERSIST_KEY_PREFIX_V1 = "saklas.chat.v1.";
 
 function persistKey(): string | null {
   const id = sessionState.info?.model_id;
   return id ? PERSIST_KEY_PREFIX + id : null;
 }
 
-function persistKeyV1(): string | null {
-  const id = sessionState.info?.model_id;
-  return id ? PERSIST_KEY_PREFIX_V1 + id : null;
-}
-
-interface PersistedSnapshotV1 {
-  version: 1;
-  model_id: string;
-  saved_at: number;
-  turns: ChatTurn[];
-  highlight: {
-    target: string | null;
-    compareTarget: string | null;
-    compareTwo: boolean;
-  };
-}
-
-interface PersistedSnapshotV2 {
-  version: 2;
+interface PersistedSnapshot {
+  version: 3;
   model_id: string;
   saved_at: number;
   /** Cached loom tree.  ``null`` until the first server fetch lands. */
@@ -3515,6 +3425,27 @@ interface PersistedSnapshotV2 {
     compareTarget: string | null;
     compareTwo: boolean;
   };
+}
+
+function isPersistedSnapshot(value: unknown): value is PersistedSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snap = value as Record<string, unknown>;
+  if (snap.version !== PERSIST_VERSION || typeof snap.model_id !== "string") return false;
+  if (typeof snap.saved_at !== "number") return false;
+  if (!snap.highlight || typeof snap.highlight !== "object") return false;
+  const highlight = snap.highlight as Record<string, unknown>;
+  if (!(typeof highlight.target === "string" || highlight.target === null)) return false;
+  if (!(typeof highlight.compareTarget === "string" || highlight.compareTarget === null)) return false;
+  if (typeof highlight.compareTwo !== "boolean") return false;
+  if (snap.tree === null) return true;
+  if (!snap.tree || typeof snap.tree !== "object") return false;
+  const tree = snap.tree as Record<string, unknown>;
+  return typeof tree.root_id === "string"
+    && typeof tree.active_node_id === "string"
+    && typeof tree.rev === "number"
+    && Array.isArray(tree.nodes)
+    && tree.children_of !== null
+    && typeof tree.children_of === "object";
 }
 
 function safeLocalStorageGet(key: string): string | null {
@@ -3542,123 +3473,25 @@ function safeLocalStorageRemove(key: string): void {
   }
 }
 
-/** ULID-like throwaway id for synthetic migration nodes.  We don't need
- *  Crockford-base32 + monotonicity here — the server's tree fetch will
- *  overwrite this shape immediately, so unique-per-call is enough. */
-function _localId(prefix: string): string {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random()
-    .toString(36)
-    .slice(2, 10)}`;
-}
-
-/** Hydrate a v1 linear chat log as a single-branch loom tree.  No data
- *  loss — every user/assistant turn becomes a node with a synthetic id,
- *  parent-chained root-down.  Sets ``rev`` to 0 because the snapshot
- *  isn't authoritative; the server fetch will overwrite. */
-function hydrateV1ChatAsLinearTree(turns: ChatTurn[]): void {
-  loomTree.nodes.clear();
-  loomTree.children_of.clear();
-  const rootId = _localId("root");
-  loomTree.nodes.set(rootId, {
-    id: rootId,
-    parent_id: null,
-    role: "system",
-    text: "",
-  });
-  loomTree.root_id = rootId;
-  let parent = rootId;
-  for (const t of turns) {
-    if (!t || (t.role !== "user" && t.role !== "assistant" && t.role !== "system")) continue;
-    const id = _localId(t.role);
-    loomTree.nodes.set(id, {
-      id,
-      parent_id: parent,
-      role: t.role,
-      text: t.text ?? "",
-      finish_reason: t.finishReason ?? null,
-      applied_steering: t.appliedSteering ?? null,
-      aggregate_readings: t.aggregateReadings,
-    });
-    const sibs = loomTree.children_of.get(parent) ?? [];
-    loomTree.children_of.set(parent, [...sibs, id]);
-    parent = id;
-  }
-  loomTree.active_node_id = parent;
-  // Local hydration is rev 0 — server fetch will bump it.
-  loomTree.rev = 0;
-  recomputeActivePath();
-}
-
 function loadPersistedChat(): void {
-  const v2key = persistKey();
-  const v1key = persistKeyV1();
-  if (!v2key) return;
-  // Try v2 first; fall back to v1 migration.
-  let parsed: PersistedSnapshotV2 | null = null;
-  const v2raw = safeLocalStorageGet(v2key);
-  if (v2raw) {
-    try {
-      const tmp = JSON.parse(v2raw) as PersistedSnapshotV2;
-      if (tmp.version === 2 && tmp.model_id === sessionState.info?.model_id) {
-        parsed = tmp;
-      }
-    } catch {
-      /* corrupt — fall through to v1 migration */
-    }
-  }
-  if (parsed) {
-    if (parsed.tree) {
-      // First-paint cache: hydrate without overwriting future server
-      // fetches.  ``rev`` is preserved from cache, but ``refreshLoomTree``
-      // is the authoritative source — its result overwrites.
-      applyTreeSnapshot(parsed.tree);
-      // Snapshot may have been from an in-flight gen; clear pendingNodeId
-      // so a stale "streaming" indicator doesn't ghost the UI.
-      loomTree.pendingNodeId = null;
-    }
-    if (parsed.highlight) {
-      highlightState.target = parsed.highlight.target ?? null;
-      highlightState.compareTarget = parsed.highlight.compareTarget ?? null;
-      highlightState.compareTwo = !!parsed.highlight.compareTwo;
-    }
-    return;
-  }
-  if (!v1key) return;
-  const v1raw = safeLocalStorageGet(v1key);
-  if (!v1raw) return;
+  const key = persistKey();
+  if (!key) return;
+  const raw = safeLocalStorageGet(key);
+  if (!raw) return;
   try {
-    const v1 = JSON.parse(v1raw) as PersistedSnapshotV1;
-    if (v1.version !== 1) return;
-    if (v1.model_id !== sessionState.info?.model_id) return;
-    // Hydrate the linear log as a single-branch tree.  Don't drop the
-    // snapshot on server-empty-history any more — the server will
-    // either accept the tree on next mutation or fetch its own and
-    // overwrite ours.
-    if (Array.isArray(v1.turns)) {
-      hydrateV1ChatAsLinearTree(
-        v1.turns.filter(
-          (t) =>
-            t && typeof t === "object" && typeof (t as ChatTurn).role === "string",
-        ),
-      );
-      // Also seed chatLog.turns directly so Chat.svelte has content on
-      // first paint even before applyTreeSnapshot rewrites — the
-      // hydrate above leaves rev at 0, so syncChatLogFromTree is a
-      // no-op.
-      chatLog.turns = v1.turns.filter(
-        (t) => t && typeof t === "object" && typeof (t as ChatTurn).role === "string",
-      );
-      chatLog.pendingIndex = null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isPersistedSnapshot(parsed)) {
+      safeLocalStorageRemove(key);
+      return;
     }
-    if (v1.highlight) {
-      highlightState.target = v1.highlight.target ?? null;
-      highlightState.compareTarget = v1.highlight.compareTarget ?? null;
-      highlightState.compareTwo = !!v1.highlight.compareTwo;
-    }
-    // Drop the v1 key once we've migrated — next persist writes v2.
-    safeLocalStorageRemove(v1key);
+    if (parsed.model_id !== sessionState.info?.model_id) return;
+    if (parsed.tree) applyTreeSnapshot(parsed.tree);
+    loomTree.pendingNodeId = null;
+    highlightState.target = parsed.highlight.target;
+    highlightState.compareTarget = parsed.highlight.compareTarget;
+    highlightState.compareTwo = parsed.highlight.compareTwo;
   } catch {
-    // Corrupt blob — drop it on the floor.
+    safeLocalStorageRemove(key);
   }
 }
 
@@ -3689,8 +3522,8 @@ function schedulePersist(): void {
         model_id: loomTree.modelId ?? sessionState.info?.model_id,
       };
     }
-    const snapshot: PersistedSnapshotV2 = {
-      version: 2,
+    const snapshot: PersistedSnapshot = {
+      version: 3,
       model_id: sessionState.info!.model_id,
       saved_at: Date.now(),
       tree,
@@ -3746,7 +3579,7 @@ function attachPersistence(): void {
         void t.tokens?.length;
         void t.thinkingTokens?.length;
       }
-      // Loom tree changes drive the v2 persisted shape; touch rev so
+      // Loom tree changes drive the persisted shape; touch rev so
       // every mutation queues a save.
       void loomTree.rev;
       void highlightState.target;
@@ -3836,7 +3669,6 @@ function _edgeKey(parentId: string, childId: string): string {
  *  immediately when the entry is already cached.  Bumps reactivity
  *  when the label arrives so all consumers re-render. */
 export function fetchEdgeLabel(parentId: string, childId: string): void {
-  if (loomTree.unavailable) return;
   const key = _edgeKey(parentId, childId);
   if (edgeLabelCache.has(key)) return;
   if (_edgeLabelInFlight.has(key)) return;
@@ -4092,7 +3924,7 @@ export async function bootstrap(): Promise<void> {
   // (it's scoped by model_id), so we serialize that step.  The other
   // refreshes parallelize as before.
   await refreshSession();
-  // First-paint: load persisted (v2 cache or v1 migration) before
+  // First-paint: load the current cache before
   // attaching the persist effect so we don't immediately overwrite.
   loadPersistedChat();
   // Per-model render-mode override (base vs chat) — also model-scoped.
@@ -4100,15 +3932,12 @@ export async function bootstrap(): Promise<void> {
   attachPersistence();
   await Promise.allSettled([
     refreshVectorList(),
-    // Unified probe roster — every probe shape (flat subspace + curved
-    // manifold).  404 tolerated (pre-read-side server) → ``unavailable``.
+    // Unified probe roster — every probe shape.
     refreshProbeList(),
     refreshCorrelation(),
-    // Manifold catalog — 404 tolerated (server pre-dates the manifold
-    // HTTP surface); ``refreshManifoldList`` flips ``unavailable``.
+    // Current manifold catalog.
     refreshManifoldList(),
-    // Server tree wins — fetch and reconcile.  404 is a quiet no-op
-    // (server pre-loom); other failures surface via loomTree.error.
+    // Server tree wins — fetch and reconcile; failures remain visible.
     refreshLoomTree(),
   ]);
 }

@@ -4,10 +4,10 @@
   // it as a browser download.  Mirrors the TUI's ``/save`` but client-
   // side only — no server round-trip.
   //
-  // Shape: {version, savedAt, model_id?, chatLog, steerRack, subspaceAlong,
+  // Shape: {version, savedAt, model_id, chatLog, steerRack, subspaceAlong,
   //         probeRack, highlightState, samplingState}.  Steer / probe rack
   //         Maps are serialized as plain arrays (Map → tuples) for JSON
-  //         safety.  (v1 saves used a vector-only ``vectorRack`` array.)
+  //         safety.
 
   import {
     chatLog,
@@ -28,14 +28,12 @@
   // would otherwise capture a partial turn.  User can re-open the drawer
   // to refresh.
   const snapshot = $derived.by(() => ({
-    version: 2 as const,
+    version: 3 as const,
     savedAt: new Date().toISOString(),
-    model_id: sessionState.info?.model_id ?? null,
-    session_id: sessionState.info?.id ?? null,
+    model_id: sessionState.info!.model_id,
+    session_id: sessionState.info!.id,
     chatLog: chatLog.turns,
-    // Full steer rack — every term (subspace + manifold) plus the shared
-    // subspace-along master.  (v1 saves carried a vector-only ``vectorRack``
-    // array; the loader still accepts that shape for back-compat.)
+    // Full steer rack — every term plus the shared subspace-along master.
     steerRack: [...steerRack.entries.entries()].map(([name, entry]) => ({
       name,
       ...entry,
@@ -109,7 +107,7 @@
 
   <div class="body">
     <p class="hint">
-      writes a JSON blob containing the chat log, vector rack, probe rack,
+      writes a JSON blob containing the chat log, steering rack, probe rack,
       sampling state and highlight settings.  Re-open via the load-
       conversation drawer to restore.
     </p>

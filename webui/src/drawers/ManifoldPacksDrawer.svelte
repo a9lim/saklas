@@ -167,12 +167,7 @@
 
   <div class="body">
     {#if tab === "installed"}
-      {#if steerRack.unavailable}
-        <p class="muted">
-          this server doesn't expose the manifold API — update saklas to
-          author and fit steering manifolds.
-        </p>
-      {:else if steerRack.loading && steerRack.catalog.length === 0}
+      {#if steerRack.loading && steerRack.catalog.length === 0}
         <p class="muted">loading manifolds…</p>
       {:else if steerRack.catalog.length === 0}
         <p class="muted">

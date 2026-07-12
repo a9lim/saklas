@@ -102,14 +102,14 @@
   const CAST_SLUG_RE = /^[a-z0-9._-]+$/;
   const castReady = $derived(sessionState.info !== null);
   const castUserSupported = $derived(
-    !(sessionState.info?.is_base_model ?? false) &&
+    sessionState.info?.is_base_model === false &&
       !effectiveRawMode() &&
-      (sessionState.info?.user_role_supported ?? false),
+      sessionState.info?.user_role_supported === true,
   );
   const castAsstSupported = $derived(
-    !(sessionState.info?.is_base_model ?? false) &&
+    sessionState.info?.is_base_model === false &&
       !effectiveRawMode() &&
-      (sessionState.info?.role_substitution_supported ?? false),
+      sessionState.info?.role_substitution_supported === true,
   );
   const castUserValid = $derived(
     samplingState.user_role.trim() === "" ||

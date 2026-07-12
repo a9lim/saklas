@@ -1043,12 +1043,7 @@
     </div>
   {/if}
 
-  {#if loomTree.unavailable}
-    <div class="empty">
-      <p>Server doesn't support loom yet.</p>
-      <p class="hint">Update saklas server to v2.3+ to enable the tree view.</p>
-    </div>
-  {:else if loomTree.error}
+  {#if loomTree.error}
     <div class="empty err">
       <p>tree error: {loomTree.error}</p>
       <button type="button" onclick={fullRefresh}>retry</button>
@@ -1502,10 +1497,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
-  }
-  .empty .hint {
-    font-size: var(--text-xs);
-    color: var(--fg-subtle);
   }
   .empty.err {
     color: var(--accent-red);

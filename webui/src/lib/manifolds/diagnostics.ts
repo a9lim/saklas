@@ -28,8 +28,7 @@ export type DiscoverDiagnostics =
   | ({ kind: "spectral" } & ManifoldSpectralDiagnostics);
 
 /** Tag a raw diagnostics block with its method.  Returns ``null`` for
- *  authored fits or for shapes that don't match either method (an
- *  older server sending a sparser dict). */
+ *  authored fits or diagnostics that do not match a discover method. */
 export function classifyDiagnostics(
   fit: ManifoldFitInfo,
 ): DiscoverDiagnostics | null {

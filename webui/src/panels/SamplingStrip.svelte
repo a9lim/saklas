@@ -67,7 +67,7 @@
    *  so we don't lock controls against backends that pre-date the
    *  field. */
   const thinkingOptional = $derived(
-    sessionState.info?.thinking_is_optional ?? true,
+    sessionState.info?.thinking_is_optional === true,
   );
 
   // (The per-message role boxes moved to the composer's cast row —

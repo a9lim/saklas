@@ -30,7 +30,7 @@
     const out: string[] = [];
     if (!sessionState.info) out.push("session info is not loaded");
     if (sessionState.error) out.push(sessionState.error);
-    if (loomTree.unavailable) out.push("loom API unavailable; branch workflows are disabled");
+    if (loomTree.error) out.push(`loom API error: ${loomTree.error}`);
     if (vectorsState.names.length === 0) out.push("no vectors registered in the session");
     if (probeRack.active.length === 0) out.push("no active probes; internal-state views will be sparse");
     return out;
@@ -114,7 +114,7 @@
       <h3>readiness checks</h3>
       <div class="checks">
         <div class:ok={!!sessionState.info}>session metadata</div>
-        <div class:ok={!loomTree.unavailable && loomTree.rev > 0}>loom API</div>
+        <div class:ok={loomTree.rev > 0 && !loomTree.error}>loom API</div>
         <div class:ok={vectorsState.names.length > 0}>vector registry</div>
         <div class:ok={probeRack.active.length > 0}>probe monitor</div>
         <div class:ok={steerRack.correlation !== null}>correlation cache</div>

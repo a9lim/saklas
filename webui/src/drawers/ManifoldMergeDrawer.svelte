@@ -139,12 +139,7 @@
       aren't mergeable — only their <em>autofitted</em> siblings.
     </p>
 
-    {#if steerRack.unavailable}
-      <p class="muted">
-        this server doesn't expose the manifold API — update saklas to
-        author and fit steering manifolds.
-      </p>
-    {:else if discoverManifolds.length < 2}
+    {#if discoverManifolds.length < 2}
       <p class="muted">
         need ≥ 2 discover-mode (pca / spectral) manifolds in the
         catalog to merge.  Author one via <strong>+ build manifold</strong>

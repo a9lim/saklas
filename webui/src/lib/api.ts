@@ -359,9 +359,7 @@ export const apiProbes = {
 // ========================================================== manifolds ==
 
 /** Steering-manifold endpoints — top-level (not session-scoped), like
- *  packs.  All routes 404 on servers that pre-date the manifold HTTP
- *  surface; callers should catch ``ApiError`` with status 404 and treat
- *  manifolds as unavailable. */
+ *  packs.  These routes are required by the current dashboard. */
 export const apiManifolds = {
   list(): Promise<ManifoldListResponse> {
     return request(MANIFOLDS_BASE);
@@ -608,9 +606,7 @@ export async function apiExtractStream(
 
 // ============================================================== tree ==
 //
-// Loom tree REST surface (v2.3, phase 2).  All routes 404 on servers
-// that don't yet ship the loom layer — callers should catch ApiError
-// with status 404 and fall back to non-loom behaviour.
+// Required loom tree REST surface.
 
 export const apiTree = {
   /** Full tree dump.  Cheap enough to fetch on every reconcile. */

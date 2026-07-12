@@ -58,33 +58,22 @@ export interface SessionInfo {
    *  families (gpt-oss / Mistral-3 Reasoning / Qwen3-Thinking) ship
    *  ``supports_thinking=true`` but ``thinking_is_optional=false`` so
    *  the UI can lock the toggle and explain why pressing it is a
-   *  no-op.  Older servers may omit this field; clients should treat
-   *  ``undefined`` as ``true`` (the historical default — most thinking
-   *  models were toggleable). */
-  thinking_is_optional?: boolean;
+   *  no-op. */
+  thinking_is_optional: boolean;
   default_steering: string | null;
-  /** Non-canonical: optional architecture string surfaced for the
-   * yellow-banner warning when ``model_type`` isn't in
-   * ``_TESTED_ARCHS``.  Server may or may not populate this; clients
-   * should tolerate ``undefined``. */
-  architecture?: string;
-  /** True iff the loaded model has no chat template — generation runs
-   *  as flat completion (no roles, no bubbles).  Older servers omit
-   *  this; clients treat ``undefined`` as ``false`` (chat model). */
-  is_base_model?: boolean;
+  /** True iff the loaded model has no chat template. */
+  is_base_model: boolean;
   /** True iff a Jacobian lens artifact is fitted for the loaded model
    *  (a server-side path check, not a load).  Gates the token
-   *  drilldown's j-lens tab; ``undefined`` (older server) reads as
-   *  ``false`` and the tab shows the fit hint. */
-  jlens_fitted?: boolean;
+   *  drilldown's j-lens tab. */
+  jlens_fitted: boolean;
   /** Live workspace-readout state (``POST .../lens/live``): the resolved
    *  layer list while the live lens is enabled, ``null`` while off.
-   *  Rehydrates the WORKSPACE panel toggle across page reloads; older
-   *  servers omit it (reads as off). */
-  live_lens_layers?: number[] | null;
+   *  Rehydrates the WORKSPACE panel toggle across page reloads. */
+  live_lens_layers: number[] | null;
   /** Resident SAE runtime capability and identity. */
-  sae_loaded?: boolean;
-  sae_info?: {
+  sae_loaded: boolean;
+  sae_info: {
     release: string;
     revision?: string | null;
     fingerprint?: string | null;
@@ -95,39 +84,36 @@ export interface SessionInfo {
     neuronpedia_id?: string | null;
   } | null;
   /** True while per-token SAE discovery readout is enabled. */
-  live_sae?: boolean;
+  live_sae: boolean;
   /** CAA live toggle state (``POST .../probes/live``): whether per-token
    *  monitor scoring feeds live consumers.  Off ⇒ probes report only the
-   *  end-of-gen aggregate (gates still force what they need).  Older
-   *  servers omit it (reads as on). */
-  live_probe_scores?: boolean;
+   *  end-of-gen aggregate (gates still force what they need). */
+  live_probe_scores: boolean;
   /** True iff the loaded model family supports assistant-role
    *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
-   *  talkie no). Drives whether the roles control is enabled. Older
-   *  servers omit this; treat ``undefined`` as ``false``. */
-  role_substitution_supported?: boolean;
-  /** True iff the family supports *user*-role substitution. Same family
-   *  set as the assistant side today. Treat ``undefined`` as ``false``. */
-  user_role_supported?: boolean;
+   *  talkie no). Drives whether the roles control is enabled. */
+  role_substitution_supported: boolean;
+  /** True iff the family supports *user*-role substitution. */
+  user_role_supported: boolean;
   /** The family's *standard* assistant-role label (e.g. Gemma ``model``,
-   *  ChatML ``assistant``), or ``null``/``undefined`` when the family can't
+   *  ChatML ``assistant``), or ``null`` when the family can't
    *  substitute the assistant side.  Seeds the assistant-role box so it
    *  shows the live default; a box value equal to this is treated as "no
    *  override" on send. */
-  default_assistant_role?: string | null;
+  default_assistant_role: string | null;
   /** The family's *standard* user-role label (``user`` everywhere today),
-   *  or ``null``/``undefined`` when unsupported.  Seeds the user-role box. */
-  default_user_role?: string | null;
+   *  or ``null`` when unsupported.  Seeds the user-role box. */
+  default_user_role: string | null;
   /** True iff the session's validated scene grammar is active (the cast
    *  model's stitcher renders — arbitrary seat sequences, seat toggle,
-   *  free commit seating).  Older servers omit it (reads as off). */
-  scene_mode?: boolean;
+   *  free commit seating). */
+  scene_mode: boolean;
   /** True iff a committed thinking block can be rendered (scene mode +
    *  family think delimiters).  Gates the composer's thinking box. */
-  thinking_input_supported?: boolean;
+  thinking_input_supported: boolean;
   /** True when the family template strips history thinking — a committed
    *  thinking block lasts one turn.  Drives the composer warning. */
-  strips_history_thinking?: boolean;
+  strips_history_thinking: boolean;
 }
 
 // -------------------------------------------------- jacobian lens --
@@ -319,12 +305,11 @@ export interface ManifoldFitInfo {
   method: string;
   feature_space: string;
   node_count: number;
-  nodes_sha256?: string;
+  nodes_sha256: string;
   /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
    *  ``spectral`` for coords derived from per-node activations, ``baked``
-   *  for a corpus-less precomputed direction.  Older servers may omit
-   *  this; treat ``undefined`` as ``"authored"``. */
-  fit_mode?: "authored" | "pca" | "spectral" | "auto" | "baked";
+   *  for a corpus-less precomputed direction. */
+  fit_mode: "authored" | "pca" | "spectral" | "auto" | "baked";
   /** Discover-mode only.  ``max_dim``/``var_threshold`` for PCA;
    *  ``max_dim``/``k_nn``/``bandwidth``/``reference_layer`` for spectral. */
   hyperparams?: Record<string, number | string>;
@@ -348,11 +333,10 @@ export interface ManifoldInfo {
   node_coords: number[][];
   /** Per-node assistant-role substitution recorded on the manifold,
    *  aligned with ``node_labels``.  ``null`` for a given node means
-   *  "pooled under the standard assistant baseline" (the legacy
-   *  default).  An all-``null`` array (or absent) marks a non-role
+   *  "pooled under the standard assistant baseline".  An all-``null`` array marks a non-role
    *  manifold; any non-``null`` entry marks a persona / role-paired
    *  manifold. */
-  node_roles?: (string | null)[];
+  node_roles: (string | null)[];
   fitted_models: string[];
   /** True iff a tensor for the loaded session model is present. */
   fitted_for_session: boolean;
@@ -363,25 +347,20 @@ export interface ManifoldInfo {
    *  ``spectral`` for coords derived per-model from activations, ``auto``
    *  for a discover folder whose flat-vs-curved geometry is resolved
    *  per-model at fit time, ``baked`` for a corpus-less precomputed
-   *  direction.  Older servers may omit this; treat ``undefined`` as
-   *  ``"authored"``. */
-  fit_mode?: "authored" | "pca" | "spectral" | "auto" | "baked";
+   *  direction. */
+  fit_mode: "authored" | "pca" | "spectral" | "auto" | "baked";
   /** The geometry an ``auto`` folder resolved to for the loaded model —
    *  ``"pca"`` (flat) / ``"spectral"`` (curved) once fitted, ``null`` when
    *  not yet fitted (geometry unknown → show in both rack drawers).  For a
-   *  non-``auto`` folder this mirrors ``fit_mode``.  Absent on older
-   *  servers. */
-  resolved_fit_mode?: "pca" | "spectral" | "authored" | "baked" | null;
+   *  non-``auto`` folder this mirrors ``fit_mode``. */
+  resolved_fit_mode: "pca" | "spectral" | "authored" | "baked" | null;
   /** True for ``pca`` / ``spectral`` (coords derived per-model), false
-   *  for ``authored``.  Server-supplied; absent on older servers. */
-  is_discover?: boolean;
+   *  for ``authored``. */
+  is_discover: boolean;
   /** Category-valued tags off ``manifold.json`` (e.g. ``register`` /
    *  ``cultural``).  Drives the category grouping in the shared RackDrawer.
-   *  NOTE: the ``GET /manifolds`` list serializer currently omits this
-   *  (``manifold_summary`` doesn't emit ``tags``), so it's usually
-   *  absent on the wire today — grouping degrades to "Other" until the
-   *  server adds the field. */
-  tags?: string[];
+   *  Current list and detail routes always emit it. */
+  tags: string[];
   /** Resting steering coefficient hint for a concept axis.  Read by
    *  ``recommendedAlpha`` (defaults to 0.5 when absent).  Not currently
    *  emitted by the list serializer — provenance for a future field. */
@@ -389,7 +368,7 @@ export interface ManifoldInfo {
   /** Discover-mode only: the knobs the fit (will) use.  Empty / absent
    *  on authored folders.  PCA accepts ``max_dim`` / ``var_threshold``;
    *  spectral accepts ``max_dim`` / ``k_nn`` / ``bandwidth``. */
-  hyperparams?: Record<string, number | string>;
+  hyperparams: Record<string, number | string>;
   /** Detail-only: full node specs with statement corpora.  In discover
    *  mode each node's ``coords`` is either the derived per-model layout
    *  (when a fit exists) or ``null`` (pending fit). */

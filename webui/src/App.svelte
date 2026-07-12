@@ -155,14 +155,13 @@
 
     const mod = ev.ctrlKey || ev.metaKey;
     // ⌘K — the command palette; works everywhere, including pre-boot and
-    // with the loom unavailable (it's pure navigation).
+    // before the tree is loaded (it's pure navigation).
     if (mod && !ev.shiftKey && ev.key.toLowerCase() === "k") {
       ev.preventDefault();
       togglePalette();
       return;
     }
 
-    if (loomTree.unavailable) return;
     if (!mod) return;
     // Shift+ctrl combos fall through to the browser; the loom shortcuts
     // use bare Cmd/Ctrl+key.

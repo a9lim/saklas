@@ -90,28 +90,17 @@
   />
 
   <div class="strips" class:is-empty={count === 0} role="list">
-    {#if probeRack.unavailable}
-      <div class="empty">
-        <p class="empty-copy">
-          This server doesn't expose the read-side probe routes.
-        </p>
-      </div>
-    {:else}
-      {#each probes as name (name)}
+    {#each probes as name (name)}
         {@const entry = probeRack.entries.get(name)}
         {#if entry}
           <div role="listitem">
             <ProbeCard {name} {entry} />
           </div>
         {/if}
-      {/each}
-    {/if}
+    {/each}
   </div>
 
-  <!-- The family's launcher stays reachable in both empty + populated
-       states (hidden only when the server lacks the probe routes). -->
-  {#if !probeRack.unavailable}
-    <div class="actions">
+  <div class="actions">
       {#if family === "subspace"}
         <button
           type="button"
@@ -131,8 +120,7 @@
           + manifold probe
         </button>
       {/if}
-    </div>
-  {/if}
+  </div>
 </section>
 
 <style>
@@ -169,24 +157,6 @@
   .strips.is-empty {
     align-items: center;
     justify-content: center;
-  }
-
-  /* "Probe routes unavailable" notice — the one remaining empty state
-   * (the first-run teaching copy is gone; the launchers below stand in). */
-  .empty {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--space-4);
-    padding: var(--space-5) var(--space-4);
-    text-align: center;
-  }
-  .empty-copy {
-    margin: 0;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.5;
-    max-width: 32ch;
   }
 
   /* Anchored at the bottom — same padding as SteeringRack so the two

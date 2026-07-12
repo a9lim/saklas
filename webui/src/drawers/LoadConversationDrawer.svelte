@@ -1,8 +1,7 @@
 <script lang="ts">
   // Load-conversation drawer — restore from a previously-saved JSON blob.
-  // Mirrors SaveConversationDrawer's wire shape exactly.  Unknown / missing
-  // sections are tolerated; warnings surface inline so the user knows what
-  // didn't apply.
+  // Mirrors SaveConversationDrawer's current wire shape exactly. Older and
+  // partial files are rejected rather than guessed into current state.
 
   import {
     chatLog,
@@ -28,9 +27,13 @@
     closeDrawer,
     refreshVectorList,
     vectorsState,
+    steerRack,
+    probeRack,
+    attachProbe,
+    detachProbe,
+    setProbeSortMode,
   } from "../lib/stores.svelte";
-  import { polesOf } from "../lib/concepts";
-  import type { ChatTurn, Trigger, Variant } from "../lib/types";
+  import type { ChatTurn, ProbeSortMode, Trigger, Variant } from "../lib/types";
   import type { SamplingState } from "../lib/stores.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
@@ -45,70 +48,97 @@
   let warnings: string[] = $state([]);
   let appliedSummary: string | null = $state(null);
 
-  /** One persisted steer row — the v2 ``steerRack`` shape (mode + position),
-   *  with the legacy v1 ``vectorRack`` vector fields (``alpha`` / ``projection``
-   *  / ``ablate``) kept optional so old saves still load. */
   interface SteerRowShape {
     name: string;
-    mode?: "subspace" | "manifold";
-    coords?: number[];
-    label?: string | null;
+    mode: "subspace" | "manifold";
+    coords: number[];
+    label: string | null;
     variant?: Variant;
     blend?: number;
     onto?: number;
-    trigger?: Trigger;
-    enabled?: boolean;
-    // legacy v1 (vector) fields:
-    alpha?: number;
-    projection?: unknown;
-    ablate?: boolean;
+    trigger: Trigger;
+    enabled: boolean;
   }
 
-  /** Loose snapshot shape — matches the writer's output but every field
-   * is optional so partial / older saves still load opportunistically. */
   interface SnapshotShape {
-    version?: number;
-    savedAt?: string;
-    model_id?: string | null;
-    chatLog?: ChatTurn[];
-    /** v2: the full steer rack (subspace + manifold entries). */
-    steerRack?: SteerRowShape[];
-    /** v2: the shared subspace-along master. */
-    subspaceAlong?: number;
-    /** v1 legacy: vector-only rack array. */
-    vectorRack?: SteerRowShape[];
-    probeRack?: {
-      sortMode?: string;
-      active?: string[];
-      entries?: Array<{
+    version: 3;
+    savedAt: string;
+    model_id: string;
+    session_id: string;
+    chatLog: ChatTurn[];
+    steerRack: SteerRowShape[];
+    subspaceAlong: number;
+    probeRack: {
+      sortMode: string;
+      active: string[];
+      entries: Array<{
         name: string;
-        sparkline?: number[];
-        current?: number;
-        previous?: number;
+        sparkline: number[];
+        current: number;
+        previous: number;
       }>;
     };
-    highlightState?: {
-      target?: string | null;
-      compareTarget?: string | null;
-      compareTwo?: boolean;
-      smoothBlend?: boolean;
+    highlightState: {
+      target: string | null;
+      compareTarget: string | null;
+      compareTwo: boolean;
+      smoothBlend: boolean;
     };
-    samplingState?: Partial<SamplingState>;
+    samplingState: SamplingState;
   }
 
   function isSnapshotShape(v: unknown): v is SnapshotShape {
     if (!v || typeof v !== "object") return false;
     const obj = v as Record<string, unknown>;
-    // Tolerate missing chatLog as long as at least one of the recognized
-    // sections is present — older saves might be sampling-only.
-    return (
-      "chatLog" in obj ||
-      "steerRack" in obj ||
-      "vectorRack" in obj ||
-      "probeRack" in obj ||
-      "samplingState" in obj ||
-      "highlightState" in obj
-    );
+    if (obj.version !== 3 || typeof obj.savedAt !== "string") return false;
+    if (typeof obj.model_id !== "string" || typeof obj.session_id !== "string") return false;
+    if (!Array.isArray(obj.chatLog) || !Array.isArray(obj.steerRack)) return false;
+    if (!obj.chatLog.every((turn) => {
+      if (!turn || typeof turn !== "object") return false;
+      const t = turn as Record<string, unknown>;
+      return (t.role === "system" || t.role === "user" || t.role === "assistant")
+        && typeof t.text === "string";
+    })) return false;
+    if (typeof obj.subspaceAlong !== "number") return false;
+    if (!obj.probeRack || typeof obj.probeRack !== "object") return false;
+    const probes = obj.probeRack as Record<string, unknown>;
+    if (!(probes.sortMode === "name" || probes.sortMode === "value" || probes.sortMode === "change")) return false;
+    if (!Array.isArray(probes.active) || !probes.active.every((x) => typeof x === "string")) return false;
+    if (!Array.isArray(probes.entries) || !probes.entries.every((raw) => {
+      if (!raw || typeof raw !== "object") return false;
+      const entry = raw as Record<string, unknown>;
+      return typeof entry.name === "string"
+        && Array.isArray(entry.sparkline)
+        && entry.sparkline.every((x) => typeof x === "number")
+        && typeof entry.current === "number"
+        && typeof entry.previous === "number";
+    })) return false;
+    if (!obj.highlightState || typeof obj.highlightState !== "object") return false;
+    const highlight = obj.highlightState as Record<string, unknown>;
+    if (!(typeof highlight.target === "string" || highlight.target === null)
+      || !(typeof highlight.compareTarget === "string" || highlight.compareTarget === null)
+      || typeof highlight.compareTwo !== "boolean"
+      || typeof highlight.smoothBlend !== "boolean") return false;
+    if (!obj.samplingState || typeof obj.samplingState !== "object") return false;
+    const sampling = obj.samplingState as Record<string, unknown>;
+    const expectedSamplingKeys = Object.keys(samplingState).sort();
+    if (Object.keys(sampling).sort().join("\0") !== expectedSamplingKeys.join("\0")) return false;
+    if (!obj.steerRack.every((raw) => {
+      if (!raw || typeof raw !== "object") return false;
+      const row = raw as Record<string, unknown>;
+      const common = typeof row.name === "string"
+        && (row.mode === "subspace" || row.mode === "manifold")
+        && Array.isArray(row.coords)
+        && row.coords.every((x) => typeof x === "number")
+        && (typeof row.label === "string" || row.label === null)
+        && typeof row.trigger === "string"
+        && typeof row.enabled === "boolean";
+      if (!common) return false;
+      return row.mode === "subspace"
+        ? typeof row.variant === "string"
+        : typeof row.blend === "number" && typeof row.onto === "number";
+    })) return false;
+    return true;
   }
 
   async function onFileChange(ev: Event): Promise<void> {
@@ -135,7 +165,7 @@
     }
     if (!isSnapshotShape(json)) {
       parseError =
-        "unrecognized format, expected a saklas conversation JSON with at least one of {chatLog, vectorRack, probeRack, samplingState, highlightState}";
+        "unsupported conversation file: expected the complete saklas conversation schema version 3";
       return;
     }
     parsed = json;
@@ -150,80 +180,34 @@
     let skippedTerms = 0;
     let appliedSampling = 0;
 
-    // Refresh server-known vectors so we can warn about missing ones
-    // before we try to add them.  This call is best-effort — failure
-    // shouldn't block the local restore.
-    try {
-      await refreshVectorList();
-    } catch {
-      /* ignore — restore will still attempt with whatever is local */
-    }
+    await refreshVectorList();
+    chatLog.turns = parsed.chatLog;
+    appliedTurns = parsed.chatLog.length;
 
-    if (Array.isArray(parsed.chatLog)) {
-      chatLog.turns = parsed.chatLog;
-      appliedTurns = parsed.chatLog.length;
-    } else {
-      warnings.push("chatLog missing or invalid, skipped");
-    }
-
-    // v2 ``steerRack`` (subspace + manifold) wins; fall back to the legacy
-    // v1 ``vectorRack`` (vector-only) and convert each pole to a subspace
-    // term toward its signed pole, the magnitude → the shared master.
-    const steerRows = Array.isArray(parsed.steerRack)
-      ? parsed.steerRack
-      : Array.isArray(parsed.vectorRack)
-        ? parsed.vectorRack
-        : null;
-    if (steerRows) {
-      if (typeof parsed.subspaceAlong === "number") {
-        setSubspaceAlong(parsed.subspaceAlong);
-      }
-      let firstLegacyAlong = true;
-      for (const row of steerRows) {
-        if (!row || typeof row !== "object" || typeof row.name !== "string") {
-          warnings.push("steerRack: skipped malformed entry");
-          continue;
-        }
+    const steerRows = parsed.steerRack;
+    steerRack.entries.clear();
+    setSubspaceAlong(parsed.subspaceAlong);
+    for (const row of steerRows) {
         const name = row.name;
         if (row.mode === "manifold") {
           addManifoldToRack(name);
-          if (typeof row.label === "string") setManifoldLabel(name, row.label);
-          else if (Array.isArray(row.coords)) setManifoldCoords(name, row.coords);
+          if (row.label !== null) setManifoldLabel(name, row.label);
+          else setManifoldCoords(name, row.coords);
           if (typeof row.blend === "number") setManifoldBlend(name, row.blend);
           if (typeof row.onto === "number") setManifoldOnto(name, row.onto);
-          if (typeof row.trigger === "string") setManifoldTrigger(name, row.trigger as Trigger);
+          setManifoldTrigger(name, row.trigger);
           if (row.enabled === false) setManifoldEnabled(name, false);
           appliedTerms++;
           continue;
         }
-        // subspace (v2) OR legacy v1 vector row.
         addSubspaceToRack(name);
-        if (row.mode === "subspace") {
-          if (typeof row.label === "string") setSubspaceLabel(name, row.label);
-          else if (Array.isArray(row.coords)) setSubspaceCoords(name, row.coords);
-        } else {
-          // legacy vector → subspace toward the signed pole; |alpha| → master.
-          if (typeof row.alpha === "number") {
-            if (firstLegacyAlong) {
-              setSubspaceAlong(Math.abs(row.alpha));
-              firstLegacyAlong = false;
-            }
-            if (row.alpha < 0) {
-              const neg = polesOf(name).negative;
-              if (neg) setSubspaceLabel(name, neg);
-            }
-          }
-          if (row.projection || row.ablate) {
-            warnings.push(
-              `'${name}': projection/ablation dropped (no longer authorable in the rack)`,
-            );
-          }
-        }
+        if (row.label !== null) setSubspaceLabel(name, row.label);
+        else setSubspaceCoords(name, row.coords);
         if (typeof row.variant === "string") setSubspaceVariant(name, row.variant as Variant);
-        if (typeof row.trigger === "string") setSubspaceTrigger(name, row.trigger as Trigger);
+        setSubspaceTrigger(name, row.trigger);
         if (row.enabled === false) setSubspaceEnabled(name, false);
         appliedTerms++;
-      }
+    }
       // Sanity-check against the server's known set; surface a warning
       // for terms that aren't currently registered.  Informational only —
       // the rack carries them as-is.
@@ -241,28 +225,34 @@
       } catch {
         /* ignore */
       }
-    } else {
-      warnings.push("steerRack / vectorRack missing or invalid, skipped");
-    }
-
-    if (parsed.samplingState && typeof parsed.samplingState === "object") {
-      for (const [k, v] of Object.entries(parsed.samplingState)) {
-        if (k in samplingState) {
-          // setSampling is typed; cast at the boundary.
-          setSampling(k as keyof SamplingState, v as never);
-          appliedSampling++;
-        }
+    for (const [k, v] of Object.entries(parsed.samplingState)) {
+      if (k in samplingState) {
+        setSampling(k as keyof SamplingState, v as never);
+        appliedSampling++;
       }
     }
 
-    if (parsed.highlightState && typeof parsed.highlightState === "object") {
-      const hs = parsed.highlightState;
-      if (hs.target !== undefined) setHighlightTarget(hs.target ?? null);
-      if (hs.compareTarget !== undefined) setCompareTarget(hs.compareTarget ?? null);
-      if (typeof hs.compareTwo === "boolean")
-        highlightState.compareTwo = hs.compareTwo;
-      if (typeof hs.smoothBlend === "boolean")
-        highlightState.smoothBlend = hs.smoothBlend;
+    const hs = parsed.highlightState;
+    setHighlightTarget(hs.target);
+    setCompareTarget(hs.compareTarget);
+    highlightState.compareTwo = hs.compareTwo;
+    highlightState.smoothBlend = hs.smoothBlend;
+
+    for (const name of [...probeRack.active]) await detachProbe(name);
+    setProbeSortMode(parsed.probeRack.sortMode as ProbeSortMode);
+    const savedProbeEntries = new Map(parsed.probeRack.entries.map((entry) => [entry.name, entry]));
+    for (const name of parsed.probeRack.active) {
+      await attachProbe(name);
+      const entry = probeRack.entries.get(name);
+      const saved = savedProbeEntries.get(name);
+      if (entry && saved) {
+        probeRack.entries.set(name, {
+          ...entry,
+          sparkline: [...saved.sparkline],
+          current: saved.current,
+          previous: saved.previous,
+        });
+      }
     }
 
     appliedSummary = `restored ${appliedTurns} turn${appliedTurns === 1 ? "" : "s"}, ${appliedTerms} term${appliedTerms === 1 ? "" : "s"}${skippedTerms ? ` (${skippedTerms} not server-known)` : ""}, ${appliedSampling} sampling field${appliedSampling === 1 ? "" : "s"}`;
@@ -302,14 +292,13 @@
     {#if parsed}
       <div class="parsed-info">
         <span class="meta">
-          {parsed.savedAt ? `saved ${parsed.savedAt}` : "saved (no timestamp)"}
-          {#if parsed.model_id} · model {parsed.model_id}{/if}
+          saved {parsed.savedAt} · model {parsed.model_id}
         </span>
         <ul class="counts">
           <li>turns: {parsed.chatLog?.length ?? 0}</li>
-          <li>terms: {parsed.steerRack?.length ?? parsed.vectorRack?.length ?? 0}</li>
-          <li>probes: {parsed.probeRack?.active?.length ?? 0}</li>
-          <li>sampling fields: {parsed.samplingState ? Object.keys(parsed.samplingState).length : 0}</li>
+          <li>terms: {parsed.steerRack.length}</li>
+          <li>probes: {parsed.probeRack.active.length}</li>
+          <li>sampling fields: {Object.keys(parsed.samplingState).length}</li>
         </ul>
       </div>
     {/if}
