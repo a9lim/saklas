@@ -134,7 +134,7 @@
       class="enable"
       class:off={!entry.enabled}
       onclick={toggleEnabled}
-      title={entry.enabled ? "Enabled (click to disable)" : "Disabled (click to enable)"}
+      title={entry.enabled ? "disable" : "enable"}
       aria-pressed={entry.enabled}
       aria-label="Toggle steering for {name}"
     >
@@ -149,11 +149,11 @@
     </span>
 
     {#if !fitted && info}
-      <span class="warn" title="no fitted tensor for the loaded model — fit it from the manifolds drawer">
+      <span class="warn" title="fit required">
         unfitted
       </span>
     {:else if stale}
-      <span class="warn" title="the fitted tensor is stale — node geometry changed since the fit">
+      <span class="warn" title="refit required">
         stale
       </span>
     {/if}
@@ -164,7 +164,7 @@
       type="button"
       class="trigger-pill"
       onclick={cycleTrigger}
-      title="trigger: {TRIGGER_LABEL[entry.trigger]} (click to cycle)"
+      title="trigger: {TRIGGER_LABEL[entry.trigger]}"
       aria-label="trigger for {name}: {entry.trigger}"
     >
       {TRIGGER_WORD[entry.trigger]}
@@ -185,14 +185,14 @@
     {#if info}
       {#if info.node_labels.length > 0}
         <label class="ctl-row">
-          <span class="ctl-label">snap to node</span>
+          <span class="ctl-label">node</span>
           <span class="ctl-select">
             <Select
               value={activeLabel ?? ""}
               options={snapOptions}
               onchange={onSnapToNode}
               ariaLabel="snap to node"
-              title="pick a node to lock to label-form, or '(free position)' to set coords with the sliders"
+              title="node or free position"
             />
           </span>
         </label>
@@ -215,7 +215,7 @@
             step={0.05}
             oninput={onBlendInput}
             ariaLabel="along fraction for {name}"
-            title="along — how far to slide toward the manifold position"
+            title="along"
           />
           <span class="along-val" title="along fraction">{m.blend.toFixed(2)}</span>
         </div>
@@ -228,17 +228,15 @@
             step={0.05}
             oninput={onOntoInput}
             ariaLabel="onto fraction for {name}"
-            title="onto — collapse the off-surface residual onto the manifold (curved only)"
+            title="onto"
           />
           <span class="along-val" title="onto fraction">{m.onto.toFixed(2)}</span>
         </div>
       {:else}
-        <p class="hint">magnitude: shared “subspace along” at the top of the rack</p>
+        <p class="hint">shared rack magnitude</p>
       {/if}
     {:else}
-      <p class="missing">
-        manifold metadata unavailable — coordinates are still applied.
-      </p>
+      <p class="missing">metadata unavailable</p>
     {/if}
   {/snippet}
 </RackCard>

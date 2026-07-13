@@ -242,20 +242,17 @@
    *  Used by both the disabled gate and tryCommit's early return. */
   const canCommit = $derived(commitMode && input.trim() !== "");
 
-  /** Four-state placeholder, same `<verb>…  <bind list>` shape across
-   *  TUI and GUI.  Verb names the action that bare `⏎` (or `⌃⏎` in
-   *  commit mode) will perform; the trailing key list is the minimum
-   *  cheatsheet for the bindings that change behavior. */
+  /** Keep the composer prompt to the active action; shortcuts live in help. */
   const inputPlaceholder = $derived(
     commitMode
       ? (onUserNode
-          ? "commit assistant…  ⌃⏎ send · ⇧⏎ newline"
-          : "commit user…  ⌃⏎ send · ⇧⏎ newline")
+          ? "commit assistant…"
+          : "commit user…")
       : userSeatActive
-        ? "speak the user seat…  ⏎ send (empty = continue) · ⇧⏎ newline"
+        ? "user seat…"
         : (onUserNode
-            ? "prefill reply…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"
-            : "message…  ⏎ send · ⌃⏎ commit · ⇧⏎ newline"),
+            ? "prefill…"
+            : "message…"),
   );
   /** Send-button caption tracks the role-aware action; any held commit
    *  modifier overrides both prefill and send with a "commit" register.
@@ -1043,7 +1040,7 @@
         onchange={onCompareToggle}
         ariaLabel="compare-two"
       />
-      <span class="ctl-label">compare-two</span>
+      <span class="ctl-label">compare</span>
     </span>
 
     {#if highlightState.compareTwo}
@@ -1073,7 +1070,7 @@
       class="mode-badge"
       class:raw={rawMode}
       onclick={() => setGenUiMode(rawMode ? "chat" : "raw")}
-      title={"render mode: " + genUiMode.mode + " — click to toggle"}
+      title={`render: ${genUiMode.mode}`}
     >
       {genUiMode.mode}
     </button>
@@ -1088,7 +1085,7 @@
         type="button"
         class="hbtn kbd-hint"
         onclick={togglePalette}
-        title="Command palette — every tool lives here"
+        title="tools"
       >
         ⌘K
       </button>
@@ -1101,7 +1098,7 @@
           onchange={toggleAutoRegen}
           ariaLabel="auto-regen"
         />
-        <span class="ctl-label">auto-regen</span>
+        <span class="ctl-label">auto</span>
       </span>
       {#if autoRegenState.enabled}
         <span class="ctl-select">
@@ -1181,7 +1178,7 @@
                     </span>
                     <span class="who-meta">(alt)</span>
                   </div>
-                  <span class="placeholder-text">— pending —</span>
+                  <span class="placeholder-text">pending…</span>
                 </div>
               {/if}
             {/each}
@@ -1203,10 +1200,10 @@
     <label
       class="cast"
       title={castUserSupported
-        ? "the label your turns speak under — stamped on each sent turn, immutable afterward"
-        : "role substitution unavailable for this model / mode"}
+        ? "your role"
+        : "unavailable"}
     >
-      <span class="cast-label">speaking as</span>
+      <span class="cast-label">you</span>
       <input
         class="cast-input"
         class:invalid={!castUserValid}
@@ -1220,10 +1217,10 @@
     <label
       class="cast"
       title={castAsstSupported
-        ? "the persona the model replies as — stamped on each generated turn"
-        : "role substitution unavailable for this model / mode"}
+        ? "model role"
+        : "unavailable"}
     >
-      <span class="cast-label">reply as</span>
+      <span class="cast-label">model</span>
       <input
         class="cast-input"
         class:invalid={!castAsstValid}
@@ -1240,9 +1237,9 @@
         class="seat-toggle"
         role="radiogroup"
         aria-label="generation seat"
-        title="which seat the model speaks next — user-seat generation and empty-send continue need scene mode"
+        title="generation seat"
       >
-        <span class="cast-label">speak seat</span>
+        <span class="cast-label">seat</span>
         <button
           type="button"
           class="seat"
@@ -1262,7 +1259,7 @@
     <button
       type="button"
       class="cast-manage"
-      title="cast manager — named labels with standing steering recipes"
+      title="cast"
       onclick={() => openDrawer("cast")}
     >cast…</button>
     <datalist id="cast-roster-labels">
@@ -1280,23 +1277,20 @@
         class:open={thinkingOpen}
         class:drafted={thinkingDraft.trim() !== ""}
         onclick={() => (thinkingOpen = !thinkingOpen)}
-        title="author a thinking block for the next committed turn (⌃⏎)"
+        title="next commit"
       >{thinkingOpen ? "− thinking" : "+ thinking"}</button>
       {#if thinkingOpen}
         <div class="thinking-box">
           <textarea
             class="thinking-input"
             bind:value={thinkingDraft}
-            placeholder="thinking for the next committed turn (⌃⏎)…"
+            placeholder="thinking…"
             rows="2"
             spellcheck="false"
             aria-label="committed thinking block"
           ></textarea>
           {#if stripsHistoryThinking}
-            <p class="thinking-warn" role="note">
-              this family strips history thinking — the block renders for
-              one turn, then drops from the context.
-            </p>
+            <p class="thinking-warn" role="note">one turn only</p>
           {/if}
         </div>
       {/if}
@@ -1320,12 +1314,12 @@
         class="send"
         disabled={!input.trim() && !canContinue}
         title={userSeatActive
-          ? "⏎ speak the user seat (empty = continue) · ⇧⏎ newline"
+          ? "⏎ user seat"
           : onUserNode
-            ? "⏎ prefill reply · ⌃-click commit assistant · ⇧⏎ newline"
+            ? "⏎ prefill"
             : canContinue && !input.trim()
-              ? "⏎ continue — the model speaks next with no committed turn"
-              : "⏎ send · ⌃-click commit user · ⇧⏎ newline"}
+              ? "⏎ continue"
+              : "⏎ send"}
       >{sendLabel}</button>
       <button
         type="button"
@@ -1339,7 +1333,7 @@
         class="regen"
         onclick={regenAction}
         disabled={!canRegen}
-        title="Rewind and re-issue the last user message"
+        title="regenerate"
       >regen</button>
     </div>
   </form>
@@ -1352,7 +1346,7 @@
     <div
       class="stage"
       class:shadow={isShadow}
-      title="system prompt — stage direction"
+      title="system prompt"
     >{turn.text}</div>
   {:else}
   <div
@@ -1368,7 +1362,7 @@
       {#if turn.role === "assistant" && turn.meanLogprob != null && Number.isFinite(turn.meanLogprob)}
         <span
           class="prov"
-          title="realized-sequence perplexity: exp(mean chosen-token surprise); distinct from the footer's predictive-distribution entropy perplexity"
+          title="sequence perplexity"
         >seq ppl {Math.exp(-turn.meanLogprob).toFixed(1)}</span>
       {/if}
     </div>

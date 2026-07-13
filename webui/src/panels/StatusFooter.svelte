@@ -21,8 +21,8 @@
   const pendingCount = $derived(pendingActions.queue.length);
   const pendingTitle = $derived(
     pendingCount === 1
-      ? "1 item queued; drains automatically on the next done event"
-      : `${pendingCount} items queued; drain automatically on each done event`,
+      ? "1 queued"
+      : `${pendingCount} queued`,
   );
 
   // Live elapsed counter — ticks while gen is active, freezes on done so
@@ -82,7 +82,7 @@
         />
       </span>
     {:else}
-      <span class="text done-label">done · {genStatus.tokensSoFar} tokens</span>
+      <span class="text done-label">{genStatus.tokensSoFar} tokens</span>
     {/if}
     <span class="sep" aria-hidden="true">·</span>
     <span class="text">{tokPerSec.toFixed(1)} t/s</span>
@@ -92,8 +92,8 @@
       <span class="sep" aria-hidden="true">·</span>
       <span
         class="text"
-        title="predictive-distribution entropy perplexity, geometrically averaged across generated tokens"
-      >entropy ppl {ppl.toFixed(2)}</span>
+        title="entropy perplexity"
+      >ppl {ppl.toFixed(2)}</span>
     {/if}
     {#if !genStatus.active && finishLabel}
       <span class="sep" aria-hidden="true">·</span>

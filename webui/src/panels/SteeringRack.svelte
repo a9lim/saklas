@@ -53,9 +53,9 @@
              once).  Per-term relative weight lives in each card's position. -->
         <div
           class="along-master"
-          title="shared subspace-along — one slide magnitude for every flat term"
+          title="shared magnitude"
         >
-          <span class="along-label">along</span>
+          <span class="along-label">all</span>
           <Slider
             value={steerRack.subspaceAlong}
             min={0}
@@ -81,7 +81,7 @@
         type="button"
         class="add-subspace"
         onclick={() => openDrawer("subspace")}
-        title="Browse flat subspaces — concept axes and personas"
+        title="add subspace"
       >
         + subspace steer
       </button>
@@ -90,7 +90,7 @@
         type="button"
         class="add-manifold"
         onclick={() => openDrawer("manifolds")}
-        title="Browse curved steering manifolds"
+        title="add manifold"
       >
         + manifold steer
       </button>

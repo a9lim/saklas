@@ -38,7 +38,7 @@
       swatch: "var(--pillar-subspace)",
       hex: "#EDEFF7",
       name: "subspace · chrome",
-      role: "flat geometry + the room itself — white reads as a hue against colored siblings",
+      role: "flat geometry + chrome",
     },
     {
       swatch: "var(--pillar-manifold)",
@@ -50,25 +50,25 @@
       swatch: "var(--pillar-sae)",
       hex: "#F2C94C",
       name: "sae",
-      role: "feature space — the only saturated warm on screen",
+      role: "feature space",
     },
     {
       swatch: "var(--pillar-lens)",
       hex: "#6BA6F8",
       name: "lens · surprise",
-      role: "logit space — the lens and surprise share the family",
+      role: "logit space + surprise",
     },
     {
       swatch: "var(--live)",
       hex: "#34D399",
       name: "live",
-      role: "streaming, moving probes, probe ramp +pole — where the glow budget is spent",
+      role: "live state + positive pole",
     },
     {
       swatch: "var(--accent-red)",
       hex: "#E5544F",
       name: "error",
-      role: "errors, stop, probe ramp −pole",
+      role: "errors + negative pole",
     },
   ];
 
@@ -133,13 +133,10 @@
 <div class="guide">
   <div class="wrap">
     <header>
-      <div class="eyebrow">saklas · design system · living specimen page</div>
+      <div class="eyebrow">saklas · design system</div>
       <h1><span class="wordmark">saklas</span> / design</h1>
       <p class="lede">
-        Every specimen is the real component reading the real tokens. If it
-        looks wrong here it is wrong everywhere — fix the token, not the
-        page. Direction: Observatory+ — a calm translucent room where the
-        living things glow.
+        Live components and tokens.
       </p>
     </header>
 
@@ -147,7 +144,7 @@
     <section>
       <div class="sec-head">
         <span class="eyebrow">01 · color</span>
-        <h2>Hue answers "which space am I looking at?"</h2>
+        <h2>Hue by space</h2>
       </div>
       <div class="onto">
         {#each ONTOLOGY as o (o.name)}
@@ -159,11 +156,7 @@
         {/each}
       </div>
       <p class="note">
-        Chrome is achromatic. Roles carry no hue (the cast model). Warm
-        belongs to SAE alone — pending and anchor chrome are demoted
-        bronzes. Gradients are material, never data: fills sheen
-        <em>across</em> the value axis; along-axis gradients only where the
-        gradient <em>is</em> the data (depth strips, time trails).
+        Achromatic chrome · hue marks data space · gradients mark depth or time.
       </p>
     </section>
 
@@ -203,7 +196,7 @@
     <section>
       <div class="sec-head">
         <span class="eyebrow">03 · surfaces</span>
-        <h2>Elevation is light, not shade</h2>
+        <h2>Elevation</h2>
       </div>
       <div class="tiles">
         <div class="tile" style:background="var(--bg-deep)"><span>--bg-deep</span></div>
@@ -217,7 +210,7 @@
           <div class="cs-label">glass · idle</div>
         </GlassCard>
         <GlassCard accent="var(--pillar-manifold)" active>
-          <div class="cs-label">glass · active (hue ring + glow)</div>
+          <div class="cs-label">glass · active</div>
         </GlassCard>
         <GlassCard disabled>
           <div class="cs-label">glass · disabled</div>
@@ -280,7 +273,7 @@
             ]}
             ariaLabel="specimen select"
           />
-          <Checkbox bind:checked={chkVal} label="fit immediately" />
+          <Checkbox bind:checked={chkVal} label="fit now" />
           <Radio bind:group={radVal} value="pca" label="pca" name="sg-fit" />
           <Radio bind:group={radVal} value="spectral" label="spectral" name="sg-fit" />
           <NumberInput bind:value={numVal} min={0} max={2} step={0.05} ariaLabel="specimen number" />
@@ -290,10 +283,9 @@
       <div class="spec-row">
         <span class="spec-label">disclosure</span>
         <div class="spec-items grow">
-          <Disclosure bind:expanded={discOpen} summary="Advanced options">
+          <Disclosure bind:expanded={discOpen} summary="advanced">
             <p class="note" style:margin="8px 0 0">
-              Hyperparams live here — max_dim, var_threshold, k_nn,
-              bandwidth. Collapsed by default; density stays available.
+              max_dim · var_threshold · k_nn · bandwidth
             </p>
           </Disclosure>
         </div>
@@ -304,7 +296,7 @@
     <section>
       <div class="sec-head">
         <span class="eyebrow">05 · ramps</span>
-        <h2>Constant hue, alpha strength</h2>
+        <h2>Hue × strength</h2>
       </div>
       <div class="ramp-play">
         <div class="ramp-controls">
@@ -343,7 +335,7 @@
     <section>
       <div class="sec-head">
         <span class="eyebrow">06 · data</span>
-        <h2>Charts + the card grammar</h2>
+        <h2>Charts + cards</h2>
       </div>
       <div class="data-grid">
         <div class="data-col">
@@ -417,7 +409,7 @@
     <section>
       <div class="sec-head">
         <span class="eyebrow">07 · motion</span>
-        <h2>Glow marks what is alive</h2>
+        <h2>Live motion</h2>
       </div>
       <div class="spec-row">
         <span class="spec-label">live</span>
@@ -425,10 +417,7 @@
           <span class="live-dot"></span>
           <span class="caret"></span>
           <span class="note-inline">
-            pulse + caret ride <code>--live</code>; springs use
-            <code>--ease-spring</code>; the stream card above is the
-            reference implementation. Reduced motion kills all of it
-            globally.
+            <code>--live</code> · <code>--ease-spring</code> · reduced motion
           </span>
         </div>
       </div>

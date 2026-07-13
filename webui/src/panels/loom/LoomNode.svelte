@@ -100,10 +100,10 @@
   {/if}
   <span class="preview">{preview}</span>
   {#if steerLabel}
-    <span class="steer" title="steering delta from parent">{steerLabel}</span>
+    <span class="steer" title="steering delta">{steerLabel}</span>
   {/if}
   {#if weightBadge != null}
-    <span class="weight" title="mean chosen-token logprob (response span)">
+    <span class="weight" title="mean logprob">
       {weightBadge.toFixed(2)}
     </span>
   {/if}

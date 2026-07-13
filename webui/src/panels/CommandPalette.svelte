@@ -168,7 +168,7 @@
         aria-activedescendant={filtered.length > 0
           ? `command-palette-option-${selected}`
           : undefined}
-        placeholder="jump to an instrument, open a tool…"
+        placeholder="search…"
         aria-label="Filter commands"
         onkeydown={onKey}
       />
@@ -181,7 +181,7 @@
       role="listbox"
     >
       {#if filtered.length === 0}
-        <p class="none">nothing matches "{query}"</p>
+        <p class="none">no matches</p>
       {:else}
         {#each filtered as cmd, i (cmd.group + cmd.label)}
           {@const hue = hueFor(cmd)}

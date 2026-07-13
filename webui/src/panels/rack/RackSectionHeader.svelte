@@ -51,7 +51,7 @@
         title={liveTitle}
         aria-pressed={live}
       >
-        {live ? "live: on" : "live: off"}
+        {live ? "live" : "off"}
       </button>
     {/if}
     {#if count}<span class="count" aria-live="polite">{count}</span>{/if}
@@ -59,7 +59,6 @@
 
   {#if hasSort}
     <label class="sort">
-      <span class="sort-label">sort</span>
       <span class="sort-select">
         <Select
           value={sortValue as T}
@@ -94,8 +93,7 @@
     letter-spacing: 0;
     text-transform: uppercase;
   }
-  .count,
-  .sort-label {
+  .count {
     color: var(--fg-muted);
     font-size: var(--text-sm);
     flex: 0 0 auto;

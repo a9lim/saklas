@@ -44,7 +44,7 @@
           class="cancel"
           onclick={() => cancelPendingAction(item.id)}
           aria-label="Cancel pending {item.label}"
-          title="Cancel this queued item"
+          title="cancel"
         >×</button>
       </div>
     {/each}

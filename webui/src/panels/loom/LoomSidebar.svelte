@@ -897,7 +897,7 @@
       type="button"
       class="action-btn"
       onclick={clearChat}
-      title="Clear chat back to root"
+      title="clear"
     >
       clear
     </button>
@@ -905,7 +905,7 @@
       type="button"
       class="action-btn"
       onclick={() => openDrawer("save_conversation")}
-      title="Save this conversation tree to disk"
+      title="save"
     >
       save
     </button>
@@ -913,7 +913,7 @@
       type="button"
       class="action-btn"
       onclick={() => openDrawer("load_conversation")}
-      title="Load a saved conversation tree"
+      title="load"
     >
       load
     </button>
@@ -921,7 +921,7 @@
       type="button"
       class="icon-btn"
       onclick={fullRefresh}
-      title="Refresh tree from server"
+      title="refresh"
       aria-label="Refresh"
     >↻</button>
   </header>
@@ -934,7 +934,7 @@
       onkeydown={onFilterKey}
       placeholder="filter: agg:angry.calm > 0.4"
       aria-label="Filter expression"
-      title="Filter grammar (click ? for help)"
+      title="filter"
     />
     <!-- Logit-pass (Decision 8): help popover for the filter grammar.
          Clicked-toggle keeps the popover anchored without stealing
@@ -975,18 +975,17 @@
          clicking the ? again or pressing Esc on the sidebar. -->
     <div class="filter-help" role="region" aria-label="Filter grammar help">
       <p>
-        <strong>Grammar:</strong> comma-separated terms; all must match.
+        comma-separated; all match
       </p>
       <ul>
-        <li><code>&lt;probe&gt; &gt; &lt;n&gt;</code>: aggregate reading (e.g. <code>angry.calm &gt; 0.4</code>)</li>
-        <li><code>agg:</code>|<code>any:</code>|<code>last:&lt;probe&gt; &lt;op&gt; &lt;n&gt;</code>: pick aggregator</li>
-        <li><code>starred</code>: only starred nodes</li>
-        <li><code>text:&lt;query&gt;</code>: substring search</li>
-        <li><code>sort:surprise</code>: reorder siblings most-surprising first</li>
-        <li><code>sort:confidence</code>: reorder siblings most-confident first</li>
+        <li><code>&lt;probe&gt; &gt; &lt;n&gt;</code></li>
+        <li><code>agg: | any: | last:</code></li>
+        <li><code>starred</code></li>
+        <li><code>text:&lt;query&gt;</code></li>
+        <li><code>sort:surprise | sort:confidence</code></li>
       </ul>
       <p>
-        <strong>Examples:</strong>
+        examples
       </p>
       <ul class="examples">
         <li><code>agg:angry.calm &gt; 0.4</code></li>
@@ -1045,12 +1044,12 @@
 
   {#if loomTree.error}
     <div class="empty err">
-      <p>tree error: {loomTree.error}</p>
+      <p>tree unavailable</p>
       <button type="button" onclick={fullRefresh}>retry</button>
     </div>
   {:else if rows.length === 0}
     <div class="empty">
-      <p>(empty tree, start a conversation)</p>
+      <p>empty</p>
     </div>
   {:else}
     <div class="tree-scroll">
@@ -1118,7 +1117,7 @@
       <button
         type="button"
         role="menuitem"
-        title="branch a sibling with the same text and the seat flipped"
+        title="flip seat"
         onclick={menuSwapSeat}
       >swap seat ⇄ branch</button>
     {/if}
@@ -1193,10 +1192,10 @@
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
-        <p class="hint">Re-runs the active assistant's parent user turn with the current rack.</p>
+        <p class="hint">current rack</p>
       {:else if modal.kind === "delete"}
-        <p>Delete node <code>{(modal.nodeId ?? "").slice(0, 12)}</code> and its entire subtree?</p>
-        <p class="hint danger">This is destructive. Ancestors of the active node cannot be deleted. Please navigate away first.</p>
+        <p>Delete <code>{(modal.nodeId ?? "").slice(0, 12)}</code> and subtree?</p>
+        <p class="hint danger">Permanent. Navigate away from ancestors first.</p>
       {:else if modal.kind === "navpicker" || modal.kind === "search"}
         <input
           bind:this={modalInput as HTMLInputElement}
@@ -1225,7 +1224,7 @@
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
-        <p class="hint">One sibling per α: a comma list, linspace(), or start:stop:step.</p>
+        <p class="hint">comma list, linspace(), or start:stop:step</p>
       {:else if modal.kind === "regen_mode"}
         <label>
           <span>mode</span>
@@ -1254,7 +1253,7 @@
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
-        <p class="hint">Recipe-override modifier overlays the parent's recipe.</p>
+        <p class="hint">overlays parent recipe</p>
       {:else}
         <textarea
           bind:this={modalInput as HTMLTextAreaElement}
@@ -1273,7 +1272,7 @@
             }
           }}
         ></textarea>
-        <p class="hint">⌃⏎ / ⌘⏎ to commit</p>
+        <p class="hint">⌃⏎ / ⌘⏎</p>
       {/if}
       {#if modal.error}
         <p class="modal-error" role="alert">{modal.error}</p>
@@ -1349,9 +1348,6 @@
     line-height: 1.45;
     max-height: 14em;
     overflow: auto;
-  }
-  .filter-help strong {
-    color: var(--fg);
   }
   .filter-help code {
     color: var(--accent);

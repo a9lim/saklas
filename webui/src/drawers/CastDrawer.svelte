@@ -103,15 +103,10 @@
   </header>
 
   <div class="body">
-    <p class="hint">
-      named labels with standing steering recipes.  a turn labeled with a
-      member's slug generates under its recipe — the weakest tier: the
-      rack and per-send controls override it field-for-field.  the roster
-      saves with the conversation.
-    </p>
+    <p class="hint">saved with conversation · rack/send override</p>
 
     {#if roster.length === 0}
-      <p class="empty">no cast members yet — name one below.</p>
+      <p class="empty">none</p>
     {:else}
       <ul class="roster" aria-label="Cast roster">
         {#each roster as [slug, member] (slug)}
@@ -159,7 +154,7 @@
         />
       </label>
       <label class="field">
-        <span class="label">steering recipe</span>
+        <span class="label">recipe</span>
         <input
           class="input mono"
           bind:value={steering}
@@ -173,7 +168,7 @@
         <input
           class="input"
           bind:value={notes}
-          placeholder="optional"
+          placeholder="—"
           spellcheck="false"
           autocomplete="off"
         />

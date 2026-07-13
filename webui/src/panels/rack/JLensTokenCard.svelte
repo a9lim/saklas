@@ -107,7 +107,7 @@
 
     <span
       class="com"
-      title="depth center of mass ±spread, weighted by per-layer probability (0 = first block, 1 = last)"
+      title="depth ± spread"
     >@{com.toFixed(2)} ±{spread.toFixed(2)}</span>
 
     <span class="spacer"></span>
@@ -121,7 +121,7 @@
       {#snippet left()}
         <span
           class="row-label"
-          title="strength — mean probability of this token across the workspace band (0–1)"
+          title="mean band probability"
         >strength</span>
       {/snippet}
       {#snippet bar()}

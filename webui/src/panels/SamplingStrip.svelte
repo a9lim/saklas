@@ -192,7 +192,7 @@
 <section class="sampling-strip" aria-label="sampling controls">
   <!-- Row 1: temperature + top-p sliders -->
   <div class="row sliders">
-    <label class="control" title="Sampling temperature (0=greedy, 2=chaos)">
+    <label class="control" title="temperature">
       <span class="label">T</span>
       <span class="slider-cell">
         <Slider
@@ -208,7 +208,7 @@
       <span class="value">{tempView.toFixed(2)}</span>
     </label>
 
-    <label class="control" title="Top-p (nucleus) cumulative probability cutoff">
+    <label class="control" title="top-p">
       <span class="label">P</span>
       <span class="slider-cell">
         <Slider
@@ -227,7 +227,7 @@
 
   <!-- Row 2: top-k, repetition (frequency) penalty, presence penalty -->
   <div class="row">
-    <label class="control" title="Top-k hard cap on candidate vocab size">
+    <label class="control" title="top-k">
       <span class="label">K</span>
       <span class="num-cell">
         <NumberInput
@@ -244,7 +244,7 @@
 
     <label
       class="control"
-      title="Repetition (frequency) penalty: discourages tokens by repeat count (−2…2)"
+      title="frequency penalty"
     >
       <span class="label">rep</span>
       <span class="num-cell">
@@ -262,7 +262,7 @@
 
     <label
       class="control"
-      title="Presence penalty: discourages tokens already present (−2…2)"
+      title="presence penalty"
     >
       <span class="label">pres</span>
       <span class="num-cell">
@@ -283,7 +283,7 @@
 
   <!-- Row 4: max tokens, alts (top-K capture), seed -->
   <div class="row">
-    <label class="control" title="Maximum tokens to generate">
+    <label class="control" title="max tokens">
       <span class="label">max</span>
       <span class="num-cell">
         <NumberInput
@@ -303,7 +303,7 @@
          mode.  Default 8 per Decision 1. -->
     <label
       class="control"
-      title="Top-K alternative tokens to capture per position (0 disables; feeds the drilldown logits tab + surprise highlight)"
+      title="captured alternatives"
     >
       <span class="label">alts</span>
       <span class="num-cell">
@@ -319,7 +319,7 @@
       </span>
     </label>
 
-    <label class="control" title="RNG seed: empty means the model picks (clear the field to unpin)">
+    <label class="control" title="seed">
       <span class="label">seed</span>
       <span class="num-cell">
         <NumberInput
@@ -343,7 +343,7 @@
       class="sys-btn"
       disabled={!ready}
       onclick={openAdvanced}
-      title="Open stop strings, logit bias, and numeric top-K alternatives"
+      title="more sampling"
     >
       advanced
     </button>
@@ -353,19 +353,19 @@
       class="sys-btn"
       disabled={!ready}
       onclick={openSystemPrompt}
-      title="Edit system prompt"
+      title="system prompt"
     >
-      <span aria-hidden="true">⚙</span> system prompt
+      <span aria-hidden="true">⚙</span> system
     </button>
 
     <label
       class="control toggle"
       class:forced={thinkingForced}
       title={!thinkingSupported
-        ? "This model doesn't support thinking"
+        ? "unsupported"
         : !thinkingOptional
-          ? "This model always thinks"
-          : "Force chain-of-thought thinking on/off (overrides auto)"}
+          ? "always on"
+          : "thinking"}
     >
       <span class="label think-label">think{thinkingForced ? " (forced)" : ""}</span>
       <Checkbox

@@ -226,7 +226,7 @@
           {#if geom}
             <span class="meta">{rankLabel} · {intrinsicLabel}</span>
             {#if !geom.rank_uniform}
-              <span class="warn" title="this flat fit kept a different rank per layer">
+              <span class="warn" title="rank varies by layer">
                 rank varies by layer
               </span>
             {/if}
@@ -240,17 +240,17 @@
   </header>
 
   {#if !probeName}
-    <div class="body"><div class="empty">nothing selected</div></div>
+    <div class="body"><div class="empty">select a probe</div></div>
   {:else if loading}
     <div class="body"><div class="empty">loading…</div></div>
   {:else if error}
     <div class="body"><div class="empty err">error: {error}</div></div>
   {:else if !geom || layerList.length === 0}
-    <div class="body"><div class="empty">no fitted geometry for {displayName}</div></div>
+    <div class="body"><div class="empty">no geometry</div></div>
   {:else}
     <div class="body">
       <div class="bars-col">
-        <div class="section-label">layers · ‖share‖<span class="dim"> · click to scrub</span></div>
+        <div class="section-label">layers · ‖share‖</div>
         <div class="bars">
           {#each layerList as l (l.layer)}
             <button
@@ -285,12 +285,12 @@
           ></canvas>
           <span class="layer-chip">L{selectedLayer}</span>
           {#if canOrbit}
-            <span class="orbit-hint">drag to orbit · scroll to zoom</span>
+            <span class="orbit-hint">drag · scroll</span>
           {/if}
           {#if trailPoints.length > 0}
             <span class="trail-hint">{trailPoints.length} trail pts</span>
           {:else}
-            <span class="live-hint">generate to see the live point + trail</span>
+            <span class="live-hint">run for live trail</span>
           {/if}
         </div>
       </div>
@@ -508,12 +508,6 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
     margin-bottom: var(--space-3);
-  }
-  .section-label .dim {
-    color: var(--fg-subtle);
-    text-transform: none;
-    letter-spacing: 0;
-    font-weight: var(--weight-normal);
   }
   .bars {
     display: flex;

@@ -194,7 +194,7 @@
       shape={affine ? "circle" : "diamond"}
       pinned={true}
       onclick={() => void onDetach()}
-      title="Attached (click to detach)"
+      title="detach"
       ariaLabel={`Detach probe ${name}`}
     />
 
@@ -203,7 +203,7 @@
     {#if depthCom !== null}
       <span
         class="com"
-        title="depth center of mass of the per-layer read, share-weighted ±spread (0 = first block, 1 = last)"
+        title="depth ± spread"
       >@{fmtCoord(depthCom)}{depthSpread !== null ? ` ±${fmtCoord(depthSpread)}` : ""}</span>
     {/if}
 
@@ -213,7 +213,7 @@
       type="button"
       class="icon inspect"
       aria-label="Inspect probe {name}"
-      title="Open probe inspector"
+      title="inspect"
       onclick={onInspect}
     >ⓘ</button>
 
@@ -225,7 +225,7 @@
       aria-label={isHighlight
         ? `Deselect ${name} as transcript highlight target`
         : `Select ${name} as transcript highlight target`}
-      title="Use this probe to color transcript tokens"
+      title="highlight"
       onclick={toggleHighlight}
     >{isHighlight ? "highlighted" : "highlight"}</button>
 
@@ -251,7 +251,7 @@
       {#snippet left()}
         <span
           class="row-label"
-          title="subspaceness — share of the centered activation living in this probe's subspace (0–1)"
+          title="subspace share"
         >subspace</span>
       {/snippet}
       {#snippet bar()}
@@ -313,7 +313,7 @@
       <!-- Settled meta: the curved-only off-surface residual (the depth
            CoM moved to the statline, right of the probe name). -->
       <div class="meta">
-        <span class="meta-item" title="normalized off-surface residual">
+        <span class="meta-item" title="residual">
           residual {fmtCoord(residual)}
         </span>
       </div>

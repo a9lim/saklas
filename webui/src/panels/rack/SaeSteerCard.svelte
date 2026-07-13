@@ -38,7 +38,7 @@
       class="enable"
       class:off={!entry.enabled}
       onclick={() => setSaeEnabled(name, !entry.enabled)}
-      title={entry.enabled ? "Enabled (click to disable)" : "Disabled (click to enable)"}
+      title={entry.enabled ? "disable" : "enable"}
       aria-pressed={entry.enabled}
       aria-label="Toggle steering for {name}"
     >
@@ -55,7 +55,7 @@
       type="button"
       class="trigger-pill"
       onclick={cycleTrigger}
-      title="trigger: {TRIGGER_LABEL[entry.trigger]} (click to cycle)"
+      title="trigger: {TRIGGER_LABEL[entry.trigger]}"
       aria-label="trigger for {name}: {entry.trigger}"
     >
       {TRIGGER_WORD[entry.trigger]}
@@ -81,10 +81,10 @@
         max={1}
         step={0.05}
         ariaLabel="alpha for {name}"
-        title="α — push coefficient along the feature's decoder row"
+        title="coefficient"
         oninput={(v) => Number.isFinite(v) && setSaeAlpha(name, v)}
       />
-      <span class="alpha-val" title="push coefficient">{entry.alpha.toFixed(2)}</span>
+      <span class="alpha-val" title="coefficient">{entry.alpha.toFixed(2)}</span>
     </div>
   {/snippet}
 </RackCard>

@@ -194,9 +194,6 @@
   <header class="header">
     <div class="title">
       <span class="eyebrow">experiment lab</span>
-      <div class="name-row">
-        <span class="meta">run alpha grids as loom siblings, then inspect the response surface</span>
-      </div>
     </div>
     <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
   </header>
@@ -210,19 +207,19 @@
 
       <div class="axis-grid">
         <label class="field">
-          <span>x concept</span>
+          <span>x</span>
           <input list="concepts" bind:value={xConcept} placeholder="honest.deceptive" />
         </label>
         <label class="field">
-          <span>x alphas</span>
+          <span>x α</span>
           <input bind:value={xGrid} placeholder="linspace(-1, 1, 9)" />
         </label>
         <label class="field">
-          <span>y concept</span>
+          <span>y</span>
           <input list="concepts" bind:value={yConcept} placeholder="optional" />
         </label>
         <label class="field">
-          <span>y alphas</span>
+          <span>y α</span>
           <input bind:value={yGrid} placeholder="-0.5, 0, 0.5" />
         </label>
       </div>
@@ -253,7 +250,7 @@
     <section class="results">
       <div class="result-head">
         <div>
-          <h3>response surface</h3>
+          <h3>surface</h3>
           <p>{response ? `${response.total} runs` : "no run yet"}</p>
         </div>
         {#if response}
@@ -302,9 +299,7 @@
           {/each}
         </div>
       {:else}
-        <div class="empty">
-          alpha grids become loom siblings; each cell can be opened as the active branch after the run.
-        </div>
+        <div class="empty">run an α grid</div>
       {/if}
     </section>
   </div>
@@ -342,16 +337,6 @@
     font-weight: var(--weight-medium);
     text-transform: uppercase;
     letter-spacing: 0.08em;
-  }
-  .name-row {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  .meta {
-    color: var(--fg-subtle);
-    font-size: var(--text-sm);
   }
   .close {
     background: var(--glass);

@@ -140,7 +140,7 @@
           {/if}
         {:else}
           <span class="meta">
-            {names.length === 0 ? "no vectors or probes registered" : "pick a name"}
+            {names.length === 0 ? "no data" : "select a name"}
           </span>
         {/if}
       </div>
@@ -173,9 +173,9 @@
     {:else if loading}
       <div class="empty">loading…</div>
     {:else if !selected}
-      <div class="empty">nothing selected</div>
+      <div class="empty">select a name</div>
     {:else if sortedLayers.length === 0}
-      <div class="empty">no layer data for {selected}</div>
+      <div class="empty">no layer data</div>
     {:else}
       <div class="bars">
         {#each sortedLayers as e (e.layer)}
@@ -190,11 +190,7 @@
   </div>
 
   <footer class="drawer-footer">
-    <span class="hint">
-      Per-layer ‖baked‖.  Bar length encodes magnitude relative to the
-      max layer for this concept.  Sources: registered steering vectors
-      ∪ active probes.
-    </span>
+    <span class="hint">‖baked‖ by layer · relative to max</span>
   </footer>
 </aside>
 

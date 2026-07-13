@@ -323,10 +323,10 @@
     busyKeys.add(key);
     try {
       const info = await attachProbe(key);
-      pushToast(`attached probe ${info.name}`, { kind: "info" });
+      pushToast(`probe ${info.name}`, { kind: "info" });
       closeDrawer();
     } catch (e) {
-      pushToast(`attach failed — ${describeError(e)}`, {
+      pushToast(`attach: ${describeError(e)}`, {
         kind: "error",
         ttlMs: null,
       });
@@ -355,11 +355,11 @@
       if (customAlias.trim()) opts.name = customAlias.trim();
       if (customTopN && customTopN > 0) opts.top_n = customTopN;
       const info = await attachProbe(sel, opts);
-      pushToast(`attached probe ${info.name}`, { kind: "info" });
+      pushToast(`probe ${info.name}`, { kind: "info" });
       customSelector = "";
       customAlias = "";
     } catch (e) {
-      pushToast(`attach failed — ${describeError(e)}`, {
+      pushToast(`attach: ${describeError(e)}`, {
         kind: "error",
         ttlMs: null,
       });
@@ -510,7 +510,7 @@
             class="nodes-toggle"
             aria-expanded={nodesOpen(key)}
             onclick={() => toggleNodes(key)}
-            title={nodesOpen(key) ? "collapse nodes" : "expand nodes"}
+            title={nodesOpen(key) ? "collapse" : "expand"}
           >
             <span class="caret" aria-hidden="true">{nodesOpen(key) ? "▾" : "▸"}</span>
             <span class="nodes-label">nodes</span>
@@ -565,7 +565,7 @@
               class="act inspect"
               aria-expanded={inspecting}
               onclick={() => void toggleInspect(m)}
-              title={inspecting ? "hide diagnostics" : "inspect fit"}
+              title={inspecting ? "hide" : "inspect"}
             >{inspecting ? "▾" : "ⓘ"}</button>
             <button
               type="button"
@@ -613,10 +613,7 @@
               {#if isDiscoverMode(detail)}
                 <DiagnosticsPanel manifold={detail} />
               {:else}
-                <p class="muted">
-                  authored manifold — no discover-mode diagnostics
-                  ({detail.domain_label}, dim={detail.intrinsic_dim})
-                </p>
+                <p class="muted">authored · {detail.domain_label} · dim {detail.intrinsic_dim}</p>
               {/if}
             {/if}
           </div>
@@ -666,7 +663,7 @@
     {/if}
 
     <details class="custom-attach">
-      <summary>attach probe by selector</summary>
+      <summary>attach selector</summary>
       <form class="attach-form" onsubmit={onCustomAttachSubmit}>
         <label class="row-label">
           <span>selector</span>
@@ -680,11 +677,11 @@
           />
         </label>
         <label class="row-label">
-          <span>name <span class="optional">(optional)</span></span>
+          <span>name</span>
           <input
             type="text"
             class="text-input"
-            placeholder="registered name"
+            placeholder="name"
             aria-label="Registered probe name (optional)"
             bind:value={customAlias}
             disabled={customAttaching}
@@ -735,7 +732,7 @@
           class="refresh"
           onclick={() => void refreshManifoldList()}
           disabled={steerRack.loading}
-          title="re-fetch"
+          title="refresh"
           aria-label="Refresh"
         >{steerRack.loading ? "…" : "↻"}</button>
       </div>
@@ -748,10 +745,7 @@
     {#if steerRack.loading && familyTotal === 0}
       <p class="muted">loading…</p>
     {:else if familyTotal === 0}
-      <p class="muted">
-        no {title === "manifold" ? "manifolds" : "subspaces"} yet — use
-        + {launcherLabel} above to author one.
-      </p>
+      <p class="muted">none</p>
     {:else}
       {#if ftSections.length > 0}
         <h2 class="section-title">Fitted</h2>
@@ -787,7 +781,7 @@
       {#if unSections.length > 0}
         <h2 class="section-title">
           Unfitted
-          <span class="section-hint">no tensor for this model yet</span>
+          <span class="section-hint">unfitted</span>
         </h2>
         <div class="catalog">
           {#each unSections as { cat, items } (cat)}
@@ -819,7 +813,7 @@
       {/if}
 
       {#if fitted.length === 0 && unfitted.length === 0}
-        <p class="muted">no {title} or node matches "{query.trim()}".</p>
+        <p class="muted">no matches</p>
       {/if}
     {/if}
   </div>
@@ -1168,10 +1162,6 @@
   }
   .attach-form .row-label > span {
     flex: 0 0 5.5em;
-  }
-  .attach-form .optional {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
   }
   .text-input {
     flex: 1 1 0;

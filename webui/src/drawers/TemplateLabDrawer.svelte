@@ -227,22 +227,17 @@
 
   <div class="body">
     {#if tab === "score"}
-      <p class="hint">
-        The model's <strong>restricted-choice</strong> distribution over a
-        template's values, per context — the logit read. Add a steering
-        expression to see how steering reshapes it (the distributional
-        before/after).
-      </p>
+      <p class="hint">restricted-choice probabilities</p>
 
       {#if loading}
         <p class="muted">loading…</p>
       {:else if templates.length === 0}
-        <p class="muted">no templates yet — author one in the <strong>build</strong> tab.</p>
+        <p class="muted">no templates</p>
       {:else}
         <label class="field">
           <span class="label">template</span>
           <select bind:value={selectedKey} disabled={scoring}>
-            <option value="">— pick a template —</option>
+            <option value="">select…</option>
             {#each templates as t (`${t.namespace}/${t.name}`)}
               <option value={`${t.namespace}/${t.name}`}>
                 {t.namespace}/{t.name} · {t.n_values} values × {t.n_contexts} ctx
@@ -252,7 +247,7 @@
         </label>
 
         <label class="field">
-          <span class="label">steering <span class="optional">(optional)</span></span>
+          <span class="label">steering</span>
           <input type="text" placeholder="0.5 patient.hurried" bind:value={steerExpr}
             disabled={scoring} autocomplete="off" spellcheck="false" />
         </label>
@@ -261,8 +256,8 @@
           <label class="byrow">
             <span class="label">rank by</span>
             <select bind:value={scoreBy}>
-              <option value="sum">sum (joint)</option>
-              <option value="mean">mean (length-norm)</option>
+              <option value="sum">sum</option>
+              <option value="mean">mean</option>
             </select>
           </label>
           <Button variant="solid" disabled={!selectedTemplate || scoring} onclick={runScore}>
@@ -294,16 +289,11 @@
       {/if}
 
     {:else}
-      <p class="hint">
-        Author a template: a <strong>slot</strong> token, candidate
-        <strong>values</strong> (one node per value), and one or more
-        <strong>contexts</strong> — a multi-turn history ending on a user turn,
-        plus the final assistant turn that carries the slot exactly once.
-      </p>
+      <p class="hint">slot · values · contexts</p>
 
       <form class="form" onsubmit={submitBuild}>
         <label class="field">
-          <span class="label">name <span class="optional">(under local/)</span></span>
+          <span class="label">name</span>
           <input type="text" placeholder="weekday" bind:value={bName} disabled={building}
             autocomplete="off" spellcheck="false" />
         </label>
@@ -313,7 +303,7 @@
             autocomplete="off" spellcheck="false" />
         </label>
         <label class="field">
-          <span class="label">values <span class="optional">(one per line or comma-separated)</span></span>
+          <span class="label">values</span>
           <textarea rows="3" placeholder={"Monday\nTuesday\nWednesday"}
             bind:value={bValuesText} disabled={building}></textarea>
         </label>
@@ -344,7 +334,7 @@
               {/each}
               <button type="button" class="mini add" onclick={() => addTurn(ci)}>+ turn</button>
               <label class="field assistant-field">
-                <span class="label">assistant (slot here)</span>
+                <span class="label">assistant · slot</span>
                 <input type="text" placeholder={`today is ${bSlot}`} bind:value={ctx.assistant}
                   disabled={building} autocomplete="off" />
               </label>
@@ -462,10 +452,6 @@
     margin: 0;
     line-height: 1.5;
     max-width: 62ch;
-  }
-  .hint strong {
-    color: var(--fg-strong);
-    font-weight: var(--weight-medium);
   }
   .muted { color: var(--fg-muted); font-size: var(--text-sm); }
   .field { display: flex; flex-direction: column; gap: var(--space-2); }

@@ -46,13 +46,11 @@
     </ol>
     {#if diag.kind === "spectral" && diag.component_count > 1}
       <p class="warn">
-        graph disconnected ({diag.component_count} components) —
-        increase k_nn or switch to pca
+        {diag.component_count} components · raise k_nn or use pca
       </p>
     {/if}
     {#if fit && fit.hyperparams}
       <p class="hyperparams">
-        hyperparams:
         {#each Object.entries(fit.hyperparams) as [k, v] (k)}
           <code>{k}={typeof v === "number" ? v.toString() : v}</code>
         {/each}
@@ -61,8 +59,7 @@
   </div>
 {:else if manifold.fit_mode === "pca" || manifold.fit_mode === "spectral"}
   <p class="muted">
-    no diagnostics yet — discover-mode coords + diagnostics land after
-    the first fit.
+    fit for diagnostics
   </p>
 {/if}
 

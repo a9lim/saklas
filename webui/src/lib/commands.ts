@@ -31,18 +31,18 @@ export const RAIL_CATEGORIES: RailCategory[] = [
     // builder's pca path.  The catalog is the shared RackDrawer
     // (family-split), reached from the rack "+" buttons.
     key: "manifolds",
-    label: "Steering manifolds",
+    label: "Steering",
     // Undulating spline curve — reads as "manifold" and is visually
     // distinct from analysis' line graph.
     icon: "M3 17c4-8 6-8 9-4s2 8 9 0",
     tools: [
       {
-        label: "build manifold…",
+        label: "build…",
         drawer: "manifold_builder",
         keywords: "extract author create concept vector fit",
       },
       {
-        label: "merge manifolds…",
+        label: "merge…",
         drawer: "manifold_merge",
         keywords: "union corpora",
       },
@@ -69,28 +69,28 @@ export const RAIL_CATEGORIES: RailCategory[] = [
     icon: "M4 18l5-12 4 8 3-5 4 9",
     tools: [
       {
-        label: "correlation matrix…",
+        label: "correlation…",
         drawer: "correlation",
         keywords: "cosine similarity vectors",
       },
       {
-        label: "pairwise compare…",
+        label: "compare…",
         drawer: "compare",
         keywords: "cross-layer cosine",
       },
       { label: "layer norms…", drawer: "layer_norms", keywords: "magnitude" },
       {
-        label: "activation atlas…",
+        label: "atlas…",
         drawer: "activation_atlas",
         keywords: "heatmap token layer probe",
       },
       {
-        label: "experiment lab…",
+        label: "experiments…",
         drawer: "experiment_lab",
         keywords: "alpha grid fan sweep",
       },
       {
-        label: "recipe builder…",
+        label: "recipe…",
         drawer: "recipe_builder",
         keywords: "expression steering terms",
       },
@@ -98,17 +98,17 @@ export const RAIL_CATEGORIES: RailCategory[] = [
   },
   {
     key: "session",
-    label: "Session & model",
+    label: "Session",
     icon: "M5 21v-6M5 11V3M12 21v-9M12 8V3M19 21v-4M19 13V3M2 15h6M9 8h6M16 13h6",
     tools: [
-      { label: "model health…", drawer: "health", keywords: "device dtype" },
+      { label: "health…", drawer: "health", keywords: "device dtype" },
       {
-        label: "session / auth…",
+        label: "auth…",
         drawer: "session_admin",
         keywords: "api key bearer",
       },
       {
-        label: "help / shortcuts…",
+        label: "help…",
         drawer: "help",
         keywords: "keyboard grammar cheatsheet",
       },
@@ -135,25 +135,25 @@ export interface PaletteCommand {
 export function paletteCommands(): PaletteCommand[] {
   const cmds: PaletteCommand[] = [
     {
-      label: "subspace instrument",
+      label: "subspace",
       group: "instruments",
       action: { kind: "tab", tab: "subspace" },
       keywords: "pillar flat affine concept vector caa steer probe",
     },
     {
-      label: "manifold instrument",
+      label: "manifold",
       group: "instruments",
       action: { kind: "tab", tab: "manifold" },
       keywords: "pillar curved emotions months steer probe",
     },
     {
-      label: "sae instrument",
+      label: "sae",
       group: "instruments",
       action: { kind: "tab", tab: "sae" },
       keywords: "pillar features sparse autoencoder",
     },
     {
-      label: "lens instrument",
+      label: "lens",
       group: "instruments",
       action: { kind: "tab", tab: "lens" },
       keywords: "pillar jacobian jlens workspace readout token",

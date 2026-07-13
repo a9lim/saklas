@@ -394,7 +394,7 @@
           {#if ids.length >= 2}
             {ids.length} node{ids.length > 2 ? "s" : ""} selected
           {:else}
-            select nodes to compare
+            select nodes
           {/if}
         </span>
       </div>
@@ -429,11 +429,7 @@
 
   <div class="body">
     {#if ids.length < 2}
-      <p class="empty">
-        Pick at least two assistant nodes via the sidebar's "select for
-        compare" right-click action, or right-click a user node with
-        ≥2 assistant children and pick "compare children".
-      </p>
+      <p class="empty">select ≥2 assistant nodes in Threads</p>
     {:else if loading && diffs.length === 0}
       <p class="empty">computing diff…</p>
     {:else}
@@ -442,7 +438,7 @@
         <div class="col anchor-col">
           <header class="col-header">
             <code class="col-id">{anchorId?.slice(0, 12) ?? ""}</code>
-            <span class="col-tag">anchor (A)</span>
+            <span class="col-tag">A · anchor</span>
           </header>
           <p class="col-preview">{nodePreview(anchorId ?? "")}</p>
         </div>
@@ -465,21 +461,21 @@
       {#if siblingSummary.length > 0}
         <section class="siblings-summary">
           <header class="ss-header">
-            <span class="ss-label">siblings · distributional rollup</span>
-            <span class="ss-foot">vs. {siblingSummary[0]?.label ?? "A"} (baseline)</span>
+            <span class="ss-label">siblings</span>
+            <span class="ss-foot">vs {siblingSummary[0]?.label ?? "A"}</span>
           </header>
           <table class="ss-table">
             <thead>
               <tr>
                 <th class="ss-tag">tag</th>
                 <th class="ss-preview">preview</th>
-                <th class="ss-num" title="mean chosen-token logprob over the response span">
+                <th class="ss-num" title="mean logprob">
                   mean lp
                 </th>
-                <th class="ss-num" title="fraction of aligned positions where argmax did not change">
+                <th class="ss-num" title="rank-1 agreement">
                   rk1 unchanged
                 </th>
-                <th class="ss-num" title="mean top-K-truncated KL(baseline ∥ this) across aligned positions">
+                <th class="ss-num" title="approximate KL">
                   mean ≈KL
                 </th>
               </tr>
@@ -527,7 +523,7 @@
               </span>
               {#if d.parent_applied_steering !== null || d.steering_delta}
                 <code class="recipe-delta" title="steering delta A → B">
-                  Δ steering: {d.steering_delta || "(none)"}
+                  Δ recipe: {d.steering_delta || "none"}
                 </code>
               {/if}
             </header>
@@ -607,23 +603,19 @@
                  the start of a parent block). -->
             {#if joint}
               {#if joint.kind === "loading"}
-                <p class="dim small">
-                  computing cross-branch logprobs…
-                </p>
+                <p class="dim small">computing logprobs…</p>
               {:else if joint.kind === "err"}
                 <p class="error small" role="alert">
-                  joint logprobs unavailable: {joint.message}
+                  logprobs: {joint.message}
                 </p>
               {:else}
                 {@const aligned = alignedRows(joint.data.rows)}
                 {#if aligned.length > 0}
                   <div class="joint-table">
                     <header class="joint-header">
-                      <span class="joint-label">cross-branch logprobs</span>
+                      <span class="joint-label">logprobs</span>
                       <span class="joint-summary">
-                        rank-1 changed at <strong>
-                          {joint.data.n_rank1_changed}
-                        </strong> of {aligned.length} aligned positions
+                        <strong>{joint.data.n_rank1_changed}</strong> / {aligned.length} rank-1 changes
                       </span>
                     </header>
                     <table class="lp-table">
@@ -660,18 +652,9 @@
                         {/each}
                       </tbody>
                     </table>
-                    <p class="joint-foot">
-                      lp: chosen-token logprob.  Δ lp(A): how B would have
-                      scored A's chosen token, minus what A actually gave
-                      it (negative = B disagreed).  ≈KL: top-{32}-truncated
-                      KL(A ∥ B), approximate signal, not measurement.
-                    </p>
                   </div>
                 {:else}
-                  <p class="dim small">
-                    no byte-aligned assistant tokens between these
-                    branches, so cross-evaluation has nothing to score.
-                  </p>
+                  <p class="dim small">no aligned tokens</p>
                 {/if}
               {/if}
             {/if}
@@ -679,7 +662,7 @@
             <!-- Readings delta table. -->
             {#if sortedRs.length > 0}
               <div class="readings-table">
-                <span class="readings-label">readings Δ (B − A)</span>
+                <span class="readings-label">Δ readings</span>
                 <div class="readings-grid">
                   {#each sortedRs as r (r.name)}
                     {@const top = topDeltas.has(r.name)}
@@ -704,10 +687,7 @@
                 </div>
               </div>
             {:else}
-              <p class="dim small">
-                no readings recorded; either node has empty
-                ``aggregate_readings``.
-              </p>
+              <p class="dim small">no readings</p>
             {/if}
           </section>
         {/if}
@@ -1142,13 +1122,6 @@
   .lp-table tr.rank-flip .lp-flag {
     color: var(--pillar-lens);
   }
-  .joint-foot {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    line-height: 1.5;
-    margin: 0;
-  }
-
   .readings-table {
     display: flex;
     flex-direction: column;

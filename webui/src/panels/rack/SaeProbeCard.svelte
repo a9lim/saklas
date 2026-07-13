@@ -107,7 +107,7 @@
         pinned={true}
         disabled={unpinBusy}
         onclick={() => void onUnpin()}
-        title="Pinned (click to unpin)"
+        title="unpin"
         ariaLabel={`Unpin probe ${name}`}
       />
     {:else}
@@ -116,17 +116,17 @@
         pinned={false}
         disabled={busy}
         onclick={() => onpin?.(id)}
-        title="Pin as a persistent, gate-able probe"
+        title="pin"
         ariaLabel={`Pin probe ${name}`}
       />
     {/if}
 
-    <span class="name" title="probe {name} — feature activation on the resident SAE">
+    <span class="name" title="probe {name}">
       {id}{label ? ` · ${label}` : ""}
     </span>
 
     {#if layer !== null}
-      <span class="layer" title="the resident SAE's hook layer">L{layer}</span>
+      <span class="layer" title="hook layer">L{layer}</span>
     {/if}
 
     <span class="spacer"></span>
@@ -143,7 +143,7 @@
         {#snippet left()}
           <span
             class="row-label"
-            title="strength — activation ({rawValue.toFixed(1)}) / Neuronpedia max activation (~{maxAct?.toFixed(1)}); the @when:sae/{id} gate channel"
+            title="normalized activation"
           >strength</span>
         {/snippet}
         {#snippet bar()}
@@ -160,7 +160,7 @@
         {#snippet left()}
           <span
             class="row-label"
-            title="activation — raw feature activation (no Neuronpedia max yet; bar scaled to the largest visible reading); the @when:sae/{id} gate channel"
+            title="raw activation"
           >activation</span>
         {/snippet}
         {#snippet bar()}

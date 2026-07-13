@@ -106,7 +106,7 @@
           type="button"
           class="add add-subspace"
           onclick={onAddSubspaceProbe}
-          title="Attach a flat subspace as a read-side probe"
+          title="add subspace probe"
         >
           + subspace probe
         </button>
@@ -115,7 +115,7 @@
           type="button"
           class="add add-manifold"
           onclick={onAddManifoldProbe}
-          title="Attach a curved manifold as a read-side probe"
+          title="add manifold probe"
         >
           + manifold probe
         </button>

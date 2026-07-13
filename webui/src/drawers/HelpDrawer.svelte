@@ -31,34 +31,28 @@
 
   <div class="body">
     <section class="block">
-      <h3>keyboard shortcuts</h3>
+      <h3>shortcuts</h3>
       <table class="kb">
         <tbody>
           <tr>
             <td><kbd>Esc</kbd></td>
-            <td>stop in-flight generation; close drawer when idle</td>
+            <td>stop / close</td>
           </tr>
           <tr>
             <td><kbd>Enter</kbd></td>
-            <td>send message</td>
+            <td>send</td>
           </tr>
           <tr>
             <td><kbd>Shift</kbd> + <kbd>Enter</kbd></td>
-            <td>newline in chat input</td>
+            <td>newline</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>Enter</kbd></td>
-            <td>send message (alternate)</td>
-          </tr>
-          <tr>
-            <td>
-              <kbd>{modKey}</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd>
-            </td>
-            <td>regenerate last response (reserved, not yet wired)</td>
+            <td>commit</td>
           </tr>
           <tr>
             <td>click token</td>
-            <td>open per-layer × per-probe drilldown for that token</td>
+            <td>token details</td>
           </tr>
         </tbody>
       </table>
@@ -66,56 +60,51 @@
 
     <section class="block">
       <h3>loom tree</h3>
-      <p class="prose">
-        the single-letter keys fire while the loom sidebar is focused;
-        the <kbd>{modKey}</kbd>-combos act on the active node from
-        anywhere.
-      </p>
       <table class="kb">
         <tbody>
           <tr>
             <td><kbd>j</kbd> / <kbd>k</kbd></td>
-            <td>focus the previous / next sibling</td>
+            <td>previous / next sibling</td>
           </tr>
           <tr>
             <td><kbd>h</kbd> / <kbd>l</kbd></td>
-            <td>focus the parent / first child</td>
+            <td>parent / first child</td>
           </tr>
           <tr>
             <td><kbd>Enter</kbd></td>
-            <td>activate the focused node</td>
+            <td>activate</td>
           </tr>
           <tr>
             <td><kbd>s</kbd></td>
-            <td>star / unstar the focused node</td>
+            <td>star</td>
           </tr>
           <tr>
             <td><kbd>n</kbd></td>
-            <td>add or edit a note</td>
+            <td>note</td>
           </tr>
           <tr>
             <td><kbd>/</kbd></td>
-            <td>search node text</td>
+            <td>search</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>R</kbd></td>
-            <td>regenerate the active node</td>
+            <td>regenerate</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>E</kbd></td>
-            <td>edit the active node's text</td>
+            <td>edit</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>B</kbd></td>
-            <td>branch a new sibling</td>
+            <td>branch</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>N</kbd></td>
-            <td>navigate by node-id prefix</td>
+            <td>navigate</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>D</kbd></td>
-            <td>delete the active node's subtree</td>
+            <td>delete subtree</td>
           </tr>
         </tbody>
       </table>
@@ -123,11 +112,6 @@
 
     <section class="block">
       <h3>steering grammar</h3>
-      <p class="prose">
-        the same grammar speaks Python, YAML, the chat input, and this UI's
-        rack.  Server-side parser lives in
-        <code>saklas.core.steering_expr</code>.
-      </p>
       <pre class="grammar">{`expr      := term (("+" | "-") term)*
 term      := [coeff "*"?] ["!"] selector ["@" trigger]
 selector  := atom (("~" | "|") atom | "%" position)?
@@ -139,7 +123,7 @@ variant   := raw | sae | sae-<release>
              | role | role-<name> | from | from-<source>
 `}</pre>
 
-      <p class="prose">examples</p>
+      <h3>examples</h3>
       <pre class="grammar">{`0.3 honest                   # plain additive, default coeff = 0.5
 0.4 warm@after               # active only after </think>
 -0.5 wolf                    # bare pole resolves to deer.wolf @ -0.5
@@ -154,57 +138,6 @@ variant   := raw | sae | sae-<release>
 0.3 a + 0.5 b@thinking - 0.2 c|d   # compose
 `}</pre>
 
-      <table class="kb">
-        <tbody>
-          <tr>
-            <td><code>+</code> / <code>-</code></td>
-            <td>add / subtract terms</td>
-          </tr>
-          <tr>
-            <td><code>*</code></td>
-            <td>attach explicit coefficient (optional)</td>
-          </tr>
-          <tr>
-            <td><code>!</code></td>
-            <td>mean-ablate; does not compose with projection</td>
-          </tr>
-          <tr>
-            <td><code>~</code></td>
-            <td>project onto direction (keep shared component)</td>
-          </tr>
-          <tr>
-            <td><code>|</code></td>
-            <td>project orthogonal (remove shared component)</td>
-          </tr>
-          <tr>
-            <td><code>@trigger</code></td>
-            <td>per-term trigger override</td>
-          </tr>
-          <tr>
-            <td><code>:variant</code></td>
-            <td>route to SAE tensor (raw is default)</td>
-          </tr>
-        </tbody>
-      </table>
-    </section>
-
-    <section class="block">
-      <h3>tips</h3>
-      <ul class="prose-list">
-        <li>
-          bare pole names (<code>wolf</code>) resolve cross-namespace and
-          flip sign automatically; <code>ns/concept</code> disambiguates.
-        </li>
-        <li>
-          dotted bipolar names (<code>happy.sad</code>) are first-class;
-          <code>.</code> and <code>_</code> are the only allowed
-          punctuation in concept identifiers.
-        </li>
-        <li>
-          mid-generation rack edits queue as pending actions and apply on
-          the next <code>done</code> event (or instantly with apply-now).
-        </li>
-      </ul>
     </section>
   </div>
 
@@ -300,10 +233,6 @@ variant   := raw | sae | sae-<release>
     font-family: inherit;
     font-size: var(--text-xs);
   }
-  code {
-    color: var(--accent);
-    font-family: var(--font-mono);
-  }
   .grammar {
     background: var(--bg-deep);
     padding: var(--space-3) var(--space-4);
@@ -314,19 +243,6 @@ variant   := raw | sae | sae-<release>
     line-height: 1.4;
     overflow-x: auto;
     white-space: pre;
-  }
-  .prose {
-    margin: var(--space-2) 0;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.4;
-  }
-  .prose-list {
-    margin: var(--space-2) 0 0;
-    padding-left: 1.2em;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.5;
   }
   .footer {
     display: flex;

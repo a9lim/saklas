@@ -62,9 +62,6 @@
   <header class="drawer-header">
     <div class="title">
       <span class="eyebrow">model health</span>
-      <div class="name-row">
-        <span class="meta">runtime readiness, tree state, artifacts, probes, and UI coverage</span>
-      </div>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
@@ -76,7 +73,7 @@
         <p>{sessionState.info ? `${sessionState.info.device}/${sessionState.info.dtype}` : "session offline"}</p>
       </div>
       <Button variant="solid" disabled={busy} onclick={audit}>
-        {busy ? "auditing…" : "refresh audit"}
+        {busy ? "checking…" : "refresh"}
       </Button>
     </section>
 
@@ -91,29 +88,29 @@
         <p>{genStatus.tokensSoFar}/{genStatus.maxTokens || "—"} tokens · {genStatus.tokPerSec.toFixed(1)} tok/s</p>
       </div>
       <div class="tile">
-        <span>entropy perplexity</span>
+        <span>ppl</span>
         <strong>{ppl === null ? "—" : ppl.toFixed(2)}</strong>
-        <p>{genStatus.ppl.count} scored steps</p>
+        <p>{genStatus.ppl.count} steps</p>
       </div>
       <div class="tile">
         <span>loom tree</span>
         <strong>{loomTree.nodes.size || "—"}</strong>
-        <p>rev {loomTree.loaded ? loomTree.rev : "—"} · active depth {loomTree.activePath.length || "—"}</p>
+        <p>rev {loomTree.loaded ? loomTree.rev : "—"} · depth {loomTree.activePath.length || "—"}</p>
       </div>
       <div class="tile">
         <span>artifacts</span>
         <strong>{steerRack.catalog.length}</strong>
-        <p>{steerRack.entries.size} on rack · {vectorsState.names.length} resident profiles</p>
+        <p>{steerRack.entries.size} racked · {vectorsState.names.length} resident</p>
       </div>
       <div class="tile">
         <span>probes</span>
         <strong>{probeRack.active.length}</strong>
-        <p>{probeRack.entries.size} live rows · {steerRack.correlation ? "correlation cached" : "no matrix"}</p>
+        <p>{probeRack.entries.size} rows · {steerRack.correlation ? "matrix cached" : "no matrix"}</p>
       </div>
     </section>
 
     <section class="panel">
-      <h3>readiness checks</h3>
+      <h3>checks</h3>
       <div class="checks">
         <div class:ok={!!sessionState.info}>session metadata</div>
         <div class:ok={loomTree.loaded && !loomTree.error}>loom API</div>
@@ -126,7 +123,7 @@
     <section class="panel">
       <h3>warnings</h3>
       {#if warnings.length === 0}
-        <p class="good">no visible health warnings from the web client cache</p>
+        <p class="good">clear</p>
       {:else}
         <ul>
           {#each warnings as warning (warning)}
@@ -135,7 +132,7 @@
         </ul>
       {/if}
       {#if lastAudit}
-        <p class="dim">last audit: {lastAudit}</p>
+        <p class="dim">updated {lastAudit}</p>
       {/if}
     </section>
   </div>
@@ -173,16 +170,6 @@
     font-weight: var(--weight-medium);
     text-transform: uppercase;
     letter-spacing: 0.08em;
-  }
-  .name-row {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-3);
-    min-width: 0;
-  }
-  .meta {
-    color: var(--fg-subtle);
-    font-size: var(--text-sm);
   }
   .hero p, .tile p, .dim {
     margin: var(--space-1) 0 0;

@@ -162,7 +162,7 @@
 
 <section class="drawer-shell" aria-label="Export drawer">
   <header class="header">
-    <span class="title">export last result</span>
+    <span class="title">export</span>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
       >✕</button
     >
@@ -170,12 +170,8 @@
 
   <div class="body">
     {#if !lastTurn}
-      <p class="dim">no assistant result yet, generate something first.</p>
+      <p class="dim">no result</p>
     {:else}
-      <p class="hint">
-        exports the last assistant turn (text, applied_steering, sampling,
-        per-token data, and aggregate probe readings if present).
-      </p>
 
       <div class="mode-row" role="radiogroup" aria-label="Format">
         <Radio bind:group={format} value="jsonl" label="JSONL" />
@@ -202,11 +198,11 @@
           </span>
         </p>
         <p class="meta-row">
-          <span class="meta-key">finish reason</span>
+          <span class="meta-key">finish</span>
           <span class="meta-val">{lastTurn.finishReason ?? "—"}</span>
         </p>
         <p class="meta-row">
-          <span class="meta-key">applied steering</span>
+          <span class="meta-key">steering</span>
           <span class="meta-val">
             {lastTurn.appliedSteering ?? "—"}
           </span>
@@ -222,10 +218,7 @@
       </div>
 
       {#if !hasReadings}
-        <p class="warn">
-          last turn carries no aggregate probe readings; the export will
-          still succeed with an empty <code>readings</code> field.
-        </p>
+        <p class="warn">no readings</p>
       {/if}
     {/if}
   </div>
@@ -299,12 +292,6 @@
   .dim {
     color: var(--fg-muted);
   }
-  .hint {
-    margin: 0;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.4;
-  }
   .mode-row {
     display: flex;
     gap: var(--space-6);
@@ -357,13 +344,6 @@
     color: var(--accent-yellow);
     font-size: var(--text-sm);
     margin: 0;
-  }
-  .warn code {
-    color: var(--accent-yellow);
-    background: rgba(210, 153, 34, 0.1);
-    padding: 0 var(--space-1);
-    border-radius: var(--radius);
-    font-family: var(--font-mono);
   }
   .footer {
     display: flex;

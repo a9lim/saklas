@@ -133,18 +133,12 @@
 
   <div class="body">
     <p class="hint">
-      Union the <strong>nodes</strong> of two or more discover-mode
-      manifolds into a fresh discover folder, then re-fit on the
-      combined heap.  Authored manifolds (declared domain + coords)
-      aren't mergeable — only their <em>autofitted</em> siblings.
+      Union nodes from ≥2 discover manifolds.
     </p>
 
     {#if discoverManifolds.length < 2}
       <p class="muted">
-        need ≥ 2 discover-mode (pca / spectral) manifolds in the
-        catalog to merge.  Author one via <strong>+ build manifold</strong>
-        in the manifold drawer, or pull one from <strong>manifold packs →
-        search hf</strong>.
+        need ≥2 discover manifolds
       </p>
     {:else}
       <form class="form" onsubmit={onSubmit}>
@@ -201,8 +195,7 @@
         </label>
         {#if sourceModes.length > 1}
           <p class="warn">
-            sources have mixed fit_modes ({sourceModes.join(", ")})
-            — pick one explicitly above.
+            mixed fit modes: {sourceModes.join(", ")}
           </p>
         {/if}
 
@@ -214,10 +207,10 @@
             class="primary"
             disabled={!canSubmit}
             title={selected.size < 2
-              ? "pick >= 2 sources"
+                ? "pick ≥2"
               : !targetName.trim()
                 ? "target name required"
-                : "merge into a fresh discover folder"}
+                : "merge"}
           >
             {#if merging}
               <span class="spinner" aria-hidden="true"></span> merging…
@@ -291,19 +284,11 @@
     font-size: var(--text-sm);
     line-height: 1.5;
   }
-  .hint strong {
-    color: var(--accent-purple);
-    font-weight: var(--weight-medium);
-  }
   .muted {
     margin: 0;
     color: var(--fg-muted);
     font-size: var(--text-sm);
     line-height: 1.4;
-  }
-  .muted strong {
-    color: var(--accent-purple);
-    font-weight: var(--weight-medium);
   }
   .form {
     flex: 1 1 auto;

@@ -142,9 +142,9 @@
           <code class="name">{conceptA} × {conceptB}</code>
           <span class="meta">{layersA.length} × {layersB.length} layers · model {data.model ?? "—"}</span>
         {:else if names.length < 2}
-          <span class="meta">need at least two vectors or probes</span>
+          <span class="meta">≥2 names required</span>
         {:else}
-          <span class="meta">pick two names</span>
+          <span class="meta">select A / B</span>
         {/if}
       </div>
     </div>
@@ -178,7 +178,7 @@
     {:else if loading && !matrix}
       <div class="empty">loading…</div>
     {:else if !matrix || layersA.length === 0 || layersB.length === 0}
-      <div class="empty">no layer data for the selected pair</div>
+      <div class="empty">no layer data</div>
     {:else}
       <div class="grid-scroll">
         <table class="grid" style="--cell: {CELL_SIZE}px;">

@@ -81,7 +81,7 @@
       <div class="name-row">
         <span class="meta">
           {names.length} {names.length === 1 ? "name" : "names"}
-          {#if names.length > 0} · vectors + probes{/if}
+          {#if names.length > 0} · steering + probes{/if}
         </span>
       </div>
     </div>
@@ -90,7 +90,7 @@
         size="sm"
         onclick={() => void reload()}
         disabled={loading}
-        title="Re-fetch the correlation matrix"
+        title="refresh"
       >{loading ? "…" : "refresh"}</Button>
       <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
         ✕
@@ -104,7 +104,7 @@
     {:else if loading && !data}
       <div class="empty">loading…</div>
     {:else if !data || names.length === 0}
-      <div class="empty">no vectors or probes registered</div>
+      <div class="empty">no data</div>
     {:else}
       <div class="grid-scroll">
         <table class="grid" style="--cell: {CELL_SIZE}px;">
@@ -141,10 +141,7 @@
   </div>
 
   <footer class="drawer-footer">
-    <span class="hint">
-      Magnitude-weighted cosine across shared layers.  Diagonal pinned
-      at +1.  Sources: registered steering vectors ∪ active probes.
-    </span>
+    <span class="hint">magnitude-weighted cosine · shared layers</span>
   </footer>
 </aside>
 

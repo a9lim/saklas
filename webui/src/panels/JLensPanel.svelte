@@ -397,7 +397,7 @@
           bind:value={fitPrompts}
           placeholder="100"
           aria-label="J-lens corpus prompts"
-          title="Corpus prompts (1–5000)"
+          title="1–5000"
         />
       </label>
       <label class="setup-field setup-field-wide">
@@ -407,7 +407,7 @@
           bind:value={fitLayers}
           placeholder="workspace | all | 13,14,…"
           aria-label="J-lens source layers"
-          title="workspace, all, or comma-separated layer ids"
+          title="workspace, all, or layer ids"
         />
       </label>
     {/snippet}
@@ -418,7 +418,7 @@
         accent="var(--accent-blue)"
         disabled={sourceBusy || !fitReady}
         onclick={requestFit}
-        title="Fit a Saklas-owned local Jacobian lens over the selected layers"
+        title="fit local lens"
       >
         {fitConfirm ? "confirm local fit" : "fit local"}
       </Button>
@@ -459,17 +459,14 @@
               color="var(--accent-blue)"
             />
           </div>
-          <p class="hint">
-            the fit holds the model — generations error until it lands;
-            an interrupted fit resumes from its last checkpoint
-          </p>
+          <p class="hint">generation paused · resumable</p>
           <Button
             size="sm"
             variant="danger"
             disabled={lensFitState.cancelling}
             onclick={() => void cancelLensFit()}
           >
-            {lensFitState.cancelling ? "requesting cancel…" : "cancel fit"}
+            {lensFitState.cancelling ? "cancelling…" : "cancel"}
           </Button>
         </div>
       {/if}
@@ -477,16 +474,13 @@
     {#snippet warning()}
       {#if fitConfirm && !lensFitState.running}
         <p class="hint fit-warning" role="alert">
-          Local fitting blocks generation and may take hours. Press confirm again.
+          Blocks generation; may take hours. Confirm again.
         </p>
       {/if}
     {/snippet}
     {#snippet summary()}
       {#if !fitted}
-        <p class="hint">
-          Fetch a supported official lens without copying it into Saklas,
-          or fit a local one for this exact model.
-        </p>
+        <p class="hint">fetch or fit</p>
       {/if}
     {/snippet}
     {#snippet messages()}
@@ -546,8 +540,8 @@
         live={liveOn}
         liveBusy={lensState.busy}
         liveTitle={liveOn
-          ? "Stop the per-step lens readout (pinned probes settle to the end-of-gen aggregate)"
-          : "Stream the J-lens readout live during generation (pinned probes + workspace top-k)"}
+          ? "disable live readout"
+          : "enable live readout"}
         onLiveToggle={onToggleLive}
         sortValue={lensState.workspaceSortMode}
         sortOptions={SORT_OPTIONS}
@@ -586,16 +580,12 @@
 
         {#if liveOn}
           {#if aggRows.length > 0}
-            <p class="hint drill-hint">
-              click a transcript token for its full per-layer matrix
-            </p>
+            <p class="hint drill-hint">click a token for layers</p>
           {:else}
-            <p class="hint">workspace top-k streams on the next generation</p>
+            <p class="hint">run to discover</p>
           {/if}
         {:else}
-          <p class="hint">
-            live off — pinned probes report the end-of-gen aggregate only
-          </p>
+          <p class="hint">pinned only · end of run</p>
         {/if}
       </div>
 

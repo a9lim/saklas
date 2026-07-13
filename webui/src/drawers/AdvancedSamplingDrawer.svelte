@@ -44,7 +44,6 @@
   <header class="header">
     <div>
       <span class="title">advanced sampling</span>
-      <p>per-run controls for stop strings and logit bias</p>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
@@ -62,11 +61,7 @@
           >{m.label}</button>
         {/each}
       </div>
-      <p class="hint">
-        the {genUiMode.mode} surface is active. this is a
-        {isBaseModel ? "base" : "chat"} model, so {isBaseModel ? "raw" : "chat"}
-        is its default. switching mode never changes the loom tree.
-      </p>
+      <p class="hint">default: {isBaseModel ? "raw" : "chat"} · tree unchanged</p>
     </section>
 
     <section class="panel">

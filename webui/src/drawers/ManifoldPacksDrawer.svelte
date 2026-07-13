@@ -139,7 +139,7 @@
 
 <div class="drawer-shell">
   <header class="header">
-    <span class="title">manifold packs</span>
+    <span class="title">packs</span>
     <button
       type="button"
       class="close"
@@ -162,7 +162,7 @@
       aria-selected={tab === "search"}
       class:active={tab === "search"}
       onclick={() => (tab = "search")}
-    >search hf</button>
+    >hf</button>
   </div>
 
   <div class="body">
@@ -171,8 +171,7 @@
         <p class="muted">loading manifolds…</p>
       {:else if steerRack.catalog.length === 0}
         <p class="muted">
-          no manifolds installed yet — search HF above, or use
-          <strong>+ build manifold</strong> from the manifold drawer.
+          none installed
         </p>
       {:else}
         <ul class="rows" role="list">
@@ -205,7 +204,7 @@
           <span class="vh">search query</span>
           <input
             type="search"
-            placeholder="search HF for saklas-manifold repos…"
+            placeholder="search HF…"
             aria-label="Search HF for saklas-manifold repos"
             bind:value={query}
             oninput={scheduleSearch}
@@ -213,15 +212,14 @@
         </label>
         {#if !query.trim()}
           <p class="muted">
-            type to search the HF hub for
-            <code>saklas-manifold</code>-tagged repos.
+            <code>saklas-manifold</code> repos
           </p>
         {:else if searchLoading}
-          <p class="muted">searching hf hub…</p>
+          <p class="muted">searching…</p>
         {:else if searchError}
           <p class="error" role="alert">{searchError}</p>
         {:else if searchResults.length === 0}
-          <p class="muted">no matches.</p>
+          <p class="muted">no matches</p>
         {:else}
           <ul class="rows" role="list">
             {#each searchResults as row (selectorOf(row))}
@@ -390,10 +388,6 @@
     font-family: var(--font-mono);
     color: var(--fg-strong);
     font-size: var(--text-sm);
-  }
-  .muted strong {
-    color: var(--accent-purple);
-    font-weight: var(--weight-medium);
   }
   .error {
     margin: 0;

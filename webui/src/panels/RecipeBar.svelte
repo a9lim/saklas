@@ -111,7 +111,7 @@
 <div class="recipe" title={expression || "no active steering"}>
   <span class="lbl">recipe</span>
   {#if chips.length === 0}
-    <span class="empty">no steering — model runs clean</span>
+    <span class="empty">none</span>
   {:else}
     <div class="chips">
       {#each chips as chip (chip.name)}
@@ -130,7 +130,7 @@
     <button
       type="button"
       class="copy"
-      title="copy the canonical expression"
+      title="copy expression"
       aria-label="Copy steering expression"
       onclick={copyExpression}
     >⧉</button>

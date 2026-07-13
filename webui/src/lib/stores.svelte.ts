@@ -189,10 +189,10 @@ export async function useLensSource(source: string): Promise<void> {
     lensState.layers = out.live_layers;
     await refreshSession();
     await refreshLensSources();
-    pushToast(`J-lens source active — ${source}`, { kind: "info" });
+    pushToast(`J-lens · ${source}`, { kind: "info" });
   } catch (e) {
     pushToast(
-      `J-lens source switch failed — ${e instanceof Error ? e.message : String(e)}`,
+      `J-lens source: ${e instanceof Error ? e.message : String(e)}`,
       { kind: "error" },
     );
   } finally {
@@ -314,7 +314,7 @@ export async function setLiveSae(enabled: boolean): Promise<void> {
     }
   } catch (e) {
     pushToast(
-      `live SAE ${enabled ? "enable" : "disable"} failed: ` +
+      `SAE live: ` +
         (e instanceof Error ? e.message : String(e)),
       { kind: "error" },
     );
@@ -353,7 +353,7 @@ export async function loadSae(release: string): Promise<void> {
   } catch (e) {
     saeState.loading = false;
     saeState.loadError = e instanceof Error ? e.message : String(e);
-    pushToast(`SAE load failed — ${saeState.loadError}`, { kind: "error" });
+    pushToast(`SAE load: ${saeState.loadError}`, { kind: "error" });
   }
 }
 
@@ -405,10 +405,10 @@ export async function pollSaeTrain(): Promise<void> {
         await refreshProbeList();
         if (st.finished_at !== null) {
           if (st.message === "cancelled") {
-            pushToast("SAE training cancelled", { kind: "info" });
+            pushToast("SAE train cancelled", { kind: "info" });
           } else {
             pushToast(
-              st.error ? `SAE training failed — ${st.error}` : "Local SAE trained — live readout on",
+              st.error ? `SAE train: ${st.error}` : "SAE trained · live",
               { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
             );
           }
@@ -437,7 +437,7 @@ export async function startSaeTrain(body: {
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     saeTrainState.error = message;
-    pushToast(`SAE training start failed — ${message}`, { kind: "error" });
+    pushToast(`SAE train: ${message}`, { kind: "error" });
   }
 }
 
@@ -449,7 +449,7 @@ export async function cancelSaeTrain(): Promise<void> {
   } catch (e) {
     saeTrainState.cancelling = false;
     pushToast(
-      `SAE training cancel failed — ${e instanceof Error ? e.message : String(e)}`,
+      `SAE cancel: ${e instanceof Error ? e.message : String(e)}`,
       { kind: "error" },
     );
   }
@@ -486,7 +486,7 @@ export async function setLiveProbes(enabled: boolean): Promise<void> {
     probesLiveState.enabled = out.enabled;
   } catch (e) {
     pushToast(
-      `live probes ${enabled ? "enable" : "disable"} failed: ` +
+      `probe live: ` +
         (e instanceof Error ? e.message : String(e)),
       { kind: "error" },
     );
@@ -529,7 +529,7 @@ export async function setLiveLens(enabled: boolean): Promise<void> {
     }
   } catch (e) {
     pushToast(
-      `live lens ${enabled ? "enable" : "disable"} failed: ` +
+      `lens live: ` +
         (e instanceof Error ? e.message : String(e)),
       { kind: "error" },
     );
@@ -574,7 +574,7 @@ export async function pollLensFetch(): Promise<void> {
         await refreshLensSources();
         if (st.finished_at !== null) {
           pushToast(
-            st.error ? `official J-lens fetch failed — ${st.error}` : "Official J-lens active — live readout on",
+            st.error ? `J-lens fetch: ${st.error}` : "J-lens active · live",
             { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
           );
         }
@@ -599,7 +599,7 @@ export async function startLensFetch(
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     lensFetchState.error = message;
-    pushToast(`official J-lens fetch start failed — ${message}`, { kind: "error" });
+    pushToast(`J-lens fetch: ${message}`, { kind: "error" });
   }
 }
 
@@ -672,12 +672,12 @@ export async function pollLensFit(): Promise<void> {
           if (st.message === "cancelled") {
             pushToast("J-lens fit cancelled", { kind: "info" });
           } else if (st.error) {
-            pushToast(`lens fit failed — ${st.error}`, {
+            pushToast(`J-lens fit: ${st.error}`, {
               kind: "error",
               ttlMs: null,
             });
           } else {
-            pushToast("J-lens fitted — live readout on", { kind: "info" });
+            pushToast("J-lens fitted · live", { kind: "info" });
           }
           await refreshSession();
           await refreshLensSources();
@@ -705,7 +705,7 @@ export async function startLensFit(
     _applyFitStatus(st);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`lens fit start failed — ${msg}`, { kind: "error" });
+    pushToast(`J-lens fit: ${msg}`, { kind: "error" });
     return;
   }
   void pollLensFit();
@@ -719,10 +719,10 @@ export async function cancelLensFit(): Promise<void> {
   try {
     const st = await apiLens.cancelFit();
     _applyFitStatus(st);
-    pushToast("J-lens fit cancellation requested", { kind: "info" });
+    pushToast("J-lens cancelling…", { kind: "info" });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`lens fit cancel failed — ${msg}`, { kind: "error" });
+    pushToast(`J-lens cancel: ${msg}`, { kind: "error" });
     lensFitState.cancelling = false;
   }
 }
@@ -737,7 +737,7 @@ export async function checkLensFit(): Promise<void> {
     if (st.running) void pollLensFit();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`lens fit status failed — ${msg}`, { kind: "error" });
+    pushToast(`J-lens status: ${msg}`, { kind: "error" });
   }
 }
 
@@ -2051,7 +2051,7 @@ export async function refreshLoomTree(): Promise<void> {
     applyTreeSnapshot(snap);
   } catch (e) {
     loomTree.error = e instanceof Error ? e.message : String(e);
-    pushToast(`Tree API failed: ${loomTree.error}`, { kind: "error" });
+    pushToast(`tree: ${loomTree.error}`, { kind: "error" });
   }
 }
 
@@ -2727,7 +2727,7 @@ export function ensureWebSocket(): Promise<WebSocket> {
         } catch (e) {
           rehydrating = false;
           loomTree.error = e instanceof Error ? e.message : String(e);
-          pushToast(`WebSocket rehydration failed: ${loomTree.error}`, { kind: "error" });
+          pushToast(`reconnect: ${loomTree.error}`, { kind: "error" });
           // Never leave an apparently reusable OPEN socket behind after its
           // authoritative snapshot failed.  A later send must establish a
           // fresh connection and retry the complete rehydration barrier.
@@ -3177,7 +3177,7 @@ function handleWsMessage(msg: WSServerMessage): void {
       // server-owned log rendered generation errors as a silent empty
       // node.  A sticky toast survives every tree sync — errors must
       // never be silent.
-      pushToast(`generation error: ${msg.message}`, {
+      pushToast(`generation: ${msg.message}`, {
         kind: "error",
         ttlMs: null,
       });

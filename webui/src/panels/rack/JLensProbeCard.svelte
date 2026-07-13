@@ -105,18 +105,18 @@
       pinned={true}
       disabled={unpinBusy}
       onclick={() => void onUnpin()}
-      title="Pinned (click to unpin)"
+      title="unpin"
       ariaLabel={`Unpin probe ${name}`}
     />
 
-    <span class="name" title="probe {name} — readout strength over the workspace band">
+    <span class="name" title="probe {name}">
       {word}
     </span>
 
     {#if depthCom !== null}
       <span
         class="com"
-        title="depth center of mass ±spread, weighted by per-layer probability (0 = first block, 1 = last)"
+        title="depth ± spread"
       >@{fmtCoord(depthCom)}{depthSpread !== null ? ` ±${fmtCoord(depthSpread)}` : ""}</span>
     {/if}
 
@@ -131,7 +131,7 @@
       {#snippet left()}
         <span
           class="row-label"
-          title="strength — mean probability of this token across the workspace band (0–1); the @when:jlens/{word} gate channel"
+          title="mean band probability"
         >strength</span>
       {/snippet}
       {#snippet bar()}

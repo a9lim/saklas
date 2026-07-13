@@ -110,12 +110,7 @@
   </header>
 
   <div class="body">
-    <p class="hint">
-      writes a JSON blob containing the complete conversation tree (all
-      branches, recipes, token metadata, notes, stars, and cast) plus the
-      steering, probe, sampling, and highlight workspace. Re-open it via
-      load to restore the server-owned tree atomically.
-    </p>
+    <p class="hint">complete tree + workspace</p>
 
     <label class="field">
       <span class="label">filename</span>

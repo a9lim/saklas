@@ -218,10 +218,10 @@
 
 {#if bootStatus === "failed"}
   <div class="boot-failed" role="alert">
-    <h1>connection failed</h1>
+    <h1>offline</h1>
     <p class="message">{bootError}</p>
     <p class="hint">
-      saklas server unreachable.  Is <code>saklas serve</code> running?
+      start <code>saklas serve</code>
     </p>
     <button type="button" class="retry" onclick={runBootstrap}>retry</button>
   </div>
@@ -346,7 +346,7 @@
     {#if bootStatus === "loading"}
       <div class="boot-loading" role="status" aria-live="polite">
         <span class="boot-spinner" aria-hidden="true"></span>
-        <span>loading workbench</span>
+        <span>loading…</span>
       </div>
     {/if}
 

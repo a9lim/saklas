@@ -40,7 +40,6 @@
   <header class="header">
     <div>
       <span class="title">session & auth</span>
-      <p>bearer key, session list, and multi-session readiness</p>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
@@ -52,13 +51,13 @@
         <input
           type="password"
           bind:value={key}
-          placeholder="SAKLAS_API_KEY for this browser tab"
+          placeholder="SAKLAS_API_KEY"
           autocomplete="off"
         />
         <button type="button" onclick={saveKey}>{saved ? "saved" : "apply"}</button>
         <button type="button" onclick={() => { key = ""; void saveKey(); }}>clear</button>
       </div>
-      <p class="hint">Stored only in memory for this page session; no localStorage write.</p>
+      <p class="hint">memory only</p>
     </section>
 
     <section class="panel">
@@ -73,7 +72,7 @@
       {/if}
       <div class="sessions">
         {#if sessions.length === 0}
-          <div class="empty">click refresh to query the native session collection</div>
+          <div class="empty">refresh to list</div>
         {:else}
           {#each sessions as s (s.id)}
             <article class:active={sessionState.info?.id === s.id}>
@@ -86,15 +85,6 @@
       </div>
     </section>
 
-    <section class="panel">
-      <h3>remote/multi-session posture</h3>
-      <p>
-        The native API is already shaped like a multi-session service, but this
-        local dashboard still talks to the bundled same-origin server and the
-        websocket path resolves the default session. This surface makes the
-        boundary visible instead of hiding it inside fetch helpers.
-      </p>
-    </section>
   </div>
 </section>
 
@@ -102,7 +92,7 @@
   .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: transparent; }
   .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-6); background: var(--surface); }
   .title { color: var(--accent); letter-spacing: 0; font-size: var(--text-md); font-weight: var(--weight-medium); }
-  .header p, .hint, .panel p { margin: var(--space-1) 0 0; color: var(--fg-muted); line-height: 1.45; }
+  .hint, .panel p { margin: var(--space-1) 0 0; color: var(--fg-muted); line-height: 1.45; }
   .close {
     background: var(--glass);
     color: var(--fg-muted);

@@ -285,11 +285,7 @@
   </header>
 
   <div class="body">
-    <p class="hint">
-      restore a complete saklas v4 conversation file into the live server.
-      The file's model must match; vectors referenced by workspace controls
-      must already be registered for steering to take effect.
-    </p>
+    <p class="hint">model must match</p>
 
     <label class="field">
       <span class="label">file</span>
@@ -315,7 +311,7 @@
           <li>turns: {parsed.tree.nodes.filter((node) => node.parent_id !== null).length}</li>
           <li>terms: {parsed.steerRack.length}</li>
           <li>probes: {parsed.probeRack.active.length}</li>
-          <li>sampling fields: {Object.keys(parsed.samplingState).length}</li>
+          <li>sampling: {Object.keys(parsed.samplingState).length}</li>
         </ul>
       </div>
     {/if}

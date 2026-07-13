@@ -90,7 +90,6 @@
   <header class="header">
     <div>
       <span class="title">recipe builder</span>
-      <p>canonical expression, the shared subspace-along, and per-term triggers</p>
     </div>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
@@ -98,7 +97,7 @@
   <div class="body">
     <section class="expression-card">
       <div>
-        <span class="label">canonical expression</span>
+        <span class="label">expression</span>
         <code>{expression || "unsteered"}</code>
       </div>
       <div class="actions">
@@ -107,19 +106,19 @@
     </section>
 
     <section class="add-card">
-      <input list="recipe-concepts" bind:value={newTerm} placeholder="add concept or ns/concept" onkeydown={(ev) => { if (ev.key === "Enter") add(); }} />
+      <input list="recipe-concepts" bind:value={newTerm} placeholder="concept" onkeydown={(ev) => { if (ev.key === "Enter") add(); }} />
       <datalist id="recipe-concepts">
         {#each allNames as name (name)}
           <option value={name}></option>
         {/each}
       </datalist>
-      <button type="button" onclick={add}>add term</button>
+      <button type="button" onclick={add}>add</button>
       <button type="button" onclick={() => openDrawer("subspace")}>browse…</button>
     </section>
 
     {#if hasSubspace}
       <section class="along-card">
-        <span class="label">subspace along (shared)</span>
+        <span class="label">shared along</span>
         <div class="along-row">
           <Slider
             value={steerRack.subspaceAlong}
@@ -131,13 +130,12 @@
           />
           <strong>{steerRack.subspaceAlong.toFixed(2)}</strong>
         </div>
-        <p class="muted">one slide magnitude for every flat term — relative weight lives in each term's position (set on its card)</p>
       </section>
     {/if}
 
     <section class="terms">
       {#if entries.length === 0}
-        <div class="empty">no active steering terms, add a concept or manifold to start</div>
+        <div class="empty">no terms</div>
       {:else}
         {#each entries as [name, entry] (name)}
           <article class="term" class:disabled={!entry.enabled}>
@@ -174,7 +172,6 @@
   .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: transparent; }
   .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-6); background: var(--surface); }
   .title { color: var(--accent); letter-spacing: 0; font-size: var(--text-md); font-weight: var(--weight-medium); }
-  .header p { margin: var(--space-2) 0 0; color: var(--fg-muted); }
   .remove { background: transparent; border: 0; color: var(--fg-muted); font-size: var(--text-md); }
   .close {
     background: var(--glass);

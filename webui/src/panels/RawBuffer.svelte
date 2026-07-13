@@ -347,7 +347,7 @@
 
 <div class="raw-buffer" aria-label="Completion buffer">
   <div class="raw-head">
-    <span class="head-label">completion buffer</span>
+    <span class="head-label">buffer</span>
     <div class="mode-toggle" role="tablist" aria-label="Buffer mode">
       <button
         type="button"
@@ -355,7 +355,7 @@
         aria-selected={mode === "edit"}
         class:active={mode === "edit"}
         onclick={() => (mode = "edit")}
-        title="edit the raw completion text"
+        title="edit"
       >edit</button>
       <button
         type="button"
@@ -415,7 +415,7 @@
         oninput={onInput}
         onkeydown={onKeydown}
         spellcheck="false"
-        placeholder="(empty completion buffer — type a prompt and continue)"
+        placeholder="prompt…"
         aria-label="Editable completion buffer"
       ></textarea>
     {/if}
@@ -426,14 +426,14 @@
 
   <div class="actions">
     {#if dirty}
-      <span class="dirty-flag" title="the buffer has uncommitted edits">
+      <span class="dirty-flag" title="uncommitted">
         edited
       </span>
       <button
         type="button"
         class="act commit"
         onclick={() => void commitEdit()}
-        title="⌃⏎ — land the edit on the tree without generating"
+        title="⌃⏎ commit"
       >
         commit edit
       </button>
@@ -446,7 +446,7 @@
       class="act continue"
       onclick={continueGen}
       disabled={genStatus.active}
-      title="⏎ — generate a raw continuation from the buffer (⇧⏎ for a newline)"
+      title="⏎ continue"
     >continue</button>
     <button
       type="button"

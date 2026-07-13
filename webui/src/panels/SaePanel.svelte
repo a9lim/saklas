@@ -375,7 +375,7 @@
         <input
           class="add-input"
           bind:value={localName}
-          placeholder="local SAE name"
+          placeholder="name"
           aria-label="Local SAE name"
         />
       </label>
@@ -388,7 +388,7 @@
           step="10000"
           bind:value={trainTokens}
           aria-label="SAE training tokens"
-          title="Training tokens"
+          title="tokens"
         />
       </label>
       <label class="setup-field setup-field-narrow">
@@ -432,15 +432,14 @@
           disabled={saeTrainState.cancelling}
           onclick={() => void cancelSaeTrain()}
         >
-          {saeTrainState.cancelling ? "requesting cancel…" : "cancel training"}
+          {saeTrainState.cancelling ? "cancelling…" : "cancel"}
         </Button>
       </div>
     {/snippet}
     {#snippet warning()}
       {#if trainConfirm}
         <p class="hint train-warning" role="alert">
-          Training blocks generation and uses the default FineWeb-Edu stream.
-          Press confirm again.
+          Blocks generation; uses FineWeb-Edu. Confirm again.
         </p>
       {/if}
     {/snippet}
@@ -450,10 +449,7 @@
           <code>{info?.release}</code> · L{info?.layer} · {info?.width?.toLocaleString()} features
         </p>
       {:else}
-        <p class="hint">
-          Fetch a provider release without copying its weights into Saklas,
-          or train a Saklas-owned local SAE.
-        </p>
+        <p class="hint">fetch or train</p>
       {/if}
     {/snippet}
     {#snippet messages()}
@@ -467,7 +463,7 @@
         <p class="hint load-error" role="alert">local train: {saeTrainState.error}</p>
       {/if}
       {#if discoverError}
-        <p class="hint" role="alert">registry suggestions unavailable: {discoverError}</p>
+        <p class="hint" role="alert">registry: {discoverError}</p>
       {/if}
     {/snippet}
   </InstrumentSourceSection>
@@ -519,8 +515,8 @@
         live={saeState.live}
         liveBusy={saeState.busy}
         liveTitle={saeState.live
-          ? "Stop the per-step feature readout (pinned probes settle to the end-of-gen activation)"
-          : "Stream the SAE feature readout live during generation (pinned probes + discovery top-k)"}
+          ? "disable live readout"
+          : "enable live readout"}
         onLiveToggle={() => void setLiveSae(!saeState.live)}
         sortValue={saeState.sortMode}
         sortOptions={SORT_OPTIONS}
@@ -569,12 +565,10 @@
 
         {#if saeState.live}
           {#if discovery.length === 0}
-            <p class="hint">feature discovery streams on the next generation</p>
+            <p class="hint">run to discover</p>
           {/if}
         {:else}
-          <p class="hint">
-            live off — pinned features settle to the end-of-generation activation
-          </p>
+          <p class="hint">pinned only · end of run</p>
         {/if}
       </div>
 

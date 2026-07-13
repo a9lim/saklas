@@ -64,7 +64,7 @@
         rows="12"
         bind:value={value}
         disabled={busy}
-        placeholder="(no system prompt)"
+        placeholder="none"
         spellcheck="false"
       ></textarea>
       <span class="char-count">{value.length} char{value.length === 1 ? "" : "s"}</span>

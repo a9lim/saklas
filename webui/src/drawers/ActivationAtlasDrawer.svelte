@@ -160,7 +160,7 @@
       <strong>{probeRack.active.length}</strong>
     </div>
     <div class="stat">
-      <span class="stat-label">logprob mean</span>
+      <span class="stat-label">mean lp</span>
       <strong>{logprobStats ? logprobStats.mean.toFixed(2) : "—"}</strong>
     </div>
     <div class="stat">
@@ -173,12 +173,12 @@
     <!-- Token picker — horizontal scroll-strip of every assistant token. -->
     <section class="section">
       <div class="section-head">
-        <h3>token timeline</h3>
-        <span>{tokens.length} response tokens</span>
+        <h3>tokens</h3>
+        <span>{tokens.length}</span>
       </div>
       {#if tokens.length === 0}
         <div class="empty">
-          generate with probes or top alternatives enabled to populate the atlas
+          run with probes or alts
         </div>
       {:else}
         <div class="token-grid" role="listbox" aria-label="atlas tokens">
@@ -205,15 +205,14 @@
          col-labels, HeatmapCell with the canonical scoreToRgb palette). -->
     <section class="section">
       <div class="section-head">
-        <h3>layer / probe heatmap</h3>
+        <h3>layers × probes</h3>
         <span>
           {selected ? JSON.stringify(selected.text) : "no token selected"}
         </span>
       </div>
       {#if !selected || layerKeys.length === 0 || probeKeys.length === 0}
         <div class="empty">
-          no per-layer probe scores on the selected token — load probes and
-          generate a fresh turn to populate this grid
+          no layer scores
         </div>
       {:else}
         <div class="grid-scroll">
@@ -256,7 +255,7 @@
     <!-- Distribution lens — top alternatives for the selected token. -->
     <section class="section">
       <div class="section-head">
-        <h3>distribution lens</h3>
+        <h3>distribution</h3>
         <span>{selected?.score.topAlts?.length ?? 0} alternatives</span>
       </div>
       {#if selected?.score.topAlts?.length}
@@ -271,18 +270,14 @@
         </div>
       {:else}
         <div class="empty">
-          enable top alternatives in advanced sampling to see token counterfactuals
+          enable alts
         </div>
       {/if}
     </section>
   </div>
 
   <footer class="drawer-footer">
-    <span class="hint">
-      Per-token per-layer probe readings under the active rack.  Heatmap
-      colors match the correlation matrix and probe strip — diverging
-      red/green via the project's scoreToRgb scale.
-    </span>
+    <span class="hint">active-rack probe readings</span>
   </footer>
 </aside>
 

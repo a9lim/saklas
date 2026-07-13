@@ -505,7 +505,7 @@
           <span class="coord">
             turn {turnIdx} · {isThinking ? "thinking" : "response"}
           </span>
-          <span class="scrub" title="Walk the inspected token along this turn (← / →); every tab follows">
+          <span class="scrub" title="← / →">
             <button
               type="button"
               class="scrub-btn"
@@ -526,8 +526,8 @@
                 type="button"
                 class="scrub-btn scrub-home"
                 onclick={() => (scrubTokenIdx = null)}
-                title="Snap back to the clicked token"
-              >↩ clicked</button>
+                title="reset"
+              >↩</button>
             {/if}
           </span>
         </div>
@@ -555,13 +555,12 @@
   <div class="body">
     {#if !token}
       <div class="empty">
-        Token not found.  The chat log may have been cleared or rewound
-        since the drawer was opened.
+        token unavailable
       </div>
     {:else if tab === "probes"}
       {#if isEmpty}
         <div class="empty">
-          No per-layer scores captured for this token (probes not loaded?).
+          no probe scores
         </div>
       {:else}
         <div class="grid-scroll probe-grid">
@@ -626,7 +625,7 @@
                 <th class="tok">token</th>
                 <th class="num">logprob</th>
                 <th class="num">p</th>
-                <th class="num">Δ from rank 1</th>
+                <th class="num">Δ top</th>
                 <th class="num">branch</th>
               </tr>
             </thead>
@@ -647,7 +646,7 @@
                       size="sm"
                       disabled={row.chosen || branchingRank !== null}
                       onclick={() => branchFromAlt(row)}
-                      title="Fork a sibling branch: swap in this token and resample the continuation"
+                      title="fork with token"
                     >
                       {branchingRank === row.rank ? "…" : "fork"}
                     </Button>
@@ -662,37 +661,29 @@
         {/if}
       {:else if token.logprob != null}
         <div class="empty">
-          <p>
-            Chosen-token logprob captured:
-            <strong>{fmtLogprob(token.logprob)}</strong>, but no top-K
-            alternatives were requested for this generation.
-          </p>
+          <p>logprob {fmtLogprob(token.logprob)} · no alternatives</p>
           <p>
             <Button
               onclick={enableAlts}
               disabled={samplingState.return_top_k > 0}
             >
               {samplingState.return_top_k > 0
-                ? "alts on (effective next gen)"
-                : "enable alts (next generation)"}
+                ? "alts on next run"
+                : "enable alts"}
             </Button>
           </p>
         </div>
       {:else}
         <div class="empty">
-          <p>
-            No logprob data captured for this token. Either it was replayed
-            from a transcript that pre-dates logit capture, or capture wasn't
-            live for the run.
-          </p>
+          <p>no logprob data</p>
           <p>
             <Button
               onclick={enableAlts}
               disabled={samplingState.return_top_k > 0}
             >
               {samplingState.return_top_k > 0
-                ? "alts on (effective next gen)"
-                : "enable alts (next generation)"}
+                ? "alts on next run"
+                : "enable alts"}
             </Button>
           </p>
         </div>
@@ -706,47 +697,38 @@
            so it works for any in-session token, no per-token gen cost. -->
       {#if !jlensFitted}
         <div class="empty">
-          <p>
-            No Jacobian lens is fitted for
-            <code>{sessionState.info?.model_id ?? "this model"}</code>.
-          </p>
-          <p>
-            Fit one from a terminal —
-            <code>saklas lens fit {sessionState.info?.model_id ?? "<model>"}</code>
-            — then reopen this drawer.
-          </p>
+          <p>no J-LENS fit</p>
+          <p><code>saklas lens fit {sessionState.info?.model_id ?? "<model>"}</code></p>
         </div>
       {:else if token.rawIndex == null}
         <div class="empty">
-          This token has no raw-decode index — the readout needs a node
-          generated in this session (current uncaptured turns can't be
-          re-read, same constraint as forking).
+          no raw decode index
         </div>
       {:else if !loomNodeId}
         <div class="empty">
-          No loom assistant node is available for this token.
+          no loom node
         </div>
       {:else if lensLoading}
         <div class="empty">
-          computing workspace readout (one prefix forward)…
+          computing…
         </div>
       {:else if lensError}
         <div class="empty">
-          <p>Workspace readout failed: {lensError}</p>
+          <p>readout: {lensError}</p>
         </div>
       {:else if lensData}
         <div class="tab-summary">
           <div>
             produced: <code class="tok-inline">{JSON.stringify(lensData.token_text)}</code>
             {#if lensData.steering !== null}
-              <span class="kv steer-chip" title="The replay ran under the node's recipe steering">
+              <span class="kv steer-chip" title="recipe applied">
                 steered: <code>{lensData.steering}</code>
               </span>
             {:else if !lensSteered}
-              <span class="kv">unsteered counterfactual</span>
+              <span class="kv">unsteered</span>
             {/if}
             {#if lensHasSteering}
-              <label class="kv steer-toggle" title="Replay under the node's recipe steering vs the unsteered counterfactual of the same token stream">
+              <label class="kv steer-toggle" title="apply recipe">
                 <input type="checkbox" bind:checked={lensSteered} />
                 apply recipe steering
               </label>
@@ -811,13 +793,13 @@
       {/if}
     {:else}
       {#if !saeLoaded}
-        <div class="empty">No SAE is loaded for this session. Load one from the SAE inspector tab.</div>
+        <div class="empty">no SAE loaded</div>
       {:else if token.rawIndex == null || !loomNodeId}
-        <div class="empty">This token has no in-session raw decode record for SAE replay.</div>
+        <div class="empty">no raw decode record</div>
       {:else if saeLoading}
-        <div class="empty">computing SAE readout (one prefix forward)…</div>
+        <div class="empty">computing…</div>
       {:else if saeError}
-        <div class="empty">SAE readout failed: {saeError}</div>
+        <div class="empty">readout: {saeError}</div>
       {:else if saeData}
         <div class="tab-summary">resident SAE · L{saeData.layer} · produced <code>{JSON.stringify(saeData.token_text)}</code></div>
         <div class="grid-scroll">
@@ -1015,9 +997,6 @@
   .empty code {
     font-family: var(--font-mono);
     color: var(--fg-dim);
-  }
-  .empty strong {
-    color: var(--fg-strong);
   }
 
   /* Data wells — tables recess into a deeper glass window.  Sticky

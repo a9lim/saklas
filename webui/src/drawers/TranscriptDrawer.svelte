@@ -200,13 +200,10 @@
 
   <div class="body">
     {#if tab === "export"}
-      <p class="hint">
-        Export the path ending at the chosen node as a saklas transcript
-        YAML. Leave the field blank to export the active path.
-      </p>
+      <p class="hint">blank = active path</p>
 
       <label class="field">
-        <span class="label">node id (or prefix)</span>
+        <span class="label">node</span>
         <input
           type="text"
           class="input"
@@ -244,33 +241,31 @@
         </div>
       {/if}
     {:else}
-      <p class="hint">
-        Paste YAML below or upload a file. Pick a mode and run.
-      </p>
+      <p class="hint">paste or upload YAML</p>
 
       <div class="field">
         <span class="label">mode</span>
         <span class="mode-opt">
           <Radio bind:group={importMode} value="default" ariaLabel="default" />
-          <span><strong>default</strong>: attach at root (fresh branch)</span>
+          <span><strong>default</strong> · root</span>
         </span>
         <span class="mode-opt">
           <Radio bind:group={importMode} value="here" ariaLabel="here" />
-          <span><strong>here</strong>: attach at the active node</span>
+          <span><strong>here</strong> · active node</span>
         </span>
         <span class="mode-opt">
           <Radio bind:group={importMode} value="merge" ariaLabel="merge" />
-          <span><strong>merge</strong>: deepest user-turn prefix match</span>
+          <span><strong>merge</strong> · deepest match</span>
         </span>
       </div>
 
       <span class="mode-opt">
         <Checkbox bind:checked={importStrict} ariaLabel="strict mode" />
-        <span>strict (refuse on probe-hash drift)</span>
+        <span>strict probe hashes</span>
       </span>
 
       <div class="field">
-        <span class="label">file (optional)</span>
+        <span class="label">file</span>
         <input
           type="file"
           accept=".yaml,.yml,application/x-yaml,text/yaml"
@@ -302,21 +297,18 @@
 
       {#if importGuards.length > 0}
         <div class="banner">
-          <span class="banner-title">guards triggered</span>
+          <span class="banner-title">guards</span>
           <ul>
             {#each importGuards as g (g)}
               <li>{g}</li>
             {/each}
           </ul>
-          <p class="hint">
-            These have been stamped as notes on the imported branch's
-            root node so the sidebar can flag them in context.
-          </p>
+          <p class="hint">saved as root notes</p>
         </div>
       {/if}
       {#if importLeafId && !importError}
         <p class="ok">
-          imported successfully, leaf node
+          imported · leaf
           <code>{importLeafId.slice(0, 12)}</code>
         </p>
       {/if}

@@ -97,7 +97,7 @@
   {:else}
     <div class="setup-stack">
       <div class="setup-group">
-        <span class="setup-label">prepared / provider</span>
+        <span class="setup-label">source</span>
         <div class="setup-row source-row">
           <div class="setup-controls">
             <Select
@@ -124,25 +124,25 @@
                   ? ready
                     ? "active"
                     : selectedProviderOption
-                      ? "repair source"
+                    ? "repair"
                       : "unavailable"
                   : selectedSource
-                    ? "use source"
-                    : "fetch provider"}
+                    ? "use"
+                    : "fetch"}
             </Button>
           </div>
         </div>
         <p class="source-note">
           {#if activeSource}
             <code>{activeSource.source}</code>
-            · {activeSource.kind === "local" ? "Saklas-owned artifact" : "provider-owned cache"}
+            · {activeSource.kind === "local" ? "local" : "cached"}
           {:else}
-            no source active
+            none
           {/if}
         </p>
       </div>
       <div class="setup-group">
-        <span class="setup-label">custom</span>
+        <span class="setup-label">local</span>
         <div class="setup-row local-row">
           <div class="setup-controls">{@render localControls()}</div>
           <div class="setup-action">{@render localAction()}</div>
