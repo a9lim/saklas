@@ -151,9 +151,10 @@ def register_sae_routes(app: FastAPI) -> None:
                     info = await asyncio.to_thread(
                         session.load_sae, release, layer=body.layer,
                     )
+                    await asyncio.to_thread(session.enable_live_sae, top_k=12)
                 state["info"] = info
                 state["message"] = (
-                    f"loaded {source} at L{info.get('layer')} "
+                    f"loaded {source} · live at L{info.get('layer')} "
                     f"({info.get('width')} features)"
                 )
             except Exception as exc:  # background status owns translation

@@ -28,6 +28,7 @@
   import type { ChatTurn, TokenScore } from "../lib/types";
   import {
     scoreToRgb,
+    highlightHue,
     surpriseScore,
     SURPRISE_TARGET,
     probeScoreForTarget,
@@ -268,7 +269,7 @@
     const bg = scoreToRgb(
       tokenScore(t),
       highlightScale(highlightState.target),
-      highlightState.target === SURPRISE_TARGET ? "surprise" : "signed",
+      highlightHue(highlightState.target),
     );
     return bg === "transparent" ? "" : `background-color: ${bg}`;
   }

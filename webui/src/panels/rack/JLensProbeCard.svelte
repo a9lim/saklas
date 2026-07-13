@@ -18,10 +18,11 @@
   import type { ProbeRackEntry } from "../../lib/types";
   import Bar from "../../lib/charts/Bar.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
-  import { detachProbe } from "../../lib/stores.svelte";
+  import { detachProbe, highlightState } from "../../lib/stores.svelte";
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import RackCard from "./RackCard.svelte";
   import ProbePinButton from "./ProbePinButton.svelte";
+  import ProbeHighlightButton from "./ProbeHighlightButton.svelte";
   import LayerStrip from "./LayerStrip.svelte";
   import ProbeReadingRow from "./ProbeReadingRow.svelte";
 
@@ -33,6 +34,7 @@
   let { name, entry }: Props = $props();
 
   const word = $derived(name.slice("jlens/".length));
+  const isHighlight = $derived(highlightState.target === name);
 
   // ---------- latest reading: live during gen, settled (aggregate) after ----------
   const latest = $derived(entry.aggregate ?? entry.reading);
@@ -98,7 +100,7 @@
   }
 </script>
 
-<RackCard accent="--accent-blue" disabled={false}>
+<RackCard accent="--accent-blue" disabled={false} active={isHighlight}>
   {#snippet statline()}
     <ProbePinButton
       shape="square"
@@ -121,6 +123,8 @@
     {/if}
 
     <span class="spacer"></span>
+
+    <ProbeHighlightButton {name} />
 
     <Sparkline points={sparkline} width={56} height={14} color="var(--card-accent)" />
   {/snippet}

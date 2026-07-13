@@ -361,7 +361,10 @@ Three read surfaces over either source, plus local fit and external fetch:
   cancellable); either successful preparation activates the source and turns
   the live readout on. The SAE tab has the same SOURCE/STEER/PROBE shape:
   prepared `local:<name>` / `saelens:<release>` sources, provider fetch/load,
-  or background local training with token progress and cancellation.
+  or background local training with token progress and cancellation. When the
+  dashboard is served, Saklas restores an explicitly active SAE or attaches the
+  best compatible official provider release, then enables its live readout by
+  default; `--no-web` does not acquire or download an SAE implicitly.
   `POST /saklas/v1/sessions/{id}/lens/live` toggles the live
   lens, the native WS `token` frame carries the per-step matrix as
   `lens_readout` + the chip list as `lens_aggregate`, and session info's

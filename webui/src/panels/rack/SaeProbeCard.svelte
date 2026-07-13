@@ -16,10 +16,11 @@
 
   import Bar from "../../lib/charts/Bar.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
-  import { detachProbe } from "../../lib/stores.svelte";
+  import { detachProbe, highlightState } from "../../lib/stores.svelte";
   import { pushToast } from "../../lib/stores/toasts.svelte";
   import RackCard from "./RackCard.svelte";
   import ProbePinButton from "./ProbePinButton.svelte";
+  import ProbeHighlightButton from "./ProbeHighlightButton.svelte";
   import ProbeReadingRow from "./ProbeReadingRow.svelte";
 
   interface Props {
@@ -68,6 +69,7 @@
   }: Props = $props();
 
   const name = $derived(`sae/${id}`);
+  const isHighlight = $derived(highlightState.target === name);
   /** Normalized 0..1 strength when the unit is known; null keeps raw. */
   const strength = $derived(
     maxAct != null && maxAct > 0
@@ -99,7 +101,7 @@
   }
 </script>
 
-<RackCard accent="--pillar-sae" disabled={false}>
+<RackCard accent="--pillar-sae" disabled={false} active={isHighlight}>
   {#snippet statline()}
     {#if pinned}
       <ProbePinButton
@@ -130,6 +132,10 @@
     {/if}
 
     <span class="spacer"></span>
+
+    {#if pinned}
+      <ProbeHighlightButton {name} />
+    {/if}
 
     <Sparkline points={series} width={56} height={14} color="var(--card-accent)" />
   {/snippet}

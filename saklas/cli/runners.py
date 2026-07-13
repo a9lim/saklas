@@ -539,6 +539,63 @@ def _enable_serve_live_lens_if_compatible(session: Any) -> bool:
         return False
 
 
+def _best_serve_sae_release(rows: Sequence[dict[str, Any]]) -> str | None:
+    """Choose the strongest provider default for the dashboard runtime.
+
+    Provider-hosted, labelled, official releases win; canonical releases beat
+    broad variant sets, and a curated base release beats its ``-all`` sibling.
+    The final name tie-break keeps the choice stable across registry ordering.
+    Local artifacts remain explicit user choices unless one is already active.
+    """
+    candidates = [
+        row for row in rows
+        if row.get("source") == "saelens"
+        and isinstance(row.get("release"), str)
+        and bool(row["release"].strip())
+    ]
+    if not candidates:
+        return None
+
+    def rank(row: dict[str, Any]) -> tuple[bool, bool, bool, bool, str]:
+        release = str(row["release"])
+        repo_id = row.get("repo_id")
+        official = isinstance(repo_id, str) and repo_id.startswith("google/")
+        return (
+            not official,
+            not bool(row.get("neuronpedia")),
+            "canonical" not in release,
+            release.endswith("-all"),
+            release,
+        )
+
+    return str(min(candidates, key=rank)["release"])
+
+
+@_saklas_error_exit
+def _enable_serve_live_sae_if_available(session: Any) -> bool:
+    """Attach the best SAE and start its live view for the web dashboard."""
+    try:
+        info = session.sae_info
+        if info is None:
+            from saklas.core.sae import list_sae_releases
+
+            release = _best_serve_sae_release(
+                list_sae_releases(session.model_id),
+            )
+            if release is None:
+                return False
+            info = session.load_sae(release)
+        state = session.enable_live_sae(top_k=12)
+        print(
+            "Live SAE readout: on "
+            f"({info.get('release', 'active')} at L{state.get('layer')})"
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — never block serve startup
+        print(f"Live SAE readout: enable failed ({e})", file=sys.stderr)
+        return False
+
+
 def _run_serve(args: argparse.Namespace) -> None:
     try:
         import fastapi  # noqa: F401
@@ -601,6 +658,13 @@ def _run_serve(args: argparse.Namespace) -> None:
     # turns it off per session).  Serve-side policy only — the library and
     # TUI stay opt-in.  ``top_k=8`` matches the dashboard's readout width.
     _enable_serve_live_lens_if_compatible(session)
+
+    # Web dashboard policy: attach the strongest compatible provider SAE (or
+    # preserve an explicitly active local/provider source) and turn its live
+    # discovery view on. API-only ``--no-web`` serves do not acquire this
+    # optional provider dependency or download weights implicitly.
+    if web_enabled:
+        _enable_serve_live_sae_if_available(session)
 
     print(f"\nServing on http://{args.host}:{args.port}")
     print(f"OpenAI-compatible:  http://{args.host}:{args.port}/v1")

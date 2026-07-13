@@ -83,7 +83,7 @@
         onclick={() => openDrawer("subspace")}
         title="add subspace"
       >
-        + subspace steer
+        + steer
       </button>
     {:else}
       <button
@@ -92,7 +92,7 @@
         onclick={() => openDrawer("manifolds")}
         title="add manifold"
       >
-        + manifold steer
+        + steer
       </button>
     {/if}
   </div>

@@ -1422,6 +1422,28 @@ export function probeAxisScale(name: string, axis = 0): number {
   return nodeCoordExtent(probeRack.entries.get(name)?.info?.node_coords, axis);
 }
 
+/** Shared raw-activation unit for SAE features without Neuronpedia
+ *  ``maxActApprox`` metadata.  The SAE panel and transcript tint must use
+ *  the same denominator: metadata-backed probes already arrive normalized
+ *  from the server, while unhosted/local features remain raw and use the
+ *  largest currently visible raw activation as their absolute 0..1 unit. */
+export function saeRawFallbackScale(): number {
+  let max = 0;
+  for (const name of probeRack.active) {
+    if (!name.startsWith("sae/")) continue;
+    const entry = probeRack.entries.get(name);
+    if (!entry || entry.info.max_act != null) continue;
+    const reading = entry.aggregate ?? entry.reading;
+    max = Math.max(max, reading?.coords?.[0] ?? entry.current ?? 0);
+  }
+  for (const feature of saeState.readout) {
+    const meta = saeState.meta.get(feature.id);
+    if ((feature.max_act ?? meta?.max_act) != null) continue;
+    max = Math.max(max, feature.activation);
+  }
+  return Math.max(max, 1);
+}
+
 /** Saturation scale for a highlight target.  The surprise sentinel keeps the
  *  fixed ``HIGHLIGHT_SAT`` cutoff (``surpriseScore`` is pre-scaled to it); a
  *  real probe normalizes by its per-axis node extent — an axis target
@@ -1429,6 +1451,12 @@ export function probeAxisScale(name: string, axis = 0): number {
  *  axis isn't pinned saturated by a wider sibling axis. */
 export function highlightScale(target: string | null): number {
   if (!target || target === SURPRISE_TARGET) return HIGHLIGHT_SAT;
+  if (target.startsWith("jlens/")) return 1;
+  if (target.startsWith("sae/")) {
+    return probeRack.entries.get(target)?.info.max_act != null
+      ? 1
+      : saeRawFallbackScale();
+  }
   const { base, axis } = parseProbeTarget(target);
   return probeAxisScale(base, axis);
 }

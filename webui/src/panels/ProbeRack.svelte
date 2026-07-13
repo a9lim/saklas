@@ -108,7 +108,7 @@
           onclick={onAddSubspaceProbe}
           title="add subspace probe"
         >
-          + subspace probe
+          + probe
         </button>
       {:else}
         <button
@@ -117,7 +117,7 @@
           onclick={onAddManifoldProbe}
           title="add manifold probe"
         >
-          + manifold probe
+          + probe
         </button>
       {/if}
   </div>

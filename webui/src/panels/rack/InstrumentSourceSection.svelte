@@ -1,7 +1,8 @@
 <script lang="ts">
   // Canonical SOURCE section for the SAE and J-LENS pillars. Prepared and
-  // provider-backed artifacts share one selector; the custom lifecycle row
-  // below it is structurally identical for both pillars.
+  // provider-backed artifacts share one selector. Local authoring is an
+  // explicit selector mode: its fields stay out of the way until chosen, and
+  // the source-row action becomes the pillar's fit/train action.
 
   import type { Snippet } from "svelte";
   import type { InstrumentSourceJSON } from "../../lib/types";
@@ -28,7 +29,9 @@
     providerPlaceholder = "provider source",
     onfetch,
     localControls,
-    localAction,
+    localActionLabel,
+    localActionDisabled = false,
+    onlocal,
     progress,
     warning,
     summary,
@@ -46,7 +49,9 @@
     providerPlaceholder?: string;
     onfetch: (source: string) => void;
     localControls: Snippet;
-    localAction: Snippet;
+    localActionLabel: string;
+    localActionDisabled?: boolean;
+    onlocal: () => void;
     progress?: Snippet;
     warning?: Snippet;
     summary: Snippet;
@@ -63,8 +68,10 @@
     for (const option of providerOptions) {
       if (!prepared.has(option.value)) result.push(option);
     }
+    if (!prepared.has("local")) result.push({ value: "local", label: "local" });
     return result;
   });
+  const localSelected = $derived(value === "local");
   const selectedSource = $derived(sources.find((source) => source.source === value));
   const selectedProviderOption = $derived(
     providerOptions.find((option) => option.value === value),
@@ -74,6 +81,10 @@
 
   function applySource(): void {
     if (!value) return;
+    if (localSelected) {
+      onlocal();
+      return;
+    }
     if (selectedSource) {
       // A prepared external source and its provider intentionally share one
       // identifier (for example ``neuronpedia``).  Treat it as prepared first;
@@ -113,14 +124,19 @@
               size="sm"
               variant="solid"
               {accent}
-              disabled={busy || !value || selectedOption?.disabled === true ||
-                (selectedSource?.active === true &&
-                  (ready || selectedProviderOption === undefined))}
+              disabled={busy || !value ||
+                (localSelected
+                  ? localActionDisabled
+                  : selectedOption?.disabled === true ||
+                    (selectedSource?.active === true &&
+                      (ready || selectedProviderOption === undefined)))}
               onclick={applySource}
             >
               {busy
                 ? "working…"
-                : selectedSource?.active
+                : localSelected
+                  ? localActionLabel
+                  : selectedSource?.active
                   ? ready
                     ? "active"
                     : selectedProviderOption
@@ -141,13 +157,14 @@
           {/if}
         </p>
       </div>
-      <div class="setup-group">
-        <span class="setup-label">local</span>
-        <div class="setup-row local-row">
+      {#if localSelected}
+        <div class="setup-group local-group">
+          <span class="setup-label">local</span>
+          <div class="setup-row local-row">
           <div class="setup-controls">{@render localControls()}</div>
-          <div class="setup-action">{@render localAction()}</div>
+          </div>
         </div>
-      </div>
+      {/if}
     </div>
   {/if}
 
@@ -208,6 +225,9 @@
     gap: var(--space-2);
     min-width: 0;
   }
+  .local-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .setup-controls {
     display: flex;
     align-items: stretch;
@@ -259,5 +279,12 @@
     margin: 0;
     color: var(--accent-red);
     font-size: var(--text-sm);
+  }
+  /* Optional snippets often render no DOM at all. Empty flex children still
+     consumed a section gap, producing the large SOURCE→STEER void. */
+  .warning:empty,
+  .summary:empty,
+  .messages:empty {
+    display: none;
   }
 </style>

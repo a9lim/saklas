@@ -152,6 +152,12 @@ class TestSaeRoutes:
         )
         assert resp.status_code == 202
         assert resp.json()["release"] == "saelens:scope"
+        for _ in range(20):
+            status = client.get("/saklas/v1/sessions/default/sae/load").json()
+            if not status["running"]:
+                break
+        assert status["error"] is None
+        session.enable_live_sae.assert_called_once_with(top_k=12)
 
     def test_train_cancel_requires_running_job_and_sets_event(
         self, session_and_client: Any,

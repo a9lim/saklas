@@ -118,6 +118,11 @@ manifold (`personas`, `emotions`) — is attached at session construction
 dashboard rack opens already watching them. `_resolve_probes` maps unset / `all` →
 `None` (the session's default-roster signal), `none` / `[]` → `[]`, and an explicit
 category list through verbatim (tagged concepts only, no multi-node sweep).
+Serve then enables a compatible J-lens when present. For a web-enabled serve it
+also restores the active SAE or chooses the strongest compatible official,
+Neuronpedia-backed provider release (canonical/curated variants first), loads it,
+and enables the 12-card live SAE readout; `--no-web` skips implicit SAE discovery
+and acquisition.
 
 ## Flags
 

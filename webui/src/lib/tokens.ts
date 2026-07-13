@@ -79,7 +79,7 @@ export function surpriseScore(
  *  — surprise is a vocabulary-distribution quantity, so it shares the
  *  J-lens hue family and is unmistakably distinct from any probe
  *  reading (pre-v2 it reused the positive green band). */
-export type TintHue = "signed" | "surprise";
+export type TintHue = "signed" | "surprise" | "sae";
 
 /* Ramp poles (tokens.css: --highlight-pos / --highlight-neg /
  * --highlight-surprise) as rgb triplets, and the alpha ceiling.  v2
@@ -90,6 +90,7 @@ export type TintHue = "signed" | "surprise";
 const TINT_POS = "52, 211, 153"; /* #34d399 */
 const TINT_NEG = "229, 84, 79"; /* #e5544f */
 const TINT_SURPRISE = "107, 166, 248"; /* #6ba6f8 */
+const TINT_SAE = "242, 201, 76"; /* #f2c94c */
 const TINT_MAX_ALPHA = 0.62;
 
 /** Map a probe score to a CSS rgba() background (stronger score =
@@ -105,8 +106,11 @@ const TINT_MAX_ALPHA = 0.62;
  * token.  A degenerate (0 / non-finite) scale falls back to the fixed
  * cutoff rather than dividing by zero.
  *
- * ``hue`` picks the ramp: ``signed`` (default — green/red poles) or
- * ``surprise`` (unsigned logit-space blue; |t| drives opacity). */
+ * ``hue`` picks the ramp: ``signed`` (default — green/red poles),
+ * ``surprise`` (unsigned logit/J-lens blue), or ``sae`` (unsigned gold).
+ * J-LENS and metadata-backed SAE probes pass scale=1; metadata-less SAE
+ * probes pass their shared raw-activation denominator.  Either way the
+ * readout strength saturates on the same unit interval as surprise. */
 export function scoreToRgb(
   score: number | null | undefined,
   scale: number = HIGHLIGHT_SAT,
@@ -118,7 +122,17 @@ export function scoreToRgb(
   if (t === 0) return "transparent";
   const a = (Math.abs(t) * TINT_MAX_ALPHA).toFixed(3);
   if (hue === "surprise") return `rgba(${TINT_SURPRISE}, ${a})`;
+  if (hue === "sae") return `rgba(${TINT_SAE}, ${a})`;
   return t > 0 ? `rgba(${TINT_POS}, ${a})` : `rgba(${TINT_NEG}, ${a})`;
+}
+
+/** Color family for a selected transcript-highlight channel. */
+export function highlightHue(target: string | null): TintHue {
+  if (target === SURPRISE_TARGET || target?.startsWith("jlens/")) {
+    return "surprise";
+  }
+  if (target?.startsWith("sae/")) return "sae";
+  return "signed";
 }
 
 /** Per-probe color/bar scale: the largest ``|node coordinate|`` on the

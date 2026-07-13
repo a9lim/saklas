@@ -106,14 +106,18 @@
     const active = lensSourceState.sources.find((source) => source.active);
     const known = lensSourceState.sources.some(
       (source) => source.source === selectedSource,
-    ) || LENS_PROVIDER_OPTIONS.some((source) => source.value === selectedSource);
+    ) || LENS_PROVIDER_OPTIONS.some((source) => source.value === selectedSource) ||
+      selectedSource === "local";
     if (
       !selectedSource ||
       !known
     ) {
-      selectedSource = active?.source ?? lensSourceState.sources[0]?.source ??
-        LENS_PROVIDER_OPTIONS[0]?.value ?? "";
+      selectedSource = active?.source ?? LENS_PROVIDER_OPTIONS[0]?.value ?? "";
     }
+  });
+
+  $effect(() => {
+    if (selectedSource !== "local") fitConfirm = false;
   });
 
   // ---------- STEER: jlens-mode rack entries (alphabetical) ----------
@@ -384,6 +388,9 @@
     providerOptions={LENS_PROVIDER_OPTIONS}
     providerPlaceholder="lens provider"
     onfetch={(source) => void startLensFetch(source)}
+    localActionLabel={fitConfirm ? "confirm fit" : "fit"}
+    localActionDisabled={sourceBusy || !fitReady}
+    onlocal={requestFit}
   >
     {#snippet localControls()}
       <label class="setup-field setup-field-medium">
@@ -410,18 +417,6 @@
           title="workspace, all, or layer ids"
         />
       </label>
-    {/snippet}
-    {#snippet localAction()}
-      <Button
-        size="sm"
-        variant={fitConfirm ? "solid" : "ghost"}
-        accent="var(--accent-blue)"
-        disabled={sourceBusy || !fitReady}
-        onclick={requestFit}
-        title="fit local lens"
-      >
-        {fitConfirm ? "confirm local fit" : "fit local"}
-      </Button>
     {/snippet}
     {#snippet progress()}
       {#if lensFetchState.running}

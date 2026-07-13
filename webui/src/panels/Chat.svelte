@@ -76,6 +76,7 @@
   import type { ChatTurn, TokenScore } from "../lib/types";
   import {
     scoreToRgb,
+    highlightHue,
     twoStripeStyle,
     twoBlendStyle,
     formatScoreTooltip,
@@ -855,10 +856,6 @@
    * gracefully fall back to single-probe rendering.  ``SURPRISE_TARGET``
    * works in either slot — it reads in the logit-space blue ramp
    * (distinct from any probe's signed green/red), per-slot. */
-  function hueFor(target: string | null): "signed" | "surprise" {
-    return target === SURPRISE_TARGET ? "surprise" : "signed";
-  }
-
   function tokenStyle(
     t: TokenScore,
   ): { backgroundColor?: string; backgroundImage?: string } {
@@ -871,10 +868,10 @@
       const bScore = pickScore(t, b);
       const scaleB = highlightScale(b);
       return highlightState.smoothBlend
-        ? twoBlendStyle(aScore, bScore, scaleA, scaleB, hueFor(a), hueFor(b))
-        : twoStripeStyle(aScore, bScore, scaleA, scaleB, hueFor(a), hueFor(b));
+        ? twoBlendStyle(aScore, bScore, scaleA, scaleB, highlightHue(a), highlightHue(b))
+        : twoStripeStyle(aScore, bScore, scaleA, scaleB, highlightHue(a), highlightHue(b));
     }
-    const bg = scoreToRgb(aScore, scaleA, hueFor(a));
+    const bg = scoreToRgb(aScore, scaleA, highlightHue(a));
     return bg === "transparent" ? {} : { backgroundColor: bg };
   }
 

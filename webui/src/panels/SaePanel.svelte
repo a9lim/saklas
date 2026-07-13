@@ -38,6 +38,7 @@
     saeState,
     saeSourceState,
     saeTrainState,
+    saeRawFallbackScale,
     seedProbeDisplay,
     sessionState,
     setLiveSae,
@@ -83,14 +84,18 @@
     const active = saeSourceState.sources.find((source) => source.active);
     const known = saeSourceState.sources.some(
       (source) => source.source === selectedSource,
-    ) || providerOptions.some((source) => source.value === selectedSource);
+    ) || providerOptions.some((source) => source.value === selectedSource) ||
+      selectedSource === "local";
     if (
       !selectedSource ||
       !known
     ) {
-      selectedSource = active?.source ?? saeSourceState.sources[0]?.source ??
-        providerOptions[0]?.value ?? "";
+      selectedSource = active?.source ?? providerOptions[0]?.value ?? "";
     }
+  });
+
+  $effect(() => {
+    if (selectedSource !== "local") trainConfirm = false;
   });
 
   $effect(() => {
@@ -154,20 +159,7 @@
    *  across the visible cards that lack a maxActApprox unit, so their
    *  bars and numbers rank identically.  Cards WITH the unit render on
    *  the absolute 0..1 strength scale instead. */
-  const fallbackScale = $derived.by(() => {
-    let max = 0;
-    for (const row of pinnedBase) {
-      const entry = row.entry!;
-      if (entry.info.max_act != null) continue;
-      const reading = entry.aggregate ?? entry.reading;
-      max = Math.max(max, reading?.coords?.[0] ?? entry.current ?? 0);
-    }
-    for (const feature of discoveryBase) {
-      if (feature.max_act != null) continue;
-      max = Math.max(max, feature.activation);
-    }
-    return Math.max(max, 1);
-  });
+  const fallbackScale = $derived(saeRawFallbackScale());
 
   const SORT_OPTIONS: { value: SaeSortMode; label: string }[] = [
     { value: "strength", label: "strength" },
@@ -368,6 +360,9 @@
     providerOptions={providerOptions}
     providerPlaceholder="SAELens release"
     onfetch={(source) => void loadSae(source)}
+    localActionLabel={trainConfirm ? "confirm train" : "train"}
+    localActionDisabled={!localName.trim() || sourceBusy}
+    onlocal={requestTrain}
   >
     {#snippet localControls()}
       <label class="setup-field setup-field-wide">
@@ -401,15 +396,6 @@
           aria-label="Residual layer (blank for automatic)"
         />
       </label>
-    {/snippet}
-    {#snippet localAction()}
-      <Button
-        size="sm"
-        variant={trainConfirm ? "solid" : "ghost"}
-        accent="var(--pillar-sae)"
-        disabled={!localName.trim() || sourceBusy}
-        onclick={requestTrain}
-      >{trainConfirm ? "confirm local train" : "train local"}</Button>
     {/snippet}
     {#snippet progress()}
       <div class="train-progress" role="status" aria-live="polite">

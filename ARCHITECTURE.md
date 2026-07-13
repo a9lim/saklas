@@ -1042,7 +1042,11 @@ selects either owner for later sessions; both lower to the same runtime backend.
 The native server exposes the same source lifecycle as J-lens: list/use prepared
 sources, provider fetch/load, and a polled cancellable local build. The Svelte
 SAE and J-LENS pillars share a SOURCE section above their parallel STEER and
-PROBE sections; successful preparation activates the source and live channel.
+PROBE sections; local fit/train controls appear only when the synthetic `local`
+source mode is selected, and successful preparation activates the source and
+live channel. `saklas serve` restores the active SAE or selects the strongest
+compatible official provider default for the dashboard, then enables live SAE
+discovery; `--no-web` leaves SAE acquisition explicit.
 
 The runtime has the same three consumers as the J-lens, but is single-layer:
 

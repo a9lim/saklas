@@ -426,7 +426,8 @@ the ordinary busy path — surfaced client-side by the sticky WS error toast.
 `saelens:<release>` sources. The background `POST/GET .../sae/load` accepts
 either harmonized source string (the `saelens:` prefix is stripped only at the
 provider-adapter boundary), so it both fetches a new provider release and
-switches an existing source. `POST/GET/DELETE .../sae/train` starts, polls, and
+switches an existing source; successful load also enables the 12-card live SAE
+readout. `POST/GET/DELETE .../sae/train` starts, polls, and
 cooperatively cancels native local training over the default FineWeb-Edu stream;
 status carries token progress. A successful train makes the local source
 resident and enables live SAE discovery. Provider load and local train are
