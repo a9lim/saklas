@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
@@ -50,7 +51,7 @@ class _Tokenizer:
 
 TOKENIZER = _Tokenizer()
 MODEL = torch.nn.Module()
-MODEL._saklas_source_fingerprint = "1" * 64
+cast(Any, MODEL)._saklas_source_fingerprint = "1" * 64
 
 
 def _deterministic_acts() -> dict[int, torch.Tensor]:

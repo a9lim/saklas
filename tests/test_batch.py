@@ -282,7 +282,7 @@ class TestGenerateBatch:
 
         s = SaklasSession.__new__(SaklasSession)
         s._steering_composer = SteeringComposer(s)
-        s._trait_queues = [object()]
+        cast(Any, s)._trait_queues = [object()]
         return s
 
     def test_returns_results_in_prompt_order(self) -> None:
@@ -401,7 +401,7 @@ class TestGenerateBatch:
     def test_probes_fall_back_to_serial_generation(self) -> None:
         s, model = _fast_batch_session()
         cast(Any, s._monitor).probe_names = ["mood"]
-        s._trait_queues = [object()]
+        cast(Any, s)._trait_queues = [object()]
         capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 

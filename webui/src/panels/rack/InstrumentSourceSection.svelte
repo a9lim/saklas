@@ -66,7 +66,7 @@
     return result;
   });
   const selectedSource = $derived(sources.find((source) => source.source === value));
-  const selectedProvider = $derived(
+  const selectedProviderOption = $derived(
     providerOptions.find((option) => option.value === value),
   );
   const selectedOption = $derived(options.find((option) => option.value === value));
@@ -74,8 +74,13 @@
 
   function applySource(): void {
     if (!value) return;
-    if (selectedProvider) onfetch(value);
-    else if (selectedSource) onuse(value);
+    if (selectedSource) {
+      // A prepared external source and its provider intentionally share one
+      // identifier (for example ``neuronpedia``).  Treat it as prepared first;
+      // only re-enter the provider fetch when the active binding is not usable.
+      if (selectedSource.active && !ready && selectedProviderOption) onfetch(value);
+      else onuse(value);
+    }
     else onfetch(value);
   }
 </script>
@@ -109,18 +114,21 @@
               variant="solid"
               {accent}
               disabled={busy || !value || selectedOption?.disabled === true ||
-                (selectedSource?.active === true && !selectedProvider)}
+                (selectedSource?.active === true &&
+                  (ready || selectedProviderOption === undefined))}
               onclick={applySource}
             >
               {busy
                 ? "working…"
-                : selectedProvider
-                  ? "fetch provider"
-                  : selectedSource?.active
+                : selectedSource?.active
+                  ? ready
                     ? "active"
-                    : selectedSource
-                      ? "use source"
-                      : "fetch provider"}
+                    : selectedProviderOption
+                      ? "repair source"
+                      : "unavailable"
+                  : selectedSource
+                    ? "use source"
+                    : "fetch provider"}
             </Button>
           </div>
         </div>

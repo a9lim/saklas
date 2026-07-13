@@ -758,7 +758,12 @@ def load_sae_backend(
 
     return SaeLensBackend(
         release=release,
-        revision=revision,
+        # ``revision`` on the resident backend is the immutable identity we
+        # actually loaded, not merely the caller's optional selector.  For a
+        # normal provider fetch the caller passes no revision; retaining that
+        # ``None`` made the successfully pinned backend impossible to persist
+        # as runtime metadata after the weights were materialized.
+        revision=resolved_commit or revision,
         fingerprint=fingerprint,
         layers=frozenset(ids_by_layer_int),
         _loader=_load_layer,

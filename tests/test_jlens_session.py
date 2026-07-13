@@ -120,6 +120,7 @@ class _StubSession:
         self._lens_step_stash: Any = None
         self._last_lens_step_readings: Any = None
         self._jlens_readout_module_cache: Any = None
+        self._jlens_device_cache: dict[Any, Any] = {}
         self._jlens_depths_cache: dict[Any, list[float]] = {}
         self._jlens_depth_tensor_cache: dict[Any, torch.Tensor] = {}
         self._readout_long_tensor_cache: dict[Any, torch.Tensor] = {}

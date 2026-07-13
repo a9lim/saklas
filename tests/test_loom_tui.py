@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -431,7 +431,7 @@ def test_format_compare_renders_sibling_diff():
     session = SimpleNamespace(tree=tree)
     _wire_real_diff(session, tree)
 
-    out = format_compare(session, bid)
+    out = format_compare(cast(Any, session), bid)
     assert "compare" in out
     assert aid[:8] in out          # the sibling is listed
     assert "honest" in out         # steering delta term
@@ -449,8 +449,8 @@ def test_format_compare_one_reply_is_advisory():
     session = SimpleNamespace(tree=tree)
     # A turn with a single reply has nothing to compare — same advisory
     # whether the cursor sits on the assistant reply or the user node.
-    assert "one assistant reply" in format_compare(session, aid)
-    assert "one assistant reply" in format_compare(session, uid)
+    assert "one assistant reply" in format_compare(cast(Any, session), aid)
+    assert "one assistant reply" in format_compare(cast(Any, session), uid)
 
 
 def test_format_compare_user_turn_with_no_replies_is_advisory():
@@ -459,7 +459,7 @@ def test_format_compare_user_turn_with_no_replies_is_advisory():
     tree = LoomTree()
     uid = tree.add_user_turn("hi")
     session = SimpleNamespace(tree=tree)
-    out = format_compare(session, uid)
+    out = format_compare(cast(Any, session), uid)
     assert "no assistant replies" in out
 
 
@@ -478,7 +478,7 @@ def test_format_compare_from_user_node_diffs_replies():
     session = SimpleNamespace(tree=tree)
     _wire_real_diff(session, tree)
 
-    out = format_compare(session, uid)
+    out = format_compare(cast(Any, session), uid)
     assert "compare" in out
     assert "honest" in out         # steering delta term
     assert "calm" in out           # reading delta

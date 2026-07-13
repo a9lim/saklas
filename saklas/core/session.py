@@ -57,8 +57,9 @@ from saklas.core.loom import (
     InvalidNodeOperationError,
     LoomMutated,
     LoomTree,
-    Recipe,
+    LoomTreeError,
     MutationDuringGenerationError,
+    Recipe,
     derive_seed_schedule,
 )
 from saklas.core.model import (
@@ -3788,23 +3789,15 @@ class SaklasSession:
             validate_residual_width(
                 backend, selected, int(self._model_info["hidden_dim"]),
             )
-            self._sae_backend = backend
-            self._sae_layer = selected
-            self._sae_width = width
-            self._sae_feature_meta = (
+            feature_meta = (
                 {} if isinstance(backend, LocalSaeBackend)
                 else load_sae_feature_meta(self.model_id, release)
             )
-            self._live_sae = None
-            self._sae_step_stash = None
-            self._last_sae_step_readings = None
-            # Feature ids belong to the resident release; changing it evicts
-            # stale directions and pinned probes rather than silently reusing ids.
-            for name in [key for key in self._profiles if key.startswith("sae/")]:
-                del self._profiles[name]
-            for name in list(self._sae_probes):
-                self._probe_hash_cache.pop(name, None)
-            self._sae_probes.clear()
+            # Publish/validate the source binding before replacing the
+            # session's resident runtime.  A metadata failure must leave the
+            # previous source intact; the old order reported "load failed"
+            # while ``sae_loaded`` was nevertheless true for the half-adopted
+            # provider backend.
             if isinstance(backend, LocalSaeBackend):
                 set_active_sae_source(
                     self.model_id, "local", release.removeprefix("local:"),
@@ -3821,6 +3814,20 @@ class SaklasSession:
                         str(selected)
                     ),
                 })
+            self._sae_backend = backend
+            self._sae_layer = selected
+            self._sae_width = width
+            self._sae_feature_meta = feature_meta
+            self._live_sae = None
+            self._sae_step_stash = None
+            self._last_sae_step_readings = None
+            # Feature ids belong to the resident release; changing it evicts
+            # stale directions and pinned probes rather than silently reusing ids.
+            for name in [key for key in self._profiles if key.startswith("sae/")]:
+                del self._profiles[name]
+            for name in list(self._sae_probes):
+                self._probe_hash_cache.pop(name, None)
+            self._sae_probes.clear()
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
         return self.sae_info or {}
@@ -7429,6 +7436,55 @@ class SaklasSession:
         self.tree.reset()
         self._monitor.reset_history()
 
+    def restore_tree(self, data: dict[str, Any]) -> LoomTree:
+        """Atomically replace the live conversation with a validated tree.
+
+        The caller must hold the server's async session lock (or otherwise
+        guarantee that no generation is in flight).  Imported files are
+        model-bound: recipes and token ids are not portable across models,
+        so a mismatch is rejected instead of producing a subtly corrupt
+        continuation.  Runtime session identity is retained while every
+        conversation-owned field (branches, recipes, cast, tokens, notes)
+        comes from the file.
+        """
+        restored = LoomTree.from_dict(
+            data,
+            events=self.events,
+            conflict_check=self._loom_conflict_check,
+        )
+        if restored.model_id not in (None, self.model_id):
+            raise LoomTreeError(
+                f"tree model {restored.model_id!r} does not match loaded model "
+                f"{self.model_id!r}"
+            )
+
+        old_tree = self.tree
+        old_ids = set(old_tree.nodes)
+        restored.model_id = self.model_id
+        restored.session_id = old_tree.session_id
+        # A restore is a mutation of this live session even when the file was
+        # saved at a lower revision.  Preserve monotonic wire revisions so
+        # connected clients can apply the replacement without a special
+        # rollback rule.
+        restored.rev = max(old_tree.rev, restored.rev) + 1
+        self.tree = restored
+        self._joint_logprob_cache.clear()
+        self._monitor.reset_history()
+
+        new_ids = set(restored.nodes)
+        # LoomTree deliberately accepts the session EventBus through a
+        # cycle-breaking duck-typed boundary; emit through that same typed
+        # adapter rather than widening the core lifecycle Event union here.
+        restored._emit(LoomMutated(  # pyright: ignore[reportPrivateUsage]
+            op="restore",
+            rev=restored.rev,
+            added=tuple(nid for nid in restored.nodes if nid not in old_ids),
+            removed=tuple(nid for nid in old_tree.nodes if nid not in new_ids),
+            updated=tuple(nid for nid in restored.nodes if nid in old_ids),
+            active_node_id=restored.active_node_id,
+        ))
+        return restored
+
     # -- Prefix KV cache --
 
     def cache_prefix(
@@ -7673,7 +7729,7 @@ class SaklasSession:
         # Tolerate stale test sentinels or pre-dataclass tuples by treating
         # anything unexpected as a miss. Real cache entries are always
         # ``_PrefixCacheEntry``.
-        if not isinstance(entry, _PrefixCacheEntry):
+        if not isinstance(entry, _PrefixCacheEntry):  # pyright: ignore[reportUnnecessaryIsInstance]  # stale/test sentinels can violate annotation
             return None
         prefix_ids_cpu = entry.prefix_ids_cpu
         prefix_len = entry.prefix_len

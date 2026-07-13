@@ -109,6 +109,13 @@
   function handleKeydown(ev: KeyboardEvent): void {
     onkeydown?.(ev);
     if (ev.defaultPrevented || ev.key !== "Enter") return;
+    // Own Enter completely.  Letting the native number input / surrounding
+    // form continue after our explicit commit can dispatch a second change or
+    // activate a neighbouring default button; in the sampling strip that
+    // turned a just-entered max-token value into the field minimum and could
+    // start a generation with the wrong cap.
+    ev.preventDefault();
+    ev.stopPropagation();
     // Native number inputs do not consistently emit ``change`` on Enter
     // (Chrome waits for blur), despite Enter being the explicit commit
     // gesture promised by this component. Commit the current draft here so

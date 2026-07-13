@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -1557,7 +1557,7 @@ class TestWSTokenEventLens:
             generation_state=SimpleNamespace(emit_map=[]),
         )
         return build_token_event(
-            session,
+            cast(Any, session),
             [None],
             text=" x",
             is_thinking=False,
@@ -1590,7 +1590,7 @@ class TestWSTokenEventLens:
         )
 
         event = build_token_event(
-            session,
+            cast(Any, session),
             ["node-1"],
             text=" x",
             is_thinking=False,
@@ -1613,7 +1613,7 @@ class TestWSTokenEventLens:
             generation_state=SimpleNamespace(emit_map=[]),
         )
         event = build_token_event(
-            session,
+            cast(Any, session),
             [None],
             text=" x",
             is_thinking=False,
@@ -1636,7 +1636,7 @@ class TestWSTokenEventLens:
         )
 
         event = build_token_event(
-            session,
+            cast(Any, session),
             ["node-1"],
             text=" x",
             is_thinking=False,

@@ -752,7 +752,7 @@ class TestWebSocketProbeReadings:
             input: Any, *, steering: Any = None, sampling: Any = None, stateless: bool = False,
             raw: bool = False, thinking: Any = None, on_token: Callable[..., Any] | None = None,
             parent_node_id: Any = None, n: int = 1, recipe_override: Any = None,
-        ) -> GenerationResult:
+        ) -> RunSet:
             for i, tok in enumerate(tokens):
                 if on_token is not None:
                     if getattr(session.monitor, "probe_names", None):

@@ -164,8 +164,9 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
     }
     monkeypatch.setitem(sys.modules, "sae_lens", fake_sae_lens)
 
-    from saklas.core.sae import load_sae_backend
+    from saklas.core.sae import SaeLensBackend, load_sae_backend
     backend = load_sae_backend("mock-canonical", model_id="test-model", device="cpu")
+    assert isinstance(backend, SaeLensBackend)
     assert backend.layers == frozenset({2, 5, 8})
     assert backend.release == "mock-canonical"
     # Registry resolution is cheap; weights stay cold until a covered layer is
@@ -192,14 +193,80 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
 
 def test_installed_sae_lens_registry_api_resolves_without_loading_weights() -> None:
     pytest.importorskip("sae_lens")
-    from saklas.core.sae import load_sae_backend
+    from saklas.core.sae import SaeLensBackend, load_sae_backend
 
     backend = load_sae_backend(
         "gemma-scope-2-4b-it-res",
         model_id="google/gemma-3-4b-it", device="cpu",
     )
+    assert isinstance(backend, SaeLensBackend)
     assert backend.layers == frozenset({9, 17, 22, 29})
     assert backend._active_sae is None
+
+
+def test_provider_backend_records_the_resolved_hub_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default provider fetch must persist the commit it actually pinned.
+
+    The UI passes no explicit revision.  Returning that input ``None`` from the
+    backend made ``session.load_sae`` reject its own otherwise-valid runtime
+    metadata after the SAE had already downloaded and materialized.
+    """
+    import sys
+    import types
+
+    import huggingface_hub
+    import torch
+
+    commit = "a" * 40
+    seen_revisions: list[str | None] = []
+    fake_sae_lens = types.ModuleType("sae_lens")
+
+    class FakeSAE:
+        def __init__(self) -> None:
+            self.cfg = types.SimpleNamespace(
+                d_in=4, d_sae=8, model_name="test-model", hook_layer=2,
+                metadata={"hook_name": "blocks.2.hook_resid_post"},
+            )
+            self.W_dec = torch.zeros(8, 4)
+
+        @classmethod
+        def from_pretrained(
+            cls, release: Any, sae_id: Any, device: Any = None,
+            revision: str | None = None,
+        ) -> Any:
+            del release, sae_id, device
+            seen_revisions.append(revision)
+            return cls(), {"hook_layer": 2}, None
+
+        def to(self, **_kwargs: Any) -> "FakeSAE":
+            return self
+
+    class FakeHfApi:
+        def model_info(self, *_args: Any, **_kwargs: Any) -> Any:
+            return types.SimpleNamespace(sha=commit)
+
+    fake_sae_lens.SAE = FakeSAE  # pyright: ignore[reportAttributeAccessIssue]
+    fake_sae_lens.get_pretrained_saes_directory = lambda: {  # pyright: ignore[reportAttributeAccessIssue]
+        "mock-provider": {
+            "saes_map": {"layer_2": 2},
+            "model": "test-model",
+            "repo_id": "org/mock-saes",
+        },
+    }
+    monkeypatch.setitem(sys.modules, "sae_lens", fake_sae_lens)
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)
+
+    from saklas.core.sae import load_sae_backend
+
+    backend = load_sae_backend(
+        "mock-provider", model_id="test-model", device="cpu",
+    )
+    assert backend.revision == commit
+    assert backend.fingerprint is not None
+    assert backend.feature_count(2) == 8
+    assert seen_revisions == [commit]
 
 
 def test_release_discovery_omits_known_non_residual_families(

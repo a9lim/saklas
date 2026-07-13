@@ -333,7 +333,7 @@ def _build_whitened_factors(
         R = m_r.shape[0]
         try:
             chol = torch.linalg.cholesky(m_r)
-        except torch.linalg.LinAlgError:
+        except torch.linalg.LinAlgError:  # pyright: ignore[reportPrivateImportUsage]  # public runtime exception, absent from torch stubs
             # Defensive jitter for a near-singular subspace gram.
             eye = torch.eye(R, dtype=m_r.dtype)
             jitter = 1e-8 * float(m_r.diagonal().mean().clamp_min(1e-12))

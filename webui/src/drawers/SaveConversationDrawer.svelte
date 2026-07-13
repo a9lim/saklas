@@ -1,22 +1,22 @@
 <script lang="ts">
-  // Save-conversation drawer — serialize the live chat log + rack state +
-  // probe rack + sampling + highlight settings to a JSON blob and offer
-  // it as a browser download.  Mirrors the TUI's ``/save`` but client-
-  // side only — no server round-trip.
+  // Save-conversation drawer — serialize the complete authoritative Loom
+  // tree plus rack, probe, sampling, and highlight state to a JSON blob.
+  // The tree payload is the exact inverse of PUT /tree, so branches,
+  // recipes, token metadata, notes, stars, and cast all survive restore.
   //
-  // Shape: {version, savedAt, model_id, chatLog, steerRack, subspaceAlong,
+  // Shape: {version, savedAt, model_id, tree, steerRack, subspaceAlong,
   //         probeRack, highlightState, samplingState}.  Steer / probe rack
   //         Maps are serialized as plain arrays (Map → tuples) for JSON
   //         safety.
 
   import {
-    chatLog,
     steerRack,
     probeRack,
     highlightState,
     samplingState,
     sessionState,
     closeDrawer,
+    currentLoomTreeSnapshot,
   } from "../lib/stores.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
@@ -28,11 +28,11 @@
   // would otherwise capture a partial turn.  User can re-open the drawer
   // to refresh.
   const snapshot = $derived.by(() => ({
-    version: 3 as const,
+    version: 4 as const,
     savedAt: new Date().toISOString(),
     model_id: sessionState.info!.model_id,
     session_id: sessionState.info!.id,
-    chatLog: chatLog.turns,
+    tree: currentLoomTreeSnapshot(),
     // Full steer rack — every term plus the shared subspace-along master.
     steerRack: [...steerRack.entries.entries()].map(([name, entry]) => ({
       name,
@@ -54,6 +54,9 @@
   }));
 
   const previewText = $derived(JSON.stringify(snapshot, null, 2));
+  const turnCount = $derived(
+    snapshot.tree?.nodes.filter((node) => node.parent_id !== null).length ?? 0,
+  );
 
   // Cap preview at ~200 lines (~16k chars) so a runaway log doesn't lock
   // the textarea.  The downloaded blob is always the full snapshot.
@@ -85,6 +88,7 @@
   }
 
   function download(): void {
+    if (!snapshot.tree) return;
     const blob = new Blob([previewText], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -107,9 +111,10 @@
 
   <div class="body">
     <p class="hint">
-      writes a JSON blob containing the chat log, steering rack, probe rack,
-      sampling state and highlight settings.  Re-open via the load-
-      conversation drawer to restore.
+      writes a JSON blob containing the complete conversation tree (all
+      branches, recipes, token metadata, notes, stars, and cast) plus the
+      steering, probe, sampling, and highlight workspace. Re-open it via
+      load to restore the server-owned tree atomically.
     </p>
 
     <label class="field">
@@ -128,7 +133,7 @@
       <span class="label">preview</span>
       <pre class="preview" aria-label="Preview JSON">{previewDisplay}</pre>
       <span class="meta">
-        {chatLog.turns.length} turn{chatLog.turns.length === 1 ? "" : "s"} ·
+        {turnCount} turn{turnCount === 1 ? "" : "s"} ·
         {snapshot.steerRack.length} term{snapshot.steerRack.length === 1 ? "" : "s"} ·
         {probeRack.active.length} probe{probeRack.active.length === 1 ? "" : "s"}
       </span>
@@ -137,7 +142,7 @@
 
   <footer class="footer">
     <button type="button" class="btn" onclick={closeDrawer}>cancel</button>
-    <button type="button" class="btn primary" onclick={download}>
+    <button type="button" class="btn primary" disabled={!snapshot.tree} onclick={download}>
       download
     </button>
   </footer>

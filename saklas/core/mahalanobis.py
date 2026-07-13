@@ -244,7 +244,7 @@ class LayerWhitener:
             G.diagonal().add_(n * lam)
             try:
                 chol = torch.linalg.cholesky(G)
-            except torch.linalg.LinAlgError:
+            except torch.linalg.LinAlgError:  # pyright: ignore[reportPrivateImportUsage]  # public runtime exception, absent from torch stubs
                 eye = torch.eye(n, dtype=G.dtype)
                 jitter = 1e-8 * float(G.diagonal().mean().clamp_min(1e-12))
                 chol = torch.linalg.cholesky(G + jitter * eye)

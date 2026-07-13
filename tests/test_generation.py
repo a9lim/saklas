@@ -619,7 +619,7 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
         _tid: int | None,
         _lp: float | None,
         _top_alts: Any,
-        _perplexity: float | None,
+        _perplexity: float | None = None,
     ) -> None:
         seen_tokens.append(text)
 

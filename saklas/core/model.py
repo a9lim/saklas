@@ -1053,6 +1053,22 @@ def load_model(
             model = _try_load_with_fallbacks()
             model = model.to(device)  # pyright: ignore[reportArgumentType]  # transformers stub: .to(str) overload missing
 
+    # ``from_pretrained`` preserves the resolved Hub revision on an ordinary
+    # model config, but the text-only multimodal path builds a fresh causal-LM
+    # config via ``from_config``.  Transformers does not copy the composite
+    # config's private ``_commit_hash`` into that child, which made an official
+    # J-lens fetched for the exact same immutable checkpoint look stale as soon
+    # as Saklas compared it with the live text model.  The revision was already
+    # resolved before any weights were read and every read above was pinned to
+    # it, so stamp that proven identity onto the returned model uniformly.
+    if resolved_revision:
+        live_config = getattr(model, "config", None)
+        if live_config is not None:
+            live_config._commit_hash = str(resolved_revision)
+            live_text_config = getattr(live_config, "text_config", None)
+            if live_text_config is not None:
+                live_text_config._commit_hash = str(resolved_revision)
+
     model.requires_grad_(False)
     model.train(False)
     # Mark only saklas-owned loads as source-trusted.  Arbitrary modules whose

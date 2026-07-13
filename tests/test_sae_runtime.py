@@ -1,6 +1,7 @@
 """CPU-only contract tests for the first-class live SAE runtime."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, cast
@@ -76,6 +77,48 @@ def test_select_runtime_layer_prefers_workspace_near_65_percent() -> None:
     assert select_runtime_layer({1, 8, 14, 18}, 24, requested=8) == 8
     with pytest.raises(ValueError, match="does not cover"):
         select_runtime_layer({1, 8}, 24, requested=9)
+
+
+def test_failed_provider_binding_does_not_half_adopt_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core import sae as sae_module
+    from saklas.io import sae as sae_io
+
+    session: Any = SaklasSession.__new__(SaklasSession)
+    previous = MockSaeBackend(
+        layers=frozenset({0}), d_model=4, release="previous",
+    )
+    replacement = MockSaeBackend(
+        layers=frozenset({1}), d_model=4, release="replacement",
+        revision="commit", repo_id="org/sae",
+    )
+    session._device = torch.device("cpu")
+    session._dtype = torch.float32
+    session._layers = [object(), object()]
+    session._model_info = {"model_id": "org/model", "hidden_dim": 4}
+    session._sae_backend = previous
+    session._sae_layer = 0
+    session._sae_width = 4
+    session._sae_feature_meta = {"1": {"label": "old", "max_act": 1.0}}
+    session._model_exclusive = lambda *_args, **_kwargs: nullcontext()
+
+    monkeypatch.setattr(sae_module, "load_sae_backend", lambda *_a, **_kw: replacement)
+    monkeypatch.setattr(sae_io, "load_sae_feature_meta", lambda *_a: {})
+    monkeypatch.setattr(
+        sae_io, "save_sae_metadata",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("disk full")),
+    )
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        session.load_sae("replacement", layer=1)
+
+    assert session._sae_backend is previous
+    assert session._sae_layer == 0
+    assert session._sae_width == 4
+    assert session._sae_feature_meta == {
+        "1": {"label": "old", "max_act": 1.0},
+    }
 
 
 def test_sae_encoder_readout_is_detached_from_autograd() -> None:

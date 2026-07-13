@@ -14,9 +14,12 @@ output drives ``subspace_inject`` as intended.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
+from saklas.core.mahalanobis import LayerWhitener
 from saklas.core.manifold import (
     CustomDomain,
     LayerSubspace,
@@ -28,12 +31,18 @@ from saklas.core.manifold import (
 )
 
 
-def synthesize_subspace(*args, neutral_means, whitener=None, **kwargs):
+def synthesize_subspace(
+    *args: Any,
+    neutral_means: dict[int, torch.Tensor],
+    whitener: LayerWhitener | None = None,
+    **kwargs: Any,
+) -> SynthesizedSubspace:
     """Current-shape test adapter: every synthesis owns a covering metric."""
     if whitener is None and neutral_means:
         from tests._whitener import isotropic_whitener
         first = next(iter(neutral_means.values()))
         whitener = isotropic_whitener(list(neutral_means), int(first.numel()))
+    assert whitener is not None
     return _synthesize_subspace(
         *args, neutral_means=neutral_means, whitener=whitener, **kwargs,
     )

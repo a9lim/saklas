@@ -54,6 +54,10 @@ class TreeTranscriptLoadRequest(NativeRequest):
     strict: bool = False
 
 
+class TreeRestoreRequest(NativeRequest):
+    tree: dict[str, Any]
+
+
 class TreeDiffRequest(NativeRequest):
     a_id: str
     b_id: str

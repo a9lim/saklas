@@ -79,6 +79,8 @@ class _StubSession:
         monitor.probe_names = []
         monitor.profiles = {}
         self.monitor = monitor
+        self._monitor = monitor
+        self._joint_logprob_cache: dict[Any, Any] = {}
         self.lens_probe_names: list[str] = []
         self.sae_probe_names: list[str] = []
         self.token_probe_payload: dict[str, Any] = {}
@@ -104,9 +106,15 @@ class _StubSession:
 
         self._next_token_stream: list[str] = ["hi"]
         self._fail_next: bool = False
+        self._block_until_stop = False
+        self._stop_event = threading.Event()
 
     def clear_history(self) -> None:
         self.tree.reset()
+
+    def restore_tree(self, data: dict[str, Any]):
+        from saklas.core.session import SaklasSession
+        return SaklasSession.restore_tree(self, data)  # type: ignore[arg-type]
 
     def rewind(self) -> None:
         self.tree.rewind()
@@ -129,7 +137,7 @@ class _StubSession:
                 pass
 
     def stop(self) -> None:
-        pass
+        self._stop_event.set()
 
     # ----- loom conflict check (mirrors SaklasSession._loom_conflict_check)
     def _loom_conflict_check(self, node_id: str, op: str) -> None:
@@ -190,6 +198,8 @@ class _StubSession:
                 self.tree.append_token(
                     assistant_id, {"token_id": 1000 + sibling_idx, "text": token_text},
                 )
+                if self._block_until_stop:
+                    assert self._stop_event.wait(timeout=5.0)
                 result = GenerationResult(
                     text=token_text, tokens=[1000 + sibling_idx],
                     token_count=1, tok_per_sec=10.0, elapsed=0.1,
@@ -376,6 +386,61 @@ class TestTreeGet:
         assert root_node["role"] == "system"
         assert root_node["text"] == ""
         assert root_node["id"] == session.tree.root_id
+
+    def test_full_tree_restore_round_trip(self, session_and_client: Any):
+        session, client = session_and_client
+        user_id = session.tree.add_user_turn("saved branch")
+        assistant_id = session.tree.begin_assistant(user_id)
+        session.tree.finalize_assistant(assistant_id, text="saved reply")
+        saved = client.get("/saklas/v1/sessions/default/tree").json()
+        saved_rev = saved["rev"]
+
+        assert client.post("/saklas/v1/sessions/default/tree/reset").status_code == 204
+        restored = client.put(
+            "/saklas/v1/sessions/default/tree",
+            json={"tree": saved},
+        )
+        assert restored.status_code == 200
+        body = restored.json()
+        assert body["nodes"] == 3
+        assert body["active_node_id"] == assistant_id
+        assert body["rev"] > saved_rev
+        tree = client.get("/saklas/v1/sessions/default/tree").json()
+        assert [node["text"] for node in tree["nodes"]] == [
+            "", "saved branch", "saved reply",
+        ]
+
+    def test_full_tree_restore_rejects_model_mismatch(self, session_and_client: Any):
+        _, client = session_and_client
+        saved = client.get("/saklas/v1/sessions/default/tree").json()
+        saved["model_id"] = "other/model"
+        restored = client.put(
+            "/saklas/v1/sessions/default/tree",
+            json={"tree": saved},
+        )
+        assert restored.status_code == 400
+        assert "does not match loaded model" in str(restored.json())
+
+    def test_full_tree_restore_emits_snapshot_barrier(self, session_and_client: Any):
+        session, client = session_and_client
+        saved = client.get("/saklas/v1/sessions/default/tree").json()
+        saved["name"] = "restored elsewhere"
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            response = client.put(
+                "/saklas/v1/sessions/default/tree",
+                json={"tree": saved},
+            )
+            assert response.status_code == 200
+            while True:
+                frame = ws.receive_json()
+                if frame.get("type") == "tree_mutated":
+                    break
+
+        assert frame["op"] == "restore"
+        assert frame["rev"] == session.tree.rev
+        assert frame["active_node_id"] == session.tree.active_node_id
+        assert session.tree.name == "restored elsewhere"
 
     def test_matches_to_dict(self, session_and_client: Any):
         session, client = session_and_client
@@ -706,6 +771,32 @@ class TestTranscript:
 
 
 class TestWebSocketLoom:
+    def test_user_stop_is_distinct_from_natural_completion(self, session_and_client: Any):
+        """The native stream labels an explicit user cancellation distinctly.
+
+        The engine and stored loom node retain the protocol-compatible
+        ``stop`` reason; only the dashboard-facing done frame says
+        ``cancelled``.
+        """
+        session, client = session_and_client
+        session._block_until_stop = True
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "keep going"})
+            # The connection's perpetual reader queues this while the
+            # dispatcher starts the worker, matching a fast stop-button click.
+            ws.send_json({"type": "stop"})
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "error":
+                    pytest.fail(msg["message"])
+                if msg["type"] == "done":
+                    done = msg
+                    break
+
+        assert done["result"]["finish_reason"] == "cancelled"
+        assert session.tree.get(done["node_id"]).finish_reason == "stop"
+
     def test_generate_with_parent_node_id(self, session_and_client: Any):
         """Result attaches under the supplied parent_node_id."""
         session, client = session_and_client
@@ -725,6 +816,7 @@ class TestWebSocketLoom:
             # Collect events until done.
             done = None
             seen_tree_mut = False
+            seen_finalize = False
             seen_node_id_on_token = None
             while True:
                 msg = ws.receive_json()
@@ -733,6 +825,13 @@ class TestWebSocketLoom:
                     assert msg["sibling_count"] == 1
                 elif t == "tree_mutated":
                     seen_tree_mut = True
+                    if msg.get("op") == "finalize_assistant":
+                        seen_finalize = True
+                        assert any(
+                            node.get("text") == "tok0"
+                            and node.get("finish_reason") == "stop"
+                            for node in msg["updated"]
+                        )
                     assert msg["rev"] >= rev_before
                 elif t == "token":
                     seen_node_id_on_token = msg.get("node_id")
@@ -742,6 +841,7 @@ class TestWebSocketLoom:
 
         assert done is not None
         assert seen_tree_mut, "tree_mutated event should fire when tree mutates"
+        assert seen_finalize, "finalized node must arrive before the done frame"
         assert seen_node_id_on_token is not None, "token frames should be tagged with node_id"
         # New user turn attached under u2 (not u1, which would have been
         # the active node before the request).  The assistant attaches
@@ -1071,7 +1171,7 @@ class TestCommit:
 
 
 class TestCast:
-    def test_cast_crud_round_trip(self, session_and_client):
+    def test_cast_crud_round_trip(self, session_and_client: Any) -> None:
         session, client = session_and_client
         # PUT creates.
         resp = client.put(
@@ -1098,7 +1198,7 @@ class TestCast:
             "/saklas/v1/sessions/default/tree/cast/deer"
         ).status_code == 204
 
-    def test_cast_put_validates(self, session_and_client):
+    def test_cast_put_validates(self, session_and_client: Any) -> None:
         _session, client = session_and_client
         # Bad label (uppercase/space) -> 400 via SaklasError mapping.
         resp = client.put(
@@ -1113,7 +1213,9 @@ class TestCast:
         )
         assert resp.status_code == 400
 
-    def test_cast_mutation_emits_ws_frame_with_roster(self, session_and_client):
+    def test_cast_mutation_emits_ws_frame_with_roster(
+        self, session_and_client: Any,
+    ) -> None:
         session, client = session_and_client
         u1 = session.tree.add_user_turn("hello")
         del u1

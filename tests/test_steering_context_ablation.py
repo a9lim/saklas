@@ -8,6 +8,7 @@ steering-stack manipulation and hook-manager wiring is exercised.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
@@ -63,7 +64,7 @@ def _skeleton_session() -> SaklasSession:
     session._whitener = isotropic_whitener([1], 3)
     session._compiled = False
     session._compiled_clean_eligible = False
-    session._monitor = type("_Monitor", (), {"probe_names": []})()
+    cast(Any, session)._monitor = type("_Monitor", (), {"probe_names": []})()
     session.events = EventBus()
     session._history = []  # pyright: ignore[reportAttributeAccessIssue]  # skeleton: _history is dynamically set
     return session

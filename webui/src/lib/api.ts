@@ -619,6 +619,21 @@ export const apiTree = {
   get(id: string = SESSION): Promise<LoomTreeJSON> {
     return request(`${SESSION_BASE(id)}/tree`);
   },
+  /** Replace the complete server-owned Loom tree from a saved snapshot. */
+  restore(
+    tree: LoomTreeJSON,
+    id: string = SESSION,
+  ): Promise<{
+    rev: number;
+    root_id: string;
+    active_node_id: string;
+    nodes: number;
+  }> {
+    return request(
+      `${SESSION_BASE(id)}/tree`,
+      { ...jsonBody({ tree }), method: "PUT" },
+    );
+  },
   /** Just the active path — what the chat panel needs to render the
    *  conversation linearly.  Less data than the full tree.  Server
    *  shape: ``{active_node_id, rev, messages, node_ids}`` (parallel

@@ -557,6 +557,30 @@ def test_multimodal_routes_to_text_extraction_even_when_outer_accessible():
     )
 
 
+def test_text_extraction_preserves_the_pinned_hub_revision():
+    """Official artifacts bind to the immutable base-model revision.
+
+    The text-only multimodal loader constructs a new model config, so Saklas
+    must carry the already-resolved outer revision onto that live config.
+    """
+    cfg = _FakeConfig(model_type="gemma3", text_model_type="gemma3_text")
+    cfg._commit_hash = "immutable-model-commit"
+
+    with (
+        patch.object(model_mod, "AutoTokenizer") as mock_tok,
+        patch.object(model_mod, "AutoConfig") as mock_cfg,
+        patch.object(model_mod, "AutoModelForCausalLM"),
+        patch.object(model_mod, "_load_text_from_multimodal") as mock_extract,
+    ):
+        mock_tok.from_pretrained.return_value = SimpleNamespace()
+        mock_cfg.from_pretrained.return_value = cfg
+        mock_extract.return_value = _FakeModel("sdpa")
+        model, _ = model_mod.load_model("google/gemma-3-4b-it", device="cpu")
+
+    assert model.config._commit_hash == "immutable-model-commit"
+    assert mock_extract.call_args.kwargs["revision"] == "immutable-model-commit"
+
+
 def test_plain_text_model_uses_standard_load():
     """A non-multimodal config (no text_config) takes the standard load —
     there is nothing to extract."""

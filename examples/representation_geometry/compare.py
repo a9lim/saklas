@@ -20,7 +20,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from analyze import eucl_pdist, load_fit, loo_decode, pearson  # noqa: E402
-from data import PROBES  # noqa: E402
+from data import PROBES  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]  # sibling script module inserted above
 
 FIGROOT = Path(__file__).parent / "figures"
 

@@ -1943,6 +1943,34 @@ function applyTreeSnapshot(snap: LoomTreeJSON): void {
   syncChatLogFromTree();
 }
 
+/** Materialize the reactive Loom slice in the server's portable JSON shape.
+ *  Used by explicit v4 whole-conversation export. */
+export function currentLoomTreeSnapshot(): LoomTreeJSON | null {
+  if (
+    !loomTree.loaded || !loomTree.root_id || !loomTree.active_node_id ||
+    loomTree.tree_format === null || loomTree.saklas_version === null
+  ) return null;
+  const nodes: LoomNodeJSON[] = [];
+  for (const [, node] of loomTree.nodes) nodes.push(node);
+  const children_of: Record<string, string[]> = {};
+  for (const [parentId, childIds] of loomTree.children_of) {
+    children_of[parentId] = [...childIds];
+  }
+  return {
+    tree_format: loomTree.tree_format,
+    saklas_version: loomTree.saklas_version,
+    root_id: loomTree.root_id,
+    active_node_id: loomTree.active_node_id,
+    rev: loomTree.rev,
+    nodes,
+    children_of,
+    model_id: loomTree.modelId ?? sessionState.info?.model_id ?? null,
+    session_id: loomTree.session_id,
+    name: loomTree.name,
+    cast: { ...castState.roster },
+  };
+}
+
 /** Apply a ``tree_mutated`` delta in place.  Returns ``false`` if the
  *  client missed a rev — caller full-refetches on false.
  *
@@ -2436,12 +2464,17 @@ function roleOverride(
 }
 
 function buildSamplingPayload(): WSSampling | null {
-  // temperature / top-p / top-k / max-tokens / thinking are PATCHed to
-  // the session as the user edits them, so they ride the server's own
-  // defaults and aren't echoed here.  Seed has no PATCH path and the
-  // advanced extras (penalties, stop, logit-bias, return_top_k) aren't
-  // PATCH-able either — both always ride per-call.
+  // The strip PATCHes these numeric controls so they become defaults for
+  // future calls, but that persistence request is deliberately asynchronous.
+  // Echo the values visible in the UI on every generation as well: otherwise
+  // changing a field and immediately pressing Send can race the PATCH and run
+  // with the previous server default while the footer claims the new cap.
+  // Per-call values are the authoritative snapshot for this generation.
   const payload: WSSampling = {
+    temperature: samplingState.temperature,
+    top_p: samplingState.top_p,
+    top_k: samplingState.top_k,
+    max_tokens: samplingState.max_tokens,
     persist_per_layer_scores: true,
     // The probe-inspector live point + fading trail need per-layer whitened
     // subspace coords on each token reading.  Sent whenever a probe is attached
@@ -2648,8 +2681,61 @@ export function ensureWebSocket(): Promise<WebSocket> {
   }
   const socket = connectWs();
   wsConn.socket = socket;
+  // A socket can reconnect to a freshly restarted server whose tree has a
+  // lower revision and entirely different node ids.  Buffer wire events until
+  // we have replaced the local cache with the new authoritative snapshot;
+  // otherwise the first post-restart generation splices new nodes into the
+  // stale pre-restart sidebar.
+  let rehydrating = true;
+  const bufferedMessages: WSServerMessage[] = [];
+  const dispatch = (msg: WSServerMessage): void => {
+    handleWsMessage(msg);
+    for (const cb of wsConn.listeners) {
+      try {
+        cb(msg);
+      } catch {
+        /* ignore subscriber failures */
+      }
+    }
+  };
   wsConn.ready = new Promise<void>((resolve, reject) => {
-    socket.addEventListener("open", () => resolve(), { once: true });
+    socket.addEventListener("open", () => {
+      void (async () => {
+        try {
+          const snap = await apiTree.get();
+          applyTreeSnapshot(snap);
+          rehydrating = false;
+          // The snapshot already includes deltas at or below its revision.
+          // Replay only genuinely newer tree frames; non-tree frames retain
+          // their original arrival order.
+          for (const msg of bufferedMessages) {
+            if (msg.type === "tree_mutated" && msg.rev <= snap.rev) continue;
+            dispatch(msg);
+          }
+          bufferedMessages.length = 0;
+          // Other server-owned surfaces may also have changed across a
+          // restart.  Refresh them before callers are allowed to submit the
+          // next generation against this connection.
+          await Promise.allSettled([
+            refreshSession(),
+            refreshVectorList(),
+            refreshProbeList(),
+            refreshCorrelation(),
+            refreshManifoldList(),
+          ]);
+          resolve();
+        } catch (e) {
+          rehydrating = false;
+          loomTree.error = e instanceof Error ? e.message : String(e);
+          pushToast(`WebSocket rehydration failed: ${loomTree.error}`, { kind: "error" });
+          // Never leave an apparently reusable OPEN socket behind after its
+          // authoritative snapshot failed.  A later send must establish a
+          // fresh connection and retry the complete rehydration barrier.
+          socket.close();
+          reject(e);
+        }
+      })();
+    }, { once: true });
     socket.addEventListener("error", (e) => reject(e), { once: true });
   });
   socket.addEventListener("message", (ev: MessageEvent) => {
@@ -2659,14 +2745,8 @@ export function ensureWebSocket(): Promise<WebSocket> {
     } catch {
       return;
     }
-    handleWsMessage(msg);
-    for (const cb of wsConn.listeners) {
-      try {
-        cb(msg);
-      } catch {
-        /* ignore subscriber failures */
-      }
-    }
+    if (rehydrating) bufferedMessages.push(msg);
+    else dispatch(msg);
   });
   socket.addEventListener("close", () => {
     if (wsConn.socket === socket) {
@@ -2754,6 +2834,15 @@ function handleWsMessage(msg: WSServerMessage): void {
       // Roster mutation: the frame inlines the full cast (no node ids).
       if (msg.op === "cast" && msg.cast) {
         castState.roster = msg.cast;
+      }
+      // Whole-tree restore can change parentage and sibling order even when
+      // node ids overlap the old tree.  Ordinary add/update/remove deltas do
+      // not carry enough information to detach an intersecting node from its
+      // former parent, so every connected client crosses an authoritative
+      // full-snapshot barrier for this operation.
+      if (msg.op === "restore") {
+        void refreshLoomTree();
+        return;
       }
       // Apply the delta; on rev gap, full re-fetch.
       const ok = applyTreeDelta(msg);
@@ -3608,18 +3697,20 @@ async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
 
 // =================================================== persistence ========
 //
-// Current loom cache:
-//   localStorage is a *cache* of the server's loom tree.  On bootstrap we
-//   fetch from the server and reconcile (server wins) — this retires the
-//   authority; localStorage is only a first-paint cache while the fetch
-//   is in flight.  Older cache versions are ignored.
+// Presentation preference cache:
+//   The server is the sole authority for the Loom tree.  In particular, do
+//   not first-paint a cached tree: after a server restart its node ids are
+//   invalid, and rendering it briefly triggers requests against nonexistent
+//   edges before the authoritative fetch arrives.  Durable conversation
+//   persistence is the explicit v4 whole-tree Save/Load flow; localStorage
+//   retains only lightweight highlight preferences.
 //
-// We persist on a debounced effect rather than synchronously per
-// mutation so token-streaming gens don't write hundreds of times per
-// turn — once per ~250 ms is enough to survive an unplanned reload.
+// Preference changes persist through a short debounce so rapid highlight
+// switching does not issue redundant synchronous localStorage writes.
 
-const PERSIST_VERSION = 3;
+const PERSIST_VERSION = 4;
 const PERSIST_KEY_PREFIX = "saklas.chat.v" + PERSIST_VERSION + ".";
+const LEGACY_TREE_PERSIST_KEY_PREFIX = "saklas.chat.v3.";
 
 function persistKey(): string | null {
   const id = sessionState.info?.model_id;
@@ -3627,11 +3718,9 @@ function persistKey(): string | null {
 }
 
 interface PersistedSnapshot {
-  version: 3;
+  version: 4;
   model_id: string;
   saved_at: number;
-  /** Cached loom tree.  ``null`` until the first server fetch lands. */
-  tree: LoomTreeJSON | null;
   highlight: {
     target: string | null;
     compareTarget: string | null;
@@ -3649,15 +3738,7 @@ function isPersistedSnapshot(value: unknown): value is PersistedSnapshot {
   if (!(typeof highlight.target === "string" || highlight.target === null)) return false;
   if (!(typeof highlight.compareTarget === "string" || highlight.compareTarget === null)) return false;
   if (typeof highlight.compareTwo !== "boolean") return false;
-  if (snap.tree === null) return true;
-  if (!snap.tree || typeof snap.tree !== "object") return false;
-  const tree = snap.tree as Record<string, unknown>;
-  return typeof tree.root_id === "string"
-    && typeof tree.active_node_id === "string"
-    && typeof tree.rev === "number"
-    && Array.isArray(tree.nodes)
-    && tree.children_of !== null
-    && typeof tree.children_of === "object";
+  return true;
 }
 
 function safeLocalStorageGet(key: string): string | null {
@@ -3685,9 +3766,14 @@ function safeLocalStorageRemove(key: string): void {
   }
 }
 
-function loadPersistedChat(): void {
+function loadPersistedPreferences(): void {
   const key = persistKey();
   if (!key) return;
+  // v3 embedded the complete tree and could occupy most of the origin quota.
+  // It is unsafe after a backend restart and superseded by explicit v4
+  // save/load, so reclaim it during the one model-scoped bootstrap read.
+  const modelId = sessionState.info?.model_id;
+  if (modelId) safeLocalStorageRemove(LEGACY_TREE_PERSIST_KEY_PREFIX + modelId);
   const raw = safeLocalStorageGet(key);
   if (!raw) return;
   try {
@@ -3697,7 +3783,6 @@ function loadPersistedChat(): void {
       return;
     }
     if (parsed.model_id !== sessionState.info?.model_id) return;
-    if (parsed.tree) applyTreeSnapshot(parsed.tree);
     loomTree.pendingNodeId = null;
     highlightState.target = parsed.highlight.target;
     highlightState.compareTarget = parsed.highlight.compareTarget;
@@ -3714,76 +3799,21 @@ function schedulePersist(): void {
     _persistTimer = null;
     const key = persistKey();
     if (!key) return;
-    // Serialise the loom tree from the SvelteMap-backed slice.  Use
-    // the server's ``to_dict`` list shape so a future reload (or any
-    // server that consumes this cache) is consistent with the
-    // authoritative wire format.
-    let tree: LoomTreeJSON | null = null;
-    if (
-      loomTree.loaded && loomTree.root_id && loomTree.active_node_id &&
-      loomTree.tree_format !== null && loomTree.saklas_version !== null
-    ) {
-      const nodes: LoomNodeJSON[] = [];
-      for (const [, n] of loomTree.nodes) nodes.push(n);
-      const children_of: Record<string, string[]> = {};
-      for (const [pid, ids] of loomTree.children_of)
-        children_of[pid] = [...ids];
-      tree = {
-        tree_format: loomTree.tree_format,
-        saklas_version: loomTree.saklas_version,
-        root_id: loomTree.root_id,
-        active_node_id: loomTree.active_node_id,
-        rev: loomTree.rev,
-        nodes,
-        children_of,
-        model_id: loomTree.modelId ?? sessionState.info!.model_id,
-        session_id: loomTree.session_id,
-        name: loomTree.name,
-        cast: { ...castState.roster },
-      };
-    }
     const snapshot: PersistedSnapshot = {
-      version: 3,
+      version: 4,
       model_id: sessionState.info!.model_id,
       saved_at: Date.now(),
-      tree,
       highlight: {
         target: highlightState.target,
         compareTarget: highlightState.compareTarget,
         compareTwo: highlightState.compareTwo,
       },
     };
-    const payload = JSON.stringify(snapshot);
-    // Soft ~5MB budget warning (plan §"Size management").  Each loom-
-    // tree rev bumps trigger a re-write of the whole snapshot, so a
-    // large tree can put real pressure on the localStorage quota.  The
-    // toast is advisory — we still write — and fires at most once per
-    // session so the user doesn't get spammed on every rev.
-    if (payload.length > _LOCALSTORAGE_SOFT_BUDGET && !_sizeWarned) {
-      _sizeWarned = true;
-      const mb = (payload.length / (1024 * 1024)).toFixed(1);
-      pushToast(
-        `Loom tree cache is ~${mb}MB in localStorage. Consider exporting and clearing — most browsers cap origin storage at 5–10MB.`,
-        { kind: "warning", ttlMs: 10000 },
-      );
-    }
-    safeLocalStorageSet(key, payload);
+    safeLocalStorageSet(key, JSON.stringify(snapshot));
   }, 250);
 }
 
-/** 1 GB soft budget — effectively "never toast".  The toast was the only
- *  in-app surface that flagged cache size; muting it means the user no
- *  longer sees a warning before the browser's hard quota kicks in.
- *  ``safeLocalStorageSet`` still try/catches the resulting
- *  ``QuotaExceededError`` silently when that happens (write drops, next
- *  refresh refetches the server tree). */
-const _LOCALSTORAGE_SOFT_BUDGET = 1024 * 1024 * 1024;
-
-/** Once-per-session latch so we don't toast on every rev bump after
- *  the budget threshold is crossed.  Reset implicitly on page reload. */
-let _sizeWarned = false;
-
-/** Wire a $effect.root that watches the chat log + highlight slice and
+/** Wire a $effect.root that watches the highlight slice and
  * debounces a save to localStorage.  Called from ``bootstrap`` after
  * the model id is known so the storage key resolves. */
 function attachPersistence(): void {
@@ -3791,17 +3821,6 @@ function attachPersistence(): void {
     $effect(() => {
       // Touch every reactive field we want to persist so the effect
       // re-runs whenever any of them change.
-      void chatLog.turns.length;
-      // Mutate-in-place arrays (token stream) — read .length on every
-      // turn so ``schedulePersist`` debouncer fires through gen.
-      for (const t of chatLog.turns) {
-        void t.text;
-        void t.tokens?.length;
-        void t.thinkingTokens?.length;
-      }
-      // Loom tree changes drive the persisted shape; touch rev so
-      // every mutation queues a save.
-      void loomTree.rev;
       void highlightState.target;
       void highlightState.compareTarget;
       void highlightState.compareTwo;
@@ -4144,9 +4163,10 @@ export async function bootstrap(): Promise<void> {
   // (it's scoped by model_id), so we serialize that step.  The other
   // refreshes parallelize as before.
   await refreshSession();
-  // First-paint: load the current cache before
-  // attaching the persist effect so we don't immediately overwrite.
-  loadPersistedChat();
+  // Restore presentation preferences before attaching the persist effect so
+  // we do not immediately overwrite them.  The tree always comes from the
+  // authoritative server fetch below.
+  loadPersistedPreferences();
   // Per-model render-mode override (base vs chat) — also model-scoped.
   loadGenUiMode();
   attachPersistence();

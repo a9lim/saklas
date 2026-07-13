@@ -593,7 +593,8 @@ class LoomMutated:
 
     ``op`` is one of ``"edit"``, ``"branch"``, ``"navigate"``, ``"delete"``,
     ``"star"``, ``"note"``, ``"reset"``, ``"add_user"``, ``"begin_assistant"``,
-    ``"finalize_assistant"``, ``"cast"`` (roster change — no node ids;
+    ``"finalize_assistant"``, ``"restore"`` (whole-tree replacement),
+    ``"cast"`` (roster change — no node ids;
     clients refetch the roster).
 
     Delta payload fields carry ids only at the engine level — the

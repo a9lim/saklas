@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from saklas import SaklasSession, SamplingConfig
 
 if TYPE_CHECKING:
-    from saklas import RunSet
+    from saklas import GenerationResult
 
 
 def main() -> None:
@@ -41,17 +41,22 @@ def main() -> None:
         )
 
     print("\n=== unsteered ===")
-    print(unsteered.text)
+    print(unsteered.first.text)
     print("\n=== steered (alpha={:.2f}) ===".format(args.alpha))
-    print(steered.text)
+    print(steered.first.text)
 
-    def probe_summary(result: RunSet) -> dict[str, float]:
-        return {name: round(r.mean, 3) for name, r in result.readings.items()}
+    def probe_summary(result: GenerationResult) -> dict[str, float]:
+        """Axis-0 aggregate at the last generated content token."""
+        return {
+            name: round(reading.coords[0], 3)
+            for name, reading in result.probe_readings.items()
+            if reading.coords
+        }
 
     print("\n=== probe means ===")
     print(json.dumps({
-        "unsteered": probe_summary(unsteered),
-        "steered": probe_summary(steered),
+        "unsteered": probe_summary(unsteered.first),
+        "steered": probe_summary(steered.first),
     }, indent=2))
 
 

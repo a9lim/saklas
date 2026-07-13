@@ -2198,7 +2198,9 @@ def test_monopolar_affine_transfer_rebakes_positive_world_direction_share() -> N
         whitener=whitener, target_layer_means=whitener.layer_means,
         from_model="src", to_model="tgt",
     )
-    expected_world = transferred.layers[0].node_coords[0] @ transferred.layers[0].basis
+    transferred_coords = transferred.layers[0].node_coords
+    assert transferred_coords is not None
+    expected_world = transferred_coords[0] @ transferred.layers[0].basis
     assert transferred.mahalanobis_share[0] == pytest.approx(
         whitener.mahalanobis_norm(0, expected_world), rel=1e-5,
     )
@@ -3428,7 +3430,7 @@ def _baked_manifold(name: str = "merged", n_layers: int = 3):
     from saklas.core.vectors import fold_directions_to_subspace
 
     directions = {i: torch.randn(8) for i in range(n_layers)}
-    whitener = _target_whitener(dim=8, layers=range(n_layers))
+    whitener = _target_whitener(dim=8, layers=tuple(range(n_layers)))
     return (
         fold_directions_to_subspace(
             name, directions, whitener.layer_means,

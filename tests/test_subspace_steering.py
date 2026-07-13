@@ -13,11 +13,14 @@ kernel math (the affine geodesic slide) lives in ``test_manifold_math.py`` /
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 from torch import nn
 
 from saklas.core.hooks import _SUBSPACE_GAIN, SteeringManager
+from saklas.core.mahalanobis import LayerWhitener
 from saklas.core.manifold import (
     CustomDomain,
     SynthesizedSubspace,
@@ -30,7 +33,12 @@ from tests._whitener import isotropic_whitener
 _DIM = 8
 
 
-def synthesize_subspace(*args, neutral_means, whitener=None, **kwargs):
+def synthesize_subspace(
+    *args: Any,
+    neutral_means: dict[int, torch.Tensor],
+    whitener: LayerWhitener | None = None,
+    **kwargs: Any,
+) -> SynthesizedSubspace:
     if whitener is None:
         whitener = isotropic_whitener(neutral_means, _DIM)
     return _synthesize_subspace(

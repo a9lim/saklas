@@ -196,10 +196,53 @@ def register_ws_stream(app: FastAPI) -> None:
                         await _send_json(payload)
                     except Exception:
                         return
+                    if payload.get("op") == "finalize_assistant":
+                        updated = payload.get("updated")
+                        if isinstance(updated, list):
+                            for node in updated:
+                                if not isinstance(node, dict):
+                                    continue
+                                node_id = node.get("id")
+                                if isinstance(node_id, str):
+                                    tree_forwarded_finalized.add(node_id)
+                    tree_forwarded_event.set()
             except asyncio.CancelledError:
                 return
 
+        tree_forwarded_finalized: set[str] = set()
+        tree_forwarded_event = asyncio.Event()
         forwarder_task = asyncio.create_task(_tree_forwarder())
+
+        async def _wait_for_tree_finalization(node_id: str) -> None:
+            """Do not let ``done`` overtake its authoritative tree delta.
+
+            The mutation forwarder and generation dispatcher are separate
+            tasks sharing a send lock.  Serialization alone does not impose
+            ordering: the dispatcher could acquire the lock first even though
+            the worker had already queued its ``finalize`` event, briefly
+            leaving clients with a completed but empty assistant node.
+            """
+            while node_id not in tree_forwarded_finalized:
+                tree_forwarded_event.clear()
+                if node_id in tree_forwarded_finalized:
+                    return
+                event_wait = asyncio.create_task(tree_forwarded_event.wait())
+                finished, pending = await asyncio.wait(
+                    {event_wait, forwarder_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    if task is not forwarder_task:
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+                if (
+                    forwarder_task in finished
+                    and node_id not in tree_forwarded_finalized
+                ):
+                    raise RuntimeError(
+                        "tree mutation stream ended before generation finalization"
+                    )
 
         deferred_incoming: deque[_Inbound] = deque()
 
@@ -226,7 +269,7 @@ def register_ws_stream(app: FastAPI) -> None:
                 if isinstance(msg, WSGenerateMessage):
                     await _ws_handle_generate(
                         session, msg, app.state.default_steering, incoming,
-                        deferred_incoming, _send_json,
+                        deferred_incoming, _send_json, _wait_for_tree_finalization,
                     )
                 elif isinstance(msg, _Stop):
                     # Idle-state stop: nothing in flight.
@@ -271,6 +314,7 @@ async def _ws_handle_generate(
     incoming: asyncio.Queue[_Inbound],
     deferred_incoming: "deque[_Inbound]",
     send_json: Callable[[JSONObject], Awaitable[None]],
+    wait_for_tree_finalization: Callable[[str], Awaitable[None]],
 ) -> None:
     """Run one generate turn and stream token/done/error events.
 
@@ -547,6 +591,7 @@ async def _ws_handle_generate(
             return
         for sibling_idx, seed_i in enumerate(seeds):
             generation_id = uuid.uuid4().hex[:12]
+            tree_rev_before_generation = int(session.tree.rev)
 
             # Per-sibling sampling override carrying the derived seed.
             if n == 1 and seed_i is None:
@@ -747,6 +792,15 @@ async def _ws_handle_generate(
                 raise RuntimeError("generation completed without a result")
             result = result_holder[0]
             result_json = result_to_json(result)
+            # The engine deliberately uses the OpenAI-compatible ``stop``
+            # finish reason for EOS, stop sequences, and an external stop
+            # request.  This native WebSocket knows which case happened:
+            # surface a distinct UI-only reason so the dashboard does not
+            # present a user-cancelled 659/1024-token turn as ordinary
+            # completion.  Protocol adapters and the stored loom recipe keep
+            # the engine's canonical reason unchanged.
+            if stop_signaled and result_json.get("finish_reason") == "stop":
+                result_json["finish_reason"] = "cancelled"
             # The settled per-probe aggregate rides the ``done`` event in
             # the same rich shape as each token frame.  Shared with the
             # SSE / NDJSON finalization via ``probe_reading_aggregate``
@@ -771,6 +825,11 @@ async def _ws_handle_generate(
                 mean_surprise_out = node.mean_surprise
             result_json["mean_logprob"] = mean_logprob_out
             result_json["mean_surprise"] = mean_surprise_out
+            if (
+                finalized_node_id is not None
+                and int(session.tree.rev) > tree_rev_before_generation
+            ):
+                await wait_for_tree_finalization(finalized_node_id)
             await send_json({
                 "type": "done",
                 "result": result_json,

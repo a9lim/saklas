@@ -1995,7 +1995,7 @@ class Manifold:
             )
         if any(
             isinstance(value, bool)
-            or not isinstance(value, (int, float))
+            or not isinstance(value, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime-loaded artifacts can violate annotations
             or not math.isfinite(value)
             or value <= 0.0
             for value in self.mahalanobis_share.values()
@@ -2390,7 +2390,7 @@ class SynthesizedSubspace:
                 raise ValueError("SynthesizedSubspace tensors must be finite")
             if (
                 isinstance(self.share[layer], bool)
-                or not isinstance(self.share[layer], (int, float))
+                or not isinstance(self.share[layer], (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime-loaded values can violate annotations
                 or not math.isfinite(self.share[layer])
                 or self.share[layer] <= 0.0
             ):

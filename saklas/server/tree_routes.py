@@ -20,6 +20,7 @@ from saklas.server.tree_models import (
     TreeEditRequest,
     TreeNavigateRequest,
     TreeNoteRequest,
+    TreeRestoreRequest,
     TreeStarRequest,
     TreeTranscriptLoadRequest,
     TreeTranscriptRequest,
@@ -43,6 +44,27 @@ def register_tree_routes(app: FastAPI) -> None:
         """
         resolve_session_id(session_id)
         return tree_to_json(session)
+
+    @app.put("/saklas/v1/sessions/{session_id}/tree")
+    async def restore_tree(session_id: str, req: TreeRestoreRequest):
+        """Atomically restore a complete Loom tree from its JSON form.
+
+        This is the inverse of the full-tree GET and backs the dashboard's
+        save/load affordance.  Structural/schema validation is delegated to
+        :meth:`LoomTree.from_dict`; model mismatch is refused because saved
+        token ids and stamped generation recipes are model-specific.
+        """
+        resolve_session_id(session_id)
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
+            session.restore_tree(req.tree)
+        return {
+            "rev": session.tree.rev,
+            "root_id": session.tree.root_id,
+            "active_node_id": session.tree.active_node_id,
+            "nodes": len(session.tree.nodes),
+        }
 
     @app.get("/saklas/v1/sessions/{session_id}/tree/active")
     def get_tree_active(session_id: str):

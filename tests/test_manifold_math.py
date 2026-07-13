@@ -577,6 +577,9 @@ def test_fit_layer_subspace_returns_reusable_mu_centered_coords():
     expected_anchor_coords = (
         (centroids.float() - neutral.float()) @ sub.basis.float().T
     )
+    assert sub.node_params is not None
+    assert sub.rbf_weights is not None
+    assert sub.poly_coeffs is not None
     fitted_anchor_coords = eval_rbf(
         sub.node_params, sub.rbf_weights, sub.poly_coeffs, sub.node_params,
     )

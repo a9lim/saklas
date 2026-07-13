@@ -1,10 +1,10 @@
 <script lang="ts">
   // Load-conversation drawer — restore from a previously-saved JSON blob.
-  // Mirrors SaveConversationDrawer's current wire shape exactly. Older and
-  // partial files are rejected rather than guessed into current state.
+  // Mirrors SaveConversationDrawer's v4 whole-tree wire shape exactly.
+  // Older active-path-only files are rejected rather than pretending to
+  // restore state the server does not own.
 
   import {
-    chatLog,
     addSubspaceToRack,
     setSubspaceLabel,
     setSubspaceCoords,
@@ -26,6 +26,7 @@
     highlightState,
     closeDrawer,
     refreshVectorList,
+    refreshLoomTree,
     vectorsState,
     steerRack,
     probeRack,
@@ -33,7 +34,8 @@
     detachProbe,
     setProbeSortMode,
   } from "../lib/stores.svelte";
-  import type { ChatTurn, ProbeSortMode, Trigger, Variant } from "../lib/types";
+  import { apiTree } from "../lib/api";
+  import type { LoomTreeJSON, ProbeSortMode, Trigger, Variant } from "../lib/types";
   import type { SamplingState } from "../lib/stores.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
@@ -47,6 +49,7 @@
   let parseError: string | null = $state(null);
   let warnings: string[] = $state([]);
   let appliedSummary: string | null = $state(null);
+  let applying = $state(false);
 
   interface SteerRowShape {
     name: string;
@@ -61,11 +64,11 @@
   }
 
   interface SnapshotShape {
-    version: 3;
+    version: 4;
     savedAt: string;
     model_id: string;
     session_id: string;
-    chatLog: ChatTurn[];
+    tree: LoomTreeJSON;
     steerRack: SteerRowShape[];
     subspaceAlong: number;
     probeRack: {
@@ -90,15 +93,19 @@
   function isSnapshotShape(v: unknown): v is SnapshotShape {
     if (!v || typeof v !== "object") return false;
     const obj = v as Record<string, unknown>;
-    if (obj.version !== 3 || typeof obj.savedAt !== "string") return false;
+    if (obj.version !== 4 || typeof obj.savedAt !== "string") return false;
     if (typeof obj.model_id !== "string" || typeof obj.session_id !== "string") return false;
-    if (!Array.isArray(obj.chatLog) || !Array.isArray(obj.steerRack)) return false;
-    if (!obj.chatLog.every((turn) => {
-      if (!turn || typeof turn !== "object") return false;
-      const t = turn as Record<string, unknown>;
-      return (t.role === "system" || t.role === "user" || t.role === "assistant")
-        && typeof t.text === "string";
-    })) return false;
+    if (!obj.tree || typeof obj.tree !== "object" || !Array.isArray(obj.steerRack)) return false;
+    const tree = obj.tree as Record<string, unknown>;
+    if (typeof tree.tree_format !== "number"
+      || typeof tree.saklas_version !== "string"
+      || typeof tree.root_id !== "string"
+      || typeof tree.active_node_id !== "string"
+      || typeof tree.rev !== "number"
+      || tree.model_id !== obj.model_id
+      || !Array.isArray(tree.nodes)
+      || !tree.children_of || typeof tree.children_of !== "object"
+      || !tree.cast || typeof tree.cast !== "object") return false;
     if (typeof obj.subspaceAlong !== "number") return false;
     if (!obj.probeRack || typeof obj.probeRack !== "object") return false;
     const probes = obj.probeRack as Record<string, unknown>;
@@ -165,7 +172,7 @@
     }
     if (!isSnapshotShape(json)) {
       parseError =
-        "unsupported conversation file: expected the complete saklas conversation schema version 3";
+        "unsupported conversation file: expected the complete saklas conversation schema version 4";
       return;
     }
     parsed = json;
@@ -180,14 +187,17 @@
     let skippedTerms = 0;
     let appliedSampling = 0;
 
-    await refreshVectorList();
-    chatLog.turns = parsed.chatLog;
-    appliedTurns = parsed.chatLog.length;
+    applying = true;
+    try {
+      await apiTree.restore(parsed.tree);
+      await refreshLoomTree();
+      await refreshVectorList();
+      appliedTurns = parsed.tree.nodes.filter((node) => node.parent_id !== null).length;
 
-    const steerRows = parsed.steerRack;
-    steerRack.entries.clear();
-    setSubspaceAlong(parsed.subspaceAlong);
-    for (const row of steerRows) {
+      const steerRows = parsed.steerRack;
+      steerRack.entries.clear();
+      setSubspaceAlong(parsed.subspaceAlong);
+      for (const row of steerRows) {
         const name = row.name;
         if (row.mode === "manifold") {
           addManifoldToRack(name);
@@ -207,7 +217,7 @@
         setSubspaceTrigger(name, row.trigger);
         if (row.enabled === false) setSubspaceEnabled(name, false);
         appliedTerms++;
-    }
+      }
       // Sanity-check against the server's known set; surface a warning
       // for terms that aren't currently registered.  Informational only —
       // the rack carries them as-is.
@@ -225,37 +235,44 @@
       } catch {
         /* ignore */
       }
-    for (const [k, v] of Object.entries(parsed.samplingState)) {
-      if (k in samplingState) {
-        setSampling(k as keyof SamplingState, v as never);
-        appliedSampling++;
+      for (const [k, v] of Object.entries(parsed.samplingState)) {
+        if (k in samplingState) {
+          setSampling(k as keyof SamplingState, v as never);
+          appliedSampling++;
+        }
       }
-    }
 
-    const hs = parsed.highlightState;
-    setHighlightTarget(hs.target);
-    setCompareTarget(hs.compareTarget);
-    highlightState.compareTwo = hs.compareTwo;
-    highlightState.smoothBlend = hs.smoothBlend;
+      const hs = parsed.highlightState;
+      setHighlightTarget(hs.target);
+      setCompareTarget(hs.compareTarget);
+      highlightState.compareTwo = hs.compareTwo;
+      highlightState.smoothBlend = hs.smoothBlend;
 
-    for (const name of [...probeRack.active]) await detachProbe(name);
-    setProbeSortMode(parsed.probeRack.sortMode as ProbeSortMode);
-    const savedProbeEntries = new Map(parsed.probeRack.entries.map((entry) => [entry.name, entry]));
-    for (const name of parsed.probeRack.active) {
-      await attachProbe(name);
-      const entry = probeRack.entries.get(name);
-      const saved = savedProbeEntries.get(name);
-      if (entry && saved) {
-        probeRack.entries.set(name, {
-          ...entry,
-          sparkline: [...saved.sparkline],
-          current: saved.current,
-          previous: saved.previous,
-        });
+      for (const name of [...probeRack.active]) await detachProbe(name);
+      setProbeSortMode(parsed.probeRack.sortMode as ProbeSortMode);
+      const savedProbeEntries = new Map(
+        parsed.probeRack.entries.map((entry) => [entry.name, entry]),
+      );
+      for (const name of parsed.probeRack.active) {
+        await attachProbe(name);
+        const entry = probeRack.entries.get(name);
+        const saved = savedProbeEntries.get(name);
+        if (entry && saved) {
+          probeRack.entries.set(name, {
+            ...entry,
+            sparkline: [...saved.sparkline],
+            current: saved.current,
+            previous: saved.previous,
+          });
+        }
       }
-    }
 
-    appliedSummary = `restored ${appliedTurns} turn${appliedTurns === 1 ? "" : "s"}, ${appliedTerms} term${appliedTerms === 1 ? "" : "s"}${skippedTerms ? ` (${skippedTerms} not server-known)` : ""}, ${appliedSampling} sampling field${appliedSampling === 1 ? "" : "s"}`;
+      appliedSummary = `restored ${appliedTurns} turn${appliedTurns === 1 ? "" : "s"}, ${appliedTerms} term${appliedTerms === 1 ? "" : "s"}${skippedTerms ? ` (${skippedTerms} not server-known)` : ""}, ${appliedSampling} sampling field${appliedSampling === 1 ? "" : "s"}`;
+    } catch (e) {
+      parseError = `restore failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      applying = false;
+    }
   }
 </script>
 
@@ -269,9 +286,9 @@
 
   <div class="body">
     <p class="hint">
-      restore from a saklas conversation JSON file.  Vectors must already be
-      registered on the server for steering to take effect; missing names
-      stay in the rack but won't apply at gen time.
+      restore a complete saklas v4 conversation file into the live server.
+      The file's model must match; vectors referenced by workspace controls
+      must already be registered for steering to take effect.
     </p>
 
     <label class="field">
@@ -295,7 +312,7 @@
           saved {parsed.savedAt} · model {parsed.model_id}
         </span>
         <ul class="counts">
-          <li>turns: {parsed.chatLog?.length ?? 0}</li>
+          <li>turns: {parsed.tree.nodes.filter((node) => node.parent_id !== null).length}</li>
           <li>terms: {parsed.steerRack.length}</li>
           <li>probes: {parsed.probeRack.active.length}</li>
           <li>sampling fields: {Object.keys(parsed.samplingState).length}</li>
@@ -324,9 +341,9 @@
     <button
       type="button"
       class="btn primary"
-      disabled={!parsed}
+      disabled={!parsed || applying}
       onclick={applySnapshot}
-    >restore</button>
+    >{applying ? "restoring…" : "restore"}</button>
   </footer>
 </section>
 
