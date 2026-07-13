@@ -22,9 +22,9 @@
   //           to the end-of-gen aggregate, discovery cards go quiet.  The
   //           full per-layer ranking lives in the transcript drilldown.
   //
-  // SOURCE is the shared lifecycle shell: select a prepared source, fetch the
-  // official Neuronpedia artifact into the HF cache, or start/cancel a local
-  // fit. Successful preparation activates the source and live readout.
+  // SOURCE is the shared lifecycle shell: one selector uses or fetches an
+  // artifact, followed by the same labelled custom row as SAE. Successful
+  // preparation activates the source and live readout.
 
   import Bar from "../lib/charts/Bar.svelte";
   import Button from "../lib/ui/Button.svelte";
@@ -70,11 +70,10 @@
   const LENS_PROVIDER_OPTIONS = [
     { value: "neuronpedia", label: "neuronpedia" },
   ];
-  let providerSource = $state("neuronpedia");
   let fitPrompts = $state(100);
   let fitLayers = $state("workspace");
   let fitConfirm = $state(false);
-  let selectedSource = $state("");
+  let selectedSource = $state("neuronpedia");
   const fitReady = $derived(
     Number.isInteger(fitPrompts) && fitPrompts >= 1 && fitPrompts <= 5000 &&
       fitLayers.trim().length > 0,
@@ -97,16 +96,23 @@
   onMount(() => {
     void checkLensFit();
     void checkLensFetch();
-    void refreshLensSources();
+    void refreshLensSources().then(() => {
+      const active = lensSourceState.sources.find((source) => source.active);
+      if (active) selectedSource = active.source;
+    });
   });
 
   $effect(() => {
     const active = lensSourceState.sources.find((source) => source.active);
+    const known = lensSourceState.sources.some(
+      (source) => source.source === selectedSource,
+    ) || LENS_PROVIDER_OPTIONS.some((source) => source.value === selectedSource);
     if (
       !selectedSource ||
-      !lensSourceState.sources.some((source) => source.source === selectedSource)
+      !known
     ) {
-      selectedSource = active?.source ?? lensSourceState.sources[0]?.source ?? "";
+      selectedSource = active?.source ?? lensSourceState.sources[0]?.source ??
+        LENS_PROVIDER_OPTIONS[0]?.value ?? "";
     }
   });
 
@@ -375,30 +381,35 @@
     sourceError={lensSourceState.error}
     working={lensFetchState.running || lensFitState.running}
     onuse={(source) => void useLensSource(source)}
-    bind:providerValue={providerSource}
     providerOptions={LENS_PROVIDER_OPTIONS}
     providerPlaceholder="lens provider"
     onfetch={(source) => void startLensFetch(source)}
   >
     {#snippet localControls()}
-      <input
-        class="add-input prompts-input"
-        type="number"
-        min="1"
-        max="5000"
-        step="25"
-        bind:value={fitPrompts}
-        placeholder="prompts"
-        aria-label="J-lens corpus prompts"
-        title="Corpus prompts (1–5000)"
-      />
-      <input
-        class="add-input band-input"
-        bind:value={fitLayers}
-        placeholder="workspace"
-        aria-label="J-lens source layer band"
-        title="workspace, all, or comma-separated layer ids"
-      />
+      <label class="setup-field setup-field-medium">
+        <span class="setup-field-label">prompts</span>
+        <input
+          class="add-input"
+          type="number"
+          min="1"
+          max="5000"
+          step="25"
+          bind:value={fitPrompts}
+          placeholder="100"
+          aria-label="J-lens corpus prompts"
+          title="Corpus prompts (1–5000)"
+        />
+      </label>
+      <label class="setup-field setup-field-wide">
+        <span class="setup-field-label">layers</span>
+        <input
+          class="add-input"
+          bind:value={fitLayers}
+          placeholder="workspace | all | 13,14,…"
+          aria-label="J-lens source layers"
+          title="workspace, all, or comma-separated layer ids"
+        />
+      </label>
     {/snippet}
     {#snippet localAction()}
       <Button
@@ -407,7 +418,7 @@
         accent="var(--accent-blue)"
         disabled={sourceBusy || !fitReady}
         onclick={requestFit}
-        title="Fit a Saklas-owned local Jacobian lens over the workspace band"
+        title="Fit a Saklas-owned local Jacobian lens over the selected layers"
       >
         {fitConfirm ? "confirm local fit" : "fit local"}
       </Button>
@@ -628,12 +639,6 @@
     flex-direction: column;
     gap: var(--space-3);
     padding: var(--space-5);
-  }
-  .prompts-input {
-    flex: 1 1 0;
-  }
-  .band-input {
-    flex: 1 1 0;
   }
   .work-status {
     margin: 0;

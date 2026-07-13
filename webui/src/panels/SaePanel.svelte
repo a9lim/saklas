@@ -15,9 +15,9 @@
   //           readout — pinned probes settle to the end-of-gen activation,
   //           discovery cards go quiet.
   //
-  // SOURCE mirrors J-LENS exactly: select a prepared source, fetch a provider
-  // release into its normal cache, or start/cancel a Saklas-owned local train.
-  // Successful preparation makes the source resident and turns live readout on.
+  // SOURCE mirrors J-LENS exactly: one selector uses or fetches an artifact,
+  // followed by a labelled custom row. Successful preparation makes the source
+  // resident and turns live readout on.
 
   import Bar from "../lib/charts/Bar.svelte";
   import Button from "../lib/ui/Button.svelte";
@@ -52,7 +52,6 @@
 
   const loaded = $derived(sessionState.info?.sae_loaded === true);
   const info = $derived(sessionState.info?.sae_info ?? null);
-  let release = $state("");
   let selectedSource = $state("");
   let localName = $state("my-sae");
   let trainTokens = $state(1_000_000);
@@ -65,7 +64,7 @@
   }[]>([]);
   let discoverError = $state<string | null>(null);
   const providerOptions = $derived(releases.map((row) => ({
-    value: row.release,
+    value: `saelens:${row.release}`,
     label: row.release,
   })));
   const sourceBusy = $derived(
@@ -73,17 +72,24 @@
   );
 
   onMount(() => {
-    void refreshSaeSources();
+    void refreshSaeSources().then(() => {
+      const active = saeSourceState.sources.find((source) => source.active);
+      if (active) selectedSource = active.source;
+    });
     void checkSaeTrain();
   });
 
   $effect(() => {
     const active = saeSourceState.sources.find((source) => source.active);
+    const known = saeSourceState.sources.some(
+      (source) => source.source === selectedSource,
+    ) || providerOptions.some((source) => source.value === selectedSource);
     if (
       !selectedSource ||
-      !saeSourceState.sources.some((source) => source.source === selectedSource)
+      !known
     ) {
-      selectedSource = active?.source ?? saeSourceState.sources[0]?.source ?? "";
+      selectedSource = active?.source ?? saeSourceState.sources[0]?.source ??
+        providerOptions[0]?.value ?? "";
     }
   });
 
@@ -91,7 +97,9 @@
     if (releases.length > 0) return;
     void apiSae.releases().then((result) => {
       releases = result.releases.filter((row) => row.source !== "local");
-      if (!release && releases.length > 0) release = releases[0].release;
+      if (!selectedSource && releases.length > 0) {
+        selectedSource = `saelens:${releases[0].release}`;
+      }
     }).catch((error) => {
       discoverError = error instanceof Error ? error.message : String(error);
     });
@@ -357,34 +365,42 @@
     sourceError={saeSourceState.error}
     working={saeTrainState.running}
     onuse={(source) => void loadSae(source)}
-    bind:providerValue={release}
     providerOptions={providerOptions}
     providerPlaceholder="SAELens release"
-    onfetch={(source) => void loadSae(`saelens:${source}`)}
+    onfetch={(source) => void loadSae(source)}
   >
     {#snippet localControls()}
-      <input
-        class="add-input"
-        bind:value={localName}
-        placeholder="local SAE name"
-        aria-label="Local SAE name"
-      />
-      <input
-        class="add-input compact"
-        type="number"
-        min="1"
-        step="10000"
-        bind:value={trainTokens}
-        aria-label="SAE training tokens"
-        title="Training tokens"
-      />
-      <input
-        class="add-input layer-input"
-        inputmode="numeric"
-        bind:value={trainLayer}
-        placeholder="auto L"
-        aria-label="Residual layer (blank for automatic)"
-      />
+      <label class="setup-field setup-field-wide">
+        <span class="setup-field-label">name</span>
+        <input
+          class="add-input"
+          bind:value={localName}
+          placeholder="local SAE name"
+          aria-label="Local SAE name"
+        />
+      </label>
+      <label class="setup-field setup-field-medium">
+        <span class="setup-field-label">tokens</span>
+        <input
+          class="add-input"
+          type="number"
+          min="1"
+          step="10000"
+          bind:value={trainTokens}
+          aria-label="SAE training tokens"
+          title="Training tokens"
+        />
+      </label>
+      <label class="setup-field setup-field-narrow">
+        <span class="setup-field-label">layer</span>
+        <input
+          class="add-input"
+          inputmode="numeric"
+          bind:value={trainLayer}
+          placeholder="auto"
+          aria-label="Residual layer (blank for automatic)"
+        />
+      </label>
     {/snippet}
     {#snippet localAction()}
       <Button
@@ -609,12 +625,6 @@
     align-items: center;
     gap: var(--space-2);
     min-width: 0;
-  }
-  .compact {
-    flex: 0 1 7.5rem;
-  }
-  .layer-input {
-    flex: 0 1 4.5rem;
   }
   .train-progress {
     display: flex;

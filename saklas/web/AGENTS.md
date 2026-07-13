@@ -165,10 +165,9 @@ webui/src/
     JLensPanel.svelte         # J-LENS pillar — SOURCE picker + official fetch
                               # and cancellable local fit; then STEER + merged
                               # PROBE cards with live workspace discovery
-    rack/InstrumentSource{Picker,Section}.svelte # exact shared prepared-source
-                              # selector plus the canonical provider Select /
-                              # fetch action and two-row lifecycle shell for
-                              # the SAE and J-LENS pillars
+    rack/InstrumentSourceSection.svelte # one shared prepared/provider selector
+                              # plus the canonical labelled custom lifecycle
+                              # row for the SAE and J-LENS pillars
     WorkbenchCard.svelte      # active-workbench card (model + device); bottom of threads column
     StatusFooter.svelte       # gen progress · t/s · elapsed · ppl + pending-queue count badge; mounted inside Chat above the input row
     PendingBubbles.svelte     # ghosted bubbles for queued sends/commits/mutations + per-item × cancel; mounted between StatusFooter and the input row
