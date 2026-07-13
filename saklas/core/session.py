@@ -2002,6 +2002,17 @@ class SaklasSession:
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
 
+    def select_jlens_source(self, source: str) -> None:
+        """Select a prepared local/external lens and evict derived live state.
+
+        Source preparation is deliberately separate: callers fit or fetch
+        first, then use this exact source identifier to switch the session.
+        """
+        from saklas.io.lens_sources import use_lens_source
+
+        use_lens_source(self.model_id, source)
+        self._evict_resident_jlens()
+
     def _adopt_fitted_jlens(
         self, lens: "Any", *, sidecar: "Mapping[str, Any] | None" = None,
     ) -> "Any":
@@ -3657,6 +3668,7 @@ class SaklasSession:
         seed: int = 0,
         force: bool = False,
         on_progress: "Callable[[str], None] | None" = None,
+        cancel_event: "threading.Event | None" = None,
     ) -> dict[str, Any]:
         """Train and persist a Saklas-owned residual-post SAE."""
         import hashlib
@@ -3695,6 +3707,7 @@ class SaklasSession:
                 dead_feature_threshold=dead_feature_threshold,
                 seed=seed,
                 on_progress=on_progress,
+                cancel_event=cancel_event,
             )
             manifest = save_local_sae(
                 self.model_id,

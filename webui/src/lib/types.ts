@@ -189,6 +189,32 @@ export interface LensFitStatusJSON {
   live_layers: number[] | null;
 }
 
+/** One usable artifact source. The ``source`` string is deliberately the
+ * same identifier accepted by the sibling ``use`` action. */
+export interface InstrumentSourceJSON {
+  source: string;
+  kind: "local" | "huggingface" | "saelens";
+  name: string;
+  active: boolean;
+  path?: string;
+  provider?: string;
+  repo_id?: string;
+  repo_revision?: string;
+  checkpoint?: string;
+  layer?: number;
+  features?: number;
+}
+
+export interface LensFetchStatusJSON {
+  running: boolean;
+  source: string | null;
+  message: string | null;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  live_layers: number[] | null;
+}
+
 // ------------------------------------------------ sparse autoencoder --
 
 export interface SaeFeatureJSON {
@@ -212,6 +238,18 @@ export interface SaeFeatureMetaResponse {
 export interface SaeLoadStatusJSON {
   running: boolean;
   release: string | null;
+  message: string | null;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  info: SessionInfo["sae_info"];
+}
+
+export interface SaeTrainStatusJSON {
+  running: boolean;
+  name: string | null;
+  tokens_done: number;
+  tokens_total: number;
   message: string | null;
   error: string | null;
   started_at: number | null;

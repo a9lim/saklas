@@ -23,10 +23,11 @@ those registrars import):
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
-- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/*` (token readout +
-  the live-lens toggle)
-- `sae_routes.register_sae_routes` — `/sessions/{id}/sae/*` (release discovery,
-  background load, live toggle, feature validation, token readout, and
+- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/*` (source list/use,
+  background official fetch/local fit, token readout + the live-lens toggle)
+- `sae_routes.register_sae_routes` — `/sessions/{id}/sae/*` (source/release
+  discovery, background provider load/local train, live toggle, feature
+  validation, token readout, and
   `POST .../sae/features/metadata` — the Neuronpedia metadata backfill:
   `{ids: [...]}` (≤64) → `session.fetch_sae_feature_meta` in a worker thread,
   no session lock (network + disk cache only, like validation); the dashboard
@@ -356,6 +357,13 @@ node_ids, rows}`.
 
 ### lens_routes.py — Jacobian-lens routes
 
+`GET /sessions/{id}/lens/sources` lists prepared `local:default` and
+`neuronpedia` sources. `POST .../lens/use` selects one under the session lock,
+evicts derived lens state, and auto-enables its workspace-band live readout.
+`POST/GET .../lens/fetch` starts/polls an official Neuronpedia fetch: provider
+bytes stay in the Hugging Face cache, the worker publishes only a Saklas binding,
+then activates it under the lock. Fetch and local fit are mutually exclusive.
+
 `POST /sessions/{id}/lens/token/validate` body `{word}` — a read-only tokenizer
 check for the dashboard's J-lens STEER and PROBE add forms. Returns
 `{word, token_id}` only when the word round-trips as exactly one vocabulary
@@ -411,6 +419,18 @@ parsed from the engine's `prompt N/M` progress lines). Error text follows
 the SSE scrubbing discipline (typed `user_message()`, else exception type
 only). Generations attempted while the fit holds the model raise through
 the ordinary busy path — surfaced client-side by the sticky WS error toast.
+
+### sae_routes.py — sparse-autoencoder routes
+
+`GET /sessions/{id}/sae/sources` lists prepared `local:<name>` and
+`saelens:<release>` sources. The background `POST/GET .../sae/load` accepts
+either harmonized source string (the `saelens:` prefix is stripped only at the
+provider-adapter boundary), so it both fetches a new provider release and
+switches an existing source. `POST/GET/DELETE .../sae/train` starts, polls, and
+cooperatively cancels native local training over the default FineWeb-Edu stream;
+status carries token progress. A successful train makes the local source
+resident and enables live SAE discovery. Provider load and local train are
+mutually exclusive.
 
 ### traits_routes.py — live traits SSE
 

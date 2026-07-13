@@ -70,6 +70,16 @@ The dashboard speaks the native `/saklas/v1/*` API (registered by
   `probesLiveState`/`setLiveProbes`; backs the live toggle on `ProbeRack`'s
   PROBE header — with it and the lens toggle both off, a compute-constrained
   session pays no per-token scoring at all.
+- **J-LENS source lifecycle** — `GET /sessions/{id}/lens/sources`, `POST
+  /lens/use`, and polled `POST/GET /lens/fetch` back the tab's SOURCE section.
+  Fetch leaves official payloads in the Hugging Face cache and writes only the
+  binding; use/fetch activation turns the live workspace on. The existing
+  polled/cancellable `/lens/fit` is the Saklas-owned local sibling.
+- **SAE source lifecycle** — `GET /sessions/{id}/sae/sources`, background
+  `POST/GET /sae/load`, and polled/cancellable `POST/GET/DELETE /sae/train` back
+  the symmetric SOURCE section. Load accepts `local:<name>` or
+  `saelens:<release>`; local training reports token progress and activates the
+  resulting Saklas-owned source.
 
 ## Source layout
 
@@ -128,8 +138,8 @@ webui/src/
                               # inspector: every racked term as a pillar-colored
                               # chip (click → jump to its tab, × → remove, ⧉ →
                               # copy the canonical expression)
-    SaePanel.svelte           # resident SAE pillar — unloaded: release picker;
-                              # loaded: identity strip (release · L · width) +
+    SaePanel.svelte           # SAE pillar — SOURCE picker + provider fetch and
+                              # cancellable local train; loaded: identity +
                               # decoder-row STEER cards + pinned/live-discovery
                               # feature PROBE cards (▲ unpins / △ pins — same
                               # merged-PROBE shape and strength/name sort as the
@@ -152,7 +162,13 @@ webui/src/
                               # lens = JLensPanel. InspectorTab union is the four
                               # pillar names (the pre-4.2 "probes"/"jlens" values
                               # are gone)
-    JLensPanel.svelte         # J-LENS tab: STEER cards (mode:"jlens" rack entries → "α jlens/word" terms, per-card α default 0.3) + ONE merged PROBE section — pinned jlens/<word> probe cards (■ glyph unpins) above the unpinned live top-k aggregate cards (□ glyph pins; strength-history sparkline off lensState.aggHistory), BOTH the same card shape: strength bar (the one channel — mean band probability, the gate channel) + per-layer strength strip (p_l cells, color normalized to the card's own max). One strength/name/depth sort, live-lens toggle right of the PROBE title → apiLens.setLive({top_k: 8}); live off ⇒ pinned cards settle to the end-of-gen aggregate. The card list scrolls under an anchored header + add-form footer (the CAA racks' fixed-chrome shape); STEER sizes to content with its own capped card scroll. Every probe-family card (CAA ProbeCard, JLensProbeCard, JLensTokenCard, SaeProbeCard) puts its status chips right of the name and a sparkline top right — one statline grammar across all four tabs
+    JLensPanel.svelte         # J-LENS pillar — SOURCE picker + official fetch
+                              # and cancellable local fit; then STEER + merged
+                              # PROBE cards with live workspace discovery
+    rack/InstrumentSource{Picker,Section}.svelte # exact shared prepared-source
+                              # selector plus the canonical provider Select /
+                              # fetch action and two-row lifecycle shell for
+                              # the SAE and J-LENS pillars
     WorkbenchCard.svelte      # active-workbench card (model + device); bottom of threads column
     StatusFooter.svelte       # gen progress · t/s · elapsed · ppl + pending-queue count badge; mounted inside Chat above the input row
     PendingBubbles.svelte     # ghosted bubbles for queued sends/commits/mutations + per-item × cancel; mounted between StatusFooter and the input row

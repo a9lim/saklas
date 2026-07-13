@@ -15,27 +15,36 @@
   //           readout — pinned probes settle to the end-of-gen activation,
   //           discovery cards go quiet.
   //
-  // With no resident SAE (``session_info.sae_loaded``) the tab renders the
-  // release picker instead — loading pins one SAELens release + hook layer
-  // for the session, so the absent channel advertises itself (the same
-  // move as the lens tab's "fit j-lens" button).
+  // SOURCE mirrors J-LENS exactly: select a prepared source, fetch a provider
+  // release into its normal cache, or start/cancel a Saklas-owned local train.
+  // Successful preparation makes the source resident and turns live readout on.
 
+  import Bar from "../lib/charts/Bar.svelte";
+  import Button from "../lib/ui/Button.svelte";
+  import { onMount } from "svelte";
   import SaeProbeCard from "./rack/SaeProbeCard.svelte";
   import SaeSteerCard from "./rack/SaeSteerCard.svelte";
+  import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import { apiSae } from "../lib/api";
   import {
     activeProbeNames,
     addSaeToRack,
     attachProbe,
+    cancelSaeTrain,
+    checkSaeTrain,
     loadSae,
     probeRack,
     saeState,
+    saeSourceState,
+    saeTrainState,
     seedProbeDisplay,
     sessionState,
     setLiveSae,
     setSaeSortMode,
+    startSaeTrain,
     steerRack,
+    refreshSaeSources,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
   import type { SaeSteerEntry } from "../lib/types";
@@ -44,18 +53,66 @@
   const loaded = $derived(sessionState.info?.sae_loaded === true);
   const info = $derived(sessionState.info?.sae_info ?? null);
   let release = $state("");
-  let releases = $state<{ release: string; layers: number[] }[]>([]);
+  let selectedSource = $state("");
+  let localName = $state("my-sae");
+  let trainTokens = $state(1_000_000);
+  let trainLayer = $state("");
+  let trainConfirm = $state(false);
+  let releases = $state<{
+    release: string;
+    layers: number[];
+    source?: "local" | "saelens";
+  }[]>([]);
   let discoverError = $state<string | null>(null);
+  const providerOptions = $derived(releases.map((row) => ({
+    value: row.release,
+    label: row.release,
+  })));
+  const sourceBusy = $derived(
+    saeSourceState.loading || saeState.loading || saeTrainState.running,
+  );
+
+  onMount(() => {
+    void refreshSaeSources();
+    void checkSaeTrain();
+  });
 
   $effect(() => {
-    if (loaded || releases.length > 0) return;
+    const active = saeSourceState.sources.find((source) => source.active);
+    if (
+      !selectedSource ||
+      !saeSourceState.sources.some((source) => source.source === selectedSource)
+    ) {
+      selectedSource = active?.source ?? saeSourceState.sources[0]?.source ?? "";
+    }
+  });
+
+  $effect(() => {
+    if (releases.length > 0) return;
     void apiSae.releases().then((result) => {
-      releases = result.releases;
+      releases = result.releases.filter((row) => row.source !== "local");
       if (!release && releases.length > 0) release = releases[0].release;
     }).catch((error) => {
       discoverError = error instanceof Error ? error.message : String(error);
     });
   });
+
+  function requestTrain(): void {
+    if (!localName.trim() || saeTrainState.running) return;
+    if (!trainConfirm) {
+      trainConfirm = true;
+      return;
+    }
+    trainConfirm = false;
+    const parsedLayer = trainLayer.trim() === "" ? null : Number(trainLayer);
+    void startSaeTrain({
+      name: localName.trim(),
+      tokens: trainTokens,
+      layer: parsedLayer != null && Number.isInteger(parsedLayer)
+        ? parsedLayer
+        : null,
+    });
+  }
 
   // ---------- STEER: sae-mode rack entries (by feature id) ----------
   const steerCards = $derived.by(() => {
@@ -291,52 +348,115 @@
 </script>
 
 <div class="sae" aria-label="Sparse-autoencoder inspector">
-  {#if !loaded}
-    <section class="section">
-      <RackSectionHeader title="SAE" />
-      <p class="hint">
-        no resident SAE in this session — feature atoms, probes, and the
-        live discovery readout all need one loaded SAELens release
-      </p>
-      <form class="load-form" onsubmit={(event) => { event.preventDefault(); void loadSae(release); }}>
-        <input
-          class="add-input"
-          list="sae-releases"
-          bind:value={release}
-          placeholder="SAELens release"
-          aria-label="SAE release"
+  <InstrumentSourceSection
+    ready={loaded}
+    sources={saeSourceState.sources}
+    bind:value={selectedSource}
+    busy={sourceBusy}
+    accent="var(--pillar-sae)"
+    sourceError={saeSourceState.error}
+    working={saeTrainState.running}
+    onuse={(source) => void loadSae(source)}
+    bind:providerValue={release}
+    providerOptions={providerOptions}
+    providerPlaceholder="SAELens release"
+    onfetch={(source) => void loadSae(`saelens:${source}`)}
+  >
+    {#snippet localControls()}
+      <input
+        class="add-input"
+        bind:value={localName}
+        placeholder="local SAE name"
+        aria-label="Local SAE name"
+      />
+      <input
+        class="add-input compact"
+        type="number"
+        min="1"
+        step="10000"
+        bind:value={trainTokens}
+        aria-label="SAE training tokens"
+        title="Training tokens"
+      />
+      <input
+        class="add-input layer-input"
+        inputmode="numeric"
+        bind:value={trainLayer}
+        placeholder="auto L"
+        aria-label="Residual layer (blank for automatic)"
+      />
+    {/snippet}
+    {#snippet localAction()}
+      <Button
+        size="sm"
+        variant={trainConfirm ? "solid" : "ghost"}
+        accent="var(--pillar-sae)"
+        disabled={!localName.trim() || sourceBusy}
+        onclick={requestTrain}
+      >{trainConfirm ? "confirm local train" : "train local"}</Button>
+    {/snippet}
+    {#snippet progress()}
+      <div class="train-progress" role="status" aria-live="polite">
+        <div class="train-line">
+          <span class="work-status">{saeTrainState.message ?? "training…"}</span>
+          <span class="train-count">
+            {saeTrainState.tokensDone.toLocaleString()}/{saeTrainState.tokensTotal.toLocaleString()}
+          </span>
+        </div>
+        <Bar
+          value={saeTrainState.tokensDone}
+          max={Math.max(saeTrainState.tokensTotal, 1)}
+          width={160}
+          height={8}
+          color="var(--pillar-sae)"
         />
-        <datalist id="sae-releases">
-          {#each releases as row (row.release)}
-            <option value={row.release}>{row.layers.map((layer) => `L${layer}`).join(", ")}</option>
-          {/each}
-        </datalist>
-        <button class="add-btn" disabled={!release.trim() || saeState.loading}>
-          {saeState.loading ? "loading…" : "load SAE"}
-        </button>
-      </form>
-      <p class="hint">
-        the selected hook layer stays resident; weights use the normal
-        Hugging Face cache
-      </p>
+        <Button
+          size="sm"
+          variant="danger"
+          disabled={saeTrainState.cancelling}
+          onclick={() => void cancelSaeTrain()}
+        >
+          {saeTrainState.cancelling ? "requesting cancel…" : "cancel training"}
+        </Button>
+      </div>
+    {/snippet}
+    {#snippet warning()}
+      {#if trainConfirm}
+        <p class="hint train-warning" role="alert">
+          Training blocks generation and uses the default FineWeb-Edu stream.
+          Press confirm again.
+        </p>
+      {/if}
+    {/snippet}
+    {#snippet summary()}
+      {#if loaded}
+        <p class="source-meta">
+          <code>{info?.release}</code> · L{info?.layer} · {info?.width?.toLocaleString()} features
+        </p>
+      {:else}
+        <p class="hint">
+          Fetch a provider release without copying its weights into Saklas,
+          or train a Saklas-owned local SAE.
+        </p>
+      {/if}
+    {/snippet}
+    {#snippet messages()}
       {#if saeState.loadMessage}
         <p class="hint" role="status" aria-live="polite">{saeState.loadMessage}</p>
       {/if}
       {#if saeState.loadError}
         <p class="hint load-error" role="alert">{saeState.loadError}</p>
       {/if}
+      {#if saeTrainState.error}
+        <p class="hint load-error" role="alert">local train: {saeTrainState.error}</p>
+      {/if}
       {#if discoverError}
         <p class="hint" role="alert">registry suggestions unavailable: {discoverError}</p>
       {/if}
-    </section>
-  {:else}
-    <!-- Identity strip — which SAE is resident (release · hook layer ·
-         dictionary width).  Session identity, not a section. -->
-    <div class="identity">
-      <span class="release" title="resident SAELens release">{info?.release}</span>
-      <span class="chip">L{info?.layer}</span>
-      <span class="chip">{info?.width?.toLocaleString()} features</span>
-    </div>
+    {/snippet}
+  </InstrumentSourceSection>
+
+  {#if loaded}
 
     <!-- STEER — decoder-row atom cards in the shared steering expression. -->
     <section class="section steer">
@@ -475,31 +595,6 @@
     overflow: hidden;
   }
 
-  /* Identity strip — borderless: the mono/muted register and its own
-     padding separate it from the STEER section below. */
-  .identity {
-    display: flex;
-    gap: var(--space-3);
-    align-items: center;
-    padding: var(--space-3) var(--space-5) 0;
-    color: var(--fg-muted);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-  }
-  .release {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .chip {
-    background: var(--glass);
-    border-radius: var(--radius);
-    padding: 0 var(--space-2);
-    font-variant-numeric: tabular-nums;
-    flex: 0 0 auto;
-  }
-
   /* Flat borderless sections — typography + padding carry the divide,
      matching the rack chrome. */
   .section {
@@ -508,6 +603,50 @@
     gap: var(--space-3);
     padding: var(--space-5);
     min-height: 0;
+  }
+  .train-line {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .compact {
+    flex: 0 1 7.5rem;
+  }
+  .layer-input {
+    flex: 0 1 4.5rem;
+  }
+  .train-progress {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-2);
+  }
+  .train-line {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .work-status,
+  .source-meta {
+    margin: 0;
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+  .work-status {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .train-count {
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
+  }
+  .train-warning {
+    color: var(--accent-yellow);
   }
   .section.steer {
     flex: 0 1 auto;
@@ -558,8 +697,7 @@
   }
 
   /* ----- add / load forms ----- */
-  .add-form,
-  .load-form {
+  .add-form {
     display: flex;
     gap: var(--space-2);
   }

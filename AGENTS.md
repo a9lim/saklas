@@ -354,11 +354,15 @@ Three read surfaces over either source, plus local fit and external fetch:
   **every** fitted layer in the 40–90% band, and `saklas serve` auto-enables the
   live lens at startup when the artifact exists (serve-side policy; library +
   TUI stay opt-in). The dashboard's **J-LENS tab** is
-  the server sibling (the inspector column always carries CAA / J-LENS tabs;
-  with no fitted lens the J-LENS tab hosts a "fit j-lens" button that drives
-  the background fit route `POST /saklas/v1/sessions/{id}/lens/fit` —
-  workspace-band fit, polled progress, live readout auto-enabled on
-  completion): `POST /saklas/v1/sessions/{id}/lens/live` toggles the live
+  the server sibling. Its SOURCE section lists `local:default` and fetched
+  `neuronpedia` bindings, switches an existing source, fetches the official
+  artifact into the Hugging Face cache, or drives the background local fit
+  route `POST /saklas/v1/sessions/{id}/lens/fit` (workspace-band, polled,
+  cancellable); either successful preparation activates the source and turns
+  the live readout on. The SAE tab has the same SOURCE/STEER/PROBE shape:
+  prepared `local:<name>` / `saelens:<release>` sources, provider fetch/load,
+  or background local training with token progress and cancellation.
+  `POST /saklas/v1/sessions/{id}/lens/live` toggles the live
   lens, the native WS `token` frame carries the per-step matrix as
   `lens_readout` + the chip list as `lens_aggregate`, and session info's
   `live_lens_layers` rehydrates the toggle across reloads. The tab's STEER

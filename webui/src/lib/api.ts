@@ -23,6 +23,8 @@ import type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  InstrumentSourceJSON,
+  LensFetchStatusJSON,
   LensFitStatusJSON,
   LensTokenValidationJSON,
   LensTokenReadoutJSON,
@@ -42,6 +44,7 @@ import type {
   ScoreTemplateResponse,
   SaeFeatureMetaResponse,
   SaeLoadStatusJSON,
+  SaeTrainStatusJSON,
   SaeTokenReadoutJSON,
   SessionInfo,
   TemplateDetail,
@@ -75,6 +78,8 @@ export type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  InstrumentSourceJSON,
+  LensFetchStatusJSON,
   LensFitStatusJSON,
   LensTokenValidationJSON,
   LensTokenReadoutJSON,
@@ -94,6 +99,7 @@ export type {
   ScoreTemplateResponse,
   SaeFeatureMetaResponse,
   SaeLoadStatusJSON,
+  SaeTrainStatusJSON,
   SaeTokenReadoutJSON,
   SessionInfo,
   TemplateDetail,
@@ -815,6 +821,30 @@ export const apiExperiments = {
 // ====================================================== jacobian lens ==
 
 export const apiLens = {
+  sources(
+    id: string = SESSION,
+  ): Promise<{ sources: InstrumentSourceJSON[] }> {
+    return request(`${SESSION_BASE(id)}/lens/sources`);
+  },
+
+  use(
+    source: string,
+    id: string = SESSION,
+  ): Promise<{ source: string; live_layers: number[] }> {
+    return request(`${SESSION_BASE(id)}/lens/use`, jsonBody({ source }));
+  },
+
+  fetch(
+    body: { source?: string; force?: boolean } = {},
+    id: string = SESSION,
+  ): Promise<LensFetchStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fetch`, jsonBody(body));
+  },
+
+  fetchStatus(id: string = SESSION): Promise<LensFetchStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fetch`);
+  },
+
   /** Check that ``word`` round-trips through the loaded model tokenizer as
    * exactly one vocabulary token.  Read-only: steering/probe state is not
    * changed when validation fails. */
@@ -892,9 +922,13 @@ export const apiLens = {
 // ================================================= sparse autoencoder ==
 
 export const apiSae = {
+  sources(id: string = SESSION): Promise<{ sources: InstrumentSourceJSON[] }> {
+    return request(`${SESSION_BASE(id)}/sae/sources`);
+  },
   releases(id: string = SESSION): Promise<{ releases: {
     release: string; model?: string | null; layers: number[];
     repo_id?: string | null; neuronpedia?: boolean;
+    source?: "local" | "saelens";
   }[] }> {
     return request(`${SESSION_BASE(id)}/sae/releases`);
   },
@@ -906,6 +940,31 @@ export const apiSae = {
   },
   loadStatus(id: string = SESSION): Promise<SaeLoadStatusJSON> {
     return request(`${SESSION_BASE(id)}/sae/load`);
+  },
+  train(
+    body: {
+      name: string;
+      layer?: number | null;
+      tokens?: number;
+      seq_len?: number;
+      batch_size?: number;
+      width?: number | null;
+      expansion?: number;
+      learning_rate?: number;
+      l1?: number;
+      dead_threshold?: number;
+      seed?: number;
+      force?: boolean;
+    },
+    id: string = SESSION,
+  ): Promise<SaeTrainStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/train`, jsonBody(body));
+  },
+  trainStatus(id: string = SESSION): Promise<SaeTrainStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/train`);
+  },
+  cancelTrain(id: string = SESSION): Promise<SaeTrainStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/train`, { method: "DELETE" });
   },
   setLive(
     body: { enabled: boolean; top_k?: number },

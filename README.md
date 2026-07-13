@@ -543,8 +543,12 @@ SAE weights remain in Hugging Face/SAELens caches; Saklas stores only a pinned
 binding and the active-source selection. `lens rm` / `sae rm` therefore delete
 local payloads or forget bindings, but never purge provider caches.
 
-The dashboard SAE tab loads one release into the running session, streams its
-top feature activations, and pins features as probes. `0.3 sae/9143` steers on
+The dashboard's SAE and J-LENS tabs share one source lifecycle: select an
+already prepared source, fetch provider-owned weights into their normal cache,
+or start a Saklas-owned local train/fit with polled progress and cancellation.
+Successful preparation activates the source and turns its live readout on.
+The SAE tab then streams top feature activations and pins features as probes;
+the J-LENS tab exposes the symmetric token workspace. `0.3 sae/9143` steers on
 decoder row 9143; `!sae/9143` uses saklas's ordinary directional
 mean-ablation; `@when:sae/9143 > 3` gates on the raw post-nonlinearity encoder
 activation. V1 keeps one deterministic hook layer resident (nearest 65% depth,

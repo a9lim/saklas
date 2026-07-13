@@ -40,6 +40,7 @@ import type {
   CastMemberJSON,
   ChatTurn,
   GenStatus,
+  InstrumentSourceJSON,
   JLensSteerEntry,
   SaeFeatureJSON,
   SaeSteerEntry,
@@ -160,6 +161,45 @@ export const lensState: LensState = $state({
   busy: false,
 });
 
+export const lensSourceState: {
+  sources: InstrumentSourceJSON[];
+  loading: boolean;
+  busy: boolean;
+  error: string | null;
+} = $state({ sources: [], loading: false, busy: false, error: null });
+
+export async function refreshLensSources(): Promise<void> {
+  if (lensSourceState.loading) return;
+  lensSourceState.loading = true;
+  try {
+    lensSourceState.sources = (await apiLens.sources()).sources;
+    lensSourceState.error = null;
+  } catch (e) {
+    lensSourceState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    lensSourceState.loading = false;
+  }
+}
+
+export async function useLensSource(source: string): Promise<void> {
+  if (lensSourceState.busy || !source) return;
+  lensSourceState.busy = true;
+  try {
+    const out = await apiLens.use(source);
+    lensState.layers = out.live_layers;
+    await refreshSession();
+    await refreshLensSources();
+    pushToast(`J-lens source active — ${source}`, { kind: "info" });
+  } catch (e) {
+    pushToast(
+      `J-lens source switch failed — ${e instanceof Error ? e.message : String(e)}`,
+      { kind: "error" },
+    );
+  } finally {
+    lensSourceState.busy = false;
+  }
+}
+
 export function setLensWorkspaceSortMode(mode: LensWorkspaceSortMode): void {
   lensState.workspaceSortMode = mode;
 }
@@ -202,6 +242,25 @@ export const saeState: SaeState = $state({
   loadMessage: null,
   loadError: null,
 });
+
+export const saeSourceState: {
+  sources: InstrumentSourceJSON[];
+  loading: boolean;
+  error: string | null;
+} = $state({ sources: [], loading: false, error: null });
+
+export async function refreshSaeSources(): Promise<void> {
+  if (saeSourceState.loading) return;
+  saeSourceState.loading = true;
+  try {
+    saeSourceState.sources = (await apiSae.sources()).sources;
+    saeSourceState.error = null;
+  } catch (e) {
+    saeSourceState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    saeSourceState.loading = false;
+  }
+}
 
 export type SaeSortMode = "strength" | "name";
 
@@ -272,6 +331,8 @@ async function pollSaeLoad(): Promise<void> {
     saeState.loadError = status.error;
     if (!status.running) {
       await refreshSession();
+      await refreshSaeSources();
+      await refreshProbeList();
       if (!status.error && status.finished_at !== null) {
         pushToast("SAE loaded", { kind: "info" });
       }
@@ -293,6 +354,115 @@ export async function loadSae(release: string): Promise<void> {
     saeState.loading = false;
     saeState.loadError = e instanceof Error ? e.message : String(e);
     pushToast(`SAE load failed — ${saeState.loadError}`, { kind: "error" });
+  }
+}
+
+export interface SaeTrainState {
+  running: boolean;
+  tokensDone: number;
+  tokensTotal: number;
+  message: string | null;
+  error: string | null;
+  polling: boolean;
+  cancelling: boolean;
+}
+
+export const saeTrainState: SaeTrainState = $state({
+  running: false,
+  tokensDone: 0,
+  tokensTotal: 0,
+  message: null,
+  error: null,
+  polling: false,
+  cancelling: false,
+});
+
+function _applySaeTrainStatus(st: {
+  running: boolean;
+  tokens_done: number;
+  tokens_total: number;
+  message: string | null;
+  error: string | null;
+}): void {
+  saeTrainState.running = st.running;
+  saeTrainState.tokensDone = st.tokens_done;
+  saeTrainState.tokensTotal = st.tokens_total;
+  saeTrainState.message = st.message;
+  saeTrainState.error = st.error;
+  if (!st.running) saeTrainState.cancelling = false;
+}
+
+export async function pollSaeTrain(): Promise<void> {
+  if (saeTrainState.polling) return;
+  saeTrainState.polling = true;
+  try {
+    for (;;) {
+      const st = await apiSae.trainStatus();
+      _applySaeTrainStatus(st);
+      if (!st.running) {
+        await refreshSession();
+        await refreshSaeSources();
+        await refreshProbeList();
+        if (st.finished_at !== null) {
+          if (st.message === "cancelled") {
+            pushToast("SAE training cancelled", { kind: "info" });
+          } else {
+            pushToast(
+              st.error ? `SAE training failed — ${st.error}` : "Local SAE trained — live readout on",
+              { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
+            );
+          }
+        }
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  } catch (e) {
+    saeTrainState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    saeTrainState.polling = false;
+  }
+}
+
+export async function startSaeTrain(body: {
+  name: string;
+  layer?: number | null;
+  tokens?: number;
+  width?: number | null;
+}): Promise<void> {
+  if (saeTrainState.running || saeTrainState.polling) return;
+  try {
+    _applySaeTrainStatus(await apiSae.train(body));
+    void pollSaeTrain();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    saeTrainState.error = message;
+    pushToast(`SAE training start failed — ${message}`, { kind: "error" });
+  }
+}
+
+export async function cancelSaeTrain(): Promise<void> {
+  if (!saeTrainState.running || saeTrainState.cancelling) return;
+  saeTrainState.cancelling = true;
+  try {
+    _applySaeTrainStatus(await apiSae.cancelTrain());
+  } catch (e) {
+    saeTrainState.cancelling = false;
+    pushToast(
+      `SAE training cancel failed — ${e instanceof Error ? e.message : String(e)}`,
+      { kind: "error" },
+    );
+  }
+}
+
+export async function checkSaeTrain(): Promise<void> {
+  if (saeTrainState.polling) return;
+  try {
+    const st = await apiSae.trainStatus();
+    _applySaeTrainStatus(st);
+    if (st.running) void pollSaeTrain();
+  } catch {
+    // Source setup remains usable when no background status is available.
   }
 }
 
@@ -368,6 +538,82 @@ export async function setLiveLens(enabled: boolean): Promise<void> {
   }
 }
 
+export interface LensFetchState {
+  running: boolean;
+  message: string | null;
+  error: string | null;
+  polling: boolean;
+}
+
+export const lensFetchState: LensFetchState = $state({
+  running: false,
+  message: null,
+  error: null,
+  polling: false,
+});
+
+function _applyLensFetchStatus(st: {
+  running: boolean;
+  message: string | null;
+  error: string | null;
+}): void {
+  lensFetchState.running = st.running;
+  lensFetchState.message = st.message;
+  lensFetchState.error = st.error;
+}
+
+export async function pollLensFetch(): Promise<void> {
+  if (lensFetchState.polling) return;
+  lensFetchState.polling = true;
+  try {
+    for (;;) {
+      const st = await apiLens.fetchStatus();
+      _applyLensFetchStatus(st);
+      if (!st.running) {
+        await refreshSession();
+        await refreshLensSources();
+        if (st.finished_at !== null) {
+          pushToast(
+            st.error ? `official J-lens fetch failed — ${st.error}` : "Official J-lens active — live readout on",
+            { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
+          );
+        }
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  } catch (e) {
+    lensFetchState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    lensFetchState.polling = false;
+  }
+}
+
+export async function startLensFetch(
+  source: string = "neuronpedia",
+): Promise<void> {
+  if (lensFetchState.running || lensFetchState.polling) return;
+  try {
+    _applyLensFetchStatus(await apiLens.fetch({ source }));
+    void pollLensFetch();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    lensFetchState.error = message;
+    pushToast(`official J-lens fetch start failed — ${message}`, { kind: "error" });
+  }
+}
+
+export async function checkLensFetch(): Promise<void> {
+  if (lensFetchState.polling) return;
+  try {
+    const st = await apiLens.fetchStatus();
+    _applyLensFetchStatus(st);
+    if (st.running) void pollLensFetch();
+  } catch {
+    // A fetch status is optional setup state; leave the rest of the panel live.
+  }
+}
+
 // ------------------------------------------------- lens fit (button) --
 
 export interface LensFitState {
@@ -423,7 +669,9 @@ export async function pollLensFit(): Promise<void> {
       _applyFitStatus(st);
       if (!st.running) {
         if (st.finished_at !== null) {
-          if (st.error) {
+          if (st.message === "cancelled") {
+            pushToast("J-lens fit cancelled", { kind: "info" });
+          } else if (st.error) {
             pushToast(`lens fit failed — ${st.error}`, {
               kind: "error",
               ttlMs: null,
@@ -432,6 +680,7 @@ export async function pollLensFit(): Promise<void> {
             pushToast("J-lens fitted — live readout on", { kind: "info" });
           }
           await refreshSession();
+          await refreshLensSources();
         }
         return;
       }
@@ -447,10 +696,12 @@ export async function pollLensFit(): Promise<void> {
 /** Kick off the background Jacobian-lens fit (the "fit j-lens" button) and
  *  start polling.  Server defaults: 100 fineweb-edu prompts, workspace-band
  *  source layers, resume-if-matching. */
-export async function startLensFit(): Promise<void> {
+export async function startLensFit(
+  body: { prompts?: number; layers?: string } = {},
+): Promise<void> {
   if (lensFitState.running || lensFitState.polling) return;
   try {
-    const st = await apiLens.fit({});
+    const st = await apiLens.fit(body);
     _applyFitStatus(st);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

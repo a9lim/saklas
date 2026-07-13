@@ -1039,6 +1039,10 @@ small binding and optional Neuronpedia labels under `sae/bindings/`. Native
 `sae train` fits a residual-post ReLU SAE over an arbitrary Saklas-supported HF
 model and stores its fp32 weights under `sae/local/<name>/`. `sae/active.json`
 selects either owner for later sessions; both lower to the same runtime backend.
+The native server exposes the same source lifecycle as J-lens: list/use prepared
+sources, provider fetch/load, and a polled cancellable local build. The Svelte
+SAE and J-LENS pillars share a SOURCE section above their parallel STEER and
+PROBE sections; successful preparation activates the source and live channel.
 
 The runtime has the same three consumers as the J-lens, but is single-layer:
 

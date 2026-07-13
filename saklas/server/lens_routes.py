@@ -31,6 +31,7 @@ sidecar/payload and live-weight compatibility check, never the ~GB fp32 lens loa
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import logging
 import re
 import threading
@@ -88,6 +89,15 @@ class LensFitRequest(NativeRequest):
     force: bool = False
 
 
+class LensFetchRequest(NativeRequest):
+    source: str = "neuronpedia"
+    force: bool = False
+
+
+class LensUseRequest(NativeRequest):
+    source: str = Field(min_length=1)
+
+
 def _parse_layers(layers: str | None) -> list[int] | str | None:
     """``"3,7,11"`` → ``[3, 7, 11]``; named modes pass through."""
     if layers is None or not layers.strip():
@@ -124,6 +134,16 @@ def register_lens_routes(app: FastAPI) -> None:
     }
     app.state.lens_fit_task = None
     app.state.lens_fit_cancel = None
+    app.state.lens_fetch = {
+        "running": False,
+        "source": None,
+        "message": None,
+        "error": None,
+        "started_at": None,
+        "finished_at": None,
+        "live_layers": None,
+    }
+    app.state.lens_fetch_task = None
 
     async def _stop_lens_fit() -> None:
         event = app.state.lens_fit_cancel
@@ -132,8 +152,117 @@ def register_lens_routes(app: FastAPI) -> None:
             event.set()
         if task is not None and not task.done():
             await task
+        fetch_task = app.state.lens_fetch_task
+        if fetch_task is not None and not fetch_task.done():
+            fetch_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await fetch_task
 
     app.router.on_shutdown.append(_stop_lens_fit)
+
+    @app.get("/saklas/v1/sessions/{session_id}/lens/sources")
+    def lens_sources(session_id: str):
+        """List fitted local lenses and fetched external bindings."""
+        resolve_session_id(session_id)
+        from saklas.io.lens_sources import list_lens_sources
+
+        return {
+            "sources": [
+                {key: value for key, value in row.items() if key != "path"}
+                for row in list_lens_sources(session.model_id)
+            ],
+        }
+
+    async def _activate_lens_source(source: str) -> list[int]:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise RuntimeError("session locked")
+            session.disable_live_lens()
+            await asyncio.to_thread(session.select_jlens_source, source)
+            return await asyncio.to_thread(session.enable_live_lens, top_k=8)
+
+    @app.post("/saklas/v1/sessions/{session_id}/lens/use")
+    async def lens_use(session_id: str, body: LensUseRequest):
+        """Select an already fitted/fetched source and turn its readout on."""
+        resolve_session_id(session_id)
+        if app.state.lens_fit["running"] or app.state.lens_fetch["running"]:
+            raise HTTPException(409, "a J-lens artifact operation is already running")
+        try:
+            layers = await _activate_lens_source(body.source)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except LensNotFittedError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except SaklasError as exc:
+            status, text = exc.user_message()
+            raise HTTPException(status, text) from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        return {"source": body.source, "live_layers": layers}
+
+    def _fetch_status_payload() -> dict[str, object]:
+        return dict(app.state.lens_fetch)
+
+    async def _lens_fetch_job(body: LensFetchRequest) -> None:
+        from saklas.io.lens_sources import fetch_neuronpedia_lens
+
+        st = app.state.lens_fetch
+        try:
+            if body.source != "neuronpedia":
+                raise ValueError("J-lens source must be neuronpedia")
+            st["message"] = "fetching official lens into the Hugging Face cache…"
+            binding = await asyncio.to_thread(
+                fetch_neuronpedia_lens,
+                session.model_id,
+                force=body.force,
+                activate=False,
+            )
+            st["message"] = "activating…"
+            st["live_layers"] = await _activate_lens_source(binding.name)
+            st["message"] = (
+                f"active: {binding.name} ({len(binding.source_layers)} layers)"
+            )
+            st["error"] = None
+        except FileNotFoundError as exc:
+            st["error"] = str(exc)
+            st["message"] = "official lens unavailable"
+        except (ValueError, RuntimeError) as exc:
+            st["error"] = str(exc)
+            st["message"] = "fetch failed"
+        except Exception as exc:  # noqa: BLE001 - scrubbed, logged server-side
+            log.exception("J-lens fetch failed")
+            st["error"] = f"J-lens fetch failed ({type(exc).__name__})"
+            st["message"] = "fetch failed"
+        finally:
+            st["running"] = False
+            st["finished_at"] = time.time()
+
+    @app.post("/saklas/v1/sessions/{session_id}/lens/fetch", status_code=202)
+    async def lens_fetch_start(
+        session_id: str, body: LensFetchRequest | None = None,
+    ):
+        resolve_session_id(session_id)
+        body = body or LensFetchRequest()
+        if app.state.lens_fit["running"] or app.state.lens_fetch["running"]:
+            raise HTTPException(409, "a J-lens artifact operation is already running")
+        app.state.lens_fetch.update({
+            "running": True,
+            "source": body.source,
+            "message": "starting…",
+            "error": None,
+            "started_at": time.time(),
+            "finished_at": None,
+            "live_layers": None,
+        })
+        app.state.lens_fetch_task = asyncio.create_task(_lens_fetch_job(body))
+        return _fetch_status_payload()
+
+    @app.get("/saklas/v1/sessions/{session_id}/lens/fetch")
+    async def lens_fetch_status(session_id: str):
+        resolve_session_id(session_id)
+        return _fetch_status_payload()
 
     @app.post("/saklas/v1/sessions/{session_id}/lens/token/validate")
     def validate_lens_token(
@@ -363,8 +492,8 @@ def register_lens_routes(app: FastAPI) -> None:
                 "use 'workspace', 'all', or an explicit csv list",
             )
         st = app.state.lens_fit
-        if st["running"]:
-            raise HTTPException(409, "a lens fit is already running")
+        if st["running"] or app.state.lens_fetch["running"]:
+            raise HTTPException(409, "a J-lens artifact operation is already running")
         st.update(
             running=True,
             prompts_done=0,

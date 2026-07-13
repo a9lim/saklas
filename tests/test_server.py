@@ -32,6 +32,7 @@ def _mock_session():
     }
     session.model = MagicMock()
     session.model.config.model_type = "gemma2"
+    session.layers = [MagicMock() for _ in range(26)]
 
     session.config = MagicMock()
     session.config.temperature = 1.0
@@ -124,6 +125,50 @@ class TestModels:
 
 
 class TestSaeRoutes:
+    def test_sources_lists_prepared_local_and_provider_artifacts(
+        self, session_and_client: Any, monkeypatch: Any,
+    ) -> None:
+        _, client = session_and_client
+        monkeypatch.setattr(
+            "saklas.io.sae.list_sae_sources",
+            lambda _model: [{
+                "source": "local:mine", "kind": "local", "name": "mine",
+                "active": True, "path": "/tmp/manifest.json", "layer": 14,
+                "features": 4096,
+            }],
+        )
+        resp = client.get("/saklas/v1/sessions/default/sae/sources")
+        assert resp.status_code == 200
+        assert resp.json()["sources"][0]["source"] == "local:mine"
+
+    def test_load_accepts_harmonized_saelens_source(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.load_sae.return_value = {"layer": 14, "width": 4096}
+        resp = client.post(
+            "/saklas/v1/sessions/default/sae/load",
+            json={"release": "saelens:scope"},
+        )
+        assert resp.status_code == 202
+        assert resp.json()["release"] == "saelens:scope"
+
+    def test_train_cancel_requires_running_job_and_sets_event(
+        self, session_and_client: Any,
+    ) -> None:
+        import threading
+
+        _, client = session_and_client
+        resp = client.delete("/saklas/v1/sessions/default/sae/train")
+        assert resp.status_code == 409
+        event = threading.Event()
+        client.app.state.sae_train["running"] = True
+        client.app.state.sae_train_cancel = event
+        resp = client.delete("/saklas/v1/sessions/default/sae/train")
+        assert resp.status_code == 202
+        assert event.is_set()
+        assert resp.json()["message"] == "cancelling…"
+
     def test_session_info_carries_sae_runtime(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.sae_info = {
@@ -1301,6 +1346,35 @@ class TestLensTokenReadout:
 
 
 class TestLensFitLifecycle:
+    def test_source_list_and_use(
+        self, session_and_client: Any, monkeypatch: Any,
+    ) -> None:
+        session, client = session_and_client
+        monkeypatch.setattr(
+            "saklas.io.lens_sources.list_lens_sources",
+            lambda _model: [{
+                "source": "neuronpedia", "kind": "huggingface",
+                "name": "neuronpedia", "active": True,
+                "path": "/tmp/binding.json",
+            }],
+        )
+        session.enable_live_lens.return_value = [10, 11]
+
+        resp = client.get("/saklas/v1/sessions/default/lens/sources")
+        assert resp.status_code == 200
+        assert resp.json()["sources"][0]["source"] == "neuronpedia"
+
+        resp = client.post(
+            "/saklas/v1/sessions/default/lens/use",
+            json={"source": "neuronpedia"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "source": "neuronpedia", "live_layers": [10, 11],
+        }
+        session.disable_live_lens.assert_called_once()
+        session.select_jlens_source.assert_called_once_with("neuronpedia")
+
     def test_start_returns_202_and_rejects_second_fit(
         self, session_and_client: Any, monkeypatch: Any,
     ) -> None:

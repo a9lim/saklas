@@ -125,3 +125,26 @@ def test_native_sae_trainer_runs_without_saelens() -> None:
     assert metrics["tokens_trained"] == 32
     assert metrics["d_sae"] == 7
     assert all(torch.isfinite(value).all() for value in tensors.values())
+
+
+def test_native_sae_trainer_cancels_before_next_batch() -> None:
+    import threading
+
+    from saklas.core.sae_training import SaeTrainingCancelled, train_residual_sae
+
+    cancel = threading.Event()
+    cancel.set()
+    model = _TinyModel().eval().requires_grad_(False)
+    with pytest.raises(SaeTrainingCancelled):
+        train_residual_sae(
+            model,
+            _Tokenizer(),
+            list(model.layers),
+            ["abcdefgh"],
+            layer=1,
+            tokens=8,
+            seq_len=8,
+            batch_size=1,
+            d_sae=7,
+            cancel_event=cancel,
+        )

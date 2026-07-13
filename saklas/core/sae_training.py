@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 import hashlib
 import math
+import threading
 from typing import Any
 
 import torch
@@ -12,6 +13,10 @@ import torch
 
 class _SaeCaptureComplete(RuntimeError):
     """Internal short-circuit after the selected residual layer is captured."""
+
+
+class SaeTrainingCancelled(RuntimeError):
+    """Raised when a cooperative local-SAE training cancellation lands."""
 
 
 def _token_rows(tokenizer: Any, documents: Sequence[str], seq_len: int) -> list[list[int]]:
@@ -100,6 +105,7 @@ def train_residual_sae(
     dead_feature_threshold: float = 1e-6,
     seed: int = 0,
     on_progress: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     """Train a one-layer ReLU SAE over transformer block outputs.
 
@@ -155,6 +161,8 @@ def train_residual_sae(
     mse_values: list[float] = []
     l1_values: list[float] = []
     while token_count < tokens:
+        if cancel_event is not None and cancel_event.is_set():
+            raise SaeTrainingCancelled("SAE training cancelled")
         if cursor >= len(rows):
             cursor = 0
             epoch += 1
@@ -162,6 +170,8 @@ def train_residual_sae(
         cursor += len(batch_rows)
         ids, mask = _padded_batch(batch_rows, int(pad_id), device)
         activations = _capture_layer_tokens(model, layers[layer], ids, mask)
+        if cancel_event is not None and cancel_event.is_set():
+            raise SaeTrainingCancelled("SAE training cancelled")
         remaining = tokens - token_count
         if activations.shape[0] > remaining:
             activations = activations[:remaining]

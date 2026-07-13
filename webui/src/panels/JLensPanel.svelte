@@ -22,12 +22,14 @@
   //           to the end-of-gen aggregate, discovery cards go quiet.  The
   //           full per-layer ranking lives in the transcript drilldown.
   //
-  // With no fitted lens (``session_info.jlens_fitted``) the tab renders a
-  // "fit j-lens" button instead — it kicks off the server's background fit
-  // (``POST .../lens/fit``) and shows polled progress; the live readout
-  // auto-enables when the artifact lands.  Every section needs the artifact.
+  // SOURCE is the shared lifecycle shell: select a prepared source, fetch the
+  // official Neuronpedia artifact into the HF cache, or start/cancel a local
+  // fit. Successful preparation activates the source and live readout.
 
   import Bar from "../lib/charts/Bar.svelte";
+  import Button from "../lib/ui/Button.svelte";
+  import { onMount } from "svelte";
+  import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
   import JLensSteerCard from "./rack/JLensSteerCard.svelte";
@@ -37,17 +39,23 @@
     addJLensToRack,
     activeProbeNames,
     attachProbe,
+    checkLensFetch,
     cancelLensFit,
     checkLensFit,
     lensFitState,
+    lensFetchState,
+    lensSourceState,
     lensState,
     probeRack,
+    refreshLensSources,
     seedProbeDisplay,
     sessionState,
     setLensWorkspaceSortMode,
     setLiveLens,
+    startLensFetch,
     startLensFit,
     steerRack,
+    useLensSource,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
   import type { JLensSteerEntry, ProbeRackEntry } from "../lib/types";
@@ -55,7 +63,22 @@
 
   const fitted = $derived(sessionState.info?.jlens_fitted === true);
   const liveOn = $derived(lensState.layers !== null);
+  const sourceBusy = $derived(
+    lensSourceState.loading || lensSourceState.busy ||
+      lensFetchState.running || lensFitState.running,
+  );
+  const LENS_PROVIDER_OPTIONS = [
+    { value: "neuronpedia", label: "neuronpedia" },
+  ];
+  let providerSource = $state("neuronpedia");
+  let fitPrompts = $state(100);
+  let fitLayers = $state("workspace");
   let fitConfirm = $state(false);
+  let selectedSource = $state("");
+  const fitReady = $derived(
+    Number.isInteger(fitPrompts) && fitPrompts >= 1 && fitPrompts <= 5000 &&
+      fitLayers.trim().length > 0,
+  );
 
   function requestFit(): void {
     if (!fitConfirm) {
@@ -63,13 +86,28 @@
       return;
     }
     fitConfirm = false;
-    void startLensFit();
+    void startLensFit({
+      prompts: fitPrompts,
+      layers: fitLayers.trim(),
+    });
   }
 
   // Resume-visibility: a page reload mid-fit should pick the progress
   // polling back up (the fit runs server-side regardless of the client).
+  onMount(() => {
+    void checkLensFit();
+    void checkLensFetch();
+    void refreshLensSources();
+  });
+
   $effect(() => {
-    if (!fitted) void checkLensFit();
+    const active = lensSourceState.sources.find((source) => source.active);
+    if (
+      !selectedSource ||
+      !lensSourceState.sources.some((source) => source.source === selectedSource)
+    ) {
+      selectedSource = active?.source ?? lensSourceState.sources[0]?.source ?? "";
+    }
   });
 
   // ---------- STEER: jlens-mode rack entries (alphabetical) ----------
@@ -328,10 +366,58 @@
 </script>
 
 <div class="jlens" aria-label="Jacobian-lens inspector">
-  {#if !fitted}
-    <section class="section">
-      <RackSectionHeader title="J-LENS" />
-      {#if lensFitState.running}
+  <InstrumentSourceSection
+    ready={fitted}
+    sources={lensSourceState.sources}
+    bind:value={selectedSource}
+    busy={sourceBusy}
+    accent="var(--accent-blue)"
+    sourceError={lensSourceState.error}
+    working={lensFetchState.running || lensFitState.running}
+    onuse={(source) => void useLensSource(source)}
+    bind:providerValue={providerSource}
+    providerOptions={LENS_PROVIDER_OPTIONS}
+    providerPlaceholder="lens provider"
+    onfetch={(source) => void startLensFetch(source)}
+  >
+    {#snippet localControls()}
+      <input
+        class="add-input prompts-input"
+        type="number"
+        min="1"
+        max="5000"
+        step="25"
+        bind:value={fitPrompts}
+        placeholder="prompts"
+        aria-label="J-lens corpus prompts"
+        title="Corpus prompts (1–5000)"
+      />
+      <input
+        class="add-input band-input"
+        bind:value={fitLayers}
+        placeholder="workspace"
+        aria-label="J-lens source layer band"
+        title="workspace, all, or comma-separated layer ids"
+      />
+    {/snippet}
+    {#snippet localAction()}
+      <Button
+        size="sm"
+        variant={fitConfirm ? "solid" : "ghost"}
+        accent="var(--accent-blue)"
+        disabled={sourceBusy || !fitReady}
+        onclick={requestFit}
+        title="Fit a Saklas-owned local Jacobian lens over the workspace band"
+      >
+        {fitConfirm ? "confirm local fit" : "fit local"}
+      </Button>
+    {/snippet}
+    {#snippet progress()}
+      {#if lensFetchState.running}
+        <p class="work-status" role="status" aria-live="polite">
+          {lensFetchState.message ?? "fetching official lens…"}
+        </p>
+      {:else}
         <div
           class="fit-progress"
           role="status"
@@ -366,46 +452,43 @@
             the fit holds the model — generations error until it lands;
             an interrupted fit resumes from its last checkpoint
           </p>
-          <button
-            type="button"
-            class="fit-btn cancel"
+          <Button
+            size="sm"
+            variant="danger"
             disabled={lensFitState.cancelling}
             onclick={() => void cancelLensFit()}
           >
             {lensFitState.cancelling ? "requesting cancel…" : "cancel fit"}
-          </button>
+          </Button>
         </div>
-      {:else}
-        <p class="hint">
-          no Jacobian lens fitted for this model — the workspace readout,
-          token atoms, and token probes all need the per-model artifact
-        </p>
-        {#if lensFitState.error}
-          <p class="hint fit-error" role="alert">last fit: {lensFitState.error}</p>
-        {/if}
-        <button
-          type="button"
-          class="fit-btn"
-          class:confirm={fitConfirm}
-          onclick={requestFit}
-          title="Fit the Jacobian lens over the workspace band (~100 web-text prompts; hours of wall clock, checkpointed and resumable)"
-        >
-          {fitConfirm ? "confirm fit — model unavailable for hours" : "fit j-lens"}
-        </button>
-        {#if fitConfirm}
-          <p class="hint fit-warning" role="alert">
-            This starts a checkpointed background fit and blocks generation.
-            Press confirm again to begin.
-          </p>
-        {/if}
-        <p class="hint">
-          ≈100 web-text prompts over the 40–90% workspace band —
-          compute-bound (hours on Apple silicon), checkpointed every 25
-          prompts, resumable; live readout turns on when it lands
+      {/if}
+    {/snippet}
+    {#snippet warning()}
+      {#if fitConfirm && !lensFitState.running}
+        <p class="hint fit-warning" role="alert">
+          Local fitting blocks generation and may take hours. Press confirm again.
         </p>
       {/if}
-    </section>
-  {:else}
+    {/snippet}
+    {#snippet summary()}
+      {#if !fitted}
+        <p class="hint">
+          Fetch a supported official lens without copying it into Saklas,
+          or fit a local one for this exact model.
+        </p>
+      {/if}
+    {/snippet}
+    {#snippet messages()}
+      {#if lensFitState.error}
+        <p class="hint fit-error" role="alert">local fit: {lensFitState.error}</p>
+      {/if}
+      {#if lensFetchState.error}
+        <p class="hint fit-error" role="alert">official fetch: {lensFetchState.error}</p>
+      {/if}
+    {/snippet}
+  </InstrumentSourceSection>
+
+  {#if fitted}
     <!-- STEER — token-atom cards in the shared steering expression. -->
     <section class="section steer">
       <RackSectionHeader
@@ -546,6 +629,18 @@
     gap: var(--space-3);
     padding: var(--space-5);
   }
+  .prompts-input {
+    flex: 1 1 0;
+  }
+  .band-input {
+    flex: 1 1 0;
+  }
+  .work-status {
+    margin: 0;
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+  }
   .section.steer {
     flex: 0 1 auto;
     min-height: 0;
@@ -590,36 +685,8 @@
     color: var(--fg-dim);
   }
 
-  /* ----- fit button + progress (the not-fitted state) ----- */
-  .fit-btn {
-    align-self: flex-start;
-    background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
-    color: var(--accent-blue);
-    border: 1px solid transparent;
-    border-radius: var(--radius);
-    font-size: var(--text-sm);
-    padding: var(--space-2) var(--space-5);
-    cursor: pointer;
-    transition: background var(--dur) var(--ease-out);
-    min-height: 24px;
-  }
-  .fit-btn:hover {
-    background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
-  }
   .fit-error {
     color: var(--accent-red);
-  }
-  .fit-btn.confirm {
-    color: var(--accent-yellow);
-    background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
-  }
-  .fit-btn.cancel {
-    color: var(--accent-red);
-    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
-  }
-  .fit-btn:disabled {
-    opacity: 0.55;
-    cursor: default;
   }
   .fit-warning {
     color: var(--accent-yellow);

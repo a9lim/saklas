@@ -367,6 +367,7 @@ def fetch_neuronpedia_lens(
     revision: str = "main",
     dataset: str = "Salesforce-wikitext",
     force: bool = False,
+    activate: bool = True,
 ) -> ExternalLensBinding:
     """Fetch a supported official lens into the HF cache and bind it.
 
@@ -442,10 +443,12 @@ def fetch_neuronpedia_lens(
         if path.exists() and not force:
             current = load_external_lens_binding(model_id, binding.name)
             if current == binding:
-                set_active_lens_source(model_id, "huggingface", binding.name)
+                if activate:
+                    set_active_lens_source(model_id, "huggingface", binding.name)
                 return binding
         write_json_atomic(path, binding.to_json())
-    set_active_lens_source(model_id, "huggingface", binding.name)
+    if activate:
+        set_active_lens_source(model_id, "huggingface", binding.name)
     return binding
 
 
