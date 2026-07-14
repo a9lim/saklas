@@ -416,8 +416,8 @@ async def _ws_handle_generate(
             })
             return
 
-        # Commit-only submissions can use the established no-decode path.
-        # Commit+generate keeps the authored fields above and generates from
+        # Append-only submissions can use the established no-decode path.
+        # Append+generate keeps the authored fields above and generates from
         # ``input=None`` after the worker lands the turn.
         if submit.generated_seat is None:
             assert submit_authored_seat is not None
@@ -664,7 +664,9 @@ async def _ws_handle_generate(
         await send_json({
             "type": "done",
             "result": {
-                "kind": "commit",
+                "kind": (
+                    "append" if native_commit_seat is not None else "commit"
+                ),
                 "role": msg.commit_role,
                 "seat": chat_role_to_seat(msg.commit_role),
                 "text": commit_text,
@@ -846,6 +848,11 @@ async def _ws_handle_generate(
                             gen_kwargs["recipe_override"] = _recipe_override
                         if msg.generate_seat is not None:
                             gen_kwargs["gen_seat"] = msg.generate_seat
+                        # Fan-out is intentionally sibling-oriented. A normal
+                        # one-shot call takes the engine's coalescing default;
+                        # only the exceptional fan case needs an override.
+                        if n > 1:
+                            gen_kwargs["append_same_role"] = False
                         result = session.generate(
                             build_input(msg.input), **gen_kwargs,
                         ).first

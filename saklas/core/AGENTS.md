@@ -937,9 +937,13 @@ the session passes False for stateless gens that aren't loom-attached / opted-in
 `logprobs` needs it. Stop-sequence matching keeps only a bounded tail of the
 emitted text (`_stop_keep = max(len(s))−1` chars) instead of growing the full
 completion, so the per-token match is O(tail+emit) not the old O(n²) concat. The
-`SaklasSession` fork/commit entry points (`fork_from_token` / `prefill_assistant`
-/ `append_user_turn` / `append_assistant_turn`, all in `session.py`) build on this
-decode loop. `detect_base_model` (no chat template) routes flat (`raw=True`) generation.
+`SaklasSession` fork/append entry points (`fork_from_token` /
+`prefill_assistant` / `append_user_turn` / `append_assistant_turn`, all in
+`session.py`) build on this decode loop. Matching structural role + role label
+coalesces authored spans in place; ordinary one-shot generation reuses a
+matching leaf and forces its existing text as the prefix, while explicit fan /
+fork / prefill operations retain sibling semantics. `detect_base_model` (no
+chat template) routes flat (`raw=True`) generation.
 Per-message role substitution (`role_templates.apply_with_per_turn_roles`) backs
 the roleplay scaffold; `_active_role` is the steering-driven role.
 `supports_thinking` / `_detect_think_delimiters` round-trips Qwen/Gemma

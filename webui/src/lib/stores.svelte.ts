@@ -749,11 +749,18 @@ export async function checkLensFit(): Promise<void> {
  * so the gen-status footer rendered ``gen N/256`` even when the engine
  * was running against a 1024-token cap.  Sync once on every refresh so
  * the displayed cap matches what generation actually used. */
+let _roleDefaultsModelId: string | null = null;
+
 function _hydrateSamplingFromInfo(): void {
   const info = sessionState.info;
-  // Human/model are Saklas-native structural names.  Family labels from
-  // session info are renderer-adapter details and therefore do not replace
-  // these sticky cast boxes.
+  // Structural seats stay human/model; the editable values are the actual
+  // role labels used by this model family's chat template. Seed once per
+  // loaded model so ordinary refreshes never erase a custom cast label.
+  if (info && _roleDefaultsModelId !== info.model_id) {
+    _roleDefaultsModelId = info.model_id;
+    samplingState.human_role = info.default_user_role ?? "human";
+    samplingState.model_role = info.default_assistant_role ?? "model";
+  }
   const cfg = info?.config;
   if (!cfg) return;
   if (typeof cfg.max_tokens === "number" && Number.isFinite(cfg.max_tokens)) {
@@ -795,14 +802,18 @@ export async function patchSessionDefaults(
 /** Display label for a turn, honoring its per-message role-substitution
  *  label (the roleplay scaffold stamped at send time).  ``roleLabel`` —
  *  the node's ``role_label`` — wins when set; otherwise the structural
- *  ``role`` (user / assistant / system) is shown verbatim. */
+ *  ``role`` falls back to the model family's actual chat-template label. */
 export function roleDisplayLabel(
   role: string,
   roleLabel?: string | null,
 ): string {
   if (roleLabel) return roleLabel;
-  if (role === "user") return "human";
-  if (role === "assistant") return "model";
+  if (role === "user") {
+    return sessionState.info?.default_user_role ?? "human";
+  }
+  if (role === "assistant") {
+    return sessionState.info?.default_assistant_role ?? "model";
+  }
   return role;
 }
 
@@ -1904,10 +1915,12 @@ function syncChatLogFromTree(): void {
     ) {
       // Mutate-in-place so the streaming token arrays survive.
       prev.nodeId = nid;
-      const nextText = node.text;
-      if (!(loomTree.pendingNodeId === nid && prev.generated && nextText === "")) {
-        prev.text = nextText;
-      }
+      // A same-role generated continuation deliberately clears and reuses
+      // its existing node before replaying the old text as a forced prefix.
+      // The tree snapshot is authoritative even when that temporary value is
+      // empty; preserving the prior UI text here would duplicate the prefix
+      // as streamed tokens arrive.
+      prev.text = node.text;
       prev.generated = node.recipe !== null;
       prev.appliedSteering = node.applied_steering ?? prev.appliedSteering ?? null;
       prev.aggregateReadings = node.aggregate_readings ?? prev.aggregateReadings;
@@ -3251,12 +3264,11 @@ export interface SendSubmitOpts {
 
 function submitLabel(
   text: string | null,
-  authoredSeat: Seat | null,
   generatedSeat: Seat | null,
 ): string {
-  if (generatedSeat === null) return `commit ${authoredSeat ?? "turn"}`;
-  if (text === null) return `continue ${generatedSeat}`;
-  return `${authoredSeat} → ${generatedSeat}`;
+  if (generatedSeat === null) return "append";
+  if (text === null) return "generate";
+  return "send";
 }
 
 function buildSubmitPending(
@@ -3267,7 +3279,7 @@ function buildSubmitPending(
 ): PendingAction {
   return {
     id: `pa-${_pendingCounter++}`,
-    label: submitLabel(text, authoredSeat, generatedSeat),
+    label: submitLabel(text, generatedSeat),
     text,
     apply: () => sendSubmitNow(text, authoredSeat, generatedSeat, opts),
     awaitsGen: true,
@@ -3287,8 +3299,8 @@ function buildSubmitPending(
 
 /** Send one native human/model submission.
  *
- * Text is committed in ``authoredSeat``.  ``generatedSeat`` optionally
- * follows it with a decode; omit it for commit-only.  With no text, the
+ * Text is appended in ``authoredSeat``.  ``generatedSeat`` optionally
+ * follows it with a decode; omit it for append-only.  With no text, the
  * generated seat continues directly from the selected leaf.  No branch
  * depends on the selected node's role.
  */

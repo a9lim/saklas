@@ -610,15 +610,18 @@ def test_append_user_turn_lands_under_root():
     assert t.active_node_id == new_id
 
 
-def test_append_user_turn_refuses_under_user_node():
-    """D15 — sending a user turn under a user node is forbidden, same
-    rule the normal-send path enforces."""
+def test_append_user_turn_coalesces_under_same_role_node():
+    """A same-role authored span extends the active message in place."""
     from unittest.mock import MagicMock
     t = LoomTree()
-    t.add_user_turn("hi")  # active = u1, a user node
-    append_user, _ = _bind_commit_methods(t, MagicMock())
-    with pytest.raises(InvalidNodeOperationError, match="cannot send a new user turn"):
-        append_user(None, "more")
+    uid = t.add_user_turn("hi")
+    tok = MagicMock()
+    tok.encode.return_value = [1, 2, 3]
+    append_user, _ = _bind_commit_methods(t, tok)
+    appended = append_user(None, " more")
+    assert appended == uid
+    assert t.nodes[uid].text == "hi more"
+    assert [node.id for node in t.active_path()] == [t.root_id, uid]
 
 
 def test_append_user_turn_dedups_same_text_sibling():
@@ -672,13 +675,61 @@ def test_append_assistant_turn_lands_under_user_with_tokenization():
     tok.encode.assert_called_once_with("the reply", add_special_tokens=False)
 
 
-def test_append_assistant_turn_refuses_non_user_parent():
+def test_append_assistant_turn_coalesces_under_same_role_node():
     from unittest.mock import MagicMock
     t = _seed_tree()  # leaf is an assistant
     aid = t.active_node_id
-    _, append_assistant = _bind_commit_methods(t, MagicMock())
-    with pytest.raises(InvalidNodeOperationError, match="not a user node"):
-        append_assistant(aid, "reply")
+    tok = MagicMock()
+    tok.encode.return_value = [1, 2, 3]
+    _, append_assistant = _bind_commit_methods(t, tok)
+    appended = append_assistant(aid, " reply")
+    assert appended == aid
+    assert t.nodes[aid].text == "hello reply"
+    assert t.nodes[aid].recipe is None
+    assert [node.id for node in t.active_path()] == [
+        t.root_id, t.nodes[aid].parent_id, aid,
+    ]
+
+
+def test_append_authored_clears_stale_generation_receipt():
+    t = LoomTree()
+    uid = t.add_user_turn("prompt")
+    aid = t.begin_assistant(uid, recipe=Recipe(steering="0.2 formal"))
+    t.append_token(aid, {"token_id": 10, "text": "answer"})
+    t.finalize_assistant(
+        aid, text="answer", aggregate_readings={"formal": 0.4},
+        applied_steering="0.2 formal", finish_reason="stop",
+        mean_logprob=-0.2, mean_surprise=0.2, raw_token_ids=[10],
+    )
+
+    returned = t.append_authored(aid, " edited", raw_token_ids=[10, 11])
+
+    node = t.nodes[aid]
+    assert returned == aid
+    assert node.text == "answer edited"
+    assert node.recipe is None
+    assert node.tokens is None
+    assert node.aggregate_readings == {}
+    assert node.applied_steering is None
+    assert node.raw_token_ids == [10, 11]
+
+
+def test_begin_continuation_reuses_and_resets_node():
+    t = LoomTree()
+    uid = t.add_user_turn("prompt")
+    aid = t.begin_assistant(uid, recipe=Recipe())
+    t.finalize_assistant(aid, text="prefix", raw_token_ids=[1, 2])
+
+    returned = t.begin_continuation(aid, Recipe(steering="0.1 warm"))
+
+    node = t.nodes[aid]
+    assert returned == aid
+    assert node.parent_id == uid
+    assert node.text == ""
+    assert node.recipe == Recipe(steering="0.1 warm")
+    assert node.tokens == []
+    assert node.raw_token_ids is None
+    assert t.active_node_id == aid
 
 
 def test_append_assistant_turn_empty_text_raises():

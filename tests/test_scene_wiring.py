@@ -404,9 +404,9 @@ def test_commit_thinking_gate():
     assert none_stub.tree.nodes[nid].thinking_text is None
 
 
-def test_commit_seating_frees_under_scene_mode():
-    """Scene mode lifts the commit-parent guards (u/u and a/a authored
-    shapes are renderable); legacy families keep them."""
+def test_authored_same_roles_coalesce_before_scene_seating_rules():
+    """Same effective roles append in place on every renderer; scene mode
+    still permits distinct-label same-seat turns that legacy templates reject."""
     from typing import cast as _cast
 
     from saklas.core.session import SaklasSession
@@ -431,25 +431,43 @@ def test_commit_seating_frees_under_scene_mode():
     tok = _tok(QWEN_STRIP_TEMPLATE)
     grammar = extract_turn_grammar(tok, "qwen3")
 
-    # Scene mode: user under user, assistant under assistant, assistant
-    # under root all land.
+    # Matching roles coalesce, regardless of renderer.
     stub = _SeatStub(grammar)
     u1 = SaklasSession.append_user_turn(as_sess(stub), None, "one")
-    u2 = SaklasSession.append_user_turn(as_sess(stub), u1, "two")
-    assert stub.tree.nodes[u2].parent_id == u1
-    a1 = SaklasSession.append_assistant_turn(as_sess(stub), u2, "three")
-    a2 = SaklasSession.append_assistant_turn(as_sess(stub), a1, "four")
-    assert stub.tree.nodes[a2].parent_id == a1
+    u2 = SaklasSession.append_user_turn(as_sess(stub), u1, " two")
+    assert u2 == u1
+    assert stub.tree.nodes[u1].text == "one two"
+    a1 = SaklasSession.append_assistant_turn(as_sess(stub), u1, "three")
+    a2 = SaklasSession.append_assistant_turn(as_sess(stub), a1, " four")
+    assert a2 == a1
+    assert stub.tree.nodes[a1].text == "three four"
     root_a = SaklasSession.append_assistant_turn(
         as_sess(stub), stub.tree.root_id, "first",
     )
     assert stub.tree.nodes[root_a].role == "assistant"
 
-    # Legacy (no grammar): both guards still hold.
+    # Distinct labels are distinct messages; scene mode can render the
+    # resulting same-seat adjacency.
+    u3 = SaklasSession.append_user_turn(
+        as_sess(stub), u1, "other", role_label="narrator",
+    )
+    assert u3 != u1
+    assert stub.tree.nodes[u3].parent_id == u1
+
+    # Legacy templates coalesce matching labels but still reject distinct
+    # same-seat messages.
     legacy = _SeatStub(None)
     lu = SaklasSession.append_user_turn(as_sess(legacy), None, "one")
+    lu2 = SaklasSession.append_user_turn(as_sess(legacy), lu, " two")
+    assert lu2 == lu
     with pytest.raises(InvalidNodeOperationError):
-        SaklasSession.append_user_turn(as_sess(legacy), lu, "two")
+        SaklasSession.append_user_turn(
+            as_sess(legacy), lu, "two", role_label="narrator",
+        )
     la = SaklasSession.append_assistant_turn(as_sess(legacy), lu, "reply")
+    la2 = SaklasSession.append_assistant_turn(as_sess(legacy), la, " again")
+    assert la2 == la
     with pytest.raises(InvalidNodeOperationError):
-        SaklasSession.append_assistant_turn(as_sess(legacy), la, "again")
+        SaklasSession.append_assistant_turn(
+            as_sess(legacy), la, "again", role_label="narrator",
+        )

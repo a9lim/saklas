@@ -1040,6 +1040,47 @@ class LoomTree:
             ))
             return node.id
 
+    def begin_continuation(
+        self,
+        node_id: str,
+        recipe: Recipe,
+    ) -> str:
+        """Reuse ``node_id`` as the target of a same-role continuation.
+
+        The caller has already saved the node's current text as a forced
+        decode prefix.  Clear the visible/result payload in place so the
+        ordinary token stream and finalizer can rebuild the complete message
+        (prefix plus newly sampled tail) without adding a redundant same-role
+        child to the tree.
+        """
+        with self._lock:
+            node = self.nodes.get(node_id)
+            if node is None:
+                raise UnknownNodeError(node_id)
+            if node_id == self.root_id:
+                raise InvalidNodeOperationError(
+                    "cannot continue the synthetic root node"
+                )
+            self._conflict_check(node_id, "begin_assistant")
+            node.text = ""
+            node.thinking_text = None
+            node.tokens = []
+            node.thinking_tokens = []
+            node.recipe = recipe
+            node.aggregate_readings = {}
+            node.applied_steering = None
+            node.finish_reason = None
+            node.mean_logprob = None
+            node.mean_surprise = None
+            node.raw_token_ids = None
+            self.active_node_id = node_id
+            self.rev += 1
+            self._emit(LoomMutated(
+                op="begin_assistant", rev=self.rev,
+                updated=(node_id,), active_node_id=node_id,
+            ))
+            return node_id
+
     def append_token(
         self,
         node_id: str,
@@ -1144,6 +1185,54 @@ class LoomTree:
             self._emit(LoomMutated(
                 op="edit", rev=self.rev, updated=(node_id,),
             ))
+
+    def append_authored(
+        self,
+        node_id: str,
+        text: str,
+        *,
+        thinking_text: str | None = None,
+        raw_token_ids: list[int] | None = None,
+    ) -> str:
+        """Append authored text to an existing same-role message.
+
+        A node-level generation receipt cannot faithfully describe a message
+        after a human-authored tail is added, so generated payloads are
+        cleared and the node becomes an authored message.  The tree shape is
+        unchanged and the existing node stays active.
+        """
+        with self._lock:
+            node = self.nodes.get(node_id)
+            if node is None:
+                raise UnknownNodeError(node_id)
+            if node_id == self.root_id:
+                raise InvalidNodeOperationError(
+                    "cannot append to the synthetic root node"
+                )
+            self._conflict_check(node_id, "edit")
+            node.text += text
+            if thinking_text is not None:
+                node.thinking_text = (node.thinking_text or "") + thinking_text
+            node.tokens = None
+            node.thinking_tokens = None
+            node.recipe = None
+            node.aggregate_readings = {}
+            node.applied_steering = None
+            node.finish_reason = "stop"
+            node.mean_logprob = None
+            node.mean_surprise = None
+            node.raw_token_ids = (
+                list(raw_token_ids) if raw_token_ids is not None else None
+            )
+            node.edit_count += 1
+            node.edited_at = time.time()
+            self.active_node_id = node_id
+            self.rev += 1
+            self._emit(LoomMutated(
+                op="edit", rev=self.rev, updated=(node_id,),
+                active_node_id=node_id,
+            ))
+            return node_id
 
     def branch(
         self,

@@ -7170,21 +7170,13 @@ class SaklasSession:
         role_label: str | None = None,
         thinking: str | None = None,
     ) -> str:
-        """Land a user turn under ``parent_node_id`` without generating.
+        """Append a user-seat span without generating.
 
-        The Ctrl+Enter "commit" on the chat surfaces: the typed text
-        lands as a user-role child and the active node advances, but no
-        decode runs.  The follow-up move is usually to type a prefill
-        and hit Enter (which then routes through
-        :meth:`prefill_assistant`) — together these let a user assemble
-        a turn pair manually.
-
-        Refuses anchoring under a user-role parent
-        (:meth:`_check_user_send_target`) — that would corrupt the
-        v2 chat-message flatten by producing user-under-user.  Dedup is
-        on: a same-text user sibling under ``parent_node_id`` is
-        returned without growing the tree, matching the regen workflow.
-        Returns the new (or deduped) user node id.
+        If the selected parent already has the user structural role and the
+        same effective ``role_label``, ``text`` is concatenated exactly onto
+        that node. Otherwise a new user-role child is created. Legacy chat
+        templates reject the latter user-under-user shape; scene renderers
+        accept it.
 
         ``allow_any_parent`` skips the user-under-user guard: in flat
         (base-model) mode the role tag is authorship provenance, not a
@@ -7192,7 +7184,7 @@ class SaklasSession:
         node of any role.
 
         ``text`` must be non-empty (whitespace-only is honored, but a
-        completely empty string raises) — empty commits should be
+        completely empty string raises) — empty appends should be
         no-op'd at the surface, not sent over the wire.
         """
         if text == "":
@@ -7201,11 +7193,22 @@ class SaklasSession:
             )
         if thinking is not None:
             self._check_thinking_commit(thinking)
-        # Scene mode lifts the user-under-user guard for commits: the
-        # stitcher renders arbitrary seat sequences (u/u is a legal
-        # scene shape), so the guard would refuse a renderable tree.
-        # The generation-path guard (fresh user *send* from a user
-        # node) is unchanged — send semantics stay conservative.
+        parent_id = parent_node_id or self.tree.active_node_id
+        parent = self.tree.get(parent_id)
+        if parent.role == "user" and parent.role_label == role_label:
+            combined = parent.text + text
+            raw_token_ids = list(
+                self._tokenizer.encode(combined, add_special_tokens=False)
+            )
+            return self.tree.append_authored(
+                parent_id,
+                text,
+                thinking_text=thinking,
+                raw_token_ids=raw_token_ids,
+            )
+
+        # A different role label is a genuinely new turn.  Scene mode lifts
+        # the legacy user-under-user guard for that shape.
         if not allow_any_parent and self.scene_grammar is None:
             self._check_user_send_target(parent_node_id)
         return self.tree.add_user_turn(
@@ -7222,9 +7225,9 @@ class SaklasSession:
         role_label: str | None = None,
         thinking: str | None = None,
     ) -> str:
-        """Commit one authored turn in the native ``human``/``model`` seat.
+        """Append one authored span in the native ``human``/``model`` seat.
 
-        This is the seat-neutral commit primitive.  The older
+        This is the seat-neutral append primitive. The older
         :meth:`append_user_turn` and :meth:`append_assistant_turn` methods stay
         as compatibility adapters for callers that speak chat-protocol roles.
         """
@@ -7253,17 +7256,13 @@ class SaklasSession:
         role_label: str | None = None,
         thinking: str | None = None,
     ) -> str:
-        """Land a user-authored assistant turn under ``user_node_id``.
+        """Append a model-seat span without generating.
 
-        The Ctrl+Enter "commit" on a user node: the typed text becomes
-        the whole assistant turn — no sampling, no steering, no
-        thinking.  The result is a sibling assistant under
-        ``user_node_id`` whose ``text`` is exactly the typed text, with
-        ``raw_token_ids`` populated by ``tokenizer.encode(text,
-        add_special_tokens=False)`` so the node remains forkable.
-        ``recipe`` stays ``None`` — that's the implicit "no model run
-        produced this" marker, the same shape transcript-loaded nodes
-        already carry.
+        If ``user_node_id`` is already an assistant structural role under the
+        same effective ``role_label``, ``text`` is concatenated exactly onto
+        that node. Otherwise an authored assistant child is created with no
+        sampling or steering. Authored messages keep ``recipe=None`` and carry
+        tokenized full text so they remain forkable.
 
         Raises :class:`InvalidNodeOperationError` when ``user_node_id``
         isn't a user node on a legacy-render family (scene mode frees
@@ -7278,6 +7277,22 @@ class SaklasSession:
         if thinking is not None:
             self._check_thinking_commit(thinking)
         node = self.tree.get(user_node_id)
+        if node.role == "assistant" and node.role_label == role_label:
+            combined = node.text + text
+            raw_token_ids = list(
+                self._tokenizer.encode(combined, add_special_tokens=False)
+            )
+            if not raw_token_ids:
+                raise InvalidNodeOperationError(
+                    f"append_assistant_turn: {combined!r} tokenized to an "
+                    f"empty sequence — nothing to append"
+                )
+            return self.tree.append_authored(
+                user_node_id,
+                text,
+                thinking_text=thinking,
+                raw_token_ids=raw_token_ids,
+            )
         # Scene mode lifts the user-parent requirement: the stitcher
         # renders arbitrary seat sequences, so an authored assistant
         # turn may hang under any node (a/a, assistant-first shapes).
@@ -7296,7 +7311,7 @@ class SaklasSession:
         if not raw_token_ids:
             raise InvalidNodeOperationError(
                 f"append_assistant_turn: {text!r} tokenized to an "
-                f"empty sequence — nothing to commit"
+                f"empty sequence — nothing to append"
             )
 
         new_id = self.tree.begin_assistant(
@@ -8255,13 +8270,16 @@ class SaklasSession:
         steering_obj: Steering | None,
         use_thinking_req: bool,
         gen_seat: str = "assistant",
+        continuation_node_id: str | None = None,
     ) -> str | None:
         """Create the loom nodes for a stateful generation.
 
         ``gen_seat`` is the seat the generated node occupies (the cast
         model: "generated" is provenance, not a seat).  An explicit
         non-assistant seat implies scene mode, where seating is free — the
-        user-under-user guard is skipped.
+        user-under-user guard is skipped. ``continuation_node_id`` reuses an
+        existing same-role message whose text the caller will replay as the
+        forced decode prefix.
         """
         if stateless:
             return None
@@ -8294,7 +8312,7 @@ class SaklasSession:
             user_node_id = self.tree.add_user_turn(
                 input, parent_id=parent_node_id, role_label=user_role)
         else:
-            # ``input=None`` (continue — no new committed turn) or a raw
+            # ``input=None`` (generate — no new authored turn) or a raw
             # messages list: anchor directly on the parent.
             user_node_id = parent_node_id or self.tree.active_node_id
 
@@ -8311,6 +8329,10 @@ class SaklasSession:
         # The generated node's label follows its seat (user-seat gens are
         # labeled by the ``user_role`` box, assistant-seat by ``assistant_role``).
         gen_label = user_role if gen_seat == "user" else assistant_role
+        if continuation_node_id is not None:
+            return self.tree.begin_continuation(
+                continuation_node_id, recipe=recipe,
+            )
         return self.tree.begin_assistant(
             user_node_id, recipe=recipe, role_label=gen_label, seat=gen_seat)
 
@@ -8470,6 +8492,7 @@ class SaklasSession:
         recipe_override: "Recipe | str | None" = None,
         forced_prefix: list[int] | None = None,
         gen_seat: str = "assistant",
+        append_same_role: bool = False,
     ) -> GenerationResult:
         """Shared generation implementation.
 
@@ -8506,6 +8529,61 @@ class SaklasSession:
                     sampling=sampling,
                     thinking=thinking,
                 )
+
+            # Ordinary one-shot continuation is message-oriented: if the
+            # selected leaf already occupies the same structural seat under
+            # the same effective role label, regenerate that node in place
+            # with its current text as the forced prefix.  Specialist fan,
+            # fork, and prefill paths leave this flag off and retain their
+            # explicit sibling semantics.
+            continuation_node_id: str | None = None
+            continuation_prefix: list[int] | None = None
+            continuation_parent_id: str | None = None
+            if (
+                append_same_role
+                and not stateless
+                and forced_prefix is None
+                and (input is None or (raw and input == ""))
+            ):
+                candidate_id = parent_node_id or self.tree.active_node_id
+                candidate = self.tree.get(candidate_id)
+                candidate_seat = (
+                    "user" if gen_seat == "user" else "assistant"
+                )
+                generated_label = None
+                if sampling is not None and not raw:
+                    generated_label = (
+                        sampling.user_role
+                        if gen_seat == "user"
+                        else sampling.assistant_role
+                    )
+                if (
+                    candidate.role == candidate_seat
+                    and candidate.role_label == generated_label
+                ):
+                    continuation_node_id = candidate.id
+                    continuation_parent_id = candidate.parent_id
+                    continuation_prefix = list(
+                        self._tokenizer.encode(
+                            candidate.text, add_special_tokens=False,
+                        )
+                    )
+                    if continuation_prefix:
+                        from dataclasses import replace as _replace
+                        base_sampling = (
+                            sampling if sampling is not None else SamplingConfig()
+                        )
+                        base_max = (
+                            base_sampling.max_tokens
+                            or self.config.max_new_tokens
+                        )
+                        sampling = _replace(
+                            base_sampling,
+                            max_tokens=len(continuation_prefix) + base_max,
+                        )
+                    # Same-message continuation is an answer/body prefill,
+                    # not a request to open a fresh thinking channel.
+                    thinking = False
 
             (
                 steering_obj,
@@ -8804,7 +8882,11 @@ class SaklasSession:
             # ``Assistant message must have a string or a list of chunks ...``;
             # permissive templates render the duplicate user silently and
             # degrade prompt quality.
-            chat_history_anchor = parent_node_id
+            chat_history_anchor = (
+                continuation_parent_id
+                if continuation_node_id is not None
+                else parent_node_id
+            )
             if (
                 not stateless
                 and (isinstance(input, str) or input is None)
@@ -8821,6 +8903,7 @@ class SaklasSession:
                 steering_obj=steering_obj,
                 use_thinking_req=use_thinking_req,
                 gen_seat=gen_seat,
+                continuation_node_id=continuation_node_id,
             )
 
             if steering_cm is not None:
@@ -8946,7 +9029,11 @@ class SaklasSession:
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
                     lp_count=lp_count,
-                    forced_prefix=forced_prefix,
+                    forced_prefix=(
+                        continuation_prefix
+                        if continuation_node_id is not None
+                        else forced_prefix
+                    ),
                     # Per-token perplexity costs one host sync/token.  Compute
                     # it only when something surfaces it: a loom-attached gen
                     # persists it on the token row, an interactive (non-
@@ -9065,6 +9152,7 @@ class SaklasSession:
         n: int = 1,
         recipe_override: "Recipe | str | None" = None,
         gen_seat: str = "assistant",
+        append_same_role: bool = True,
     ) -> RunSet:
         """Run one or more sibling generations and return a ``RunSet``."""
         if n < 1:
@@ -9081,6 +9169,7 @@ class SaklasSession:
                 parent_node_id=parent_node_id,
                 recipe_override=recipe_override,
                 gen_seat=gen_seat,
+                append_same_role=append_same_role,
             )
             node_id = self.tree.active_node_id if not stateless else None
             return RunSet([result], node_ids=[node_id], kind="generation")
@@ -9191,6 +9280,7 @@ class SaklasSession:
         n: int = 1,
         recipe_override: "Recipe | str | None" = None,
         gen_seat: str = "assistant",
+        append_same_role: bool = True,
     ) -> RunSet:
         """Blocking generation.
 
@@ -9229,9 +9319,13 @@ class SaklasSession:
                 node lands with ``role="user"`` + a stamped recipe —
                 generated is provenance, not a seat.  A non-assistant
                 seat needs a validated scene grammar
-                (:attr:`scene_grammar`).  ``input=None`` skips the
-                committed turn entirely — the model continues from the
-                current leaf (the a/a and u/u shapes).
+                (:attr:`scene_grammar`). ``input=None`` skips an authored
+                span. For a one-shot generation, ``append_same_role=True``
+                reuses a matching leaf and treats its existing text as a
+                forced prefix; fan-out retains sibling branches.
+            append_same_role: coalesce a one-shot bare generation into a leaf
+                with the same structural role and role label. Disable for
+                specialist operations whose contract requires a new sibling.
 
         Returns:
             :class:`RunSet` in every case.  It is list-like for fan-out
@@ -9249,6 +9343,7 @@ class SaklasSession:
             n=n,
             recipe_override=recipe_override,
             gen_seat=gen_seat,
+            append_same_role=append_same_role,
         )
 
     # -- Generation: streaming --
@@ -9267,6 +9362,7 @@ class SaklasSession:
         live_scores: bool = True,
         live_readouts: bool = True,
         gen_seat: str = "assistant",
+        append_same_role: bool = True,
     ) -> GenerationStream:
         """Streaming generation.  See :meth:`generate` for kwargs.
 
@@ -9352,6 +9448,7 @@ class SaklasSession:
                     parent_node_id=parent_node_id,
                     recipe_override=recipe_override,
                     gen_seat=gen_seat,
+                    append_same_role=append_same_role,
                 )
                 result_holder.append(result)
             except BaseException as e:

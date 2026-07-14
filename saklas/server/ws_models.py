@@ -68,8 +68,8 @@ class WSGenerateMessage(NativeRequest):
 class WSSubmitMessage(NativeRequest):
     """Native seat-neutral chat submission.
 
-    ``text`` plus ``authored_seat`` commits a turn.  ``generated_seat`` then
-    optionally asks the model to continue from it; omit it for commit-only.
+    ``text`` plus ``authored_seat`` appends a span.  ``generated_seat`` then
+    optionally asks the model to continue from it; omit it for append-only.
     With no text, ``generated_seat`` is a bare continue from the selected leaf.
     """
 

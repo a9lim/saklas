@@ -24,7 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.events import EventBus
-from saklas.core.loom import LoomTree
+from saklas.core.loom import LoomTree, Recipe
 from saklas.core.results import GenerationResult, RunSet
 
 # ---------------------------------------------------------------------------
@@ -85,6 +85,9 @@ class _StubSession:
         self.sae_probe_names: list[str] = []
         self.token_probe_payload: dict[str, Any] = {}
         self._tokenizer = MagicMock()
+        self._tokenizer.encode.side_effect = lambda text, **_: [
+            3000 + i for i, _ch in enumerate(str(text))
+        ]
         self._layers = []
         capture = MagicMock()
         capture._per_layer = {}
@@ -168,7 +171,8 @@ class _StubSession:
     def generate(self, input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: bool = False, raw: bool = False, thinking: Any = None,
                  on_token: Any = None, parent_node_id: Any = None, n: int = 1,
-                 gen_seat: str = "assistant", recipe_override: Any = None):
+                 gen_seat: str = "assistant", recipe_override: Any = None,
+                 append_same_role: bool = True):
         """Stub generate.
 
         Routes through the tree the same way SaklasSession does for
@@ -194,8 +198,31 @@ class _StubSession:
                     str(input), parent_id=parent_node_id,
                 )
             self._active_gen_reservation = anchor_id
-
-            assistant_id = self.tree.begin_assistant(anchor_id, seat=gen_seat)
+            role_label = None
+            if sampling is not None and not raw:
+                role_label = (
+                    sampling.user_role
+                    if gen_seat == "user"
+                    else sampling.assistant_role
+                )
+            anchor = self.tree.get(anchor_id)
+            can_continue = bool(
+                append_same_role
+                and n == 1
+                and input is None
+                and anchor.role == gen_seat
+                and anchor.role_label == role_label
+            )
+            prefix = anchor.text if can_continue else ""
+            if can_continue:
+                assistant_id = self.tree.begin_continuation(
+                    anchor_id, Recipe(),
+                )
+            else:
+                assistant_id = self.tree.begin_assistant(
+                    anchor_id, recipe=Recipe(), role_label=role_label,
+                    seat=gen_seat,
+                )
             try:
                 token_text = f"tok{sibling_idx}"
                 if on_token is not None:
@@ -205,14 +232,15 @@ class _StubSession:
                 )
                 if self._block_until_stop:
                     assert self._stop_event.wait(timeout=5.0)
+                full_text = prefix + token_text
                 result = GenerationResult(
-                    text=token_text, tokens=[1000 + sibling_idx],
+                    text=full_text, tokens=[1000 + sibling_idx],
                     token_count=1, tok_per_sec=10.0, elapsed=0.1,
                     finish_reason="stop",
                 )
                 self.tree.finalize_assistant(
                     assistant_id,
-                    text=token_text,
+                    text=full_text,
                     aggregate_readings={},
                     applied_steering=None,
                     finish_reason="stop",
@@ -296,6 +324,18 @@ class _StubSession:
             if resolved_parent is not None
             else None
         )
+        if (
+            parent is not None
+            and parent.role == "user"
+            and parent.role_label == role_label
+        ):
+            raw_token_ids = self._tokenizer.encode(
+                parent.text + text, add_special_tokens=False,
+            )
+            return self.tree.append_authored(
+                parent.id, text, thinking_text=thinking,
+                raw_token_ids=raw_token_ids,
+            )
         if not allow_any_parent and parent is not None and parent.role == "user":
             raise InvalidNodeOperationError(
                 f"cannot send a new user turn from a user node "
@@ -320,6 +360,14 @@ class _StubSession:
                 "append_assistant_turn: text must be non-empty"
             )
         node = self.tree.get(user_node_id)
+        if node.role == "assistant" and node.role_label == role_label:
+            raw_token_ids = self._tokenizer.encode(
+                node.text + text, add_special_tokens=False,
+            )
+            return self.tree.append_authored(
+                node.id, text, thinking_text=thinking,
+                raw_token_ids=raw_token_ids,
+            )
         if node.role != "user" and getattr(self, "scene_grammar", None) is None:
             raise InvalidNodeOperationError(
                 f"append_assistant_turn: {user_node_id!r} is a "
@@ -1140,6 +1188,7 @@ class TestSubmit:
                     break
                 assert msg["type"] != "error", msg
         assert msg["result"]["seat"] == "model"
+        assert msg["result"]["kind"] == "append"
         path = session.tree.active_path()[1:]
         assert [node.role for node in path] == ["assistant"]
         assert path[0].recipe is None
@@ -1200,11 +1249,53 @@ class TestSubmit:
         path = session.tree.active_path()[1:]
         assert [node.role for node in path] == ["assistant"]
 
+    def test_append_reuses_matching_authored_message(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit", "text": "one",
+                "authored_seat": "human",
+            })
+            while (first := ws.receive_json())["type"] != "done":
+                assert first["type"] != "error", first
+            ws.send_json({
+                "type": "submit", "text": " two",
+                "authored_seat": "human",
+            })
+            while (second := ws.receive_json())["type"] != "done":
+                assert second["type"] != "error", second
+        assert second["node_id"] == first["node_id"]
+        path = session.tree.active_path()[1:]
+        assert len(path) == 1
+        assert path[0].text == "one two"
+
+    def test_generate_reuses_matching_role_as_prefill(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        session.scene_grammar = MagicMock()
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit", "text": "Once",
+                "authored_seat": "model",
+            })
+            while (appended := ws.receive_json())["type"] != "done":
+                assert appended["type"] != "error", appended
+            ws.send_json({"type": "submit", "generated_seat": "model"})
+            while (generated := ws.receive_json())["type"] != "done":
+                assert generated["type"] != "error", generated
+        assert generated["node_id"] == appended["node_id"]
+        path = session.tree.active_path()[1:]
+        assert len(path) == 1
+        assert path[0].role == "assistant"
+        assert path[0].text == "Oncetok0"
+
 
 class TestCommitContinued:
-    def test_commit_user_refused_under_user_node(self, session_and_client: Any):
-        """Server rejects commit_role=user when the resolved parent is
-        itself a user node — D15 keeps user-under-user out of the tree."""
+    def test_commit_user_appends_under_user_node(self, session_and_client: Any):
+        """The compatibility commit adapter shares same-role append semantics."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("first")  # active = uid
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
@@ -1214,13 +1305,13 @@ class TestCommitContinued:
                 "commit_text": "second",
                 "parent_node_id": uid,
             })
-            # Skip the started frame; we want the error.
             while True:
                 msg = ws.receive_json()
                 if msg["type"] in ("error", "done"):
                     break
-        assert msg["type"] == "error"
-        assert msg["code"] == "InvalidNodeOperationError"
+        assert msg["type"] == "done"
+        assert msg["node_id"] == uid
+        assert session.tree.nodes[uid].text == "firstsecond"
 
     def test_commit_user_raw_allows_user_parent(self, session_and_client: Any):
         """A flat (base-model) commit carries ``raw: true`` — the
@@ -1245,7 +1336,8 @@ class TestCommitContinued:
                 assert msg["type"] != "error", msg
         assert done is not None
         new_id = done["result"]["node_id"]
-        assert session.tree.nodes[new_id].parent_id == uid
+        assert new_id == uid
+        assert session.tree.nodes[new_id].text == "firstsecond"
 
     def test_commit_assistant_lands_authored_sibling(self, session_and_client: Any):
         """Ctrl+Enter on a user active node lands a sibling assistant

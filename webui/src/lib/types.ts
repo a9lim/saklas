@@ -1009,7 +1009,7 @@ export interface WSGenerateRequest {
 export type Seat = "human" | "model";
 
 /** Native composer submission.  Authorship and generation are explicit,
- * independent seats; omit ``generated_seat`` for a commit-only action. */
+ * independent seats; omit ``generated_seat`` for an append-only action. */
 export interface WSSubmitRequest {
   type: "submit";
   text?: string | null;

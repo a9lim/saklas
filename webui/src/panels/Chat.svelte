@@ -83,6 +83,8 @@
   } from "../lib/tokens";
   import Select from "../lib/Select.svelte";
   import Checkbox from "../lib/Checkbox.svelte";
+  import Combobox from "../lib/Combobox.svelte";
+  import Button from "../lib/ui/Button.svelte";
 
   // --------------------------------------------------------------- input --
 
@@ -150,8 +152,8 @@
   // --- Unified submission -----------------------------------------------
   // The composer has exactly two states: ordinary and swapped.  Selection
   // chooses the branch anchor only; it never changes what the box means.
-  // Prefill remains an explicit loom/node tool rather than an implicit
-  // consequence of focusing a human-seat node.
+  // Same-role adjacency coalesces in the engine, so prefill is no longer a
+  // separate composer state: append a model prefix, then generate model.
   const rawMode = $derived.by(() => {
     void genUiMode.mode;
     return effectiveRawMode();
@@ -173,12 +175,19 @@
   const generatedSeat = $derived<"human" | "model">(
     swapSeats ? "human" : "model",
   );
-  const humanLabel = $derived(samplingState.human_role.trim() || "human");
-  const modelLabel = $derived(samplingState.model_role.trim() || "model");
+  const humanLabel = $derived(
+    samplingState.human_role.trim()
+      || sessionState.info?.default_user_role
+      || "human",
+  );
+  const modelLabel = $derived(
+    samplingState.model_role.trim()
+      || sessionState.info?.default_assistant_role
+      || "model",
+  );
   const authoredLabel = $derived(authoredSeat === "human" ? humanLabel : modelLabel);
-  const generatedLabel = $derived(generatedSeat === "human" ? humanLabel : modelLabel);
 
-  // Committed-thinking input: a block the next *commit* (⌃⏎) carries,
+  // Authored-thinking input: a block the next *append* (modifier+Enter) carries,
   // rendered through the family think delimiters.  Strip families keep
   // it for one turn only — the warning under the box says so before
   // submit (a9 convention 3).
@@ -191,34 +200,40 @@
   let thinkingOpen = $state(false);
   let thinkingDraft = $state("");
 
-  // --- Commit modifier (Ctrl / Cmd / Option) ----------------------------
-  // Any of Ctrl, Cmd (⌘), or Option (⌥) commits a non-empty draft without
-  // generation.  Empty input always continues the generated seat; the
-  // modifier is deliberately irrelevant when there is nothing to commit.
+  // --- Append modifier (Ctrl / Cmd / Option) ----------------------------
+  // Any of Ctrl, Cmd (⌘), or Option (⌥) appends a non-empty draft without
+  // generation. Empty input always generates in the generated seat; the
+  // modifier is deliberately irrelevant when there is nothing to append.
   // Tracked at the window level so the
   // state survives textarea blur and we can swap the send-button caption
   // the moment the modifier comes down — without needing the user to
   // type anything first.
   let modHeld = $state(false);
   const hasText = $derived(input.trim() !== "");
-  const commitMode = $derived(modHeld && hasText);
+  const appendMode = $derived(modHeld && hasText);
 
   /** Keep the composer prompt to the active action; shortcuts live in help. */
   const inputPlaceholder = $derived(
-    commitMode
-      ? `commit ${authoredLabel}…`
+    appendMode
+      ? `append ${authoredLabel}…`
       : `message as ${authoredLabel}…`,
   );
   const sendLabel = $derived(
-    commitMode
-      ? `commit ${authoredLabel}`
-      : hasText
-        ? `send → ${generatedLabel}`
-        : `continue → ${generatedLabel}`,
+    appendMode ? "append" : hasText ? "send" : "generate",
   );
 
-  function doSend(commit: boolean = false): void {
-    const text = input.trim();
+  const castRoleOptions = $derived(
+    [...new Set([
+      sessionState.info?.default_user_role,
+      sessionState.info?.default_assistant_role,
+      ...Object.keys(castState.roster),
+    ].filter((value): value is string => !!value))]
+      .sort((a, b) => a.localeCompare(b))
+      .map((value) => ({ value, label: value })),
+  );
+
+  function doSend(append: boolean = false): void {
+    const text = hasText ? input : "";
     const replaceSlot = consumePulledSlot();
     if (!text) {
       if (replaceSlot !== null) {
@@ -238,11 +253,11 @@
       pushInputHistory(text);
       input = "";
     }
-    const commitOnly = commit && text !== "";
+    const appendOnly = append && text !== "";
     void sendSubmit(
       text || null,
       text ? authoredSeat : null,
-      commitOnly ? null : generatedSeat,
+      appendOnly ? null : generatedSeat,
       {
         parent_node_id: parent,
         replaceSlot,
@@ -288,9 +303,9 @@
 
   function onKeydown(ev: KeyboardEvent): void {
     if (ev.key === "Enter") {
-      // Shift-Enter is a newline; Ctrl/Cmd/Option-Enter is the commit
-      // modifier (no generation); bare Enter is the normal send/prefill
-      // path.  Reading the modifier flags off the event directly is
+      // Shift-Enter is a newline; Ctrl/Cmd/Option-Enter is the append
+      // modifier (no generation); bare Enter sends or generates according
+      // to whether the box has text. Reading the modifier flags directly is
       // more reliable than ``modHeld`` (which lags on focus-blur edge
       // cases) — at the moment of Enter the event carries the truth.
       if (ev.shiftKey) return;
@@ -610,7 +625,7 @@
     scrollToBottom();
     textareaRef?.focus();
 
-    // Track any commit modifier at the window level so the send-button
+    // Track any append modifier at the window level so the send-button
     // label flips the moment the user presses it, not only when they
     // hit Enter.  We read all three flags off the event so the modifier
     // works across platforms and key layouts:
@@ -629,7 +644,7 @@
     window.addEventListener("keydown", setHeld);
     window.addEventListener("keyup", setHeld);
     // ``blur`` covers tab-out / window-switch where the keyup never
-    // fires — without it the label sticks in "commit" mode after the
+    // fires — without it the label sticks in "append" mode after the
     // user Cmd-Tabs away mid-modifier.
     window.addEventListener("blur", clearHeld);
     return () => {
@@ -1017,16 +1032,15 @@
         ? "your role"
         : "unavailable"}
     >
-      <span class="cast-label">you</span>
-      <input
-        class="cast-input"
-        class:invalid={!castUserValid}
+      <span class="cast-label">human</span>
+      <Combobox
         bind:value={samplingState.human_role}
+        options={castRoleOptions}
         disabled={!castReady || !castUserSupported}
-        placeholder="human"
-        spellcheck="false"
-        aria-label="human role label"
-        list="cast-roster-labels"
+        invalid={!castUserValid}
+        placeholder={sessionState.info?.default_user_role ?? "human"}
+        spellcheck={false}
+        ariaLabel="human role label"
       />
     </label>
     <label
@@ -1036,15 +1050,14 @@
         : "unavailable"}
     >
       <span class="cast-label">model</span>
-      <input
-        class="cast-input"
-        class:invalid={!castAsstValid}
+      <Combobox
         bind:value={samplingState.model_role}
+        options={castRoleOptions}
         disabled={!castReady || !castAsstSupported}
-        placeholder={roleDisplayLabel("assistant")}
-        spellcheck="false"
-        aria-label="model role label"
-        list="cast-roster-labels"
+        invalid={!castAsstValid}
+        placeholder={sessionState.info?.default_assistant_role ?? "model"}
+        spellcheck={false}
+        ariaLabel="model role label"
       />
     </label>
     <div
@@ -1060,29 +1073,25 @@
         ariaLabel="swap human and model seats"
       />
     </div>
-    <button
-      type="button"
-      class="cast-manage"
-      title="cast"
-      onclick={() => openDrawer("cast")}
-    >cast…</button>
-    <datalist id="cast-roster-labels">
-      {#each Object.keys(castState.roster) as slug (slug)}
-        <option value={slug}></option>
-      {/each}
-    </datalist>
+    <div class="cast-manage">
+      <Button
+        size="sm"
+        title="cast"
+        onclick={() => openDrawer("cast")}
+      >cast…</Button>
+    </div>
   </div>
 
   {#if thinkingInputSupported}
     <div class="thinking-row">
-      <button
-        type="button"
-        class="thinking-toggle"
-        class:open={thinkingOpen}
-        class:drafted={thinkingDraft.trim() !== ""}
-        onclick={() => (thinkingOpen = !thinkingOpen)}
-        title="next commit"
-      >{thinkingOpen ? "− thinking" : "+ thinking"}</button>
+      <div class="thinking-control">
+        <Button
+          size="sm"
+          accent={thinkingDraft.trim() !== "" ? "var(--accent-violet)" : undefined}
+          onclick={() => (thinkingOpen = !thinkingOpen)}
+          title="next append"
+        >{thinkingOpen ? "− thinking" : "+ thinking"}</Button>
+      </div>
       {#if thinkingOpen}
         <div class="thinking-box">
           <textarea
@@ -1091,7 +1100,7 @@
             placeholder="thinking…"
             rows="2"
             spellcheck="false"
-            aria-label="committed thinking block"
+            aria-label="authored thinking block"
           ></textarea>
           {#if stripsHistoryThinking}
             <p class="thinking-warn" role="note">one turn only</p>
@@ -1112,26 +1121,25 @@
       aria-label={`Compose as ${authoredLabel}`}
     ></textarea>
     <div class="input-actions">
-      <button
+      <Button
         type="submit"
-        class="send"
+        variant="solid"
+        accent="var(--accent-green)"
         disabled={!loomTree.loaded}
-        title={commitMode ? "modifier + ⏎ commit" : "⏎ submit"}
-      >{sendLabel}</button>
-      <button
-        type="button"
-        class="stop"
+        title={appendMode ? "modifier + ⏎ append" : "⏎ submit"}
+      >{sendLabel}</Button>
+      <Button
+        variant="danger"
         onclick={sendStop}
         disabled={!genStatus.active}
         title="Esc"
-      >stop</button>
-      <button
-        type="button"
-        class="regen"
+      >stop</Button>
+      <Button
+        accent="var(--accent-blue)"
         onclick={regenAction}
         disabled={!canRegen}
         title="regenerate"
-      >regen</button>
+      >regen</Button>
     </div>
   </form>
   {/if}
@@ -1578,6 +1586,8 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
+    width: 13em;
+    min-width: 0;
   }
   .cast-label {
     font-family: var(--font-mono);
@@ -1586,29 +1596,6 @@
     text-transform: uppercase;
     color: var(--fg-muted);
   }
-  .cast-input {
-    width: 9em;
-    background: var(--glass-strong);
-    color: var(--fg-dim);
-    border: 1px solid transparent;
-    border-radius: var(--radius-pill);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    padding: 2px var(--space-4);
-    transition: border-color var(--dur-fast) var(--ease-out);
-  }
-  .cast-input:focus-visible {
-    outline: none;
-    border-color: var(--accent-glow);
-    color: var(--fg);
-  }
-  .cast-input.invalid {
-    border-color: var(--accent-red);
-  }
-  .cast-input:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
   .seat-toggle {
     display: inline-flex;
     align-items: center;
@@ -1616,19 +1603,6 @@
   }
   .cast-manage {
     margin-left: auto;
-    background: none;
-    border: none;
-    color: var(--fg-muted);
-    font-family: var(--font-mono);
-    font-size: var(--text-2xs);
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    cursor: pointer;
-    padding: 2px var(--space-2);
-    transition: color var(--dur-fast) var(--ease-out);
-  }
-  .cast-manage:hover {
-    color: var(--fg);
   }
 
   .thinking-row {
@@ -1637,25 +1611,8 @@
     gap: var(--space-2);
     padding: 0 var(--space-1);
   }
-  .thinking-toggle {
+  .thinking-control {
     align-self: flex-start;
-    background: none;
-    border: none;
-    color: var(--fg-muted);
-    font-family: var(--font-mono);
-    font-size: var(--text-2xs);
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    cursor: pointer;
-    padding: 0 var(--space-1);
-    transition: color var(--dur-fast) var(--ease-out);
-  }
-  .thinking-toggle:hover,
-  .thinking-toggle.open {
-    color: var(--fg);
-  }
-  .thinking-toggle.drafted {
-    color: var(--fg-strong);
   }
   .thinking-box {
     display: flex;
@@ -1721,32 +1678,5 @@
     display: flex;
     gap: var(--space-2);
     align-items: center;
-  }
-  .input-actions button {
-    background: var(--glass);
-    color: var(--fg-strong);
-    border: 0;
-    border-radius: var(--radius);
-    padding: var(--space-2) var(--space-5);
-    cursor: pointer;
-    font: inherit;
-    font-family: var(--font-mono);
-    transition: background var(--dur-fast) var(--ease-out);
-  }
-  .input-actions button:hover:not(:disabled) {
-    background: var(--glass-strong);
-  }
-  .input-actions button:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
-  }
-  .input-actions .send {
-    color: var(--accent-green);
-  }
-  .input-actions .stop {
-    color: var(--accent-red);
-  }
-  .input-actions .regen {
-    color: var(--accent-blue);
   }
 </style>

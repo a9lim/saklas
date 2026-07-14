@@ -535,7 +535,8 @@ class TestWebSocket:
         """Install a fake ``session.generate`` that drives ``on_token``."""
         def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: Any = False, raw: Any = False, thinking: Any = None,
-                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1,
+                 append_same_role: Any = True) -> Any:
             for i, tok in enumerate(tokens):
                 on_token(tok, False, 1000 + i, None, None)  # pyright: ignore[reportOptionalCall]
                 time.sleep(0.001)
@@ -607,7 +608,8 @@ class TestWebSocket:
 
         def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: Any = False, raw: Any = False, thinking: Any = None,
-                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1,
+                 append_same_role: Any = True) -> Any:
             callbacks.append(on_token)
             idx = len(callbacks) - 1
             if idx == 1:
@@ -697,7 +699,8 @@ class TestWebSocket:
 
         def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: Any = False, raw: Any = False, thinking: Any = None,
-                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1,
+                 append_same_role: Any = True) -> Any:
             calls.append(str(input))
             time.sleep(0.02 if input == "one" else 0.001)
             on_token(str(input), False, 1000 + len(calls), None, None)  # pyright: ignore[reportOptionalCall]
