@@ -445,7 +445,16 @@ across generations; multiple clients supported. Events: `start`
 ### WS /saklas/v1/sessions/{id}/stream (in `ws_stream.py`)
 
 Bidirectional WebSocket; only the exact `session_id == "default"` is accepted.
-Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
+The dashboard composer sends `{type:"submit", text?, authored_seat?,
+generated_seat?, steering?, sampling?, thinking?, authored_thinking?, raw?,
+parent_node_id?, n?, recipe_override?}`. Seats use native `"human"|"model"`
+names. Text requires `authored_seat`; omit `generated_seat` for commit-only;
+omit text for a bare continuation. The server commits text once, then fans
+generated siblings from that node, so authored and generated seats are explicit
+and independent.
+
+The compatibility and specialist client frame is `{type: "stop"}`, or
+`{type: "generate", input, steering,
 sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?,
 generate_seat?}`. `generate_seat` (`"user"|"assistant"`, default assistant) is
 the cast model's seat selector: `"user"` renders the generation prompt as a

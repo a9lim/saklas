@@ -1,13 +1,13 @@
 <script lang="ts">
-  // Export drawer — JSONL or CSV download of the last assistant turn.
+  // Export drawer — JSONL or CSV download of the last generated turn.
   // Mirrors the TUI's ``/export <path>``: the TUI dumps
   // ``session.last_result`` through ``ResultCollector``.  The web side
   // doesn't keep ``last_result`` in scope, so we serialize the last
-  // assistant turn from ``chatLog`` — same fields the rest of the UI
+  // generated turn from ``chatLog`` — same fields the rest of the UI
   // already shows (text, applied_steering, aggregateReadings, finish
   // reason, perplexity, sampling).
   //
-  // Empty result (no assistant turn yet, or last turn had no readings)
+  // Empty result (no generated turn yet, or last turn had no readings)
   // → renders a notice and disables the download button.
 
   import { chatLog, samplingState, closeDrawer } from "../lib/stores.svelte";
@@ -23,11 +23,11 @@
   let format: Format = $state("jsonl");
   let filename = $state("");
 
-  /** Locate the most recent assistant turn — that's "the last result"
+  /** Locate the most recent generated turn — that's "the last result"
    * for export purposes.  Returns null if there isn't one. */
   const lastTurn: ChatTurn | null = $derived.by(() => {
     for (let i = chatLog.turns.length - 1; i >= 0; i--) {
-      if (chatLog.turns[i].role === "assistant") return chatLog.turns[i];
+      if (chatLog.turns[i].generated) return chatLog.turns[i];
     }
     return null;
   });
@@ -60,7 +60,8 @@
       seed: samplingState.seed,
     };
     return {
-      role: turn.role,
+      seat: turn.role === "user" ? "human" : "model",
+      role: turn.roleLabel ?? (turn.role === "user" ? "human" : "model"),
       text: turn.text ?? "",
       thinking: turn.thinking ?? false,
       applied_steering: turn.appliedSteering ?? null,
@@ -99,6 +100,7 @@
     const readings = (rec.readings ?? {}) as Record<string, number>;
     const sampling = (rec.sampling ?? {}) as Record<string, unknown>;
     const cols: { key: string; value: unknown }[] = [
+      { key: "seat", value: rec.seat },
       { key: "role", value: rec.role },
       { key: "text", value: rec.text },
       { key: "thinking", value: rec.thinking },

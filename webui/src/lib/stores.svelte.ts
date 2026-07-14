@@ -55,6 +55,7 @@ import type {
   TokenScore,
   Trigger,
   Variant,
+  Seat,
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
@@ -741,13 +742,6 @@ export async function checkLensFit(): Promise<void> {
   }
 }
 
-/** One-shot guard: the role boxes are client-sticky (they ride each send),
- *  unlike the numeric sampling defaults which mirror server config on every
- *  patch.  We seed them from the family's standard role labels exactly once,
- *  on the first session-info load — re-seeding on later patches would clobber
- *  a value the user typed. */
-let _roleDefaultsSeeded = false;
-
 /** Mirror the server's session.config defaults into the local
  * ``samplingState``.  The local store was previously pre-seeded with its
  * own constants (``max_tokens: 256`` etc.) which drifted away from the
@@ -757,18 +751,9 @@ let _roleDefaultsSeeded = false;
  * the displayed cap matches what generation actually used. */
 function _hydrateSamplingFromInfo(): void {
   const info = sessionState.info;
-  // Seed the sticky role boxes once, so they show e.g. ``user`` / ``model``
-  // instead of an empty ``—`` placeholder.  Only fills an empty box, so a
-  // value already in hand (typed before info landed) is never overwritten.
-  if (!_roleDefaultsSeeded && info) {
-    _roleDefaultsSeeded = true;
-    if (samplingState.user_role === "" && info.default_user_role) {
-      samplingState.user_role = info.default_user_role;
-    }
-    if (samplingState.assistant_role === "" && info.default_assistant_role) {
-      samplingState.assistant_role = info.default_assistant_role;
-    }
-  }
+  // Human/model are Saklas-native structural names.  Family labels from
+  // session info are renderer-adapter details and therefore do not replace
+  // these sticky cast boxes.
   const cfg = info?.config;
   if (!cfg) return;
   if (typeof cfg.max_tokens === "number" && Number.isFinite(cfg.max_tokens)) {
@@ -815,7 +800,10 @@ export function roleDisplayLabel(
   role: string,
   roleLabel?: string | null,
 ): string {
-  return roleLabel || role;
+  if (roleLabel) return roleLabel;
+  if (role === "user") return "human";
+  if (role === "assistant") return "model";
+  return role;
 }
 
 /** Single-character glyph for the loom node badge — first char of the
@@ -1820,6 +1808,7 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
     text: n.text,
     roleLabel: n.role_label,
     nodeId: n.id,
+    generated: n.recipe !== null,
     appliedSteering: n.applied_steering ?? null,
     aggregateReadings: n.aggregate_readings ?? undefined,
     finishReason: n.finish_reason ?? undefined,
@@ -1916,15 +1905,10 @@ function syncChatLogFromTree(): void {
       // Mutate-in-place so the streaming token arrays survive.
       prev.nodeId = nid;
       const nextText = node.text;
-      if (
-        !(
-          loomTree.pendingNodeId === nid &&
-          prev.role === "assistant" &&
-          nextText === ""
-        )
-      ) {
+      if (!(loomTree.pendingNodeId === nid && prev.generated && nextText === "")) {
         prev.text = nextText;
       }
+      prev.generated = node.recipe !== null;
       prev.appliedSteering = node.applied_steering ?? prev.appliedSteering ?? null;
       prev.aggregateReadings = node.aggregate_readings ?? prev.aggregateReadings;
       prev.finishReason = node.finish_reason ?? prev.finishReason;
@@ -2173,9 +2157,7 @@ export async function loomNote(node_id: string, text: string): Promise<void> {
   }
 }
 
-/** Regenerate the active assistant: send a fresh ``generate`` request
- *  anchored at the user-parent's parent, so the replayed user prompt
- *  dedups onto the existing user node and creates a sibling assistant.
+/** Regenerate the active generated node as a sibling in the same seat.
  *  N=1 by default.  Recipe is implicit (current rack) unless
  *  ``opts.recipe_override`` is set, in which case the engine applies
  *  the recipe-override modifier on top of the parent's recipe. */
@@ -2187,38 +2169,37 @@ export async function loomRegenerateActive(
   const activeId = loomTree.active_node_id;
   if (!activeId) return;
   const node = loomTree.nodes.get(activeId);
-  if (!node || node.role !== "assistant") return;
+  if (!node || node.recipe === null || node.role === "system") return;
   const parentId = node.parent_id;
   if (!parentId) return;
-  // The user turn (parent) carries the prompt text we need to replay.
-  const parent = loomTree.nodes.get(parentId);
-  if (!parent || parent.role !== "user") return;
   try {
-    await sendGenerate(parent.text, {
-      parent_node_id: parent.parent_id ?? null,
+    await sendGenerate(null, {
+      parent_node_id: parentId,
       n,
       recipe_override: opts.recipe_override ?? undefined,
+      generate_seat: node.role,
     });
   } catch (e) {
     _captureLoomError("regenerate", e);
   }
 }
 
-/** Regenerate under a specific user node (the "fan out" entry point).
- *  Anchor at the user's parent so ``add_user_turn`` reuses that user
- *  node and fans out sibling assistant replies. */
-export async function loomRegenerateFromUser(
-  userNodeId: string,
+/** Generate opposite-seat continuations under a committed turn.
+ *  This is the fan-out entry point for either structural seat; the selected
+ *  node supplies context only, while its role determines the reply seat. */
+export async function loomContinueFromCommitted(
+  nodeId: string,
   opts: { n?: number; recipe_override?: string | null } = {},
 ): Promise<void> {
   if (!loomTree.loaded) return;
-  const user = loomTree.nodes.get(userNodeId);
-  if (!user || user.role !== "user") return;
+  const node = loomTree.nodes.get(nodeId);
+  if (!node || node.role === "system" || node.recipe !== null) return;
   try {
-    await sendGenerate(user.text, {
-      parent_node_id: user.parent_id ?? null,
+    await sendGenerate(null, {
+      parent_node_id: node.id,
       n: opts.n ?? 1,
       recipe_override: opts.recipe_override ?? undefined,
+      generate_seat: node.role === "user" ? "assistant" : "user",
     });
   } catch (e) {
     _captureLoomError("regenerate", e);
@@ -2322,12 +2303,12 @@ export interface SamplingState {
    *  "show alts" toggle in ``SamplingStrip``; the canonical "on" value
    *  is ``8`` per Decision 1 of ``docs/plans/logit-pass.md``. */
   return_top_k: number;
-  /** Per-message role-substitution labels (roleplay scaffold).  Sticky
+  /** Native cast labels for the structural human/model seats.  Sticky
    *  client state like ``seed`` — whatever's in the boxes rides the next
-   *  send and is stamped onto that turn's loom node (immutable afterward).
-   *  Empty string = standard role label (nothing sent). */
-  user_role: string;
-  assistant_role: string;
+   *  submission and is stamped onto that turn's loom node.  The wire adapter
+   *  lowers custom values to ``user_role`` / ``assistant_role``. */
+  human_role: string;
+  model_role: string;
 }
 
 export const samplingState: SamplingState = $state({
@@ -2341,8 +2322,8 @@ export const samplingState: SamplingState = $state({
   logit_bias_text: "",
   presence_penalty: 0,
   frequency_penalty: 0,
-  user_role: "",
-  assistant_role: "",
+  human_role: "human",
+  model_role: "model",
   // Initial thinking state: explicit ``false`` so an unchecked checkbox
   // on first paint actually sends ``thinking: false`` to the server.
   // The previous ``null`` (auto) state silently fell through to whatever
@@ -2470,10 +2451,16 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
     // no-op, so we omit it too: the node isn't stamped with a redundant label
     // and the bubble keeps its structural heading.  Only a genuine override
     // (a label the user changed away from the default) is sent.
-    ...roleOverride(samplingState.user_role, sessionState.info?.default_user_role, "user_role"),
     ...roleOverride(
-      samplingState.assistant_role,
+      samplingState.human_role,
+      sessionState.info?.default_user_role,
+      "human",
+      "user_role",
+    ),
+    ...roleOverride(
+      samplingState.model_role,
       sessionState.info?.default_assistant_role,
+      "model",
       "assistant_role",
     ),
   };
@@ -2484,10 +2471,11 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
 function roleOverride(
   raw: string,
   fallback: string | null | undefined,
+  structural: "human" | "model",
   key: "user_role" | "assistant_role",
 ): Partial<WSSampling> {
   const value = raw.trim();
-  if (!value || value === fallback) return {};
+  if (!value || value === structural || value === fallback) return {};
   return { [key]: value };
 }
 
@@ -2859,8 +2847,9 @@ function adoptStreamingNode(nodeId: string | null | undefined): void {
 function handleWsMessage(msg: WSServerMessage): void {
   switch (msg.type) {
     case "tree_mutated": {
-      // Roster mutation: the frame inlines the full cast (no node ids).
-      if (msg.op === "cast" && msg.cast) {
+      // The roster is derived from every observed turn label, so any tree
+      // mutation may change it.  The server inlines the effective snapshot.
+      if (msg.cast) {
         castState.roster = msg.cast;
       }
       // Whole-tree restore can change parentage and sibling order even when
@@ -2897,14 +2886,16 @@ function handleWsMessage(msg: WSServerMessage): void {
         syncChatLogFromTree();
       }
       if (abState.processingAb && abState.pendingTurnIdx !== null) {
-        // A/B shadow run: attach a fresh assistant abPair to the steered
+        // A/B shadow run: attach a fresh same-seat abPair to the generated
         // turn that just finished.  Don't append a new top-level turn —
         // the chat panel renders the abPair in its own column.
         const steered = chatLog.turns[abState.pendingTurnIdx];
         if (steered) {
           steered.abPair = {
-            role: "assistant",
+            role: abState.pendingRole ?? steered.role,
+            roleLabel: abState.pendingRoleLabel ?? steered.roleLabel,
             text: "",
+            generated: true,
             tokens: [],
             thinkingTokens: [],
           };
@@ -3111,6 +3102,8 @@ function handleWsMessage(msg: WSServerMessage): void {
         // already did that when it finished.
         abState.processingAb = false;
         abState.pendingTurnIdx = null;
+        abState.pendingRole = null;
+        abState.pendingRoleLabel = null;
         // Drain pending actions queued during the shadow gen — same
         // gen-active gate the steered branch uses.
         void drainNextPendingAction();
@@ -3146,7 +3139,7 @@ function handleWsMessage(msg: WSServerMessage): void {
         if (
           override === "unsteered" &&
           steeredIdx !== null &&
-          chatLog.turns[steeredIdx]?.role === "assistant"
+          chatLog.turns[steeredIdx]?.generated === true
         ) {
           void _sendShadowGenerate(steeredIdx);
         } else if (
@@ -3211,6 +3204,8 @@ function handleWsMessage(msg: WSServerMessage): void {
       });
       abState.processingAb = false;
       abState.pendingTurnIdx = null;
+      abState.pendingRole = null;
+      abState.pendingRoleLabel = null;
       // Drain the next pending action even on error so the UI doesn't
       // get stuck in "changes pending" forever.  The failed send
       // already surfaced as the system message above.
@@ -3240,6 +3235,140 @@ export interface SendGenerateOpts {
   /** Loom phase 5: recipe-override modifier — mode string or partial
    *  recipe expression. */
   recipe_override?: string | null;
+}
+
+export interface SendSubmitOpts {
+  /** Explicit anchor.  The queue-only sentinel resolves against the live
+   * active node when this action reaches the head. */
+  parent_node_id?: string | null | "active@drain";
+  replaceSlot?: number | null;
+  raw?: boolean;
+  authored_thinking?: string | null;
+  steering?: string | null;
+  n?: number;
+  recipe_override?: string | null;
+}
+
+function submitLabel(
+  text: string | null,
+  authoredSeat: Seat | null,
+  generatedSeat: Seat | null,
+): string {
+  if (generatedSeat === null) return `commit ${authoredSeat ?? "turn"}`;
+  if (text === null) return `continue ${generatedSeat}`;
+  return `${authoredSeat} → ${generatedSeat}`;
+}
+
+function buildSubmitPending(
+  text: string | null,
+  authoredSeat: Seat | null,
+  generatedSeat: Seat | null,
+  opts: Omit<SendSubmitOpts, "replaceSlot">,
+): PendingAction {
+  return {
+    id: `pa-${_pendingCounter++}`,
+    label: submitLabel(text, authoredSeat, generatedSeat),
+    text,
+    apply: () => sendSubmitNow(text, authoredSeat, generatedSeat, opts),
+    awaitsGen: true,
+    rebuild: text === null
+      ? null
+      : (newText: string) =>
+          buildSubmitPending(newText, authoredSeat, generatedSeat, opts),
+    createdAt: Date.now(),
+    endsOnUserNode:
+      (generatedSeat ?? authoredSeat) === "human"
+        ? true
+        : (generatedSeat ?? authoredSeat) === "model"
+          ? false
+          : null,
+  };
+}
+
+/** Send one native human/model submission.
+ *
+ * Text is committed in ``authoredSeat``.  ``generatedSeat`` optionally
+ * follows it with a decode; omit it for commit-only.  With no text, the
+ * generated seat continues directly from the selected leaf.  No branch
+ * depends on the selected node's role.
+ */
+export async function sendSubmit(
+  text: string | null,
+  authoredSeat: Seat | null,
+  generatedSeat: Seat | null,
+  opts: SendSubmitOpts = {},
+): Promise<void> {
+  if (text !== null && text === "") return;
+  if (text !== null && authoredSeat === null) {
+    throw new Error("A text submission requires an authored seat");
+  }
+  if (text === null && generatedSeat === null) return;
+  if (isPendingBusy()) {
+    const { replaceSlot, ...queuedOpts } = opts;
+    const item = buildSubmitPending(
+      text,
+      authoredSeat,
+      generatedSeat,
+      queuedOpts,
+    );
+    enqueuePending(
+      {
+        label: item.label,
+        text: item.text,
+        apply: item.apply,
+        awaitsGen: item.awaitsGen,
+        rebuild: item.rebuild,
+        endsOnUserNode: item.endsOnUserNode,
+      },
+      { replaceSlot: replaceSlot ?? null },
+    );
+    return;
+  }
+  return sendSubmitNow(text, authoredSeat, generatedSeat, opts);
+}
+
+async function sendSubmitNow(
+  text: string | null,
+  authoredSeat: Seat | null,
+  generatedSeat: Seat | null,
+  opts: Omit<SendSubmitOpts, "replaceSlot"> = {},
+): Promise<void> {
+  if (!loomTree.loaded) {
+    await refreshLoomTree();
+    if (!loomTree.loaded) {
+      throw new Error("Conversation tree is not ready; retry after it loads");
+    }
+  }
+  const sock = await ensureWebSocket();
+  const steering =
+    opts.steering === undefined ? currentSteeringExpression() : opts.steering;
+  const sampling = buildSamplingPayload();
+  genStatus.maxTokens = sampling?.max_tokens ?? samplingState.max_tokens;
+  const requestedParent = opts.parent_node_id;
+  const parent = requestedParent === "active@drain"
+    ? loomTree.active_node_id
+    : requestedParent;
+  const payload: WSClientMessage = {
+    type: "submit",
+    text,
+    authored_seat: authoredSeat,
+    generated_seat: generatedSeat,
+    steering: steering || null,
+    sampling,
+    thinking: samplingState.thinking ?? false,
+    raw: opts.raw ?? false,
+    ...(opts.authored_thinking
+      ? { authored_thinking: opts.authored_thinking }
+      : {}),
+    ...(parent !== undefined ? { parent_node_id: parent } : {}),
+    ...(opts.n !== undefined ? { n: opts.n } : {}),
+    ...(opts.recipe_override !== undefined
+      ? { recipe_override: opts.recipe_override }
+      : {}),
+  };
+  const send = () => sock.send(JSON.stringify(payload));
+  if (sock.readyState === WebSocket.OPEN) send();
+  else sock.addEventListener("open", send, { once: true });
 }
 
 /** Build a :class:`PendingAction` for a queued chat send.  The
@@ -3643,41 +3772,48 @@ export function sendStop(): void {
 export interface AbState {
   pendingTurnIdx: number | null;
   processingAb: boolean;
+  pendingRole: "user" | "assistant" | null;
+  pendingRoleLabel: string | null;
 }
 
 export const abState: AbState = $state({
   pendingTurnIdx: null,
   processingAb: false,
+  pendingRole: null,
+  pendingRoleLabel: null,
 });
 
 /** Build the conversation as a messages list to replay through the
  * unsteered shadow.  Walks ``chatLog.turns[0..steeredIdx-1]`` (excluding
- * ``steeredIdx`` itself, which is the steered assistant response we
+ * ``steeredIdx`` itself, which is the generated response we
  * don't want the shadow to inherit), filtering out system / error turns
  * that aren't real conversation context.
  *
- * The unsteered model sees prior steered assistant turns as if they
+ * The unsteered model sees prior steered turns as if they
  * happened naturally — that's the user's "play the conversation back"
- * contract.  Only the most recent user turn (the last entry in the
- * returned list) is what the shadow generates a fresh response for.
- *
- * Returns ``null`` when the slice doesn't end on a user turn (no
- * generation possible — the chatLog must have a trailing user turn for
- * the steered response to pair against). */
+ * contract. Scene rendering permits arbitrary seat sequences, so the target
+ * turn itself—not the final history role—selects the prompt that follows. */
 function _buildShadowMessages(
   steeredIdx: number,
-): Array<{ role: "user" | "assistant"; content: string }> | null {
-  const out: Array<{ role: "user" | "assistant"; content: string }> = [];
+): Array<{
+  role: "user" | "assistant";
+  content: string;
+  label?: string | null;
+}> {
+  const out: Array<{
+    role: "user" | "assistant";
+    content: string;
+    label?: string | null;
+  }> = [];
   for (let i = 0; i < steeredIdx; i++) {
     const t = chatLog.turns[i];
     if (!t) continue;
     if (t.role !== "user" && t.role !== "assistant") continue; // skip system / errors
-    // Use the accumulated text — assistant turns already exclude their
+    // Use the accumulated text — generated turns already exclude their
     // thinking content (only response tokens land in ``turn.text``), so
     // replaying them through ``enable_thinking=False`` is well-formed.
-    out.push({ role: t.role, content: t.text ?? "" });
+    out.push({ role: t.role, content: t.text ?? "", label: t.roleLabel });
   }
-  if (out.length === 0 || out[out.length - 1].role !== "user") return null;
   return out;
 }
 
@@ -3689,18 +3825,25 @@ function _buildShadowMessages(
  * the messages list is the *only* context the unsteered model sees.
  * That makes the comparison work for any turn, not just the first. */
 async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
+  const target = chatLog.turns[steeredIdx];
+  if (!target?.generated || target.role === "system") return;
   const messages = _buildShadowMessages(steeredIdx);
-  if (messages === null) return;
   const sock = await ensureWebSocket();
   // Shadow path mirrors ``sendGenerate``'s sampling-payload build so the
   // ``return_top_k`` opt-in rides shadow / auto-regen runs too (matches
   // the steered turn's wire-shape, keeps logit captures comparable across
   // siblings).
-  const sampling = buildSamplingPayload();
+  const sampling = buildSamplingPayload() ?? {};
+  if (target.roleLabel) {
+    if (target.role === "user") sampling.user_role = target.roleLabel;
+    else sampling.assistant_role = target.roleLabel;
+  }
   // Mark the WS reception path before the request lands so the
   // ``started`` event routes into the abPair and not a fresh turn.
   abState.pendingTurnIdx = steeredIdx;
   abState.processingAb = true;
+  abState.pendingRole = target.role;
+  abState.pendingRoleLabel = target.roleLabel ?? null;
   const payload: WSClientMessage = {
     type: "generate",
     // ``input`` accepts ``Any`` server-side; a list goes straight through
@@ -3717,6 +3860,7 @@ async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
     // the conversation up to (but not including) the steered response.
     stateless: true,
     raw: false,
+    generate_seat: target.role,
   };
   const send = () => sock.send(JSON.stringify(payload));
   if (sock.readyState === WebSocket.OPEN) send();
@@ -4080,8 +4224,8 @@ export function unpinComparison(): void {
 
 // ------------------------------- node multi-select for diff ---------
 
-/** Multi-select for the cross-branch diff drawer.  Right-click on an
- *  assistant node toggles its membership; "Compare selected" opens the
+/** Multi-select for the cross-branch diff drawer.  Right-click on a
+ *  generated node toggles its membership; "Compare selected" opens the
  *  drawer with these ids.  Clears on drawer close or successful diff. */
 export const nodeSelection: { ids: string[] } = $state({ ids: [] });
 
@@ -4127,7 +4271,7 @@ export function toggleAutoRegen(): void {
   const wasOff = !autoRegenState.enabled;
   autoRegenState.enabled = !autoRegenState.enabled;
   // Off → on with the "unsteered" mode: replay the conversation through
-  // the unsteered agent for the most recent steered assistant turn that
+  // the unsteered model for the most recent generated turn that
   // doesn't already carry an ``abPair``.  Mirrors the pre-v2.3 A/B
   // toggle's retroactive-shadow behaviour, so users who flip the toggle
   // on after-the-fact see the right column populate immediately rather
@@ -4139,7 +4283,7 @@ export function toggleAutoRegen(): void {
   for (let i = chatLog.turns.length - 1; i >= 0; i--) {
     const t = chatLog.turns[i];
     if (!t) continue;
-    if (t.role !== "assistant") continue;
+    if (!t.generated || t.role === "system") continue;
     if (t.abPair) break;
     void _sendShadowGenerate(i);
     break;

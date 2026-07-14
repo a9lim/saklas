@@ -167,7 +167,8 @@ class _StubSession:
     # ----- generation entry point --------------------------------------
     def generate(self, input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: bool = False, raw: bool = False, thinking: Any = None,
-                 on_token: Any = None, parent_node_id: Any = None, n: int = 1):
+                 on_token: Any = None, parent_node_id: Any = None, n: int = 1,
+                 gen_seat: str = "assistant", recipe_override: Any = None):
         """Stub generate.
 
         Routes through the tree the same way SaklasSession does for
@@ -183,14 +184,18 @@ class _StubSession:
 
         results = []
         for sibling_idx, seed_i in enumerate(schedule):
-            # User turn (deduplicated by text — multiple siblings share one
-            # user parent).
-            user_id = self.tree.add_user_turn(
-                str(input), parent_id=parent_node_id,
-            )
-            self._active_gen_reservation = user_id
+            # Text input retains the compatibility generate contract (a user
+            # commit); ``None`` is the native bare continuation used by
+            # seat-neutral submit after it commits explicitly.
+            if input is None:
+                anchor_id = parent_node_id or self.tree.active_node_id
+            else:
+                anchor_id = self.tree.add_user_turn(
+                    str(input), parent_id=parent_node_id,
+                )
+            self._active_gen_reservation = anchor_id
 
-            assistant_id = self.tree.begin_assistant(user_id)
+            assistant_id = self.tree.begin_assistant(anchor_id, seat=gen_seat)
             try:
                 token_text = f"tok{sibling_idx}"
                 if on_token is not None:
@@ -315,7 +320,7 @@ class _StubSession:
                 "append_assistant_turn: text must be non-empty"
             )
         node = self.tree.get(user_node_id)
-        if node.role != "user":
+        if node.role != "user" and getattr(self, "scene_grammar", None) is None:
             raise InvalidNodeOperationError(
                 f"append_assistant_turn: {user_node_id!r} is a "
                 f"{node.role} node, not a user node"
@@ -342,6 +347,16 @@ class _StubSession:
             thinking_text=thinking,
         )
         return new_id
+
+    def append_turn(
+        self, parent_node_id: Any, text: Any, *, seat: Any,
+        raw: bool = False, role_label: Any = None, thinking: Any = None,
+    ):
+        from saklas.core.session import SaklasSession
+        return SaklasSession.append_turn(  # type: ignore[arg-type]
+            self, parent_node_id, text, seat=seat, raw=raw,
+            role_label=role_label, thinking=thinking,
+        )
 
     # Cast roster passthroughs — the real session methods only touch
     # ``self.tree``, so borrow them wholesale (same trick the loom
@@ -1092,6 +1107,101 @@ class TestCommit:
         assert session.tree.nodes[new_id].parent_id == root
         assert session.tree.rev > rev_before
 
+
+class TestSubmit:
+    def test_text_requires_authored_seat(self, session_and_client: Any):
+        _session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit",
+                "text": "hello",
+                "generated_seat": "model",
+            })
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["status"] == 400
+
+    def test_swapped_commit_only_can_start_with_model(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        # Seat swapping is exposed only for scene-capable renderers, where a
+        # model-authored first turn is a legal structural shape.
+        session.scene_grammar = MagicMock()
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit",
+                "text": "opening as the model",
+                "authored_seat": "model",
+            })
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    break
+                assert msg["type"] != "error", msg
+        assert msg["result"]["seat"] == "model"
+        path = session.tree.active_path()[1:]
+        assert [node.role for node in path] == ["assistant"]
+        assert path[0].recipe is None
+
+    def test_unswapped_commits_human_then_generates_model(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit",
+                "text": "hello",
+                "authored_seat": "human",
+                "generated_seat": "model",
+            })
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    break
+                assert msg["type"] != "error", msg
+        path = session.tree.active_path()[1:]
+        assert [node.role for node in path] == ["user", "assistant"]
+        assert path[0].text == "hello"
+
+    def test_swapped_commits_model_then_generates_human(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        human_id = session.tree.add_user_turn("question")
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit",
+                "text": "authored answer",
+                "authored_seat": "model",
+                "generated_seat": "human",
+                "parent_node_id": human_id,
+            })
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    break
+                assert msg["type"] != "error", msg
+        path = session.tree.active_path()[1:]
+        assert [node.role for node in path] == ["user", "assistant", "user"]
+        assert path[-2].text == "authored answer"
+
+    def test_empty_with_no_modifier_semantics_continues_generated_seat(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "submit", "generated_seat": "model"})
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    break
+                assert msg["type"] != "error", msg
+        path = session.tree.active_path()[1:]
+        assert [node.role for node in path] == ["assistant"]
+
+
+class TestCommitContinued:
     def test_commit_user_refused_under_user_node(self, session_and_client: Any):
         """Server rejects commit_role=user when the resolved parent is
         itself a user node — D15 keeps user-under-user out of the tree."""

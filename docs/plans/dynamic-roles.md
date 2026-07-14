@@ -1,6 +1,6 @@
 # Dynamic roles — the cast model
 
-*Status: **phases 1–3 landed** (2026-07-10/11). Phases 1–2: `core/scene.py`
+*Status: **unified composer + phases 1–3 landed** (2026-07-10–13). Phases 1–2: `core/scene.py`
 (autopsy + stitcher + validation, live-validated on 11 real templates) and
 the engine wiring (`scene_grammar` on the session, `build_chat_input`
 through the stitcher, `gen_seat` through generate/stream/fork/regen/
@@ -14,19 +14,26 @@ block, v1 shim, seat-general import), **committed thinking**
 (`LoomNode.thinking_text` end-to-end with commit-time capability gate),
 **per-seat stop segments** (non-assistant seats add the seat close as a
 stop string when it differs from the assistant's), **freed commit seating**
-under scene mode, and the webui: composer seat toggle + empty-send
-continue, `+ thinking` disclosure with the one-turn warning, `cast…`
-manager sheet, loom `swap seat ⇄ branch`. Session info carries
+under scene mode, and the webui. The original two-button generation-seat
+control and selected-node prefill mode were superseded by one **swap seats**
+checkbox and the native `submit` contract: explicit `authored_seat` plus
+optional `generated_seat`, named `human` / `model`. Empty always continues;
+a modifier suppresses generation only for a non-empty draft. `+ thinking`,
+the `cast…` manager, and loom `swap seat ⇄ branch` remain. The effective cast
+is auto-derived from structural and observed turn labels; the stored map
+contains configuration only. Session info carries
 `scene_mode`/`thinking_input_supported`/`strips_history_thinking`.
 Live-verified on gemma-3-4b end-to-end (cast fill + explicit clear +
 user-seat continue + seat-swap + thinking 400 + all UI affordances).
-Remaining: per-turn `Recipe.overlay` UI for member-level per-turn
-overrides, phase 4 research (seat-swap probe diffs), TUI parity.
+Result affordances (tokens, fork, regen, comparison, export) are capability-
+gated by their artifacts rather than `role == "assistant"`. Remaining:
+per-turn `Recipe.overlay` UI for member-level per-turn overrides, phase 4
+research (seat-swap probe diffs), TUI parity.
 Companion to `docs/plans/sae-pillar.md` in spirit.*
 
 ## Vision (a9)
 
-Roles become fully dynamic: "deer", "pirate", "user", "assistant" are all
+Roles become fully dynamic: "deer", "pirate", "human", "model" are all
 swappable labels, and **both the human and the model can write for any role**.
 The chat-app framing (blue human, green machine, two fixed seats) dissolves
 into a loom-native one: a transcript is a *script*, turns are lines spoken by
@@ -43,17 +50,17 @@ Two ambition-setting requirements (2026-07-10):
 
 ## The cast model
 
-A turn is `(seat, label, provenance)`:
+A turn is `(seat, label)` plus optional generation artifacts:
 
-- **seat** — the *structural* role rendered into the token stream. Stays
-  **binary** (user-side / assistant-side, plus system as stage direction) —
-  two seats is what the models' templates know how to emit. All the freedom
-  lives in sequence, label, and provenance.
+- **seat** — the *structural* Saklas role, named **human** / **model** (plus
+  system as stage direction). At renderer and compatibility-protocol
+  boundaries these lower to `user` / `assistant`, because those are what
+  model templates know how to emit.
 - **label** — arbitrary slug, what the reader (and the model) sees ("deer",
   "pirate", "user").
-- **provenance** — committed (human-typed) vs generated (model-authored).
-  Kept **derived** (recipe presence + `forced_prefix` for mixed prefill
-  nodes), not a stored field.
+- **generation artifacts** — recipe, raw token ids, scored token rows, and
+  logprobs. These expose only the operations they support; no separate
+  provenance field participates in identity or presentation.
 
 `LoomNode` already carries `(role=seat, role_label=label)`; the engine change
 is in *rendering* and in decoupling "generated" from `role == "assistant"`.

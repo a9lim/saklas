@@ -44,7 +44,7 @@
     const out: AtlasToken[] = [];
     for (let turn = 0; turn < chatLog.turns.length; turn++) {
       const t = chatLog.turns[turn];
-      if (t.role !== "assistant") continue;
+      if (!t.generated) continue;
       for (let token = 0; token < (t.tokens ?? []).length; token++) {
         const score = t.tokens![token];
         out.push({ idx: out.length, turn, token, text: score.text, score });

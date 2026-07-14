@@ -65,6 +65,28 @@ class WSGenerateMessage(NativeRequest):
     generate_seat: Literal["user", "assistant"] | None = None
 
 
+class WSSubmitMessage(NativeRequest):
+    """Native seat-neutral chat submission.
+
+    ``text`` plus ``authored_seat`` commits a turn.  ``generated_seat`` then
+    optionally asks the model to continue from it; omit it for commit-only.
+    With no text, ``generated_seat`` is a bare continue from the selected leaf.
+    """
+
+    type: Literal["submit"]
+    text: str | None = None
+    authored_seat: Literal["human", "model"] | None = None
+    generated_seat: Literal["human", "model"] | None = None
+    steering: str | None = None
+    sampling: WSSamplingParams | None = None
+    thinking: bool | None = None
+    authored_thinking: str | None = None
+    raw: bool = False
+    parent_node_id: str | None = None
+    n: int = 1
+    recipe_override: str | None = None
+
+
 def build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
     if body is None:
         return None

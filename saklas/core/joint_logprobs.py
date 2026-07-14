@@ -370,20 +370,40 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
     else:
         thinking = bool(stamped_thinking)
 
-    parent_id = node.parent_id
-    parent = tree.nodes.get(parent_id) if parent_id is not None else None
-    if parent is not None and parent.role == "user":
-        prompt_messages = tree.messages_for(parent.id)
-    else:
-        prompt_messages = tree.messages_for(node_id)
     system_prompt = session.config.system_prompt or None
-    prompt_input = build_chat_input(
-        tokenizer,
-        prompt_messages,
-        system_prompt=system_prompt,
-        thinking=thinking,
-        add_generation_prompt=True,
-    )
+    prepare_input = getattr(session, "_prepare_input", None)
+    if callable(prepare_input):
+        # Rebuild the exact prompt that opened this generated node.  Recipe
+        # presence is the capability boundary; the structural seat may be
+        # either human or model, and scene histories need not alternate.
+        prompt_input = prepare_input(
+            None,
+            thinking=thinking,
+            parent_node_id=node.parent_id,
+            user_role=node.role_label if node.role == "user" else None,
+            assistant_role=(
+                node.role_label if node.role == "assistant" else None
+            ),
+            gen_seat=node.role,
+            to_device=False,
+        )
+    else:
+        # Lightweight test/third-party sessions predating the native prompt
+        # builder retain the legacy alternating-chat reconstruction.
+        parent_id = node.parent_id
+        parent = tree.nodes.get(parent_id) if parent_id is not None else None
+        prompt_messages = (
+            tree.messages_for(parent.id)
+            if parent is not None and parent.role == "user"
+            else tree.messages_for(node_id)
+        )
+        prompt_input = build_chat_input(
+            tokenizer,
+            prompt_messages,
+            system_prompt=system_prompt,
+            thinking=thinking,
+            add_generation_prompt=True,
+        )
     prompt_ids = [int(t) for t in prompt_input[0].tolist()]
 
     response_ids, response_texts = _row_token_ids(node.tokens)
@@ -392,13 +412,30 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
     )
 
     if not response_ids:
-        full_input = build_chat_input(
-            tokenizer,
-            tree.messages_for(node_id),
-            system_prompt=system_prompt,
-            thinking=thinking,
-            add_generation_prompt=False,
-        )
+        if callable(prepare_input):
+            messages = tree.messages_for(node_id, with_labels=True)
+            has_labels = any(m.get("label") for m in messages)
+            model_type = (
+                session._resolved_model_type() if has_labels else None
+            )
+            full_input = build_chat_input(
+                tokenizer,
+                messages,
+                system_prompt=system_prompt,
+                thinking=thinking,
+                add_generation_prompt=False,
+                model_type=model_type,
+                scene=session.scene_grammar,
+                gen_seat=node.role,
+            )
+        else:
+            full_input = build_chat_input(
+                tokenizer,
+                tree.messages_for(node_id),
+                system_prompt=system_prompt,
+                thinking=thinking,
+                add_generation_prompt=False,
+            )
         full_ids = [int(t) for t in full_input[0].tolist()]
         cut = _shared_prefix_len(prompt_ids, full_ids)
         prompt_ids = full_ids[:cut]
@@ -587,7 +624,7 @@ def compute_joint_logprobs(
     a_id: str,
     b_id: str,
 ) -> JointLogprobs:
-    """Run cross-evaluation between two assistant sibling nodes.
+    """Run cross-evaluation between two generated sibling nodes.
 
     Builds each branch's prompt through the chat template, force-replays
     its stored response tokens under that node's recipe, and assembles
@@ -597,7 +634,7 @@ def compute_joint_logprobs(
 
     Raises ``KeyError`` when either node id is unknown to the tree.
     Returns an empty-rows :class:`JointLogprobs` when the branches share
-    no divergent assistant tokens (e.g. one node is empty), which is the
+    no divergent generated tokens (e.g. one node is empty), which is the
     least-surprising shape for the drawer to render.
     """
     tree = session.tree

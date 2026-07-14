@@ -26,6 +26,7 @@ from saklas.server.tree_models import (
     TreeTranscriptRequest,
     active_path_json,
     node_json,
+    cast_json,
     tree_to_json,
 )
 
@@ -165,12 +166,7 @@ def register_tree_routes(app: FastAPI) -> None:
         cheap standalone read.
         """
         resolve_session_id(session_id)
-        return {
-            "cast": {
-                label: member.to_dict()
-                for label, member in session.tree.cast.items()
-            }
-        }
+        return {"cast": cast_json(session)}
 
     @app.put("/saklas/v1/sessions/{session_id}/tree/cast/{label}")
     async def tree_cast_put(session_id: str, label: str, req: CastMemberRequest):
@@ -342,13 +338,13 @@ def register_tree_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/diff")
     def tree_diff(session_id: str, req: TreeDiffRequest):
-        """Cross-branch diff between two assistant nodes (phase 5).
+        """Cross-branch diff between two generated nodes (phase 5).
 
         Returns a JSON view of :class:`NodeDiff` (text spans + readings
         deltas) augmented with the parent-recipe steering delta and any
         per-token deltas available from the session's
         ``last_per_token_scores`` — the per-token table is only present
-        for the most-recently-generated assistant so callers shouldn't
+        for the most-recently-generated turn so callers shouldn't
         rely on it.
         """
         from saklas.core.loom_diff import per_token_diff, steering_delta
@@ -444,7 +440,7 @@ def register_tree_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/joint_logprobs")
     async def tree_joint_logprobs(session_id: str, req: JointLogprobsRequest):
-        """Cross-evaluation between two sibling assistant nodes.
+        """Cross-evaluation between two sibling generated nodes.
 
         Logit-pass Phase 5 of ``docs/plans/logit-pass.md``.  Force-replays
         each branch under the node's stamped recipe, steering hooks, probe

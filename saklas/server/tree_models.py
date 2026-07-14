@@ -68,9 +68,32 @@ class JointLogprobsRequest(NativeRequest):
     b_id: str
 
 
+def cast_json(session: SaklasSession) -> dict[str, Any]:
+    """Serialize the effective auto-derived cast with configuration origin."""
+    configured = session.tree.cast
+    out: dict[str, Any] = {}
+    for label, member in session.tree.cast_roster().items():
+        row = member.to_dict()
+        row["origin"] = (
+            "configured" if label in configured
+            else "structural" if label in ("human", "model")
+            else "observed"
+        )
+        out[label] = row
+    return out
+
+
 def tree_to_json(session: SaklasSession) -> dict[str, Any]:
     """Serialize the session's loom tree to JSON with token payloads."""
-    return session.tree.to_dict(include_tokens=True)
+    out = session.tree.to_dict(include_tokens=True)
+    out["cast"] = cast_json(session)
+    for node in out["nodes"]:
+        node["seat"] = (
+            "human" if node["role"] == "user"
+            else "model" if node["role"] == "assistant"
+            else None
+        )
+    return out
 
 
 def active_path_json(session: SaklasSession) -> dict[str, Any]:
@@ -94,5 +117,6 @@ def active_path_json(session: SaklasSession) -> dict[str, Any]:
 def node_json(session: SaklasSession, node_id: str) -> dict[str, Any]:
     node = session.tree.get(node_id)
     out = node.to_dict(include_tokens=True)
+    out["seat"] = node.seat
     out["children"] = list(session.tree.children_of.get(node_id, []))
     return out

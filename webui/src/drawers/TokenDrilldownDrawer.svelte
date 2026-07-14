@@ -305,7 +305,7 @@
     branchError = null;
     const nodeId = loomNodeId;
     if (!nodeId) {
-      branchError = "no loom assistant node is available for this token";
+      branchError = "no generated loom node is available for this token";
       return;
     }
     if (token == null || token.rawIndex == null) {

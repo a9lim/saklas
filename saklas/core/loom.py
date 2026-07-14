@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterator, Literal, cast
 
 from saklas.core.errors import SaklasError
 from saklas.core.sampling import SamplingConfig
+from saklas.core.seats import chat_role_to_seat
 
 # ---------------------------------------------------------------------------
 # ulid — tiny inline implementation
@@ -393,7 +394,13 @@ class CastMember:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CastMember":
-        _require_fields(data, _CAST_MEMBER_FIELDS, "cast member")
+        # Native effective-roster responses annotate whether the member was
+        # structural, observed, or explicitly configured.  Origin is derived
+        # and is not persisted as configuration.
+        _require_fields(
+            data, _CAST_MEMBER_FIELDS, "cast member",
+            optional=frozenset({"origin"}),
+        )
         recipe = None
         if data["recipe"] is not None:
             if not isinstance(data["recipe"], dict):
@@ -474,6 +481,13 @@ class LoomNode:
     # turns, and is persisted explicitly rather than inferred from absence.
     raw_token_ids: list[int] | None = None
 
+    @property
+    def seat(self) -> str | None:
+        """Native structural seat, independent of who authored the turn."""
+        if self.role == "system":
+            return None
+        return chat_role_to_seat(self.role)
+
     def to_dict(self, *, include_tokens: bool = False) -> dict[str, Any]:
         out: dict[str, Any] = {
             "id": self.id,
@@ -503,7 +517,10 @@ class LoomNode:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LoomNode":
         required = _NODE_FIELDS_WITH_TOKENS if "tokens" in data else _NODE_FIELDS
-        _require_fields(data, required, "loom node")
+        # Native tree responses add the derived human/model ``seat`` beside
+        # the persisted chat-protocol ``role``.  Accept it on restore, but
+        # never persist it as a second source of truth.
+        _require_fields(data, required, "loom node", optional=frozenset({"seat"}))
         recipe = None
         if data["recipe"] is not None:
             if not isinstance(data["recipe"], dict):
@@ -511,6 +528,16 @@ class LoomNode:
             recipe = Recipe.from_dict(data["recipe"])
         if data["role"] not in ("user", "assistant", "system"):
             raise LoomTreeError(f"invalid loom node role {data['role']!r}")
+        expected_seat = (
+            "human" if data["role"] == "user"
+            else "model" if data["role"] == "assistant"
+            else None
+        )
+        if "seat" in data and data["seat"] != expected_seat:
+            raise LoomTreeError(
+                f"loom node seat {data['seat']!r} disagrees with role "
+                f"{data['role']!r}"
+            )
         if not isinstance(data["id"], str) or not data["id"]:
             raise LoomTreeError("loom node field 'id' must be a non-empty string")
         if data["parent_id"] is not None and not isinstance(data["parent_id"], str):
@@ -806,6 +833,29 @@ class LoomTree:
     def active_path(self) -> list[LoomNode]:
         """Path from the root to :attr:`active_node_id`."""
         return self.path_to(self.active_node_id)
+
+    def cast_roster(self) -> dict[str, CastMember]:
+        """Return the configured cast plus every role observed in the tree.
+
+        ``human`` and ``model`` are structural defaults and therefore always
+        exist.  Per-turn labels join the roster automatically across the whole
+        loom (not merely the active path), so navigation cannot make speakers
+        flicker in and out.  Explicit members win because they may carry a
+        standing recipe or notes.
+        """
+        with self._lock:
+            roster: dict[str, CastMember] = {
+                "human": CastMember(),
+                "model": CastMember(),
+            }
+            for node in self.nodes.values():
+                if node.role == "system":
+                    continue
+                label = node.role_label or node.seat
+                if label:
+                    roster.setdefault(label, CastMember())
+            roster.update(self.cast)
+            return roster
 
     def messages_for(
         self,
@@ -1125,6 +1175,10 @@ class LoomTree:
                 parent_id=sibling.parent_id,
                 role=role if role is not None else sibling.role,
                 text=text,
+                role_label=sibling.role_label,
+                thinking_text=(
+                    sibling.thinking_text if text == sibling.text else None
+                ),
             )
             self._add_child(sibling.parent_id, new)
             if make_active:
@@ -1310,11 +1364,12 @@ class LoomTree:
             path = self.active_path()
             if len(path) < 2:
                 return  # nothing meaningful to rewind from
-            # Walk back: if active is assistant, go up two (assistant -> user -> parent).
-            # If active is user, go up one (user -> parent).  Land on root in
-            # the worst case.
+            # Walk back one whole submission when the active node carries a
+            # generation receipt, otherwise one committed turn.  Seat is
+            # identity, not provenance: swapped model→human submissions rewind
+            # exactly like human→model ones.
             anchor = path[-1]
-            steps = 2 if anchor.role == "assistant" else 1
+            steps = 2 if anchor.recipe is not None else 1
             target_idx = max(0, len(path) - 1 - steps)
             target = path[target_idx]
             if target.id == self.active_node_id:
@@ -1454,6 +1509,13 @@ class LoomTree:
         for label, raw in raw_cast.items():
             if not isinstance(label, str) or not isinstance(raw, dict):
                 raise LoomTreeError("cast must map string labels to member objects")
+            origin = raw.get("origin")
+            if origin is not None and origin not in (
+                "structural", "observed", "configured",
+            ):
+                raise LoomTreeError(f"invalid cast member origin {origin!r}")
+            if origin in ("structural", "observed"):
+                continue
             _validate_role(label)
             tree.cast[label] = CastMember.from_dict(raw)
         tree._validate_structure()

@@ -1,6 +1,6 @@
 <script lang="ts">
   // Chat panel — v1.7 rewrite.  Replaces the v1.6 ChatPlaceholder/legacy
-  // shape with the full feature set: thinking-collapsible per assistant
+  // shape with the full feature set: thinking-collapsible per turn
   // turn, per-token tinted spans driven by a top-bar highlight dropdown,
   // optional compare-two stripe overlay, click-token drilldown, send /
   // stop, and an A/B split-view container.
@@ -13,8 +13,8 @@
   // Turn surface follows the CAST MODEL (docs/plans/dynamic-roles.md):
   // every speaker gets one neutral glass card — roles aren't a "space",
   // so they carry no hue — with identity in the role chip (glyph letter +
-  // label, arbitrary strings first-class) and provenance as the ppl badge
-  // generated turns carry. System turns render as stage directions (a
+  // label, arbitrary strings first-class). Analysis badges appear only when
+  // their backing artifacts exist. System turns render as stage directions (a
   // note about the scene, not a speaker). The ``speaking as`` chips in
   // the composer are the promoted SamplingStrip role boxes — same client
   // state, same wire block.
@@ -40,7 +40,7 @@
     toggleCompareTwo,
     unpinComparison,
     probeRack,
-    sendGenerate,
+    sendSubmit,
     sendStop,
     genStatus,
     openDrawer,
@@ -50,13 +50,10 @@
     navigateInputHistory,
     cancelInputPull,
     consumePulledSlot,
-    rewindSession,
-    sendPrefill,
-    sendCommit,
+    loomRegenerateActive,
     enqueuePending,
     pendingActions,
     cancelPendingAction,
-    predictedQueueEndOnUserNode,
     isPendingBusy,
     toggleAutoRegen,
     setAutoRegenMode,
@@ -96,8 +93,9 @@
   //
   // The ``speaking as`` / ``reply as`` chips — the SamplingStrip role
   // boxes promoted into the composer (the visible step toward the cast
-  // model).  Same client state (``samplingState.user_role`` /
-  // ``assistant_role``), same wire block, same support gates: base /
+  // model).  Same client state (``samplingState.human_role`` /
+  // ``model_role``), lowered to protocol role labels at the wire boundary.
+  // Same support gates: base /
   // completion models and label-free families (Mistral / talkie) can't
   // relabel turns, raw mode has no roles.
   const CAST_SLUG_RE = /^[a-z0-9._-]+$/;
@@ -113,12 +111,12 @@
       sessionState.info?.role_substitution_supported === true,
   );
   const castUserValid = $derived(
-    samplingState.user_role.trim() === "" ||
-      CAST_SLUG_RE.test(samplingState.user_role.trim()),
+    samplingState.human_role.trim() === "" ||
+      CAST_SLUG_RE.test(samplingState.human_role.trim()),
   );
   const castAsstValid = $derived(
-    samplingState.assistant_role.trim() === "" ||
-      CAST_SLUG_RE.test(samplingState.assistant_role.trim()),
+    samplingState.model_role.trim() === "" ||
+      CAST_SLUG_RE.test(samplingState.model_role.trim()),
   );
 
   /** Auto-grow the textarea between 1 and 6 rows (≈ 132px at 13px line-h).
@@ -149,19 +147,11 @@
     autosize();
   });
 
-  // --- Role-aware input -------------------------------------------------
-  // The selected loom node's role decides what the input box composes.
-  // On an assistant / root node you write the next *user* message (the
-  // normal chat flow).  On a *user* node the turn below it is the
-  // assistant's — so the input composes the assistant reply instead:
-  //   text  + send → answer-prefill — seed the reply with that text
-  //   empty        → no-op (send button is grayed, mirroring an
-  //                  assistant node).  Re-rolling / fanning a user node
-  //                  lives on the loom sidebar's regenerate / fan-out
-  //                  menu and the dedicated regen button, not here.
-  // Raw (flat completion) mode — base models, or an explicit override.
-  // In raw mode the role-aware commit derivations short-circuit: there
-  // are no roles, so the input box never enters prefill / commit mode.
+  // --- Unified submission -----------------------------------------------
+  // The composer has exactly two states: ordinary and swapped.  Selection
+  // chooses the branch anchor only; it never changes what the box means.
+  // Prefill remains an explicit loom/node tool rather than an implicit
+  // consequence of focusing a human-seat node.
   const rawMode = $derived.by(() => {
     void genUiMode.mode;
     return effectiveRawMode();
@@ -170,46 +160,23 @@
   const activeNodeId = $derived(
     loomTree.loaded ? (loomTree.active_node_id ?? null) : null,
   );
-  const activeNode = $derived(
-    activeNodeId ? (loomTree.nodes.get(activeNodeId) ?? null) : null,
-  );
-  const liveOnUserNode = $derived(!rawMode && activeNode?.role === "user");
-  // Queue-aware role: a queued ``commit user`` lands a user node before
-  // this submission gets to run, so the next message should already be
-  // in prefill / commit-assistant mode.  Walks the queue tail-first;
-  // falls back to the live active node when nothing in the queue
-  // changes the role.  ``pendingActions.queue.length`` is touched so
-  // the derived re-runs on queue mutations.
-  const onUserNode = $derived.by(() => {
-    if (rawMode) return false;
-    void pendingActions.queue.length;
-    const predicted = predictedQueueEndOnUserNode();
-    return predicted === null ? liveOnUserNode : predicted;
-  });
-
-  // ---------------------------------------------------------- cast seats --
-  //
-  // Scene mode (the validated stitcher grammar) frees the seat the model
-  // generates into: the seat toggle picks it, and an empty send becomes
-  // an explicit *continue* (``input: null`` — no committed turn, the
-  // model speaks next from the leaf: the a/a and u-continue shapes).
-  // Continue is deliberately NOT offered on a user-node leaf with the
-  // assistant seat — that shape is regen, which lives on the loom
-  // sidebar, not the input bar.
   const sceneMode = $derived(sessionState.info?.scene_mode ?? false);
-  let genSeat = $state<"assistant" | "user">("assistant");
+  let swapSeats = $state(false);
   $effect(() => {
-    // Fallback families have no seat freedom — snap the toggle back.
-    if (!sceneMode && genSeat !== "assistant") genSeat = "assistant";
+    // A non-scene renderer cannot open a generation prompt on the human
+    // seat.  Keep that compatibility boundary localized to the checkbox.
+    if ((!sceneMode || rawMode) && swapSeats) swapSeats = false;
   });
-  const userSeatActive = $derived(sceneMode && genSeat === "user");
-  const canContinue = $derived(
-    sceneMode &&
-      !genStatus.active &&
-      input.trim() === "" &&
-      loomTree.loaded &&
-      (userSeatActive || !onUserNode),
+  const authoredSeat = $derived<"human" | "model">(
+    swapSeats ? "model" : "human",
   );
+  const generatedSeat = $derived<"human" | "model">(
+    swapSeats ? "human" : "model",
+  );
+  const humanLabel = $derived(samplingState.human_role.trim() || "human");
+  const modelLabel = $derived(samplingState.model_role.trim() || "model");
+  const authoredLabel = $derived(authoredSeat === "human" ? humanLabel : modelLabel);
+  const generatedLabel = $derived(generatedSeat === "human" ? humanLabel : modelLabel);
 
   // Committed-thinking input: a block the next *commit* (⌃⏎) carries,
   // rendered through the family think delimiters.  Strip families keep
@@ -225,200 +192,66 @@
   let thinkingDraft = $state("");
 
   // --- Commit modifier (Ctrl / Cmd / Option) ----------------------------
-  // Any of Ctrl, Cmd (⌘), or Option (⌥) held flips the input into
-  // "commit" mode: the typed text lands as the next turn but no
-  // generation runs.  On an assistant/root node, that turn is a new user
-  // node; on a user node, it's an authored assistant turn (the full
-  // reply, not a prefilled seed).  Tracked at the window level so the
+  // Any of Ctrl, Cmd (⌘), or Option (⌥) commits a non-empty draft without
+  // generation.  Empty input always continues the generated seat; the
+  // modifier is deliberately irrelevant when there is nothing to commit.
+  // Tracked at the window level so the
   // state survives textarea blur and we can swap the send-button caption
   // the moment the modifier comes down — without needing the user to
   // type anything first.
   let modHeld = $state(false);
-  /** True whenever the modifier is held, regardless of input content —
-   *  so the label flips and gives the user visual confirmation that the
-   *  modifier registered.  The button's disabled gate (below) still
-   *  refuses to submit an empty commit. */
-  const commitMode = $derived(modHeld);
-  /** Empty input in commit mode is a no-op (we can't commit nothing).
-   *  Used by both the disabled gate and tryCommit's early return. */
-  const canCommit = $derived(commitMode && input.trim() !== "");
+  const hasText = $derived(input.trim() !== "");
+  const commitMode = $derived(modHeld && hasText);
 
   /** Keep the composer prompt to the active action; shortcuts live in help. */
   const inputPlaceholder = $derived(
     commitMode
-      ? (onUserNode
-          ? "commit assistant…"
-          : "commit user…")
-      : userSeatActive
-        ? "user seat…"
-        : (onUserNode
-            ? "prefill…"
-            : "message…"),
+      ? `commit ${authoredLabel}…`
+      : `message as ${authoredLabel}…`,
   );
-  /** Send-button caption tracks the role-aware action; any held commit
-   *  modifier overrides both prefill and send with a "commit" register.
-   *  In scene mode an empty draft reads "continue" — the explicit
-   *  ``input: null`` no-committed-turn generation. */
   const sendLabel = $derived(
     commitMode
-      ? (onUserNode ? "commit assistant" : "commit user")
-      : userSeatActive
-        ? (input.trim() ? "send ⇢ user" : "continue ⇢ user")
-        : canContinue && !input.trim()
-          ? "continue"
-          : (onUserNode ? "prefill" : "send"),
+      ? `commit ${authoredLabel}`
+      : hasText
+        ? `send → ${generatedLabel}`
+        : `continue → ${generatedLabel}`,
   );
 
-  /** Shared commit dispatch — used by both Ctrl/Cmd/Option+Enter and a
-   *  modified-click on the send button.  Returns true when it claimed
-   *  the action (including the empty-input no-op), so the caller knows
-   *  not to fall through to the normal send/prefill path: the modifier
-   *  explicitly means "don't generate," so an empty commit silently
-   *  consumes rather than falling through. */
-  function tryCommit(): boolean {
+  function doSend(commit: boolean = false): void {
     const text = input.trim();
-    // Forward the pulled slot (if any) so a re-edited queued commit
-    // lands at its original position rather than appending to the
-    // tail.  ``consumePulledSlot`` clears the pull state in one call.
     const replaceSlot = consumePulledSlot();
     if (!text) {
-      // Empty commit on a pulled slot is the cancel gesture — drop
-      // the slot from the queue.
-      if (replaceSlot !== null) {
-        cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
-      }
-      return true;  // consumed
-    }
-    // When the queue holds an action that flips the active role (e.g. a
-    // queued ``commit user`` puts us in predicted-prefill mode), the
-    // live ``activeNodeId`` doesn't yet point at the parent the new
-    // commit should hang under.  Pass the ``"active@drain"`` sentinel
-    // so the pending action resolves the parent at drain time — by
-    // which point the earlier queue items have landed the right node.
-    const parent = isPendingBusy()
-      ? ("active@drain" as const)
-      : activeNodeId;
-    // A drafted thinking block rides this commit (the only surface that
-    // carries one) and is consumed by it — one block, one turn.
-    const thinking = thinkingDraft.trim() !== "" ? thinkingDraft : null;
-    if (thinking !== null) {
-      thinkingDraft = "";
-      thinkingOpen = false;
-    }
-    if (onUserNode) {
-      if (!parent) return true;
-      pushInputHistory(text);
-      input = "";
-      void sendCommit("assistant", parent, text, { replaceSlot, thinking });
-    } else {
-      // Active node is root/assistant.  Pass it as the parent so the
-      // server anchors the new user node under it (active-node fall-
-      // through would do the same, but explicit avoids races with any
-      // mid-flight active-node swap).
-      pushInputHistory(text);
-      input = "";
-      void sendCommit("user", parent, text, { replaceSlot, thinking });
-    }
-    scrolledUp = false;
-    queueScrollToBottom();
-    queueMicrotask(autosize);
-    return true;
-  }
-
-  function doSend(commit: boolean = false): void {
-    // Modifier-held path: commit the text as the next turn without
-    // running a decode.  tryCommit always consumes the action when
-    // commit is true — empty input no-ops silently.
-    if (commit && tryCommit()) return;
-    // User-seat path (scene mode): the model speaks the user seat.
-    // Text commits as a user turn first (the engine's input-string
-    // contract), so this covers u/u; empty is the explicit continue.
-    // Bypasses prefill mode entirely — prefill seeds an assistant
-    // reply, which isn't what this seat means.
-    if (userSeatActive) {
-      const text = input.trim();
-      const replaceSlot = consumePulledSlot();
-      if (!text) {
-        if (replaceSlot !== null) {
-          cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
-          return;
-        }
-        if (!canContinue) return;
-        void sendGenerate(null, { generate_seat: "user" });
-      } else {
-        pushInputHistory(text);
-        input = "";
-        void sendGenerate(text, { replaceSlot, generate_seat: "user" });
-      }
-      scrolledUp = false;
-      queueScrollToBottom();
-      queueMicrotask(autosize);
-      return;
-    }
-    // Empty-draft continue (scene mode, assistant seat): generate with
-    // no committed turn from the current leaf — the a/a shape.  Only
-    // offered off user-node leaves (that shape is regen — sidebar).
-    if (!input.trim() && canContinue && !onUserNode) {
-      const replaceSlot = consumePulledSlot();
       if (replaceSlot !== null) {
         cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
         return;
       }
-      void sendGenerate(null, {});
-      scrolledUp = false;
-      queueScrollToBottom();
-      return;
     }
-    // Role-aware branch: on a user node the input seeds the assistant
-    // reply rather than appending a new user turn.
-    if (onUserNode && (activeNodeId || isPendingBusy())) {
-      // Keep the raw value — a trailing space in a prefill is meaningful
-      // (it decides whether the continuation starts a fresh word).
-      const raw = input;
-      const trimmed = raw.trim();
-      const replaceSlot = consumePulledSlot();
+    const parent = isPendingBusy()
+      ? ("active@drain" as const)
+      : activeNodeId;
+    const thinking = text && thinkingDraft.trim() !== "" ? thinkingDraft : null;
+    if (thinking !== null) {
+      thinkingDraft = "";
+      thinkingOpen = false;
+    }
+    if (text) {
+      pushInputHistory(text);
       input = "";
-      // Deferred resolution when busy (see tryCommit for the rationale).
-      const target = isPendingBusy()
-        ? ("active@drain" as const)
-        : activeNodeId!;
-      if (trimmed) {
-        pushInputHistory(trimmed);
-        void sendPrefill(target, raw, { replaceSlot });
-      } else if (replaceSlot !== null) {
-        // Empty prefill on a pulled slot cancels the queued item.
-        cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
-      }
-      // Empty + not pulled → no-op.  The send button is grayed in this
-      // state (mirroring an assistant node); re-rolling the assistant
-      // for a selected user node lives on the loom sidebar's regenerate /
-      // fan-out menu, so the input bar no longer doubles as a regen.
-      scrolledUp = false;
-      queueScrollToBottom();
-      queueMicrotask(autosize);
-      return;
     }
-    const text = input.trim();
-    const replaceSlot = consumePulledSlot();
-    if (!text) {
-      // Empty send on a pulled slot cancels the queued item; otherwise
-      // a no-op.
-      if (replaceSlot !== null) {
-        cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
-      }
-      return;
-    }
-    // Push to ↑/↓ recall before clearing — covers both chat messages
-    // and slash commands (every line typed in here is recallable).
-    pushInputHistory(text);
-    input = "";
-    // Defer the actual send so the textarea clears before the WS round-
-    // trip — feels less like the UI froze.
-    void sendGenerate(text, { replaceSlot });
-    // Force-scroll to bottom on send regardless of where the user was.
+    const commitOnly = commit && text !== "";
+    void sendSubmit(
+      text || null,
+      text ? authoredSeat : null,
+      commitOnly ? null : generatedSeat,
+      {
+        parent_node_id: parent,
+        replaceSlot,
+        raw: rawMode,
+        authored_thinking: thinking,
+      },
+    );
     scrolledUp = false;
     queueScrollToBottom();
-    // Snap textarea height back.
     queueMicrotask(autosize);
   }
 
@@ -588,8 +421,7 @@
   // clear / regen / transcript / auto-regen used to live on the Topbar;
   // they act on the conversation, so they belong here.  The mutating
   // ones route through ``enqueuePending`` so clicking them mid-gen
-  // queues rather than racing the WS.  (regen still rewinds internally —
-  // the standalone "rewind" button was vestigial and was removed.)
+  // queues rather than racing the WS.
 
   const AUTO_REGEN_MODES: { value: AutoRegenMode; label: string }[] = [
     { value: "unsteered", label: "unsteered" },
@@ -600,43 +432,26 @@
     { value: "custom", label: "custom…" },
   ];
 
-  /** Last user input — used by regen to re-issue the message. */
-  function lastUserInput(): string | null {
-    for (let i = chatLog.turns.length - 1; i >= 0; i--) {
-      if (chatLog.turns[i].role === "user") return chatLog.turns[i].text;
-    }
-    return null;
-  }
-
-  /** Rewind one user→assistant pair then re-send the captured input —
-   * without the rewind the new gen lands as an appended duplicate. */
-  async function regen(input: string): Promise<void> {
-    await rewindSession();
-    void sendGenerate(input);
-  }
-
   function regenAction(): void {
-    // Capture the input now — a queued action fires later, by which point
-    // the local log may have shifted.
-    const input = lastUserInput();
-    if (input === null) return;
+    if (!canRegen) return;
     if (genStatus.active || pendingActions.queue.length > 0) {
       enqueuePending({
         label: "regen",
         text: null,
-        apply: () => void regen(input),
+        apply: () => void loomRegenerateActive(1),
         awaitsGen: true,
         rebuild: null,
-        // Regen rewinds to the user node then sends — lands a new
-        // assistant sibling, so the post-drain active is assistant.
-        endsOnUserNode: false,
+        endsOnUserNode: null,
       });
     } else {
-      void regen(input);
+      void loomRegenerateActive(1);
     }
   }
 
-  const canRegen = $derived(lastUserInput() !== null);
+  const canRegen = $derived.by(() => {
+    const id = loomTree.active_node_id;
+    return id ? (loomTree.nodes.get(id)?.recipe != null) : false;
+  });
 
   function openTranscript(): void {
     openDrawer("transcript");
@@ -687,7 +502,9 @@
         out.push({
           role: node.role,
           text: node.text ?? "",
+          roleLabel: node.role_label,
           nodeId: node.id,
+          generated: node.recipe !== null,
           appliedSteering: node.applied_steering ?? null,
           aggregateReadings: node.aggregate_readings ?? undefined,
           finishReason: node.finish_reason ?? undefined,
@@ -1162,7 +979,7 @@
             {/each}
           {:else}
             {#each chatLog.turns as turn, turnIdx (turnIdx)}
-              {#if turn.role === "user" || turn.role === "system"}
+              {#if !turn.generated || turn.role === "system"}
                 {@render bubble(turn, turnIdx, false)}
               {:else if turn.abPair}
                 {@render bubble(turn.abPair, turnIdx, true)}
@@ -1170,8 +987,8 @@
                 <div class="msg placeholder" aria-hidden="true">
                   <div class="who">
                     <span class="role-chip">
-                      <b>{roleGlyphLetter("assistant")}</b>
-                      {roleDisplayLabel("assistant")}
+                      <b>{roleGlyphLetter(turn.role, turn.roleLabel)}</b>
+                      {roleDisplayLabel(turn.role, turn.roleLabel)}
                     </span>
                     <span class="who-meta">(alt)</span>
                   </div>
@@ -1204,11 +1021,12 @@
       <input
         class="cast-input"
         class:invalid={!castUserValid}
-        bind:value={samplingState.user_role}
+        bind:value={samplingState.human_role}
         disabled={!castReady || !castUserSupported}
-        placeholder="user"
+        placeholder="human"
         spellcheck="false"
-        aria-label="user role label"
+        aria-label="human role label"
+        list="cast-roster-labels"
       />
     </label>
     <label
@@ -1221,38 +1039,27 @@
       <input
         class="cast-input"
         class:invalid={!castAsstValid}
-        bind:value={samplingState.assistant_role}
+        bind:value={samplingState.model_role}
         disabled={!castReady || !castAsstSupported}
         placeholder={roleDisplayLabel("assistant")}
         spellcheck="false"
-        aria-label="assistant role label"
+        aria-label="model role label"
         list="cast-roster-labels"
       />
     </label>
-    {#if sceneMode}
-      <div
-        class="seat-toggle"
-        role="radiogroup"
-        aria-label="generation seat"
-        title="generation seat"
-      >
-        <span class="cast-label">seat</span>
-        <button
-          type="button"
-          class="seat"
-          class:active={genSeat === "assistant"}
-          aria-pressed={genSeat === "assistant"}
-          onclick={() => (genSeat = "assistant")}
-        >assistant</button>
-        <button
-          type="button"
-          class="seat"
-          class:active={genSeat === "user"}
-          aria-pressed={genSeat === "user"}
-          onclick={() => (genSeat = "user")}
-        >user</button>
-      </div>
-    {/if}
+    <div
+      class="seat-toggle"
+      title={sceneMode && !rawMode
+        ? "swap who writes and who replies"
+        : "seat swapping requires scene mode"}
+    >
+      <Checkbox
+        bind:checked={swapSeats}
+        disabled={!sceneMode || rawMode}
+        label="swap seats"
+        ariaLabel="swap human and model seats"
+      />
+    </div>
     <button
       type="button"
       class="cast-manage"
@@ -1297,26 +1104,19 @@
   <form class="input-row" onsubmit={(ev) => { ev.preventDefault(); doSend(modHeld); }}>
     <textarea
       class="input"
-      class:prefill-mode={onUserNode}
       bind:this={textareaRef}
       bind:value={input}
       onkeydown={onKeydown}
       placeholder={inputPlaceholder}
       rows="1"
-      aria-label={onUserNode ? "Assistant prefill input" : "Chat input"}
+      aria-label={`Compose as ${authoredLabel}`}
     ></textarea>
     <div class="input-actions">
       <button
         type="submit"
         class="send"
-        disabled={!input.trim() && !canContinue}
-        title={userSeatActive
-          ? "⏎ user seat"
-          : onUserNode
-            ? "⏎ prefill"
-            : canContinue && !input.trim()
-              ? "⏎ continue"
-              : "⏎ send"}
+        disabled={!loomTree.loaded}
+        title={commitMode ? "modifier + ⏎ commit" : "⏎ submit"}
       >{sendLabel}</button>
       <button
         type="button"
@@ -1356,7 +1156,7 @@
         {roleDisplayLabel(turn.role, turn.roleLabel)}
       </span>
       {#if isShadow && !pinnedActive}<span class="who-meta">(unsteered)</span>{/if}
-      {#if turn.role === "assistant" && turn.meanLogprob != null && Number.isFinite(turn.meanLogprob)}
+      {#if turn.meanLogprob != null && Number.isFinite(turn.meanLogprob)}
         <span
           class="prov"
           title="sequence perplexity"
@@ -1364,74 +1164,66 @@
       {/if}
     </div>
 
-    {#if turn.role === "assistant"}
-      {#if (turn.thinkingTokens?.length ?? 0) > 0 || turn.thinking}
-        <div class="thinking-block" class:collapsed={turnCollapsed(turnIdx, turn)}>
-          <button
-            type="button"
-            class="thinking-toggle"
-            onclick={() => toggleThinking(turnIdx)}
-            aria-expanded={!turnCollapsed(turnIdx, turn)}
-          >
-            <span class="caret">{turnCollapsed(turnIdx, turn) ? "▶" : "▼"}</span>
-            <span>thinking{turnCollapsed(turnIdx, turn) ? "…" : ""}</span>
-          </button>
-          {#if !turnCollapsed(turnIdx, turn)}
-            <div class="thinking-body">
-              {#if (turn.thinkingTokens?.length ?? 0) > 0}
-                {#each turn.thinkingTokens ?? [] as tok, tokenIdx (tokenIdx)}
-                  <span
-                    class="tok"
-                    class:tinted={highlightState.target !== null}
-                    style={styleString(tokenStyle(tok))}
-                    title={tooltipFor(tok)}
-                    onclick={(ev) => tokenClicked(turnIdx, tokenIdx, ev, true)}
-                    onkeydown={(ev) => {
-                      if (ev.key === "Enter" || ev.key === " ") {
-                        ev.preventDefault();
-                        ev.stopPropagation();
-                        openDrawer("token_drilldown", { turnIdx, tokenIdx, isThinking: true });
-                      }
-                    }}
-                    role="button"
-                    tabindex="-1"
-                  >{tok.text}</span>
-                {/each}
-              {:else}
-                <span class="plain">{turn.text ?? ""}</span>
-              {/if}
-            </div>
-          {/if}
-        </div>
-      {/if}
-
-      <div class="response-body">
-        {#if (turn.tokens?.length ?? 0) > 0}
-          {#each visibleResponseTokens(turn.tokens ?? []) as { tok, originalIdx } (originalIdx)}
-            <span
-              class="tok"
-              class:tinted={highlightState.target !== null}
-              style={styleString(tokenStyle(tok))}
-              title={tooltipFor(tok)}
-              onclick={(ev) => tokenClicked(turnIdx, originalIdx, ev, false)}
-              onkeydown={(ev) => {
-                if (ev.key === "Enter" || ev.key === " ") {
-                  ev.preventDefault();
-                  ev.stopPropagation();
-                  openDrawer("token_drilldown", { turnIdx, tokenIdx: originalIdx });
-                }
-              }}
-              role="button"
-              tabindex="-1"
-            >{tok.text}</span>
-          {/each}
-        {:else}
-          <span class="plain">{plainResponseText(turn)}</span>
+    {#if (turn.thinkingTokens?.length ?? 0) > 0 || turn.thinking}
+      <div class="thinking-block" class:collapsed={turnCollapsed(turnIdx, turn)}>
+        <button
+          type="button"
+          class="thinking-toggle"
+          onclick={() => toggleThinking(turnIdx)}
+          aria-expanded={!turnCollapsed(turnIdx, turn)}
+        >
+          <span class="caret">{turnCollapsed(turnIdx, turn) ? "▶" : "▼"}</span>
+          <span>thinking{turnCollapsed(turnIdx, turn) ? "…" : ""}</span>
+        </button>
+        {#if !turnCollapsed(turnIdx, turn)}
+          <div class="thinking-body">
+            {#each turn.thinkingTokens ?? [] as tok, tokenIdx (tokenIdx)}
+              <span
+                class="tok"
+                class:tinted={highlightState.target !== null}
+                style={styleString(tokenStyle(tok))}
+                title={tooltipFor(tok)}
+                onclick={(ev) => tokenClicked(turnIdx, tokenIdx, ev, true)}
+                onkeydown={(ev) => {
+                  if (ev.key === "Enter" || ev.key === " ") {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    openDrawer("token_drilldown", { turnIdx, tokenIdx, isThinking: true });
+                  }
+                }}
+                role="button"
+                tabindex="-1"
+              >{tok.text}</span>
+            {/each}
+          </div>
         {/if}
       </div>
-    {:else}
-      <div class="response-body"><span class="plain">{turn.text}</span></div>
     {/if}
+
+    <div class="response-body">
+      {#if (turn.tokens?.length ?? 0) > 0}
+        {#each visibleResponseTokens(turn.tokens ?? []) as { tok, originalIdx } (originalIdx)}
+          <span
+            class="tok"
+            class:tinted={highlightState.target !== null}
+            style={styleString(tokenStyle(tok))}
+            title={tooltipFor(tok)}
+            onclick={(ev) => tokenClicked(turnIdx, originalIdx, ev, false)}
+            onkeydown={(ev) => {
+              if (ev.key === "Enter" || ev.key === " ") {
+                ev.preventDefault();
+                ev.stopPropagation();
+                openDrawer("token_drilldown", { turnIdx, tokenIdx: originalIdx });
+              }
+            }}
+            role="button"
+            tabindex="-1"
+          >{tok.text}</span>
+        {/each}
+      {:else}
+        <span class="plain">{plainResponseText(turn)}</span>
+      {/if}
+    </div>
   </div>
   {/if}
 {/snippet}
@@ -1616,9 +1408,9 @@
     color: var(--accent-red);
     background: color-mix(in srgb, var(--accent-red) 12%, transparent);
   }
-  /* The cast model: every speaker wears ONE neutral glass card — role
-   * identity lives in the chip, provenance in the ppl badge, and hue
-   * stays reserved for spaces and states.  Borderless: the glass fill +
+  /* Every speaker wears ONE neutral glass card — role identity lives in
+   * the chip, while optional analysis artifacts live beside it. Hue stays
+   * reserved for spaces and states.  Borderless: the glass fill +
    * top-light are the card; the border slot exists only so the A/B
    * shadow column can wear its violet-tinted hairline (a comparison
    * marker — state, not chrome). */
@@ -1822,26 +1614,6 @@
     align-items: center;
     gap: var(--space-2);
   }
-  .seat {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: var(--radius-pill);
-    font-family: var(--font-mono);
-    font-size: var(--text-2xs);
-    padding: 2px var(--space-3);
-    cursor: pointer;
-    transition:
-      background var(--dur-fast) var(--ease-out),
-      color var(--dur-fast) var(--ease-out);
-  }
-  .seat:hover {
-    color: var(--fg);
-  }
-  .seat.active {
-    background: var(--glass-strong);
-    color: var(--fg-strong);
-  }
   .cast-manage {
     margin-left: auto;
     background: none;
@@ -1943,16 +1715,6 @@
   }
   .input:focus {
     outline: none;
-    border-color: var(--accent);
-  }
-  /* Prefill mode: the active loom node is a user turn, so this box
-     composes the assistant reply.  Tint the border to signal the role
-     shift before the user starts typing. */
-  .input.prefill-mode {
-    border-color: var(--accent);
-    background: rgba(167, 139, 250, 0.06);
-  }
-  .input.prefill-mode:focus {
     border-color: var(--accent);
   }
   .input-actions {

@@ -3,9 +3,9 @@
   // named labels, each with a standing steering recipe.  A member's
   // recipe is the *weakest* tier at generation: it fills only fields
   // the send left unset, so the rack and per-send controls always win.
-  // The roster rides tree save / transcript v2; mutations land via the
-  // REST cast routes and reconcile through the ``op="cast"``
-  // ``tree_mutated`` frame (the server inlines the roster).
+  // Identity is auto-derived from labels observed anywhere in the tree;
+  // configuration adds only a standing recipe/notes layer.  Mutations and
+  // new observed labels reconcile through the inlined effective roster.
   //
   // A steering surface, not a chat feature: labels here are the same
   // slugs the composer's "speaking as" / "reply as" chips take, and a
@@ -81,9 +81,6 @@
   async function remove(slug: string): Promise<void> {
     try {
       await apiTree.castDelete(slug);
-      const next = { ...castState.roster };
-      delete next[slug];
-      castState.roster = next;
       if (editing === slug) clearForm();
     } catch (e) {
       pushToast(
@@ -103,7 +100,7 @@
   </header>
 
   <div class="body">
-    <p class="hint">saved with conversation · rack/send override</p>
+    <p class="hint">roles appear from conversation history · recipes are saved</p>
 
     {#if roster.length === 0}
       <p class="empty">none</p>
@@ -128,13 +125,15 @@
                 {/if}
               </span>
             </button>
-            <button
-              type="button"
-              class="remove"
-              aria-label="remove {slug}"
-              title="remove {slug}"
-              onclick={() => void remove(slug)}
-            >✕</button>
+            {#if member.origin === "configured"}
+              <button
+                type="button"
+                class="remove"
+                aria-label="clear configuration for {slug}"
+                title="clear recipe and notes"
+                onclick={() => void remove(slug)}
+              >✕</button>
+            {/if}
           </li>
         {/each}
       </ul>

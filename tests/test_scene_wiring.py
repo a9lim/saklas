@@ -221,6 +221,19 @@ def test_ws_generate_message_rejects_bad_seat():
         WSGenerateMessage(type="generate", generate_seat="narrator")  # type: ignore[arg-type]
 
 
+def test_ws_submit_message_uses_native_seats():
+    from saklas.server.ws_models import WSSubmitMessage
+
+    msg = WSSubmitMessage(
+        type="submit",
+        text="answer",
+        authored_seat="model",
+        generated_seat="human",
+    )
+    assert msg.authored_seat == "model"
+    assert msg.generated_seat == "human"
+
+
 # ---------------------------------------------------------------------------
 # Per-seat stop segments (convention 2)
 # ---------------------------------------------------------------------------

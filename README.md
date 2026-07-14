@@ -186,7 +186,7 @@ saklas serve google/gemma-4-31b-it
 
 Open `http://localhost:8000/`.
 
-The chat is a branching loom tree, so any turn can fork into siblings. Hitting Enter commits your message as a user node and runs the model, or, when the selected node is a user node, prefills the model's turn and generates from there. Holding Ctrl, Cmd, or Option while you submit commits without running the model. Submissions during generation get queued.
+The chat is a branching loom tree, so any turn can fork into siblings. The composer is selection-agnostic: normally, Enter commits the draft in the **human** seat and generates the **model** seat; **swap seats** reverses both. With an empty draft, Enter simply continues the generated seat. Holding Ctrl, Cmd, or Option affects non-empty drafts only and commits without generating. Prefill remains an explicit loom action rather than an implicit composer mode. Submissions during generation get queued.
 
 You can select a probe (or `surprise (logprob)`) to color tokens by score live, and you can compare two probes at once. Every generated token is clickable, and clicking shows all probe scores at all layers for that token, plus the top alternatives the model considered. The probe inspector renders each probe's geometry in the whitened metric, and the activation atlas extends the per-token view across the whole conversation.
 

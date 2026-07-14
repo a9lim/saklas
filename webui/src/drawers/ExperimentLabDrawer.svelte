@@ -52,7 +52,7 @@
   function lastUserPrompt(): string | null {
     for (let i = chatLog.turns.length - 1; i >= 0; i--) {
       const t = chatLog.turns[i];
-      if (t.role === "user" && t.text.trim()) return t.text;
+      if (!t.generated && t.role !== "system" && t.text.trim()) return t.text;
     }
     return null;
   }

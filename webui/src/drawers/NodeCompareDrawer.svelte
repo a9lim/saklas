@@ -1,6 +1,6 @@
 <script lang="ts">
   // Cross-branch diff drawer — phase 5.  Renders a side-by-side
-  // word-level diff between two (or more) assistant nodes, plus the
+  // word-level diff between two (or more) generated nodes, plus the
   // sorted readings-delta table and the per-token alignment for the
   // primary pair.
   //
@@ -429,7 +429,7 @@
 
   <div class="body">
     {#if ids.length < 2}
-      <p class="empty">select ≥2 assistant nodes in Threads</p>
+      <p class="empty">select ≥2 generated nodes in Threads</p>
     {:else if loading && diffs.length === 0}
       <p class="empty">computing diff…</p>
     {:else}

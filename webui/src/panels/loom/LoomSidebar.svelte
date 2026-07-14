@@ -30,7 +30,7 @@
     edgeLabelCache,
     filterState,
     highlightState,
-    loomRegenerateFromUser,
+    loomContinueFromCommitted,
     loomTree,
     loomNavigate,
     loomEdit,
@@ -77,20 +77,17 @@
 
   // --------------------------------------- compare bar (active node) --
   //
-  // A single role-aware "compare" — the loom alternates user/assistant,
-  // so "compare siblings" (assistant node) and "compare children" (user
-  // node) were never both live and always meant the same thing: diff
-  // the assistant continuations of one user turn.  We resolve that user
-  // turn from the active node (user → itself, assistant → its parent)
-  // and compare its assistant children.
+  // A single capability-aware "compare": a generated node compares its
+  // siblings; a committed node compares its generated children.  Seat does
+  // not decide which branch is a model result.
 
-  /** The user turn whose assistant continuations the compare acts on. */
+  /** The turn whose generated continuations the compare acts on. */
   const compareUserParentId = $derived.by<string | null>(() => {
     const id = loomTree.active_node_id;
     const n = id ? (loomTree.nodes.get(id) ?? null) : null;
     if (!n) return null;
-    if (n.role === "user") return n.id;
-    if (n.role === "assistant") return n.parent_id;
+    if (n.recipe !== null) return n.parent_id;
+    if (n.role !== "system") return n.id;
     return null;
   });
 
@@ -98,7 +95,7 @@
     if (!compareUserParentId) return [];
     return (loomTree.children_of.get(compareUserParentId) ?? [])
       .map((id) => loomTree.nodes.get(id))
-      .filter((n): n is LoomNodeJSON => n != null && n.role === "assistant");
+      .filter((n): n is LoomNodeJSON => n != null && n.recipe !== null);
   });
 
   function compareBranch(): void {
@@ -210,12 +207,12 @@
   /** Steering-delta label for the edge into ``node`` — read from the
    *  cache LoomEdge populates.  Rendered as a trailing chip on the node
    *  (it used to be an absolutely-positioned edge label that overlapped
-   *  the node text).  Assistant-only: user / system nodes don't carry
+   *  the node text).  Generated-only: committed / system nodes don't carry
    *  steering, so a delta against their steered parent collapses to
    *  "negate the parent's expression" — misleading to render. */
   function steerLabelFor(node: LoomNodeJSON): string | null {
     if (!node.parent_id) return null;
-    if (node.role !== "assistant") return null;
+    if (node.recipe === null) return null;
     return edgeLabelCache.get(`${node.parent_id}|${node.id}`) ?? null;
   }
 
@@ -506,7 +503,7 @@
           // Recipe override carries the per-row alpha for the swept
           // vector.  The engine's modifier resolver accepts a partial
           // recipe expression on the ``steering`` axis.
-          await loomRegenerateFromUser(userId, {
+          await loomContinueFromCommitted(userId, {
             n: 1,
             recipe_override: `${alpha} ${vector}`,
           });
@@ -514,19 +511,20 @@
         break;
       }
       case "regen_mode": {
-        // Manual regen-with-modifier: anchor on the active assistant
-        // (or its user-parent) and dispatch N siblings under the
+        // Manual regen-with-modifier: regenerate a generated node, or
+        // author fresh continuations under a committed node, and dispatch N
+        // siblings under the
         // chosen mode.  Modes are resolved engine-side.
         const node = loomTree.nodes.get(m.nodeId);
         const mode = (m.mode ?? "unsteered").trim();
         const N = Math.max(1, Math.floor(m.n));
-        if (node?.role === "user") {
-          await loomRegenerateFromUser(m.nodeId, {
+        if (node?.recipe === null) {
+          await loomContinueFromCommitted(m.nodeId, {
             n: N,
             recipe_override: mode,
           });
         } else {
-          // Active assistant — set it as active then call regen.
+          // Generated node — set it active then regenerate in its own seat.
           if (loomTree.active_node_id !== m.nodeId) {
             await loomNavigate(m.nodeId);
           }
@@ -640,10 +638,10 @@
   // --------------------------------------- click + global keys --
 
   function onNodeClick(node: LoomNodeJSON, ev: MouseEvent): void {
-    // Ctrl/Cmd-click on an assistant node toggles its multi-select
+    // Ctrl/Cmd-click on a generated node toggles its multi-select
     // membership for the cross-branch diff drawer.  Plain click
     // still navigates.
-    if ((ev.ctrlKey || ev.metaKey) && node.role === "assistant") {
+    if ((ev.ctrlKey || ev.metaKey) && node.recipe !== null) {
       ev.preventDefault();
       ev.stopPropagation();
       toggleNodeSelection(node.id);
@@ -810,10 +808,10 @@
     closeMenu();
     if (!nid) return;
     const node = loomTree.nodes.get(nid);
-    // Anchor the fan-out on the user node.  If the user clicked an
-    // assistant node, walk up to its user parent.
+    // Anchor the fan-out on the committed turn.  If the user clicked a
+    // generated node, walk up to its parent.
     let anchorId = nid;
-    if (node?.role === "assistant" && node.parent_id) {
+    if (node && node.recipe !== null && node.parent_id) {
       anchorId = node.parent_id;
     }
     void openModal("fanout", anchorId, "0.0, 0.3, 0.6", 1);
@@ -824,19 +822,18 @@
     closeMenu();
     if (!nid) return;
     const node = loomTree.nodes.get(nid);
-    // Resolve the user turn: a user node compares its own assistant
-    // children; an assistant node compares its sibling set (its
-    // parent's assistant children).
+    // A committed node compares generated children; a generated node
+    // compares its generated sibling set.
     let parentId: string | null = null;
-    if (node?.role === "user") parentId = nid;
-    else if (node?.role === "assistant") parentId = node.parent_id;
+    if (node && node.recipe === null && node.role !== "system") parentId = nid;
+    else if (node && node.recipe !== null) parentId = node.parent_id;
     if (!parentId) return;
-    const assistantChildren = (loomTree.children_of.get(parentId) ?? []).filter(
-      (id) => loomTree.nodes.get(id)?.role === "assistant",
+    const generatedChildren = (loomTree.children_of.get(parentId) ?? []).filter(
+      (id) => loomTree.nodes.get(id)?.recipe !== null,
     );
-    if (assistantChildren.length < 2) return;
+    if (generatedChildren.length < 2) return;
     openDrawer("node_compare", {
-      node_ids: assistantChildren,
+      node_ids: generatedChildren,
       parent_id: parentId,
     });
   }
@@ -1007,9 +1004,8 @@
     </div>
   {/if}
 
-  <!-- Compare bar — diffs the assistant continuations of the active
-       node's user turn.  One role-aware action: works whether the
-       cursor sits on the user node or one of its assistant replies. -->
+  <!-- Compare bar — diffs generated siblings. The same capability-aware
+       action works from a committed parent or one of its generated replies. -->
   <div class="weight-bar compare-bar">
     <span class="weight-label">compare</span>
     <button
@@ -1017,7 +1013,7 @@
       class="action-btn"
       onclick={compareBranch}
       disabled={comparableNodes.length < 2}
-      title="Compare the assistant continuations of the current user turn"
+      title="Compare generated continuations from the current branch point"
     >
       {comparableNodes.length >= 2
         ? `${comparableNodes.length} continuations`
@@ -1065,8 +1061,8 @@
             <LoomEdge
               active={row.isActivePath}
               dead={row.isDead}
-              parentId={row.node.role === "assistant" ? row.node.parent_id : null}
-              childId={row.node.role === "assistant" ? row.node.id : null}
+              parentId={row.node.recipe !== null ? row.node.parent_id : null}
+              childId={row.node.recipe !== null ? row.node.id : null}
               weight={edgeWeightFor(row.node)}
             />
           {/if}
@@ -1094,14 +1090,14 @@
 {#if menu.open && menu.nodeId}
   {@const menuNode = loomTree.nodes.get(menu.nodeId)}
   {@const cmpParentId =
-    menuNode?.role === "user"
+    menuNode?.recipe === null && menuNode?.role !== "system"
       ? menu.nodeId
-      : menuNode?.role === "assistant"
-        ? menuNode.parent_id
+      : menuNode?.recipe !== null
+        ? (menuNode?.parent_id ?? null)
         : null}
   {@const cmpCount = cmpParentId
     ? (loomTree.children_of.get(cmpParentId) ?? []).filter(
-        (id) => loomTree.nodes.get(id)?.role === "assistant",
+        (id) => loomTree.nodes.get(id)?.recipe !== null,
       ).length
     : 0}
   <div
@@ -1128,7 +1124,7 @@
     </button>
     <button type="button" role="menuitem" onclick={menuNote}>add note…</button>
     <hr />
-    {#if menuNode?.role === "assistant"}
+    {#if menuNode?.recipe !== null}
       <button type="button" role="menuitem" onclick={menuPin}>
         {pinnedComparison.nodeId === menu.nodeId
           ? "unpin from comparison"
@@ -1145,7 +1141,7 @@
       role="menuitem"
       onclick={menuCompareBranch}
       disabled={cmpCount < 2}
-      title={cmpCount < 2 ? "needs ≥2 assistant continuations" : ""}
+      title={cmpCount < 2 ? "needs ≥2 generated continuations" : ""}
     >compare continuations…</button>
     <button type="button" role="menuitem" onclick={menuFanOut}>fan out…</button>
     <hr />

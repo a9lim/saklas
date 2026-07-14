@@ -170,15 +170,16 @@
 
     if (k === "r") {
       ev.preventDefault();
-      // Ctrl+R = regenerate active assistant (N=1, current rack).
+      // Ctrl+R = regenerate the active node when it carries a generation
+      // receipt, independent of which seat it occupies.
       const active = loomTree.active_node_id;
       if (!active) return;
       const node = loomTree.nodes.get(active);
-      if (node?.role === "assistant") {
+      if (node?.recipe) {
         await loomRegenerateActive(1);
       } else {
-        // Active is a user node — open the modal to let the user pick N
-        // and confirm.
+        // A committed node has no regeneration capability; open the modal
+        // to author a fresh continuation instead.
         requestLoomModal("regenerate", { nodeId: active, n: 1 });
       }
       return;

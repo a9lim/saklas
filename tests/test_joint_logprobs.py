@@ -19,6 +19,7 @@ from saklas.core.joint_logprobs import (
     JointLogprobRow,
     JointLogprobs,
     _approx_kl_topk,
+    _branch_inputs,
     _cache_key,
     _compute_rows,
     _shared_prefix_len,
@@ -419,3 +420,29 @@ def test_compute_joint_logprobs_to_dict_round_trip():
     }
     for row in payload["rows"]:
         assert set(row.keys()) == expected_keys
+
+
+def test_branch_inputs_rebuilds_generated_human_seat_prompt():
+    session: Any = _MockSession()
+    node = session.tree.nodes["a1"]
+    node.role = "user"
+    node.role_label = "narrator"
+    node.tokens = [{"token_id": 2, "text": "reply"}]
+    seen: dict[str, Any] = {}
+
+    def prepare_input(input: Any, **kwargs: Any) -> torch.Tensor:
+        seen["input"] = input
+        seen.update(kwargs)
+        return torch.tensor([[0, 1]], dtype=torch.long)
+
+    session._prepare_input = prepare_input
+    branch = _branch_inputs(session, "a1")
+
+    assert branch.prompt_ids == [0, 1]
+    assert branch.response_ids == [2]
+    assert seen["input"] is None
+    assert seen["parent_node_id"] == "u1"
+    assert seen["gen_seat"] == "user"
+    assert seen["user_role"] == "narrator"
+    assert seen["assistant_role"] is None
+    assert seen["to_device"] is False

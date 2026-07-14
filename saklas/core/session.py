@@ -80,6 +80,7 @@ from saklas.core.results import (
     TokenEvent,
 )
 from saklas.core.sampling import SamplingConfig
+from saklas.core.seats import Seat, coerce_seat
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm, ProjectedTerm
 from saklas.core.manifold import Manifold
@@ -6866,7 +6867,7 @@ class SaklasSession:
 
         Both nodes are looked up in :attr:`tree`; the diff bundles the
         word-level text diff and the readings delta table.  ``parent_id``
-        on the returned diff is the shared user-parent when both nodes
+        on the returned diff is the shared parent when both nodes
         share one (the common sibling-comparison case); ``None``
         otherwise.
         """
@@ -6963,14 +6964,15 @@ class SaklasSession:
 
         # Resolve where the regen anchors (continue-mode: no text resend,
         # the history walk carries every turn).  A generated node regens
-        # as a sibling under its parent, same seat; a committed turn gets
-        # a fresh assistant-seat reply generated under it.
-        if parent.recipe is not None or parent.role == "assistant":
+        # as a sibling under its parent in the same seat.  A committed turn
+        # receives a fresh reply in the opposite seat.  Recipe presence is
+        # the capability boundary; seat never stands in for provenance.
+        if parent.recipe is not None:
             anchor_parent = parent.parent_id
             seat = parent.role
         else:
             anchor_parent = parent_node_id
-            seat = "assistant"
+            seat = "user" if parent.role == "assistant" else "assistant"
         if anchor_parent is None:
             raise InvalidNodeOperationError(
                 f"regen_with_modifier: cannot anchor sibling under "
@@ -7011,18 +7013,13 @@ class SaklasSession:
         Lands as a sibling under the same parent turn, occupying the same
         seat as the source node (a user-seat generated node forks into
         user-seat siblings — the cast model).  Raises
-        :class:`InvalidNodeOperationError` when the node isn't a forkable
-        turn — wrong role, no ``raw_token_ids`` (legacy or
-        transcript-loaded node), or ``raw_index`` out of range.
+        :class:`InvalidNodeOperationError` when the node has no
+        ``raw_token_ids`` capability (legacy or transcript-loaded node), or
+        when ``raw_index`` is out of range.
         """
         from dataclasses import replace as _replace
 
         node = self.tree.get(node_id)
-        if node.role not in ("assistant", "user"):
-            raise InvalidNodeOperationError(
-                f"fork_from_token: {node_id!r} is a {node.role} node, "
-                f"not a forkable turn"
-            )
         raw = node.raw_token_ids
         if not raw:
             raise InvalidNodeOperationError(
@@ -7214,6 +7211,39 @@ class SaklasSession:
         return self.tree.add_user_turn(
             text, parent_id=parent_node_id, role_label=role_label,
             thinking_text=thinking)
+
+    def append_turn(
+        self,
+        parent_node_id: str | None,
+        text: str,
+        *,
+        seat: Seat,
+        raw: bool = False,
+        role_label: str | None = None,
+        thinking: str | None = None,
+    ) -> str:
+        """Commit one authored turn in the native ``human``/``model`` seat.
+
+        This is the seat-neutral commit primitive.  The older
+        :meth:`append_user_turn` and :meth:`append_assistant_turn` methods stay
+        as compatibility adapters for callers that speak chat-protocol roles.
+        """
+        seat = coerce_seat(seat)
+        if seat == "human":
+            return self.append_user_turn(
+                parent_node_id,
+                text,
+                allow_any_parent=raw,
+                role_label=role_label,
+                thinking=thinking,
+            )
+        parent = parent_node_id or self.tree.active_node_id
+        return self.append_assistant_turn(
+            parent,
+            text,
+            role_label=role_label,
+            thinking=thinking,
+        )
 
     def append_assistant_turn(
         self,
@@ -8067,10 +8097,15 @@ class SaklasSession:
         labels, so the roster doesn't apply there.
         """
         cast_label: str | None = None
-        if not raw and sampling is not None:
-            cast_label = (
-                sampling.user_role if gen_seat == "user"
-                else sampling.assistant_role
+        if not raw:
+            explicit_label = None
+            if sampling is not None:
+                explicit_label = (
+                    sampling.user_role if gen_seat == "user"
+                    else sampling.assistant_role
+                )
+            cast_label = explicit_label or (
+                "human" if gen_seat == "user" else "model"
             )
         member = self.tree.cast.get(cast_label) if cast_label else None
         if member is None or member.recipe is None:

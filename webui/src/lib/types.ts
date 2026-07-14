@@ -1006,11 +1006,30 @@ export interface WSGenerateRequest {
   generate_seat?: "user" | "assistant" | null;
 }
 
+export type Seat = "human" | "model";
+
+/** Native composer submission.  Authorship and generation are explicit,
+ * independent seats; omit ``generated_seat`` for a commit-only action. */
+export interface WSSubmitRequest {
+  type: "submit";
+  text?: string | null;
+  authored_seat?: Seat | null;
+  generated_seat?: Seat | null;
+  steering?: string | null;
+  sampling?: WSSampling | null;
+  thinking?: boolean | null;
+  authored_thinking?: string | null;
+  raw?: boolean;
+  parent_node_id?: string | null;
+  n?: number;
+  recipe_override?: string | null;
+}
+
 export interface WSStopRequest {
   type: "stop";
 }
 
-export type WSClientMessage = WSGenerateRequest | WSStopRequest;
+export type WSClientMessage = WSGenerateRequest | WSSubmitRequest | WSStopRequest;
 
 export interface WSStartedEvent {
   type: "started";
@@ -1160,6 +1179,9 @@ export interface LoomNodeJSON {
   id: string;
   parent_id: string | null;
   role: "user" | "assistant" | "system";
+  /** Native structural seat.  ``role`` remains as a compatibility adapter
+   *  for persisted trees and chat-template boundaries. */
+  seat?: Seat | null;
   text: string;
   /** Per-turn role-substitution label (roleplay scaffold) — the custom
    *  role this turn was *sent* with (e.g. "captain" / "pirate"), or null
@@ -1170,7 +1192,7 @@ export interface LoomNodeJSON {
    *  decoded thinking channel of a generated node (stamped at finalize).
    *  Strip families re-render it for one turn only. Null means no block. */
   thinking_text: string | null;
-  /** Assistant nodes only.  Mirrors saklas.core.loom.Recipe. */
+  /** Generated nodes only, irrespective of seat. Mirrors Recipe. */
   recipe: {
     steering: string | null;
     sampling: WSSampling | null;
@@ -1241,6 +1263,7 @@ export interface CastMemberJSON {
     seed?: number | null;
   } | null;
   notes?: string;
+  origin?: "structural" | "observed" | "configured";
 }
 
 /** Phase-5 cross-branch diff response (server side: NodeDiff +
@@ -1454,6 +1477,9 @@ export interface ChatTurn {
   roleLabel?: string | null;
   /** Loom node backing this turn, when the server tree is active. */
   nodeId?: string | null;
+  /** Capability bit derived from the node's generation receipt.  Used only
+   *  for regeneration/export actions; never to name or style the role. */
+  generated?: boolean;
   /** True iff any thinking content was emitted. */
   thinking?: boolean;
   /** Visible response tokens with score data. */
@@ -1461,8 +1487,7 @@ export interface ChatTurn {
   /** Thinking-only tokens with score data (rendered inside the
    * <Collapsible> equivalent). */
   thinkingTokens?: TokenScore[];
-  /** A/B-mode pair: the unsteered shadow turn, rendered side-by-side
-   * when present.  Always role: "assistant". */
+  /** A/B-mode pair: the unsteered same-seat shadow turn. */
   abPair?: ChatTurn;
   /** Steering expression applied — round-trips through parseExpression. */
   appliedSteering?: string | null;

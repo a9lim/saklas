@@ -1117,6 +1117,15 @@ def test_cast_roster_crud_and_events():
     assert not seen
 
 
+def test_cast_roster_derives_structural_and_observed_roles():
+    t = LoomTree()
+    human_id = t.add_user_turn("hello", role_label="captain")
+    t.begin_assistant(human_id, role_label="oracle")
+
+    assert list(t.cast_roster()) == ["human", "model", "captain", "oracle"]
+    assert t.cast == {}  # derived identity is not persisted as configuration
+
+
 def test_cast_label_validated():
     from saklas import CastMember
     from saklas.core.role_templates import InvalidRoleError

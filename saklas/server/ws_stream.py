@@ -24,6 +24,7 @@ from saklas.core.errors import SaklasError
 from saklas.core.loom import LoomMutated
 from saklas.core.results import GenerationResult, TokenAlt
 from saklas.core.sampling import SamplingConfig
+from saklas.core.seats import Seat, chat_role_to_seat, seat_to_chat_role
 from saklas.core.session import SaklasSession
 from saklas.core.token_callback import TokenConsumer, TokenConsumerOptions
 from saklas.core.steering import Steering
@@ -31,10 +32,11 @@ from saklas.server.app import acquire_session_lock, ws_auth_ok
 from saklas.server.native_common import SINGLE_SESSION_ID
 from saklas.server.request_helpers import merge_steering, parse_request_steering
 from saklas.server.streaming import probe_reading_aggregate
-from saklas.server.tree_models import node_json
+from saklas.server.tree_models import cast_json, node_json
 from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
     WSGenerateMessage,
+    WSSubmitMessage,
     build_input,
     build_sampling,
     result_to_json,
@@ -65,7 +67,10 @@ class _InvalidInbound:
     message: str
 
 
-_Inbound = WSGenerateMessage | _Stop | _Disconnect | _ReaderFailure | _InvalidInbound
+_Inbound = (
+    WSGenerateMessage | WSSubmitMessage | _Stop | _Disconnect
+    | _ReaderFailure | _InvalidInbound
+)
 
 
 @dataclass(frozen=True)
@@ -114,9 +119,14 @@ def register_ws_stream(app: FastAPI) -> None:
                     raw = await websocket.receive_json()
                     if not isinstance(raw, dict):
                         await incoming.put(_InvalidInbound("message must be an object"))
-                    elif raw.get("type") == "generate":
+                    elif raw.get("type") in ("generate", "submit"):
                         try:
-                            await incoming.put(WSGenerateMessage(**raw))
+                            message = (
+                                WSSubmitMessage(**raw)
+                                if raw.get("type") == "submit"
+                                else WSGenerateMessage(**raw)
+                            )
+                            await incoming.put(message)
                         except ValidationError as exc:
                             await incoming.put(_InvalidInbound(str(exc)))
                     elif raw.get("type") == "stop":
@@ -171,13 +181,11 @@ def register_ws_stream(app: FastAPI) -> None:
                 ],
                 "active_node_id": event.active_node_id,
             })
-            if event.op == "cast":
-                # Roster ops carry no node ids — inline the full roster
-                # (small) so clients reconcile without a refetch.
-                mutated_payload["cast"] = {
-                    label: member.to_dict()
-                    for label, member in session.tree.cast.items()
-                }
+            # The roster is derived from the full tree's observed labels as
+            # well as explicit configuration.  Inline the small effective
+            # roster on every mutation so adds, deletes, and restores reconcile
+            # identity without a refetch or provenance inference client-side.
+            mutated_payload["cast"] = cast_json(session)
             _queue_tree_event(mutated_payload)
         loom_unsub = session.events.subscribe(_on_loom_event)
 
@@ -266,7 +274,7 @@ def register_ws_stream(app: FastAPI) -> None:
                     raise WebSocketDisconnect(code=1000)
                 if isinstance(msg, _ReaderFailure):
                     raise RuntimeError(msg.message)
-                if isinstance(msg, WSGenerateMessage):
+                if isinstance(msg, (WSGenerateMessage, WSSubmitMessage)):
                     await _ws_handle_generate(
                         session, msg, app.state.default_steering, incoming,
                         deferred_incoming, _send_json, _wait_for_tree_finalization,
@@ -309,7 +317,7 @@ def register_ws_stream(app: FastAPI) -> None:
 
 async def _ws_handle_generate(
     session: SaklasSession,
-    msg: WSGenerateMessage,
+    msg: WSGenerateMessage | WSSubmitMessage,
     default_steering: "Steering | None",
     incoming: asyncio.Queue[_Inbound],
     deferred_incoming: "deque[_Inbound]",
@@ -350,6 +358,97 @@ async def _ws_handle_generate(
     """
     loop = asyncio.get_running_loop()
 
+    # ``submit`` is the native composer contract: an explicit authored seat
+    # plus an optional generated seat.  Normalize its generation half to the
+    # legacy adapter shape while retaining the authored turn for one atomic
+    # commit inside the generation worker (the async session lock below covers
+    # the whole commit + N-way fan).  ``generate`` remains accepted for protocol
+    # compatibility and the specialist fork/prefill tools.
+    submit = msg if isinstance(msg, WSSubmitMessage) else None
+    submit_text: str | None = None
+    submit_authored_seat: Seat | None = None
+    submit_authored_thinking: str | None = None
+    native_commit_seat: Seat | None = None
+    if submit is not None:
+        if submit.text is None:
+            if submit.authored_seat is not None:
+                await send_json({
+                    "type": "error",
+                    "message": "authored_seat requires non-empty text",
+                    "code": "ValueError",
+                    "status": 400,
+                })
+                return
+            if submit.authored_thinking is not None:
+                await send_json({
+                    "type": "error",
+                    "message": "authored_thinking requires non-empty text",
+                    "code": "ValueError",
+                    "status": 400,
+                })
+                return
+        else:
+            if submit.text == "":
+                await send_json({
+                    "type": "error",
+                    "message": "submit text must be non-empty when present",
+                    "code": "ValueError",
+                    "status": 400,
+                })
+                return
+            if submit.authored_seat is None:
+                await send_json({
+                    "type": "error",
+                    "message": "text requires authored_seat",
+                    "code": "ValueError",
+                    "status": 400,
+                })
+                return
+            submit_text = submit.text
+            submit_authored_seat = submit.authored_seat
+            submit_authored_thinking = submit.authored_thinking
+        if submit.generated_seat is None and submit_text is None:
+            await send_json({
+                "type": "error",
+                "message": "submit requires text or generated_seat",
+                "code": "ValueError",
+                "status": 400,
+            })
+            return
+
+        # Commit-only submissions can use the established no-decode path.
+        # Commit+generate keeps the authored fields above and generates from
+        # ``input=None`` after the worker lands the turn.
+        if submit.generated_seat is None:
+            assert submit_authored_seat is not None
+            native_commit_seat = submit_authored_seat
+            msg = WSGenerateMessage(
+                type="generate",
+                commit_role=seat_to_chat_role(submit_authored_seat),
+                commit_text=submit_text,
+                commit_thinking=submit_authored_thinking,
+                parent_node_id=submit.parent_node_id,
+                sampling=submit.sampling,
+                raw=submit.raw,
+            )
+            submit_text = None
+            submit_authored_seat = None
+            submit_authored_thinking = None
+        else:
+            msg = WSGenerateMessage(
+                type="generate",
+                input=None,
+                steering=submit.steering,
+                sampling=submit.sampling,
+                thinking=submit.thinking,
+                stateless=False,
+                raw=submit.raw,
+                parent_node_id=submit.parent_node_id,
+                n=submit.n,
+                recipe_override=submit.recipe_override,
+                generate_seat=seat_to_chat_role(submit.generated_seat),
+            )
+
     sampling = build_sampling(msg.sampling)
     try:
         req_steering, explicit_clear = parse_request_steering(msg.steering)
@@ -389,6 +488,7 @@ async def _ws_handle_generate(
         return
 
     parent_node_id = msg.parent_node_id
+    submitted_parent_holder: list[str] = []
 
     # Logit fork: when ``fork_node_id`` is set the worker calls
     # ``session.fork_from_token`` instead of ``session.generate``.  All
@@ -463,7 +563,11 @@ async def _ws_handle_generate(
                 "status": 400,
             })
             return
-        if msg.commit_role == "assistant" and parent_node_id is None:
+        if (
+            native_commit_seat is None
+            and msg.commit_role == "assistant"
+            and parent_node_id is None
+        ):
             await send_json({
                 "type": "error",
                 "message": (
@@ -508,7 +612,22 @@ async def _ws_handle_generate(
                 commit_thinking = (
                     None if msg.raw else (msg.commit_thinking or None)
                 )
-                if msg.commit_role == "user":
+                if native_commit_seat is not None:
+                    commit_label = (
+                        commit_user_role
+                        if native_commit_seat == "human"
+                        else commit_asst_role
+                    )
+                    new_id = await asyncio.to_thread(
+                        session.append_turn,
+                        parent_node_id,
+                        commit_text,
+                        seat=native_commit_seat,
+                        raw=msg.raw,
+                        role_label=None if msg.raw else commit_label,
+                        thinking=commit_thinking,
+                    )
+                elif msg.commit_role == "user":
                     # ``raw`` flags a flat (base-model) commit — the
                     # authored span may hang under a node of any role,
                     # so the user-under-user guard is lifted.
@@ -547,6 +666,7 @@ async def _ws_handle_generate(
             "result": {
                 "kind": "commit",
                 "role": msg.commit_role,
+                "seat": chat_role_to_seat(msg.commit_role),
                 "text": commit_text,
                 "node_id": new_id,
                 "finish_reason": "stop",
@@ -668,6 +788,27 @@ async def _ws_handle_generate(
                 _recipe_override: str | None = recipe_override,
             ) -> None:
                 try:
+                    effective_parent = parent_node_id
+                    if submit_text is not None:
+                        if not submitted_parent_holder:
+                            assert submit_authored_seat is not None
+                            commit_label = None
+                            if not msg.raw and msg.sampling is not None:
+                                commit_label = (
+                                    msg.sampling.user_role
+                                    if submit_authored_seat == "human"
+                                    else msg.sampling.assistant_role
+                                ) or None
+                            committed_id = session.append_turn(
+                                parent_node_id,
+                                submit_text,
+                                seat=submit_authored_seat,
+                                raw=msg.raw,
+                                role_label=commit_label,
+                                thinking=submit_authored_thinking,
+                            )
+                            submitted_parent_holder.append(committed_id)
+                        effective_parent = submitted_parent_holder[0]
                     if msg.fork_node_id is not None:
                         # Fork: recipe / sampling / parent all come from
                         # the source node inside ``fork_from_token``; the
@@ -699,7 +840,7 @@ async def _ws_handle_generate(
                             "raw": msg.raw,
                             "thinking": msg.thinking,
                             "on_token": _on_token,
-                            "parent_node_id": parent_node_id,
+                            "parent_node_id": effective_parent,
                         }
                         if _recipe_override is not None:
                             gen_kwargs["recipe_override"] = _recipe_override
