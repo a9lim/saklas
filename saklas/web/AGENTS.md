@@ -332,6 +332,14 @@ An authored tail clears stale node-level generation receipts; a generated tail
 rebuilds the receipt for the whole forced-prefix result. Exact draft whitespace
 is preserved—only the emptiness test trims.
 
+The composer footer has only the green primary action and red stop action. Both
+use the same tinted-glass `Button` treatment; the action label changes among
+`send` / `generate` / `append`. Regeneration is message-local: every non-system
+bubble renders a small flat `↻` button immediately after its role chip and calls
+`loomRegenerateNode(node_id)`. The replacement is a generated sibling in the
+same structural seat, so authored and generated human/model messages are all
+rerollable without consulting provenance.
+
 Every speaker still renders as one neutral glass card with identity in the role
 chip; system nodes are stage directions. The cast manager (`cast…`) owns the
 tree-scoped roster and standing recipes, and `+ thinking` drafts an authored

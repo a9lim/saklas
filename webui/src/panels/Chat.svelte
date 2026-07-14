@@ -50,7 +50,7 @@
     navigateInputHistory,
     cancelInputPull,
     consumePulledSlot,
-    loomRegenerateActive,
+    loomRegenerateNode,
     enqueuePending,
     pendingActions,
     cancelPendingAction,
@@ -433,7 +433,7 @@
 
   // -------------------------------------------------- conversation actions --
   //
-  // clear / regen / transcript / auto-regen used to live on the Topbar;
+  // clear / transcript / auto-regen used to live on the Topbar;
   // they act on the conversation, so they belong here.  The mutating
   // ones route through ``enqueuePending`` so clicking them mid-gen
   // queues rather than racing the WS.
@@ -447,26 +447,22 @@
     { value: "custom", label: "custom…" },
   ];
 
-  function regenAction(): void {
-    if (!canRegen) return;
-    if (genStatus.active || pendingActions.queue.length > 0) {
+  function regenMessage(turn: ChatTurn): void {
+    const nodeId = turn.nodeId;
+    if (!nodeId) return;
+    if (isPendingBusy()) {
       enqueuePending({
         label: "regen",
         text: null,
-        apply: () => void loomRegenerateActive(1),
+        apply: () => void loomRegenerateNode(nodeId, 1),
         awaitsGen: true,
         rebuild: null,
-        endsOnUserNode: null,
+        endsOnUserNode: turn.role === "user",
       });
     } else {
-      void loomRegenerateActive(1);
+      void loomRegenerateNode(nodeId, 1);
     }
   }
-
-  const canRegen = $derived.by(() => {
-    const id = loomTree.active_node_id;
-    return id ? (loomTree.nodes.get(id)?.recipe != null) : false;
-  });
 
   function openTranscript(): void {
     openDrawer("transcript");
@@ -1086,6 +1082,7 @@
     <div class="thinking-row">
       <div class="thinking-control">
         <Button
+          variant="flat"
           size="sm"
           accent={thinkingDraft.trim() !== "" ? "var(--accent-violet)" : undefined}
           onclick={() => (thinkingOpen = !thinkingOpen)}
@@ -1123,7 +1120,6 @@
     <div class="input-actions">
       <Button
         type="submit"
-        variant="solid"
         accent="var(--accent-green)"
         disabled={!loomTree.loaded}
         title={appendMode ? "modifier + ⏎ append" : "⏎ submit"}
@@ -1134,12 +1130,6 @@
         disabled={!genStatus.active}
         title="Esc"
       >stop</Button>
-      <Button
-        accent="var(--accent-blue)"
-        onclick={regenAction}
-        disabled={!canRegen}
-        title="regenerate"
-      >regen</Button>
     </div>
   </form>
   {/if}
@@ -1163,6 +1153,14 @@
         <b>{roleGlyphLetter(turn.role, turn.roleLabel)}</b>
         {roleDisplayLabel(turn.role, turn.roleLabel)}
       </span>
+      {#if turn.nodeId}
+        <Button
+          size="sm"
+          onclick={() => regenMessage(turn)}
+          title="reroll this message"
+          ariaLabel={`Reroll ${roleDisplayLabel(turn.role, turn.roleLabel)} message`}
+        >↻</Button>
+      {/if}
       {#if isShadow && !pinnedActive}<span class="who-meta">(unsteered)</span>{/if}
       {#if turn.meanLogprob != null && Number.isFinite(turn.meanLogprob)}
         <span

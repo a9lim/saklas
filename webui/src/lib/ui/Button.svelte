@@ -1,7 +1,8 @@
 <script lang="ts">
-  // v2 button — the one button. Three variants on one skeleton:
+  // v2 button — the one button. Four variants on one skeleton:
   //   solid  — accent-filled, dark text; the primary action of a surface
   //   ghost  — borderless glass fill + wash on hover; the default workhorse
+  //   flat   — transparent compact action; color-only hover feedback
   //   danger — red ghost; destructive affordances
   //
   // ``accent`` retints a button to a pillar hue (pass the CSS color) —
@@ -13,12 +14,13 @@
 
   interface Props {
     children: Snippet;
-    variant?: "solid" | "ghost" | "danger";
+    variant?: "solid" | "ghost" | "flat" | "danger";
     size?: "sm" | "md";
     /** Pillar/state hue override — any CSS color. */
     accent?: string;
     disabled?: boolean;
     title?: string;
+    ariaLabel?: string;
     type?: "button" | "submit";
     onclick?: (ev: MouseEvent) => void;
   }
@@ -30,6 +32,7 @@
     accent,
     disabled = false,
     title,
+    ariaLabel,
     type = "button",
     onclick,
   }: Props = $props();
@@ -37,9 +40,11 @@
 
 <button
   class="sk-btn {variant} {size}"
+  class:accented={accent !== undefined}
   style:--btn-accent={accent}
   {disabled}
   {title}
+  aria-label={ariaLabel}
   {type}
   {onclick}
 >
@@ -107,6 +112,24 @@
   .ghost:hover:not(:disabled) {
     background: color-mix(in srgb, var(--btn-accent) 10%, var(--glass));
     color: var(--fg);
+  }
+  .ghost.accented {
+    background: color-mix(in srgb, var(--btn-accent) 7%, var(--glass));
+    color: var(--btn-accent);
+  }
+  .ghost.accented:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--btn-accent) 14%, var(--glass));
+    color: var(--btn-accent);
+  }
+
+  .flat {
+    background: transparent;
+    color: var(--fg-muted);
+    border-color: transparent;
+  }
+  .flat:hover:not(:disabled) {
+    background: transparent;
+    color: var(--btn-accent);
   }
 
   .danger {

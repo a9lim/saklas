@@ -2170,19 +2170,18 @@ export async function loomNote(node_id: string, text: string): Promise<void> {
   }
 }
 
-/** Regenerate the active generated node as a sibling in the same seat.
+/** Regenerate one conversation node as a generated sibling in the same seat.
  *  N=1 by default.  Recipe is implicit (current rack) unless
  *  ``opts.recipe_override`` is set, in which case the engine applies
  *  the recipe-override modifier on top of the parent's recipe. */
-export async function loomRegenerateActive(
+export async function loomRegenerateNode(
+  nodeId: string,
   n: number = 1,
   opts: { recipe_override?: string | null } = {},
 ): Promise<void> {
   if (!loomTree.loaded) return;
-  const activeId = loomTree.active_node_id;
-  if (!activeId) return;
-  const node = loomTree.nodes.get(activeId);
-  if (!node || node.recipe === null || node.role === "system") return;
+  const node = loomTree.nodes.get(nodeId);
+  if (!node || node.role === "system") return;
   const parentId = node.parent_id;
   if (!parentId) return;
   try {
@@ -2195,6 +2194,17 @@ export async function loomRegenerateActive(
   } catch (e) {
     _captureLoomError("regenerate", e);
   }
+}
+
+/** Active-node compatibility adapter for keyboard, loom-menu, and auto-regen
+ * callers. Chat message controls call ``loomRegenerateNode`` directly. */
+export async function loomRegenerateActive(
+  n: number = 1,
+  opts: { recipe_override?: string | null } = {},
+): Promise<void> {
+  const activeId = loomTree.active_node_id;
+  if (!activeId) return;
+  return loomRegenerateNode(activeId, n, opts);
 }
 
 /** Generate opposite-seat continuations under a committed turn.

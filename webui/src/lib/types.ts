@@ -1477,8 +1477,8 @@ export interface ChatTurn {
   roleLabel?: string | null;
   /** Loom node backing this turn, when the server tree is active. */
   nodeId?: string | null;
-  /** Capability bit derived from the node's generation receipt.  Used only
-   *  for regeneration/export actions; never to name or style the role. */
+  /** Whether a model run authored this turn. Used for generation artifacts
+   *  and analysis only; never to name, style, or gate rerolling the role. */
   generated?: boolean;
   /** True iff any thinking content was emitted. */
   thinking?: boolean;

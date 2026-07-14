@@ -432,7 +432,7 @@
         edited
       </span>
       <Button
-        accent="var(--accent)"
+        accent="var(--accent-green)"
         onclick={() => void appendEdit()}
         title="modifier + ⏎ append"
       >
@@ -443,7 +443,6 @@
       </Button>
     {/if}
     <Button
-      variant="solid"
       accent="var(--accent-green)"
       onclick={submitBuffer}
       disabled={genStatus.active}
