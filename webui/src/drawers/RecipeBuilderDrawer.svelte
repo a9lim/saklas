@@ -1,11 +1,8 @@
 <script lang="ts">
-  // Recipe builder — a list editor over the unified steer rack.  Since 4.1
-  // every term is a position on a fitted geometry; per-card coefficient,
-  // projection, ablation, and variant editing moved out (subspace terms share
-  // one "subspace along" master, positions are authored on the cards).  What
-  // survives here: the canonical-expression readout, an add-by-name field, the
-  // shared subspace-along master, and a per-term trigger / enable / remove
-  // list across both families.
+  // Recipe builder — visual rack editor plus an advanced full-grammar mode.
+  // The visual rack stays the approachable surface for positions; the text
+  // mode makes projection, ablation, probe gates, and mixed expressions
+  // genuinely authorable instead of merely documenting syntax the UI drops.
   import {
     addSubspaceToRack,
     closeDrawer,
@@ -20,7 +17,16 @@
     setSubspaceAlong,
     steerRack,
     vectorsState,
+    applyCustomSteeringExpression,
+    useVisualSteeringRack,
+    setJLensTrigger,
+    setJLensEnabled,
+    removeJLensFromRack,
+    setSaeTrigger,
+    setSaeEnabled,
+    removeSaeFromRack,
   } from "../lib/stores.svelte";
+  import { apiSessions } from "../lib/api";
   import type { SteerEntry, Trigger } from "../lib/types";
   import Select from "../lib/Select.svelte";
   import Slider from "../lib/Slider.svelte";
@@ -33,12 +39,15 @@
 
   let newTerm = $state("");
   let copied = $state(false);
+  let rawDraft = $state(currentSteeringExpression());
+  let validating = $state(false);
+  let expressionError: string | null = $state(null);
 
   const entries = $derived(
     [...steerRack.entries.entries()].sort((a, b) => a[0].localeCompare(b[0])),
   );
   const hasSubspace = $derived(entries.some(([, e]) => e.mode === "subspace"));
-  const expression = $derived(currentSteeringExpression());
+  const customActive = $derived(steerRack.customExpression !== null);
   const allNames = $derived.by(() => {
     const names = new Set<string>([...vectorsState.names, ...steerRack.profiles.keys()]);
     return [...names].sort();
@@ -61,15 +70,21 @@
 
   function setTrig(name: string, entry: SteerEntry, t: Trigger): void {
     if (entry.mode === "subspace") setSubspaceTrigger(name, t);
-    else setManifoldTrigger(name, t);
+    else if (entry.mode === "manifold") setManifoldTrigger(name, t);
+    else if (entry.mode === "jlens") setJLensTrigger(name, t);
+    else setSaeTrigger(name, t);
   }
   function setEn(name: string, entry: SteerEntry, v: boolean): void {
     if (entry.mode === "subspace") setSubspaceEnabled(name, v);
-    else setManifoldEnabled(name, v);
+    else if (entry.mode === "manifold") setManifoldEnabled(name, v);
+    else if (entry.mode === "jlens") setJLensEnabled(name, v);
+    else setSaeEnabled(name, v);
   }
   function remove(name: string, entry: SteerEntry): void {
     if (entry.mode === "subspace") removeSubspaceFromRack(name);
-    else removeManifoldFromRack(name);
+    else if (entry.mode === "manifold") removeManifoldFromRack(name);
+    else if (entry.mode === "jlens") removeJLensFromRack(name);
+    else removeSaeFromRack(name);
   }
   function onAlongInput(v: number): void {
     if (Number.isFinite(v)) setSubspaceAlong(v);
@@ -77,12 +92,36 @@
 
   async function copyExpression(): Promise<void> {
     try {
-      await navigator.clipboard.writeText(expression);
+      await navigator.clipboard.writeText(rawDraft);
       copied = true;
       setTimeout(() => (copied = false), 1200);
     } catch {
       copied = false;
     }
+  }
+
+  async function useExpression(): Promise<void> {
+    validating = true;
+    expressionError = null;
+    try {
+      const result = await apiSessions.validateSteering(rawDraft);
+      if (!result.valid) {
+        expressionError = result.error ?? "This expression cannot be applied.";
+        return;
+      }
+      rawDraft = result.expression;
+      applyCustomSteeringExpression(result.expression);
+    } catch (e) {
+      expressionError = e instanceof Error ? e.message : String(e);
+    } finally {
+      validating = false;
+    }
+  }
+
+  function useVisual(): void {
+    useVisualSteeringRack();
+    rawDraft = currentSteeringExpression();
+    expressionError = null;
   }
 </script>
 
@@ -96,25 +135,48 @@
 
   <div class="body">
     <section class="expression-card">
-      <div>
+      <div class="expression-editor">
         <span class="label">expression</span>
-        <code>{expression || "unsteered"}</code>
+        <textarea
+          bind:value={rawDraft}
+          rows="4"
+          aria-label="Full steering expression"
+          placeholder="0.5 personas%pirate + 0.2 !verbose.concise@response"
+        ></textarea>
+        <p class="muted">
+          Full grammar: positions, push, <code>!</code> ablation,
+          <code>~</code>/<code>|</code> projection, triggers, and probe gates.
+          Applying switches from the visual rack to this exact expression.
+        </p>
+        {#if expressionError}
+          <p class="error" role="alert">{expressionError}</p>
+        {/if}
       </div>
       <div class="actions">
         <button type="button" onclick={copyExpression}>{copied ? "copied" : "copy"}</button>
+        <button
+          type="button"
+          class="primary"
+          disabled={validating}
+          onclick={() => void useExpression()}
+        >{validating ? "checking…" : "use expression"}</button>
+        {#if customActive}
+          <button type="button" onclick={useVisual}>use visual rack</button>
+        {/if}
       </div>
     </section>
 
-    <section class="add-card">
-      <input list="recipe-concepts" bind:value={newTerm} placeholder="concept" onkeydown={(ev) => { if (ev.key === "Enter") add(); }} />
-      <datalist id="recipe-concepts">
-        {#each allNames as name (name)}
-          <option value={name}></option>
-        {/each}
-      </datalist>
-      <button type="button" onclick={add}>add</button>
-      <button type="button" onclick={() => openDrawer("subspace")}>browse…</button>
-    </section>
+    {#if !customActive}
+      <section class="add-card">
+        <input list="recipe-concepts" bind:value={newTerm} placeholder="concept" onkeydown={(ev) => { if (ev.key === "Enter") add(); }} />
+        <datalist id="recipe-concepts">
+          {#each allNames as name (name)}
+            <option value={name}></option>
+          {/each}
+        </datalist>
+        <button type="button" onclick={add}>add</button>
+        <button type="button" onclick={() => openDrawer("subspace")}>browse…</button>
+      </section>
 
     {#if hasSubspace}
       <section class="along-card">
@@ -165,6 +227,12 @@
         {/each}
       {/if}
     </section>
+    {:else}
+      <section class="custom-note">
+        Advanced expression mode is active. Use “visual rack” above to return
+        to card-based authoring; adding a card will also leave this mode.
+      </section>
+    {/if}
   </div>
 </section>
 
@@ -203,18 +271,25 @@
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     padding: var(--space-6);
   }
-  .expression-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-5); align-items: center; }
+  .expression-card { display: grid; gap: var(--space-4); }
+  .expression-editor { min-width: 0; }
   .label, .field span { display: block; color: var(--fg-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0; margin-bottom: var(--space-2); }
   code { color: var(--accent-amber); font-family: var(--font-mono); white-space: pre-wrap; word-break: break-word; }
-  .actions, .add-card { display: flex; gap: var(--space-4); align-items: center; }
+  .actions, .add-card { display: flex; gap: var(--space-4); align-items: center; flex-wrap: wrap; }
   button { border: 1px solid transparent; border-radius: var(--radius); background: var(--glass-strong); color: var(--fg); padding: var(--space-4) var(--space-5); }
-  button:hover { background: color-mix(in srgb, var(--accent) 10%, var(--glass-strong)); color: var(--accent); }
+  button:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 10%, var(--glass-strong)); color: var(--accent); }
+  button.primary { background: color-mix(in srgb, var(--accent) 18%, var(--glass-strong)); color: var(--accent); }
+  button:disabled { opacity: 0.5; }
   .add-card input { flex: 1; }
   input { border: 1px solid transparent; border-radius: var(--radius); background: var(--input-well); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); font-size: var(--text-xs); }
   input:focus { outline: none; border-color: var(--accent); }
+  textarea { width: 100%; resize: vertical; min-height: 6.5rem; box-sizing: border-box; border: 1px solid transparent; border-radius: var(--radius); background: var(--input-well); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.5; }
+  textarea:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; border-color: var(--accent); }
   .along-row { display: grid; grid-template-columns: 1fr 4rem; gap: var(--space-5); align-items: center; }
   .along-row strong { color: var(--accent); font-family: var(--font-mono); text-align: right; }
   .muted { color: var(--fg-muted); font-size: var(--text-xs); margin: var(--space-3) 0 0; }
+  .error { color: var(--accent-red); font-size: var(--text-xs); margin: var(--space-3) 0 0; white-space: pre-wrap; }
+  .custom-note { color: var(--fg-muted); background: var(--glass); border-radius: var(--radius); padding: var(--space-6); font-size: var(--text-xs); line-height: 1.5; }
   .terms { display: grid; gap: var(--space-5); }
   .term { display: grid; gap: var(--space-5); }
   .term.disabled { opacity: 0.58; }

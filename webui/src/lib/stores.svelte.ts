@@ -712,8 +712,8 @@ export async function startLensFit(
   void pollLensFit();
 }
 
-/** Ask the background worker to stop at the next prompt boundary. The
- * partial checkpoint remains resumable, matching server semantics. */
+/** Ask the background worker to stop after its current provider read or
+ * estimator pass. Any prior complete checkpoint remains resumable. */
 export async function cancelLensFit(): Promise<void> {
   if (!lensFitState.running || lensFitState.cancelling) return;
   lensFitState.cancelling = true;
@@ -772,9 +772,9 @@ function _hydrateSamplingFromInfo(): void {
   if (typeof cfg.top_p === "number") {
     samplingState.top_p = cfg.top_p;
   }
-  if (typeof cfg.top_k === "number") {
-    samplingState.top_k = cfg.top_k;
-  }
+  // ``null`` is meaningful: no top-k cutoff.  Assign it rather than keeping a
+  // stale local number after the user clears the field.
+  samplingState.top_k = cfg.top_k;
   if (typeof cfg.system_prompt === "string") {
     samplingState.system_prompt = cfg.system_prompt;
   }
@@ -787,7 +787,7 @@ export async function patchSessionDefaults(
   body: Partial<{
     temperature: number;
     top_p: number;
-    top_k: number;
+    top_k: number | null;
     max_tokens: number;
     system_prompt: string;
     thinking: boolean;
@@ -906,6 +906,9 @@ export interface SteerRack {
    *  (flat) vs manifold (curved).  Variant lives on the entry, not the key —
    *  matching the saklas parser's Steering.alphas semantics. */
   entries: Map<string, SteerEntry>;
+  /** Advanced full-grammar expression. ``null`` means serialize the visual
+   * rack; a string (including empty = explicitly unsteered) is authoritative. */
+  customExpression: string | null;
   /** Shared "subspace along" master — the single slide magnitude every
    *  subspace (flat) term serializes with (the merged affine subspace has one
    *  slide).  Unclamped (a high-share layer is meant to overshoot; the engine
@@ -929,6 +932,7 @@ export interface SteerRack {
 // callers that mutate an entry must reassign via .set(name, {...e, …}).
 export const steerRack: SteerRack = $state({
   entries: new SvelteMap(),
+  customExpression: null,
   subspaceAlong: DEFAULT_SUBSPACE_ALONG,
   profiles: new SvelteMap(),
   correlation: null,
@@ -1052,6 +1056,7 @@ export function setSubspaceEnabled(name: string, enabled: boolean): void {
  *  shared ``subspaceAlong`` master, not per-card. */
 export function addSubspaceToRack(name: string): void {
   if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
   const info = manifoldByName(name);
   let coords: number[] = [];
   let label: string | null = null;
@@ -1075,7 +1080,24 @@ export function removeSubspaceFromRack(name: string): void {
  * Recomputed on demand; cheap.  Subspace terms first (at the shared
  * ``subspaceAlong`` master), then manifold (curved) terms. */
 export function currentSteeringExpression(): string {
-  return serializeExpression(steerRack.entries, steerRack.subspaceAlong);
+  return steerRack.customExpression
+    ?? serializeExpression(steerRack.entries, steerRack.subspaceAlong);
+}
+
+/** Make a validated full-grammar expression authoritative.  The visual rack
+ * cannot faithfully represent every binary projection/gate form, so mixing
+ * the two would lie about what generation uses; switching modes clears it. */
+export function applyCustomSteeringExpression(expression: string): void {
+  enqueueOrApply("apply custom steering expression", () => {
+    steerRack.entries.clear();
+    steerRack.customExpression = expression;
+  });
+}
+
+export function useVisualSteeringRack(): void {
+  enqueueOrApply("use visual steering rack", () => {
+    steerRack.customExpression = null;
+  });
 }
 
 // ------------------------------------------------------ manifold catalog
@@ -1131,6 +1153,7 @@ function mutateManifold(
 /** Add a curved manifold to the rack at its domain centroid, along 0.5. */
 export function addManifoldToRack(name: string): void {
   if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
   const info = manifoldByName(name);
   const coords = info ? manifoldCentroid(info) : [];
   steerRack.entries.set(name, {
@@ -1175,6 +1198,7 @@ export function addJLensToRack(word: string): void {
   if (!bare) return;
   const name = `jlens/${bare}`;
   if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
   steerRack.entries.set(name, {
     mode: "jlens",
     alpha: JLENS_DEFAULT_ALPHA,
@@ -1220,6 +1244,7 @@ function mutateSae(
 export function addSaeToRack(featureId: number): void {
   const name = `sae/${featureId}`;
   if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
   steerRack.entries.set(name, {
     mode: "sae",
     alpha: SAE_DEFAULT_ALPHA,
@@ -1406,6 +1431,7 @@ function _emptyProbeEntry(info: ProbeInfo): ProbeRackEntry {
     perLayer: {},
     reading: null,
     aggregate: null,
+    savedAggregate: null,
     nearest: [],
     trajectory: [],
     subspaceTrail: [],
@@ -1505,6 +1531,7 @@ export async function refreshProbeList(): Promise<void> {
       if (!seen.has(name)) probeRack.entries.delete(name);
     }
     probeRack.active = r.probes.map((p) => p.name);
+    hydrateProbeRackFromActiveNode();
     probeRack.error = null;
   } catch (e) {
     probeRack.entries.clear();
@@ -1567,6 +1594,7 @@ export function seedProbeDisplay(
     perLayer: seed.perLayer ? { ...seed.perLayer } : prev.perLayer,
     reading: seed.reading === undefined ? prev.reading : seed.reading,
     aggregate: seed.aggregate === undefined ? prev.aggregate : seed.aggregate,
+    savedAggregate: null,
   });
 }
 
@@ -1592,6 +1620,7 @@ export function resetProbeStreams(): void {
       ...e,
       nearest: [],
       aggregate: null,
+      savedAggregate: null,
       trajectory: [],
       subspaceTrail: [],
     });
@@ -1648,6 +1677,7 @@ export function updateProbesFromReadings(
       previous: prev.current,
       perLayer: _primaryPerLayer(prev.info, reading),
       reading,
+      savedAggregate: null,
       nearest: reading.nearest,
       trajectory,
       subspaceTrail,
@@ -1667,6 +1697,7 @@ export function setProbeAggregates(
     probeRack.entries.set(name, {
       ...prev,
       aggregate: agg,
+      savedAggregate: null,
       current: _primaryScalar(prev.info, agg),
       perLayer: _primaryPerLayer(prev.info, agg),
       nearest: agg.nearest,
@@ -1868,8 +1899,17 @@ function attachChild(parentId: string | null, childId: string): void {
 }
 
 function upsertLoomNode(raw: LoomNodeJSON & { children?: string[] }): LoomNodeJSON {
-  const { children: _children, ...node } = raw;
+  const { children, ...node } = raw;
   loomTree.nodes.set(node.id, node);
+  // Portable Loom snapshots require ``children_of`` to contain one key for
+  // *every* node, including leaves.  Live deltas only need to extend the
+  // parent list, so newly generated leaves previously had no own empty entry:
+  // exporting that otherwise-correct live tree produced a file the server
+  // refused to import.  Preserve an existing list on updates; seed a new node
+  // from the serializer's optional children field (normally ``[]``).
+  if (!loomTree.children_of.has(node.id)) {
+    loomTree.children_of.set(node.id, [...(children ?? [])]);
+  }
   if (node.parent_id !== null) {
     attachChild(node.parent_id, node.id);
   } else {
@@ -1945,6 +1985,38 @@ function syncChatLogFromTree(): void {
   chatLog.pendingIndex = pendingIdx;
 }
 
+/** Rehydrate the scalar probe summary persisted on the selected Loom node.
+ *
+ * Rich per-layer ``ProbeReading`` payloads intentionally do not live in the
+ * portable tree, but the aggregate scalar does.  Without this bridge a page
+ * reload or branch navigation reset every attached card to a fake zero and
+ * told the user to generate a token even while a generated node with saved
+ * readings was selected.  Keep the scalar honest and mark it as historical;
+ * ``ProbeCard`` explains why the layer strip is unavailable. */
+function hydrateProbeRackFromActiveNode(): void {
+  if (!loomTree.loaded || genStatus.active) return;
+  const node = loomTree.active_node_id
+    ? loomTree.nodes.get(loomTree.active_node_id)
+    : undefined;
+  const readings = node?.aggregate_readings ?? {};
+  for (const [name, prev] of probeRack.entries) {
+    const raw = readings[name];
+    const value = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+    probeRack.entries.set(name, {
+      ...prev,
+      current: value ?? 0,
+      previous: prev.current,
+      perLayer: {},
+      reading: null,
+      aggregate: null,
+      savedAggregate: value,
+      nearest: [],
+      trajectory: [],
+      subspaceTrail: [],
+    });
+  }
+}
+
 /** Replace the in-memory tree with a current server snapshot. */
 function applyTreeSnapshot(snap: LoomTreeJSON): void {
   loomTree.loaded = true;
@@ -1966,6 +2038,7 @@ function applyTreeSnapshot(snap: LoomTreeJSON): void {
   castState.roster = snap.cast;
   recomputeActivePath();
   syncChatLogFromTree();
+  hydrateProbeRackFromActiveNode();
 }
 
 /** Materialize the reactive Loom slice in the server's portable JSON shape.
@@ -1978,8 +2051,11 @@ export function currentLoomTreeSnapshot(): LoomTreeJSON | null {
   const nodes: LoomNodeJSON[] = [];
   for (const [, node] of loomTree.nodes) nodes.push(node);
   const children_of: Record<string, string[]> = {};
-  for (const [parentId, childIds] of loomTree.children_of) {
-    children_of[parentId] = [...childIds];
+  // Export the server's exact total mapping contract even when this browser
+  // began before the leaf-initialization fix or received an older partial
+  // client state.  Node order is already the portable snapshot order.
+  for (const node of nodes) {
+    children_of[node.id] = [...(loomTree.children_of.get(node.id) ?? [])];
   }
   return {
     tree_format: loomTree.tree_format,
@@ -2000,10 +2076,11 @@ export function currentLoomTreeSnapshot(): LoomTreeJSON | null {
  *  client missed a rev — caller full-refetches on false.
  *
  *  Phase-2 server semantics: ``updated`` carries full LoomNodeJSON
- *  objects (potentially with an extra ``children`` field that we
- *  ignore — children_of is rebuilt from the added/removed deltas).
+ *  objects (potentially with an extra ``children`` field used only to seed a
+ *  new node's own children entry; parent links still come from deltas).
  *  ``added`` nodes may also be implicit children-list extensions of
- *  existing parents. */
+ *  existing parents.  ``upsertLoomNode`` additionally establishes the
+ *  required empty ``children_of`` entry for every new leaf. */
 function applyTreeDelta(ev: {
   added?: LoomNodeJSON[];
   removed?: string[];
@@ -2016,8 +2093,8 @@ function applyTreeDelta(ev: {
   if (loomTree.loaded && ev.rev > loomTree.rev + 1) return false;
   // ``added``: inject node + extend its parent's children list.  Node
   // payloads from the server may include a ``children`` field
-  // (the server serializer adds it); strip before storing so the cached node
-  // shape stays consistent with the bootstrap fetch.
+  // (the server serializer adds it); use it only to seed children_of, while
+  // stripping it from the cached node so bootstrap/delta shapes stay equal.
   for (const raw of ev.added ?? []) {
     upsertLoomNode(raw as LoomNodeJSON & { children?: string[] });
   }
@@ -2035,7 +2112,7 @@ function applyTreeDelta(ev: {
       }
     }
   }
-  // ``updated``: full node replacement.  Same children-strip as added.
+  // ``updated``: full node replacement.  Same children handling as added.
   for (const raw of ev.updated ?? []) {
     upsertLoomNode(raw as LoomNodeJSON & { children?: string[] });
   }
@@ -2066,6 +2143,7 @@ function applyTreeDelta(ev: {
   invalidateEdgeLabels();
   recomputeActivePath();
   syncChatLogFromTree();
+  hydrateProbeRackFromActiveNode();
   return true;
 }
 

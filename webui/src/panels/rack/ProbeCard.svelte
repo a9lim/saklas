@@ -61,10 +61,16 @@
   const latest = $derived(entry.aggregate ?? entry.reading);
   /** Subspaceness — share of the centered activation living in this probe's
    *  subspace, [0,1].  Backs the white top-row bar. */
-  const fraction = $derived(latest?.fraction ?? 0);
+  const fraction = $derived(
+    latest?.fraction ?? (!affine ? entry.savedAggregate ?? 0 : 0),
+  );
   /** Domain-frame coordinates, one per intrinsic dimension — each gets its
    *  own signed bar below the subspaceness row. */
-  const coordVec = $derived(latest?.coords ?? []);
+  const coordVec = $derived(
+    latest?.coords ?? (affine && entry.savedAggregate !== null
+      ? [entry.savedAggregate]
+      : []),
+  );
   /** Coordinate-bar count — the intrinsic dim, falling back to the live
    *  coord-vector length for a row reporting 0. */
   const nDim = $derived(
@@ -324,6 +330,9 @@
       cells={layerCells}
       scale={axisScale}
       ariaLabel={`Per-layer readings for ${name}`}
+      emptyMessage={entry.savedAggregate !== null
+        ? "saved aggregate; per-layer detail was not retained"
+        : "no data yet, generate a token first"}
     />
 
     {#if showMiniMap}

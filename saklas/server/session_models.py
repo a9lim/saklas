@@ -25,6 +25,10 @@ class PatchSessionRequest(NativeRequest):
     thinking: bool | None = None
 
 
+class ValidateSteeringRequest(NativeRequest):
+    expression: str
+
+
 def session_config_dict(session: SaklasSession) -> dict[str, Any]:
     cfg = session.config
     return {

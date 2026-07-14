@@ -1603,6 +1603,28 @@
     margin-left: auto;
   }
 
+  @media (max-width: 600px) {
+    /* Keep both editable role labels legible on phones.  Four controls in one
+     * flex row truncated the model value (often to ``mode``) and compressed
+     * the seat toggle into an ambiguous sliver. */
+    .cast-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: var(--space-2) var(--space-4);
+    }
+    .cast {
+      width: auto;
+    }
+    .seat-toggle {
+      grid-column: 1;
+    }
+    .cast-manage {
+      grid-column: 2;
+      justify-self: end;
+      margin-left: 0;
+    }
+  }
+
   .thinking-row {
     display: flex;
     flex-direction: column;

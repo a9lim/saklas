@@ -959,7 +959,14 @@ class SteeringComposer:
         # targets).
         whitener = session.whitener
 
-        # trigger -> {"push": [(basis_dirs, coord_dirs, coeff)], "ablate": [dirs]}
+        # trigger -> {
+        #   "push": [(basis_dirs, coord_dirs, coeff)],
+        #   "ablate": [(dirs, coeff)],
+        # }
+        #
+        # Ablation coefficients must remain attached to their directions all
+        # the way into synthesis.  Dropping them here silently turned every
+        # partial ablation (``0.15 !x``) into a full ablation.
         grouped: dict[Trigger, dict[str, list[Any]]] = {}
 
         def _bucket(trigger: Trigger) -> dict[str, list[Any]]:
@@ -976,7 +983,9 @@ class SteeringComposer:
                     L: v.to(torch.float32).reshape(-1)
                     for L, v in ablate_prof.items()
                 }
-                _bucket(entry.trigger)["ablate"].append(ablate_dirs)
+                _bucket(entry.trigger)["ablate"].append(
+                    (ablate_dirs, entry.coeff),
+                )
                 continue
             if isinstance(entry, ManifoldTerm):
                 manifold = session._manifolds.get(entry.manifold)

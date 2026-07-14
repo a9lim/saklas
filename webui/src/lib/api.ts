@@ -172,12 +172,17 @@ export class ApiError extends Error {
   readonly rawBody: string;
 
   constructor(status: number, path: string, rawBody: string, parsed: unknown) {
+    const record =
+      parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    const nestedError =
+      record?.error && typeof record.error === "object"
+        ? (record.error as Record<string, unknown>)
+        : null;
+    const detail = record?.detail ?? nestedError?.message;
     super(
-      `${path}: ${status} ${
-        parsed && typeof parsed === "object" && "detail" in (parsed as object)
-          ? (parsed as { detail: unknown }).detail
-          : rawBody.slice(0, 200)
-      }`,
+      typeof detail === "string" && detail.trim()
+        ? detail
+        : rawBody.trim().slice(0, 200) || `Request failed (${status})`,
     );
     this.name = "ApiError";
     this.status = status;
@@ -253,7 +258,7 @@ export const apiSessions = {
     body: Partial<{
       temperature: number;
       top_p: number;
-      top_k: number;
+      top_k: number | null;
       max_tokens: number;
       system_prompt: string;
       thinking: boolean;
@@ -270,6 +275,15 @@ export const apiSessions = {
   },
   rewind(id: string = SESSION): Promise<void> {
     return request<void>(`${SESSION_BASE(id)}/rewind`, { method: "POST" });
+  },
+  validateSteering(
+    expression: string,
+    id: string = SESSION,
+  ): Promise<{ valid: boolean; expression: string; error: string | null }> {
+    return request(
+      `${SESSION_BASE(id)}/steering/validate`,
+      jsonBody({ expression }),
+    );
   },
 };
 
@@ -928,7 +942,7 @@ export const apiLens = {
     return request(`${SESSION_BASE(id)}/lens/fit`);
   },
 
-  /** Request cooperative cancellation at the next prompt boundary. */
+  /** Request cooperative cancellation after the current estimator pass. */
   cancelFit(id: string = SESSION): Promise<LensFitStatusJSON> {
     return request(`${SESSION_BASE(id)}/lens/fit`, { method: "DELETE" });
   },

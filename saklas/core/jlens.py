@@ -137,7 +137,7 @@ class LensNotFittedError(JacobianLensError):
 
 
 class JacobianLensCancelled(JacobianLensError):
-    """Raised after a cooperative fit stop at a complete-prompt boundary."""
+    """Raised after a cooperative stop at a safe estimator boundary."""
 
     def user_message(self) -> tuple[int, str]:
         return (409, str(self) or "Jacobian-lens fit cancelled")
@@ -1253,7 +1253,17 @@ def fit_jacobian_lens(
                             captured=captured, batch=batch, skip_first=skip_first,
                             attention_mask=attention_mask, lengths=lengths,
                             row_start=committed_row,
+                            cancel_event=cancel_event,
                         )
+                        # Close the tiny race after the final VJP block: a
+                        # cancellation that lands after that block's internal
+                        # check must still prevent this group (especially the
+                        # terminal group) from being counted and published.
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise JacobianLensCancelled(
+                                "Jacobian-lens fit cancelled after the active "
+                                "prompt group"
+                            )
                         break
                     except _BatchedVjpUnavailable as exc:
                         assert requested_vjp_mode == "auto"
@@ -1467,6 +1477,7 @@ def _accumulate_prompt_jacobian(
     attention_mask: torch.Tensor | None = None,
     lengths: torch.Tensor | None = None,
     row_start: int = 0,
+    cancel_event: Any | None = None,
 ) -> None:
     """Run one prompt microbatch's exact VJP sweep into bounded row stripes.
 
@@ -1496,6 +1507,10 @@ def _accumulate_prompt_jacobian(
     source_counts = valid_mask.sum(dim=1).clamp_min(1).to(torch.float32)
     captured.clear()
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise JacobianLensCancelled(
+                "Jacobian-lens fit cancelled before the next prompt group"
+            )
         vjp_mode = str(state["vjp_mode"])
         if vjp_mode != "batched" and prompt_count != 1:
             raise ValueError(f"{vjp_mode} VJP requires prompt_batch=1")
@@ -1837,6 +1852,17 @@ def _accumulate_prompt_jacobian(
         dim_start = int(row_start)
         pass_idx = 0
         while dim_start < d_model:
+            if cancel_event is not None and cancel_event.is_set():
+                # A cancellation must not leave accelerator work or an async
+                # transfer alive after the fit worker releases the model. The
+                # current prompt group's partial CPU sums are intentionally
+                # abandoned; only complete-group checkpoints are resumable.
+                drain_cuda_pending_in_order()
+                if device.type == "mps":
+                    torch.mps.synchronize()
+                raise JacobianLensCancelled(
+                    "Jacobian-lens fit cancelled during an active prompt group"
+                )
             n_dims = min(batch, d_model - dim_start)
             dims = dim_start + batch_rows[:n_dims]
             # grad(final, sources) rather than backward(): the grads return
@@ -1860,6 +1886,13 @@ def _accumulate_prompt_jacobian(
                 ):
                     raise _BatchedVjpUnavailable(committed_until) from exc
                 raise
+            if cancel_event is not None and cancel_event.is_set():
+                drain_cuda_pending_in_order()
+                if device.type == "mps":
+                    torch.mps.synchronize()
+                raise JacobianLensCancelled(
+                    "Jacobian-lens fit cancelled during an active prompt group"
+                )
             if vjp_mode == "replicated":
                 if cot is None:
                     cot = torch.zeros_like(final)

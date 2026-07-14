@@ -11,6 +11,7 @@ loom-mutation forwarder, and a per-generate-turn worker; see the
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections import deque
 from contextlib import suppress
@@ -41,6 +42,8 @@ from saklas.server.ws_models import (
     build_sampling,
     result_to_json,
 )
+
+_logger = logging.getLogger(__name__)
 
 JSONValue = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
 JSONObject = dict[str, JSONValue]
@@ -449,6 +452,11 @@ async def _ws_handle_generate(
                 generate_seat=seat_to_chat_role(submit.generated_seat),
             )
 
+    # Both submit branches above normalize to the specialist generation
+    # schema; direct generate frames already have that type.  Keep the
+    # invariant explicit for readers and static analysis across the long
+    # handler below.
+    assert isinstance(msg, WSGenerateMessage)
     sampling = build_sampling(msg.sampling)
     try:
         req_steering, explicit_clear = parse_request_steering(msg.steering)
@@ -925,10 +933,26 @@ async def _ws_handle_generate(
 
             if error_holder and not result_holder:
                 exc = error_holder[0]
+                # The model worker runs in a thread, so by the time control
+                # returns here there is no active exception for
+                # ``logger.exception`` to capture.  Preserve its original
+                # traceback explicitly: native WebSocket failures used to be
+                # surfaced only to the browser, leaving operators with no
+                # actionable server-side evidence for backend/device bugs.
+                _logger.error(
+                    "native WebSocket generation failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                if isinstance(exc, SaklasError):
+                    status, message = exc.user_message()
+                else:
+                    status = 500
+                    message = "Generation failed. Check the server log for details."
                 await send_json({
                     "type": "error",
-                    "message": str(exc),
+                    "message": message,
                     "code": type(exc).__name__,
+                    "status": status,
                     "node_id": current_node_holder[0],
                     "sibling_index": sibling_idx,
                 })

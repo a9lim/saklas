@@ -15,10 +15,11 @@
     removeManifoldFromRack,
     removeJLensFromRack,
     removeSaeFromRack,
+    currentSteeringExpression,
+    openDrawer,
   } from "../lib/stores.svelte";
   import type { InspectorTab } from "../lib/stores.svelte";
   import {
-    serializeExpression,
     formatSubspaceTerm,
     formatManifoldTerm,
     formatJLensTerm,
@@ -93,9 +94,8 @@
     return arr;
   });
 
-  const expression = $derived(
-    serializeExpression(steerRack.entries, steerRack.subspaceAlong),
-  );
+  const expression = $derived(currentSteeringExpression());
+  const custom = $derived(steerRack.customExpression !== null);
 
   async function copyExpression(): Promise<void> {
     if (!expression) return;
@@ -109,9 +109,29 @@
 </script>
 
 <div class="recipe" title={expression || "no active steering"}>
-  <span class="lbl">recipe</span>
-  {#if chips.length === 0}
-    <span class="empty">none</span>
+  <button
+    type="button"
+    class="lbl edit"
+    title="edit steering recipe"
+    aria-label="Edit steering recipe"
+    onclick={() => openDrawer("recipe_builder")}
+  >recipe</button>
+  {#if custom}
+    <button
+      type="button"
+      class="custom-expression"
+      title="advanced expression — click to edit"
+      onclick={() => openDrawer("recipe_builder")}
+    >
+      <span class="custom-badge">custom</span>
+      <code>{expression || "unsteered"}</code>
+    </button>
+  {:else if chips.length === 0}
+    <button
+      type="button"
+      class="empty edit-empty"
+      onclick={() => openDrawer("recipe_builder")}
+    >none · edit</button>
   {:else}
     <div class="chips">
       {#each chips as chip (chip.name)}
@@ -127,6 +147,8 @@
         </Chip>
       {/each}
     </div>
+  {/if}
+  {#if expression}
     <button
       type="button"
       class="copy"
@@ -164,11 +186,51 @@
     padding-top: 3px;
     flex: none;
   }
+  button.lbl,
+  .edit-empty,
+  .custom-expression {
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+  button.lbl:hover,
+  .edit-empty:hover {
+    color: var(--fg);
+  }
   .empty {
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     color: var(--fg-muted);
     padding-top: 1px;
+  }
+  .edit-empty {
+    padding: 1px 0 0;
+  }
+  .custom-expression {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0;
+    text-align: left;
+  }
+  .custom-expression code {
+    color: var(--fg-strong);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .custom-badge {
+    flex: none;
+    color: var(--accent-amber);
+    background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+    border-radius: var(--radius-sm);
+    padding: 1px var(--space-2);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
   }
   .chips {
     display: flex;

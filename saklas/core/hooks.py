@@ -1472,8 +1472,13 @@ class SteeringManager:
             for L in layer_set:
                 sub_L = synth.layers[L]
                 sub_target = synth.target_coord[L].to(torch.float32)
-                # Per-axis collapse mask κ (0 push / translate, 1 ablate).
-                sub_kappa = synth.kappa[L].to(torch.float32)
+                # Per-axis requested ablation coefficient (0 on push axes).
+                # ``subspace_inject`` multiplies it by ``along``; compensate
+                # for the affine push gain below so ``0.15 !x`` removes 15%,
+                # not ``16×`` that amount.  Orthogonalization runs on the
+                # user-space coefficients first, then this one scalar division
+                # preserves the resulting operator exactly.
+                requested_kappa = synth.kappa[L].to(torch.float32)
                 # Orthogonalize the affine subspace against any curved manifold
                 # sharing this layer (curved wins the shared directions); κ rides
                 # through the re-orthonormalization.  Drop the layer if the affine
@@ -1481,11 +1486,11 @@ class SteeringManager:
                 curved = curved_basis_by_layer.get(L)
                 if curved is not None:
                     res = _orthogonalize_affine_against(
-                        sub_L, sub_target, sub_kappa, curved,
+                        sub_L, sub_target, requested_kappa, curved,
                     )
                     if res is None:
                         continue
-                    sub_L, sub_target, sub_kappa = res
+                    sub_L, sub_target, requested_kappa = res
                 r_l = sub_L.rank
                 sub_domain = CustomDomain(r_l)
                 # Affine origin is span-coord 0 (neutral → coord 0, §5); the
@@ -1496,6 +1501,7 @@ class SteeringManager:
                 # share-weighted ``eff_along`` is unclamped (``norm_cap`` bounds
                 # it in ``subspace_inject``).
                 eff_along_L = shares[L] * _SUBSPACE_GAIN
+                sub_kappa = requested_kappa / eff_along_L
                 manifold_by_layer.setdefault(L, []).append((
                     sub_L, sub_domain, sub_target, sub_origin,
                     eff_along_L, 0.0, sub_kappa, sub_trigger,

@@ -404,7 +404,8 @@ def _branch_inputs(session: "SaklasSession", node_id: str) -> _ReplayBranch:
             thinking=thinking,
             add_generation_prompt=True,
         )
-    prompt_ids = [int(t) for t in prompt_input[0].tolist()]
+    prompt_tensor = cast(torch.Tensor, prompt_input)
+    prompt_ids = [int(t) for t in prompt_tensor[0].tolist()]
 
     response_ids, response_texts = _row_token_ids(node.tokens)
     thinking_ids, _thinking_texts = _row_token_ids(

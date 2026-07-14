@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from saklas.core.errors import SaklasError
 from saklas.core.generation import GenerationConfig
 from saklas.core.results import GenerationResult, RunSet
 from saklas.server.ws_models import WSSamplingParams, build_sampling
@@ -206,6 +207,73 @@ class TestSessions:
         assert session.config.system_prompt == "Be brief."
         assert session.config.thinking is False
         assert resp.json()["config"]["thinking"] is False
+
+    def test_patch_top_k_distinguishes_omitted_from_explicit_null(
+        self, session_and_client: Any,
+    ) -> None:
+        """The dashboard's blank top-k field must really disable the cutoff."""
+        from dataclasses import replace
+
+        session, client = session_and_client
+        session.config = replace(session.config, top_k=40)
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
+            preserved = client.patch(
+                "/saklas/v1/sessions/default", json={"temperature": 0.4},
+            )
+            cleared = client.patch(
+                "/saklas/v1/sessions/default", json={"top_k": None},
+            )
+        assert preserved.status_code == 200
+        assert preserved.json()["config"]["top_k"] == 40
+        assert cleared.status_code == 200
+        assert cleared.json()["config"]["top_k"] is None
+        assert session.config.top_k is None
+
+    def test_validate_steering_parses_and_dry_installs(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/steering/validate",
+            json={"expression": "0.2 default/honest.deceptive@response"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "valid": True,
+            "expression": "0.2 default/honest.deceptive%honest@response",
+            "error": None,
+        }
+        session.steering.assert_called_once()
+
+    def test_validate_steering_returns_expected_errors_in_band(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.steering.side_effect = SaklasError(
+            "No vector registered for ablation target 'definitely_missing'",
+        )
+        resp = client.post(
+            "/saklas/v1/sessions/default/steering/validate",
+            json={"expression": "0.5 !definitely_missing"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "valid": False,
+            "expression": "0.5 !definitely_missing",
+            "error": "No vector registered for ablation target 'definitely_missing'",
+        }
+
+    def test_validate_steering_keeps_empty_as_explicit_unsteered(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/steering/validate",
+            json={"expression": "   "},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"valid": True, "expression": "", "error": None}
+        session.steering.assert_not_called()
 
     @staticmethod
     def _set_family(session: Any, model_type: str) -> None:
@@ -575,6 +643,39 @@ class TestWebSocket:
             assert tokens == ["Hello", " ", "world"]
             assert done["result"]["finish_reason"] == "stop"
             assert "per_token_probes" not in done["result"]
+
+    def test_generate_worker_typed_error_uses_safe_message(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.generate.side_effect = SaklasError("safe generation detail")
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "hi"})
+            assert ws.receive_json()["type"] == "started"
+            error = ws.receive_json()
+
+        assert error["type"] == "error"
+        assert error["message"] == "safe generation detail"
+        assert error["status"] == 500
+
+    def test_generate_worker_untyped_error_is_scrubbed(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.generate.side_effect = RuntimeError("private backend detail")
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "hi"})
+            assert ws.receive_json()["type"] == "started"
+            error = ws.receive_json()
+
+        assert error["type"] == "error"
+        assert error["message"] == (
+            "Generation failed. Check the server log for details."
+        )
+        assert "private backend detail" not in error["message"]
+        assert error["status"] == 500
 
     def test_generate_rejects_unknown_fields(self, session_and_client: Any) -> None:
         _, client = session_and_client

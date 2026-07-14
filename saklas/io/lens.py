@@ -20,11 +20,12 @@ different corpus or mutable model revision reads as stale, and ``n_prompts`` so 
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
 import os
 import struct
+import threading
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -1341,14 +1342,76 @@ def resolved_default_lens_corpus_spec() -> tuple[str, str]:
     )
 
 
-def stream_default_lens_corpus(n: int) -> tuple[list[str], str]:
+def stream_default_lens_corpus(
+    n: int,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[str], str]:
     """Stream ``n`` documents from the default web-text corpus.
 
     Returns ``(documents, corpus_spec)``.  Needs the optional ``datasets``
     dependency (``pip install 'saklas[hf]'``); raises
     :class:`~saklas.core.jlens.JacobianLensError` without it so both the CLI
-    and the fit route surface the same actionable message.
+    and the fit route surface the same actionable message.  When a cancellation
+    event is supplied, Hub resolution and streaming run in an isolated spawned
+    process.  A blocked provider read can therefore be terminated without
+    trapping the server in ``cancelling…`` or leaving provider threads behind.
     """
+    from saklas.core.jlens import JacobianLensCancelled, JacobianLensError
+
+    # CLI callers do not have a cancellation event and retain the direct,
+    # traceback-preserving path.  The server path must be able to return even
+    # if the provider is blocked inside dataset resolution or ``next(stream)``.
+    if cancel_event is None:
+        return _collect_default_lens_corpus(n)
+    if cancel_event.is_set():
+        raise JacobianLensCancelled(
+            "Jacobian-lens fit cancelled while preparing its corpus"
+        )
+
+    process, receiver = _start_default_lens_corpus_process(n)
+    try:
+        while True:
+            if cancel_event.is_set():
+                raise JacobianLensCancelled(
+                    "Jacobian-lens fit cancelled while streaming its corpus"
+                )
+            ready = receiver.poll(0.1)
+            # A click that lands while ``poll`` is waiting must win over a
+            # simultaneously-ready result; once the user asks to cancel, do
+            # not unexpectedly advance into the hours-long estimator phase.
+            if cancel_event.is_set():
+                raise JacobianLensCancelled(
+                    "Jacobian-lens fit cancelled while streaming its corpus"
+                )
+            if ready:
+                payload = receiver.recv()
+                kind = payload[0]
+                if kind == "ok":
+                    return cast(tuple[list[str], str], payload[1])
+                if kind == "typed_error":
+                    raise JacobianLensError(str(payload[1]))
+                raise RuntimeError(
+                    f"default lens corpus worker failed ({payload[1]})"
+                )
+            if not process.is_alive():
+                raise RuntimeError(
+                    "default lens corpus worker exited without a result"
+                )
+    finally:
+        receiver.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        else:
+            process.join(timeout=0)
+
+
+def _collect_default_lens_corpus(n: int) -> tuple[list[str], str]:
+    """Direct provider read, used by CLI and the isolated server worker."""
     from saklas.core.jlens import JacobianLensError
 
     try:
@@ -1359,6 +1422,7 @@ def stream_default_lens_corpus(n: int) -> tuple[list[str], str]:
             "dependency — `pip install 'saklas[hf]'`, or supply a corpus "
             "file (one document per line)"
         ) from e
+
     repo, config = DEFAULT_LENS_CORPUS
     revision, corpus_spec = resolved_default_lens_corpus_spec()
     stream = load_dataset(
@@ -1372,3 +1436,40 @@ def stream_default_lens_corpus(n: int) -> tuple[list[str], str]:
         if len(docs) >= n:
             break
     return docs, corpus_spec
+
+
+def _default_lens_corpus_process(n: int, sender: Any) -> None:
+    """Spawn target that transports only JSON/pickle-safe result payloads."""
+    from saklas.core.jlens import JacobianLensError
+
+    try:
+        payload: tuple[str, object] = ("ok", _collect_default_lens_corpus(n))
+    except JacobianLensError as exc:
+        payload = ("typed_error", str(exc))
+    except BaseException as exc:  # noqa: BLE001 — preserve worker liveness
+        log.exception("default lens corpus worker failed")
+        payload = ("error", type(exc).__name__)
+    try:
+        sender.send(payload)
+    except (BrokenPipeError, EOFError, OSError):
+        # Parent cancellation closes the receive end before terminating us.
+        # Do not turn that expected race into a second worker traceback.
+        pass
+    finally:
+        sender.close()
+
+
+def _start_default_lens_corpus_process(n: int) -> tuple[Any, Any]:
+    """Start a spawn-only provider process, safe beside initialized MPS."""
+    import multiprocessing
+
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_default_lens_corpus_process,
+        args=(n, sender),
+        name="saklas-jlens-corpus",
+    )
+    process.start()
+    sender.close()
+    return process, receiver

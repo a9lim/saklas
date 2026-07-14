@@ -419,6 +419,9 @@ parsed from the engine's `prompt N/M` progress lines). Error text follows
 the SSE scrubbing discipline (typed `user_message()`, else exception type
 only). Generations attempted while the fit holds the model raise through
 the ordinary busy path — surfaced client-side by the sticky WS error toast.
+`DELETE .../lens/fit` cancels either phase: corpus acquisition returns promptly
+even if its provider iterator is blocked, while estimator work stops after the
+current output-dimension VJP block and drains accelerator work before returning.
 
 ### sae_routes.py — sparse-autoencoder routes
 

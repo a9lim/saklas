@@ -1,6 +1,6 @@
 <script lang="ts">
   // Load-conversation drawer — restore from a previously-saved JSON blob.
-  // Mirrors SaveConversationDrawer's v4 whole-tree wire shape exactly.
+  // Mirrors SaveConversationDrawer's v5 whole-tree wire shape exactly.
   // Older active-path-only files are rejected rather than pretending to
   // restore state the server does not own.
 
@@ -27,14 +27,23 @@
     closeDrawer,
     refreshVectorList,
     refreshLoomTree,
-    vectorsState,
     steerRack,
     probeRack,
     attachProbe,
     detachProbe,
     setProbeSortMode,
+    applyCustomSteeringExpression,
+    currentSteeringExpression,
+    addJLensToRack,
+    setJLensAlpha,
+    setJLensTrigger,
+    setJLensEnabled,
+    addSaeToRack,
+    setSaeAlpha,
+    setSaeTrigger,
+    setSaeEnabled,
   } from "../lib/stores.svelte";
-  import { apiTree } from "../lib/api";
+  import { apiSessions, apiTree } from "../lib/api";
   import type { LoomTreeJSON, ProbeSortMode, Trigger, Variant } from "../lib/types";
   import type { SamplingState } from "../lib/stores.svelte";
 
@@ -51,26 +60,47 @@
   let appliedSummary: string | null = $state(null);
   let applying = $state(false);
 
-  interface SteerRowShape {
+  interface BaseSteerRow {
     name: string;
-    mode: "subspace" | "manifold";
-    coords: number[];
-    label: string | null;
-    variant?: Variant;
-    blend?: number;
-    onto?: number;
     trigger: Trigger;
     enabled: boolean;
   }
+  interface SubspaceSteerRow extends BaseSteerRow {
+    mode: "subspace";
+    coords: number[];
+    label: string | null;
+    variant?: Variant;
+  }
+  interface ManifoldSteerRow extends BaseSteerRow {
+    mode: "manifold";
+    coords: number[];
+    label: string | null;
+    blend?: number;
+    onto?: number;
+  }
+  interface JLensSteerRow extends BaseSteerRow {
+    mode: "jlens";
+    alpha: number;
+  }
+  interface SaeSteerRow extends BaseSteerRow {
+    mode: "sae";
+    alpha: number;
+  }
+  type SteerRowShape =
+    | SubspaceSteerRow
+    | ManifoldSteerRow
+    | JLensSteerRow
+    | SaeSteerRow;
 
   interface SnapshotShape {
-    version: 4;
+    version: 5;
     savedAt: string;
     model_id: string;
     session_id: string;
     tree: LoomTreeJSON;
     steerRack: SteerRowShape[];
     subspaceAlong: number;
+    customSteeringExpression: string | null;
     probeRack: {
       sortMode: string;
       active: string[];
@@ -93,7 +123,7 @@
   function isSnapshotShape(v: unknown): v is SnapshotShape {
     if (!v || typeof v !== "object") return false;
     const obj = v as Record<string, unknown>;
-    if (obj.version !== 4 || typeof obj.savedAt !== "string") return false;
+    if (obj.version !== 5 || typeof obj.savedAt !== "string") return false;
     if (typeof obj.model_id !== "string" || typeof obj.session_id !== "string") return false;
     if (!obj.tree || typeof obj.tree !== "object" || !Array.isArray(obj.steerRack)) return false;
     const tree = obj.tree as Record<string, unknown>;
@@ -107,6 +137,8 @@
       || !tree.children_of || typeof tree.children_of !== "object"
       || !tree.cast || typeof tree.cast !== "object") return false;
     if (typeof obj.subspaceAlong !== "number") return false;
+    if (!(typeof obj.customSteeringExpression === "string"
+      || obj.customSteeringExpression === null)) return false;
     if (!obj.probeRack || typeof obj.probeRack !== "object") return false;
     const probes = obj.probeRack as Record<string, unknown>;
     if (!(probes.sortMode === "name" || probes.sortMode === "value" || probes.sortMode === "change")) return false;
@@ -134,13 +166,16 @@
       if (!raw || typeof raw !== "object") return false;
       const row = raw as Record<string, unknown>;
       const common = typeof row.name === "string"
-        && (row.mode === "subspace" || row.mode === "manifold")
-        && Array.isArray(row.coords)
-        && row.coords.every((x) => typeof x === "number")
-        && (typeof row.label === "string" || row.label === null)
         && typeof row.trigger === "string"
         && typeof row.enabled === "boolean";
       if (!common) return false;
+      if (row.mode === "jlens" || row.mode === "sae") {
+        return typeof row.alpha === "number";
+      }
+      if (row.mode !== "subspace" && row.mode !== "manifold") return false;
+      if (!Array.isArray(row.coords)
+        || !row.coords.every((x) => typeof x === "number")
+        || !(typeof row.label === "string" || row.label === null)) return false;
       return row.mode === "subspace"
         ? typeof row.variant === "string"
         : typeof row.blend === "number" && typeof row.onto === "number";
@@ -172,7 +207,7 @@
     }
     if (!isSnapshotShape(json)) {
       parseError =
-        "unsupported conversation file: expected the complete saklas conversation schema version 4";
+        "unsupported conversation file: expected the complete saklas conversation schema version 5";
       return;
     }
     parsed = json;
@@ -196,9 +231,36 @@
 
       const steerRows = parsed.steerRack;
       steerRack.entries.clear();
+      // Reset both recipe representations before rebuilding.  A saved visual
+      // rack is allowed to be empty; without this explicit reset, loading that
+      // file while an advanced expression was active silently kept the old
+      // expression because no add-card call existed to leave custom mode.
+      steerRack.customExpression = null;
       setSubspaceAlong(parsed.subspaceAlong);
       for (const row of steerRows) {
         const name = row.name;
+        if (row.mode === "jlens") {
+          addJLensToRack(name);
+          setJLensAlpha(name, row.alpha);
+          setJLensTrigger(name, row.trigger);
+          if (row.enabled === false) setJLensEnabled(name, false);
+          appliedTerms++;
+          continue;
+        }
+        if (row.mode === "sae") {
+          const featureId = Number(name.replace(/^sae\//, ""));
+          if (!Number.isInteger(featureId) || featureId < 0) {
+            warnings = [...warnings, `skipped invalid SAE term ${name}`];
+            skippedTerms++;
+            continue;
+          }
+          addSaeToRack(featureId);
+          setSaeAlpha(name, row.alpha);
+          setSaeTrigger(name, row.trigger);
+          if (row.enabled === false) setSaeEnabled(name, false);
+          appliedTerms++;
+          continue;
+        }
         if (row.mode === "manifold") {
           addManifoldToRack(name);
           if (row.label !== null) setManifoldLabel(name, row.label);
@@ -218,22 +280,8 @@
         if (row.enabled === false) setSubspaceEnabled(name, false);
         appliedTerms++;
       }
-      // Sanity-check against the server's known set; surface a warning
-      // for terms that aren't currently registered.  Informational only —
-      // the rack carries them as-is.
-      try {
-        const known = vectorsState.names;
-        for (const row of steerRows) {
-          if (typeof row?.name !== "string") continue;
-          if (known.length > 0 && !known.includes(row.name)) {
-            skippedTerms++;
-            warnings.push(
-              `'${row.name}' not registered server-side; present in rack but won't apply at gen time`,
-            );
-          }
-        }
-      } catch {
-        /* ignore */
+      if (parsed.customSteeringExpression !== null) {
+        applyCustomSteeringExpression(parsed.customSteeringExpression);
       }
       for (const [k, v] of Object.entries(parsed.samplingState)) {
         if (k in samplingState) {
@@ -267,7 +315,24 @@
         }
       }
 
-      appliedSummary = `restored ${appliedTurns} turn${appliedTurns === 1 ? "" : "s"}, ${appliedTerms} term${appliedTerms === 1 ? "" : "s"}${skippedTerms ? ` (${skippedTerms} not server-known)` : ""}, ${appliedSampling} sampling field${appliedSampling === 1 ? "" : "s"}`;
+      // Verify the reconstructed recipe through the same resolve + dry-install
+      // path used by the recipe editor. A name-list comparison is not valid
+      // here: SAE and J-LENS atoms are registered lazily and therefore never
+      // appear in the ordinary vector catalog even when they are fully usable.
+      // The old check produced a false "won't apply" warning after restoring
+      // exactly those supported terms.
+      const recipe = currentSteeringExpression();
+      if (recipe) {
+        const validation = await apiSessions.validateSteering(recipe);
+        if (!validation.valid) {
+          warnings = [
+            ...warnings,
+            `recipe needs attention: ${validation.error ?? "validation failed"}`,
+          ];
+        }
+      }
+
+      appliedSummary = `restored ${appliedTurns} turn${appliedTurns === 1 ? "" : "s"}, ${appliedTerms} term${appliedTerms === 1 ? "" : "s"}${skippedTerms ? ` (${skippedTerms} skipped)` : ""}, ${appliedSampling} sampling field${appliedSampling === 1 ? "" : "s"}`;
     } catch (e) {
       parseError = `restore failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {

@@ -78,6 +78,9 @@
     Number.isInteger(fitPrompts) && fitPrompts >= 1 && fitPrompts <= 5000 &&
       fitLayers.trim().length > 0,
   );
+  const fitIsPreparing = $derived(
+    (lensFitState.message ?? "").startsWith("streaming "),
+  );
 
   function requestFit(): void {
     if (!fitConfirm) {
@@ -454,7 +457,15 @@
               color="var(--accent-blue)"
             />
           </div>
-          <p class="hint">generation paused · resumable</p>
+          <p class="hint">
+            {#if lensFitState.cancelling}
+              stopping background work…
+            {:else if fitIsPreparing}
+              generation available during corpus setup
+            {:else}
+              generation paused during model fitting
+            {/if}
+          </p>
           <Button
             size="sm"
             variant="danger"

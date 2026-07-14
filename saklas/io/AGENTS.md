@@ -499,6 +499,12 @@ power-loss rollback to a pointer whose payload was already collected. A dedicate
 per-model `jlens.fit` lock spans preflight, estimator/checkpoint work, final
 publication, and lifecycle removal across processes. Metadata-only
 final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.
+The default FineWeb-Edu streamer accepts a fit cancellation event. On the
+server path, Hub resolution and iteration live in a spawn-only subprocess so a
+provider call blocked below Python can be terminated without leaving the
+dashboard or shutdown stuck at `cancelling…`. Spawn is deliberate: forking the
+already-loaded MPS process is unsafe, while a detached provider thread can leave
+its own non-daemon workers behind.
 `lens_paths` /
 `lens_checkpoint_paths` / `save_lens` / `save_lens_checkpoint_accumulator` /
 `load_lens` /

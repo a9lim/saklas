@@ -366,7 +366,7 @@ Svelte 5's `$state` does NOT track `Map.set` / `Set.add` / inner-object property
 
 The server loom tree is authoritative. The browser keeps a first-paint cache of the latest `LoomTreeJSON` plus `highlightState` in `localStorage` under `saklas.chat.v3.<model_id>`; only that exact version and the server's list-shaped `nodes` wire are accepted. There is no flat-log migration or synthetic tree hydration. Saves are debounced ~250 ms after mutations, and `refreshLoomTree()` overwrites the cache with server state once the required tree endpoint responds. `pendingIndex` is force-cleared on restore so an in-flight turn from a killed tab can't ghost the UI.
 
-Downloaded conversations likewise use one exact schema (`version: 3`): complete chat, steering rack, probe rack, highlight, and sampling sections are required. Loading an older or partial file is a visible error; the client never translates `vectorRack`, per-vector `alpha`, projection, or ablation fields.
+Downloaded conversations likewise use one exact schema (`version: 5`): complete Loom tree, visual steering rack (or an authoritative custom full-grammar expression), probe rack, highlight, and sampling sections are required. Loading an older or partial file is a visible error; the client never guesses at missing state.
 
 ## Per-token highlighting
 

@@ -31,7 +31,6 @@
   const PLACEHOLDER = {
     temperature: 1.0,
     top_p: 1.0,
-    top_k: 1024,
     max_tokens: 512,
   };
 
@@ -86,7 +85,7 @@
 
   const tempView = $derived(samplingState.temperature ?? PLACEHOLDER.temperature);
   const topPView = $derived(samplingState.top_p ?? PLACEHOLDER.top_p);
-  const topKView = $derived(samplingState.top_k ?? PLACEHOLDER.top_k);
+  const topKView = $derived<number | null>(samplingState.top_k);
   const maxView = $derived(samplingState.max_tokens || PLACEHOLDER.max_tokens);
   const presenceView = $derived(samplingState.presence_penalty);
   const frequencyView = $derived(samplingState.frequency_penalty);
@@ -104,7 +103,7 @@
     body: Partial<{
       temperature: number;
       top_p: number;
-      top_k: number;
+      top_k: number | null;
       max_tokens: number;
       thinking: boolean;
     }>,
@@ -127,7 +126,11 @@
   }
 
   function onTopK(raw: number | null): void {
-    if (raw === null) return;
+    if (raw === null) {
+      setSampling("top_k", null);
+      void persistDefault({ top_k: null });
+      return;
+    }
     const v = Math.max(TOP_K_MIN, Math.min(TOP_K_MAX, Math.floor(raw)));
     setSampling("top_k", v);
     void persistDefault({ top_k: v });
@@ -227,7 +230,7 @@
 
   <!-- Row 2: top-k, repetition (frequency) penalty, presence penalty -->
   <div class="row">
-    <label class="control" title="top-k">
+    <label class="control" title="top-k (blank = disabled)">
       <span class="label">K</span>
       <span class="num-cell">
         <NumberInput
@@ -235,6 +238,8 @@
           min={TOP_K_MIN}
           max={TOP_K_MAX}
           step={1}
+          placeholder="—"
+          allowEmpty
           disabled={!ready}
           onchange={onTopK}
           ariaLabel="top-k"

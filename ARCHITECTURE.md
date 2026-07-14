@@ -579,9 +579,9 @@ Each trigger group is composed by `synthesize_subspace(push, ablate,
 neutral_means, *, whitener)` into one `SynthesizedSubspace`. Per layer (over the
 union of layers any term touches):
 
-1. Flatten every present push fragment's basis rows, then every ablation
-   fragment's rows, into one ordered list (push first); orthonormalize the union
-   (`_ortho_basis`) → the merged `(R, D)` basis `B`.
+1. Build the active push span first. Project ablation rows out of that span so a
+   push wins any shared direction; cancelled/zero pushes do not suppress an
+   ablation on the same axis.
 2. **Whitened-normalized push** (the session always passes `self.whitener`; gated
    all-or-nothing on `covers_all`). Each push fragment's raw neutral→node
    direction `dirᵢ = coord_targetᵢ @ basis_rowsᵢ` is unit-normalized **in the
@@ -589,12 +589,13 @@ union of layers any term touches):
    summed: `target_coord = Σᵢ coeffᵢ·(B@dirᵢ)/‖dirᵢ‖_M`. This *strips the raw node
    distance* from the direction (only the unit whitened bearing survives) while
    keeping α as the strength. The ablation-only axes carry `target ≈ 0`.
-3. Per-axis collapse mask `κ` (R,): `0` on the push span, `1` on the
-   ablation-only complement, derived as `κ = 1 − ‖proj onto push span‖²` (robust
-   to orthonormalization order). The kernel *translates* push axes by the fixed
-   offset but *collapses* `κ=1` axes toward 0 — a `target ≈ 0` alone no longer
-   removes an ablated direction (translate-by-offset would leave it untouched), so
-   κ is what does the ablation post translate-not-collapse.
+3. On the ablation-only complement, form the exact symmetric collapse operator
+   `A = Σᵢ αᵢuᵢuᵢᵀ` and diagonalize its tiny reduced matrix (on CPU for MPS
+   compatibility). Its eigenvectors join the merged basis and its signed
+   eigenvalues become per-axis `κ`; push axes use `κ=0`. This preserves partial,
+   repeated, negative, and non-orthogonal ablation coefficients exactly. The
+   apply path gain-compensates them so the kernel product is the requested α,
+   not the rack's global affine gain.
 4. `share = ‖Δ‖_M` — the **whitened** magnitude of the raw coeff-weighted
    displacement `Δ = Σ coeffᵢ·dirᵢ`; this is the per-layer *profile* (the absolute
    node-distance scale cancels under apply-time mean-1 normalization, leaving only
@@ -673,8 +674,9 @@ residual, then applies two operations:
   approximate foot — corrupting any off-neutral activation by 20–150% with *zero*
   steering, compounding across layers into degenerate looping.) Tangential/
   directional; by moving *on the surface* it never cuts through off-manifold
-  low-density space. A per-axis collapse mask `κ` (§4) overrides this for ablation
-  axes (`κ=1`): those collapse toward 0 instead of translating.
+  low-density space. A per-axis collapse coefficient `κ` (§4) overrides this for
+  ablation axes: those collapse by their requested signed fraction instead of
+  translating.
 - **onto (`o ∈ [0,1]`)** — scale `H_n` by `(1 − o)`: collapse the off-surface
   in-subspace residual onto the surface. Vacuous when the surface fills its
   subspace.
@@ -698,9 +700,10 @@ exactly, `H_n ≡ 0`, and `onto` is vacuous. So the kernel skips the Gauss-Newto
 foot solve, the RBF eval, and the tangent Gram-solve — it computes
 `p_new = q + a·(target − κ·q)` and keeps `H_o` verbatim. The per-axis κ from
 `synthesize_subspace` selects per axis: `κ=0` push axes translate by the fixed
-`a·target` offset (preserving per-token spread), `κ=1` ablation axes do
-`q + a·(0 − q)` (collapse the component toward 0), so push and ablation share one
-analytic op. This is load-bearing for throughput: a folded vector is the common
+`a·target` offset (preserving per-token spread), while ablation axes use the
+gain-compensated coefficient that makes `a·κ` equal the user's signed α. Full
+α=1 does `q + (0 − q)`; partial α blends toward 0. Push and ablation therefore
+share one analytic op. This is load-bearing for throughput: a folded vector is the common
 case and the curved per-token solve would blow the throughput invariant. The
 affine branch also drops the `norm_cap` — the displacement `(p_new − q)@basis` is
 bounded and added to a large-norm residual, so it can't push `‖h_new‖` past the

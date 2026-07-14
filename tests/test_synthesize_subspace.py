@@ -138,6 +138,32 @@ def test_two_orthogonal_pushes_independent_axes():
     assert torch.allclose(synth.target_coord[1], torch.tensor([0.3, 0.2]), atol=1e-5)
 
 
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="mixed CPU-provider/MPS-runtime regression requires MPS",
+)
+def test_provider_fragments_follow_runtime_layer_device():
+    """CPU-backed external artifacts compose on an MPS model layer.
+
+    Provider J-lens/SAE tensors are intentionally loaded on CPU and promoted
+    lazily.  The dispatch synthesizer is the artifact-family join point, so it
+    owns the final co-location guarantee instead of requiring every provider
+    adapter to have identical promotion timing.
+    """
+    u = _unit(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    v = _unit(torch.tensor([4.0, -3.0, 2.0, -1.0]))
+    neutral = torch.zeros(4, device="mps")
+    synth = synthesize_subspace(
+        push=[({0: _row(u)}, {0: torch.tensor([1.0])}, 0.3)],
+        ablate=[({0: v}, 0.2)],
+        neutral_means={0: neutral},
+    )
+    assert synth.layers[0].basis.device.type == "mps"
+    assert synth.layers[0].mean.device.type == "mps"
+    assert synth.target_coord[0].device.type == "mps"
+    assert synth.kappa[0].device.type == "mps"
+
+
 def test_share_is_displacement_magnitude():
     torch.manual_seed(3)
     uh = _unit(torch.randn(16))
@@ -197,7 +223,7 @@ def test_ablation_axis_gets_zero_target():
     ua = _unit(ua - (ua @ uh) * uh)       # ablate dir ⟂ push dir
     synth = synthesize_subspace(
         push=[({2: _row(uh)}, {2: torch.tensor([1.0])}, 0.6)],
-        ablate=[{2: ua}], neutral_means={2: torch.zeros(16)},
+        ablate=[({2: ua}, 1.0)], neutral_means={2: torch.zeros(16)},
     )
     sub = synth.layers[2]
     assert sub.rank == 2                   # spans push ∪ ablate
@@ -212,7 +238,7 @@ def test_pure_ablation_zero_target_basis_spans():
     ua = _unit(torch.randn(10))
     ba = 2.5 * ua
     synth = synthesize_subspace(
-        push=[], ablate=[{4: ba}], neutral_means={4: torch.zeros(10)},
+        push=[], ablate=[({4: ba}, 1.0)], neutral_means={4: torch.zeros(10)},
     )
     sub = synth.layers[4]
     assert sub.rank == 1
@@ -264,7 +290,7 @@ def test_synthesized_subspace_drives_subspace_inject():
     neutral = torch.zeros(D)
     synth = synthesize_subspace(
         push=[({0: _row(uh)}, {0: torch.tensor([1.0])}, 0.5)],
-        ablate=[{0: ua}], neutral_means={0: neutral},
+        ablate=[({0: ua}, 1.0)], neutral_means={0: neutral},
     )
     sub = synth.layers[0]
     domain = CustomDomain(sub.rank)

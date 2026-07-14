@@ -6,6 +6,7 @@ import hashlib
 
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from saklas.core.jlens import JacobianLens
+from saklas.core.jlens import JacobianLens, JacobianLensCancelled
 from saklas.io.lens import (
     LENS_FORMAT_VERSION,
     lens_artifact_size,
@@ -29,6 +30,7 @@ from saklas.io.lens import (
     promote_lens_checkpoint,
     save_lens,
     save_lens_checkpoint_accumulator,
+    stream_default_lens_corpus,
 )
 from saklas.io.paths import safe_model_id
 
@@ -37,6 +39,118 @@ _MODEL = "test-org/tiny-model"
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def test_default_corpus_cancel_does_not_wait_for_blocked_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The web cancel button must not depend on a blocked Hub read returning."""
+    import saklas.io.lens as lens_io
+
+    provider_entered = threading.Event()
+    cancelled = threading.Event()
+
+    class BlockedProcess:
+        alive = True
+        terminated = False
+        joined = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.alive = False
+
+        def kill(self) -> None:
+            self.alive = False
+
+        def join(self, timeout: float = 0) -> None:
+            del timeout
+            self.joined = True
+
+    class EmptyReceiver:
+        closed = False
+
+        def poll(self, timeout: float) -> bool:
+            provider_entered.set()
+            time.sleep(timeout)
+            return False
+
+        def recv(self) -> object:
+            raise AssertionError("blocked provider has no result")
+
+        def close(self) -> None:
+            self.closed = True
+
+    process = BlockedProcess()
+    receiver = EmptyReceiver()
+    monkeypatch.setattr(
+        lens_io,
+        "_start_default_lens_corpus_process",
+        lambda _n: (process, receiver),
+    )
+
+    def request_cancel() -> None:
+        assert provider_entered.wait(timeout=1)
+        cancelled.set()
+
+    threading.Thread(target=request_cancel, daemon=True).start()
+    started = time.monotonic()
+    with pytest.raises(JacobianLensCancelled, match="streaming its corpus"):
+        stream_default_lens_corpus(1, cancel_event=cancelled)
+    assert time.monotonic() - started < 1.0
+    assert process.terminated and process.joined
+    assert receiver.closed
+
+
+def test_default_corpus_cancel_wins_a_simultaneously_ready_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel arriving during poll must not start the estimator afterward."""
+    import saklas.io.lens as lens_io
+
+    cancelled = threading.Event()
+
+    class FinishedProcess:
+        def is_alive(self) -> bool:
+            return False
+
+        def terminate(self) -> None:
+            raise AssertionError("completed worker must not be terminated")
+
+        def kill(self) -> None:
+            raise AssertionError("completed worker must not be killed")
+
+        def join(self, timeout: float = 0) -> None:
+            del timeout
+
+    class ReadyReceiver:
+        closed = False
+
+        def poll(self, timeout: float) -> bool:
+            del timeout
+            cancelled.set()
+            return True
+
+        def recv(self) -> object:
+            raise AssertionError("cancel must win over the queued result")
+
+        def close(self) -> None:
+            self.closed = True
+
+    receiver = ReadyReceiver()
+    monkeypatch.setattr(
+        lens_io,
+        "_start_default_lens_corpus_process",
+        lambda _n: (FinishedProcess(), receiver),
+    )
+
+    with pytest.raises(JacobianLensCancelled, match="streaming its corpus"):
+        stream_default_lens_corpus(1, cancel_event=cancelled)
+    assert receiver.closed
+
+
 _D = 8
 
 

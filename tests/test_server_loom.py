@@ -401,8 +401,9 @@ class _StubSession:
         raw: bool = False, role_label: Any = None, thinking: Any = None,
     ):
         from saklas.core.session import SaklasSession
-        return SaklasSession.append_turn(  # type: ignore[arg-type]
-            self, parent_node_id, text, seat=seat, raw=raw,
+        return SaklasSession.append_turn(
+            self,  # pyright: ignore[reportArgumentType]
+            parent_node_id, text, seat=seat, raw=raw,
             role_label=role_label, thinking=thinking,
         )
 

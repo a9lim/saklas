@@ -152,10 +152,12 @@ class TestSaeRoutes:
         )
         assert resp.status_code == 202
         assert resp.json()["release"] == "saelens:scope"
+        status: dict[str, Any] = {}
         for _ in range(20):
             status = client.get("/saklas/v1/sessions/default/sae/load").json()
             if not status["running"]:
                 break
+        assert status
         assert status["error"] is None
         session.enable_live_sae.assert_called_once_with(top_k=12)
 
@@ -1387,7 +1389,9 @@ class TestLensFitLifecycle:
         _, client = session_and_client
         monkeypatch.setattr(
             "saklas.io.lens.stream_default_lens_corpus",
-            lambda _n: (["a prompt that is long enough."], "test"),
+            lambda _n, *, cancel_event=None: (
+                ["a prompt that is long enough."], "test"
+            ),
         )
         response = client.post(
             "/saklas/v1/sessions/default/lens/fit",

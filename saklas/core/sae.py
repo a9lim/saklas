@@ -526,6 +526,7 @@ def load_sae_backend(
     model_id: str,
     device: str | torch.device,
     dtype: torch.dtype | None = None,
+    warn_on_multiple: bool = True,
 ) -> SaeLensBackend | LocalSaeBackend:
     """Resolve a local artifact or SAELens release to a lazy backend.
 
@@ -605,6 +606,7 @@ def load_sae_backend(
         int(hook_layer): sae_id
         for sae_id, hook_layer in _canonical_layer_map(
             saes_map,
+            warn=warn_on_multiple,
             neuronpedia_ids=(
                 neuronpedia_raw if isinstance(neuronpedia_raw, Mapping) else None
             ),

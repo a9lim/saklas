@@ -69,7 +69,11 @@ batches when the overlap buffer itself causes OOM. If a later VJP OOMs the graph
 is rebuilt at the first uncommitted row. A fully unsynced
 MPS loop can still let the CPU enqueue too far
 ahead, so the pass loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4), and
-zero rows raise before a stripe is committed. Prompt/dimension widths halve
+zero rows raise before a stripe is committed. Cooperative cancellation is also
+checked before and after every output-dimension VJP block (not merely after a
+complete prompt microbatch); accelerator queues and pending CUDA transfers are
+drained before the active group's partial sums are abandoned, so the web cancel
+control remains responsive even when `prompt_batch > 1`. Prompt/dimension widths halve
 independently on OOM and stay below the proven failure ceiling. The fit is
 compute-bound; `source_layers` restriction is
 the one real wall-time lever (1.73× for the 40–90% band).
@@ -510,7 +514,10 @@ project-onto-normal + renorm that corrupted off-neutral activations every fire),
 onto shrinks `H_n` toward the zero-thickness wire on legacy/no-σ fits or toward
 the local fuzzy σ-tube when present, `H_o` kept). MGS orthonormalization + a CPU-hopped
 `n×n` SVD keep it MPS-safe (`linalg.qr`/`svd` are unimplemented/`fallback` on
-Metal). `synthesize_subspace` emits the κ mask (0 push / 1 ablate).
+Metal). `synthesize_subspace` emits per-axis κ coefficients: 0 on push axes and
+the exact signed ablation-operator eigenvalues on the ablation complement
+(partial/repeated/non-orthogonal terms preserved; the tiny eigensolve CPU-hops
+for MPS). Hook-time gain compensation keeps `along·κ` equal to the user α.
 `norm_cap = 3·‖h‖` is the only norm guard. `invert_parameterization` is the cold/eval-only damped-LM nearest-
 point projection.
 

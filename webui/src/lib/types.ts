@@ -1638,6 +1638,10 @@ export interface ProbeRackEntry {
   /** End-of-gen aggregate the ``done`` event lands — the settled reading.
    *  Null between gens; set on ``done``, cleared on the next ``started``. */
   aggregate: ProbeReadingJSON | null;
+  /** Scalar aggregate restored from the selected saved Loom node.  The tree
+   * keeps this portable summary but not the full per-layer reading; cards use
+   * it instead of presenting a false zero after reload/navigation. */
+  savedAggregate: number | null;
   /** Most-recent per-token nearest list (ascending distance).  Drives the
    *  inline nearest readout + mini-map hover; empty until the first token. */
   nearest: [string, number][];

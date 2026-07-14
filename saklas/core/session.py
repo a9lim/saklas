@@ -3768,7 +3768,7 @@ class SaklasSession:
         ):
             backend = load_sae_backend(
                 release, model_id=self.model_id, device=self._device,
-                dtype=self._dtype,
+                dtype=self._dtype, warn_on_multiple=False,
             )
             if (
                 isinstance(backend, LocalSaeBackend)

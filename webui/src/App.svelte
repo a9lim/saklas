@@ -46,9 +46,11 @@
   ]);
 
   type BootStatus = "loading" | "ready" | "failed";
+  type CompactView = "threads" | "chat" | "rack";
   let bootStatus: BootStatus = $state("loading");
   let bootError: string | null = $state(null);
   let drawerEl: HTMLElement | null = $state(null);
+  let compactView: CompactView = $state("chat");
 
   const FOCUSABLE = [
     "button:not([disabled])",
@@ -233,15 +235,51 @@
       inert={paletteState.open || bootStatus !== "ready"}
       aria-busy={bootStatus === "loading"}
     >
-      <section class="loom-zone" aria-label="Threads" inert={drawerState.open !== null}>
+      <nav class="compact-nav" aria-label="Workbench views">
+        <button
+          type="button"
+          class:active={compactView === "threads"}
+          aria-pressed={compactView === "threads"}
+          onclick={() => (compactView = "threads")}
+        >threads</button>
+        <button
+          type="button"
+          class:active={compactView === "chat"}
+          aria-pressed={compactView === "chat"}
+          onclick={() => (compactView = "chat")}
+        >chat</button>
+        <button
+          type="button"
+          class:active={compactView === "rack"}
+          aria-pressed={compactView === "rack"}
+          onclick={() => (compactView = "rack")}
+        >instruments</button>
+      </nav>
+
+      <section
+        class="loom-zone"
+        class:compact-active={compactView === "threads"}
+        aria-label="Threads"
+        inert={drawerState.open !== null}
+      >
         <LoomSidebar />
       </section>
 
-      <section class="chat-zone" aria-label="Chat" inert={drawerState.open !== null}>
+      <section
+        class="chat-zone"
+        class:compact-active={compactView === "chat"}
+        aria-label="Chat"
+        inert={drawerState.open !== null}
+      >
         <Chat />
       </section>
 
-      <section class="rack-zone" aria-label="Control rack" inert={drawerState.open !== null}>
+      <section
+        class="rack-zone"
+        class:compact-active={compactView === "rack"}
+        aria-label="Control rack"
+        inert={drawerState.open !== null}
+      >
         <InspectorPanel />
       </section>
 
@@ -362,8 +400,8 @@
     grid-template-rows: 1fr;
     height: 100vh;
     width: 100vw;
-    min-width: 1280px;
-    min-height: 720px;
+    min-width: 0;
+    min-height: 0;
     background: var(--bg);
     color: var(--fg);
     overflow: hidden;
@@ -423,6 +461,9 @@
      * and the chat/rack content visibly shifts left then snaps back. */
     overflow: hidden;
   }
+  .compact-nav {
+    display: none;
+  }
   .loom-zone {
     background: var(--bg-alt);
     overflow: hidden;
@@ -447,6 +488,67 @@
   .rack-zone {
     min-height: 0;
     overflow: hidden;
+  }
+
+  /* Below the three-column cockpit's honest 1280px floor, turn the same
+   * three primary surfaces into explicit full-width views.  The previous
+   * fixed ``min-width: 1280px`` silently cropped the inspector (and most of
+   * chat on a phone), with no horizontal scrollbar or way to reach it.
+   * This keeps every workflow available without shrinking dense scientific
+   * controls into illegibility. */
+  @media (max-width: 1279px) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 0;
+    }
+    .compact-nav {
+      grid-column: 1;
+      grid-row: 1;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      padding: var(--space-2);
+      background: var(--bg-deep);
+      border-bottom: 1px solid var(--grid-line);
+      z-index: 1;
+    }
+    .compact-nav button {
+      min-width: 0;
+      padding: var(--space-3) var(--space-2);
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--fg-muted);
+      font: inherit;
+      font-family: var(--font-mono);
+      font-size: var(--text-sm);
+      text-transform: lowercase;
+      cursor: pointer;
+    }
+    .compact-nav button:hover {
+      color: var(--fg-strong);
+      background: var(--glass);
+    }
+    .compact-nav button.active {
+      color: var(--fg-strong);
+      background: var(--glass-strong);
+      border-color: var(--glass-line);
+    }
+    .loom-zone,
+    .chat-zone,
+    .rack-zone {
+      grid-column: 1;
+      grid-row: 2;
+      display: none;
+      min-width: 0;
+    }
+    .loom-zone.compact-active,
+    .chat-zone.compact-active,
+    .rack-zone.compact-active {
+      display: flex;
+      flex-direction: column;
+    }
   }
 
   /* Sheet host — analysis tools float in from the right as a rounded
@@ -579,5 +681,20 @@
   }
   .retry:hover {
     background: var(--accent-subtle);
+  }
+
+  /* Drawer base rules are declared after the compact layout block, so keep
+   * this size override at the end of the cascade. */
+  @media (max-width: 1279px) {
+    .drawer {
+      top: var(--space-2);
+      right: var(--space-2);
+      bottom: var(--space-2);
+      width: calc(100% - 2 * var(--space-2));
+      max-width: 980px;
+    }
+    .drawer.narrow {
+      width: min(480px, calc(100% - 2 * var(--space-2)));
+    }
   }
 </style>

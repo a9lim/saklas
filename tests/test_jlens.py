@@ -663,6 +663,82 @@ def test_fit_cancellation_persists_completed_prefix_and_removes_hooks() -> None:
     assert all(not layer._forward_pre_hooks for layer in _layers(model))
 
 
+def test_fit_cancellation_interrupts_an_active_prompt_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A width-2 fit must not make cancel wait for both full prompt sweeps."""
+    import threading
+
+    import saklas.core.jlens as jlens_module
+    from saklas.core.jlens import JacobianLensCancelled
+
+    model = _frozen_model(n_layers=2)
+    event = threading.Event()
+    real_block = jlens_module._grad_row_block
+    grad_calls = 0
+
+    def _cancel_after_first_block(*args: Any, **kwargs: Any) -> Any:
+        nonlocal grad_calls
+        result = real_block(*args, **kwargs)
+        grad_calls += 1
+        event.set()
+        return result
+
+    monkeypatch.setattr(
+        jlens_module, "_grad_row_block", _cancel_after_first_block,
+    )
+    with pytest.raises(JacobianLensCancelled, match="active prompt group"):
+        fit_jacobian_lens(
+            model,
+            _CharTokenizer(),
+            ["a prompt that is long enough."] * 2,
+            _layers(model),
+            dim_batch=1,
+            prompt_batch=2,
+            cancel_event=event,
+        )
+
+    assert grad_calls == 1
+    assert all(not layer._forward_hooks for layer in _layers(model))
+    assert all(not layer._forward_pre_hooks for layer in _layers(model))
+
+
+def test_fit_cancellation_after_terminal_group_prevents_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel in the final return window must not be silently ignored."""
+    import threading
+
+    import saklas.core.jlens as jlens_module
+    from saklas.core.jlens import JacobianLensCancelled
+
+    model = _frozen_model(n_layers=2)
+    event = threading.Event()
+    real_accumulate = jlens_module._accumulate_prompt_jacobian
+
+    def _cancel_at_group_return(*args: Any, **kwargs: Any) -> Any:
+        result = real_accumulate(*args, **kwargs)
+        event.set()
+        return result
+
+    monkeypatch.setattr(
+        jlens_module, "_accumulate_prompt_jacobian", _cancel_at_group_return,
+    )
+    with pytest.raises(JacobianLensCancelled, match="after the active"):
+        fit_jacobian_lens(
+            model,
+            _CharTokenizer(),
+            ["a prompt that is long enough."] * 2,
+            _layers(model),
+            dim_batch=3,
+            prompt_batch=2,
+            cancel_event=event,
+        )
+
+    assert all(not layer._forward_hooks for layer in _layers(model))
+    assert all(not layer._forward_pre_hooks for layer in _layers(model))
+
+
 def test_source_layers_must_precede_final() -> None:
     model = _frozen_model(n_layers=2)
     with pytest.raises(ValueError, match="source_layers"):

@@ -86,12 +86,16 @@
   async function onUnpin(): Promise<void> {
     if (unpinBusy) return;
     unpinBusy = true;
+    // Unpinning destroys this keyed card. Capture its reactive identity before
+    // the request so the completion path never reads a derived owned by the
+    // now-destroyed component effect (Svelte's `derived_inert` warning).
+    const featureName = name;
     try {
-      await detachProbe(name);
-      pushToast(`unpinned ${name}`, { kind: "info" });
+      await detachProbe(featureName);
+      pushToast(`unpinned ${featureName}`, { kind: "info" });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      pushToast(`unpin ${name} failed — ${msg}`, {
+      pushToast(`unpin ${featureName} failed — ${msg}`, {
         kind: "error",
         ttlMs: null,
       });

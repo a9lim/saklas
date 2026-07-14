@@ -2303,11 +2303,14 @@ class SynthesizedSubspace:
     Per layer the subspace spans the union of every active term's directions
     (push + ablation).  The ``along`` step **translates** the foot by the
     ``target_coord`` offset on each *push* axis (preserving the per-token
-    spread → coherent strong steer) and **collapses** the foot to ``0`` on each
-    *ablation* axis (removing the ablated component).  ``kappa`` is the per-axis
-    blend that selects which is which (``0`` push / translate, ``1`` ablate /
-    collapse): the kernel applies ``target − κ⊙q``, so push axes ignore ``q``
-    (fixed offset) while ablation axes drive ``q`` toward ``0``.  ``share`` is the
+    spread → coherent strong steer) and **collapses** the foot toward ``0`` on
+    each *ablation* axis (removing the requested fraction of that component).
+    ``kappa`` stores the requested per-axis ablation coefficient: ``0`` on push
+    axes, ``1`` for full mean replacement, fractional for partial ablation, and
+    signed/outside ``[0, 1]`` for the grammar's extrapolating forms.  The hook
+    divides it by the affine push gain before calling the shared kernel, so the
+    kernel's ``along · kappa`` product is exactly the user coefficient rather
+    than the affine steering gain.  ``share`` is the
     un-normalized per-layer budget weight — the push-displacement magnitude
     ``‖Δ_L‖_M`` under the required covering whitener; a pure-ablation layer
     weights by the summed
@@ -2322,7 +2325,7 @@ class SynthesizedSubspace:
     layers: dict[int, "LayerSubspace"]        # affine: mean = neutral_L, basis = ortho span
     target_coord: dict[int, torch.Tensor]     # (R_L,) the along target (poles / 0)
     share: dict[int, float]                   # ‖Δ_L‖, un-normalized budget weight
-    kappa: dict[int, torch.Tensor] = field(   # (R_L,) per-axis: 0 push (translate), 1 ablate (collapse)
+    kappa: dict[int, torch.Tensor] = field(   # (R_L,) per-axis requested ablation coefficient
         default_factory=dict
     )
 
@@ -2403,7 +2406,7 @@ def synthesize_subspace(
     push: Sequence[
         tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], float]
     ],
-    ablate: Sequence[dict[int, torch.Tensor]],
+    ablate: Sequence[tuple[dict[int, torch.Tensor], float]],
     neutral_means: dict[int, torch.Tensor],
     *,
     whitener: "LayerWhitener",
@@ -2420,28 +2423,30 @@ def synthesize_subspace(
       own basis* (a pole / node coordinate, origin-relative).
     - ``coeff`` — the signed strength (the blend fraction / α).
 
-    Each **ablation** term is a per-layer ``(R_i, D)`` (or ``(D,)``) direction
-    set to remove; its target is the origin (``0``).  ``neutral_means`` supplies
-    each layer's anchor (``mean``); it must cover every participating layer.
+    Each **ablation** term is ``(directions, coeff)``: a per-layer ``(R_i, D)``
+    (or ``(D,)``) direction set plus the signed fraction to remove.  Its target
+    is the origin (``0``).  ``neutral_means`` supplies each layer's anchor
+    (``mean``); it must cover every participating layer.
 
     Per layer (over the union of layers any term touches):
 
-    - Flatten every present push term's basis rows, then every ablation term's
-      rows, into one ordered list (push first); orthonormalize the union
-      (:func:`_ortho_basis`) → the merged ``(R, D)`` basis ``B``.
+    - Orthonormalize the push span, project ablation directions out of it (push
+      wins a shared direction), and build the reduced symmetric ablation
+      operator ``A = Σ coeffᵢ uᵢuᵢᵀ`` on the remaining span.  Diagonalizing
+      ``A`` gives an orthonormal ablation basis and one exact collapse
+      coefficient per axis, including partial, repeated, and negative terms.
     - World push displacement ``Δ = Σ_push coeffᵢ·(coord_targetᵢ @ basis_rowsᵢ)``
       — each fragment's own ``(R_i,) @ (R_i, D) = (D,)`` world vector, scaled by
       its coeff.  ``target = B @ Δ`` is its coordinate in the merged basis.
       Because ``Δ`` lives in the push span and the ablation-only axes are its
       orthogonal complement, those axes get ``target ≈ 0``.
-    - Per-axis collapse mask ``kappa`` ``(R,)`` — ``0`` on the push span, ``1`` on
-      the ablation-only complement (``κ = 1 − ‖proj onto push span‖²``).  The
-      kernel *translates* push axes by the fixed offset but *collapses* ``κ=1``
-      axes toward 0 (``p_new = q + a·(target − κ·q)``): post translate-not-
-      collapse a ``target ≈ 0`` alone no longer removes an ablated direction (a
-      pure translate by 0 is a no-op), so ``κ`` is what carries the ablation.
+    - Per-axis ``kappa`` ``(R,)`` — ``0`` on the push span and the eigenvalues of
+      ``A`` on the ablation-only complement.  The apply path gain-compensates
+      these coefficients before the kernel evaluates
+      ``p_new = q + along·(target − kappa·q)``.
     - ``share = ‖Δ‖`` (the world displacement magnitude); a pure-ablation layer
-      weights by the summed ablation-row magnitude instead.
+      uses a positive magnitude proxy because gain compensation makes the
+      resulting collapse independent of cross-layer share normalization.
 
     **Whitened normalization (``whitener`` given).**  The push magnitude used to
     be the *raw-Euclidean* node displacement ``‖Δ_L‖₂``, which is not a
@@ -2480,7 +2485,7 @@ def synthesize_subspace(
     all_layers: set[int] = set()
     for basis_dirs, _coords, _c in push:
         all_layers |= basis_dirs.keys()
-    for dirs in ablate:
+    for dirs, _coeff in ablate:
         all_layers |= dirs.keys()
 
     from saklas.core.mahalanobis import WhitenerError
@@ -2516,10 +2521,20 @@ def synthesize_subspace(
         push_rows: list[torch.Tensor] = []          # individual (D,) basis rows
         push_frags: list[tuple[float, torch.Tensor]] = []   # (coeff, world_dir (D,))
         for basis_dirs, coord_dirs, coeff in push:
+            if abs(float(coeff)) < eps:
+                continue
             B_i = basis_dirs.get(L)
             if B_i is None:
                 continue
-            B_i = B_i.to(torch.float32)
+            # ``synthesize_subspace`` is the join point for profiles from
+            # several artifact families.  Fitted manifolds already follow the
+            # model device, while external J-lens shards and provider SAE
+            # payloads are CPU-backed and may be promoted lazily.  Treat the
+            # neutral mean as the canonical per-layer runtime device and
+            # co-locate every fragment here; merely changing dtype preserves a
+            # stray CPU device and makes a valid mixed J-lens + SAE recipe fail
+            # before its first token.
+            B_i = B_i.to(device=mean.device, dtype=torch.float32)
             if B_i.ndim == 1:
                 B_i = B_i.reshape(1, -1)
             if float(torch.linalg.matrix_norm(B_i)) < eps:
@@ -2529,68 +2544,110 @@ def synthesize_subspace(
                 # No target coords for this layer ⇒ no displacement, but the
                 # rows still join the span (a degenerate push = ablation).
                 c_i = B_i.new_zeros(B_i.shape[0])
-            c_i = c_i.to(torch.float32).reshape(-1)
+            c_i = c_i.to(device=mean.device, dtype=torch.float32).reshape(-1)
             push_rows.extend(B_i)
             push_frags.append((float(coeff), c_i @ B_i))    # (D,) raw world dir
 
-        ablate_rows: list[torch.Tensor] = []        # individual (D,) basis rows
-        ablate_raw: list[torch.Tensor] = []         # raw rows (magnitude → share)
-        for dirs in ablate:
+        ablate_frags: list[tuple[float, torch.Tensor]] = []
+        ablate_share = 0.0
+        for dirs, coeff in ablate:
+            coeff_f = float(coeff)
+            if abs(coeff_f) < eps:
+                continue
             d = dirs.get(L)
             if d is None:
                 continue
-            d = d.to(torch.float32)
+            d = d.to(device=mean.device, dtype=torch.float32)
             if d.ndim == 1:
                 d = d.reshape(1, -1)
             for row in d:
                 if float(torch.linalg.vector_norm(row)) < eps:
                     continue
-                ablate_rows.append(row)
-                ablate_raw.append(row)
+                row_norm = float(torch.linalg.vector_norm(row))
+                unit = row / row_norm
+                ablate_frags.append((coeff_f, unit))
+                # A strictly positive proxy is sufficient here: hook-time gain
+                # compensation cancels share from the actual ablation amount.
+                ablate_share += abs(coeff_f) * max(
+                    float(maha.mahalanobis_norm(L, row)), eps,
+                )
 
-        ordered = push_rows + ablate_rows
-        if not ordered:
-            continue
-        # ``_ortho_basis`` uses its own scale-free dependency tolerance; ``eps``
-        # here is only the degenerate-direction prefilter (applied above).
-        basis, _kept = _ortho_basis(ordered)
-        if basis.shape[0] == 0:
-            continue
+        # Build the active push target in world coordinates first.  If all
+        # pushes cancel, they must not suppress an ablation on the same axis.
+        world_target = mean.new_zeros(mean.shape)
+        raw_delta = mean.new_zeros(mean.shape)
+        for cf, wd in push_frags:
+            wn = float(maha.mahalanobis_norm(L, wd))
+            raw_delta = raw_delta + cf * wd
+            if wn > eps:
+                world_target = world_target + (cf / wn) * wd
+        has_push = float(torch.linalg.vector_norm(world_target)) >= eps
 
-        if push_frags:
+        if has_push:
+            B_push, _ = _ortho_basis(push_rows)
+        else:
+            B_push = mean.new_zeros((0, mean.numel()))
+
+        # Push wins shared directions.  The remaining ablation operator is
+        # diagonalized in its own small span so coefficients survive exactly;
+        # a per-axis mask cannot represent unequal non-orthogonal terms.
+        projected_ablate: list[tuple[float, torch.Tensor]] = []
+        for coeff_f, unit in ablate_frags:
+            residual = unit
+            if B_push.shape[0]:
+                residual = residual - (residual @ B_push.T) @ B_push
+            rn = float(torch.linalg.vector_norm(residual))
+            if rn >= eps:
+                projected_ablate.append((coeff_f, residual / rn))
+
+        B_ab = mean.new_zeros((0, mean.numel()))
+        ablate_eigenvalues = mean.new_zeros((0,))
+        if projected_ablate:
+            B_ab_span, _ = _ortho_basis([row for _cf, row in projected_ablate])
+            reduced = B_ab_span.new_zeros((B_ab_span.shape[0], B_ab_span.shape[0]))
+            for coeff_f, row in projected_ablate:
+                coord = B_ab_span @ row
+                reduced = reduced + coeff_f * torch.outer(coord, coord)
+            # ``torch.linalg.eigh`` is still unavailable on MPS.  This is a
+            # tiny rank-by-rank compose-time matrix (never a decode hot-path
+            # operation), so diagonalize it on CPU and return the result to
+            # the originating device.  Keeping this explicit also avoids
+            # requiring users to opt into PyTorch's process-wide MPS fallback
+            # just to author an ablation term.
+            eig_device = reduced.device
+            eigenvalues, eigenvectors = torch.linalg.eigh(reduced.cpu())
+            eigenvalues = eigenvalues.to(eig_device)
+            eigenvectors = eigenvectors.to(eig_device)
+            keep = eigenvalues.abs() >= eps
+            if bool(keep.any()):
+                ablate_eigenvalues = eigenvalues[keep]
+                B_ab = eigenvectors[:, keep].T @ B_ab_span
+
+        if B_push.shape[0] == 0 and B_ab.shape[0] == 0:
+            continue
+        basis = torch.cat((B_push, B_ab), dim=0)
+
+        if has_push:
             # Raw coeff-weighted displacement — its (whitened) magnitude is the
             # per-layer **profile** weight (``share``); the absolute node-distance
             # scale cancels under the apply-time mean-1 normalization, leaving
             # only the relative across-layer shape (steer where the signal is).
-            raw_delta = torch.stack([cf * wd for cf, wd in push_frags]).sum(0)
             share_L = float(maha.mahalanobis_norm(L, raw_delta))
-            # Target = Σ_i coeff_i · (B @ world_dir_i)/‖world_dir_i‖_M — each
-            # fragment a whitened-unit direction scaled by its user coefficient.
-            tc = basis.new_zeros(basis.shape[0])
-            for cf, wd in push_frags:
-                wn = float(maha.mahalanobis_norm(L, wd))
-                if wn > eps:
-                    tc = tc + (cf / wn) * (basis @ wd)
-            if float(torch.linalg.vector_norm(tc)) < eps:
-                continue
-            target_coord[L] = tc                          # ablation axes ≈ 0
+            if share_L < eps:
+                share_L = sum(
+                    abs(cf) * float(maha.mahalanobis_norm(L, wd))
+                    for cf, wd in push_frags
+                )
+            target_coord[L] = basis @ world_target       # ablation axes ≈ 0
         else:
-            ablate_sum = torch.stack(ablate_raw).sum(0)
-            share_L = float(maha.mahalanobis_norm(L, ablate_sum))
+            share_L = ablate_share
             target_coord[L] = basis.new_zeros(basis.shape[0])   # (R,) all ≈ 0
-        # Per-axis collapse weight κ: 0 on the push span (translate — preserve
-        # the per-token in-subspace spread), 1 on the ablate-only complement
-        # (collapse the component to 0).  Derived by projecting each merged-basis
-        # axis onto the push span (``κ = 1 − ‖proj‖²``), so it is robust to the
-        # orthonormalization order.  Pure push → all 0; pure ablation → all 1.
-        if push_rows and ablate_rows:
-            B_push, _ = _ortho_basis(push_rows)             # (k_push, D)
-            proj = basis @ B_push.T                          # (R, k_push)
-            kappa[L] = (1.0 - (proj * proj).sum(-1)).clamp(0.0, 1.0)  # (R,)
-        elif ablate_rows:
-            kappa[L] = basis.new_ones(basis.shape[0])
-        else:
-            kappa[L] = basis.new_zeros(basis.shape[0])
+        if share_L < eps:
+            continue
+        kappa[L] = torch.cat((
+            basis.new_zeros(B_push.shape[0]),
+            ablate_eigenvalues.to(dtype=basis.dtype, device=basis.device),
+        ))
         layers[L] = LayerSubspace.affine(mean=mean, basis=basis)
         share[L] = share_L
 

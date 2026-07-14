@@ -5,6 +5,7 @@
   // recipes, token metadata, notes, stars, and cast all survive restore.
   //
   // Shape: {version, savedAt, model_id, tree, steerRack, subspaceAlong,
+  //         customSteeringExpression,
   //         probeRack, highlightState, samplingState}.  Steer / probe rack
   //         Maps are serialized as plain arrays (Map → tuples) for JSON
   //         safety.
@@ -28,7 +29,7 @@
   // would otherwise capture a partial turn.  User can re-open the drawer
   // to refresh.
   const snapshot = $derived.by(() => ({
-    version: 4 as const,
+    version: 5 as const,
     savedAt: new Date().toISOString(),
     model_id: sessionState.info!.model_id,
     session_id: sessionState.info!.id,
@@ -39,6 +40,7 @@
       ...entry,
     })),
     subspaceAlong: steerRack.subspaceAlong,
+    customSteeringExpression: steerRack.customExpression,
     probeRack: {
       sortMode: probeRack.sortMode,
       active: [...probeRack.active],
@@ -56,6 +58,11 @@
   const previewText = $derived(JSON.stringify(snapshot, null, 2));
   const turnCount = $derived(
     snapshot.tree?.nodes.filter((node) => node.parent_id !== null).length ?? 0,
+  );
+  const recipeSummary = $derived(
+    snapshot.customSteeringExpression !== null
+      ? "custom expression"
+      : `${snapshot.steerRack.length} term${snapshot.steerRack.length === 1 ? "" : "s"}`,
   );
 
   // Cap preview at ~200 lines (~16k chars) so a runaway log doesn't lock
@@ -129,7 +136,7 @@
       <pre class="preview" aria-label="Preview JSON">{previewDisplay}</pre>
       <span class="meta">
         {turnCount} turn{turnCount === 1 ? "" : "s"} ·
-        {snapshot.steerRack.length} term{snapshot.steerRack.length === 1 ? "" : "s"} ·
+        {recipeSummary} ·
         {probeRack.active.length} probe{probeRack.active.length === 1 ? "" : "s"}
       </span>
     </div>

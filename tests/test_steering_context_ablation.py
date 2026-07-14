@@ -118,3 +118,38 @@ def test_session_steering_string_with_ablation_end_to_end():
         assert session._steering.hooks[1].manifold_groups
 
     assert not session._steering.subspaces
+
+
+@pytest.mark.parametrize("coeff", [0.15, 1.0, -0.3])
+def test_ablation_coefficient_survives_affine_gain(coeff: float) -> None:
+    """The shared affine gain must not amplify mean-ablation coefficients."""
+    session = _skeleton_session()
+    session._profiles["refusal"] = {1: torch.tensor([1.0, 0.0, 0.0])}
+
+    steering = Steering(alphas={
+        "!refusal": AblationTerm(
+            coeff=coeff, trigger=Trigger.BOTH, target="refusal",
+        ),
+    })
+    with session.steering(steering):
+        hook = session._steering.hooks[1]
+        assert len(hook.manifold_groups) == 1
+        group = hook.manifold_groups[0]
+        along = float(group[5])
+        kernel_kappa = group[7]
+        assert isinstance(kernel_kappa, torch.Tensor)
+        assert along * float(kernel_kappa[0]) == pytest.approx(coeff)
+
+
+def test_zero_ablation_coefficient_is_a_true_noop() -> None:
+    session = _skeleton_session()
+    session._profiles["refusal"] = {1: torch.tensor([1.0, 0.0, 0.0])}
+
+    steering = Steering(alphas={
+        "!refusal": AblationTerm(
+            coeff=0.0, trigger=Trigger.BOTH, target="refusal",
+        ),
+    })
+    with session.steering(steering):
+        assert not session._steering.subspaces
+        assert not session._steering.hooks

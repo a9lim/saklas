@@ -428,7 +428,9 @@ def register_lens_routes(app: FastAPI) -> None:
         try:
             st["message"] = f"streaming {body.prompts} corpus documents…"
             docs, spec = await asyncio.to_thread(
-                stream_default_lens_corpus, body.prompts,
+                stream_default_lens_corpus,
+                body.prompts,
+                cancel_event=app.state.lens_fit_cancel,
             )
 
             def on_progress(msg: str) -> None:
@@ -518,7 +520,7 @@ def register_lens_routes(app: FastAPI) -> None:
 
     @app.delete("/saklas/v1/sessions/{session_id}/lens/fit", status_code=202)
     async def lens_fit_cancel(session_id: str):
-        """Request cooperative cancellation at the next prompt boundary."""
+        """Cancel corpus acquisition or stop after the current fit pass."""
         resolve_session_id(session_id)
         st = app.state.lens_fit
         event = app.state.lens_fit_cancel
