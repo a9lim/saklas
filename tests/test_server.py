@@ -89,7 +89,11 @@ def client():
     from saklas.core.steering import Steering
     session = _mock_session()
     app = create_app(session, default_steering=Steering(alphas={"test_vec": 0.1}))
-    return TestClient(app)
+    # Keep one portal/event loop alive for the whole test.  Routes intentionally
+    # launch background tasks whose lifetime extends beyond the response that
+    # created them; a bare TestClient may tear its per-request portal down first.
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 @pytest.fixture
@@ -97,7 +101,8 @@ def session_and_client():
     from saklas.server import create_app
     session = _mock_session()
     app = create_app(session, default_steering=None)
-    return session, TestClient(app)
+    with TestClient(app) as test_client:
+        yield session, test_client
 
 
 # ---------------------------------------------------------------------------
