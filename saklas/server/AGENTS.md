@@ -10,7 +10,7 @@ the vectors-under-session routes (extract/merge); HF upload stays CLI-only.
 
 `app.py` registers the OpenAI routes inline, then calls
 `register_ollama_routes(app)` (`ollama.py`) and `register_saklas_routes(app)`
-(`saklas_api.py`), then mounts the Svelte SPA last (so its catch-all can't shadow
+(`native_routes.py`), then mounts the Svelte SPA last (so its catch-all can't shadow
 the API). `register_saklas_routes` is the native-tree orchestrator — it delegates
 to sub-module registrars (and owns the shared request bodies + serializer helpers
 those registrars import):
@@ -23,7 +23,16 @@ those registrars import):
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
-- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/token-readout`
+- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/*` (source list/use,
+  background official fetch/local fit, token readout + the live-lens toggle)
+- `sae_routes.register_sae_routes` — `/sessions/{id}/sae/*` (source/release
+  discovery, background provider load/local train, live toggle, feature
+  validation, token readout, and
+  `POST .../sae/features/metadata` — the Neuronpedia metadata backfill:
+  `{ids: [...]}` (≤64) → `session.fetch_sae_feature_meta` in a worker thread,
+  no session lock (network + disk cache only, like validation); the dashboard
+  calls it between generations so discovery cards gain labels + the
+  `max_act` strength unit)
 - `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
 `server/sse.py`, `server/streaming.py`, and `server/ws_events.py` are the shared
@@ -101,11 +110,13 @@ protocol: tool calling, JSON-schema/structured-output mode, embeddings.
 
 ## Native route modules and schemas
 
-`saklas_api.py` is now only the native-route registrar plus a backcompat re-export
-surface for old imports. New route-specific request bodies and serializers live
-beside their route groups:
+`native_routes.py` registers the native route groups. Route-specific request
+bodies and serializers live beside their route groups:
 
-- `native_common.py` — single-session id resolution.
+- `native_common.py` — exact single-session id resolution and the shared
+  `NativeRequest` base. Every native request model inherits this base and rejects
+  unknown fields (`extra="forbid"`); nested native objects are strict too. The
+  OpenAI/Ollama protocol models remain protocol-specific.
 - `session_models.py` — session request bodies and `session_info`.
 - `vector_models.py` — vector/extract/bake request bodies and vector serializers.
 - `tree_models.py` — loom-tree request bodies and tree serializers.
@@ -113,8 +124,7 @@ beside their route groups:
 - `experiment_models.py` — experiment request bodies.
 
 URL paths carry `{session_id}` for a multi-session shape, but the impl is
-single-session: the one session has id `"default"`, and the loaded model id also
-resolves to it; everything else 404s.
+single-session: the one session has exactly id `"default"`; everything else 404s.
 
 **SSE error-frame scrubbing (info-disclosure discipline).** Long-running SSE
 workers (`/extract`, manifold `generate` / `fit`) must NOT surface raw `str(e)`
@@ -136,8 +146,17 @@ body + any typed safe-message formatter.
   `role_substitution_supported` / `user_role_supported` (against `ROLE_HEADERS` /
   `USER_ROLE_HEADERS` for the resolved `model_type`) and the resolved
   `default_assistant_role` / `default_user_role`, so the webui can gate roles,
-  plus `jlens_fitted` (a `lens_paths` existence check gating the drilldown's
-  j-lens tab — deliberately not the lazy `session.jlens` load).
+  plus `jlens_fitted` (`has_compatible_jlens`: v6 shard sidecar/payload plus loaded
+  weight identity, gating the drilldown's j-lens tab without the lazy fp32 load),
+  `live_lens_layers` (the live J-lens readout's resolved layer list, `null`
+  while off), and `live_probe_scores` (the CAA live toggle). Session metadata is
+  serialized from the exact live `SaklasSession` contract; production does not
+  coerce incomplete test doubles or inspect lens sidecars as a fallback.
+  Scene-grammar capabilities (the cast model; `_scene_capabilities`):
+  `scene_mode` (validated grammar present — gates the
+  seat toggle + free commit seating), `thinking_input_supported` (family think
+  delimiters — gates the committed-thinking box), `strips_history_thinking`
+  (drives the composer's "lasts one turn" warning).
 - `GET/PATCH/DELETE /saklas/v1/sessions/{id}` — info / update defaults / no-op 204.
 - `POST /saklas/v1/sessions/{id}/{clear,rewind}`.
 
@@ -195,20 +214,23 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   in-flight fit). Existing tensors go stale, not deleted.
 - `DELETE /manifolds/{ns}/{name}` — `remove_manifold_folder` (single source of truth
   shared with CLI `pack rm`) under `session.lock`; 409 when a fit holds the
-  gen-lock, 404 pre-lock. Response `{namespace, name, source, removed,
+  gen-lock, 404 pre-lock; referenced activation-capture groups are removed too. Response `{namespace, name, source, removed,
   rematerializes_on_restart}`.
 - `POST /manifolds/{ns}/{name}/fit` — `session.fit` under the lock; SSE
-  / JSON. Discover folders accept `fit_mode` / `hyperparams` overrides, written
-  atomically into `manifold.json` (after `sanitize_hyperparams`) *before* the fit;
-  authored folders reject them with 400. Poisedness `ValueError` →
+  / JSON. Discover folders accept `fit_mode` / `hyperparams` overrides; the
+  pipeline merges them into `manifold.json` (after `sanitize_hyperparams`) inside
+  the same cross-process manifest transaction as cache-key derivation and fit;
+  authored folders reject them with 400. `force=true` bypasses tensor/capture
+  hits. `layers` optionally names explicit
+  transformer indices or `"workspace"`/`"all"`; the fitted tensor sidecar pins
+  that layer set. Poisedness `ValueError` →
   `code: "PoisednessError"`; `ConcurrentExtractionError` → 409. Steering a fitted
   manifold needs no route — a `%` term loads it lazily on scope entry.
 
-The `POST /manifolds/templated` route survives as a **bridge** (back-compat for the
-webui's templated-manifold builder): it writes a standalone template
-(single-turn contexts from the `{user, assistant}` pairs) then a manifold that
-`template_ref`-erences it. Multi-turn contexts + the scorer ride the dedicated
-template routes.
+`POST /manifolds/from-template` derives a discover manifold from an existing
+standalone template selected by `template_ref`. Template authoring stays on
+`POST /templates`; the manifold route only materializes its value/context corpus
+and records the canonical template reference.
 
 ### template_routes.py
 
@@ -242,8 +264,8 @@ monitor unification onto the session's single `Monitor`.
   (`{name, manifold, top_n, layers, node_labels, node_count, domain, intrinsic_dim,
   feature_space}`). `_probe_info` also emits `is_affine` (the flat/curved
   discriminator the client classifies subspace-vs-manifold on, via
-  `core.manifold.manifold_is_affine` — `core.session._manifold_is_affine` is a
-  back-compat alias — defensively guarded → `False` on any read failure) and
+  `core.manifold.manifold_is_affine` — defensively guarded → `False` on any read
+  failure) and
   `node_coords` (the per-node layout backing the client mini-map,
   `null` when the manifold has none materialized).
 - `GET /probes/defaults` returns the default roster.
@@ -251,8 +273,22 @@ monitor unification onto the session's single `Monitor`.
   as_name=name, top_n=top_n)`, 201 + the probe info. The selector rides the same
   `[ns/]name[:variant]` shape `%` steering consumes — probe and steering share the
   lazy-load cache. 400 on an empty selector, 404 on `FileNotFoundError`, 400 on
-  `KeyError`/`ValueError`.
-- `DELETE /probes/{name}` → `session.remove_probe`, 204; 404 if not attached.
+  `KeyError`/`ValueError`, and any other `SaklasError` maps through
+  `user_message()` (a `jlens/<word>` selector's `LensNotFittedError` → 404).
+- `DELETE /probes/{name}` → `session.remove_probe`, 204; 404 if not attached
+  (either roster — monitor or lens).
+- **Lens probes** — a `jlens/<word>` selector lands in the session lens-probe
+  registry (the READOUT channel), not the Monitor; `GET /probes` appends those
+  rows via `_lens_probe_info` (shape-compatible with `_probe_info` plus the
+  `lens: true` discriminator, `word`, `token_id`; `feature_space: "readout"`,
+  `intrinsic_dim: 1` — the one `strength` axis, no `node_coords`),
+  and `POST /probes` returns the same shape for a lens attach. `GET
+  .../geometry` 404s on a lens probe (no subspace geometry behind it).
+- `POST /probes/live` body `{enabled}` → `session.set_live_probe_scores` under
+  the session lock — the **CAA live toggle**: off ⇒ per-token monitor scoring
+  is disabled for UI/trait/loom consumers (aggregate-only capture; probe gates
+  still force the subset they need). Session info reports the state as
+  `live_probe_scores`.
 - `GET /probes/{name:path}/geometry` → `session._monitor.probe_geometry(name)`, the
   static per-layer geometry (centroids, neutral anchor, PCA rotation for rank≥3,
   curve/surface overlay) backing the dashboard probe-inspector plot; 404 if not
@@ -267,7 +303,7 @@ not a re-render pass.
 
 ### Vectors under `/sessions/{id}/vectors` (in `vector_routes.py`)
 
-- `GET` list, `GET /{name}` profile JSON, `POST` load-from-disk, `DELETE /{name}`
+- `GET` list, `GET /{name}` profile JSON, `DELETE /{name}`
   (also drops the name from `default_steering`).
 - `GET /{name}/diagnostics` — 16-bucket `‖baked‖` histogram + per-layer magnitudes +
   the `diagnostics_by_layer` blocks when present.
@@ -276,15 +312,12 @@ not a re-render pass.
   whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer frame.
   `session.whitener` must cover every row-layer of `a`, else 409 (regenerate the
   neutral cache). Registered *before* `GET /vectors/{name}` so the literal path wins.
-- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. `coerce_corpora`
-  normalizes `source`: a concept name routes to `session.extract` (a composite
-  name fits a 2-node `pca`; a monopolar name with no baseline fits the 1-node
-  neutral-anchored ray), while two pole corpora (`{positive, negative}` /
-  `{pairs: [...]}` / a bare single `{positive, negative}`) route to
-  `session.extract_vector_from_corpora` and land a 2-node `pca` manifold.
-  `namespace` controls the destination; `force` bypasses the tensor cache;
-  `auto_register` (wire field `register`, default true) steers the result in as a
-  vector on success. There is no `/extract/preview` (the A0
+- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. The exact request shape is
+  `{concept, baseline?, sae?, role?, namespace?, force?}` and routes to
+  `session.extract`: a concept with a baseline fits a 2-node `pca`; a monopolar
+  concept fits the 1-node neutral-anchored ray. The resulting manifold's folded
+  profile is always registered in the live session. `namespace` controls the
+  destination and `force` bypasses the tensor cache. There is no `/extract/preview` (the A0
   scenario/preview machinery was removed — A2 has no scenarios).
 - `POST /vectors/bake` (`BakeVectorRequest`) body `{name, expression}` — wraps
   `merge_into_manifold` (model-scoped, `force=True`): lands a corpus-less baked
@@ -303,7 +336,16 @@ fully cover lands as `null`. Default covers everything; `names` restricts.
 `/sessions/{id}/tree`: full-tree GET, active-path GET, and navigate / edit / branch /
 delete / star / note / reset mutations, plus `edge_label`, `filter`, branch `diff`,
 `joint_logprobs`, and `transcript` / `transcript/load`. Mutations run the tree's
-conflict checks (409 when they would corrupt an in-flight generation).
+conflict checks (409 when they would corrupt an in-flight generation). Joint
+logprob reads use the session-owned `joint_logprob_cache` directly.
+Cast roster (phase 3): `GET .../tree/cast` (label → member), `PUT
+.../tree/cast/{label}` body `{steering?, thinking?, seed?, notes?}` (label-slug
++ expression syntax validated up front, 400 on either), `DELETE
+.../tree/cast/{label}` (204, absent = no-op). Roster ops are decoration-tier
+(never 409); the roster also rides the full-tree GET (`cast` key when
+non-empty) and the `op="cast"` `tree_mutated` frame. `tree/branch` takes an
+optional `role` override — with the engine's scene mode this is the seat-swap
+branch primitive.
 
 ### experiment_routes.py
 
@@ -313,22 +355,87 @@ grid is validated server-side (empty → 400), then `session.generate_sweep(...,
 stateless=False)` runs in a worker thread under the lock. Returns `{kind, total,
 node_ids, rows}`.
 
-### lens_routes.py — Jacobian-lens token readout
+### lens_routes.py — Jacobian-lens routes
+
+`GET /sessions/{id}/lens/sources` lists prepared `local:default` and
+`neuronpedia` sources. `POST .../lens/use` selects one under the session lock,
+evicts derived lens state, and auto-enables its all-fitted-layer live readout.
+`POST/GET .../lens/fetch` starts/polls an official Neuronpedia fetch: provider
+bytes stay in the Hugging Face cache, the worker publishes only a Saklas binding,
+then activates it under the lock. Fetch and local fit are mutually exclusive.
+
+`POST /sessions/{id}/lens/token/validate` body `{word}` — a read-only tokenizer
+check for the dashboard's J-lens STEER and PROBE add forms. Returns
+`{word, token_id}` only when the word round-trips as exactly one vocabulary
+token; multi-token words return 400. It never registers a direction or probe;
+the engine registration boundaries still revalidate the invariant.
 
 `GET /sessions/{id}/lens/token-readout?node_id=&raw_index=[&top_k=8][&steered=
-true][&raw=false][&layers=csv]` — the workspace readout at one decode step of a
+true][&raw=false][&layers=csv]` — the J-lens readout at one decode step of a
 loom node (`session.jlens_token_readout` in `asyncio.to_thread` under
 `acquire_session_lock`, 503 on timeout): the per-layer J-lens top-k matrix at
 the forward that produced the clicked token, each row
-`{layer, in_band, tokens:[{token, id, logprob}]}` sorted ascending (`in_band` =
-the 40–90% workspace band). `steered` (default on) replays under the node's
+`{layer, tokens:[{token, id, logprob}]}` sorted ascending, plus the
+layer-aggregated `aggregate: [{token, strength, com, spread}]` block
+(per-layer softmax → mean fitted-layer probability + probability-mass-weighted
+depth center of mass across all requested layers,
+strength-descending; `[]` from a session dict without the key). `steered` (default on) replays under the node's
 recipe steering — `steered=false` is the unsteered counterfactual; `raw` marks
 a flat-buffer node (raw-ness isn't stamped server-side, the client's render
 mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
 `InvalidNodeOperationError`/bad `layers`/`top_k` → 400, other `SaklasError`s →
-their `user_message()` status. Lens *fitting* stays CLI-only; discovery rides
-the session-info `jlens_fitted` field (a `lens_paths` existence check — never
-the ~GB lazy artifact load).
+their `user_message()` status. Discovery rides
+the session-info `jlens_fitted` field (v6 shard sidecar + live-weight compatibility,
+never the ~GB lazy artifact load).
+
+`POST /sessions/{id}/lens/live` body `{enabled, layers?}` — toggle
+the **live** J-lens readout (`session.enable_live_lens` /
+`disable_live_lens` under `acquire_session_lock`, so it never races an
+in-flight stream and applies to the next generation). Enabling moves the
+selected layers' `J_l` device-resident; `layers` omitted enables every fitted
+layer (the TUI `/lens` default). Returns `{enabled,
+layers}` (the resolved list). While enabled, the native WS `token` frame
+carries the per-step matrix as `lens_readout` (see ws_stream below) and
+session info reports the layer list as `live_lens_layers` (`null` while off —
+the dashboard's WORKSPACE-panel rehydration read). The generation's resolved
+logit-alternative `return_top_k` also sets the live lens width. Errors:
+`LensNotFittedError` → 404, bad `layers` → 400. `saklas serve` auto-enables
+the live lens at startup only when the artifact matches the loaded weights, so
+the dashboard opens hot; the toggle
+still disables per session.
+
+`POST /sessions/{id}/lens/fit` body `{prompts?=100, seq_len?, prompt_batch?,
+layers?="all", force?=false}` — kick off the **background lens fit** (the
+dashboard's "fit j-lens" button; the former CLI-only policy). 202 + the
+initial status; one fit at a time (409 while running); `layers="sample"`
+rejected (not fittable). The job resolves an immutable Hub revision, then streams the default fineweb-edu corpus
+(`io.lens.stream_default_lens_corpus` — needs the optional `datasets` dep,
+else a clean typed error), runs `session.fit_jlens` (resume-by-default,
+checkpointed) in a worker thread, and auto-enables the all-layer live lens
+when the artifact lands. Deliberately **polled, not SSE**: the fit is hours
+of wall clock and progress must survive page reloads. `GET
+/sessions/{id}/lens/fit` returns `{running, prompts_done, prompts_total,
+message, error, started_at, finished_at, live_layers}` (per-prompt counts
+parsed from the engine's `prompt N/M` progress lines). Error text follows
+the SSE scrubbing discipline (typed `user_message()`, else exception type
+only). Generations attempted while the fit holds the model raise through
+the ordinary busy path — surfaced client-side by the sticky WS error toast.
+`DELETE .../lens/fit` cancels either phase: corpus acquisition returns promptly
+even if its provider iterator is blocked, while estimator work stops after the
+current output-dimension VJP block and drains accelerator work before returning.
+
+### sae_routes.py — sparse-autoencoder routes
+
+`GET /sessions/{id}/sae/sources` lists prepared `local:<name>` and
+`saelens:<release>` sources. The background `POST/GET .../sae/load` accepts
+either harmonized source string (the `saelens:` prefix is stripped only at the
+provider-adapter boundary), so it both fetches a new provider release and
+switches an existing source; successful load also enables the 12-card live SAE
+readout. `POST/GET/DELETE .../sae/train` starts, polls, and
+cooperatively cancels native local training over the default FineWeb-Edu stream;
+status carries token progress. A successful train makes the local source
+resident and enables live SAE discovery. Provider load and local train are
+mutually exclusive.
 
 ### traits_routes.py — live traits SSE
 
@@ -341,9 +448,26 @@ across generations; multiple clients supported. Events: `start`
 
 ### WS /saklas/v1/sessions/{id}/stream (in `ws_stream.py`)
 
-Bidirectional WebSocket; only `session_id == "default"` is reachable (HF ids contain
-`/`). Client → server: `{type: "stop"}`, or `{type: "generate", input, steering,
-sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?}`. The
+Bidirectional WebSocket; only the exact `session_id == "default"` is accepted.
+The dashboard composer sends `{type:"submit", text?, authored_role?,
+generated_role?, steering?, sampling?, thinking?, authored_thinking?, raw?,
+parent_node_id?, n?, recipe_override?}`. Roles use canonical
+`"user"|"assistant"` names. Text requires `authored_role`; omit
+`generated_role` for commit-only;
+omit text for a bare continuation. The server commits text once, then fans
+generated siblings from that node, so authored and generated roles are explicit
+and independent.
+
+The compatibility and specialist client frame is `{type: "stop"}`, or
+`{type: "generate", input, steering,
+sampling, thinking, stateless, raw, parent_node_id?, n?, recipe_override?,
+generate_seat?}`. `generate_seat` (`"user"|"assistant"`, default assistant) is
+the cast model's seat selector: `"user"` renders the generation prompt as a
+user-seat header (labeled by `sampling.user_role`) and lands the node with
+`role="user"` + a stamped recipe — generated is provenance, not a seat; needs
+the session's validated scene grammar (`SceneRenderError` 400 otherwise).
+`input: null` is a continue — no committed turn, the model speaks next from
+`parent_node_id` (or the active leaf), enabling a/a and u/u sequences. The
 `sampling` block (`WSSamplingParams` → `build_sampling` → `SamplingConfig`) carries
 `user_role`/`assistant_role` (the per-message role-substitution labels, stamped
 onto the produced loom nodes and rendered faithfully per-turn), plus `return_top_k`
@@ -357,26 +481,41 @@ modes:
 - **Answer-prefill** (`prefill_node_id`/`prefill_text`) → `session.prefill_assistant`:
   the seeded assistant reply lands as a sibling under a user node. `thinking` forced
   off.
-- **Commit (no-generation send)** (`commit_role`/`commit_text`) →
-  `session.append_user_turn` / `append_assistant_turn`. `raw=true` lifts the
-  user-under-user guard. Emits one `started` (node_id=null) + one `done` carrying the
-  new node under `result.{kind="commit", role, text, node_id}`. No token frames.
+- **Commit (no-generation send)** (`commit_role`/`commit_text`, optional
+  `commit_thinking`) → `session.append_user_turn` / `append_assistant_turn`.
+  `raw=true` lifts the user-under-user guard (scene mode lifts both commit-parent
+  guards engine-side — u/u and a/a authored shapes land on validated families).
+  `commit_thinking` is a committed thinking block stored on
+  `LoomNode.thinking_text` and rendered through the family think delimiters
+  (400 `SceneThinkingUnsupportedError` when the family can't carry it;
+  suppressed in raw mode). Emits one `started` (node_id=null) + one `done`
+  carrying the new node under `result.{kind="commit", role, text, node_id}`.
+  No token frames.
 - **Recipe override** — a built-in mode string (`unsteered`/`inverted`/`reseed`/
   `cool`/`hot`) or a partial-recipe expression (`seed=42, temperature=1.5`).
 
 Fork / prefill / commit are mutually exclusive (400 on mix). `n>1` fans out N sibling
 assistant nodes on one shared user parent, generated serially with deterministic
 derived seeds. Server → client: `started` (node_id filled lazily by the first
-token), `node_created`, `tree_mutated`, `token` (per token — `logprob`/`top_alts`
-when captured, `scores`/`per_layer_scores` when probes are loaded, `probe_readings`
-`Record<name, {fraction, nearest}>` when any probe is attached, computed
-inline off `session._capture._per_layer`), `done` (`result` with `text`, `tokens`,
-`finish_reason`, `usage`, `per_token_probes`, `mean_logprob`, `mean_surprise`,
+token), `tree_mutated`, `token` (per token — `logprob`/`top_alts`/`perplexity`
+when captured, plus the token tap's canonical `captured` object — the same
+JSON-safe rich record appended to the loom row — with optional probe, J-LENS,
+and SAE channels and their original source/steering provenance). Compatibility
+aliases remain: `scores`/`per_layer_scores`/`probe_readings`, `lens_readout` +
+`lens_aggregate`, and `sae_readout`. The stream wraps `_on_token` in a typed
+`TokenConsumer` whose options request the live readouts; `build_token_event`
+forwards `captured` verbatim rather than rebuilding it from loom rows), `done`
+(`result` with `text`, `tokens`,
+`finish_reason`, `usage`, `mean_logprob`, `mean_surprise`,
 `probe_readings` aggregate), `error` (validation errors keep the connection open;
 other failures close 1011).
 
+A roster mutation (`LoomMutated(op="cast")`) forwards as a `tree_mutated`
+frame with empty `added`/`updated` plus a `cast` key inlining the full roster
+(`{label: {recipe?, notes?}}`), so clients reconcile without a refetch.
+
 Concurrency: one perpetual reader task owns `receive_json()` and feeds a shared
-`incoming` queue; `tree_mutated`/`node_created` ride a connection-level
+`incoming` queue; `tree_mutated` ride a connection-level
 `LoomMutated` subscription; all sends go through one `asyncio.Lock`. Per generate
 turn, `generate_stream` runs in a worker thread; `on_token` bridges to asyncio via
 `call_soon_threadsafe`; the handler races the token queue against `incoming` so an

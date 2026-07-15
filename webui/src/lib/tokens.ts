@@ -36,8 +36,8 @@ export function parseProbeTarget(target: string): { base: string; axis: number }
  *
  *  Axis ``i`` reads the live per-token domain coordinates captured under
  *  ``coordsByProbe`` (the full rank-R reading off the ``probe_readings`` wire
- *  channel); axis 0 falls back to the collapsed ``probes`` row, which is the
- *  channel the end-of-gen ``per_token_probes`` pass and a tree reload restore.
+ *  channel); axis 0 falls back to the collapsed ``probes`` row streamed on the
+ *  token frame and restored by a tree reload.
  *  Returns ``undefined`` when neither source carries the target, so the caller
  *  can fall through to its own default (transparent tint). */
 export function probeScoreForTarget(
@@ -74,35 +74,65 @@ export function surpriseScore(
   return tint * HIGHLIGHT_SAT;
 }
 
-/** Map a probe score to a CSS rgb() string (higher saturation = stronger
- * color).  Returns ``"transparent"`` when score is effectively zero or
- * null/undefined.
+/** Which constant-hue ramp a tint reads in.  ``signed`` is the probe
+ *  ramp (green +pole ↔ red −pole); ``surprise`` is the logit-space blue
+ *  — surprise is a vocabulary-distribution quantity, so it shares the
+ *  J-lens hue family and is unmistakably distinct from any probe
+ *  reading (pre-v2 it reused the positive green band). */
+export type TintHue = "signed" | "surprise" | "sae";
+
+/* Ramp poles (tokens.css: --highlight-pos / --highlight-neg /
+ * --highlight-surprise) as rgb triplets, and the alpha ceiling.  v2
+ * tints are constant-hue ALPHA ramps: tint strength = opacity, hue =
+ * meaning, so text contrast stays put and the poles are OKLCH-matched
+ * in perceived lightness (the old ramp swept luminance through opaque
+ * rgb(0,255·t,0), which wobbled legibility with the score). */
+const TINT_POS = "52, 211, 153"; /* #34d399 */
+const TINT_NEG = "229, 84, 79"; /* #e5544f */
+const TINT_SURPRISE = "107, 166, 248"; /* #6ba6f8 */
+const TINT_SAE = "242, 201, 76"; /* #f2c94c */
+const TINT_MAX_ALPHA = 0.62;
+
+/** Map a probe score to a CSS rgba() background (stronger score =
+ * more opaque tint of a constant hue).  Returns ``"transparent"`` when
+ * score is effectively zero or null/undefined.
  *
- * Positive (toward the +pole): green ramp from rgb(0,0,0) at t=0 to
- * rgb(0,255,0) at |t|=1.  Negative (toward the -pole): red ramp.
- *
- * ``scale`` is the value at which the ramp reaches full saturation:
+ * ``scale`` is the value at which the ramp reaches full strength:
  * ``t = score / scale``, clamped to [-1, 1].  It defaults to
  * ``HIGHLIGHT_SAT`` so the fixed-[-1,1] callers (the correlation matrix,
  * the cross-layer cosine grid) are unchanged; the probe surfaces pass a
  * per-probe node-coordinate extent (see ``nodeCoordExtent``) so a fan
  * whose coords run to ±tens isn't pinned fully saturated from the first
  * token.  A degenerate (0 / non-finite) scale falls back to the fixed
- * cutoff rather than dividing by zero. */
+ * cutoff rather than dividing by zero.
+ *
+ * ``hue`` picks the ramp: ``signed`` (default — green/red poles),
+ * ``surprise`` (unsigned logit/J-lens blue), or ``sae`` (unsigned gold).
+ * J-LENS and metadata-backed SAE probes pass scale=1; metadata-less SAE
+ * probes pass their shared raw-activation denominator.  Either way the
+ * readout strength saturates on the same unit interval as surprise. */
 export function scoreToRgb(
   score: number | null | undefined,
   scale: number = HIGHLIGHT_SAT,
+  hue: TintHue = "signed",
 ): string {
   if (score == null || !Number.isFinite(score)) return "transparent";
   const s = Number.isFinite(scale) && scale > 1e-6 ? scale : HIGHLIGHT_SAT;
   const t = Math.max(-1, Math.min(1, score / s));
   if (t === 0) return "transparent";
-  if (t > 0) {
-    const g = Math.round(255 * t);
-    return `rgb(0,${g},0)`;
+  const a = (Math.abs(t) * TINT_MAX_ALPHA).toFixed(3);
+  if (hue === "surprise") return `rgba(${TINT_SURPRISE}, ${a})`;
+  if (hue === "sae") return `rgba(${TINT_SAE}, ${a})`;
+  return t > 0 ? `rgba(${TINT_POS}, ${a})` : `rgba(${TINT_NEG}, ${a})`;
+}
+
+/** Color family for a selected transcript-highlight channel. */
+export function highlightHue(target: string | null): TintHue {
+  if (target === SURPRISE_TARGET || target?.startsWith("jlens/")) {
+    return "surprise";
   }
-  const r = Math.round(255 * -t);
-  return `rgb(${r},0,0)`;
+  if (target?.startsWith("sae/")) return "sae";
+  return "signed";
 }
 
 /** Per-probe color/bar scale: the largest ``|node coordinate|`` on the
@@ -141,9 +171,11 @@ export function twoStripeStyle(
   scoreB: number | null | undefined,
   scaleA: number = HIGHLIGHT_SAT,
   scaleB: number = HIGHLIGHT_SAT,
+  hueA: TintHue = "signed",
+  hueB: TintHue = "signed",
 ): { backgroundImage: string } {
-  const top = scoreToRgb(scoreA, scaleA);
-  const bot = scoreToRgb(scoreB, scaleB);
+  const top = scoreToRgb(scoreA, scaleA, hueA);
+  const bot = scoreToRgb(scoreB, scaleB, hueB);
   return {
     backgroundImage: `linear-gradient(to bottom, ${top} 0%, ${top} 50%, ${bot} 50%, ${bot} 100%)`,
   };
@@ -157,9 +189,11 @@ export function twoBlendStyle(
   scoreB: number | null | undefined,
   scaleA: number = HIGHLIGHT_SAT,
   scaleB: number = HIGHLIGHT_SAT,
+  hueA: TintHue = "signed",
+  hueB: TintHue = "signed",
 ): { backgroundImage: string } {
-  const top = scoreToRgb(scoreA, scaleA);
-  const bot = scoreToRgb(scoreB, scaleB);
+  const top = scoreToRgb(scoreA, scaleA, hueA);
+  const bot = scoreToRgb(scoreB, scaleB, hueB);
   return {
     backgroundImage: `linear-gradient(to bottom, ${top}, ${bot})`,
   };
@@ -192,12 +226,14 @@ export function tokenBackgroundStyle(
   smooth = false,
   scaleA: number = HIGHLIGHT_SAT,
   scaleB: number = HIGHLIGHT_SAT,
+  hueA: TintHue = "signed",
+  hueB: TintHue = "signed",
 ): { backgroundColor?: string; backgroundImage?: string } {
   if (scoreB === null || scoreB === undefined) {
-    const bg = scoreToRgb(scoreA, scaleA);
+    const bg = scoreToRgb(scoreA, scaleA, hueA);
     return bg === "transparent" ? {} : { backgroundColor: bg };
   }
   return smooth
-    ? twoBlendStyle(scoreA, scoreB, scaleA, scaleB)
-    : twoStripeStyle(scoreA, scoreB, scaleA, scaleB);
+    ? twoBlendStyle(scoreA, scoreB, scaleA, scaleB, hueA, hueB)
+    : twoStripeStyle(scoreA, scoreB, scaleA, scaleB, hueA, hueB);
 }

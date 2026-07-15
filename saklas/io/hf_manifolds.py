@@ -2,11 +2,10 @@
 
 The read-side counterpart to :mod:`saklas.io.hf`.  Manifold-folder
 artifacts (``manifold.json`` + ``nodes/*.json`` + per-model fitted
-``<safe_model>.safetensors``) ride the same HF *model*-repo convention
-packs do — safetensors is model-hub-native and ``base_model``
+``<safe_model>.safetensors``) ride an HF *model*-repo convention — safetensors is
+model-hub-native and ``base_model``
 frontmatter gives reverse-link discoverability.  The tagging convention
-diverges: a manifold repo carries ``saklas-manifold`` (parallel to
-``saklas-pack``) so the search query is unambiguous.
+uses the ``saklas-manifold`` tag so the search query is unambiguous.
 
 This module owns the pure-IO HF surface (pull + search + fetch_info).
 The folder format itself lives in :mod:`saklas.io.manifolds`; the
@@ -43,6 +42,38 @@ from saklas.io.staging import stage_verify_swap
 _HF_SEARCH_CAP = 20
 
 
+def _rewrite_staged_manifold_name(
+    staged: ManifoldFolder, destination_name: str,
+) -> dict[str, str]:
+    """Rename a staged folder and every fitted sidecar as one identity.
+
+    A fitted manifold repeats its name in each per-model sidecar.  Rewriting
+    only ``manifold.json`` makes selector discovery address the destination
+    while runtime loads still expose the source name.  Update the sidecars in
+    staging and return the corresponding trusted hash map for the caller's
+    single manifest rewrite.
+    """
+    from saklas.io.atomic import write_json_atomic
+    from saklas.io.packs import hash_file
+
+    files = dict(staged.files)
+    for stem in staged.tensor_models():
+        tensor_path = staged.tensor_path(stem)
+        sidecar_path = tensor_path.with_suffix(".json")
+        if tensor_path.name not in files or sidecar_path.name not in files:
+            raise ManifoldFormatError(
+                f"cannot rename untrusted fitted pair {tensor_path.name}: "
+                "both tensor and sidecar must have manifest proofs"
+            )
+        with open(sidecar_path) as handle:
+            sidecar = json.load(handle)
+        sidecar["name"] = destination_name
+        write_json_atomic(sidecar_path, sidecar)
+        files[sidecar_path.name] = hash_file(sidecar_path)
+    staged.name = destination_name
+    return files
+
+
 # ---------------------------------------------------------------------- pull --
 
 
@@ -76,6 +107,22 @@ def pull_manifold(
     force: bool,
     revision: Optional[str] = None,
 ) -> Path:
+    """Download and atomically install while holding the target folder lock."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    with _locked_manifest(Path(target_folder)):
+        return _pull_manifold_locked(
+            coord, target_folder, force=force, revision=revision,
+        )
+
+
+def _pull_manifold_locked(
+    coord: str,
+    target_folder: Path,
+    *,
+    force: bool,
+    revision: Optional[str] = None,
+) -> Path:
     """Download ``coord`` from HF and install into ``target_folder``.
 
     Stage-verify-swap discipline (same shape ``pull_pack`` uses):
@@ -87,27 +134,31 @@ def pull_manifold(
     target``, ``rmtree .bak``.  A crash mid-swap is recoverable from
     ``.bak``.
 
-    Back-compat (4.0): a published **legacy saklas-pack** repo (no
-    ``manifold.json`` but a ``statements.json`` of ``{positive, negative}``
-    pairs) is *ported* to a 2-node ``pca`` manifold on install via
-    :func:`~saklas.io.manifolds.port_legacy_vector_folder` (file-only — the
-    per-model subspace re-fits lazily).  A **bare control-vector** repo
-    (safetensors with no manifest and no statements) carries no recoverable
-    geometry/authoring, so it's refused — re-author it as a manifold.
+    The downloaded repository must carry the current ``manifold.json`` shape.
     """
+    # Recover a crash-left stage swap before conflict policy or pair-lock
+    # discovery.  The public caller already owns the stable manifest lock.  A
+    # force replacement will now see the recovered folder and quiesce all its
+    # fitted pair readers; a non-force install must preserve it as an existing
+    # destination rather than silently overwrite it.
+    backup = target_folder.with_name(target_folder.name + ".bak")
+    if not target_folder.exists() and backup.exists():
+        try:
+            backup.rename(target_folder)
+        except OSError as exc:
+            raise HFError(
+                f"{coord}: could not recover interrupted install ({exc})"
+            ) from exc
+    if target_folder.exists() and not force:
+        raise HFError(f"{target_folder} exists; pass force=True to overwrite")
+
     tmp_dir = Path(_download(coord, revision=revision))
 
     if not (tmp_dir / "manifold.json").is_file():
-        if (tmp_dir / "statements.json").is_file():
-            return _port_legacy_pack_dir(
-                tmp_dir, target_folder, coord, revision, force=force,
-            )
         raise HFError(
             f"{coord}: HF repo has no manifold.json at root — saklas "
             f"manifolds must be published with the manifest in place "
-            f"(see `saklas pack push`).  A legacy vector pack must carry "
-            f"statements.json to port; a bare control-vector repo must be "
-            f"re-authored as a manifold."
+            f"(see `saklas pack push`)."
         )
 
     source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
@@ -128,8 +179,20 @@ def pull_manifold(
         # manifest from the just-loaded folder and re-hashes ``files`` —
         # so the staged manifest stays self-consistent for the re-validate
         # below.
+        #
+        # The installed folder basename is its addressable identity.  An
+        # explicit ``--as ns/name`` must therefore rewrite the source repo's
+        # manifest name while the copy is still staged; otherwise selector
+        # discovery indexes the source name under a destination path that does
+        # not exist.
+        try:
+            files = _rewrite_staged_manifold_name(staged, target_folder.name)
+        except ManifoldFormatError as e:
+            raise HFError(
+                f"{coord}: staged manifold failed identity rewrite ({e})"
+            ) from e
         staged.source = source
-        staged.write_metadata(files=staged.files)
+        staged.write_metadata(files=files)
         try:
             ManifoldFolder.load(staging)
         except ManifoldFormatError as e:
@@ -138,13 +201,23 @@ def pull_manifold(
                 f"source stamp ({e})"
             ) from e
 
-    return stage_verify_swap(
-        target_folder,
-        force=force,
-        label=coord,
-        build=_build,
-        make_error=HFError,
-    )
+    def _swap() -> Path:
+        return stage_verify_swap(
+            target_folder,
+            force=force,
+            label=coord,
+            build=_build,
+            make_error=HFError,
+        )
+
+    if force and target_folder.exists():
+        from saklas.io.manifold_folder import (
+            destructive_manifold_folder_transaction,
+        )
+
+        with destructive_manifold_folder_transaction(target_folder):
+            return _swap()
+    return _swap()
 
 
 def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
@@ -155,13 +228,12 @@ def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
       * ``nodes/NN_<label>.json`` corpus files under ``nodes/``
       * Optional per-model fitted ``<safe_model>.safetensors`` + ``.json``
         sidecars at the root
-      * Optional ``scenarios.json`` provenance file (discover-mode)
 
     Anything else at the snapshot root (README, .gitattributes, etc.) is
     skipped — those are HF-side artifacts, not part of the manifold
     format.
     """
-    _ALLOWED_ROOT = {"manifold.json", "scenarios.json"}
+    _ALLOWED_ROOT = {"manifold.json"}
     _ALLOWED_SUFFIXES = (".safetensors", ".json")
 
     for entry in sorted(tmp_dir.iterdir()):
@@ -183,36 +255,6 @@ def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
                     )
 
 
-def _port_legacy_pack_dir(
-    tmp_dir: Path,
-    target_folder: Path,
-    coord: str,
-    revision: Optional[str],
-    *,
-    force: bool,
-) -> Path:
-    """Port a downloaded legacy saklas-pack repo to a 2-node ``pca`` manifold.
-
-    The 4.0 back-compat install path for a published v2 vector pack: its
-    ``statements.json`` reconstructs the equivalent 2-node manifold authoring
-    (file-only — the per-model subspace re-fits lazily on first steer).
-    ``target_folder`` is the resolved ``manifolds/<dst_ns>/<dst_name>/``
-    destination; the ``hf://`` source is stamped so ``refresh`` can re-pull.
-    Not stage-verify-swapped — porting is an idempotent file-only transform.
-    """
-    from saklas.io.manifolds import port_legacy_vector_folder
-
-    dst_ns = target_folder.parent.name
-    dst_name = target_folder.name
-    dst, mf = port_legacy_vector_folder(
-        tmp_dir, namespace=dst_ns, name=dst_name, force=force,
-    )
-    source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
-    mf.source = source
-    mf.write_metadata(files=mf.files)
-    return dst
-
-
 # ---------------------------------------------------------------------- push --
 #
 # HF upload, mirroring :func:`saklas.io.hf.push_pack` in shape: stage a
@@ -232,13 +274,13 @@ def _manifold_sidecar_stem_to_hf_coord(stem: str) -> Optional[str]:
     ``base_model:`` frontmatter lists the clean base model, then flips
     ``__`` → ``/``.  Returns ``None`` for stems that don't parse.
     """
-    from saklas.io.paths import parse_tensor_filename
+    from saklas.io.paths import parse_tensor_filename, unsafe_model_id
 
     parsed = parse_tensor_filename(f"{stem}.safetensors")
     if parsed is None:
         return None
     safe_model, _variant = parsed
-    return safe_model.replace("__", "/")
+    return unsafe_model_id(safe_model)
 
 
 def _render_manifold_card(
@@ -297,7 +339,7 @@ def _render_manifold_card(
         ]
         from saklas.io.paths import parse_tensor_filename
         for stem in sorted(tensor_stems):
-            base = _manifold_sidecar_stem_to_hf_coord(stem) or stem.replace("__", "/")
+            base = _manifold_sidecar_stem_to_hf_coord(stem) or stem
             parsed = parse_tensor_filename(f"{stem}.safetensors")
             variant = "raw" if (parsed is None or parsed[1] is None) else parsed[1]
             body.append(f"| `{base}` | `{variant}` |")
@@ -355,13 +397,18 @@ def push_manifold(
     corpus alone re-fits on the consumer side, unlike a pack where a
     tensors-and-statements-empty push is rejected.
     """
+    from contextlib import ExitStack
     import tempfile
 
-    from saklas.io.atomic import write_bytes_atomic
-    from saklas.io.manifolds import ManifoldFolder, hash_manifold_files
+    from saklas.io.manifolds import (
+        ManifoldFolder, ManifoldFormatError, hash_manifold_files,
+    )
     from saklas.io.paths import parse_tensor_filename, safe_model_id as _safe_id
-
-    mf = ManifoldFolder.load(folder)  # runs integrity check
+    from saklas.io.manifold_folder import (
+        _locked_manifest,
+        manifold_folder_tensor_paths,
+        manifold_pair_lock,
+    )
 
     scope_safe: Optional[str] = None
     if model_scope is not None:
@@ -369,40 +416,71 @@ def push_manifold(
 
     staging = Path(tempfile.mkdtemp(prefix="saklas-manifold-push-"))
     try:
-        # Always stage the corpus: manifold.json + the full nodes/ tree.
-        write_bytes_atomic(
-            staging / "manifold.json", (folder / "manifold.json").read_bytes(),
-        )
-        nodes_src = folder / "nodes"
-        if nodes_src.is_dir():
-            for child in sorted(nodes_src.iterdir()):
-                if child.is_file() and child.suffix == ".json":
-                    write_bytes_atomic(
-                        staging / "nodes" / child.name, child.read_bytes(),
-                    )
-        # Optional discover-mode provenance file.
-        scen = folder / "scenarios.json"
-        if scen.is_file():
-            write_bytes_atomic(staging / "scenarios.json", scen.read_bytes())
-
-        # Stage the fitted tensors that survive the model/variant filter,
-        # each with its sidecar.
         kept_stems: list[str] = []
-        for ts in sorted(folder.glob("*.safetensors")):
-            parsed = parse_tensor_filename(ts.name)
-            if parsed is None:
-                continue
-            file_model, var_slug = parsed
-            if scope_safe is not None and file_model != scope_safe:
-                continue
-            vkey = "raw" if var_slug is None else var_slug
-            if not _manifold_variant_matches(vkey, variant):
-                continue
-            write_bytes_atomic(staging / ts.name, ts.read_bytes())
-            kept_stems.append(ts.stem)
-            sc = ts.with_suffix(".json")
-            if sc.exists():
-                write_bytes_atomic(staging / sc.name, sc.read_bytes())
+        folder = Path(folder)
+        # Snapshot publication uses the same global mutation order as folder
+        # lifecycle operations: manifest first, then every logical fitted pair
+        # in deterministic order.  Keep both source validation and every source
+        # byte read inside this one transaction, so authoring edits and pair
+        # replacement cannot produce a mixed-generation upload.  The locks end
+        # before any Hub request below.
+        with _locked_manifest(folder):
+            with ExitStack() as pair_locks:
+                tensor_paths = manifold_folder_tensor_paths(folder)
+                for tensor_path in tensor_paths:
+                    pair_locks.enter_context(manifold_pair_lock(tensor_path))
+
+                mf = ManifoldFolder.load(folder)  # runs integrity check
+
+                # Always stage the corpus: manifold.json + the full nodes/ tree.
+                write_bytes_atomic(
+                    staging / "manifold.json",
+                    (folder / "manifold.json").read_bytes(),
+                )
+                nodes_src = folder / "nodes"
+                if nodes_src.is_dir():
+                    for child in sorted(nodes_src.iterdir()):
+                        if child.is_file() and child.suffix == ".json":
+                            write_bytes_atomic(
+                                staging / "nodes" / child.name,
+                                child.read_bytes(),
+                            )
+                # Stage the fitted tensors that survive the model/variant
+                # filter, each with its sidecar.
+                from saklas.core.manifold import load_manifold
+
+                # Iterate the candidate set whose logical locks we acquired.
+                # A lower-level writer that bypasses the documented
+                # manifest-before-pair order can create a new unmanifested pair
+                # while this snapshot owns the manifest lock; a second glob
+                # would see that unlocked generation and spuriously fail the
+                # push.  The frozen list keeps the staged snapshot exact.
+                for ts in tensor_paths:
+                    if not ts.is_file():
+                        continue
+                    parsed = parse_tensor_filename(ts.name)
+                    if parsed is None:
+                        continue
+                    file_model, var_slug = parsed
+                    if scope_safe is not None and file_model != scope_safe:
+                        continue
+                    vkey = "raw" if var_slug is None else var_slug
+                    if not _manifold_variant_matches(vkey, variant):
+                        continue
+                    sc = ts.with_suffix(".json")
+                    if not sc.exists():
+                        raise ManifoldFormatError(
+                            f"cannot push unpaired fitted tensor {ts.name}"
+                        )
+                    # Targeted runtime validation covers the trusted manifest
+                    # pair, fit policy, and current corpus/domain/template
+                    # identity. Without it a metadata edit could publish a
+                    # current corpus beside a stale fitted tensor whose old
+                    # bytes still pass the folder hash map.
+                    load_manifold(ts)
+                    write_bytes_atomic(staging / ts.name, ts.read_bytes())
+                    kept_stems.append(ts.stem)
+                    write_bytes_atomic(staging / sc.name, sc.read_bytes())
 
         # Re-hash the staged copy so the uploaded manifest matches the
         # bytes we upload (a model/variant filter changes the file set).
@@ -415,6 +493,10 @@ def push_manifold(
         staged_manifest = staging / "manifold.json"
         with open(staged_manifest) as f:
             staged_data = json.load(f)
+        # Transaction identity is local to one installed folder generation;
+        # publishing it would make every pull share the same rm/recreate epoch.
+        staged_data.pop("artifact_id", None)
+        staged_data.pop("fit_epochs", None)
         staged_data["files"] = hash_manifold_files(staging)
         _write_json_atomic(staged_manifest, staged_data)
 
@@ -543,11 +625,21 @@ def fetch_manifold_info(
         raise HFError(f"{label}: fetch_manifold_info failed ({e})") from e
 
     fmt_version = data.get("format_version")
-    if fmt_version is not None and fmt_version > MANIFOLD_FORMAT_VERSION:
+    if (
+        not isinstance(fmt_version, int)
+        or isinstance(fmt_version, bool)
+        or fmt_version != MANIFOLD_FORMAT_VERSION
+    ):
         raise HFError(
-            f"{label}: manifold format_version {fmt_version} is newer than "
-            f"this saklas understands ({MANIFOLD_FORMAT_VERSION}); update saklas."
+            f"{label}: manifold format_version must be exactly "
+            f"{MANIFOLD_FORMAT_VERSION}, got {fmt_version!r}."
         )
+    manifest_name = data.get("name")
+    if not isinstance(manifest_name, str) or not NAME_REGEX.match(manifest_name):
+        raise HFError(f"{label}: manifold has invalid or missing name")
+    fit_mode = data.get("fit_mode")
+    if fit_mode not in {"authored", "pca", "spectral", "auto", "baked"}:
+        raise HFError(f"{label}: manifold has invalid or missing fit_mode")
 
     tensor_models = sorted(
         Path(f).stem for f in files
@@ -556,7 +648,6 @@ def fetch_manifold_info(
 
     ns, _, nm = coord.partition("/")
     domain = data.get("domain") or {}
-    fit_mode = data.get("fit_mode", "authored")
     nodes = data.get("nodes") or []
     node_count = len(nodes) if isinstance(nodes, list) else 0
 
@@ -657,26 +748,13 @@ def install_manifold(
 def _install_local_manifold(
     src: Path, *, as_: Optional[str] = None, force: bool = False,
 ) -> Path:
-    """Copy a local manifold folder into the cache (or port a legacy vector pack).
-
-    Validates the source through ``ManifoldFolder.load`` first so a malformed
-    folder fails fast at the source.  A folder that isn't a manifold but carries
-    a ``statements.json`` is a legacy v2 vector pack — ported to a 2-node ``pca``
-    manifold via :func:`~saklas.io.manifolds.port_legacy_vector_folder` (the
-    back-compat bridge).  ``as_`` defaults to ``local/<src.name>``.
-    """
+    """Validate and copy a local manifold folder into the cache."""
     from saklas.io.paths import manifold_dir
 
-    is_manifold = True
     try:
         ManifoldFolder.load(src)
     except ManifoldFormatError as e:
-        if not (src / "statements.json").is_file():
-            raise ValueError(
-                f"{src}: source folder is not a manifold ({e}) and has no "
-                f"statements.json to port as a legacy vector pack"
-            ) from e
-        is_manifold = False
+        raise ValueError(f"{src}: source folder is not a manifold ({e})") from e
 
     if as_:
         if "/" not in as_:
@@ -691,17 +769,88 @@ def _install_local_manifold(
         )
 
     dst = manifold_dir(dst_ns, dst_name)
-    if dst.exists():
-        if not force:
-            raise ManifoldInstallConflict(
-                f"{dst} already exists; pass force=True or as_=<ns>/<name>"
-            )
-        shutil.rmtree(dst)
+    same_path = (
+        src.expanduser().resolve() == dst.expanduser().resolve(strict=False)
+    )
+    from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.staging import stage_verify_swap
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if is_manifold:
-        shutil.copytree(src, dst)
-    else:
-        from saklas.io.manifolds import port_legacy_vector_folder
-        port_legacy_vector_folder(src, namespace=dst_ns, name=dst_name, force=force)
-    return dst
+    def _install_from(source_path: Path) -> Path:
+        with _locked_manifest(dst):
+            backup = dst.with_name(dst.name + ".bak")
+            if not dst.exists() and backup.exists():
+                try:
+                    backup.rename(dst)
+                except OSError as exc:
+                    raise ManifoldInstallConflict(
+                        f"{dst}: could not recover interrupted local install ({exc})"
+                    ) from exc
+            if same_path:
+                if not force:
+                    raise ManifoldInstallConflict(
+                        f"{dst} already exists; pass force=True or as_=<ns>/<name>"
+                    )
+                # Reinstalling an already-installed folder onto itself is an exact
+                # no-op. Never reset the destination: it is the only source copy.
+                ManifoldFolder.load(src)
+                return dst
+            if dst.exists() and not force:
+                raise ManifoldInstallConflict(
+                    f"{dst} already exists; pass force=True or as_=<ns>/<name>"
+                )
+
+            def _build(staging: Path) -> None:
+                shutil.copytree(source_path, staging, dirs_exist_ok=True)
+                try:
+                    staged = ManifoldFolder.load(staging)
+                except ManifoldFormatError as exc:
+                    raise ManifoldInstallConflict(
+                        f"{src}: staged local manifold failed validation ({exc})"
+                    ) from exc
+                try:
+                    files = _rewrite_staged_manifold_name(staged, dst_name)
+                except ManifoldFormatError as exc:
+                    raise ManifoldInstallConflict(
+                        f"{src}: staged local manifold failed identity "
+                        f"rewrite ({exc})"
+                    ) from exc
+                staged.write_metadata(files=files)
+                try:
+                    ManifoldFolder.load(staging)
+                except ManifoldFormatError as exc:
+                    raise ManifoldInstallConflict(
+                        f"{src}: staged local manifold failed re-validation "
+                        f"after destination rename ({exc})"
+                    ) from exc
+
+            def _swap() -> Path:
+                return stage_verify_swap(
+                    dst, force=force, label=str(src), build=_build,
+                    make_error=ManifoldInstallConflict,
+                )
+
+            if force and dst.exists():
+                from saklas.io.manifold_folder import (
+                    destructive_manifold_folder_transaction,
+                )
+
+                with destructive_manifold_folder_transaction(dst):
+                    return _swap()
+            return _swap()
+
+    source_resolved = src.expanduser().resolve()
+    reserved = {
+        dst.with_name(dst.name + ".staging").resolve(strict=False),
+        dst.with_name(dst.name + ".bak").resolve(strict=False),
+    }
+    if source_resolved in reserved:
+        import tempfile
+
+        # Snapshot reserved-sibling sources before recovery/staging cleanup can
+        # rename or delete their only copy. This path is rare and correctness is
+        # worth the extra copy; normal installs still stream source→staging once.
+        with tempfile.TemporaryDirectory(prefix="saklas-local-install-") as tmp:
+            snapshot = Path(tmp) / src.name
+            shutil.copytree(src, snapshot)
+            return _install_from(snapshot)
+    return _install_from(src)

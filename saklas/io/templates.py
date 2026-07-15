@@ -17,7 +17,7 @@ to hash beyond the JSON itself):
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "name": "weekday",
   "slot": "[DAY]",
   "values": ["Monday", "Tuesday", ...],
@@ -30,8 +30,7 @@ to hash beyond the JSON itself):
 }
 ```
 
-**Invariant** (carried from the embedded-block predecessor, generalized to
-multi-turn): the slot appears exactly once in each context's final ``assistant``
+**Invariant:** the slot appears exactly once in each context's final ``assistant``
 string and *never* in a history turn — history is shared common-mode across the
 values, so the slot lives only where the value is read.
 """
@@ -54,11 +53,11 @@ from saklas.io.paths import ensure_within, templates_dir
 
 _LOG = logging.getLogger(__name__)
 
-TEMPLATE_FORMAT_VERSION = 1
+TEMPLATE_FORMAT_VERSION = 2
 
 # Node label discipline — mirrors ``io.manifolds._LABEL_REGEX`` (a templated
 # manifold's nodes are this template's slugged values, so the slug must be a
-# valid node label).  Defined here, not imported, so the migration's
+# valid node label). Defined here, not imported, so the
 # ``manifolds -> templates`` import direction stays acyclic.
 _LABEL_REGEX = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _VALID_ROLES = ("system", "user", "assistant")
@@ -182,13 +181,10 @@ class TemplateFolder:
                 {"turns": [dict(t) for t in ctx.turns], "assistant": ctx.assistant}
                 for ctx in self.contexts
             ],
+            "description": self.description,
+            "source": self.source or "local",
+            "tags": list(self.tags),
         }
-        if self.description:
-            payload["description"] = self.description
-        if self.source and self.source != "local":
-            payload["source"] = self.source
-        if self.tags:
-            payload["tags"] = list(self.tags)
         return payload
 
     def sha256(self) -> str:
@@ -237,11 +233,24 @@ class TemplateFolder:
     ) -> "TemplateFolder":
         if not isinstance(data, dict):
             raise TemplateFormatError("template.json must be a JSON object")
-        fmt = data.get("format_version")
-        if fmt is not None and fmt > TEMPLATE_FORMAT_VERSION:
+        allowed = {
+            "format_version", "name", "slot", "values", "contexts",
+            "description", "source", "tags",
+        }
+        unknown = set(data) - allowed
+        if unknown:
             raise TemplateFormatError(
-                f"template format_version {fmt} is newer than this build "
-                f"supports ({TEMPLATE_FORMAT_VERSION})"
+                f"template.json has unknown field(s): {sorted(unknown)}"
+            )
+        fmt = data.get("format_version")
+        if (
+            not isinstance(fmt, int)
+            or isinstance(fmt, bool)
+            or fmt != TEMPLATE_FORMAT_VERSION
+        ):
+            raise TemplateFormatError(
+                f"template format_version must be {TEMPLATE_FORMAT_VERSION}, "
+                f"got {fmt!r}"
             )
         name = data.get("name")
         if not isinstance(name, str) or not NAME_REGEX.match(name):
@@ -249,16 +258,34 @@ class TemplateFolder:
                 f"template 'name' {name!r} must match {NAME_REGEX.pattern}"
             )
         slot, values, contexts = _validate_body(name, data)
-        tags = data.get("tags") or ()
-        if tags and not all(isinstance(t, str) for t in tags):
+        required = {"description", "source", "tags"}
+        missing = required - set(data)
+        if missing:
+            raise TemplateFormatError(
+                f"template.json missing field(s): {sorted(missing)}"
+            )
+        tags = data["tags"]
+        if not isinstance(tags, list) or not all(
+            isinstance(t, str) for t in tags
+        ):
             raise TemplateFormatError(f"template {name!r} 'tags' must be strings")
+        description = data["description"]
+        if not isinstance(description, str):
+            raise TemplateFormatError(
+                f"template {name!r} 'description' must be a string"
+            )
+        source = data["source"]
+        if not isinstance(source, str) or not source:
+            raise TemplateFormatError(
+                f"template {name!r} 'source' must be a non-empty string"
+            )
         return cls(
             name=name,
             slot=slot,
             values=tuple(values),
             contexts=tuple(contexts),
-            description=str(data.get("description", "") or ""),
-            source=str(data.get("source", "local") or "local"),
+            description=description,
+            source=source,
             tags=tuple(tags),
             path=path,
         )
@@ -336,6 +363,12 @@ def _validate_context(
             f"template {name!r} context {i} must be an object with "
             f"'turns' and 'assistant'"
         )
+    unknown = set(ctx) - {"turns", "assistant"}
+    if unknown:
+        raise TemplateFormatError(
+            f"template {name!r} context {i} has unknown field(s): "
+            f"{sorted(unknown)}"
+        )
     raw_turns = ctx.get("turns")
     if not isinstance(raw_turns, list) or not raw_turns:
         raise TemplateFormatError(
@@ -348,6 +381,12 @@ def _validate_context(
             raise TemplateFormatError(
                 f"template {name!r} context {i} turn {j} must be a "
                 f"{{role, content}} object"
+            )
+        unknown_turn = set(turn) - {"role", "content"}
+        if unknown_turn:
+            raise TemplateFormatError(
+                f"template {name!r} context {i} turn {j} has unknown field(s): "
+                f"{sorted(unknown_turn)}"
             )
         role = turn.get("role")
         content = turn.get("content")
@@ -434,6 +473,7 @@ def create_template_folder(
             "values": values,
             "contexts": contexts,
             "description": description,
+            "source": "local",
             "tags": tags or [],
         },
     )
@@ -534,6 +574,7 @@ def remove_template_folder(namespace: str, name: str) -> bool:
 # materializer — process-scope caching sidesteps the "bundle changed under user"
 # vs "user changed it via CLI" ambiguity (see that function's docstring).
 _templates_materialized_this_process: bool = False
+_templates_materialized_home: Path | None = None
 
 
 def _canonical_json_sha256(data: bytes) -> str:
@@ -596,13 +637,19 @@ def materialize_bundled_templates() -> None:
       replaced (fork under another namespace to keep a custom copy).
     - **No change** — skip.
 
-    Process-scoped no-op after the first call.  Must run BEFORE
+    Process-scoped no-op after the first call for a given ``SAKLAS_HOME``.
+    Switching homes in-process bootstraps the new root. Must run BEFORE
     ``materialize_bundled_manifolds`` — see the module note above.
     """
-    global _templates_materialized_this_process
-    if _templates_materialized_this_process:
+    global _templates_materialized_this_process, _templates_materialized_home
+    home = templates_dir().parent
+    if (
+        _templates_materialized_this_process
+        and _templates_materialized_home == home
+    ):
         return
     _templates_materialized_this_process = True
+    _templates_materialized_home = home
 
     names = bundled_template_names()
     if not names:
@@ -633,7 +680,11 @@ def materialize_bundled_templates() -> None:
             != _canonical_json_sha256(bundled_bytes)
         )
         fmt = on_disk_payload.get("format_version")
-        format_stale = isinstance(fmt, int) and fmt < TEMPLATE_FORMAT_VERSION
+        format_stale = (
+            not isinstance(fmt, int)
+            or isinstance(fmt, bool)
+            or fmt != TEMPLATE_FORMAT_VERSION
+        )
         if not hash_changed and not format_stale:
             continue
 

@@ -7,11 +7,12 @@
 // page injects a key after load, call ``setApiKey()`` to refresh it.
 
 import type {
+  CastMemberJSON,
   CorrelationData,
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
   CreateTemplateRequest,
-  CreateTemplatedManifoldRequest,
+  CreateManifoldFromTemplateRequest,
   ExperimentFanRequest,
   ExperimentFanResponse,
   ExtractRequest,
@@ -22,6 +23,10 @@ import type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  InstrumentSourceJSON,
+  LensFetchStatusJSON,
+  LensFitStatusJSON,
+  LensTokenValidationJSON,
   LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
@@ -37,6 +42,10 @@ import type {
   ProbeRequest,
   RemoteManifoldInfo,
   ScoreTemplateResponse,
+  SaeFeatureMetaResponse,
+  SaeLoadStatusJSON,
+  SaeTrainStatusJSON,
+  SaeTokenReadoutJSON,
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
@@ -58,7 +67,7 @@ export type {
   CreateDiscoverManifoldRequest,
   CreateManifoldRequest,
   CreateTemplateRequest,
-  CreateTemplatedManifoldRequest,
+  CreateManifoldFromTemplateRequest,
   FitManifoldRequest,
   GenerateManifoldRequest,
   ExperimentFanRequest,
@@ -69,6 +78,10 @@ export type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  InstrumentSourceJSON,
+  LensFetchStatusJSON,
+  LensFitStatusJSON,
+  LensTokenValidationJSON,
   LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
@@ -84,6 +97,10 @@ export type {
   ProbeRequest,
   RemoteManifoldInfo,
   ScoreTemplateResponse,
+  SaeFeatureMetaResponse,
+  SaeLoadStatusJSON,
+  SaeTrainStatusJSON,
+  SaeTokenReadoutJSON,
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
@@ -97,11 +114,6 @@ export type {
   WSServerMessage,
 } from "./types";
 
-// Aliased name for legacy compat with the v1.6 ``WsMessage`` type — the
-// old Chat panel imports it; keeping the alias means we don't need to
-// touch panels in this phase.
-export type WsMessage = WSServerMessage;
-
 // --------------------------------------------------------- session id --
 
 /** The native API is multi-session-shaped but the current impl is single-session.
@@ -109,10 +121,6 @@ export type WsMessage = WSServerMessage;
  * isn't reachable via the WS path-param (HF model ids contain ``/`` which
  * the WS route doesn't declare as a ``:path`` param). */
 const SESSION = "default";
-
-/** Legacy v1.6 export — old panels build URLs as ``${API}/vectors``.  Kept
- * unchanged so this rewrite doesn't ripple into the panel layer. */
-export const API = `/saklas/v1/sessions/${SESSION}`;
 
 const SESSION_BASE = (id: string = SESSION) => `/saklas/v1/sessions/${id}`;
 const MANIFOLDS_BASE = "/saklas/v1/manifolds";
@@ -164,12 +172,17 @@ export class ApiError extends Error {
   readonly rawBody: string;
 
   constructor(status: number, path: string, rawBody: string, parsed: unknown) {
+    const record =
+      parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    const nestedError =
+      record?.error && typeof record.error === "object"
+        ? (record.error as Record<string, unknown>)
+        : null;
+    const detail = record?.detail ?? nestedError?.message;
     super(
-      `${path}: ${status} ${
-        parsed && typeof parsed === "object" && "detail" in (parsed as object)
-          ? (parsed as { detail: unknown }).detail
-          : rawBody.slice(0, 200)
-      }`,
+      typeof detail === "string" && detail.trim()
+        ? detail
+        : rawBody.trim().slice(0, 200) || `Request failed (${status})`,
     );
     this.name = "ApiError";
     this.status = status;
@@ -245,7 +258,7 @@ export const apiSessions = {
     body: Partial<{
       temperature: number;
       top_p: number;
-      top_k: number;
+      top_k: number | null;
       max_tokens: number;
       system_prompt: string;
       thinking: boolean;
@@ -262,6 +275,15 @@ export const apiSessions = {
   },
   rewind(id: string = SESSION): Promise<void> {
     return request<void>(`${SESSION_BASE(id)}/rewind`, { method: "POST" });
+  },
+  validateSteering(
+    expression: string,
+    id: string = SESSION,
+  ): Promise<{ valid: boolean; expression: string; error: string | null }> {
+    return request(
+      `${SESSION_BASE(id)}/steering/validate`,
+      jsonBody({ expression }),
+    );
   },
 };
 
@@ -342,14 +364,22 @@ export const apiProbes = {
       `${SESSION_BASE(id)}/probes/${encodeURIComponent(name)}/geometry`,
     );
   },
+  /** CAA live toggle — enable/disable live per-token monitor scoring.
+   *  Off ⇒ probes report only the end-of-gen aggregate (no per-token
+   *  stream / loom rows / trait events); probe gates still force what
+   *  they need. */
+  setLive(
+    req: { enabled: boolean },
+    id: string = SESSION,
+  ): Promise<{ enabled: boolean }> {
+    return request(`${SESSION_BASE(id)}/probes/live`, jsonBody(req));
+  },
 };
 
 // ========================================================== manifolds ==
 
 /** Steering-manifold endpoints — top-level (not session-scoped), like
- *  packs.  All routes 404 on servers that pre-date the manifold HTTP
- *  surface; callers should catch ``ApiError`` with status 404 and treat
- *  manifolds as unavailable. */
+ *  packs.  These routes are required by the current dashboard. */
 export const apiManifolds = {
   list(): Promise<ManifoldListResponse> {
     return request(MANIFOLDS_BASE);
@@ -374,13 +404,11 @@ export const apiManifolds = {
   ): Promise<ManifoldInfo> {
     return request(`${MANIFOLDS_BASE}/discover`, jsonBody(req));
   },
-  /** Create a templated discover manifold — slot + values + chat-turn
-   *  templates, expanded server-side into per-value node corpora. Pair with
-   *  ``apiManifoldFitStream`` to fit. */
-  createTemplated(
-    req: CreateTemplatedManifoldRequest,
+  /** Derive a discover manifold from a standalone template artifact. */
+  createFromTemplate(
+    req: CreateManifoldFromTemplateRequest,
   ): Promise<ManifoldInfo> {
-    return request(`${MANIFOLDS_BASE}/templated`, jsonBody(req));
+    return request(`${MANIFOLDS_BASE}/from-template`, jsonBody(req));
   },
   update(
     namespace: string,
@@ -598,14 +626,27 @@ export async function apiExtractStream(
 
 // ============================================================== tree ==
 //
-// Loom tree REST surface (v2.3, phase 2).  All routes 404 on servers
-// that don't yet ship the loom layer — callers should catch ApiError
-// with status 404 and fall back to non-loom behaviour.
+// Required loom tree REST surface.
 
 export const apiTree = {
   /** Full tree dump.  Cheap enough to fetch on every reconcile. */
   get(id: string = SESSION): Promise<LoomTreeJSON> {
     return request(`${SESSION_BASE(id)}/tree`);
+  },
+  /** Replace the complete server-owned Loom tree from a saved snapshot. */
+  restore(
+    tree: LoomTreeJSON,
+    id: string = SESSION,
+  ): Promise<{
+    rev: number;
+    root_id: string;
+    active_node_id: string;
+    nodes: number;
+  }> {
+    return request(
+      `${SESSION_BASE(id)}/tree`,
+      { ...jsonBody({ tree }), method: "PUT" },
+    );
   },
   /** Just the active path — what the chat panel needs to render the
    *  conversation linearly.  Less data than the full tree.  Server
@@ -644,6 +685,7 @@ export const apiTree = {
     node_id: string,
     text: string,
     id: string = SESSION,
+    role?: "user" | "assistant" | null,
   ): Promise<{
     node_id: string;
     node: LoomNodeJSON;
@@ -656,7 +698,32 @@ export const apiTree = {
   }> {
     return request(
       `${SESSION_BASE(id)}/tree/branch`,
-      jsonBody({ node_id, text }),
+      jsonBody(role ? { node_id, text, role } : { node_id, text }),
+    );
+  },
+  /** Cast roster (phase 3): label → member. */
+  cast(id: string = SESSION): Promise<{ cast: Record<string, CastMemberJSON> }> {
+    return request(`${SESSION_BASE(id)}/tree/cast`);
+  },
+  castPut(
+    label: string,
+    body: {
+      steering?: string | null;
+      thinking?: boolean | null;
+      seed?: number | null;
+      notes?: string;
+    },
+    id: string = SESSION,
+  ): Promise<{ label: string; member: CastMemberJSON }> {
+    return request(
+      `${SESSION_BASE(id)}/tree/cast/${encodeURIComponent(label)}`,
+      { ...jsonBody(body), method: "PUT" },
+    );
+  },
+  castDelete(label: string, id: string = SESSION): Promise<void> {
+    return request<void>(
+      `${SESSION_BASE(id)}/tree/cast/${encodeURIComponent(label)}`,
+      { method: "DELETE" },
     );
   },
   delete(
@@ -783,6 +850,43 @@ export const apiExperiments = {
 // ====================================================== jacobian lens ==
 
 export const apiLens = {
+  sources(
+    id: string = SESSION,
+  ): Promise<{ sources: InstrumentSourceJSON[] }> {
+    return request(`${SESSION_BASE(id)}/lens/sources`);
+  },
+
+  use(
+    source: string,
+    id: string = SESSION,
+  ): Promise<{ source: string; live_layers: number[] }> {
+    return request(`${SESSION_BASE(id)}/lens/use`, jsonBody({ source }));
+  },
+
+  fetch(
+    body: { source?: string; force?: boolean } = {},
+    id: string = SESSION,
+  ): Promise<LensFetchStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fetch`, jsonBody(body));
+  },
+
+  fetchStatus(id: string = SESSION): Promise<LensFetchStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fetch`);
+  },
+
+  /** Check that ``word`` round-trips through the loaded model tokenizer as
+   * exactly one vocabulary token.  Read-only: steering/probe state is not
+   * changed when validation fails. */
+  validateToken(
+    word: string,
+    id: string = SESSION,
+  ): Promise<LensTokenValidationJSON> {
+    return request(
+      `${SESSION_BASE(id)}/lens/token/validate`,
+      jsonBody({ word }),
+    );
+  },
+
   /** Workspace readout at one decode step of a loom node — the per-layer
    * J-lens top-k matrix at the forward that produced the clicked token.
    * ``steered`` (default true) replays under the node's recipe steering;
@@ -792,7 +896,7 @@ export const apiLens = {
   tokenReadout(
     nodeId: string,
     rawIndex: number,
-    opts: { topK?: number; steered?: boolean; raw?: boolean } = {},
+    opts: { topK?: number; steered?: boolean; raw?: boolean; layers?: string } = {},
     id: string = SESSION,
   ): Promise<LensTokenReadoutJSON> {
     const params = new URLSearchParams({
@@ -802,7 +906,136 @@ export const apiLens = {
       steered: String(opts.steered ?? true),
       raw: String(opts.raw ?? false),
     });
+    if (opts.layers) params.set("layers", opts.layers);
     return request(`${SESSION_BASE(id)}/lens/token-readout?${params}`);
+  },
+
+  /** Toggle the live J-lens readout. While enabled, each WS ``token``
+   * frame carries a ``lens_readout`` matrix (per selected layer, the top-k
+   * lens tokens for that decode step). ``layers`` omitted enables every
+   * fitted layer. The generation's logit-alternative K controls the token
+   * width. Applies to generations started after the call. */
+  setLive(
+    body: { enabled: boolean; layers?: number[] | null },
+    id: string = SESSION,
+  ): Promise<{ enabled: boolean; layers: number[] | null }> {
+    return request(`${SESSION_BASE(id)}/lens/live`, jsonBody(body));
+  },
+
+  /** Kick off a background Jacobian-lens fit (the "fit j-lens" button).
+   * 202 with the initial status; poll ``fitStatus``. Defaults: 100
+   * corpus prompts, all source layers, resume-if-matching. */
+  fit(
+    body: {
+      prompts?: number;
+      seq_len?: number;
+      layers?: string;
+      force?: boolean;
+    } = {},
+    id: string = SESSION,
+  ): Promise<LensFitStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fit`, jsonBody(body));
+  },
+
+  /** Poll the background lens fit's progress / error / completion. */
+  fitStatus(id: string = SESSION): Promise<LensFitStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fit`);
+  },
+
+  /** Request cooperative cancellation after the current estimator pass. */
+  cancelFit(id: string = SESSION): Promise<LensFitStatusJSON> {
+    return request(`${SESSION_BASE(id)}/lens/fit`, { method: "DELETE" });
+  },
+};
+
+// ================================================= sparse autoencoder ==
+
+export const apiSae = {
+  sources(id: string = SESSION): Promise<{ sources: InstrumentSourceJSON[] }> {
+    return request(`${SESSION_BASE(id)}/sae/sources`);
+  },
+  releases(id: string = SESSION): Promise<{ releases: {
+    release: string; model?: string | null; layers: number[];
+    repo_id?: string | null; neuronpedia?: boolean;
+    source?: "local" | "saelens";
+  }[] }> {
+    return request(`${SESSION_BASE(id)}/sae/releases`);
+  },
+  load(
+    body: { release: string; layer?: number | null },
+    id: string = SESSION,
+  ): Promise<SaeLoadStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/load`, jsonBody(body));
+  },
+  loadStatus(id: string = SESSION): Promise<SaeLoadStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/load`);
+  },
+  train(
+    body: {
+      name: string;
+      layer?: number | null;
+      tokens?: number;
+      seq_len?: number;
+      batch_size?: number;
+      width?: number | null;
+      expansion?: number;
+      learning_rate?: number;
+      l1?: number;
+      dead_threshold?: number;
+      seed?: number;
+      force?: boolean;
+    },
+    id: string = SESSION,
+  ): Promise<SaeTrainStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/train`, jsonBody(body));
+  },
+  trainStatus(id: string = SESSION): Promise<SaeTrainStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/train`);
+  },
+  cancelTrain(id: string = SESSION): Promise<SaeTrainStatusJSON> {
+    return request(`${SESSION_BASE(id)}/sae/train`, { method: "DELETE" });
+  },
+  setLive(
+    body: { enabled: boolean; top_k?: number },
+    id: string = SESSION,
+  ): Promise<{ enabled: boolean; layer: number | null; top_k: number }> {
+    return request(`${SESSION_BASE(id)}/sae/live`, jsonBody(body));
+  },
+  validateFeature(
+    featureId: number,
+    id: string = SESSION,
+  ): Promise<{
+    id: number; label?: string | null; layer: number;
+    max_act?: number | null;
+  }> {
+    return request(
+      `${SESSION_BASE(id)}/sae/feature/validate`,
+      jsonBody({ id: featureId }),
+    );
+  },
+  featuresMetadata(
+    ids: number[],
+    id: string = SESSION,
+  ): Promise<SaeFeatureMetaResponse> {
+    return request(
+      `${SESSION_BASE(id)}/sae/features/metadata`,
+      jsonBody({ ids }),
+    );
+  },
+  tokenReadout(
+    nodeId: string,
+    rawIndex: number,
+    opts: { topK?: number; steered?: boolean; raw?: boolean } = {},
+    id: string = SESSION,
+  ): Promise<SaeTokenReadoutJSON> {
+    const params = new URLSearchParams({
+      node_id: nodeId,
+      raw_index: String(rawIndex),
+      top_k: String(opts.topK ?? 8),
+      steered: String(opts.steered ?? true),
+      raw: String(opts.raw ?? false),
+    });
+    return request(`${SESSION_BASE(id)}/sae/token-readout?${params}`);
   },
 };
 
@@ -950,17 +1183,4 @@ export function connectWs(id: string = SESSION): WebSocket {
     url += `?token=${encodeURIComponent(_apiKey)}`;
   }
   return new WebSocket(url);
-}
-
-// =================================================== legacy compat ====
-
-/** Legacy v1.6 export — kept so existing panels keep working through the
- * Phase 2/3 transition.  Newer code should use ``apiSessions.get()``. */
-export interface LegacySessionInfo {
-  id: string;
-  model_id: string;
-  device: string;
-  dtype: string;
-  vectors: string[];
-  probes: string[];
 }

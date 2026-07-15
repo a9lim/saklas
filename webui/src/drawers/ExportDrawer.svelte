@@ -1,16 +1,21 @@
 <script lang="ts">
-  // Export drawer — JSONL or CSV download of the last assistant turn.
+  // Export drawer — JSONL or CSV download of the last generated turn.
   // Mirrors the TUI's ``/export <path>``: the TUI dumps
   // ``session.last_result`` through ``ResultCollector``.  The web side
   // doesn't keep ``last_result`` in scope, so we serialize the last
-  // assistant turn from ``chatLog`` — same fields the rest of the UI
+  // generated turn from ``chatLog`` — same fields the rest of the UI
   // already shows (text, applied_steering, aggregateReadings, finish
   // reason, perplexity, sampling).
   //
-  // Empty result (no assistant turn yet, or last turn had no readings)
+  // Empty result (no generated turn yet, or last turn had no readings)
   // → renders a notice and disables the download button.
 
-  import { chatLog, samplingState, closeDrawer } from "../lib/stores.svelte";
+  import {
+    chatLog,
+    samplingState,
+    closeDrawer,
+    roleDisplayLabel,
+  } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
   import Radio from "../lib/Radio.svelte";
 
@@ -23,11 +28,11 @@
   let format: Format = $state("jsonl");
   let filename = $state("");
 
-  /** Locate the most recent assistant turn — that's "the last result"
+  /** Locate the most recent generated turn — that's "the last result"
    * for export purposes.  Returns null if there isn't one. */
   const lastTurn: ChatTurn | null = $derived.by(() => {
     for (let i = chatLog.turns.length - 1; i >= 0; i--) {
-      if (chatLog.turns[i].role === "assistant") return chatLog.turns[i];
+      if (chatLog.turns[i].generated) return chatLog.turns[i];
     }
     return null;
   });
@@ -60,7 +65,8 @@
       seed: samplingState.seed,
     };
     return {
-      role: turn.role,
+      structural_role: turn.role,
+      role: roleDisplayLabel(turn.role, turn.roleLabel),
       text: turn.text ?? "",
       thinking: turn.thinking ?? false,
       applied_steering: turn.appliedSteering ?? null,
@@ -99,6 +105,7 @@
     const readings = (rec.readings ?? {}) as Record<string, number>;
     const sampling = (rec.sampling ?? {}) as Record<string, unknown>;
     const cols: { key: string; value: unknown }[] = [
+      { key: "structural_role", value: rec.structural_role },
       { key: "role", value: rec.role },
       { key: "text", value: rec.text },
       { key: "thinking", value: rec.thinking },
@@ -162,7 +169,7 @@
 
 <section class="drawer-shell" aria-label="Export drawer">
   <header class="header">
-    <span class="title">export last result</span>
+    <span class="title">export</span>
     <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
       >✕</button
     >
@@ -170,12 +177,8 @@
 
   <div class="body">
     {#if !lastTurn}
-      <p class="dim">no assistant result yet, generate something first.</p>
+      <p class="dim">no result</p>
     {:else}
-      <p class="hint">
-        exports the last assistant turn (text, applied_steering, sampling,
-        per-token data, and aggregate probe readings if present).
-      </p>
 
       <div class="mode-row" role="radiogroup" aria-label="Format">
         <Radio bind:group={format} value="jsonl" label="JSONL" />
@@ -202,11 +205,11 @@
           </span>
         </p>
         <p class="meta-row">
-          <span class="meta-key">finish reason</span>
+          <span class="meta-key">finish</span>
           <span class="meta-val">{lastTurn.finishReason ?? "—"}</span>
         </p>
         <p class="meta-row">
-          <span class="meta-key">applied steering</span>
+          <span class="meta-key">steering</span>
           <span class="meta-val">
             {lastTurn.appliedSteering ?? "—"}
           </span>
@@ -222,10 +225,7 @@
       </div>
 
       {#if !hasReadings}
-        <p class="warn">
-          last turn carries no aggregate probe readings; the export will
-          still succeed with an empty <code>readings</code> field.
-        </p>
+        <p class="warn">no readings</p>
       {/if}
     {/if}
   </div>
@@ -248,30 +248,44 @@
     height: 100%;
     min-height: 0;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-6);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-5) var(--space-6);
   }
   .title {
     color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    padding: var(--space-2) var(--space-3);
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--accent-red);
+    color: var(--fg);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
@@ -284,12 +298,6 @@
   }
   .dim {
     color: var(--fg-muted);
-  }
-  .hint {
-    margin: 0;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.4;
   }
   .mode-row {
     display: flex;
@@ -306,9 +314,9 @@
     text-transform: lowercase;
   }
   .input {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-3);
     font: inherit;
     font-family: var(--font-mono);
@@ -319,7 +327,6 @@
   }
   .meta-block {
     background: var(--bg-deep);
-    border: 1px solid var(--border);
     padding: var(--space-3) var(--space-4);
     display: flex;
     flex-direction: column;
@@ -337,6 +344,7 @@
   }
   .meta-val {
     color: var(--fg-strong);
+    font-family: var(--font-mono);
     word-break: break-word;
   }
   .warn {
@@ -344,45 +352,37 @@
     font-size: var(--text-sm);
     margin: 0;
   }
-  .warn code {
-    color: var(--accent-yellow);
-    background: rgba(210, 153, 34, 0.1);
-    padding: 0 var(--space-1);
-    border-radius: var(--radius);
-  }
   .footer {
     display: flex;
     justify-content: flex-end;
     gap: var(--space-3);
-    padding: var(--space-6);
-    border-top: 1px solid var(--border);
+    padding: var(--space-3) var(--space-6);
+    color: var(--fg-muted);
   }
   .btn {
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-5);
     font: inherit;
     font-family: var(--font-mono);
     cursor: pointer;
   }
   .btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .btn:disabled {
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
   .btn.primary {
     background: var(--accent);
     color: var(--text-on-accent);
-    border-color: var(--accent);
+    border-color: transparent;
   }
   .btn.primary:hover:not(:disabled) {
     background: var(--accent-light);
-    border-color: var(--accent-light);
+    border-color: transparent;
   }
   .btn.primary:disabled {
     background: var(--bg-elev);

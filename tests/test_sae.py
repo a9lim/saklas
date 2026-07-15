@@ -125,6 +125,7 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
     import types
 
     fake_sae_lens = types.ModuleType("sae_lens")
+    seen_revisions: list[str | None] = []
 
     class FakeSAE:
         def __init__(self, d_in: Any, d_sae: Any, hook_layer: Any) -> None:
@@ -142,7 +143,11 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
             return f @ self.W_dec
 
         @classmethod
-        def from_pretrained(cls, release: Any, sae_id: Any, device: Any = None) -> Any:
+        def from_pretrained(
+            cls, release: Any, sae_id: Any, device: Any = None,
+            revision: str | None = None,
+        ) -> Any:
+            seen_revisions.append(revision)
             hook_layer = int(sae_id.split("_")[1])
             return (
                 cls(d_in=4, d_sae=4, hook_layer=hook_layer),
@@ -159,16 +164,153 @@ def test_sae_lens_backend_encodes_and_decodes(monkeypatch: pytest.MonkeyPatch):
     }
     monkeypatch.setitem(sys.modules, "sae_lens", fake_sae_lens)
 
-    from saklas.core.sae import load_sae_backend
+    from saklas.core.sae import SaeLensBackend, load_sae_backend
     backend = load_sae_backend("mock-canonical", model_id="test-model", device="cpu")
+    assert isinstance(backend, SaeLensBackend)
     assert backend.layers == frozenset({2, 5, 8})
     assert backend.release == "mock-canonical"
+    # Registry resolution is cheap; weights stay cold until a covered layer is
+    # actually visited, and only the current layer remains resident.
+    assert backend._active_sae is None
 
     h = torch.randn(3, 4)
     f = backend.encode_layer(5, h)
     assert f.shape == (3, 4)
+    sae5 = backend._active_sae
     v = backend.decode_layer(5, torch.randn(4))
     assert v.shape == (4,)
+    assert backend._active_sae is sae5
+    backend.encode_layer(8, h)
+    assert backend._active_layer == 8
+    assert backend._active_sae is not sae5
+    pinned = load_sae_backend(
+        "mock-canonical", revision="commit-123",
+        model_id="test-model", device="cpu",
+    )
+    pinned.encode_layer(2, h)
+    assert seen_revisions[-1] == "commit-123"
+
+
+def test_installed_sae_lens_registry_api_resolves_without_loading_weights() -> None:
+    pytest.importorskip("sae_lens")
+    from saklas.core.sae import SaeLensBackend, load_sae_backend
+
+    backend = load_sae_backend(
+        "gemma-scope-2-4b-it-res",
+        model_id="google/gemma-3-4b-it", device="cpu",
+    )
+    assert isinstance(backend, SaeLensBackend)
+    assert backend.layers == frozenset({9, 17, 22, 29})
+    assert backend._active_sae is None
+
+
+def test_provider_backend_records_the_resolved_hub_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default provider fetch must persist the commit it actually pinned.
+
+    The UI passes no explicit revision.  Returning that input ``None`` from the
+    backend made ``session.load_sae`` reject its own otherwise-valid runtime
+    metadata after the SAE had already downloaded and materialized.
+    """
+    import sys
+    import types
+
+    import huggingface_hub
+    import torch
+
+    commit = "a" * 40
+    seen_revisions: list[str | None] = []
+    fake_sae_lens = types.ModuleType("sae_lens")
+
+    class FakeSAE:
+        def __init__(self) -> None:
+            self.cfg = types.SimpleNamespace(
+                d_in=4, d_sae=8, model_name="test-model", hook_layer=2,
+                metadata={"hook_name": "blocks.2.hook_resid_post"},
+            )
+            self.W_dec = torch.zeros(8, 4)
+
+        @classmethod
+        def from_pretrained(
+            cls, release: Any, sae_id: Any, device: Any = None,
+            revision: str | None = None,
+        ) -> Any:
+            del release, sae_id, device
+            seen_revisions.append(revision)
+            return cls(), {"hook_layer": 2}, None
+
+        def to(self, **_kwargs: Any) -> "FakeSAE":
+            return self
+
+    class FakeHfApi:
+        def model_info(self, *_args: Any, **_kwargs: Any) -> Any:
+            return types.SimpleNamespace(sha=commit)
+
+    fake_sae_lens.SAE = FakeSAE  # pyright: ignore[reportAttributeAccessIssue]
+    fake_sae_lens.get_pretrained_saes_directory = lambda: {  # pyright: ignore[reportAttributeAccessIssue]
+        "mock-provider": {
+            "saes_map": {"layer_2": 2},
+            "model": "test-model",
+            "repo_id": "org/mock-saes",
+        },
+    }
+    monkeypatch.setitem(sys.modules, "sae_lens", fake_sae_lens)
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)
+
+    from saklas.core.sae import load_sae_backend
+
+    backend = load_sae_backend(
+        "mock-provider", model_id="test-model", device="cpu",
+    )
+    assert backend.revision == commit
+    assert backend.fingerprint is not None
+    assert backend.feature_count(2) == 8
+    assert seen_revisions == [commit]
+
+
+def test_release_discovery_omits_known_non_residual_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import types
+
+    fake = types.ModuleType("sae_lens")
+    fake.get_pretrained_saes_directory = lambda: {  # pyright: ignore[reportAttributeAccessIssue]
+        "scope-res": {"saes_map": {"layer_1": 1}, "model": "m"},
+        "scope-att": {"saes_map": {"layer_1": 1}, "model": "m"},
+        "scope-mlp": {"saes_map": {"layer_1": 1}, "model": "m"},
+        "scope-transcoders": {"saes_map": {"layer_1": 1}, "model": "m"},
+        "custom": {"saes_map": {"layer_1": 1}, "model": "m"},
+    }
+    monkeypatch.setitem(sys.modules, "sae_lens", fake)
+
+    from saklas.core.sae import list_sae_releases
+
+    assert [row["release"] for row in list_sae_releases("m")] == [
+        "custom", "scope-res",
+    ]
+
+
+def test_loaded_attention_hook_is_rejected_before_use() -> None:
+    import types
+    from saklas.core.errors import SaeCoverageError
+    from saklas.core.sae import _validate_residual_hook
+
+    sae = types.SimpleNamespace(cfg=types.SimpleNamespace(
+        metadata={"hook_name": "blocks.22.attn.hook_z"},
+    ))
+    with pytest.raises(SaeCoverageError, match="choose the corresponding '-res'"):
+        _validate_residual_hook(sae, "scope-att", 22)
+
+
+def test_residual_width_must_match_model_hidden_size() -> None:
+    from saklas.core.errors import SaeCoverageError
+    from saklas.core.sae import MockSaeBackend, validate_residual_width
+
+    backend = MockSaeBackend(layers=frozenset({2}), d_model=3)
+    with pytest.raises(SaeCoverageError, match="model residual stream has width 4"):
+        validate_residual_width(backend, 2, 4)
 
 
 def test_sae_lens_backend_missing_dep_raises(monkeypatch: pytest.MonkeyPatch):
@@ -272,9 +414,54 @@ def test_sae_lens_backend_canonical_layer_map_warns_on_multiple(monkeypatch: pyt
     assert backend.layers == frozenset({0, 2})
 
 
+def test_canonical_layer_map_sorts_width_and_l0_numerically() -> None:
+    from saklas.core.sae import _canonical_layer_map
+
+    with pytest.warns(UserWarning, match="multiple SAEs"):
+        chosen = _canonical_layer_map({
+            "layer_0_width_131k_l0_small": 0,
+            "layer_0_width_16k_l0_big": 0,
+            "layer_0_width_16k_l0_medium": 0,
+            "layer_0_width_16k_l0_small": 0,
+            "layer_1/width_16k/average_l0_105": 1,
+            "layer_1/width_16k/average_l0_13": 1,
+        })
+
+    assert chosen == {
+        "layer_0_width_16k_l0_small": 0,
+        "layer_1/width_16k/average_l0_13": 1,
+    }
+
+
+def test_canonical_layer_map_prefers_neuronpedia_hosted() -> None:
+    # Neuronpedia typically hosts one L0 variant per layer/width, and hosting
+    # is where feature labels + the maxActApprox strength unit come from — a
+    # hosted SAE beats a narrower/sparser unhosted one.
+    from saklas.core.sae import _canonical_layer_map
+
+    saes_map = {
+        "layer_0_width_131k_l0_small": 0,
+        "layer_0_width_16k_l0_big": 0,
+        "layer_0_width_16k_l0_medium": 0,
+        "layer_0_width_16k_l0_small": 0,
+        "layer_1_width_16k_l0_small": 1,
+    }
+    with pytest.warns(UserWarning, match="multiple SAEs"):
+        chosen = _canonical_layer_map(saes_map, neuronpedia_ids={
+            "layer_0_width_16k_l0_medium": "model/0-res-16k",
+            "layer_1_width_16k_l0_small": "model/1-res-16k",
+        })
+    assert chosen == {
+        "layer_0_width_16k_l0_medium": 0,
+        "layer_1_width_16k_l0_small": 1,
+    }
+    # No hosting information at all → the width/L0 order is unchanged.
+    with pytest.warns(UserWarning, match="multiple SAEs"):
+        unhosted = _canonical_layer_map(saes_map)
+    assert unhosted["layer_0_width_16k_l0_small"] == 0
+
+
 # --- DLS tests (raw PCA path; co-located with the SAE extract tests above
 # because they share the ``_encode_and_capture_all`` mock infrastructure).
 # Replaces the v2.0–v2.1 ``drop_edges`` test family — edge-drop is gone in
 # v2.1, layer selection is now data-driven via :func:`compute_dls_axes`.
-
-

@@ -431,23 +431,20 @@ class LoomScreen(Screen[None]):
         Parse / eval failures fall back to ``None`` (every node bright)
         and surface in the chat panel — the loom screen never blanks.
         """
-        expr = getattr(self._app, "_loom_prune_expr", None)
+        expr = self._app._loom_prune_expr
         if not expr:
             return None
         try:
             return set(self._session.tree.filter_by_expr(expr))
         except Exception as e:
-            try:
-                self._app._chat_panel.add_system_message(
-                    f"/prune filter eval failed: {e}"
-                )
-            except Exception:
-                pass
+            self._app._chat_panel.add_system_message(
+                f"/prune filter eval failed: {e}"
+            )
             return None
 
     def _highlight_probe(self) -> str | None:
         """The chat screen's currently selected highlight probe, if any."""
-        probe = getattr(self._app, "_highlight_probe", None)
+        probe = self._app._highlight_probe
         if isinstance(probe, str) and probe and not probe.startswith("__"):
             return probe
         return None
@@ -486,7 +483,7 @@ class LoomScreen(Screen[None]):
             parts.append("[reverse] help [/]")
         elif self._compare_mode:
             parts.append("[reverse] compare [/]")
-        expr = getattr(self._app, "_loom_prune_expr", None)
+        expr = self._app._loom_prune_expr
         if expr:
             parts.append(f"filter: {escape(str(expr))}")
         self._header.update("  ·  ".join(parts))
@@ -650,10 +647,7 @@ class LoomScreen(Screen[None]):
             return
         # Prefer the active-path descendant so ``l`` walks the visible
         # chat thread by default.
-        try:
-            active_path_ids = {n.id for n in self._session.tree.active_path()}
-        except Exception:
-            active_path_ids = set()
+        active_path_ids = {n.id for n in self._session.tree.active_path()}
         for cid in kids:
             if cid in active_path_ids:
                 self._select_node(cid)
@@ -686,10 +680,7 @@ class LoomScreen(Screen[None]):
         delete) all change the active path, and the chat panel must
         reflect it rather than the turns last streamed into it.
         """
-        try:
-            self._app._repaint_chat_from_active_path()
-        except Exception:
-            pass
+        self._app._repaint_chat_from_active_path()
         self._app.pop_screen()
 
     def action_set_active(self) -> None:
@@ -743,7 +734,7 @@ class LoomScreen(Screen[None]):
         )
 
     def action_prune(self) -> None:
-        current = getattr(self._app, "_loom_prune_expr", None) or ""
+        current = self._app._loom_prune_expr or ""
         self._open_overlay(
             "prune filter (blank clears — dims non-matching nodes):",
             initial=current, kind="prune",
@@ -936,7 +927,7 @@ class LoomScreen(Screen[None]):
 
         if kind == "prune":
             expr = value.strip()
-            self._app._loom_prune_expr = expr or None
+            self._app._get_loom_controller().set_prune_expr(expr or None)
             chat.add_system_message(
                 f"prune filter: {expr}" if expr else "prune filter cleared."
             )

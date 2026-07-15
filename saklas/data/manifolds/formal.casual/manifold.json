@@ -1,5 +1,5 @@
 {
-  "format_version": 5,
+  "format_version": 9,
   "name": "formal.casual",
   "description": "Bipolar axis: formal (+) vs casual (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",
@@ -10,15 +10,19 @@
   "nodes": [
     {
       "label": "formal",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     },
     {
       "label": "casual",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     }
   ],
   "files": {},
   "tags": [
     "register"
-  ]
+  ],
+  "source": "bundled",
+  "template_ref": null
 }

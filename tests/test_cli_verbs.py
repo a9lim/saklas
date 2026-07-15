@@ -1,10 +1,12 @@
-"""The eight-verb root CLI.
+"""The nine-verb root CLI.
 
 ``manifold`` is the steering-vector / manifold *compute* surface
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); ``pack`` is
 the manifold *lifecycle* surface (ls/show/install/search/push/rm/clear/refresh/
 export); ``template`` owns the standalone templated-completion artifact; ``lens``
-owns the per-model Jacobian-lens artifact (fit/show/top/decompose/rm).  The
+owns the per-model Jacobian-lens artifact
+(fit/fetch/ls/show/use/top/decompose/rm); ``sae`` exposes the parallel
+train/fetch/ls/show/use/rm lifecycle.  The
 former ``subspace`` verb and the deprecated ``vector`` alias are gone — the
 flat-artifact verbs folded into ``manifold``.  These tests exercise the parser
 shape + dispatch wiring, not the backends.
@@ -35,11 +37,35 @@ def _isolated_home(
 # Root verb set
 # ---------------------------------------------------------------------------
 
-def test_eight_top_level_verbs() -> None:
+def test_nine_top_level_verbs() -> None:
     assert set(_COMMAND_RUNNERS) == {
         "tui", "serve", "manifold", "pack", "config", "experiment", "template",
-        "lens",
+        "lens", "sae",
     }
+
+
+def test_sae_fetch_parses_with_harmonized_model_first_shape() -> None:
+    args = cli.parse_args([
+        "sae", "fetch", "m/x", "saelens:gemma-scope", "--layer", "14", "-j",
+    ])
+    assert args.command == "sae"
+    assert args.sae_cmd == "fetch"
+    assert args.model == "m/x"
+    assert args.source == "saelens:gemma-scope"
+    assert args.layer == 14
+    assert args.json_output is True
+
+
+def test_lens_and_sae_lifecycle_shapes_are_parallel() -> None:
+    lens = cli.parse_args(["lens", "use", "m/x", "neuronpedia"])
+    sae = cli.parse_args(["sae", "use", "m/x", "local:mine"])
+    assert (lens.model, lens.source) == ("m/x", "neuronpedia")
+    assert (sae.model, sae.source) == ("m/x", "local:mine")
+
+    lens_ls = cli.parse_args(["lens", "ls", "m/x", "-j"])
+    sae_ls = cli.parse_args(["sae", "ls", "m/x", "-j"])
+    assert lens_ls.model == sae_ls.model == "m/x"
+    assert lens_ls.json_output and sae_ls.json_output
 
 
 def test_template_verb_parses() -> None:
@@ -114,6 +140,13 @@ def test_manifold_fit_parses() -> None:
     assert args.command == "manifold"
     assert args.manifold_cmd == "fit"
     assert args.target == "/tmp/folder"
+
+
+def test_manifold_fit_layers_parse() -> None:
+    args = cli.parse_args([
+        "manifold", "fit", "mood", "-m", "m/x", "--layers", "4,8,12",
+    ])
+    assert args.layers == "4,8,12"
 
 
 def test_manifold_fit_discover_hyperparams_parse() -> None:
@@ -211,13 +244,15 @@ def test_vector_alias_removed() -> None:
 
 def test_lens_fit_parses() -> None:
     args = cli.parse_args([
-        "lens", "fit", "m/x", "--prompts", "50", "--dim-batch", "32", "-f",
+        "lens", "fit", "m/x", "--prompts", "50", "--dim-batch", "32",
+        "--prompt-batch", "4", "-f",
     ])
     assert args.command == "lens"
     assert args.lens_cmd == "fit"
     assert args.model == "m/x"
     assert args.prompts == 50
     assert args.dim_batch == 32
+    assert args.prompt_batch == 4
     assert args.force is True
 
 

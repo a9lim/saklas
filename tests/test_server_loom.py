@@ -6,7 +6,7 @@ plus a generation stub — no model, no GPU.  This exercises:
 - REST routes under ``/saklas/v1/sessions/{id}/tree`` (CRUD, transcript)
 - Concurrency conflict 409 mapping when ``_active_gen_reservation`` is set
 - WS ``parent_node_id`` + ``n>1`` fan-out (siblings created, started/done
-  tagged with ``node_id``, ``node_created`` and ``tree_mutated`` events
+  tagged with ``node_id`` and complete ``tree_mutated`` events
   fire)
 
 Heavy generation paths are stubbed so the assertions stay focused on the
@@ -24,8 +24,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.events import EventBus
-from saklas.core.loom import LoomTree
-from saklas.core.results import GenerationResult
+from saklas.core.loom import LoomTree, Recipe
+from saklas.core.results import GenerationResult, RunSet
 
 # ---------------------------------------------------------------------------
 # Test session factory
@@ -78,8 +78,16 @@ class _StubSession:
         monitor = MagicMock()
         monitor.probe_names = []
         monitor.profiles = {}
+        self.monitor = monitor
         self._monitor = monitor
+        self._joint_logprob_cache: dict[Any, Any] = {}
+        self.lens_probe_names: list[str] = []
+        self.sae_probe_names: list[str] = []
+        self.token_probe_payload: dict[str, Any] = {}
         self._tokenizer = MagicMock()
+        self._tokenizer.encode.side_effect = lambda text, **_: [
+            3000 + i for i, _ch in enumerate(str(text))
+        ]
         self._layers = []
         capture = MagicMock()
         capture._per_layer = {}
@@ -91,7 +99,7 @@ class _StubSession:
 
         gen_state = MagicMock()
         gen_state.finish_reason = "stop"
-        self._gen_state = gen_state
+        self.generation_state = gen_state
 
         self.lock = asyncio.Lock()
 
@@ -99,24 +107,25 @@ class _StubSession:
         self._trait_queues = []
         self._trait_lock = threading.Lock()
 
-        # History compat: surfaces still read `session.history` (used by
-        # the existing /rewind endpoint precondition).
         self._next_token_stream: list[str] = ["hi"]
         self._fail_next: bool = False
-
-    # ----- compat shims --------------------------------------------------
-
-    @property
-    def history(self):
-        return self.tree.messages_for()
+        self._block_until_stop = False
+        self._stop_event = threading.Event()
 
     def clear_history(self) -> None:
         self.tree.reset()
+
+    def restore_tree(self, data: dict[str, Any]):
+        from saklas.core.session import SaklasSession
+        return SaklasSession.restore_tree(self, data)  # type: ignore[arg-type]
 
     def rewind(self) -> None:
         self.tree.rewind()
 
     def build_readings(self):  # pragma: no cover - unused by these tests
+        return {}
+
+    def probe_hashes(self) -> dict[str, str]:
         return {}
 
     def register_trait_queue(self, loop: Any, q: Any) -> None:
@@ -131,7 +140,7 @@ class _StubSession:
                 pass
 
     def stop(self) -> None:
-        pass
+        self._stop_event.set()
 
     # ----- loom conflict check (mirrors SaklasSession._loom_conflict_check)
     def _loom_conflict_check(self, node_id: str, op: str) -> None:
@@ -161,7 +170,9 @@ class _StubSession:
     # ----- generation entry point --------------------------------------
     def generate(self, input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: bool = False, raw: bool = False, thinking: Any = None,
-                 on_token: Any = None, parent_node_id: Any = None, n: int = 1):
+                 on_token: Any = None, parent_node_id: Any = None, n: int = 1,
+                 gen_seat: str = "assistant", recipe_override: Any = None,
+                 append_same_role: bool = True):
         """Stub generate.
 
         Routes through the tree the same way SaklasSession does for
@@ -177,14 +188,41 @@ class _StubSession:
 
         results = []
         for sibling_idx, seed_i in enumerate(schedule):
-            # User turn (deduplicated by text — multiple siblings share one
-            # user parent).
-            user_id = self.tree.add_user_turn(
-                str(input), parent_id=parent_node_id,
+            # Text input retains the compatibility generate contract (a user
+            # commit); ``None`` is the native bare continuation used by
+            # seat-neutral submit after it commits explicitly.
+            if input is None:
+                anchor_id = parent_node_id or self.tree.active_node_id
+            else:
+                anchor_id = self.tree.add_user_turn(
+                    str(input), parent_id=parent_node_id,
+                )
+            self._active_gen_reservation = anchor_id
+            role_label = None
+            if sampling is not None and not raw:
+                role_label = (
+                    sampling.user_role
+                    if gen_seat == "user"
+                    else sampling.assistant_role
+                )
+            anchor = self.tree.get(anchor_id)
+            can_continue = bool(
+                append_same_role
+                and n == 1
+                and input is None
+                and anchor.role == gen_seat
+                and anchor.role_label == role_label
             )
-            self._active_gen_reservation = user_id
-
-            assistant_id = self.tree.begin_assistant(user_id)
+            prefix = anchor.text if can_continue else ""
+            if can_continue:
+                assistant_id = self.tree.begin_continuation(
+                    anchor_id, Recipe(),
+                )
+            else:
+                assistant_id = self.tree.begin_assistant(
+                    anchor_id, recipe=Recipe(), role_label=role_label,
+                    seat=gen_seat,
+                )
             try:
                 token_text = f"tok{sibling_idx}"
                 if on_token is not None:
@@ -192,14 +230,17 @@ class _StubSession:
                 self.tree.append_token(
                     assistant_id, {"token_id": 1000 + sibling_idx, "text": token_text},
                 )
+                if self._block_until_stop:
+                    assert self._stop_event.wait(timeout=5.0)
+                full_text = prefix + token_text
                 result = GenerationResult(
-                    text=token_text, tokens=[1000 + sibling_idx],
+                    text=full_text, tokens=[1000 + sibling_idx],
                     token_count=1, tok_per_sec=10.0, elapsed=0.1,
                     finish_reason="stop",
                 )
                 self.tree.finalize_assistant(
                     assistant_id,
-                    text=token_text,
+                    text=full_text,
                     aggregate_readings={},
                     applied_steering=None,
                     finish_reason="stop",
@@ -209,7 +250,7 @@ class _StubSession:
                 self.last_result = result
             finally:
                 self._active_gen_reservation = None
-        return results[0] if n == 1 else results
+        return RunSet(results)
 
     # ----- answer-prefill entry point ----------------------------------
     def prefill_assistant(self, node_id: Any, text: Any, *, steering: Any = None,
@@ -258,7 +299,7 @@ class _StubSession:
 
     # ----- commit entry points (Ctrl+Enter on either surface) ----------
     def append_user_turn(
-        self, parent_node_id: Any, text: Any, *, allow_any_parent: bool = False, role_label: Any = None
+        self, parent_node_id: Any, text: Any, *, allow_any_parent: bool = False, role_label: Any = None, thinking: Any = None
     ):
         """Stub commit-user.
 
@@ -283,6 +324,18 @@ class _StubSession:
             if resolved_parent is not None
             else None
         )
+        if (
+            parent is not None
+            and parent.role == "user"
+            and parent.role_label == role_label
+        ):
+            raw_token_ids = self._tokenizer.encode(
+                parent.text + text, add_special_tokens=False,
+            )
+            return self.tree.append_authored(
+                parent.id, text, thinking_text=thinking,
+                raw_token_ids=raw_token_ids,
+            )
         if not allow_any_parent and parent is not None and parent.role == "user":
             raise InvalidNodeOperationError(
                 f"cannot send a new user turn from a user node "
@@ -290,9 +343,10 @@ class _StubSession:
                 f"waiting for an assistant."
             )
         return self.tree.add_user_turn(
-            text, parent_id=parent_node_id, role_label=role_label)
+            text, parent_id=parent_node_id, role_label=role_label,
+            thinking_text=thinking)
 
-    def append_assistant_turn(self, user_node_id: Any, text: Any, *, role_label: Any = None):
+    def append_assistant_turn(self, user_node_id: Any, text: Any, *, role_label: Any = None, thinking: Any = None):
         """Stub commit-assistant.
 
         Mirrors ``SaklasSession.append_assistant_turn``: refuses non-user
@@ -306,7 +360,15 @@ class _StubSession:
                 "append_assistant_turn: text must be non-empty"
             )
         node = self.tree.get(user_node_id)
-        if node.role != "user":
+        if node.role == "assistant" and node.role_label == role_label:
+            raw_token_ids = self._tokenizer.encode(
+                node.text + text, add_special_tokens=False,
+            )
+            return self.tree.append_authored(
+                node.id, text, thinking_text=thinking,
+                raw_token_ids=raw_token_ids,
+            )
+        if node.role != "user" and getattr(self, "scene_grammar", None) is None:
             raise InvalidNodeOperationError(
                 f"append_assistant_turn: {user_node_id!r} is a "
                 f"{node.role} node, not a user node"
@@ -330,8 +392,30 @@ class _StubSession:
             applied_steering=None,
             finish_reason="stop",
             raw_token_ids=raw_token_ids,
+            thinking_text=thinking,
         )
         return new_id
+
+    def append_turn(
+        self, parent_node_id: Any, text: Any, *, role: Any,
+        raw: bool = False, role_label: Any = None, thinking: Any = None,
+    ):
+        from saklas.core.session import SaklasSession
+        return SaklasSession.append_turn(
+            self,  # pyright: ignore[reportArgumentType]
+            parent_node_id, text, role=role, raw=raw,
+            role_label=role_label, thinking=thinking,
+        )
+
+    # Cast roster passthroughs — the real session methods only touch
+    # ``self.tree``, so borrow them wholesale (same trick the loom
+    # tests use for the commit methods).
+    def set_cast_member(self, label: Any, **kwargs: Any):
+        from saklas.core.session import SaklasSession
+        return SaklasSession.set_cast_member(self, label, **kwargs)  # type: ignore[arg-type]
+
+    def remove_cast_member(self, label: Any) -> None:
+        self.tree.remove_cast_member(label)
 
 
 @pytest.fixture
@@ -355,7 +439,9 @@ class TestTreeGet:
         resp = client.get("/saklas/v1/sessions/default/tree")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["tree_format"] == 1
+        from saklas.core.loom import TREE_FORMAT_VERSION
+
+        assert data["tree_format"] == TREE_FORMAT_VERSION
         assert data["root_id"] == session.tree.root_id
         assert data["active_node_id"] == session.tree.root_id
         assert len(data["nodes"]) == 1
@@ -364,6 +450,61 @@ class TestTreeGet:
         assert root_node["role"] == "system"
         assert root_node["text"] == ""
         assert root_node["id"] == session.tree.root_id
+
+    def test_full_tree_restore_round_trip(self, session_and_client: Any):
+        session, client = session_and_client
+        user_id = session.tree.add_user_turn("saved branch")
+        assistant_id = session.tree.begin_assistant(user_id)
+        session.tree.finalize_assistant(assistant_id, text="saved reply")
+        saved = client.get("/saklas/v1/sessions/default/tree").json()
+        saved_rev = saved["rev"]
+
+        assert client.post("/saklas/v1/sessions/default/tree/reset").status_code == 204
+        restored = client.put(
+            "/saklas/v1/sessions/default/tree",
+            json={"tree": saved},
+        )
+        assert restored.status_code == 200
+        body = restored.json()
+        assert body["nodes"] == 3
+        assert body["active_node_id"] == assistant_id
+        assert body["rev"] > saved_rev
+        tree = client.get("/saklas/v1/sessions/default/tree").json()
+        assert [node["text"] for node in tree["nodes"]] == [
+            "", "saved branch", "saved reply",
+        ]
+
+    def test_full_tree_restore_rejects_model_mismatch(self, session_and_client: Any):
+        _, client = session_and_client
+        saved = client.get("/saklas/v1/sessions/default/tree").json()
+        saved["model_id"] = "other/model"
+        restored = client.put(
+            "/saklas/v1/sessions/default/tree",
+            json={"tree": saved},
+        )
+        assert restored.status_code == 400
+        assert "does not match loaded model" in str(restored.json())
+
+    def test_full_tree_restore_emits_snapshot_barrier(self, session_and_client: Any):
+        session, client = session_and_client
+        saved = client.get("/saklas/v1/sessions/default/tree").json()
+        saved["name"] = "restored elsewhere"
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            response = client.put(
+                "/saklas/v1/sessions/default/tree",
+                json={"tree": saved},
+            )
+            assert response.status_code == 200
+            while True:
+                frame = ws.receive_json()
+                if frame.get("type") == "tree_mutated":
+                    break
+
+        assert frame["op"] == "restore"
+        assert frame["rev"] == session.tree.rev
+        assert frame["active_node_id"] == session.tree.active_node_id
+        assert session.tree.name == "restored elsewhere"
 
     def test_matches_to_dict(self, session_and_client: Any):
         session, client = session_and_client
@@ -399,6 +540,20 @@ class TestTreeGet:
             "logprob": -1.5,
             "probes": {"calm": 0.42},
             "per_layer_scores": {"5": {"calm": 0.38}, "10": {"calm": 0.45}},
+            "captured": {
+                "lens": {
+                    "provenance": "captured",
+                    "source": "local:default",
+                    "steering": None,
+                    "layers": [{
+                        "layer": 5,
+                        "tokens": [{
+                            "token": "hello", "id": 100, "logprob": -0.1,
+                        }],
+                    }],
+                    "aggregate": [],
+                },
+            },
         })
         session.tree.append_token(a1, {
             "token_id": 101,
@@ -423,6 +578,9 @@ class TestTreeGet:
         assert first["probes"] == {"calm": 0.42}
         assert first["per_layer_scores"] == {
             "5": {"calm": 0.38}, "10": {"calm": 0.45},
+        }
+        assert first["captured"]["lens"]["layers"][0]["tokens"][0] == {
+            "token": "hello", "id": 100, "logprob": -0.1,
         }
 
     def test_active_path_shape(self, session_and_client: Any):
@@ -661,7 +819,7 @@ class TestTranscript:
         # to_yaml uses pyyaml's safe_dump; safe-scalar strings like
         # ``test/model`` and ``hello`` come back unquoted (valid YAML).  We
         # check substrings rather than exact quoting form.
-        assert "saklas_transcript: 1" in text
+        assert "saklas_transcript: 2" in text
         assert "model_id:" in text and "test/model" in text
         # Probes block exists (empty in this stub)
         assert "probes:" in text
@@ -673,7 +831,7 @@ class TestTranscript:
         # Round-trip via the YAML loader to confirm structural shape.
         import yaml
         parsed = yaml.safe_load(text)
-        assert parsed["saklas_transcript"] == 1
+        assert parsed["saklas_transcript"] == 2
         assert parsed["model_id"] == "test/model"
         assert len(parsed["turns"]) == 2
         assert parsed["turns"][0]["role"] == "user"
@@ -694,6 +852,32 @@ class TestTranscript:
 
 
 class TestWebSocketLoom:
+    def test_user_stop_is_distinct_from_natural_completion(self, session_and_client: Any):
+        """The native stream labels an explicit user cancellation distinctly.
+
+        The engine and stored loom node retain the protocol-compatible
+        ``stop`` reason; only the dashboard-facing done frame says
+        ``cancelled``.
+        """
+        session, client = session_and_client
+        session._block_until_stop = True
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "keep going"})
+            # The connection's perpetual reader queues this while the
+            # dispatcher starts the worker, matching a fast stop-button click.
+            ws.send_json({"type": "stop"})
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "error":
+                    pytest.fail(msg["message"])
+                if msg["type"] == "done":
+                    done = msg
+                    break
+
+        assert done["result"]["finish_reason"] == "cancelled"
+        assert session.tree.get(done["node_id"]).finish_reason == "stop"
+
     def test_generate_with_parent_node_id(self, session_and_client: Any):
         """Result attaches under the supplied parent_node_id."""
         session, client = session_and_client
@@ -713,7 +897,7 @@ class TestWebSocketLoom:
             # Collect events until done.
             done = None
             seen_tree_mut = False
-            seen_node_created = False
+            seen_finalize = False
             seen_node_id_on_token = None
             while True:
                 msg = ws.receive_json()
@@ -722,9 +906,14 @@ class TestWebSocketLoom:
                     assert msg["sibling_count"] == 1
                 elif t == "tree_mutated":
                     seen_tree_mut = True
+                    if msg.get("op") == "finalize_assistant":
+                        seen_finalize = True
+                        assert any(
+                            node.get("text") == "tok0"
+                            and node.get("finish_reason") == "stop"
+                            for node in msg["updated"]
+                        )
                     assert msg["rev"] >= rev_before
-                elif t == "node_created":
-                    seen_node_created = True
                 elif t == "token":
                     seen_node_id_on_token = msg.get("node_id")
                 elif t == "done":
@@ -733,7 +922,7 @@ class TestWebSocketLoom:
 
         assert done is not None
         assert seen_tree_mut, "tree_mutated event should fire when tree mutates"
-        assert seen_node_created, "node_created event should fire on begin_assistant"
+        assert seen_finalize, "finalized node must arrive before the done frame"
         assert seen_node_id_on_token is not None, "token frames should be tagged with node_id"
         # New user turn attached under u2 (not u1, which would have been
         # the active node before the request).  The assistant attaches
@@ -769,7 +958,6 @@ class TestWebSocketLoom:
                 "parent_node_id": root_id,
             })
             done_events = []
-            node_created_events = []
             seen_sibling_indices = set()
             while True:
                 msg = ws.receive_json()
@@ -777,8 +965,6 @@ class TestWebSocketLoom:
                 if t == "started":
                     seen_sibling_indices.add(msg["sibling_index"])
                     assert msg["sibling_count"] == 2
-                elif t == "node_created":
-                    node_created_events.append(msg)
                 elif t == "done":
                     done_events.append(msg)
                     if len(done_events) == 2:
@@ -797,10 +983,6 @@ class TestWebSocketLoom:
             if session.tree.get(nid).role == "assistant"
         ]
         assert len(assistant_ids) == 2
-        # node_created fires for every newly-created node (user + 2 assistants).
-        created_ids = {ev["node_id"] for ev in node_created_events}
-        for aid in assistant_ids:
-            assert aid in created_ids
         # done frames carry distinct node_ids matching the two assistants.
         done_node_ids = {ev["node_id"] for ev in done_events}
         assert done_node_ids == set(assistant_ids)
@@ -991,9 +1173,147 @@ class TestCommit:
         assert session.tree.nodes[new_id].parent_id == root
         assert session.tree.rev > rev_before
 
-    def test_commit_user_refused_under_user_node(self, session_and_client: Any):
-        """Server rejects commit_role=user when the resolved parent is
-        itself a user node — D15 keeps user-under-user out of the tree."""
+
+class TestSubmit:
+    def test_text_requires_authored_role(self, session_and_client: Any):
+        _session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit",
+                "text": "hello",
+                "generated_role": "assistant",
+            })
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["status"] == 400
+
+    def test_swapped_commit_only_can_start_with_assistant(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        # Role swapping is exposed only for scene-capable renderers, where an
+        # assistant-authored first turn is a legal structural shape.
+        session.scene_grammar = MagicMock()
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit",
+                "text": "opening as the assistant",
+                "authored_role": "assistant",
+            })
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    break
+                assert msg["type"] != "error", msg
+        assert msg["result"]["role"] == "assistant"
+        assert msg["result"]["kind"] == "append"
+        path = session.tree.active_path()[1:]
+        assert [node.role for node in path] == ["assistant"]
+        assert path[0].recipe is None
+
+    def test_unswapped_commits_user_then_generates_assistant(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit",
+                "text": "hello",
+                "authored_role": "user",
+                "generated_role": "assistant",
+            })
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    break
+                assert msg["type"] != "error", msg
+        path = session.tree.active_path()[1:]
+        assert [node.role for node in path] == ["user", "assistant"]
+        assert path[0].text == "hello"
+
+    def test_swapped_commits_assistant_then_generates_user(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        user_id = session.tree.add_user_turn("question")
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit",
+                "text": "authored answer",
+                "authored_role": "assistant",
+                "generated_role": "user",
+                "parent_node_id": user_id,
+            })
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    break
+                assert msg["type"] != "error", msg
+        path = session.tree.active_path()[1:]
+        assert [node.role for node in path] == ["user", "assistant", "user"]
+        assert path[-2].text == "authored answer"
+
+    def test_empty_with_no_modifier_semantics_continues_generated_role(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "submit", "generated_role": "assistant"})
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "done":
+                    break
+                assert msg["type"] != "error", msg
+        path = session.tree.active_path()[1:]
+        assert [node.role for node in path] == ["assistant"]
+
+    def test_append_reuses_matching_authored_message(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit", "text": "one",
+                "authored_role": "user",
+            })
+            while (first := ws.receive_json())["type"] != "done":
+                assert first["type"] != "error", first
+            ws.send_json({
+                "type": "submit", "text": " two",
+                "authored_role": "user",
+            })
+            while (second := ws.receive_json())["type"] != "done":
+                assert second["type"] != "error", second
+        assert second["node_id"] == first["node_id"]
+        path = session.tree.active_path()[1:]
+        assert len(path) == 1
+        assert path[0].text == "one two"
+
+    def test_generate_reuses_matching_role_as_prefill(
+        self, session_and_client: Any,
+    ):
+        session, client = session_and_client
+        session.scene_grammar = MagicMock()
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit", "text": "Once",
+                "authored_role": "assistant",
+            })
+            while (appended := ws.receive_json())["type"] != "done":
+                assert appended["type"] != "error", appended
+            ws.send_json({"type": "submit", "generated_role": "assistant"})
+            while (generated := ws.receive_json())["type"] != "done":
+                assert generated["type"] != "error", generated
+        assert generated["node_id"] == appended["node_id"]
+        path = session.tree.active_path()[1:]
+        assert len(path) == 1
+        assert path[0].role == "assistant"
+        assert path[0].text == "Oncetok0"
+
+
+class TestCommitContinued:
+    def test_commit_user_appends_under_user_node(self, session_and_client: Any):
+        """The compatibility commit adapter shares same-role append semantics."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("first")  # active = uid
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
@@ -1003,13 +1323,13 @@ class TestCommit:
                 "commit_text": "second",
                 "parent_node_id": uid,
             })
-            # Skip the started frame; we want the error.
             while True:
                 msg = ws.receive_json()
                 if msg["type"] in ("error", "done"):
                     break
-        assert msg["type"] == "error"
-        assert msg["code"] == "InvalidNodeOperationError"
+        assert msg["type"] == "done"
+        assert msg["node_id"] == uid
+        assert session.tree.nodes[uid].text == "firstsecond"
 
     def test_commit_user_raw_allows_user_parent(self, session_and_client: Any):
         """A flat (base-model) commit carries ``raw: true`` — the
@@ -1034,7 +1354,8 @@ class TestCommit:
                 assert msg["type"] != "error", msg
         assert done is not None
         new_id = done["result"]["node_id"]
-        assert session.tree.nodes[new_id].parent_id == uid
+        assert new_id == uid
+        assert session.tree.nodes[new_id].text == "firstsecond"
 
     def test_commit_assistant_lands_authored_sibling(self, session_and_client: Any):
         """Ctrl+Enter on a user active node lands a sibling assistant
@@ -1067,3 +1388,69 @@ class TestCommit:
         assert assistant.raw_token_ids  # tokenized by the stub
         assert session.tree.nodes[new_id].parent_id == uid
         assert session.tree.rev > rev_before
+
+
+class TestCast:
+    def test_cast_crud_round_trip(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        # PUT creates.
+        resp = client.put(
+            "/saklas/v1/sessions/default/tree/cast/deer",
+            json={"steering": "0.5 formal.casual", "notes": "skittish"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["label"] == "deer"
+        assert body["member"]["recipe"]["steering"] == "0.5 formal.casual"
+        # GET reads the roster.
+        resp = client.get("/saklas/v1/sessions/default/tree/cast")
+        assert resp.status_code == 200
+        assert "deer" in resp.json()["cast"]
+        # The full-tree GET carries the roster too.
+        resp = client.get("/saklas/v1/sessions/default/tree")
+        assert resp.json()["cast"]["deer"]["notes"] == "skittish"
+        # DELETE removes; absent delete is still 204.
+        assert client.delete(
+            "/saklas/v1/sessions/default/tree/cast/deer"
+        ).status_code == 204
+        assert "deer" not in session.tree.cast
+        assert client.delete(
+            "/saklas/v1/sessions/default/tree/cast/deer"
+        ).status_code == 204
+
+    def test_cast_put_validates(self, session_and_client: Any) -> None:
+        _session, client = session_and_client
+        # Bad label (uppercase/space) -> 400 via SaklasError mapping.
+        resp = client.put(
+            "/saklas/v1/sessions/default/tree/cast/Not%20A%20Slug",
+            json={},
+        )
+        assert resp.status_code == 400
+        # Bad steering expression -> 400 at authoring time.
+        resp = client.put(
+            "/saklas/v1/sessions/default/tree/cast/deer",
+            json={"steering": "0.5 !!nope!!"},
+        )
+        assert resp.status_code == 400
+
+    def test_cast_mutation_emits_ws_frame_with_roster(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        u1 = session.tree.add_user_turn("hello")
+        del u1
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            resp = client.put(
+                "/saklas/v1/sessions/default/tree/cast/deer",
+                json={"steering": "0.5 formal.casual"},
+            )
+            assert resp.status_code == 200
+            frame = None
+            for _ in range(10):
+                msg = ws.receive_json()
+                if msg.get("type") == "tree_mutated" and msg.get("op") == "cast":
+                    frame = msg
+                    break
+            assert frame is not None, "op=cast tree_mutated frame should arrive"
+            assert frame["cast"]["deer"]["recipe"]["steering"] == "0.5 formal.casual"
+            assert frame["added"] == [] and frame["updated"] == []

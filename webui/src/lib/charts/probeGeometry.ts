@@ -58,9 +58,12 @@ interface Palette {
   accent: string;
   purple: string;
   bg: string;
-  /** Node centroids — one cool accent (minimal-color scheme). */
+  /** Node centroids — the probe's FAMILY hue (subspace white / manifold
+   *  violet), supplied by the host via ``--geom-node`` so the plot obeys
+   *  the hue ontology instead of hardcoding a color. */
   node: string;
-  /** Neutral anchor — warm hollow ring. */
+  /** Neutral anchor — hollow grey ring (achromatic: neutral is the
+   *  absence of concept, so it carries no hue). */
   neutral: string;
   /** Live hidden-state point halo + trail head. */
   live: string;
@@ -75,19 +78,23 @@ function readPalette(el: HTMLElement): Palette {
     return got || fallback;
   };
   return {
-    fg: v("--fg-strong", "#e6e6e6"),
-    fgDim: v("--fg-dim", "#9aa0a6"),
-    muted: v("--fg-muted", "#6b7280"),
-    border: v("--border", "#2a2a2a"),
-    accent: v("--accent", "#e6e6e6"),
-    purple: v("--accent-purple", "#b58cf0"),
-    bg: v("--bg-deep", "#0d0d0d"),
-    node: v("--accent-blue", "#488acb"),
-    neutral: v("--accent-amber", "#ca6800"),
-    live: v("--accent-green", "#009f68"),
+    fg: v("--fg-strong", "#d3d7e4"),
+    fgDim: v("--fg-dim", "#a3a8bd"),
+    muted: v("--fg-muted", "#6b7088"),
+    border: v("--border", "rgba(233, 236, 248, 0.09)"),
+    accent: v("--accent", "#edeff7"),
+    purple: v("--pillar-manifold", "#a78bfa"),
+    bg: v("--bg-deep", "#05060b"),
+    node: v("--geom-node", v("--pillar-manifold", "#a78bfa")),
+    neutral: v("--geom-neutral", v("--fg-subtle", "#8a90a6")),
+    live: v("--live", "#34d399"),
     light: v("--accent-light", "#ffffff"),
   };
 }
+
+/** Canvas font strings — Recursive Mono to match the data voice. */
+const FONT_LABEL = '10px "Recursive Mono", ui-monospace, monospace';
+const FONT_AXIS = '9px "Recursive Mono", ui-monospace, monospace';
 
 const PAD = 28;
 
@@ -171,7 +178,9 @@ function dot(
 }
 
 /** The live hidden-state point: white core inside a colored halo ring, so it
- *  reads clearly over both the node accent and the dark background. */
+ *  reads clearly over both the node accent and the dark background.  Carries
+ *  a soft green bloom — glow is reserved for what is alive right now, and
+ *  the current hidden state is exactly that. */
 function liveDot(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -179,11 +188,14 @@ function liveDot(
   pal: Palette,
 ): void {
   ctx.globalAlpha = 0.95;
+  ctx.shadowColor = pal.live;
+  ctx.shadowBlur = 10;
   ctx.beginPath();
   ctx.arc(x, y, 6.5, 0, Math.PI * 2);
   ctx.strokeStyle = pal.live;
   ctx.lineWidth = 2;
   ctx.stroke();
+  ctx.shadowBlur = 0;
   ctx.beginPath();
   ctx.arc(x, y, 3.2, 0, Math.PI * 2);
   ctx.fillStyle = pal.light;
@@ -200,7 +212,7 @@ function label(
 ): void {
   ctx.globalAlpha = 0.9;
   ctx.fillStyle = color;
-  ctx.font = "10px ui-monospace, monospace";
+  ctx.font = FONT_LABEL;
   ctx.fillText(text, x + 5, y - 4);
   ctx.globalAlpha = 1;
 }
@@ -317,7 +329,7 @@ function drawRank2(
     ctx.stroke();
     ctx.globalAlpha = 0.7;
     ctx.fillStyle = pal.muted;
-    ctx.font = "9px ui-monospace, monospace";
+    ctx.font = FONT_AXIS;
     ctx.fillText("PC1", w - PAD - 22, oy - 4);
     ctx.fillText("PC2", ox + 4, PAD + 10);
     ctx.globalAlpha = 1;
@@ -548,7 +560,7 @@ function drawRank3(
       ctx.stroke();
       ctx.globalAlpha = 0.7;
       ctx.fillStyle = pal.muted;
-      ctx.font = "9px ui-monospace, monospace";
+      ctx.font = FONT_AXIS;
       ctx.fillText(name, pos.s[0] + 3, pos.s[1] - 2);
     }
     ctx.globalAlpha = 1;

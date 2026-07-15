@@ -133,23 +133,12 @@
 
   <div class="body">
     <p class="hint">
-      Union the <strong>nodes</strong> of two or more discover-mode
-      manifolds into a fresh discover folder, then re-fit on the
-      combined heap.  Authored manifolds (declared domain + coords)
-      aren't mergeable — only their <em>autofitted</em> siblings.
+      Union nodes from ≥2 discover manifolds.
     </p>
 
-    {#if steerRack.unavailable}
+    {#if discoverManifolds.length < 2}
       <p class="muted">
-        this server doesn't expose the manifold API — update saklas to
-        author and fit steering manifolds.
-      </p>
-    {:else if discoverManifolds.length < 2}
-      <p class="muted">
-        need ≥ 2 discover-mode (pca / spectral) manifolds in the
-        catalog to merge.  Author one via <strong>+ build manifold</strong>
-        in the manifold drawer, or pull one from <strong>manifold packs →
-        search hf</strong>.
+        need ≥2 discover manifolds
       </p>
     {:else}
       <form class="form" onsubmit={onSubmit}>
@@ -206,8 +195,7 @@
         </label>
         {#if sourceModes.length > 1}
           <p class="warn">
-            sources have mixed fit_modes ({sourceModes.join(", ")})
-            — pick one explicitly above.
+            mixed fit modes: {sourceModes.join(", ")}
           </p>
         {/if}
 
@@ -219,10 +207,10 @@
             class="primary"
             disabled={!canSubmit}
             title={selected.size < 2
-              ? "pick >= 2 sources"
+                ? "pick ≥2"
               : !targetName.trim()
                 ? "target name required"
-                : "merge into a fresh discover folder"}
+                : "merge"}
           >
             {#if merging}
               <span class="spinner" aria-hidden="true"></span> merging…
@@ -243,35 +231,48 @@
     height: 100%;
     min-height: 0;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-4) var(--space-5);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-5) var(--space-6);
   }
   .title {
     color: var(--accent);
     letter-spacing: 0;
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
-    font-size: var(--text);
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
     line-height: 1;
-    padding: var(--space-2) var(--space-3);
     cursor: pointer;
-    transition: color var(--dur) var(--ease-out);
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
-  .close:hover { color: var(--accent-red); }
+  .close:hover {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: var(--space-4) var(--space-5) var(--space-5);
+    padding: var(--space-5) var(--space-6);
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
@@ -283,19 +284,11 @@
     font-size: var(--text-sm);
     line-height: 1.5;
   }
-  .hint strong {
-    color: var(--accent-purple);
-    font-weight: var(--weight-medium);
-  }
   .muted {
     margin: 0;
     color: var(--fg-muted);
     font-size: var(--text-sm);
     line-height: 1.4;
-  }
-  .muted strong {
-    color: var(--accent-purple);
-    font-weight: var(--weight-medium);
   }
   .form {
     flex: 1 1 auto;
@@ -305,7 +298,6 @@
     gap: var(--space-4);
   }
   .sources {
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-deep);
     padding: var(--space-3) var(--space-4);
@@ -342,6 +334,7 @@
   .source-label:hover { background: var(--bg-elev); }
   .row-name {
     color: var(--fg-strong);
+    font-family: var(--font-mono);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -365,9 +358,9 @@
   }
   input[type="text"],
   select {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
@@ -389,8 +382,7 @@
   /* Footer: cancel (secondary) + primary submit pinned to the bottom.
    * Only the primary accent goes purple. */
   .foot {
-    border-top: 1px solid var(--border);
-    padding-top: var(--space-4);
+    padding-top: var(--space-3);
     margin-top: auto;
     display: flex;
     justify-content: flex-end;
@@ -399,7 +391,7 @@
   .primary {
     background: var(--accent-purple);
     color: var(--text-on-accent);
-    border: 1px solid var(--accent-purple);
+    border: 1px solid transparent;
     padding: var(--space-2) var(--space-5);
     border-radius: var(--radius);
     font-family: var(--font-mono);
@@ -417,8 +409,8 @@
     cursor: not-allowed;
   }
   .secondary {
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
     color: var(--fg-dim);
     padding: var(--space-2) var(--space-5);
     border-radius: var(--radius);
@@ -427,7 +419,7 @@
     cursor: pointer;
   }
   .secondary:hover {
-    border-color: var(--fg);
+    background: var(--glass-strong);
     color: var(--fg);
   }
   .spinner {

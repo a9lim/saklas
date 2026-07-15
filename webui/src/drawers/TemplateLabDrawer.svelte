@@ -16,6 +16,8 @@
   import { ApiError, apiTemplates } from "../lib/api";
   import { closeDrawer } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
+  import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
+  import Button from "../lib/ui/Button.svelte";
   import type {
     ChoiceScores,
     TemplateContextSpec,
@@ -39,6 +41,11 @@
 
   type Tab = "score" | "build";
   let tab: Tab = $state("score");
+
+  const TAB_ITEMS: Array<{ value: Tab; label: string; title: string }> = [
+    { value: "score", label: "score", title: "Score a template's restricted-choice distribution" },
+    { value: "build", label: "build", title: "Author a new template" },
+  ];
 
   // ----- shared: template catalog --------------------------------------
   let templates: TemplateSummary[] = $state([]);
@@ -208,35 +215,29 @@
 
 <section class="drawer-shell" aria-label="Template lab">
   <header class="header">
-    <span class="title">templates</span>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
+    <div class="title">
+      <span class="eyebrow">templates</span>
+    </div>
+    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
   </header>
 
-  <div class="tabs" role="tablist">
-    <button class="tab" class:active={tab === "score"} role="tab"
-      aria-selected={tab === "score"} onclick={() => (tab = "score")}>score</button>
-    <button class="tab" class:active={tab === "build"} role="tab"
-      aria-selected={tab === "build"} onclick={() => (tab = "build")}>build</button>
+  <div class="toolbar">
+    <SegmentedTabs items={TAB_ITEMS} bind:value={tab} ariaLabel="Template lab view" />
   </div>
 
   <div class="body">
     {#if tab === "score"}
-      <p class="hint">
-        The model's <strong>restricted-choice</strong> distribution over a
-        template's values, per context — the logit read. Add a steering
-        expression to see how steering reshapes it (the distributional
-        before/after).
-      </p>
+      <p class="hint">restricted-choice probabilities</p>
 
       {#if loading}
         <p class="muted">loading…</p>
       {:else if templates.length === 0}
-        <p class="muted">no templates yet — author one in the <strong>build</strong> tab.</p>
+        <p class="muted">no templates</p>
       {:else}
         <label class="field">
           <span class="label">template</span>
           <select bind:value={selectedKey} disabled={scoring}>
-            <option value="">— pick a template —</option>
+            <option value="">select…</option>
             {#each templates as t (`${t.namespace}/${t.name}`)}
               <option value={`${t.namespace}/${t.name}`}>
                 {t.namespace}/{t.name} · {t.n_values} values × {t.n_contexts} ctx
@@ -246,7 +247,7 @@
         </label>
 
         <label class="field">
-          <span class="label">steering <span class="optional">(optional)</span></span>
+          <span class="label">steering</span>
           <input type="text" placeholder="0.5 patient.hurried" bind:value={steerExpr}
             disabled={scoring} autocomplete="off" spellcheck="false" />
         </label>
@@ -255,12 +256,13 @@
           <label class="byrow">
             <span class="label">rank by</span>
             <select bind:value={scoreBy}>
-              <option value="sum">sum (joint)</option>
-              <option value="mean">mean (length-norm)</option>
+              <option value="sum">sum</option>
+              <option value="mean">mean</option>
             </select>
           </label>
-          <button type="button" class="primary" disabled={!selectedTemplate || scoring}
-            onclick={runScore}>{scoring ? "scoring…" : "score"}</button>
+          <Button variant="solid" disabled={!selectedTemplate || scoring} onclick={runScore}>
+            {scoring ? "scoring…" : "score"}
+          </Button>
         </div>
 
         {#if baseline && scoredKey === selectedKey}
@@ -287,16 +289,11 @@
       {/if}
 
     {:else}
-      <p class="hint">
-        Author a template: a <strong>slot</strong> token, candidate
-        <strong>values</strong> (one node per value), and one or more
-        <strong>contexts</strong> — a multi-turn history ending on a user turn,
-        plus the final assistant turn that carries the slot exactly once.
-      </p>
+      <p class="hint">slot · values · contexts</p>
 
       <form class="form" onsubmit={submitBuild}>
         <label class="field">
-          <span class="label">name <span class="optional">(under local/)</span></span>
+          <span class="label">name</span>
           <input type="text" placeholder="weekday" bind:value={bName} disabled={building}
             autocomplete="off" spellcheck="false" />
         </label>
@@ -306,7 +303,7 @@
             autocomplete="off" spellcheck="false" />
         </label>
         <label class="field">
-          <span class="label">values <span class="optional">(one per line or comma-separated)</span></span>
+          <span class="label">values</span>
           <textarea rows="3" placeholder={"Monday\nTuesday\nWednesday"}
             bind:value={bValuesText} disabled={building}></textarea>
         </label>
@@ -337,7 +334,7 @@
               {/each}
               <button type="button" class="mini add" onclick={() => addTurn(ci)}>+ turn</button>
               <label class="field assistant-field">
-                <span class="label">assistant (slot here)</span>
+                <span class="label">assistant · slot</span>
                 <input type="text" placeholder={`today is ${bSlot}`} bind:value={ctx.assistant}
                   disabled={building} autocomplete="off" />
               </label>
@@ -353,10 +350,14 @@
         {/if}
 
         <footer class="foot">
-          <button type="button" class="secondary" onclick={closeDrawer}>cancel</button>
-          <button type="submit" class="primary" disabled={building || buildValidation.length > 0}>
+          <Button variant="ghost" onclick={closeDrawer}>cancel</Button>
+          <Button
+            type="submit"
+            variant="solid"
+            disabled={building || buildValidation.length > 0}
+          >
             {building ? "creating…" : "create template"}
-          </button>
+          </Button>
         </footer>
       </form>
     {/if}
@@ -368,7 +369,7 @@
           <div class="cat-row">
             <span class="cat-name">{t.namespace}/{t.name}</span>
             <span class="cat-sub">{t.slot} · {t.n_values}×{t.n_contexts}</span>
-            <button type="button" class="mini" onclick={() => deleteTemplate(t)}>delete</button>
+            <Button variant="danger" size="sm" onclick={() => deleteTemplate(t)}>delete</Button>
           </div>
         {/each}
       </div>
@@ -377,61 +378,234 @@
 </section>
 
 <style>
-  .drawer-shell { display: flex; flex-direction: column; height: 100%; }
-  .header { display: flex; align-items: center; justify-content: space-between;
-    padding: 0.75rem 1rem; border-bottom: 1px solid var(--border, #2a2a2a); }
-  .title { font-weight: 600; }
-  .close { background: none; border: none; color: inherit; cursor: pointer; font-size: 1rem; }
-  .tabs { display: flex; gap: 0.25rem; padding: 0.5rem 1rem 0; }
-  .tab { background: none; border: none; border-bottom: 2px solid transparent;
-    color: var(--muted, #888); cursor: pointer; padding: 0.35rem 0.6rem; font-size: 0.85rem; }
-  .tab.active { color: inherit; border-bottom-color: var(--accent, #fff); }
-  .body { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem; }
-  .hint { font-size: 0.8rem; color: var(--muted, #999); margin: 0; line-height: 1.4; }
-  .muted { color: var(--muted, #888); font-size: 0.85rem; }
-  .field { display: flex; flex-direction: column; gap: 0.25rem; }
-  .label { font-size: 0.75rem; color: var(--muted, #999); }
-  .optional { opacity: 0.6; }
-  input, select, textarea { background: var(--input-bg, #1a1a1a); color: inherit;
-    border: 1px solid var(--border, #333); border-radius: 4px; padding: 0.4rem 0.5rem;
-    font: inherit; font-size: 0.85rem; }
-  textarea { resize: vertical; font-family: ui-monospace, monospace; }
-  .controls { display: flex; align-items: flex-end; gap: 0.75rem; }
-  .byrow { display: flex; flex-direction: column; gap: 0.25rem; flex: 1; }
-  .primary, .secondary { border-radius: 4px; padding: 0.45rem 0.9rem; cursor: pointer;
-    font: inherit; font-size: 0.85rem; border: 1px solid var(--border, #333); }
-  .primary { background: var(--accent, #3a6); color: #fff; border-color: transparent; }
-  .primary:disabled { opacity: 0.5; cursor: not-allowed; }
-  .secondary { background: none; color: inherit; }
-  .ctx-card { border: 1px solid var(--border, #2a2a2a); border-radius: 6px; padding: 0.6rem; }
-  .ctx-head { font-size: 0.75rem; color: var(--muted, #999); margin-bottom: 0.4rem; }
-  .bar-row { display: grid; grid-template-columns: 5.5rem 1fr 4.5rem; align-items: center;
-    gap: 0.5rem; margin: 0.15rem 0; }
-  .bar-label { font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* v2 sheet interior — the host paints the sheet surface, so the root
+   * stays transparent and chrome speaks sans (values/identifiers stay
+   * mono). Templates carry no pillar hue — chrome stays achromatic. */
+  .drawer-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: transparent;
+    color: var(--fg);
+    font-family: var(--font-ui);
+    font-size: var(--text);
+  }
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+  }
+  .title {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .eyebrow {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .close {
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .close:hover {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
+
+  .toolbar {
+    padding: var(--space-3) var(--space-6);
+  }
+
+  .body {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-5) var(--space-6);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+  }
+  .hint {
+    font-size: var(--text-sm);
+    color: var(--fg-muted);
+    margin: 0;
+    line-height: 1.5;
+    max-width: 62ch;
+  }
+  .muted { color: var(--fg-muted); font-size: var(--text-sm); }
+  .field { display: flex; flex-direction: column; gap: var(--space-2); }
+  .label { font-size: var(--text-sm); color: var(--fg-muted); }
+  .optional { color: var(--fg-subtle); }
+  input,
+  select,
+  textarea {
+    background: var(--input-well);
+    color: var(--fg);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+  }
+  input:focus,
+  select:focus,
+  textarea:focus {
+    outline: none;
+    border-color: var(--fg-muted);
+  }
+  textarea { resize: vertical; }
+  .controls { display: flex; align-items: flex-end; gap: var(--space-5); }
+  .byrow { display: flex; flex-direction: column; gap: var(--space-2); flex: 1; }
+
+  /* Data well — the per-context restricted-choice distribution. */
+  .ctx-card {
+    border-radius: var(--radius);
+    background: var(--bg);
+    padding: var(--space-4);
+  }
+  .ctx-head {
+    font-size: var(--text-xs);
+    color: var(--fg-muted);
+    margin-bottom: var(--space-3);
+  }
+  .bar-row {
+    display: grid;
+    grid-template-columns: 5.5em 1fr 4.5em;
+    align-items: center;
+    gap: var(--space-3);
+    margin: var(--space-1) 0;
+  }
+  .bar-label {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .bars { display: flex; flex-direction: column; gap: 2px; }
-  .bar { height: 7px; border-radius: 3px; min-width: 1px; }
-  .bar.base { background: var(--accent, #4a8); }
-  .bar.steer { background: var(--accent-purple, #a6f); }
-  .bar-num { font-size: 0.72rem; color: var(--muted, #aaa); text-align: right; font-variant-numeric: tabular-nums; }
-  .arrow { opacity: 0.5; margin: 0 0.2rem; }
-  .form { display: flex; flex-direction: column; gap: 0.6rem; }
-  .contexts { border: 1px solid var(--border, #2a2a2a); border-radius: 6px; padding: 0.5rem; margin: 0; }
-  legend { font-size: 0.78rem; color: var(--muted, #999); padding: 0 0.35rem; }
-  .ctx-build { border-top: 1px solid var(--border, #222); padding: 0.5rem 0; }
-  .ctx-build:first-of-type { border-top: none; }
-  .ctx-build-head { display: flex; justify-content: space-between; font-size: 0.75rem;
-    color: var(--muted, #999); margin-bottom: 0.35rem; }
-  .turn-row { display: grid; grid-template-columns: 6rem 1fr auto; gap: 0.3rem; margin: 0.2rem 0; }
-  .assistant-field { margin-top: 0.35rem; }
-  .mini { background: none; border: 1px solid var(--border, #333); color: var(--muted, #aaa);
-    border-radius: 4px; padding: 0.15rem 0.45rem; cursor: pointer; font-size: 0.72rem; }
-  .mini.add { margin-top: 0.35rem; }
-  .errs { color: var(--danger, #e66); font-size: 0.78rem; margin: 0; padding-left: 1.1rem; }
-  .foot { display: flex; justify-content: flex-end; gap: 0.5rem; }
-  .catalog { border-top: 1px solid var(--border, #2a2a2a); padding-top: 0.6rem; margin-top: 0.4rem; }
-  .catalog-head { font-size: 0.72rem; color: var(--muted, #888); text-transform: uppercase;
-    letter-spacing: 0.05em; margin-bottom: 0.3rem; }
-  .cat-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center;
-    gap: 0.5rem; padding: 0.2rem 0; font-size: 0.8rem; }
-  .cat-sub { color: var(--muted, #888); font-size: 0.72rem; }
+  .bar { height: 7px; border-radius: var(--radius-sm); min-width: 1px; }
+  /* Achromatic before/after: the steered bar reads brighter above the
+   * muted baseline — no pillar hue borrowed for a non-pillar surface. */
+  .bar.base { background: var(--fg-muted); }
+  .bar.steer { background: var(--accent); }
+  .bar-num {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--fg-dim);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .arrow { color: var(--fg-subtle); margin: 0 var(--space-1); }
+
+  .form { display: flex; flex-direction: column; gap: var(--space-4); }
+  .contexts {
+    border-radius: var(--radius);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    padding: var(--space-4);
+    margin: 0;
+  }
+  legend {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 0 var(--space-2);
+  }
+  .ctx-build {
+    padding: var(--space-4) 0;
+  }
+  .ctx-build-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: var(--text-xs);
+    color: var(--fg-muted);
+    margin-bottom: var(--space-3);
+  }
+  .turn-row {
+    display: grid;
+    grid-template-columns: 6em 1fr auto;
+    gap: var(--space-2);
+    margin: var(--space-2) 0;
+  }
+  .assistant-field { margin-top: var(--space-3); }
+
+  /* Icon-ish micro-buttons — dense-row pills, styled like the reference
+   * .scrub-btn rather than the full Button component. */
+  .mini {
+    background: var(--glass);
+    border: 1px solid transparent;
+    color: var(--fg-muted);
+    border-radius: var(--radius-pill);
+    padding: var(--space-2) var(--space-4);
+    cursor: pointer;
+    font: inherit;
+    font-size: var(--text-2xs);
+    line-height: 1;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .mini:hover {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
+  .mini.add { margin-top: var(--space-3); }
+  .errs {
+    color: var(--accent-red);
+    font-size: var(--text-sm);
+    margin: 0;
+    padding-left: 1.1em;
+  }
+  .foot { display: flex; justify-content: flex-end; gap: var(--space-3); }
+
+  .catalog {
+    padding-top: var(--space-4);
+  }
+  .catalog-head {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: var(--space-3);
+  }
+  .cat-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    font-size: var(--text-sm);
+  }
+  .cat-name { font-family: var(--font-mono); color: var(--fg); }
+  .cat-sub {
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
 </style>

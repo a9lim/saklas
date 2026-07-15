@@ -75,7 +75,13 @@ def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> A
         L: (pos[L].to(torch.float32) - neg[L].to(torch.float32))
         for L in pos if L in neg
     }
-    mfld = fold_directions_to_subspace(concept, directions, None, label="p")
+    from tests._whitener import isotropic_whitener
+    neutral_means = {L: neg[L].to(torch.float32) for L in directions}
+    dim = int(next(iter(directions.values())).numel())
+    mfld = fold_directions_to_subspace(
+        concept, directions, neutral_means,
+        whitener=isotropic_whitener(directions, dim), label="p",
+    )
     return folded_vector_directions(mfld)
 
 
@@ -124,7 +130,12 @@ def _steer_subspace(mgr: Any, *pairs: Any) -> None:
             coord_dirs[L] = torch.tensor([n], device=v.device)
             neutral_means.setdefault(L, torch.zeros_like(v))
         push.append((basis_dirs, coord_dirs, alpha))
-    synth = synthesize_subspace(push, [], neutral_means=neutral_means)
+    from tests._whitener import isotropic_whitener
+    dim = int(next(iter(neutral_means.values())).numel())
+    synth = synthesize_subspace(
+        push, [], neutral_means=neutral_means,
+        whitener=isotropic_whitener(neutral_means, dim),
+    )
     mgr.add_subspace("steer", synth)
 
 
@@ -175,7 +186,7 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        _steer_subspace(mgr, (happy_profile, 1.5))
+        _steer_subspace(mgr, (happy_profile, 5.0))
         mgr.apply_to_model(layers, device, dtype)
 
         state1 = GenerationState()
@@ -194,10 +205,14 @@ class TestSteering:
         device, dtype = p.device, p.dtype
 
         input_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "Hello"}],
+            # Reuse the steering smoke's calibrated prompt/length.  A ten-token
+            # greedy "Hello" continuation can share its prefix even when the
+            # residual stream moved, which made this cleanup test spuriously
+            # fail before it ever reached the cleanup assertion.
+            [{"role": "user", "content": "Tell me about your day."}],
             add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
-        config = GenerationConfig(max_new_tokens=10, temperature=0.0)
+        config = GenerationConfig(max_new_tokens=20, temperature=0.0)
 
         # Unsteered baseline
         state_b = GenerationState()
@@ -205,7 +220,11 @@ class TestSteering:
 
         # Steered
         mgr = SteeringManager()
-        _steer_subspace(mgr, (happy_profile, 2.0))
+        # Use the same deliberately supra-threshold smoke strength as the
+        # preceding steering test.  This assertion is about hook installation
+        # and cleanup, not about calibrating the weakest alpha that changes one
+        # particular greedy continuation.
+        _steer_subspace(mgr, (happy_profile, 5.0))
         mgr.apply_to_model(layers, device, dtype)
         state_s = GenerationState()
         steered = generate_steered(model, tokenizer, input_ids.clone(), config, state_s)
@@ -221,14 +240,17 @@ class TestSteering:
 
 class TestSaveLoad:
     def test_roundtrip(self, happy_profile: Any) -> None:
-        from saklas.core.vectors import save_profile, load_profile
+        from saklas.core.profile import load_profile, save_profile
 
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "test_profile.safetensors")
-            save_profile(happy_profile, path, {"method": "difference_of_means"})
+            # ``profile`` is the current exact-schema method for a standalone
+            # baked direction. Difference-of-means is extraction provenance on
+            # the manifold artifact, not a surviving Profile wire method.
+            save_profile(happy_profile, path, {"method": "profile"})
             loaded_profile, loaded_meta = load_profile(path)
 
-            assert loaded_meta["method"] == "difference_of_means"
+            assert loaded_meta["method"] == "profile"
             assert "scores" not in loaded_meta
             assert set(loaded_profile.keys()) == set(happy_profile.keys())
             for idx in happy_profile:
@@ -399,9 +421,13 @@ class TestAblationPerformance:
 
             # Vanilla baseline.
             t0 = time.perf_counter()
-            r_vanilla = session.generate(prompt)
+            # Keep the two measurements on identical prompt state.  Without
+            # stateless mode the second call includes the first call's entire
+            # essay in its prefill, so the old test mostly measured a much
+            # longer conversation rather than steering overhead.
+            r_vanilla = session.generate(prompt, stateless=True).first
             dt_vanilla = max(time.perf_counter() - t0, 0.1)
-            tok_s_vanilla = max(len(r_vanilla.text.split()) / dt_vanilla, 1e-6)
+            tok_s_vanilla = max(len(r_vanilla.tokens) / dt_vanilla, 1e-6)
 
             # Pick two probes from the auto-loaded set: one for additive, one for ablation.
             probes = list(session.probes)
@@ -411,15 +437,17 @@ class TestAblationPerformance:
             expr = f"0.3 {additive_name} + !{ablation_name}"
             t0 = time.perf_counter()
             with session.steering(expr):
-                r_combined = session.generate(prompt)
+                r_combined = session.generate(prompt, stateless=True).first
             dt_combined = max(time.perf_counter() - t0, 0.1)
-            tok_s_combined = max(len(r_combined.text.split()) / dt_combined, 1e-6)
+            tok_s_combined = max(len(r_combined.tokens) / dt_combined, 1e-6)
 
             ratio = tok_s_combined / tok_s_vanilla
             assert ratio >= 0.80, (
                 f"combined ablation + additive too slow: "
                 f"{ratio:.2%} of vanilla (vanilla={tok_s_vanilla:.1f} tok/s, "
-                f"combined={tok_s_combined:.1f} tok/s)"
+                f"combined={tok_s_combined:.1f} tok/s; "
+                f"tokens={len(r_vanilla.tokens)}/{len(r_combined.tokens)}, "
+                f"seconds={dt_vanilla:.2f}/{dt_combined:.2f})"
             )
         finally:
             session.close()
@@ -551,11 +579,11 @@ class TestDiscoverManifoldEndToEnd:
             with session.steering(
                 f"1.0 local/smoke_personas%{pos_a}@response",
             ):
-                r_a = session.generate(prompt, sampling=sampling)
+                r_a = session.generate(prompt, sampling=sampling).first
             with session.steering(
                 f"1.0 local/smoke_personas%{pos_b}@response",
             ):
-                r_b = session.generate(prompt, sampling=sampling)
+                r_b = session.generate(prompt, sampling=sampling).first
             assert r_a.text != r_b.text, (
                 f"steering at node {label_a!r} produced identical text "
                 f"to node {label_b!r} — the manifold hook isn't moving "

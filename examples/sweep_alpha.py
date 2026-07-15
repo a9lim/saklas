@@ -36,7 +36,7 @@ def main() -> None:
                 sampling=SamplingConfig(seed=0),
             )
             print(f"\n=== alpha={alpha:.2f} ===")
-            print(result.text[: args.max_tokens * 5])
+            print(result.first.text[: args.max_tokens * 5])
 
 
 if __name__ == "__main__":

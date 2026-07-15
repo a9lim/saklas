@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult, ProbeReading, RunSet
+from saklas.core.steering_composer import SteeringComposer
 
 if TYPE_CHECKING:
     from saklas.core.session import SaklasSession
@@ -37,8 +38,7 @@ def _make_result(text: str, applied: str | None = None) -> GenerationResult:
         token_count=3,
         tok_per_sec=50.0,
         elapsed=0.06,
-        readings={},
-        vectors={},
+        steering_alphas={},
         prompt_tokens=4,
         finish_reason="stop",
         applied_steering=applied,
@@ -108,6 +108,12 @@ class _BatchModel:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.config = SimpleNamespace(vocab_size=200)
+
+    def named_parameters(self):
+        return iter(())
+
+    def named_buffers(self):
+        return iter(())
         self.generation_config = SimpleNamespace(eos_token_id=99)
 
     def generate(self, **kwargs: Any):
@@ -177,6 +183,8 @@ def _fast_batch_session():
     model = _BatchModel()
     s_any = cast(Any, s)
     s_any._model = model
+    s._model_info = {"model_id": "batch/test"}
+    s._jlens = None
     s_any._tokenizer = _BatchTokenizer()
     s._device = torch.device("cpu")
     s_any._gen_lock = threading.Lock()
@@ -202,20 +210,25 @@ def _fast_batch_session():
         zero_compiled_offsets=lambda: None,
     )
     s._live_lens = None
+    s._lens_probes = {}
+    s._sae_probes = {}
+    s._sae_layer = None
     s._trait_queues = []
     s._active_gen_reservation = None
     s._last_token_probe_payload = None
     s._capture_state = CaptureState()
+    from saklas.core.hooks import HiddenCapture
+    s._capture = HiddenCapture()
     s._compiled_clean_eligible = False
     s._incremental_readings = []
     s._incremental_gate_scores = []
     s._steering_uses_compiled_offsets = False
     s._last_per_token_scores = None
     s._last_result = None
+    s._readout_long_tensor_cache = {}
     s._internal_steering_pop = False
     s._active_role = None
-    s._steering_stack = []
-    s.build_readings = lambda: {}
+    s._steering_composer = SteeringComposer(s)
 
     def _prepare_input(
         input: Any,
@@ -226,9 +239,11 @@ def _fast_batch_session():
         user_role: str | None = None,
         assistant_role: str | None = None,
         to_device: bool = True,
+        gen_seat: str = "assistant",
+        add_generation_prompt: bool = True,
     ):
         del raw, thinking, stateless, parent_node_id
-        del user_role, assistant_role, to_device
+        del user_role, assistant_role, to_device, gen_seat, add_generation_prompt
         mapping = {
             "alpha": [1, 2],
             "beta": [3, 4, 5],
@@ -267,6 +282,8 @@ class TestGenerateBatch:
         from saklas.core.session import SaklasSession
 
         s = SaklasSession.__new__(SaklasSession)
+        s._steering_composer = SteeringComposer(s)
+        cast(Any, s)._trait_queues = [object()]
         return s
 
     def test_returns_results_in_prompt_order(self) -> None:
@@ -385,6 +402,7 @@ class TestGenerateBatch:
     def test_probes_fall_back_to_serial_generation(self) -> None:
         s, model = _fast_batch_session()
         cast(Any, s._monitor).probe_names = ["mood"]
+        cast(Any, s)._trait_queues = [object()]
         capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
@@ -411,12 +429,148 @@ class TestGenerateBatch:
             (30.0,),
             (100.0,),
         ]
-        assert [r.readings["mood"].mean for r in runset] == [
+        assert cast(Any, s._monitor).scored == [2.0, 30.0, 100.0]
+
+    def test_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _probe_fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(
+            ["alpha", "beta", "gamma"],
+            sampling=SamplingConfig(return_probe_readings=False),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
+        assert [r.probe_readings for r in runset] == [{}, {}, {}]
+        assert cast(Any, s._monitor).scored == []
+
+    def test_sae_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
+        from saklas.core.sae import MockSaeBackend
+
+        s, model = _probe_fast_batch_session()
+        cast(Any, s)._monitor = SimpleNamespace(probe_names=[])
+        s._sae_backend = MockSaeBackend(layers=frozenset({0}), d_model=1, d_feature=1)
+        s._sae_layer = 0
+        s._sae_width = 1
+        s._sae_feature_meta = {}
+        s._sae_probes = {
+            "sae/0": {
+                "feature_id": 0,
+                "layer": 0,
+                "label": None,
+                "max_act": None,
+            },
+        }
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(["alpha", "beta", "gamma"], thinking=False)
+
+        assert len(model.calls) == 1
+        assert [r.probe_readings["sae/0"].coords for r in runset] == [
             (2.0,),
             (30.0,),
             (100.0,),
         ]
-        assert cast(Any, s._monitor).scored == [2.0, 30.0, 100.0]
+
+    def test_sae_readout_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _probe_fast_batch_session()
+        cast(Any, s)._monitor = SimpleNamespace(probe_names=[])
+        s._sae_layer = 0
+        s._sae_probes = {
+            "sae/0": {
+                "feature_id": 0,
+                "layer": 0,
+                "label": None,
+                "max_act": None,
+            },
+        }
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(
+            ["alpha", "beta", "gamma"],
+            sampling=SamplingConfig(return_probe_readings=False),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert [r.probe_readings for r in runset] == [{}, {}, {}]
+
+    def test_lens_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
+        s, model = _probe_fast_batch_session()
+        s_any = cast(Any, s)
+        s_any._monitor = SimpleNamespace(probe_names=[])
+        s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
+        s_any._lens_probe_layers = lambda: {0}
+
+        def _score_lens_probes(
+            hidden: dict[int, Any],
+            **kwargs: Any,
+        ) -> dict[str, ProbeReading]:
+            del kwargs
+            value = float(hidden[0].reshape(-1)[0])
+            return {"jlens/g": ProbeReading(0.0, [], coords=(value,))}
+
+        s_any._score_lens_probes = _score_lens_probes
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(["alpha", "beta", "gamma"], thinking=False)
+
+        assert len(model.calls) == 1
+        assert [r.probe_readings["jlens/g"].coords for r in runset] == [
+            (2.0,),
+            (30.0,),
+            (100.0,),
+        ]
+
+    def test_lens_readout_probe_batch_fast_path_honors_return_probe_readings_false(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _probe_fast_batch_session()
+        s_any = cast(Any, s)
+        s_any._monitor = SimpleNamespace(probe_names=[])
+        s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
+        s_any._lens_probe_layers = lambda: {0}
+
+        def _score_lens_probes(*_args: Any, **_kwargs: Any) -> dict[str, ProbeReading]:
+            raise AssertionError("return_probe_readings=False should skip lens probes")
+
+        s_any._score_lens_probes = _score_lens_probes
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate_batch(
+            ["alpha", "beta", "gamma"],
+            sampling=SamplingConfig(return_probe_readings=False),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert [r.probe_readings for r in runset] == [{}, {}, {}]
 
     def test_deterministic_fan_uses_batched_generation(self) -> None:
         s, model = _fast_batch_session()
@@ -434,6 +588,29 @@ class TestGenerateBatch:
         assert runset.grid == [{}, {}, {}]
         assert runset.node_ids == [None, None, None]
         assert [r.tokens for r in runset] == [[10, 11], [12, 13, 14], [15]]
+
+    def test_deterministic_fan_honors_return_probe_readings_false(self) -> None:
+        from saklas.core.sampling import SamplingConfig
+
+        s, model = _probe_fast_batch_session()
+
+        def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
+            raise AssertionError("serial generation path should not run")
+
+        s._generate_core = _fail_generate_core
+
+        runset = s.generate(
+            "alpha",
+            n=3,
+            stateless=True,
+            sampling=SamplingConfig(return_probe_readings=False),
+            thinking=False,
+        )
+
+        assert len(model.calls) == 1
+        assert runset.kind == "fan"
+        assert [r.probe_readings for r in runset] == [{}, {}, {}]
+        assert cast(Any, s._monitor).scored == []
 
     def test_deterministic_fan_with_seed_uses_batched_generation(self) -> None:
         from saklas.core.sampling import SamplingConfig
@@ -467,8 +644,10 @@ class TestGenerateBatch:
 class TestPrefixCacheEligibility:
     def _session(self):
         from saklas.core.session import SaklasSession
-
-        return SaklasSession.__new__(SaklasSession)
+        session = SaklasSession.__new__(SaklasSession)
+        session._steering_composer = SteeringComposer(session)
+        session._profiles = {}
+        return session
 
     @pytest.mark.parametrize(
         "expr, expected_inactive",
@@ -504,17 +683,17 @@ class TestPrefixCacheEligibility:
         from saklas.core.triggers import Trigger
 
         s = self._session()
-        s._steering_stack = []
+        s._steering_composer._stack = []
         assert s._steering_active_in_prefill() is False
         # Response-phase entry (prompt=False) → prefill untouched.
-        s._steering_stack = [{"honest": (0.5, Trigger.GENERATED_ONLY)}]
+        s._steering_composer._stack = [{"honest": (0.5, Trigger.GENERATED_ONLY)}]
         assert s._steering_active_in_prefill() is False
         # Default BOTH entry → prefill steered.
-        s._steering_stack = [{"honest": (0.5, Trigger.BOTH)}]
+        s._steering_composer._stack = [{"honest": (0.5, Trigger.BOTH)}]
         assert s._steering_active_in_prefill() is True
         # A probe-gated trigger reports inactive during prefill.
         gated = Trigger.when("honest.deceptive", ">", 0.4)
-        s._steering_stack = [{"honest": (0.5, gated)}]
+        s._steering_composer._stack = [{"honest": (0.5, gated)}]
         assert s._steering_active_in_prefill() is False
 
     def test_batch_common_prefix_detection_keeps_scalar_walk_on_cpu(self) -> None:
@@ -616,6 +795,7 @@ class TestPrefixCacheEligibility:
         s_any._tokenizer = object()
         s_any._gen_state = object()
         s._capture_state = CaptureState(persistent=False)
+        s._steering_uses_compiled_offsets = False
         s_any._capture = SimpleNamespace(
             ingest_persistent=lambda: None,
             fire_step_sink=lambda: None,
@@ -669,7 +849,7 @@ class TestPrefixCacheEligibility:
         s._static_cache_active = True
         s._device = torch.device("cpu")
         s.config = GenerationConfig(max_new_tokens=4)
-        s._steering_stack = []
+        s._steering_composer._stack = []
         s._prefix_cache = None
         from saklas.core.session import GenState
         s._gen_phase = GenState.IDLE
@@ -740,6 +920,8 @@ class TestGenerateSweep:
         from saklas.core.session import SaklasSession
 
         s = SaklasSession.__new__(SaklasSession)
+        from saklas.core.generation import GenerationConfig
+        s.config = GenerationConfig()
         return s
 
     def test_single_concept_sweep_yields_one_per_alpha(self) -> None:

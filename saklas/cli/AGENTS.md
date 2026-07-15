@@ -1,13 +1,14 @@
 # cli/
 
-Eight-verb root parser
-(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`).
+Nine-verb root parser
+(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`/`sae`).
 `manifold` is the
 unified compute surface (extract/generate/from-template/fit/bake/merge/transfer/
 compare/why); `pack` is the lifecycle/distribution verb (ls/show/install/search/
 push/rm/clear/refresh/export gguf); `template` owns the standalone
-templated-completion artifact (create/ls/show/score/rm); `lens` owns the
-per-model Jacobian-lens artifact (fit/show/top/decompose/rm). There is no
+templated-completion artifact (create/ls/show/score/rm); `lens` and `sae` own
+parallel model-first local/external source lifecycles (`fit` vs `train`, then
+fetch/ls/show/use/rm), with lens retaining top/decompose. There is no
 `vector` alias
 — install via `pack install` and export via `pack export gguf`. Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
@@ -63,17 +64,19 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
   (`session.score_template`), steering-aware via `-S`. Bare names default to
   `local/` (`_split_manifold_ns_name`); `score`/`show`/`rm` resolve cross-namespace
   via `resolve_template`.
-- `lens` = the per-model Jacobian-lens artifact
-  (`fit`/`show`/`top`/`decompose`/`rm`) via `_LENS_VERBS`; `_run_lens`
+- `lens` = source-aware per-model Jacobian lenses
+  (`fit`/`fetch`/`ls`/`show`/`use`/`top`/`decompose`/`rm`) via `_LENS_VERBS`; `_run_lens`
   hand-dispatches (`@_saklas_error_exit`-wrapped, like `_run_experiment` — the
   lens error family carries `user_message()`). `fit`/`top`/`decompose` load a
-  model with `probes=[]` (no default probe bootstrap); `show`/`rm` are pure-IO
-  over `models/<safe_id>/jlens.*`. `fit` sources its corpus from `--corpus FILE`
+  model with `probes=[]` (no default probe bootstrap); lifecycle verbs are
+  model-first and source-aware. `fit` sources its corpus from `--corpus FILE`
   (one document per line, or JSONL with a `text` field) or streams the default
   fineweb-edu sample via the optional `datasets` dependency
   (`_load_lens_corpus`), and resumes a matching partial fit by default. The
   model is a **positional** on `fit`/`show`/`top`/`rm` (the artifact is
-  per-model); `decompose` takes a selector positional + required `-m`.
+  per-model); `fetch MODEL neuronpedia` leaves official bytes in the HF cache;
+  `use/show/rm MODEL [SOURCE]` address `local:default` or `neuronpedia`.
+  `decompose` takes a selector positional + required `-m`.
 
 ## Config loading
 
@@ -89,7 +92,8 @@ calls `ensure_vectors_installed`. There is **no** `method`/`injection_mode`/
 `theta_max`/`projection_metric` threading — those config keys were removed with the
 unified injection kernel and the Mahalanobis-only collapse.
 
-`ConfigFile.load` parses the YAML, warns on unknown keys, and validates the
+`ConfigFile.load` parses the YAML, rejects unknown keys, and validates exact
+types/ranges for every current field plus the
 `vectors:` value (a single steering expression) through `parse_expr` at load time.
 `compose` overrides field-by-field (later wins; `vectors` wholesale). Known keys
 (`_KNOWN_KEYS`): `model`, `vectors`, `thinking`, `temperature`, `top_p`,
@@ -114,6 +118,11 @@ manifold (`personas`, `emotions`) — is attached at session construction
 dashboard rack opens already watching them. `_resolve_probes` maps unset / `all` →
 `None` (the session's default-roster signal), `none` / `[]` → `[]`, and an explicit
 category list through verbatim (tagged concepts only, no multi-node sweep).
+Serve then enables a compatible J-lens when present. For a web-enabled serve it
+also restores the active SAE or chooses the strongest compatible official,
+Neuronpedia-backed provider release (canonical/curated variants first), loads it,
+and enables the 12-card live SAE readout; `--no-web` skips implicit SAE discovery
+and acquisition.
 
 ## Flags
 
@@ -129,8 +138,7 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   Mahalanobis-only — there is **no** `--projection-metric`/`--steer-mode`/
   `--theta-max`/`--legacy`.
 - **Logit block** (`_add_logit_args`): `--top-k-alts N` (→ session
-  `SamplingConfig.return_top_k`). The `[0,256]` bound is validated only on the YAML
-  `return_top_k` key, not on this flag (a plain `type=int`).
+  `SamplingConfig.return_top_k`). Both CLI and YAML enforce `[0,256]`.
 - `tui`: `model` optional (a `-c` config with `model:` can supply it); `--max-tokens`
   default 1024.
 - `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (8000), `-S/--steer EXPR`,
@@ -138,12 +146,15 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `--no-web`.
 - `manifold extract`: positional `concept` (one concept or two poles, `nargs="+"`),
   `-m/--model`, `-f/--force` (re-authors the pole corpora + bypasses the tensor
-  cache), `--sae RELEASE`, `--sae-revision REV`, `--role SLUG` (mutually exclusive
+  cache), `--sae RELEASE`, `--role SLUG` (mutually exclusive
   with `--sae`; the role bakes into the node corpora and writes the **canonical**
   tensor — no `_role-` suffix — while returning a `:role-<slug>` name tail; slug
   `[a-z0-9._-]+`), `--namespace NS` (destination; unset → `local/`). There is **no
   `--method`/`--legacy`** — difference-of-means (a 2-node `pca` fit) is the only
-  method.
+  method. The loaded session/pipeline validates model, corpus, tokenizer, role,
+  SAE-transform, and manifest identity before accepting a cache hit; extraction
+  constructs that session with `probes=[]` so probe bootstrap is not part of
+  artifact training.
 - `manifold generate`: `name` + `--concepts C...` (required, ≥2),
   `[--kind {abstract,concrete,custom}] [--system TEMPLATE] [--samples-per-prompt K]
   [--seed INT] [--role-per-node] [-m] [-f]`. LLM-authors a discover folder via
@@ -156,7 +167,8 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   assistant-role substitution → a persona manifold.
 - `manifold fit`: positional `target` (a manifold name *or* a folder path;
   `_run_manifold_fit` resolves it and reads `fit_mode`), `-m/--model`, `-f/--force`,
-  `--sae RELEASE`, `--sae-revision REV`, plus the discover hyperparams
+  `--sae RELEASE`, `--layers L1,L2,...|workspace|all`
+  (default all; subset artifacts contain only those injection layers), plus the discover hyperparams
   `--method pca|spectral|auto`, `--max-dim N`, `--min-dim N`, `--var-threshold T`,
   `--k-nn K`, `--bandwidth SIGMA`, `--max-subspace-dim R`, `--smoothing auto|0|LAMBDA`,
   `--persistence-frac F`. `-f/--force` bypasses the per-model tensor cache and
@@ -166,31 +178,49 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   re-author the corpus, so without it an unchanged corpus always cache-hits and a
   code-level fit change (e.g. a topology-selection fix) can't be picked up. An
   authored folder runs `ManifoldExtractionPipeline` directly; a discover folder
-  (`pca`/`spectral`/`auto`) has any supplied hyperparam written into
-  `manifold.json` atomically *before* the fit. Supplying a discover hyperparam
-  against an authored folder is an error.
+  (`pca`/`spectral`/`auto`) passes only the supplied override patch into
+  `session.fit`; the pipeline merges and writes it under the same manifest lock
+  as cache-key derivation and fit publication. Supplying a discover hyperparam
+  against an authored folder is an error. Cache validation happens after model
+  load so the sidecar can be checked against the actually loaded weight
+  fingerprint (a mutable model id alone cannot prove a hit); actual fit sessions
+  use `probes=[]` so artifact training does not eagerly
+  bootstrap the unrelated probe roster.
   `--method auto` defers flat-vs-curved + periodic-axis selection to
   `select_topology` per-model. `--max-subspace-dim` caps the per-layer RBF subspace
   dim for the curved spectral fit (argparse-default `None` → engine 64) and is
-  dropped by `sanitize_hyperparams` for `--method pca` — a flat fit's subspace dim
+  rejected for `--method pca` — a flat fit's subspace dim
   is its `--max-dim` layout dim. `--min-dim` (spectral only) floors the intrinsic
   dim the eigenvalue-ratio cliff picks (set `--min-dim == --max-dim` to pin it,
-  e.g. PAD's 3); ignored for `--method pca`. `--smoothing` (curved only: GCV `auto` / exact `0`
+  e.g. PAD's 3); it is rejected for `--method pca`. `--smoothing` (curved only: GCV `auto` / exact `0`
   / fixed λ) sets the penalized-RBF regularization; `--persistence-frac` (auto
   only) is the H1 loop-significance threshold. This verb folds the former separate
   `discover` verb.
 - `manifold bake`: `name` + `expression`, `-f`, `-s/--strict`, `-m/--model`. Lands
-  a corpus-less baked manifold via `merge_into_manifold`.
+  a corpus-less baked manifold via `merge_into_manifold`; accepts only
+  namespace-qualified additive/subtractive scalar terms. Dynamic terms and
+  Mahalanobis `~`/`|` projections are rejected without a live whitener.
 - `manifold merge`: `name` + `sources` (1+), `-f`. Unions the node corpora of
   discover-mode manifolds into a fresh folder — distinct from `bake` (which lowers a
   steering expression).
 - `manifold transfer`: `name`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
   Fits/loads a Procrustes alignment and writes the target's `from-<safe_src>`
   **manifold** tensor via `transfer_manifold` — one transfer path (the old
-  vector-side transfer bridge is gone). The runner calls
-  `_target_whitener_from_neutral_cache` (→ `LayerWhitener.from_cache`) on the
-  target model's cached `neutral_activations.safetensors` (no model load on a cache
-  hit) so transferred shares are re-baked in the target Mahalanobis metric;
+  vector-side transfer bridge is gone). The runner materializes the target's
+  proven neutral cache only for source-tensor layers and builds the whitener from
+  those resident rows. A cached alignment loads no model; if requested map layers
+  are missing and both
+  neutral-cache source identities remain proven, the runner fits and saves the
+  missing factors offline from those selected cached matrices, carrying forward
+  the other immutable factor shards. The per-model neutral single-flight lock is
+  acquired before model construction, so distinct concurrent alignments sharing
+  a cold model do not duplicate that model load. `-f` recomputes the requested
+  alignment factors and target transfer but reuses exact neutral caches; it does
+  not force the 90-prompt neutral capture. A first cold capture still publishes
+  the complete reusable neutral artifact, but once shared coverage is known the
+  runner narrows both in-memory seed rosters to requested layers and releases
+  each full roster before Procrustes. Transferred shares are re-baked in the
+  target Mahalanobis metric;
   **mandatory** — a missing/unusable target cache raises `WhitenerError` (the runner
   exits 1 with a regenerate-neutrals hint), there is no Euclidean rebake.
 - `manifold compare`: `concepts` (1+), `-m/--model` (required), `-v`, `-j`,
@@ -218,23 +248,53 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
   `transcript` is not a top-level verb.
 - `experiment naturalness`: `model` + `prompt`, `--manifold FOLDER` / `-S/--steer
   EXPR` (required), `--compare-linear`, `--max-tokens` (128), `-j`.
+  Its behavior-manifold preflight consumes only authoring geometry/corpus, so it
+  does not hash unrelated fitted payloads.
 - `config show`/`validate` — flags as in `config_file`.
 - `lens fit`: positional `model`, `--corpus FILE`, `--prompts N` (100),
   `--seq-len T` (128), `--dim-batch K` (8; total backward work is K-invariant,
-  so the knob trades memory for per-pass overhead — halves automatically on
-  OOM), `--layers L1,L2,...` (restrict source layers — skips all forward-graph
-  and backward work below the lowest one, the one real wall-time lever; a
-  stored lens whose layers mismatch the request refits instead of resuming),
-  `-f/--force` (restart from zero instead of resuming), `-d`, `-q`.
-- `lens show`: positional `model`, `-j`.
+  so the knob trades memory for per-pass overhead), `--prompt-batch B`
+  (consecutive ragged prompts per graph; CPU/CUDA default 4, MPS 2; both widths
+  halve independently on OOM and stay below a proven ceiling),
+  `--checkpoint-every N` (25,
+  writes a self-contained checkpoint directly from the live accumulator; the
+  full artifact is written durably once at finalization),
+  `--layers L1,L2,...|workspace` (restrict source layers — skips
+  all forward-graph and backward work below the lowest one, the one real
+  wall-time lever; `sample` is rejected for fitting because it still includes
+  layer 0 and is artifact-size/debug only), `-f/--force` (restart from zero
+  instead of resuming), `-d`, `-q`. All five numeric fit flags are positive-only.
+  An exact metadata-only no-op can run before corpus streaming/model load when
+  the sidecar's immutable model-source identity, pinned default-dataset revision
+  (or custom raw-corpus hash), layer coverage, and tensor digest all match;
+  otherwise loaded token IDs + live weights decide. That exact proof also reaps
+  a crash-left checkpoint when the durable final artifact provably subsumes it.
+  A superset stored lens satisfies
+  narrower layer requests without refit (a fresh session reads only those
+  shards and leaves the durable union intact), and missing layers are fitted as
+  a checkpointed/resumable top-up while preserving the same-corpus union. A
+  normal 100→1000 corpus extension resumes when the saved token-id hash matches
+  the new prefix; extending only a strict subset of a v4 durable superset is
+  rejected because v4 has one progress field for all layers — request the full
+  durable set or use `-f` for explicit replacement. Model
+  fingerprint mismatch forces a clean fit.
+- `lens fetch/ls/show/use/rm`: model-first lifecycle; external removal forgets
+  only the binding and never purges Hugging Face cache bytes.
 - `lens top`: positionals `model` + `prompt` (raw text, no chat template),
-  `-k/--top-k` (8), `--layers L1,L2,...` (default: 9 evenly spaced fitted
-  layers), `--position P` (repeatable, negative ok; default final position),
-  `-d`, `-q`, `-j`.
+  `-k/--top-k` (8), `--layers L1,L2,...` (default: all fitted layers),
+  `--position P` (repeatable, negative ok; default final position),
+  `-d`, `-q`, `-j`. Output leads with the layer-aggregated block (`token ·
+  strength · com ±spread`, computed over all displayed layers via
+  `jlens_readout(aggregate=True)` — same forward), then
+  the per-layer matrix; JSON carries both under `aggregate` / `layers`.
 - `lens decompose`: positional `selector`, `-m/--model` (required),
   `-k/--top-k` (16 — the sparsity budget), `--layers L1,L2,...`, `-d`, `-q`,
   `-j`.
-- `lens rm`: positional `model`, `-y/--yes`.
+- `sae train`: positionals `model name`; native residual-post ReLU fit over a
+  file or FineWeb-Edu with `--layer`, `--tokens`, `--seq-len`, `--batch-size`,
+  `--width`/`--expansion`, `--learning-rate`, `--l1`, `--dead-threshold`, seed,
+  and force controls. `sae fetch/ls/show/use/rm` mirrors lens argument order;
+  sources are `local:NAME` or `saelens:RELEASE`.
 
 ## Error handling
 

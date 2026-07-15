@@ -72,7 +72,7 @@ class TestConstruction:
         assert len(session.probes) > 0
 
     def test_history_starts_empty(self, session: SaklasSession) -> None:
-        assert session.history == []
+        assert session.tree.messages_for() == []
 
     def test_vectors_starts_empty(self, session: SaklasSession) -> None:
         assert session.vectors == {}
@@ -131,11 +131,12 @@ class TestGeneration:
         result = session.generate("Say hello in one word.")
         assert isinstance(result, RunSet)
         assert isinstance(result.first, GenerationResult)
-        assert len(result.text) > 0
-        assert result.token_count > 0
-        assert result.tok_per_sec > 0
-        assert result.elapsed > 0
-        assert result.vectors == {}  # no alphas = no steering snapshot
+        single = result.first
+        assert len(single.text) > 0
+        assert single.token_count > 0
+        assert single.tok_per_sec > 0
+        assert single.elapsed > 0
+        assert single.steering_alphas == {}
 
     def test_generate_blocking_messages(self, session: SaklasSession) -> None:
         result = session.generate([
@@ -143,29 +144,30 @@ class TestGeneration:
         ])
         assert isinstance(result, RunSet)
         assert isinstance(result.first, GenerationResult)
-        assert len(result.text) > 0
+        assert len(result.first.text) > 0
 
     def test_generate_appends_to_history(self, session: SaklasSession) -> None:
         session.clear_history()
         session.generate("Say hi.")
-        assert len(session.history) == 2
-        assert session.history[0]["role"] == "user"
-        assert session.history[1]["role"] == "assistant"
+        messages = session.tree.messages_for()
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"
 
     def test_generate_with_alphas(self, session: SaklasSession) -> None:
         name, profile = session.extract_vector_from_corpora(
             "formal.casual", _corpus("formal"), _corpus("casual"),
         )
         session.steer(name, profile)
-        result = session.generate("Hello.", steering=f"0.1 {name}")
-        assert result.vectors == {name: 0.1}
+        result = session.generate("Hello.", steering=f"0.1 {name}").first
+        assert result.steering_alphas == {name: 0.1}
         session.unsteer(name)
 
     def test_generate_with_probes(self, session: SaklasSession) -> None:
         session.clear_history()
-        result = session.generate("Tell me something exciting!")
+        result = session.generate("Tell me something exciting!").first
         if session.probes:
-            assert isinstance(result.readings, dict)
+            assert isinstance(result.probe_readings, dict)
 
     def test_last_result(self, session: SaklasSession) -> None:
         session.clear_history()
@@ -179,11 +181,11 @@ class TestGeneration:
         )
         session.steer(name, profile)
         session.clear_history()
-        steered = session.generate("Describe a sunset.", steering=f"0.2 {name}")
+        steered = session.generate("Describe a sunset.", steering=f"0.2 {name}").first
         session.clear_history()
-        unsteered = session.generate("Describe a sunset.")
-        assert steered.vectors == {name: 0.2}
-        assert unsteered.vectors == {}
+        unsteered = session.generate("Describe a sunset.").first
+        assert steered.steering_alphas == {name: 0.2}
+        assert unsteered.steering_alphas == {}
         # Both should produce text
         assert len(steered.text) > 0
         assert len(unsteered.text) > 0
@@ -247,7 +249,7 @@ class TestStreamingGeneration:
         tokens = list(session.generate_stream("Hello.", steering=f"0.15 {name}"))
         assert len(tokens) > 0
         assert session.last_result is not None  # generate_stream guarantees last_result is set
-        assert session.last_result.vectors == {name: 0.15}
+        assert session.last_result.steering_alphas == {name: 0.15}
         session.unsteer(name)
 
 
@@ -286,7 +288,7 @@ def test_return_hidden_round_trip(session: SaklasSession) -> None:
         sampling=SamplingConfig(
             max_tokens=16, temperature=0.0, return_hidden=True,
         ),
-    )
+    ).first
     assert result.hidden_states is not None
     # All layers captured.
     assert len(result.hidden_states) == num_layers
@@ -328,7 +330,7 @@ def test_return_hidden_false_leaves_hidden_states_none(session: SaklasSession) -
     result = session.generate(
         "Hello.",
         sampling=SamplingConfig(max_tokens=4, temperature=0.0),
-    )
+    ).first
     assert result.hidden_states is None
 
 
@@ -401,7 +403,7 @@ class TestPrefixCache:
             full_msg,
             sampling=SamplingConfig(max_tokens=12, temperature=0.0, seed=42),
             stateless=True,
-        )
+        ).first
 
         # Warm the cache and rerun the same prompt; outputs must match.
         prefix_len = session.cache_prefix(prefix_ids)
@@ -410,7 +412,7 @@ class TestPrefixCache:
             full_msg,
             sampling=SamplingConfig(max_tokens=12, temperature=0.0, seed=42),
             stateless=True,
-        )
+        ).first
         # Same prompt + same seed + same model state → identical token
         # stream regardless of how prefill was sliced.
         assert cached.tokens == baseline.tokens, (

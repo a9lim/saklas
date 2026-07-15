@@ -31,6 +31,15 @@ class SaklasError(Exception):
         return (500, str(self) or self.__class__.__name__)
 
 
+def is_out_of_memory_error(exc: BaseException) -> bool:
+    """Recognize accelerator and CPU allocator OOM spellings."""
+    message = str(exc).lower()
+    return any(
+        needle in message
+        for needle in ("out of memory", "can't allocate memory", "cannot allocate memory")
+    )
+
+
 class SaeBackendImportError(ImportError, SaklasError):
     """Raised when sae_lens is required but not installed."""
 
@@ -54,6 +63,20 @@ class SaeModelMismatchError(ValueError, SaklasError):
 
 class SaeCoverageError(ValueError, SaklasError):
     """Raised when an SAE release covers zero of the model's layers."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
+
+class SaeNotLoadedError(RuntimeError, SaklasError):
+    """Raised when a live SAE surface is used without a resident release."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (404, str(self) or self.__class__.__name__)
+
+
+class SaeFeatureError(ValueError, SaklasError):
+    """Raised when an SAE feature id is malformed or outside the resident width."""
 
     def user_message(self) -> tuple[int, str]:
         return (400, str(self) or self.__class__.__name__)

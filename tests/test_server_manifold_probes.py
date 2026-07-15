@@ -34,8 +34,14 @@ from fastapi.testclient import TestClient
 from saklas.core.results import (
     GenerationResult,
     ProbeReading,
+    RunSet,
     TokenEvent,
 )
+from tests._generation_stream import TestGenerationStream
+
+
+def _single_run(**kwargs: Any) -> RunSet:
+    return RunSet([GenerationResult(**kwargs)])
 
 # The single session id the native tree resolves to.
 _SID = "default"
@@ -113,8 +119,14 @@ def _mock_session():
 
     session.vectors = {}
     session.probes = {}
-    session.history = []
     session.manifolds = {}
+    session.tree = MagicMock()
+    session.tree.messages_for.return_value = []
+    session.tree.active_node_id = "test-assistant"
+    session.tree.get.return_value.mean_logprob = None
+    session.tree.get.return_value.mean_surprise = None
+    session.lens_probe_specs = {}
+    session.sae_probe_specs = {}
 
     # The unified monitor: one object, both ``probe_names`` (the wire/gate
     # surface) and ``attached_probes()`` (the serializer source).
@@ -134,10 +146,11 @@ def _mock_session():
     # The WS token-frame builder consults this first; a real None lets the
     # inline ``_monitor`` / ``_capture`` scoring branch run (a bare
     # MagicMock would shadow it with a truthy child mock).
-    session._last_token_probe_payload = None
+    session.token_probe_payload = {}
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
+    gen_state.emit_map = []
     session.generation_state = gen_state
 
     session.build_readings.return_value = {}
@@ -515,7 +528,7 @@ class TestOpenAIProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Hi"}],
@@ -531,7 +544,7 @@ class TestOpenAIProbeExtension:
 
     def test_chat_completion_absent_when_no_probes(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="hi", tokens=[1], token_count=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -548,7 +561,7 @@ class TestOpenAIProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/v1/completions", json={"prompt": "x"})
         assert resp.status_code == 200
@@ -556,28 +569,21 @@ class TestOpenAIProbeExtension:
         assert ext is not None
         assert ext["circumplex"]["fraction"] == pytest.approx(0.42)
 
-    def test_chat_stream_surface_per_token_and_aggregate(self, session_and_client: Any) -> None:
+    def test_chat_stream_surfaces_aggregate_without_default_live_scores(self, session_and_client: Any) -> None:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
         session.last_result = result
 
-        token_reading = ProbeReading(
-            fraction=0.51,
-            nearest=[("happy", 0.18), ("calm", 0.31)],
-        )
-
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
-            yield TokenEvent(
-                text="Hi", token_id=1, index=0,
-                probe_readings={"circumplex": token_reading},
-            )
-            yield TokenEvent(
-                text=" there", token_id=2, index=1,
-                probe_readings={"circumplex": token_reading},
-            )
+            assert kwargs.get("live_scores") is False
+            assert kwargs.get("live_readouts") is False
+            return TestGenerationStream([
+                TokenEvent(text="Hi", token_id=1, index=0),
+                TokenEvent(text=" there", token_id=2, index=1),
+            ], result)
 
-        session.generate_stream.return_value = _mock_stream()
+        session.generate_stream.side_effect = _mock_stream
 
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Hi"}],
@@ -592,10 +598,7 @@ class TestOpenAIProbeExtension:
         token_chunks = [c for c in chunks if c["choices"][0].get("delta", {}).get("content")]
         assert token_chunks
         for c in token_chunks:
-            ext = c["choices"][0].get("x-saklas-probe-readings")
-            assert ext is not None
-            assert ext["circumplex"]["fraction"] == pytest.approx(0.51)
-            assert ext["circumplex"]["nearest"] == [["happy", 0.18], ["calm", 0.31]]
+            assert "x-saklas-probe-readings" not in c["choices"][0]
 
         # Final chunk carries the aggregate.
         final = next(
@@ -617,7 +620,7 @@ class TestOllamaProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/api/chat", json={
             "model": "test/model",
@@ -632,7 +635,7 @@ class TestOllamaProbeExtension:
 
     def test_chat_non_streaming_absent_when_no_probes(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.generate.return_value = GenerationResult(
+        session.generate.return_value = _single_run(
             text="hi", tokens=[1], token_count=1, prompt_tokens=1,
             tok_per_sec=5.0, elapsed=0.1,
         )
@@ -647,7 +650,7 @@ class TestOllamaProbeExtension:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
-        session.generate.return_value = result
+        session.generate.return_value = RunSet([result])
 
         resp = client.post("/api/generate", json={
             "prompt": "x",
@@ -658,22 +661,18 @@ class TestOllamaProbeExtension:
         assert ext is not None
         assert ext["circumplex"]["fraction"] == pytest.approx(0.42)
 
-    def test_chat_streaming_surface_per_token_and_aggregate(self, session_and_client: Any) -> None:
+    def test_chat_streaming_surfaces_aggregate_without_default_live_scores(self, session_and_client: Any) -> None:
         session, client = session_and_client
         _attach_aggregate(session)
         result = _populate_last_result(session)
         session.last_result = result
 
-        token_reading = ProbeReading(
-            fraction=0.33,
-            nearest=[("happy", 0.2)],
-        )
-
         def _mock_stream(*args: Any, **kwargs: Any) -> Any:
-            yield TokenEvent(
-                text="Hi", token_id=1, index=0,
-                probe_readings={"circumplex": token_reading},
-            )
+            assert kwargs.get("live_scores") is False
+            assert kwargs.get("live_readouts") is False
+            return TestGenerationStream([
+                TokenEvent(text="Hi", token_id=1, index=0),
+            ], result)
 
         session.generate_stream.side_effect = _mock_stream
 
@@ -683,12 +682,10 @@ class TestOllamaProbeExtension:
         })
         assert resp.status_code == 200
         chunks = [json.loads(l) for l in resp.text.strip().split("\n") if l]
-        # First chunk: per-token reading rides under the extension key.
+        # First chunk: compatible streams do not opt into live per-token readings.
         first = chunks[0]
         assert first["done"] is False
-        ext = first.get("x-saklas-probe-readings")
-        assert ext is not None
-        assert ext["circumplex"]["fraction"] == pytest.approx(0.33)
+        assert "x-saklas-probe-readings" not in first
         # Final chunk: aggregate.
         final = chunks[-1]
         assert final["done"] is True
@@ -707,7 +704,7 @@ class TestWebSocketProbeReadings:
     ``probe_readings`` on every ``token`` frame when probes are attached,
     and the final ``done`` event still carries the aggregate.  Manifold
     readings are supplied by the session token tap via
-    ``session._last_token_probe_payload``; the WS token-frame builder only
+    ``session.token_probe_payload``; the WS token-frame builder only
     serializes that payload.
 
     Regression for the Phase 3c bug where the webui mini-map cursor
@@ -755,15 +752,15 @@ class TestWebSocketProbeReadings:
             input: Any, *, steering: Any = None, sampling: Any = None, stateless: bool = False,
             raw: bool = False, thinking: Any = None, on_token: Callable[..., Any] | None = None,
             parent_node_id: Any = None, n: int = 1, recipe_override: Any = None,
-        ) -> GenerationResult:
+        ) -> RunSet:
             for i, tok in enumerate(tokens):
                 if on_token is not None:
                     if getattr(session.monitor, "probe_names", None):
-                        session._last_token_probe_payload = {
+                        session.token_probe_payload = {
                             "probe_readings": session.monitor.score_single_token({}),
                         }
                     else:
-                        session._last_token_probe_payload = None
+                        session.token_probe_payload = {}
                     on_token(tok, False, 1000 + i, None, None)
                 time.sleep(0.001)
             result = GenerationResult(
@@ -779,7 +776,7 @@ class TestWebSocketProbeReadings:
             session.last_result = result
             session.last_per_token_scores = None
             session.last_per_token_scores = None
-            return result
+            return RunSet([result])
 
         session.generate.side_effect = _gen
 
@@ -851,6 +848,7 @@ class TestWebSocketProbeReadings:
 
         agg_blob = done["result"].get("probe_readings")
         assert agg_blob is not None
+        assert "per_token_probes" not in done["result"]
         assert agg_blob["circumplex"]["fraction"] == pytest.approx(0.42)
         assert agg_blob["circumplex"]["coords"] == [
             pytest.approx(0.61), pytest.approx(0.42),
@@ -907,7 +905,7 @@ def _author_manifold_on_disk(
     name: str = "mood",
     labels: list[str] | None = None,
 ) -> Any:
-    """Hand-author a v4 authored 1-D box manifold under ``$SAKLAS_HOME``.
+    """Hand-author a current authored 1-D box manifold under ``$SAKLAS_HOME``.
 
     Mirrors the minimal fixture ``test_manifolds_io`` uses, but writes
     into the live ``manifolds/<ns>/<name>/`` tree so the server routes
@@ -924,7 +922,10 @@ def _author_manifold_on_disk(
     folder = Path(home) / "manifolds" / namespace / name
     (folder / "nodes").mkdir(parents=True)
     coords = [[i / (k - 1)] for i in range(k)]
-    nodes = [{"label": lbl, "coords": coords[i]} for i, lbl in enumerate(labels)]
+    nodes = [
+        {"label": lbl, "coords": coords[i], "role": None, "kind": None}
+        for i, lbl in enumerate(labels)
+    ]
     for idx, node in enumerate(nodes):
         statements = [f"{node['label']} statement {i}" for i in range(3)]
         (folder / "nodes" / f"{idx:02d}_{node['label']}.json").write_text(
@@ -934,12 +935,19 @@ def _author_manifold_on_disk(
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name,
         "description": "a mood manifold",
+        "fit_mode": "authored",
         "domain": {
             "type": "box",
-            "axes": [{"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}],
+            "axes": [{
+                "name": "t", "periodic": False, "period": 1.0,
+                "lo": 0.0, "hi": 1.0,
+            }],
         },
         "nodes": nodes,
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }
     (folder / "manifold.json").write_text(_json.dumps(meta))
     return folder

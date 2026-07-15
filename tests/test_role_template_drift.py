@@ -14,12 +14,14 @@ the next chat-template drift will fail in user code rather than at
 test-time.
 
 Per-family tokenizers are tiny config-file downloads (no model weights),
-but some require HF auth + license acceptance (Gemma, Llama).  Each
-family is tested independently with skip-on-download-failure so the
-suite degrades gracefully on machines without full HF access — what
-runs is what's available.
+but some require HF auth + license acceptance (Gemma, Llama).  Ordinary
+test runs use only the local Hugging Face cache so CI never blocks on an
+external service.  Set ``SAKLAS_TEST_LIVE_TOKENIZERS=1`` to permit downloads
+and refresh every family before a release.
 """
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -89,12 +91,17 @@ def test_role_header_matches_live_template(family: str):
     from transformers import AutoTokenizer
 
     model_id = _REPRESENTATIVE_TOKENIZERS[family]
+    allow_download = os.environ.get("SAKLAS_TEST_LIVE_TOKENIZERS") == "1"
     try:
-        tok = AutoTokenizer.from_pretrained(model_id)
+        tok = AutoTokenizer.from_pretrained(
+            model_id,
+            local_files_only=not allow_download,
+        )
     except Exception as e:
         pytest.skip(
             f"could not load tokenizer for {family} ({model_id}): {e}. "
-            f"set HF_TOKEN and accept any gated licenses to run this family."
+            "set SAKLAS_TEST_LIVE_TOKENIZERS=1 (plus HF_TOKEN and any gated "
+            "license acceptance) to download and run this family."
         )
         return
 

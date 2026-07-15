@@ -25,13 +25,16 @@ from saklas.io.templates import (
 )
 
 _DEMO = {
-    "format_version": 1,
+    "format_version": 2,
     "name": "demo",
     "slot": "[X]",
     "values": ["alpha", "beta"],
     "contexts": [
         {"turns": [{"role": "user", "content": "pick one"}], "assistant": "[X]"},
     ],
+    "description": "",
+    "source": "bundled",
+    "tags": [],
 }
 
 
@@ -118,6 +121,20 @@ def test_process_scope_no_op(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     manifest.unlink()
     materialize_bundled_templates()  # flag set → no-op, no re-copy
     assert not manifest.exists()
+
+
+def test_process_scope_guard_is_per_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    pkg = tmp_path / "pkg"
+    _wire(monkeypatch, tmp_path, pkg)
+    _write_template(pkg, _DEMO)
+    materialize_bundled_templates()
+    assert (templates_dir() / "default" / "demo" / "template.json").exists()
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "second-home"))
+    materialize_bundled_templates()
+    assert (templates_dir() / "default" / "demo" / "template.json").exists()
 
 
 def test_bundle_update_recopies_and_backs_up(

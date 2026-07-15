@@ -20,7 +20,7 @@
 
 {#if messages.length > 0}
   <div class="sk-validation" role="alert">
-    <p class="sk-validation-head">not ready to {verb}:</p>
+    <p class="sk-validation-head">{verb} blocked</p>
     <ul>
       {#each messages as m (m)}
         <li>{m}</li>

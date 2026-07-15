@@ -38,41 +38,116 @@ layer, averaged over positions ≥ `SKIP_FIRST_POSITIONS` (16, attention sinks)
 and a text corpus. `fit_jacobian_lens(model, tokenizer, prompts, layer_modules,
 …)` is the **only backward-pass code in saklas**: everything else runs under
 `inference_mode`, and with frozen params + integer inputs no autograd graph
-exists at all, so the fit runs under `torch.enable_grad()` with a
-`register_forward_pre_hook` on the first block that returns a
-`requires_grad_(True)` clone of its input (reuses `get_layers`, zero per-arch
-wiring). Per prompt: one forward with the prompt replicated `dim_batch`× on the
-batch axis (graph retained), then `ceil(d_model/dim_batch)` backwards — batch
-element `b` of pass `p` carries a one-hot cotangent at output dim
-`p·dim_batch+b` injected at every valid target position, so the grad at source
-position `t` is `Σ_{t'≥t} ∂h_final[t']/∂h_l[t]`; mean over source positions;
-one backward populates every source layer. Grads come from
-`torch.autograd.grad(final, sources)` — NOT `backward()` + `retain_grad()`,
-whose `.grad` accumulation across the multi-backward loop would corrupt the
-rows — which also stops the graph walk at the shallowest requested source, so
-a `--layers`-restricted fit never backprops below its lowest layer. Each pass
-writes its row block into reused per-layer **on-device** fp32 buffers; the
-device→host transfer is one fold per prompt into the CPU fp32 accumulator,
-all-or-nothing on success (an OOM retry, which halves `dim_batch`, can't
-double-count). Sync discipline is bounded from both sides: per-pass `.cpu()`
-transfers cost ~6% (removed), but a *fully unsynced* loop lets the CPU enqueue
-arbitrarily far ahead and Metal fails **asynchronously** — no Python
-exception, the work silently never runs, the fold reads zeros — so the pass
-loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4) on MPS and the fold
-raises on any zero row (impossible for a real transformer; phrased as "out of
-memory" so the dim_batch-halving retry catches it). The fit is compute-bound —
-`d_model × 2` forward-equivalents per prompt, dim_batch-invariant (measured
-flat 8/32/64) — so `source_layers` restriction is the one real wall-time
-lever (1.73× for the 40–90% band); `empty_cache` runs at checkpoint cadence
-only.
-`checkpoint_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts for
-resumable fits; `JacobianLens.merge` is the n_prompts-weighted shard combiner.
+exists at all, so the fit runs under `torch.enable_grad()` with returning
+forward hooks that attach transparent zero-valued mean-position probe leaves;
+the first fitted block also detaches its output (reuses `get_layers`, zero
+per-arch wiring).
+Consecutive ragged prompts share one right-padded graph (`prompt_batch`,
+CPU/CUDA default 4, MPS 2) and `ceil(d_model/dim_batch)` backwards. Each backward selects one block of output
+dims, sums those dims over the valid target positions, and calls
+`torch.autograd.grad(..., is_grads_batched=True)` so `dim_batch` VJPs come from a
+single unreplicated graph while preserving equal-prompt weighting. Autograd
+returns each source as `[dim_batch,B,D]`, not `[dim_batch,B,T,D]`: the probe
+identity collapses the valid source-position mean inside backward while passing
+the full residual gradient upstream unchanged.
+`SAKLAS_JLENS_VJP=replicated` restores the reference replicated-prompt estimator,
+and `auto` falls back to exact replicated row-batch VJPs when a backend lacks vmap
+coverage. Grads come from `torch.autograd.grad(final,
+sources)` — NOT `backward()` + `retain_grad()`, whose `.grad` accumulation across
+the multi-backward loop would corrupt the rows — which also stops the graph walk
+at the shallowest requested source, so a `--layers`-restricted fit never
+backprops below its lowest layer. A terminal hook stops the forward after the
+final transformer residual, before final norm / LM head. Every backend uses
+byte-budgeted device + host row stripes (up to `_ROW_STRIPE`, never smaller than
+one active VJP block) that validate and commit directly into the persistent CPU
+accumulator. Allocation failure halves the stripe independently of prompt width;
+a later dim-batch OOM releases an oversized persistent slot before retry. CUDA
+uses two ordered event-tracked slots
+to overlap D2H with the next backward stripe, discards an entire uncommitted
+suffix on transfer failure, and drops to one slot before narrowing estimator
+batches when the overlap buffer itself causes OOM. If a later VJP OOMs the graph
+is rebuilt at the first uncommitted row. A fully unsynced
+MPS loop can still let the CPU enqueue too far
+ahead, so the pass loop drains the queue every `_MPS_SYNC_EVERY_PASSES` (4), and
+zero rows raise before a stripe is committed. Cooperative cancellation is also
+checked before and after every output-dimension VJP block (not merely after a
+complete prompt microbatch); accelerator queues and pending CUDA transfers are
+drained before the active group's partial sums are abandoned, so the web cancel
+control remains responsive even when `prompt_batch > 1`. Prompt/dimension widths halve
+independently on OOM and stay below the proven failure ceiling. The fit is
+compute-bound; explicit `source_layers` restriction is the one real wall-time
+lever (a previously benchmarked 40–90% subset measured 1.73× faster).
+Estimator teardown removes the fit hooks, clears their retained autograd graph
+and accelerator stripe buffers, then flushes the MPS/CUDA allocator cache. A
+long-lived server must not carry the backward-pass working set into the next
+decode.
+`checkpoint_accumulator_cb` fires every `DEFAULT_CHECKPOINT_EVERY` (25) prompts
+for allocation-light resumable fits: IO normalizes live sums and merges any
+prefix one layer at a time while streaming fp32, so checkpointing does not
+materialize another complete fp32 lens. Checkpoints are self-contained
+(`base_n_prompts=0`) and survive repeated interruptions even beside an older
+full artifact. Resume transfers ownership of the loaded prefix matrices into
+the estimator, scales them to raw sums in place, and accumulates the tail into
+that same storage; it therefore holds one full fp32 matrix set, not a base plus
+an equally large tail. Durable/checkpoint sidecars are compared before either
+payload is paged; a farther self-contained checkpoint wins without first
+materializing the older durable lens (and any superseded resident/device stack
+is evicted before the checkpoint load). A checkpoint that passes header
+preflight but fails full digest/finite validation falls back to the durable
+prefix after the failed payload is released. Cadence never fractures a healthy
+prompt microbatch. Checkpoint payload files and their directory entries are
+durable before the checkpoint pointer is published. When the terminal checkpoint
+is already the complete lens, finalization defensively re-fsyncs its immutable
+per-layer tensor generations and atomically repoints the durable sidecar instead
+of converting/writing the same artifact again. Each checkpoint stamps the
+token-id hash of the prefix actually consumed, so a later corpus extension can
+resume honestly from that prefix. Successful loads/writes also yield an
+in-transaction pointer proof: terminal promotion and missing-layer shard reuse
+skip a redundant full rehash only while that exact pointer remains under the fit
+lock; unverified public callers retain defensive digest validation. The checkpoint remains the
+recovery point until that pointer commit succeeds.
+`JacobianLens.merge` is the non-mutating n_prompts-weighted combiner;
+`merge_into` recycles a caller-owned
+tail; `union_layers` combines same-corpus layer shards. Persisting a
+missing-layer union reuses the existing v6 shard pointers and serializes only
+the newly fitted layers. A same-session superset remains the full resident lens
+when `fit_jlens(..., source_layers=...)` returns a narrower no-op view; a fresh
+subset no-op materializes only the requested shards and leaves the full durable
+union untouched. Because v4 has one corpus-progress identity for every layer, a
+prefix extension of a strict durable subset is rejected before payload load:
+the caller must request the full durable layer set or use `force=True` to
+explicitly replace it. Missing-layer top-ups load/preserve the full same-corpus
+union, while resume drops superseded containers before backward so only the
+selected accumulator owns its matrices. Exact no-op paths also reap a crash-left checkpoint only when the validated
+final pointer matches its semantics/layers and has reached at least its effective
+`base_n_prompts + n_prompts` progress.
 
 `JacobianLens` holds the fp32 matrices: `transport(h, layer)` maps a residual
 into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer
 — the profile-shaped direction behind `jlens/<word>` atoms; `lens_logits`
 (free function) is the full readout `W_U · norm(J_l h)` (matvec in the
-unembed's own dtype — a fp32 W_U copy would be GBs). `resolve_word_token` maps
+unembed's own dtype — a fp32 W_U copy would be GBs). `aggregate_readout(logits,
+depths, top_k)` is the **layer-aggregation** of a stacked `[L, vocab]` readout:
+per-layer softmax (calibrates away the cross-layer logit scale), then per token
+`strength = mean_l p_l(v)` (mean fitted-layer probability) and a depth center of mass +
+std weighted by the same per-layer probability `p_l(v)` — the selected-layer readout is
+sharp, and what changes over depth is *which* token leads, so a token's
+probability profile over depth is its depth signal (a diffuse noise layer's
+vote is discounted by its own lack of mass; the former within-layer salience
+gave it a full vote). Top-k by aggregated full-vocab strength (a per-layer top-k union would
+miss a mid-pack-everywhere token); CoM/spread are evaluated only for those
+selected columns, then returned as `[(vocab_id, strength, com, spread)]` in one
+batched host transfer. `readout_probabilities` is the shared calibration
+primitive; `_live_lens_readout_step` computes it once per logits matrix and
+passes the result to pinned probes, per-layer cards, and the aggregate through
+the `*_from_probabilities` helpers. `token_readout_stats(logits, depths,
+token_ids)` is the **single-token restriction** of the same calibration — read
+at pinned vocabulary ids instead of top-k selection, returning per id
+`(strength, com, spread, per_layer[p_l])` where `strength = mean_l p_l(v)`
+(∈ [0,1], the ONE probe/gate/display channel — apples-to-apples across
+tokens and layers; the depth-CoM mass is the same `p_l`, matching
+`aggregate_readout`) — the math behind
+`jlens/<word>` probe readings and gate scalars. `resolve_word_token` maps
 a word to its single vocab id (leading-space piece first, decode-and-compare
 sanity check, `MultiTokenWordError` with the pieces otherwise).
 `sparse_nonneg_decompose` is the J-space split: greedy pursuit against the
@@ -93,10 +168,19 @@ Capture runs in **right-padded batches** — `_encode_and_capture_all_batch(mode
 tokenizer, prompts, responses, layers, device, *, role=, model_type=,
 system_msg=)` renders + tokenizes the chunk, right-pads to a common length
 (attention-masked; pool indices unchanged since real tokens stay left-aligned),
-and runs one `_capture_all_hidden_states` forward that pools each row at its
+then transfers the finished ids/mask once and runs one
+`_capture_all_hidden_states` forward that pools each row at its
 last-content index *inside the hook* (per-row gather → `(B, D)` per layer, never
-`(B, T, D)`). `compute_node_centroid` / `compute_neutral_activations` chunk by
+`(B, T, D)`). Rendering, special-token walkback, and padding stay on CPU—there
+is no per-row H2D followed by a blocking `.tolist()` D2H. `role=` is uniform;
+`roles=` carries mixed per-row substitutions for fit-wide batches.
+`compute_node_centroid` / `compute_neutral_activations` chunk by
 `_CAPTURE_BATCH` and amortize the MPS `empty_cache` per chunk.
+Fit-wide manifold capture tokenizes once, sorts rows by token length, grows clean
+batches up to `_CAPTURE_BATCH_MAX`, and stops the model after the last selected
+layer so unused upper blocks, final norm, and LM head never run. Its layer-major
+centroid accumulators are normalized in place and transferred directly to fit
+ownership, avoiding a second full `layers × nodes × hidden_dim` fp32 roster.
 `_encode_and_capture_all` is the single-pair sibling. `_capture_all_hidden_states`
 hooks every layer at once and accepts an `int` (single) or `(B,)` tensor (per-row)
 `pool_index`. Capture is **conversational** (4.0 / A2): a corpus item is an
@@ -112,7 +196,7 @@ values to skip trailing chat-template markers (where outlier channels dominate).
 `special_token_ids` + `last_content_index` are the one canonical "last non-special
 token" definition shared by every single-state readout (centroid pooling, vector
 aggregate, manifold aggregate). `_render_and_tokenize_for_capture(tokenizer,
-prompt, response, device, *, role=, model_type=)` is the shared
+prompt, response, *, role=, model_type=)` is the shared
 render+tokenize+walkback front half; `role` substitutes the assistant label only
 when an explicit per-node role override is set (the persona-baselined fit), the
 swap-back default being the standard assistant. `_load_baseline_prompts` loads the
@@ -147,8 +231,7 @@ merged affine subspace.
 
 `profile.save_profile`/`profile.load_profile` own the baked-profile wire format:
 a `dict[int, Tensor]` to `.safetensors` + a slim `.json` sidecar (stamped with
-`PACK_FORMAT_VERSION` from `io/packs.py`). `vectors.save_profile`/
-`vectors.load_profile` remain compatibility aliases for the per-model
+the exact `PROFILE_FORMAT_VERSION` from `io/packs.py`) for the per-model
 `layer_means`/`neutral_activations`/alignment caches and folded-profile
 interchange. `project_profile(base, onto, operator, *, whitener=...)` is the
 per-layer `~`/`|` projection — closed-form LEACE, Mahalanobis-only: the whitener
@@ -162,13 +245,75 @@ pipeline (concept extraction and manifold fitting are the same thing — a vecto
 a 2-node `pca` manifold). Dependencies via the `ModelHandle` protocol (`model` /
 `tokenizer` / `layers` / `device` / `model_id` / `_run_generator` /
 `generate_responses`) + an `EventBus` for `ManifoldExtracted`; `SaklasSession`
-satisfies it implicitly. Cache-hit on the sidecar `nodes_sha256` (folds in corpus
-+ `{domain, node_coords}` authored / `{fit_mode, hyperparams}` discover) **and**
-`sae_revision`. Else reads `_load_baseline_prompts()` and pools per-node
-conversational centroids (`compute_node_centroid(..., responses, baseline_prompts,
-role=node_role, model_type=)`), threading the folder's `node_kinds` /
-`node_roles` into the `Manifold` + sidecar metadata, then dispatches on
-`fit_mode`:
+satisfies it implicitly. Cache-hit on the sidecar `nodes_sha256` (folds in labels, corpus
++ `{domain, node_coords}` authored / `{fit_mode, hyperparams}` discover),
+`sae_revision`, token-exact capture identity (baseline prompts + tokenizer
+render included), loaded-model fingerprint, and fitted-layer set. A mandatory
+Mahalanobis whitener is resolved after that final fitted-tensor fast path but
+before any activation capture, so a missing or partial neutral cache cannot
+waste a full model pass. Else pools the complete
+roster through `compute_manifold_node_stats`: one row stream crosses node
+boundaries so short template nodes fill shared forward batches; OOM halves the
+active batch and a clean run grows it back. Centroid-only fits reduce by node on
+device before transfer; raw curved fits retain source-dtype rows in a layer-major
+mmap spool for later covariance instead of capturing the corpus twice or holding
+the whole roster in fp32 RAM. A token-exact per-model capture cache lets domain,
+topology, and smoothing refits skip model forwards; its identity includes node
+boundaries, and its digest metadata validates centroid payloads plus exact
+per-layer row tensors; subset fits map/hash only requested row layers and validate
+only requested centroid/row layers. Capture-cache format v4 persists immutable
+generation-named safetensors shards, one per layer, so a disjoint top-up writes
+only the new shards instead of copying/replacing a multi-GiB container. Publication fsyncs
+shard payloads and their directory entries, writes a recovery journal, atomically
+replaces and directory-fsyncs the authoritative JSON pointer, and only then
+garbage-collects superseded generations. A failed publication therefore
+preserves the prior good pointer, while the next fit adopts a complete crash-left
+journal under the capture-stem lock without rerunning model capture. Cached and
+freshly captured disjoint
+layer stores combine by view (ownership is transferred to the composite), so
+the sigma covariance pass does not copy the full row roster into a third mmap.
+Each row shard validates independently, so one damaged layer recaptures only
+itself; publication streams each row payload once while computing its exact
+tensor-domain digest, and speculative auto-fit rows do not enter durable coverage
+until publish.
+The shared per-model capture stem is protected by `artifact_lock`
+only across read/top-up/publish; the downstream topology/covariance fit retains a
+PID-backed process lease that prune/GC honors without holding the exclusive stem
+lock. Safetensors stage through unique same-directory tempfiles. `force` drops
+only the requested layers from the loaded v4 pointer, so a forced subset keeps
+all unselected shard identities. Deferred auto-curved row top-ups reload and
+merge the latest pointer under the reacquired stem lock. Layer coverage is
+unioned/topped up, so full→subset needs no forward
+and overlapping subsets capture only missing layers. Cache groups prune oldest-first past 8 GiB
+(`SAKLAS_MANIFOLD_CAPTURE_CACHE_GB`) and `pack clear` / `pack rm` remove referenced
+group. Pruning runs only after the current stem transaction releases, under a
+directory prune lock plus one victim lock at a time, so eviction cannot remove
+another fit's active cache or introduce cross-stem lock inversion. `layer_indices` accepts an explicit set or the canonical 40–90% workspace
+band. It threads the folder's `node_kinds` / `node_roles` into the `Manifold` +
+sidecar metadata, then dispatches on `fit_mode`.
+The long fit lock is target-scoped and stored outside the removable folder.
+Folder-manifest locks cover only override/snapshot and final publication: the
+snapshot hashes exact nodes plus the resolved template/baseline and target clear
+epochs; publication compare-and-swaps that revision. Readers and unrelated model
+targets therefore proceed during compute, while authoring edits, scoped clears,
+and rm/recreate prevent stale publication. Tensor and sidecar payloads are both
+staged+fsynced before a sidecar-first pair commit; any interrupted mixed/orphan
+pair is a cache miss or is repaired at the next target fit.
+Every fitted tensor/sidecar read, replacement, clear, transfer, and folder
+removal uses a digest-named pair lock under the namespace parent (not inside the
+removable manifold folder). Folder-wide lifecycle operations take the manifest
+lock then all affected pair locks in sorted order, so `rm`/HF stage-swap cannot
+delete a lock inode or tear a cache-hit proof/read transaction.
+If an override changes the manifest and the fit then fails, the session evicts
+only that namespace/variant's resident manifold, folded profile, attached probe,
+and prefix state; validation failures that did not write preserve consumers.
+
+Fit uses `ManifoldFolder.load(..., verify_manifest=False)`: it hashes the live
+corpus into the capture/final identities and validates the requested tensor, but
+does not reread every historical model/SAE payload. Metadata-only authoring and
+lifecycle routing (source-tier reads for refresh/removal) also skip the payload
+walk. Runtime fitted-tensor use, install, and push retain strict integrity
+verification; publication hashes each newly committed pair exactly once.
 
 - **`pca`** (flat / discover; the 2-node-vector case): derive per-model coords
   (`discover_coords` over the layer-agnostic consensus Gram — `mean_L` of each
@@ -209,21 +354,30 @@ role=node_role, model_type=)`), threading the folder's `node_kinds` /
   `BoxDomain` axes via persistent homology. The chosen `effective_fit_mode`
   drives the same flat/curved per-layer fit below; the resolved mode + the ranked
   topology candidates land in the sidecar (`resolved_fit_mode`,
-  `topology_winner`, `topology_candidates`). Sphere is authored-only.
+  `topology_winner`, `topology_candidates`). A curved winner carries the
+  already-factorized `RbfFitPlan` from scoring into the final layer fit instead
+  of repeating layout QR/eigh/LU. Sphere is authored-only.
 
 `--sae` reconstructs each centroid through the SAE before the fit (fail-fast
 `SaeCoverageError`); the fitted subspace is model-space regardless. Bakes
 `mahalanobis_share` (+ `share_metric`/`subspace_metric`), `origin`. **No lever.**
+For multi-node SAE fits, reconstruction pops raw centroid layers as their decoded
+replacements are produced, so raw and reconstructed full rosters do not coexist;
+the `per_node` view is built only by the K=1 monopolar branch.
 Discover coords come from the **consensus Gram** —
 `mean_L` of each layer's whitened, node-mean-centered `(K,K)` Gram
 `X̃_L Σ_L⁻¹ X̃_Lᵀ` (signal-weighted, layer-agnostic; no reference layer) — and the
 same per-layer Grams' traces are stamped into the sidecar as
-`node_spread_per_layer` (`{str(L): tr(G_L)}`), the concept's whitened
+`node_spread_per_layer` (`{str(L): tr(G_L)}`), the concept's pre-DLS whitened
 signal-by-layer profile. Diagnostic only (nothing runtime branches on it; absent →
 empty dict), surfaced by `manifold show`; computed for every K≥2 fit (authored too),
 distinct from `mahalanobis_share` (the same whitened spread restricted to the
 steerable subspace). Whitener resolution is deferred past the cache-hit return
-and gated all-or-nothing on `covers_all`. `min_nodes(k) = 2k+1` for curved; a flat
+and gated all-or-nothing on `covers_all`. Each layer's centered `Σ⁻¹X` and Gram
+are computed once and reused by discovery, topology scoring, the Fisher basis,
+and neutral-layout anchoring. Curved fits share one layout-only `RbfFitPlan`
+(kernel/polynomial blocks, QR/eigensystem, λ grid, fixed-λ LU) across every layer
+and the sigma field. `min_nodes(k) = 2k+1` for curved; a flat
 `pca` fit needs only `k+1` (so K=2/k=1 is a steering vector). Emits
 `ManifoldExtracted`. (Note: `extract.py`'s old concept `ExtractionPipeline` and
 the `_capture_diffs_for_pairs` DiM apparatus are gone; the `discover-pca` 2-node
@@ -232,12 +386,43 @@ fit replaces them.)
 ## sae.py
 
 SAE backend. `SaeBackend` (runtime-checkable Protocol): `encode_layer`/
-`decode_layer`, `release`, `revision`, `layers`. `MockSaeBackend` for CPU tests;
-`SaeLensBackend` the concrete adapter. `load_sae_backend(release, *, revision,
-model_id, device, dtype)` queries SAELens, validates base-model compatibility,
-resolves per-layer sae_ids (`_canonical_layer_map` narrowest-width), gates
-`sae_lens` imports so the module loads without `[sae]`. Errors:
+`decode_layer`/`feature_count`/`feature_direction`, `release`, `revision`,
+`layers`. `MockSaeBackend` for CPU tests; `SaeLensBackend` adapts provider
+releases and `LocalSaeBackend` adapts Saklas-trained artifacts.
+`load_sae_backend(release, *, revision, model_id, device, dtype)` resolves
+`local:<name>` without importing SAELens; otherwise it queries SAELens, validates base-model compatibility,
+resolves per-layer sae_ids (`_canonical_layer_map` — Neuronpedia-hosted first,
+then narrowest width, then smallest L0: hosting supplies the label +
+`maxActApprox` metadata channel, so an unhosted pick would silently lose
+normalization), gates
+`sae_lens` imports so local-only flows avoid initializing the provider package.
+Registry resolution is eager but weights are lazy with a one-layer resident cache; a valid fitted-tensor
+hit does not import SAELens at all. An explicit `revision` is passed only when
+the installed loader exposes `revision=`; otherwise loading raises instead of
+stamping a pin it did not honor. Errors:
 `SaeBackendImportError`, `SaeReleaseNotFoundError` (difflib suggestions).
+The live runtime keeps one selected encoder/decoder layer resident;
+`select_runtime_layer` chooses nearest 65% model depth (workspace preferred),
+and `list_sae_releases` discovers both local artifacts and compatible registry
+rows without weights. `sae_training.py::train_residual_sae` trains a native
+one-layer ReLU SAE from block-output token activations under model inference
+mode; decoder rows are unit-normalized so L1 cannot be evaded by rescaling.
+`sae/<id>` steering reads `W_dec[id]`; feature probes read the encoder channel
+outside the `Monitor`. The probe/gate channel is **normalized strength** —
+`activation / maxActApprox` ∈ ~[0,1], the Neuronpedia corpus-max unit, so
+features read apples-to-apples like the lens probes' mean fitted-layer probability;
+raw activation only when no metadata is cached (offline / unlisted feature).
+Metadata (`{label, max_act}` per feature, `session._sae_feature_meta`) is
+fetched lazily from Neuronpedia — at validate/pin time
+(`_fetch_sae_feature_meta`) and via the batch backfill
+`fetch_sae_feature_meta(ids)` (the dashboard calls it between generations
+with the ids the live top-k surfaced; a fetch never runs in the decode
+loop) — and persisted through `io/sae.py::save_sae_feature_meta`. Live
+top-k rows and `sae_token_readout` features carry `max_act` beside the raw
+activation so clients render both units. The capture surface is the transformer-block output, so
+only residual-post/block-output SAEs are valid: discovery omits explicitly named
+attention/MLP/transcoder families, and loaded hook metadata plus decoder width are
+validated before a release becomes resident.
 
 ## mahalanobis.py
 
@@ -245,7 +430,8 @@ resolves per-layer sae_ids (`_canonical_layer_map` narrowest-width), gates
 inverse `K_L = (NλI + XXᵀ)⁻¹`; `apply_inv(layer, v) = (1/λ)(v − Xᵀ K X v)` in
 O(ND), no D×D. Ridge `λ_L = (‖X_L‖²_F / (N·D)) · ridge_scale`. Built lazily via
 `from_neutral_activations` (in-memory) or `from_cache(model_id)` (the single
-offline loader — reads `neutral_activations.safetensors` alone, no model load, and
+offline loader — resolves the atomic `neutral_activations.json` pointer to its
+immutable per-layer fp32 shards, no model load, and
 derives the per-layer centering mean from the cached neutrals as `X.mean(0)`;
 backs `manifold compare` + the cross-model transfer rebake); neutrals cached
 **fp32** (the project-wide
@@ -275,8 +461,7 @@ normalization). `is_affine ⇔ node_params is None`. Flat layers carry `node_coo
 (K,R) — the real neutral-anchored per-layer node positions (steer-target source).
 `affine(mean, basis, node_coords=)`, `select_axes(kept)` (per-axis DLS prune),
 `eval_at`, `jacobian_at`, `rbf_params()` (raises on a flat subspace).
-`manifold_is_affine(manifold)` — public module-level predicate (promoted from
-`session._manifold_is_affine` in T2.4); `session.py` keeps a back-compat alias.
+`manifold_is_affine(manifold)` — public module-level flat/curved predicate.
 
 `_pca_basis(X, *, n_components, whitener, layer)` — μ-centered PCA: Euclidean SVD,
 or the whitened/Fisher generalized eigenproblem `(S_b, Σ)` via the Woodbury Σ⁻¹
@@ -287,7 +472,9 @@ scatter, never anchor-center it. `fit_affine_subspace` returns `(subspace,
 mu_coords, ev_ratio)` and neutral-anchors the frame (`mean = P_basis(neutral)`,
 real `node_coords = (centroids − neutral)·basisᵀ`); `orient_to` fixes the sign.
 `subspace_share(mu_coords, basis, whitener, layer)` is the μ-centered (anchor-
-independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`).
+independent) per-layer budget weight (`DEFAULT_N_COMPONENTS = 64`). Fit callers
+can pass a precomputed Gram and `Σ⁻¹X`; Fisher directions then use
+`Aᵀ(Σ⁻¹X)` without another Woodbury application.
 
 `Manifold` — domain + per-layer `LayerSubspace`s + `node_labels`/`node_coords`/
 `node_roles`/`node_kinds` + the bakes `mahalanobis_share`/`origin` +
@@ -327,21 +514,28 @@ project-onto-normal + renorm that corrupted off-neutral activations every fire),
 onto shrinks `H_n` toward the zero-thickness wire on legacy/no-σ fits or toward
 the local fuzzy σ-tube when present, `H_o` kept). MGS orthonormalization + a CPU-hopped
 `n×n` SVD keep it MPS-safe (`linalg.qr`/`svd` are unimplemented/`fallback` on
-Metal). `synthesize_subspace` emits the κ mask (0 push / 1 ablate).
+Metal). `synthesize_subspace` emits per-axis κ coefficients: 0 on push axes and
+the exact signed ablation-operator eigenvalues on the ablation complement
+(partial/repeated/non-orthogonal terms preserved; the tiny eigensolve CPU-hops
+for MPS). Hook-time gain compensation keeps `along·κ` equal to the user α.
 `norm_cap = 3·‖h‖` is the only norm guard. `invert_parameterization` is the cold/eval-only damped-LM nearest-
 point projection.
 
 `save_manifold`/`load_manifold` round-trip the per-model tensor (`layer_<L>.{mean,
-basis[,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
+basis[,affine_map][,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
 `node_coords` + optional `origin`) + sidecar (`mahalanobis_share_per_layer`,
 `origin_per_layer`, `share_metric`, `subspace_metric` — no
 `explained_variance_per_layer`, no `lever_per_layer`). `transfer_manifold_subspaces(src,
 alignment, *, whitener, from_model, to_model)` is the pure-tensor core of the
-cross-model Procrustes transfer: maps each covered layer's subspace into target
-space (`mean → M_L mean`, `basis → basis @ M_Lᵀ`), re-bakes the Mahalanobis
+cross-model affine transfer: maps points/means through `M_L x+b_L` and basis
+directions through `M_L`, QR-orthonormalizes the mapped rows, and transforms the
+affine/RBF reduced coefficients by the exact companion map. Rank collapse is
+rejected; a curved transfer is rejected when the companion map is not an
+isometry because the current scalar sigma field cannot encode an anisotropic
+tube. It re-bakes the Mahalanobis
 **share** in target space via `subspace_share` (target whitener **required** —
-`WhitenerError` on a missing / partial one, no Euclidean rebake), clears `origin`,
-and returns the transferred `Manifold` (RBF + `node_coords` ride through untouched).
+`WhitenerError` on a missing / partial one, no Euclidean rebake), transforms
+`origin` through the same companion map, and returns the transferred `Manifold`.
 The folder read/write orchestration around it (load the source tensor, write the
 `_from-<safe_src>` variant, patch the sidecar) stays in
 `io/manifold_lifecycle.py::transfer_manifold`. Discover: `derive_pca_coords`
@@ -358,15 +552,27 @@ GCV-selects λ (`_gcv_select_lambda` → `_rbf_smoother_matrix` hat `S_λ`, GCV
 bit-for-bit; a float is a fixed λ. The fitted weight shapes are unchanged so
 `eval_rbf` (hot path) is untouched — only the coefficients shrink. `fit_layer_subspace`
 takes `smoothing=` (curved discover passes it; authored stays exact) and surfaces
-the chosen λ/edf via the `rbf_info` out-dict. CPU/fp32 (the saddle is MPS-unsafe).
+the chosen λ/edf via the `rbf_info` out-dict. `prepare_rbf_fit_plan` factors the
+node-layout-only work once per manifold; every layer and `fit_sigma_field` reuse
+it while retaining non-aliased persistent tensors. CPU/fp32 (the saddle is
+MPS-unsafe).
 
 **Fuzzy-manifold σ-field (curved only).** Optional per-layer *tube thickness*:
 the surface stops being a zero-thickness wire and carries a within-node off-surface
-spread `σ(z)`. `compute_node_reduced_covariance` (a **second** fit-time capture
-pass — needs the just-fitted basis, so it can't fold into centroid pooling)
-accumulates each node's reduced `(R,R)` within-node covariance; `fit_sigma_field`
+spread `σ(z)`. Raw curved fits retain activation rows from the shared centroid
+pass; `compute_store_reduced_covariances` streams the layer-major spool through
+bounded fp32 chunks after the basis exists, centering out-of-place before the
+projection (stable at large common-mode activation offsets and never mutating an
+fp32 mmap view), avoiding both a second model pass and `nodes × layers` small
+hidden-dimension GEMMs while accumulating each
+node's reduced `(R,R)` covariance. `compute_node_reduced_covariance_from_rows`
+and `compute_node_reduced_covariance` remain for standalone callers
+without retained rows; `fit_sigma_field`
 reduces it to one off-surface scalar per node (`_off_surface_var` — the
-normal-complement trace via the surface tangent `_reduced_tangent`) and fits a
+normal-complement trace via the surface tangent `_reduced_tangent`, divided by
+the normal degrees of freedom from the tangent's **actual local rank**, including
+rank-deficient folds where `R <= n`; one batched economy SVD supplies both rank
+and the tangent projector) and fits a
 **separate** `log σ` RBF over the same normalized `node_params`, stored on
 `LayerSubspace.{sigma_rbf_weights,sigma_poly_coeffs}` (None ⇒ `has_sigma` False ⇒
 `sigma_at` returns 0 ⇒ exact legacy). `sigma_at(embedded)` is the one extra
@@ -446,8 +652,12 @@ origin_coord, along, onto)` and runs each active one through `subspace_inject`
 state `_manifold_feet` (cold → seed at `origin`, `_MANIFOLD_COLD_GN_STEPS = 4` GN
 steps; warm → one step). The dominant case — exactly one always-active
 (`Trigger.BOTH`) affine group — is precomputed at `recompose` into
-`_single_affine_fast` and `hook_fn` short-circuits to it: one `subspace_inject` +
-`copy_`, no group loop, no trigger re-check, no foot-seed. `all_fast_path()` is
+`_single_affine_fast`: pure push becomes one constant `add_`; mixed
+push+ablation precomputes that constant and projects only the nonzero-κ ablation
+rows in model dtype (the common single-ablation case is an elementwise dot +
+axpy, avoiding MPS's expensive tiny matmul dispatch); only the fallback runs one
+`subspace_inject` + `copy_`. There is no group loop, trigger re-check, or foot
+seed on these paths. `all_fast_path()` is
 true only unsteered (no hooks); `static_steerable()` is true when *every* hook is
 that static-affine fast path — those are the two StaticCache / graph-capture
 eligibility signals (`session.use_static_cache` ORs them). A curved / gated /
@@ -495,7 +705,8 @@ persona breaks by `α ≈ 1.0`). Tagged a prototype.)
 `HiddenCapture` — public API: `attach`/`attach_persistent`/`detach`/`clear`,
 `stacked`/`latest_per_layer`/`per_layer_buckets`/`tail_slice_at`, the mode setters
 `set_incremental`/`set_aggregate_tail`/`set_tail_with_sink`, the post-forward
-`fire_step_sink`/`ingest_persistent`, and `is_transient()` (true iff transient
+`fire_step_sink`/`ingest_persistent`, selective-prefill
+`set_prompt_positions`/`prompt_stacked`, and `is_transient()` (true iff transient
 per-gen forward hooks are registered — the compiled-clean routing gate). No
 caller reaches into `_per_layer`/`_handles`/`_step_sink`: `per_layer_buckets()`
 returns the raw bucket dict (a plain attribute return — **zero per-token cost** on
@@ -545,6 +756,22 @@ Every read is a full per-probe `ProbeReading` either way; the modes trade only
 *when/how often* scoring runs (per token vs once) and memory (length-1 vs tail
 ring vs full stack).
 
+Loom-attached generation also scores visible **authored** spans on the prefill
+that already consumes them. `_pending_authored_prompt_targets` selects authored
+node channels with no prior token capture; `_match_authored_prompt_targets`
+locates their exact content-token sequences in the full rendered prompt and maps
+token `j` to its producer state at `j-1` (the same semantics generated rows use).
+`HiddenCapture` clones only those selected prompt rows at each active
+probe/J-LENS/SAE layer, not the full prompt stack. A KV-prefix hit translates
+full positions into suffix-local rows and leaves cached producers untouched;
+selective prompt capture forces transient hooks because persistent buffers carry
+only the latest slice. The first post-forward callback scores the rows in prompt
+order, writes one `capture_authored` loom mutation per populated channel, then
+runs the ordinary final-prompt sink. There is no second transformer forward, but
+the requested monitor/SAE/J-LENS readout work still runs per authored token.
+Captured authored rows are immutable: rerolls reuse their original data, while a
+standalone append remains plain until a later generation actually prefills it.
+
 ## monitor.py
 
 `Monitor` — **one** read-side class (the unification of the former `TraitMonitor` +
@@ -558,7 +785,12 @@ global per-probe slots) and runs each *curved* probe through `_score_probe_full`
 tokens from the previous foot when `enable_curved_warm` is set — the sequential
 live path). No flat/curved field asymmetry — both yield the full `ProbeReading`
 (the research-tool priority is full per-token information: nearest, curved coords,
-residual, per-layer). `score_aggregate` pools one token (the last content token)
+residual, per-layer). Both assembly sites also stamp the per-axis
+`depth_com`/`depth_spread` stats via the module-level `_depth_stats` (mass
+`share_weight_L · |coord_L[axis]|`, depths `layer/(n_layers−1)` — the
+`n_layers` ctor kwarg the session supplies; unset ⇒ stats stay empty). Pure
+host-side arithmetic over values the reading already transferred — zero tensor
+cost. `score_aggregate` pools one token (the last content token)
 and runs the per-probe `_score_probe_full`, so the aggregate is bit-identical to
 the live read at that index. Each layer's `_layer_geometry` yields the M-orthogonal
 **fraction** `sqrt(gᵀ M_R⁻¹ g)/‖x‖_M` (`g = B Σ⁻¹ x`), the whitened query for the
@@ -678,6 +910,40 @@ probes viability + caches keyed by underlying module id / device / dtype;
 `make_static_cache` sizes to `prompt_len + max_new_tokens + offset`; `warn_once`
 logs the fallback reason.
 
+## scene.py
+
+The cast-model turn stitcher (`docs/plans/dynamic-roles.md`): **template
+autopsy** renders sentinel-content probes through the live chat template and
+slices out a `TurnGrammar` — prelude, per-seat `SeatWrapper`s (open/label
+site/close), system shape (real turn vs gemma-style fold, or unsupported —
+gemma-2), generation appendices (`gen_extra` under `enable_thinking=False`,
+`gen_extra_thinking` under True; `None` = thinking-mode stitching
+unsupported), content/system trim flags (probed with padded sentinels —
+gemma/llama/qwen3.5 `| trim` content; trim applies to turn *text* before
+thinking/fold composition), `last_assistant_special` (qwen3 inserts an empty
+think scaffold into the final assistant turn of a *closed* render — that
+shape falls back to the template), think delimiters + the empirically-probed
+`strips_history_thinking` (strip families render a turn's committed thinking
+only while it is the last turn before the gen header — "lasts one turn", a9
+convention 3). `render_scene(grammar, turns, *, system, gen_seat, gen_label,
+gen_thinking)` stitches arbitrary `(seat, label, text, thinking)` sequences —
+alternation NOT required, labels placed in *constructed* headers (the
+`_splice_occurrences` label-collision class is structurally impossible) —
+plus a trailing generation header on either seat. `validate_turn_grammar` is
+the **load-bearing gate**: byte-exact round-trip against the template's own
+render (plain / gen / padded / system / closed-on-assistant / thinking-gen
+cases); a passing family's alternating renders are bit-identical through the
+stitcher (extraction baseline contract), a failing family falls back with a
+warning (`SceneGrammarError`). `render_scene_raw` is the marker-mode
+fallback (base models, mistral) — also the `build_chat_input` base-model
+branch. `SaklasSession.scene_grammar` is the lazy per-session
+autopsy+validation (None = fallback); `build_chat_input(scene=, gen_seat=)`
+routes through the stitcher when a grammar is present, byte-identical on
+every legacy render, and is the only path that can open a user-seat
+generation prompt. Live-validated on 11 real templates (gemma-2/3/4,
+llama-3.2, qwen2.5/3/3.5, talkie; GLM-4.7-Flash falls back — braids think
+markers into turn structure).
+
 ## generation.py
 
 Token-by-token decode + KV cache under `torch.inference_mode()`. Models that
@@ -695,9 +961,13 @@ the session passes False for stateless gens that aren't loom-attached / opted-in
 `logprobs` needs it. Stop-sequence matching keeps only a bounded tail of the
 emitted text (`_stop_keep = max(len(s))−1` chars) instead of growing the full
 completion, so the per-token match is O(tail+emit) not the old O(n²) concat. The
-`SaklasSession` fork/commit entry points (`fork_from_token` / `prefill_assistant`
-/ `append_user_turn` / `append_assistant_turn`, all in `session.py`) build on this
-decode loop. `detect_base_model` (no chat template) routes flat (`raw=True`) generation.
+`SaklasSession` fork/append entry points (`fork_from_token` /
+`prefill_assistant` / `append_user_turn` / `append_assistant_turn`, all in
+`session.py`) build on this decode loop. Matching structural role + role label
+coalesces authored spans in place; ordinary one-shot generation reuses a
+matching leaf and forces its existing text as the prefix, while explicit fan /
+fork / prefill operations retain sibling semantics. `detect_base_model` (no
+chat template) routes flat (`raw=True`) generation.
 Per-message role substitution (`role_templates.apply_with_per_turn_roles`) backs
 the roleplay scaffold; `_active_role` is the steering-driven role.
 `supports_thinking` / `_detect_think_delimiters` round-trips Qwen/Gemma
@@ -711,19 +981,12 @@ loaded-manifold registry (`_manifolds`), the unified `Monitor` (`_monitor`),
 `SteeringManager`, `HiddenCapture`, generation defaults (`session.config`), the loom
 tree, and a synchronous `events: EventBus`. Steering resolution + the LIFO steering
 stack live on a `SteeringComposer` collaborator (`core/steering_composer.py`),
-instantiated in `__init__` after `_monitor` (lazily rebuilt via
-`_get_steering_composer()` for `__new__` test stubs). The composer owns the stack
-(`_stack`); the session exposes a settable `_steering_stack` property over it, and
-owns projection materialization, pole alias resolution, profile/manifold loading,
-legacy vector port-on-detect, stack flattening, probe-gate predicates, steering
-lowering, and hook installation. The session keeps only narrow compatibility
-wrappers for `_push_steering`/`_pop_steering` (called by `_SteeringContext`),
-`_rebuild_steering_hooks`, `_ensure_manifold_loaded`, `_ensure_profile_registered`,
-`_steering_needs_probe_gating`, and `_build_gating_score_callback`; production
-generation and steering setup should call the composer directly when adding new
-code.
-`joint_logprobs.py` still uses the gating compatibility wrappers because it accepts
-session-like test doubles.
+instantiated exactly once in `__init__` after `_monitor`. The composer solely owns
+the stack (`_stack`), projection materialization, pole alias resolution, steering
+lowering, and hook installation. `ensure_manifold_loaded` and
+`ensure_profile_registered` are the session's single public artifact-registration
+API. The session keeps narrow `_push_steering`/`_pop_steering` context forwarders
+and generation helpers where the session boundary is meaningful.
 The composer reaches session state through `self._session` at push/pop frequency, off
 the per-token path; the one near-hot method, `build_gating_score_callback`, binds
 `capture`/`monitor` to locals and reads the session capture state through the back-ref
@@ -738,9 +1001,7 @@ does the HF load + layer-mean compute + probe bootstrap — there is no
 `_RESPONSE_MAX_TOKENS = 256` caps each in-character response (4.0 / A2
 elicitation). Module-level helper `_affine_manifold_push`
 (per-layer basis rows + node-coord targets for a flat manifold) backs the dispatch;
-`_manifold_is_affine` is a back-compat alias of the public `core.manifold.manifold_is_affine`
-(promoted there in T2.4 — `session.py` keeps the alias for `steering_composer` and legacy
-call sites).
+`core.manifold.manifold_is_affine` is the flat/curved predicate used across surfaces.
 Conversational-elicitation helpers `_KIND_TEMPLATES` / `_article` / `_system_for`
 (the per-kind system prompt — `custom` takes a caller-supplied template) /
 `_role_for` (the swapped assistant-role label: abstract → `someone_{slug}`,
@@ -790,10 +1051,7 @@ fitted Jacobian lens (raising `LensNotFittedError`/`MultiTokenWordError`, never
 falling through to extraction); (2) a fitted
 2-node `pca` manifold on disk — `try_fold_manifold` → `ensure_manifold_loaded`
 (load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
-memoized into `_profiles`; (3) a stale (`< PACK_FORMAT_VERSION`) legacy
-`vectors/<ns>/<name>/` folder — `port_stale_legacy_vector` ports it to a 2-node
-manifold file-only (no tensor yet) and raises with the exact `manifold fit` command
-to run. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
+memoized into `_profiles`. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
 probe-roster bootstrap — one pass, two tiers. **Tagged concept axes**: for each
 `default/` manifold tagged in a requested category, fit-or-load the 2-node
 `Manifold` and hand it to the `Monitor` (rank-1 coordinate, no fold; replaces the
@@ -822,10 +1080,13 @@ context, `_begin_capture`/`_end_capture`, `_finalize_generation`, and teardown.
 Monitor scoring is in-flight (no second forward pass); `SamplingConfig(return_hidden=
 True)` widens capture to every layer and lands `GenerationResult.hidden_states`,
 re-scorable via `session.score_hidden`. Probes ride the same plumbing:
-`add_probe(selector, *, as_name=None, top_n=3)` resolves via `_resolve_probe_manifold`
+`add_probe(selector, *, as_name=None, top_n=3)` routes a reserved
+`jlens/<word>` selector to the lens-probe registry (`_add_lens_probe` — the
+readout channel, see "Lens probes" below), else resolves via
+`_resolve_probe_manifold`
 (a 2-node `pca` concept folds to a rank-1 probe via `_fold_profile_probe`; a
 multi-node manifold attaches whole) and registers on the unified `_monitor`;
-`remove_probe(name)` detaches. `_begin_capture` widens to `_monitor.probe_layers()`
+`remove_probe(name)` detaches either kind. `_begin_capture` widens to `_monitor.probe_layers()`
 and picks the `CaptureMode` from `need_per_token` (gate ∨ loom row ∨ trait stream ∨
 live scores ∨ per-layer persist — see hooks.py `HiddenCapture`), storing it on the
 `CaptureState` dataclass (`mode` + `persistent` + the GATING_SUBSET subset/keys —
@@ -853,54 +1114,146 @@ events: `GenerationStarted`/`SteeringApplied`/
 `SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
 
-**Jacobian-lens surface.** `session.jlens` lazy-loads the per-model artifact
-(`io/lens.py`, like `whitener`); `fit_jlens(prompts, …)` pre-filters too-short
+**Jacobian-lens surface.** `session.jlens` validates v6 sidecar/live-weight
+identity before loading, refreshes or evicts an already-resident lens when an
+external process replaces/removes its generation, then verifies the payload digest
+while promoting each layer (`io/lens.py`, like `whitener`). Generation refreshes
+that disk identity once in `_begin_capture` (or the compatible-batch preamble) and
+pins the resulting resident lens through token scoring, gates, and final
+aggregation; per-token paths never reopen the sidecar or its layer shards, and an
+external pointer switch becomes visible at the next generation boundary.
+`fit_jlens(prompts, …)` pre-filters too-short
 prompts (so the saved `n_prompts` counts consumed prompts exactly — what makes
 resume slicing sound), hashes the filtered corpus, resumes a matching partial
 fit by default (`force=True` restarts), checkpoints via the io layer, and gates
-under `_model_exclusive` (forward AND backward passes).
-`jlens_readout(prompt, layers=, positions=, top_k=)` is the offline readout
-(captures via `_capture_all_hidden_states`, default final position only).
+under both a cross-process per-model fit lock and `_model_exclusive` (forward AND
+backward passes). Shared readout helpers:
+`_jlens_logits_rows` (the one bmm + unembed matvec over `(layer, hidden)` rows
+— per-layer top-k and aggregate both consume it), `_jlens_topk_rows` (accepts
+precomputed `logits=`), `_jlens_aggregate_rows` (`aggregate_readout` + decode),
+`_jlens_depths` (`layer/(n_layers−1)`), `_jlens_decode_id` (the one cache-backed
+single-token decode).
+`jlens_readout(prompt, layers=, positions=, top_k=, aggregate=)` is the offline
+readout (captures via `_capture_all_hidden_states`, default final position
+only); `aggregate=True` returns `(per_layer, per-position aggregate)` from the
+same logits, with both the aggregate and matrix covering every requested fitted
+layer.
 `jlens_token_readout(node_id, raw_index, *, layers=, top_k=, apply_steering=,
 raw=)` is the loom-anchored readout behind the dashboard drilldown's j-lens
 tab: fork-style validation (assistant node, `raw_token_ids`, range), rebuild
 the node's exact prompt render via `_prepare_input` (stamped role labels +
 recipe thinking; `raw=` selects the flat render — raw-ness isn't stamped on
 the node, the caller supplies it), append `raw_token_ids[:raw_index]`, one
-capture forward, per-layer top-k at the final position — the forward that
+capture forward, per-layer top-k + the all-layer `aggregate` block at the
+final position — the forward that
 *produced* the clicked token. `apply_steering` replays under the node's
 recipe steering; the steering scope opens OUTSIDE `_model_exclusive`
 (`SteeringComposer.push`/`pop` take `_gen_lock` blocking — nesting would
 self-deadlock; same ordering as `score_choices`).
 `register_jlens_direction(word)` lands `W_U[v] @ J_l` in `_profiles` under
-`jlens/<word>` — the shared resolver behind the two lazy `jlens/` branches
-(steering: `ensure_profile_registered`; probes: `_resolve_probe_manifold`,
-without which a gate-only `add_probe("jlens/x")` would fall through to
-`extract()` and author a nonsense manifold). `jspace_decompose(selector, k=,
+`jlens/<word>` — the resolver behind the lazy `jlens/` *steering* branch
+(`ensure_profile_registered`) only. `jspace_decompose(selector, k=,
 layers=)` resolves any steerable direction and splits it against the lens
-dictionary. **Live lens** (`enable_live_lens`/`disable_live_lens`/
+dictionary.
+
+**Lens probes (readout channel).** `add_probe("jlens/<word>")` routes to the
+session lens-probe registry (`_lens_probes: name -> {word, token_id, layers}`,
+all fitted layers; `_add_lens_probe` validates the artifact + single-token word
+and pre-warms the device transport stack) — **never** the Monitor, never a
+direction fold, no whitener. The reading is the readout-channel synthesis of
+`ProbeReading` (`_score_lens_probes` over `jlens.token_readout_stats`):
+`coords = (strength,)` — the ONE channel, mean fitted-layer probability
+`mean_l p_l(v)` (the gate channel `@when:jlens/<word>` and the workspace
+card's `strength`) — `coords_per_layer[l] = (p_l,)`, probability-mass-weighted
+`depth_com`, geometry fields defaulted. The live
+per-layer top-k display wire carries per-layer softmax probabilities too
+(`_live_lens_readout_step` softmaxes before top-k; monotone, so the
+ranking is unchanged), so every lens surface reads one unit. Three read sites,
+one math: per-step display readings ride the live-lens step's one calibrated
+probability matrix
+(`_last_lens_step_readings`, merged into every populated payload channel via
+`TokenProbePayload.merge_readings`); gate scalars come from
+`_score_lens_gate_scalars` in the gating score callback (once per forward,
+`Monitor.flat_scalars` over the synthesized readings, and the computed logits
+plus probabilities are stashed in `_lens_step_stash` for the display step to
+reuse — the gate
+callback runs before the token tap); the finalize aggregate
+(`_score_lens_probes_aggregate`, called from `generation_finalizer`) pools
+the last content token from the capture tail ring like `_score_aggregate_only`.
+Capture accounting: fitted lens-probe layers join the `_begin_capture` union;
+the INCREMENTAL branch swaps `set_incremental` for `set_tail_with_sink` when
+lens probes are attached (finalize needs the ring); the lens-only tail branch
+covers `_lens_probes` as well as the live lens; and a **lens-only** gate does
+not force per-token *monitor* scoring — `need_per_token` keys on
+monitor-attached gate keys (`gated_probe_keys`), while
+`SteeringComposer.gated_lens_probe_keys` detects lens gates for the callback
+merge. `probe_hashes`/`_probe_hash` stamp lens probes with a deterministic
+identity digest (`jlens-readout-v1`, model, word, token id, layers).
+
+**CAA live toggle.** `live_probe_scores` / `set_live_probe_scores(bool)` —
+when off, `_generate_core` masks every per-token monitor consumer at the
+source (trait stream, loom probe rows, live token scores, per-layer persist,
+subspace-coords persist, the tap's `needs_scores`), so generations run
+aggregate-only capture; probe gates still force the subset they need.
+Surfaced as `POST .../probes/live` + session info `live_probe_scores`.
+
+**Live lens** (`enable_live_lens`/`disable_live_lens`/
 `live_lens_layers`): the selected layers' `J_l` go device-resident, join the
 capture-widen union in `_begin_capture` (which also forces transient — not
 persistent — capture routing, and arms a bounded tail ring when no probes are
 attached), and `_live_lens_readout_step` runs at the token tap post-forward —
-no new forward hooks, `static_steerable` untouched — landing the per-step
-top-k on `TokenEvent.lens_readout` and the `_last_token_probe_payload["lens"]`
-slot. Default layer subset: five fitted layers over the 40–90% depth band.
+no new forward hooks, `static_steerable` untouched — returning `(per_layer,
+aggregate, token_ids)` and landing the compatibility pair view on
+`TokenEvent.lens_readout` /
+`TokenEvent.lens_aggregate` and the `_last_token_probe_payload["lens"]` /
+`["lens_aggregate"]` slots. `token_ids` are the ids already selected by the
+same top-k; `TokenProbePayload.to_token_payload` combines them with those
+probabilities into the endpoint-shaped, JSON-safe `captured.lens` record
+without another softmax. The aggregate covers every live layer, and its
+top-k width follows the generation's resolved logit-alternative
+`return_top_k` (8 only when alternatives are disabled). The default layer set
+is **every fitted layer**; pass an explicit `layers` list to trade coverage for
+device memory. `saklas serve`
+auto-enables the live lens at startup when the artifact exists (serve-side
+policy; library + TUI stay opt-in).
 
 ## loom.py
+
+Visible token rows own the canonical `captured` measurement record. The decode
+tap creates it for generated tokens; selective prefill capture creates the same
+shape for authored tokens from the producer rows that were already forward
+passed. Both stamp instrument source plus recipe steering and live directly on
+the loom node. Because token rows already ride the compressed token sidecar,
+explicit loom save/load preserves these rich historical channels without a
+separate cache or schema path. `set_authored_token_scores` installs one authored
+channel atomically and emits `LoomMutated(op="capture_authored")`; unlike the
+hot-loop `append_token`, it advances the tree revision so clients receive the
+updated authored node.
 
 `LoomTree` — the engine-side conversation tree. Nodes are turns, children are
 alternative continuations, the active path is the model's context.
 `messages_for(leaf)` renders the path as v2 chat messages (`with_labels=True` adds
-each node's `role_label`); `flat_text(leaf)` is the base-model analogue (one
+each node's `role_label` plus, when set, `thinking_text` under a `"thinking"`
+key for the scene stitcher); `flat_text(leaf)` is the base-model analogue (one
 continuous string, no roles). Node ids are 26-char ULIDs. Primitives: edit,
 branch, navigate, delete_subtree, `regenerate`. `Recipe` is the per-node
 reproducibility receipt (steering expression, sampling, thinking, seed, probe set
 + per-probe sha256); `Recipe.overlay`/`invert_steering`/`compose_modifier` back
-the auto-regen modes. Per-node token blobs live in memory during streaming;
-`to_dict` omits them, `save` writes a gzip sidecar. Mutators raise
-`MutationDuringGenerationError` (409) on conflict; `UnknownNodeError` (404) /
-`InvalidNodeOperationError` (400) otherwise.
+the auto-regen modes. `LoomNode.thinking_text` is the turn's verbatim thinking
+block (committed or decoded-at-finalize), plain-string, main-JSON persisted.
+**Cast roster** (phase 3): `tree.cast: dict[label, CastMember]` —
+`set_cast_member`/`remove_cast_member` are decoration-tier (no conflict check),
+validate the label as a role slug, emit `LoomMutated(op="cast")` (no node ids —
+clients refetch the roster), and ride `to_dict`/`save` as the required `cast`
+key (`tree_format` is exactly 2; an empty roster emits `{}`). Tree, node, cast,
+and v2 token-sidecar readers require the complete current writer shape; they do
+not infer defaults from omitted legacy fields. Explicit nullable values such as
+transcript-imported `raw_token_ids=None` round-trip as null. Composition at generation is the session's
+`_apply_cast_defaults` — the weakest tier, before regen overrides. Per-node
+token blobs live in memory during streaming; `to_dict` omits them, `save`
+writes a gzip sidecar. Mutators raise `MutationDuringGenerationError` (409) on
+conflict; `UnknownNodeError` (404) / `InvalidNodeOperationError` (400)
+otherwise.
 
 ## tree_filter.py
 
@@ -919,12 +1272,17 @@ b − a`, sorted by `abs(delta)`), `per_token_diff` (byte-offset alignment),
 
 ## transcript.py
 
-Transcript export/import for loom paths. `SAKLAS_TRANSCRIPT_VERSION = 1`;
-`to_yaml`/`from_yaml`. Import modes: **default** (new top-level branch), **here**
-(child of active), **merge** (attach the non-matching tail at the deepest matching
-prefix). Guards: model mismatch refuses `--merge` (`TranscriptModelMismatch`),
-system-prompt mismatch banners, probe-hash drift warns / raises
-`TranscriptProbeDriftError` under `--strict`.
+Transcript export/import for loom paths. `SAKLAS_TRANSCRIPT_VERSION = 2`
+(the cast model: per-turn `speaker:` = `role_label`, `thinking:` =
+`thinking_text`, top-level `cast:` block). `to_yaml`/`from_yaml` require that
+exact version. Import modes: **default** (new top-level
+branch), **here** (child of active), **merge** (attach the non-matching tail at
+the deepest matching prefix). Import re-attaches a recipe-bearing turn as a
+*generated* node in its recorded seat (`begin_assistant(seat=turn.role)`) and
+merges the cast block into the tree roster (session's member wins on conflict,
+`cast_conflict` guard note). Guards: model mismatch refuses `--merge`
+(`TranscriptModelMismatch`), system-prompt mismatch banners, probe-hash drift
+warns / raises `TranscriptProbeDriftError` under `--strict`.
 
 ## joint_logprobs.py
 
@@ -962,23 +1320,29 @@ context. Surfaced as `session.score_choices` / `session.score_template`.
 `ProbeReading`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s — the
-full readings, live-stream-gated); `scores` is a read-only back-compat property
-alias for `probe_readings`. `GenerationResult`
-carries `prompt_tokens`, `finish_reason`, optional `logprobs`, `readings`
-(per-probe `ProbeReadings`), `probe_readings`, and `applied_steering` (the
+`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s), and
+— while the live lens is on —
+`lens_readout` (per-layer top-k) + `lens_aggregate` (the layer-aggregated
+`[(token, strength, com, spread)]` chip list). `GenerationResult`
+carries `prompt_tokens`, `finish_reason`, optional `logprobs`,
+`probe_readings`, and `applied_steering` (the
 canonical expression, round-trips through `parse_expr`). `ProbeReading`
 (`coords`/`fraction`/`nearest`/`residual` + `assignment`/`membership` +
-`fraction_per_layer`/`coords_per_layer`/`residual_per_layer`) is the **single**
+`fraction_per_layer`/`coords_per_layer`/`residual_per_layer` +
+`depth_com`/`depth_spread`) is the **single**
 reading shape for both the live per-token stream and the end-of-gen aggregate (the
 aggregate is the reading pooled at the last-content token). `assignment`
 (`[(label, prob)]` soft node posterior) and `membership` (tube-fit density, default
 `1.0`) are the fuzzy-manifold readout — empty/`1.0` defaults keep serialization
-back-compat. Every field is populated for flat and curved fits alike;
+back-compat. `depth_com`/`depth_spread` are the per-axis depth center of mass
+(+ std) of the per-layer coordinate trace — mass `share_weight_L · |coord_L|`,
+depths `layer/(n_layers−1)` — computed at both monitor assembly sites
+(`monitor.py::_depth_stats`); empty when the reading has no per-layer trace
+(lean modes) or the `Monitor` wasn't given `n_layers`. Every field is populated for flat and curved fits alike;
 `residual` is `0` for a flat fit (the surface fills its subspace) and the
-normalized off-surface distance for a curved fit. `ProbeReadings` is vectorized per
-coordinate axis (`mean`/`std`/`min`/`max`/`delta_per_gen` are `tuple[float,...]`,
-`per_generation` a list of coord tuples). `to_dict()` omits `hidden_states`.
+normalized off-surface distance for a curved fit. `ProbeReadings` remains an
+explicit multi-run summary shape for notebook plots; it is not embedded in a
+generation result. `to_dict()` omits `hidden_states`.
 
 ## histogram.py
 

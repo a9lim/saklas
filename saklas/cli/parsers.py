@@ -9,6 +9,30 @@ import argparse
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def _bounded_int(lo: int, hi: int):
+    def parse(value: str) -> int:
+        parsed = int(value)
+        if not lo <= parsed <= hi:
+            raise argparse.ArgumentTypeError(f"must be in [{lo}, {hi}]")
+        return parsed
+
+    return parse
+
+
 def _add_common_args(p: argparse.ArgumentParser) -> None:
     """Model-loading args shared between `tui` and `serve`."""
     p.add_argument(
@@ -55,7 +79,8 @@ def _add_logit_args(p: argparse.ArgumentParser) -> None:
     YAML equivalent: ``return_top_k:`` int in ``[0, 256]``.
     """
     p.add_argument(
-        "--top-k-alts", dest="top_k_alts", type=int, default=None, metavar="N",
+        "--top-k-alts", dest="top_k_alts", type=_bounded_int(0, 256),
+        default=None, metavar="N",
         help="Session default for top-K alternatives capture (0–256). "
              "0 (default) = chosen-token logprob only; N>0 ships top-N "
              "decoded alternatives per token for distributional surfaces. "
@@ -123,13 +148,26 @@ _TEMPLATE_VERBS: list[tuple[str, str]] = [
 # (Gurnee et al. 2026): per-layer transport ``J_l = E[∂h_final/∂h_l]`` +
 # vocabulary readout.  ``fit`` loads a model and runs the only backward
 # passes in saklas; ``top``/``decompose`` load a model for one forward;
-# ``show``/``rm`` are pure-IO over ``models/<safe_id>/jlens.*``.
+# lifecycle verbs are source-aware: local payloads live under SAKLAS_HOME,
+# while external payloads remain in provider caches behind pinned bindings.
 _LENS_VERBS: list[tuple[str, str]] = [
     ("fit",       "Fit the model's Jacobian lens over a text corpus"),
-    ("show",      "Show the fitted lens artifact (layers, prompts, corpus)"),
+    ("fetch",     "Fetch an external lens into its provider cache"),
+    ("ls",        "List local and external lens sources for a model"),
+    ("show",      "Show the active or selected lens source"),
+    ("use",       "Select an already available lens source"),
     ("top",       "Lens readout on a prompt: top vocabulary tokens per layer"),
     ("decompose", "Split a steerable direction into its J-space component"),
-    ("rm",        "Remove a model's fitted lens artifact"),
+    ("rm",        "Remove a local lens or forget an external binding"),
+]
+
+_SAE_VERBS: list[tuple[str, str]] = [
+    ("train", "Train a local residual-post sparse autoencoder"),
+    ("fetch", "Fetch an external SAE into its provider cache"),
+    ("ls",    "List local and external SAE sources for a model"),
+    ("show",  "Show the active or selected SAE source"),
+    ("use",   "Select an already available SAE source"),
+    ("rm",    "Remove a local SAE or forget an external binding"),
 ]
 
 
@@ -191,7 +229,7 @@ def _build_tui_parser(parser: argparse.ArgumentParser) -> None:
                         help="Device: auto (detect), cuda, mps, or cpu")
     parser.add_argument("-p", "--probes", nargs="*", default=None,
                         help="Probe categories (default: all)")
-    parser.add_argument("--max-tokens", type=int, default=1024,
+    parser.add_argument("--max-tokens", type=_positive_int, default=1024,
                         help="Default max generation tokens")
     _add_injection_args(parser)
     _add_logit_args(parser)
@@ -222,7 +260,10 @@ def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
         help="Probe categories: all, none, epistemic, alignment, register, cultural (default: all)",
     )
     parser.add_argument("-H", "--host", default="0.0.0.0", help="Bind address")
-    parser.add_argument("-P", "--port", type=int, default=8000, help="Bind port")
+    parser.add_argument(
+        "-P", "--port", type=_bounded_int(1, 65535), default=8000,
+        help="Bind port",
+    )
     parser.add_argument("-S", "--steer", default=None, metavar="EXPR",
                         help='Default steering expression, e.g. "0.5 honest + 0.3 warm"')
     parser.add_argument("-C", "--cors", action="append", default=[], metavar="ORIGIN",
@@ -248,12 +289,8 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
     p.add_argument("-f", "--force", action="store_true")
     p.add_argument(
         "--sae", default=None, metavar="RELEASE",
-        help="Extract via a SAELens SAE release (requires `pip install .[sae]`). "
-             "No implicit default — you must name a release.",
-    )
-    p.add_argument(
-        "--sae-revision", dest="sae_revision", default=None, metavar="REV",
-        help="Pin a specific HF revision for the SAE release",
+        help="Extract via a SAELens SAE release. No implicit default — you "
+             "must name a release.",
     )
     p.add_argument(
         "--role", default=None, metavar="SLUG",
@@ -262,7 +299,7 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "(e.g. 'pirate'), so the fit lives in role-baselined activation "
              "space. The role bakes into the generated node corpora and the "
              "fit writes the canonical tensor (there is no separate "
-             "``_role-<slug>`` file, and cross-session ``:role-<slug>`` "
+             "canonical tensor, and cross-session ``:role-<slug>`` "
              "selection isn't wired up yet). Slug must match ``[a-z0-9._-]+``. "
              "Mutually exclusive with ``--sae``. Mistral-3 families don't "
              "carry a substitutable role label and raise at runtime.",
@@ -340,13 +377,14 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
     fit.add_argument("-m", "--model", default=None, metavar="MODEL_ID")
     fit.add_argument("-f", "--force", action="store_true")
     fit.add_argument(
-        "--sae", default=None, metavar="RELEASE",
-        help="Fit in an SAELens SAE feature space (requires `.[sae]`); "
-             "centroids are reconstructed through the SAE before the fit.",
+        "--layers", default=None, metavar="L1,L2,...|workspace|all",
+        help="Fit only selected transformer layers (default: all; workspace "
+             "uses the 40–90%% depth band)",
     )
     fit.add_argument(
-        "--sae-revision", dest="sae_revision", default=None, metavar="REV",
-        help="Pin a specific HF revision for the SAE release",
+        "--sae", default=None, metavar="RELEASE",
+        help="Fit in an SAELens SAE feature space; centroids are reconstructed "
+             "through the SAE before the fit.",
     )
     # Discover-mode hyperparam overrides.  Written into ``manifold.json``
     # before the fit; rejected against an authored folder.
@@ -357,16 +395,16 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "axes via persistent homology (default: keep folder's setting)",
     )
     fit.add_argument(
-        "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
+        "--max-dim", dest="max_dim", type=_positive_int, default=None, metavar="N",
         help="Discover-mode: cap intrinsic dimension "
              "(default: 8 for PCA, 8 for spectral)",
     )
     fit.add_argument(
-        "--min-dim", dest="min_dim", type=int, default=None, metavar="N",
+        "--min-dim", dest="min_dim", type=_positive_int, default=None, metavar="N",
         help="Discover spectral: floor the intrinsic dimension the "
              "eigenvalue-ratio cliff picks (the cliff undershoots when one "
              "mode dominates — set --min-dim == --max-dim to pin the dim "
-             "exactly, e.g. PAD's 3). Ignored for --method pca.",
+             "exactly, e.g. PAD's 3). Valid only for spectral/auto fits.",
     )
     fit.add_argument(
         "--var-threshold", dest="var_threshold", type=float, default=None,
@@ -375,7 +413,7 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "crosses T is picked (default: 0.70)",
     )
     fit.add_argument(
-        "--k-nn", dest="k_nn", type=int, default=None, metavar="K",
+        "--k-nn", dest="k_nn", type=_positive_int, default=None, metavar="K",
         help="Discover spectral: number of nearest neighbors in the k-NN "
              "graph (default: max(5, ceil(log K)))",
     )
@@ -385,27 +423,28 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "(default: median k-NN distance)",
     )
     fit.add_argument(
-        "--max-subspace-dim", dest="max_subspace_dim", type=int, default=None,
+        "--max-subspace-dim", dest="max_subspace_dim", type=_positive_int,
+        default=None,
         metavar="R",
         help="Discover spectral (curved) only: per-layer RBF subspace dim "
              "cap (default 64). Smaller values give finer-grained steering "
              "control at large K — each axis the RBF can move along is an "
              "axis subspace_inject can displace, so fewer axes = smaller "
-             "per-α effect = wider coherence regime. Ignored for --method pca "
+             "per-α effect = wider coherence regime. Valid only for spectral/auto "
              "(a flat fit's subspace dim is its layout dim — use --max-dim).",
     )
     fit.add_argument(
         "--smoothing", dest="smoothing", default=None, metavar="LAMBDA",
         help="Discover spectral/auto (curved): penalized-RBF smoothing — "
              "'auto' (GCV-selected, the default), '0' (exact interpolation), "
-             "or a float λ. Ignored for --method pca (no RBF surface).",
+             "or a float λ. Valid only for spectral/auto (no PCA RBF surface).",
     )
     fit.add_argument(
         "--persistence-frac", dest="persistence_frac", type=float,
         default=None, metavar="F",
         help="Discover auto: H1 loop-significance threshold as a fraction of "
              "the connectivity scale (default 0.5); higher = stricter periodic "
-             "detection. Ignored unless --method auto.",
+             "detection. Valid only for --method auto.",
     )
     fit.set_defaults(quantize=None, device="auto", probes=None)
 
@@ -437,7 +476,7 @@ def _build_manifold_generate(generate: argparse.ArgumentParser) -> None:
     )
     generate.add_argument(
         "--samples-per-prompt", dest="samples_per_prompt",
-        type=int, default=1, metavar="K",
+        type=_positive_int, default=1, metavar="K",
         help="In-character responses generated per baseline prompt (default: 1)",
     )
     generate.add_argument(
@@ -485,7 +524,7 @@ def _build_manifold_from_template(p: argparse.ArgumentParser) -> None:
              "categories like days/months).",
     )
     p.add_argument(
-        "--max-dim", dest="max_dim", type=int, default=None, metavar="N",
+        "--max-dim", dest="max_dim", type=_positive_int, default=None, metavar="N",
         help="Cap the discovered intrinsic dimension (optional).",
     )
     p.add_argument(
@@ -893,27 +932,40 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
              "via the `datasets` library (pip install 'saklas[hf]').",
     )
     p.add_argument(
-        "--prompts", type=int, default=100, metavar="N",
+        "--prompts", type=_positive_int, default=100, metavar="N",
         help="Number of corpus documents to average over (default 100 — "
              "quality saturates quickly; the paper used 1000)",
     )
     p.add_argument(
-        "--seq-len", type=int, default=None, metavar="T",
+        "--seq-len", type=_positive_int, default=None, metavar="T",
         help="Truncate each document to this many tokens (default 128)",
     )
     p.add_argument(
-        "--dim-batch", type=int, default=None, metavar="K",
+        "--dim-batch", type=_positive_int, default=None, metavar="K",
         help="Output dims per backward pass (default 8). Total backward work "
              "is K-invariant — the knob trades memory for per-pass overhead "
              "and barely moves wall time; halves automatically on OOM.",
     )
     p.add_argument(
-        "--layers", default=None, metavar="L1,L2,...",
+        "--prompt-batch", type=_positive_int, default=None, metavar="B",
+        help="Corpus prompts per autograd graph (default: 4 on CPU/CUDA, 2 on "
+             "MPS). Preserves equal-prompt estimator weighting; backs off "
+             "independently on OOM.",
+    )
+    p.add_argument(
+        "--checkpoint-every", type=_positive_int, default=None, metavar="N",
+        help="Write a self-contained resumable checkpoint every N usable "
+             "prompts (default 25); the full artifact is written durably once "
+             "at finalization.",
+    )
+    p.add_argument(
+        "--layers", default=None, metavar="L1,L2,...|workspace",
         help="Fit only these source layers (default: every layer below the "
              "final one). Restricting to the workspace band — roughly the "
              "40-90%% depth the jlens/<word> atoms use — skips the backward "
              "work below the lowest requested layer and shrinks the artifact; "
-             "readout surfaces then cover only the fitted layers.",
+             "readout surfaces then cover only the fitted layers. Pass "
+             "`workspace` as shorthand for that band.",
     )
     p.add_argument(
         "-f", "--force", action="store_true",
@@ -925,8 +977,32 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
                    help="Quantization mode (default: bf16/fp16)")
 
 
+def _build_lens_fetch(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="HuggingFace model ID")
+    p.add_argument(
+        "source", nargs="?", default="neuronpedia",
+        help="External source (currently: neuronpedia)",
+    )
+    p.add_argument("--revision", default="main", help="Provider revision to resolve and pin")
+    p.add_argument("--repo", default="neuronpedia/jacobian-lens", metavar="REPO")
+    p.add_argument("-f", "--force", action="store_true", help="Refresh the binding")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+
+def _build_lens_ls(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="Model ID whose lens sources to list")
+    p.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+
+def _build_lens_use(p: argparse.ArgumentParser) -> None:
+    p.add_argument("model", help="Model ID whose active lens to change")
+    p.add_argument("source", help="local:NAME or neuronpedia")
+
+
 def _build_lens_show(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="Model ID whose lens artifact to inspect")
+    p.add_argument("source", nargs="?", default=None,
+                   help="Source to inspect (default: active)")
     p.add_argument("-j", "--json", dest="json_output", action="store_true", help="JSON output")
 
 
@@ -934,12 +1010,12 @@ def _build_lens_top(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="HuggingFace model ID or local path")
     p.add_argument("prompt", help="Raw prompt to read out (no chat template)")
     p.add_argument(
-        "-k", "--top-k", type=int, default=8, metavar="K",
+        "-k", "--top-k", type=_positive_int, default=8, metavar="K",
         help="Tokens per (layer, position) readout (default 8)",
     )
     p.add_argument(
-        "--layers", default=None, metavar="L1,L2,...",
-        help="Comma-separated layer indices (default: 9 evenly spaced fitted layers)",
+        "--layers", default=None, metavar="L1,L2,...|sample|workspace|all",
+        help="Comma-separated layer indices or a layer mode (default: all fitted layers)",
     )
     p.add_argument(
         "--position", type=int, action="append", default=None, metavar="P",
@@ -964,13 +1040,13 @@ def _build_lens_decompose(p: argparse.ArgumentParser) -> None:
         help="Model whose lens + fitted direction to use",
     )
     p.add_argument(
-        "-k", "--top-k", type=int, default=16, metavar="K",
+        "-k", "--top-k", type=_positive_int, default=16, metavar="K",
         help="Sparsity budget: atoms in the J-space component (default 16)",
     )
     p.add_argument(
-        "--layers", default=None, metavar="L1,L2,...",
-        help="Comma-separated layer indices (default: every fitted layer the "
-             "direction covers)",
+        "--layers", default=None, metavar="L1,L2,...|workspace|all",
+        help="Comma-separated layer indices or a layer mode (default: every "
+             "fitted layer the direction covers)",
     )
     p.add_argument("-d", "--device", default="auto",
                    help="Device: auto (detect), cuda, mps, or cpu")
@@ -981,6 +1057,8 @@ def _build_lens_decompose(p: argparse.ArgumentParser) -> None:
 
 def _build_lens_rm(p: argparse.ArgumentParser) -> None:
     p.add_argument("model", help="Model ID whose lens artifact to remove")
+    p.add_argument("source", nargs="?", default=None,
+                   help="local:NAME or neuronpedia (default: active)")
     p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
 
 
@@ -990,12 +1068,20 @@ _LENS_DESCRIPTIONS: dict[str, str] = {
         "first-order effect of each layer's residual on the final-layer "
         "residual over a web-text corpus. One forward + ceil(d_model/dim_batch) "
         "backward passes per document — the only backward passes in saklas. "
-        "The artifact lands at ~/.saklas/models/<model>/jlens.safetensors "
-        "(fp16, ~0.5-1.5 GB) and backs `lens top`, `lens decompose`, the "
+        "The artifact lands under ~/.saklas/models/<model>/jlens/local/default "
+        "as an atomic manifest plus fp32 per-layer shards (~1-3 GB total) "
+        "and backs `lens top`, `lens decompose`, the "
         "jlens/<word> steering atoms, and @when:jlens/<word> gates. "
         "Interrupted fits checkpoint and resume by default."
     ),
-    "show": "Print a fitted lens artifact's sidecar (layers, prompts, corpus, size).",
+    "fetch": (
+        "Fetch an official external Jacobian lens into its provider-owned "
+        "cache, pin the repository and base-model revisions, and write only a "
+        "small Saklas binding. No provider payload is copied into SAKLAS_HOME."
+    ),
+    "ls": "List Saklas-owned local lenses and external cache bindings.",
+    "show": "Print a lens source's layers, prompts, corpus, provenance, and size.",
+    "use": "Select a fetched/fitted source without downloading or copying it.",
     "top": (
         "Run one forward pass on a raw prompt and decode selected layers' "
         "residuals through the lens: softmax(W_U · norm(J_l h)) — the tokens "
@@ -1009,12 +1095,15 @@ _LENS_DESCRIPTIONS: dict[str, str] = {
         "concept vectors typically carry only ~6-15% of their variance in the "
         "workspace) and the contributing tokens."
     ),
-    "rm": "Delete a model's fitted lens artifact (jlens.safetensors + sidecar).",
+    "rm": "Delete a local lens or forget an external binding without touching its provider cache.",
 }
 
 _LENS_BUILDERS = {
     "fit":       _build_lens_fit,
+    "fetch":     _build_lens_fetch,
+    "ls":        _build_lens_ls,
     "show":      _build_lens_show,
+    "use":       _build_lens_use,
     "top":       _build_lens_top,
     "decompose": _build_lens_decompose,
     "rm":        _build_lens_rm,
@@ -1065,6 +1154,50 @@ def _build_lens_parser(parser: argparse.ArgumentParser) -> None:
         _LENS_BUILDERS[verb](child)
 
 
+def _build_sae_parser(parser: argparse.ArgumentParser) -> None:
+    """``saklas sae`` — local/external sparse-autoencoder sources."""
+    sub = parser.add_subparsers(dest="sae_cmd", required=False, metavar="VERB")
+    for verb, desc in _SAE_VERBS:
+        child = sub.add_parser(verb, help=desc)
+        child.add_argument("model", help="HuggingFace model ID or local path")
+        if verb == "train":
+            child.add_argument("name", help="Local SAE name")
+            child.add_argument("--corpus", default=None, metavar="FILE",
+                               help="One text document per line; default: FineWeb-Edu")
+            child.add_argument("--layer", type=_nonnegative_int, default=None,
+                               help="Residual-post layer (default: nearest 65%% depth)")
+            child.add_argument("--tokens", type=_positive_int, default=1_000_000, metavar="N")
+            child.add_argument("--seq-len", type=_positive_int, default=128, metavar="T")
+            child.add_argument("--batch-size", type=_positive_int, default=8, metavar="B")
+            child.add_argument("--width", type=_positive_int, default=None, metavar="N")
+            child.add_argument("--expansion", type=_positive_int, default=8, metavar="K")
+            child.add_argument("--learning-rate", type=float, default=3e-4, metavar="LR")
+            child.add_argument("--l1", type=float, default=1e-3, metavar="LAMBDA")
+            child.add_argument("--dead-threshold", type=float, default=1e-6, metavar="T")
+            child.add_argument("--seed", type=int, default=0)
+            child.add_argument("-f", "--force", action="store_true")
+            child.add_argument("-d", "--device", default="auto")
+            child.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
+            child.add_argument("-j", "--json", dest="json_output", action="store_true")
+        elif verb == "fetch":
+            child.add_argument("source", help="saelens:RELEASE")
+            child.add_argument("--layer", type=_nonnegative_int, default=None,
+                               help="Explicit covered hook layer (default: nearest 65%% depth)")
+            child.add_argument("-d", "--device", default="auto")
+            child.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
+            child.add_argument("-j", "--json", dest="json_output", action="store_true")
+        elif verb in {"show", "rm"}:
+            child.add_argument("source", nargs="?", default=None,
+                               help="local:NAME or saelens:RELEASE (default: active)")
+            child.add_argument("-j", "--json", dest="json_output", action="store_true")
+            if verb == "rm":
+                child.add_argument("-y", "--yes", action="store_true")
+        elif verb == "use":
+            child.add_argument("source", help="local:NAME or saelens:RELEASE")
+        else:  # ls
+            child.add_argument("-j", "--json", dest="json_output", action="store_true")
+
+
 # --- config subtree ------------------------------------------------------
 
 def _build_config_parser(parser: argparse.ArgumentParser) -> None:
@@ -1106,7 +1239,7 @@ def _build_experiment_fan(p: argparse.ArgumentParser) -> None:
     p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
     p.add_argument("-d", "--device", default="auto")
     p.add_argument("-p", "--probes", nargs="*", default=None)
-    p.add_argument("--max-tokens", type=int, default=256)
+    p.add_argument("--max-tokens", type=_positive_int, default=256)
     p.add_argument("-j", "--json", dest="json_output", action="store_true")
     _add_injection_args(p)
     _add_logit_args(p)
@@ -1160,7 +1293,7 @@ def _build_experiment_transcript_parser(parser: argparse.ArgumentParser) -> None
         help="Probe categories (default: all)",
     )
     run.add_argument(
-        "--max-tokens", type=int, default=256,
+        "--max-tokens", type=_positive_int, default=256,
         help="Default max generation tokens per replay turn",
     )
     _add_injection_args(run)
@@ -1196,7 +1329,7 @@ def _build_experiment_naturalness(p: argparse.ArgumentParser) -> None:
         help="Also score a linear-chord steering baseline (the manifold "
              "term must be a single '%%' term)",
     )
-    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--max-tokens", type=_positive_int, default=128)
     p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
     p.add_argument("-d", "--device", default="auto")
     p.add_argument("-p", "--probes", nargs="*", default=None)
@@ -1284,12 +1417,19 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
     lens = sub.add_parser(
         "lens",
-        help="Jacobian lens (fit/show/top/decompose/rm)",
+        help="Jacobian lens (fit/fetch/ls/show/use/top/decompose/rm)",
         description="Per-model Jacobian lens: fit the residual→output "
                     "transport, read out what intermediate activations are "
                     "disposed to say, and split directions into their "
                     "verbalizable (J-space) component",
     )
     _build_lens_parser(lens)
+
+    sae = sub.add_parser(
+        "sae",
+        help="Sparse autoencoders (train/fetch/ls/show/use/rm)",
+        description="Train, fetch, select, and inspect per-model sparse-autoencoder sources",
+    )
+    _build_sae_parser(sae)
 
     return root

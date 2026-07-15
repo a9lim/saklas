@@ -85,7 +85,7 @@
     background: var(--bg-hover);
   }
   .sk-disclosure-trigger:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: -2px;
   }
   .sk-disclosure.is-open .sk-disclosure-trigger {

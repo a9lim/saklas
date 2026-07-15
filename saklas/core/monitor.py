@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -11,7 +12,6 @@ from saklas.core.monitor_attach import (
     DEFAULT_NEAREST_TOP_N,
     NEUTRAL_LABEL,
     _FRACTION_EPSILON,
-    _MIN_SHARE_WEIGHT,
     _woodbury_apply,
     AttachedManifoldProbe,  # re-exported: tests import from saklas.core.monitor
     _build_whitened_factors,
@@ -25,8 +25,63 @@ if TYPE_CHECKING:
 
 _MAX_HISTORY = 8
 
-_EMPTY_STATS = {"count": 0, "sum": 0.0, "sum_sq": 0.0,
-                "min": float("inf"), "max": float("-inf")}
+@dataclass(frozen=True, slots=True)
+class _ProbeGateScalarPlan:
+    """Attach/generation-stable parse of the scalar channels a gate consumes."""
+
+    probe_name: str
+    coord_axes: tuple[tuple[int, str], ...] = ()
+    fraction_key: str | None = None
+    membership_key: str | None = None
+    dist_requests: tuple[tuple[str, int], ...] = ()
+    assign_requests: tuple[tuple[str, int], ...] = ()
+    dist_index: torch.Tensor | None = None
+    assign_index: torch.Tensor | None = None
+
+
+def _depth_stats(
+    coords_per_layer: dict[int, tuple[float, ...]],
+    weights: dict[int, float],
+    denom: float,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Per-axis depth center of mass (+ std) of a per-layer coordinate trace.
+
+    Mass per (layer, axis) is ``weight_L · |coord_L[axis]|`` — where in depth
+    the probe's signal actually reads, weighted the same way the cross-layer
+    aggregate coordinate is (the Mahalanobis share).  Depths are
+    ``layer / denom`` (``denom = n_layers − 1``), so 0 = first block, 1 =
+    last.  Pure host-side arithmetic over values already transferred — no
+    tensor work.  Empty tuples when the trace is empty or ``denom`` unset;
+    a zero-mass axis (activation at neutral) reports ``(0.0, 0.0)``.
+    """
+    if not coords_per_layer or denom <= 0.0:
+        return (), ()
+    n_dim = max(len(c) for c in coords_per_layer.values())
+    coms: list[float] = []
+    spreads: list[float] = []
+    for axis in range(n_dim):
+        total = 0.0
+        first_moment = 0.0
+        for layer, coords in coords_per_layer.items():
+            if axis >= len(coords):
+                continue
+            m = weights.get(layer, 0.0) * abs(coords[axis])
+            total += m
+            first_moment += m * (layer / denom)
+        if total <= 1e-12:
+            coms.append(0.0)
+            spreads.append(0.0)
+            continue
+        com = first_moment / total
+        var = 0.0
+        for layer, coords in coords_per_layer.items():
+            if axis >= len(coords):
+                continue
+            m = weights.get(layer, 0.0) * abs(coords[axis])
+            var += m * ((layer / denom) - com) ** 2
+        coms.append(com)
+        spreads.append(max(var / total, 0.0) ** 0.5)
+    return tuple(coms), tuple(spreads)
 
 
 class Monitor:
@@ -67,19 +122,16 @@ class Monitor:
     no Euclidean readout (on real LMs the Euclidean metric is rogue-dominated,
     a wrong answer not a degraded one).
 
-    TUI-facing scalar helpers (``get_stats`` / ``get_sparkline`` /
+    TUI-facing scalar helpers (``get_sparkline`` /
     ``get_current_and_previous``) report coordinate **axis 0** so the
     untouched trait panel keeps working; the full per-axis + per-layer data
     flows through the :class:`ProbeReading` surface.
     """
 
-    @staticmethod
-    def _empty_stats() -> dict[str, Any]:
-        return dict(_EMPTY_STATS)
-
     def __init__(self, probe_manifolds: dict[str, "Manifold"] | None = None,
                  layer_means: dict[int, torch.Tensor] | None = None,
-                 whitener: Any = None):
+                 whitener: Any = None,
+                 n_layers: int | None = None):
         """
         probe_manifolds: maps probe name -> flat :class:`Manifold` (rank-1
             concept axis or rank-R discover fit).  Ad-hoc baked directions
@@ -92,10 +144,17 @@ class Monitor:
             path — only exposed via the ``layer_means`` property).
         whitener: the :class:`~saklas.core.mahalanobis.LayerWhitener`;
             mandatory at scoring time (covers every probed layer or raise).
+        n_layers: the model's block count — the depth axis for the
+            ``depth_com``/``depth_spread`` reading statistics.  ``None``
+            (direct-constructed test monitors) leaves them empty.
         """
         self._probes: dict[str, AttachedManifoldProbe] = {}
         self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
         self._whitener: Any = whitener
+        # Depth denominator for _depth_stats: layer / (n_layers − 1) ∈ [0, 1].
+        self._depth_denom: float = (
+            float(n_layers - 1) if n_layers is not None and n_layers > 1 else 0.0
+        )
         self._whitener_factor_cache: dict[
             tuple[int, str, torch.dtype],
             tuple[torch.Tensor, torch.Tensor, float],
@@ -125,15 +184,11 @@ class Monitor:
         # guard is a bool + a device compare, not a per-token tuple alloc.
         self._flat_cache_dirty: bool = True
 
-        # Per-coordinate history + summary stats.  ``history`` holds the
-        # per-generation aggregate coordinate tuple; ``_stats`` is axis-0
-        # scalar stats (TUI compat) plus the per-axis accumulators the
-        # session reads for the vectorized ``ProbeReadings``.
+        # Per-coordinate history. Rich result payloads use the pooled
+        # ``ProbeReading`` directly; scalar UI projections derive from this
+        # single history rather than maintaining a parallel summary model.
         self.history: dict[str, deque[tuple[float, ...]]] = {
             n: deque(maxlen=_MAX_HISTORY) for n in self._probes
-        }
-        self._stats: dict[str, dict[str, Any]] = {
-            n: self._empty_stats() for n in self._probes
         }
 
         # Aggregate path sets _pending_aggregate; per-token path sets _pending_per_token.
@@ -318,11 +373,8 @@ class Monitor:
         shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
         if not shared:
             return ProbeReading(fraction=0.0, nearest=[], coords=())
-        total_w = sum(sw.get(idx, 0.0) for idx in shared)
-        if total_w <= _MIN_SHARE_WEIGHT:
-            w_shared = {idx: 1.0 / len(shared) for idx in shared}
-        else:
-            w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
+        total_w = sum(sw[idx] for idx in shared)
+        w_shared = {idx: sw[idx] / total_w for idx in shared}
 
         K = probe.node_values_reduced[shared[0]].shape[0]
         inject_neutral = probe.inject_neutral
@@ -607,6 +659,9 @@ class Monitor:
                 for j in range(ta)
             ]
 
+        depth_com, depth_spread = _depth_stats(
+            coords_per_layer, w_shared, self._depth_denom,
+        )
         return ProbeReading(
             fraction=frac_mean,
             nearest=nearest,
@@ -617,6 +672,8 @@ class Monitor:
             residual_per_layer=residual_per_layer,
             assignment=assignment,
             membership=membership,
+            depth_com=depth_com,
+            depth_spread=depth_spread,
         )
 
     def _score_full(
@@ -692,21 +749,12 @@ class Monitor:
         # Preserve probe insertion order in the returned dict.
         return {name: out[name] for name in self._probes if name in out}
 
-    def _score_probe_gate_scalars(
+    def _plan_probe_gate_scalars(
         self,
         probe: "AttachedManifoldProbe",
-        hidden_per_layer: dict[int, torch.Tensor],
         gate_keys: set[str],
-        sih_cache: dict[int, torch.Tensor] | None = None,
-    ) -> dict[str, float]:
-        """Score only the exact scalar channels a probe gate consumes.
-
-        This is intentionally narrower than :meth:`_score_probe_full`: it is used
-        only by the gate-only decode path, where no UI/API consumer needs a full
-        :class:`ProbeReading`. Curved ``:fraction`` and ``@label`` / ``~label``
-        gates can skip the nearest-foot solve entirely; coord and membership
-        gates still run the geometry they semantically require.
-        """
+    ) -> _ProbeGateScalarPlan | None:
+        """Parse one probe's requested gate scalar keys once per generation."""
         name = probe.name
         suffixes = {
             key[len(name):]: key for key in gate_keys
@@ -717,7 +765,7 @@ class Monitor:
             or key.startswith(f"{name}~")
         }
         if not suffixes:
-            return {}
+            return None
 
         coord_axes: dict[int, str] = {}
         if "" in suffixes:
@@ -748,7 +796,111 @@ class Monitor:
         need_assignment = bool(assign_labels)
         need_dist = bool(need_nearest or need_assignment)
         if not (need_coords or need_fraction or need_membership or need_dist):
+            return None
+        label_to_idx = probe.label_to_candidate_idx
+        dist_requests = tuple(
+            (key, label_to_idx[label])
+            for label, key in dist_labels.items()
+            if label in label_to_idx
+        )
+        assign_requests = tuple(
+            (key, label_to_idx[label])
+            for label, key in assign_labels.items()
+            if label in label_to_idx
+        )
+        plan_device = (
+            next(iter(probe.whitened.values())).node_white_aug.device
+            if probe.whitened else torch.device("cpu")
+        )
+        return _ProbeGateScalarPlan(
+            probe_name=name,
+            coord_axes=tuple(sorted(coord_axes.items())),
+            fraction_key=fraction_key,
+            membership_key=membership_key,
+            dist_requests=dist_requests,
+            assign_requests=assign_requests,
+            dist_index=(
+                torch.tensor(
+                    [idx for _key, idx in dist_requests],
+                    device=plan_device,
+                    dtype=torch.long,
+                )
+                if dist_requests else None
+            ),
+            assign_index=(
+                torch.tensor(
+                    [idx for _key, idx in assign_requests],
+                    device=plan_device,
+                    dtype=torch.long,
+                )
+                if assign_requests else None
+            ),
+        )
+
+    def plan_gate_scalars(
+        self,
+        gate_keys: set[str],
+        *,
+        probe_names: set[str] | None = None,
+    ) -> tuple[_ProbeGateScalarPlan, ...]:
+        """Pre-parse exact monitor gate scalar keys for the decode hot path."""
+        if not gate_keys or not self._probes:
+            return ()
+        names = (
+            set(probe_names)
+            if probe_names is not None
+            else {re.split(r"[\[:@~]", k, maxsplit=1)[0] for k in gate_keys}
+        )
+        plans: list[_ProbeGateScalarPlan] = []
+        for name, probe in self._probes.items():
+            if name not in names:
+                continue
+            plan = self._plan_probe_gate_scalars(probe, gate_keys)
+            if plan is not None:
+                plans.append(plan)
+        return tuple(plans)
+
+    def _score_probe_gate_scalars(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+        gate_keys: set[str],
+        sih_cache: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, float]:
+        """Score only the exact scalar channels a probe gate consumes."""
+        plan = self._plan_probe_gate_scalars(probe, gate_keys)
+        if plan is None:
             return {}
+        return self._score_planned_probe_gate_scalars(
+            probe, hidden_per_layer, plan, sih_cache,
+        )
+
+    def _score_planned_probe_gate_scalars(
+        self,
+        probe: "AttachedManifoldProbe",
+        hidden_per_layer: dict[int, torch.Tensor],
+        plan: _ProbeGateScalarPlan,
+        sih_cache: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, float]:
+        """Score a planned probe gate scalar map.
+
+        This is intentionally narrower than :meth:`_score_probe_full`: it is used
+        only by the gate-only decode path, where no UI/API consumer needs a full
+        :class:`ProbeReading`. Curved ``:fraction`` and ``@label`` / ``~label``
+        gates can skip the nearest-foot solve entirely; coord and membership
+        gates still run the geometry they semantically require.
+        """
+        coord_axes = plan.coord_axes
+        fraction_key = plan.fraction_key
+        membership_key = plan.membership_key
+        dist_requests = plan.dist_requests
+        assign_requests = plan.assign_requests
+        need_coords = bool(coord_axes)
+        need_fraction = fraction_key is not None
+        need_membership = membership_key is not None
+        need_nearest = bool(dist_requests)
+        need_assignment = bool(assign_requests)
+        need_dist = bool(need_nearest or need_assignment)
 
         manifold = probe.manifold
         sw = probe.share_weights
@@ -756,14 +908,9 @@ class Monitor:
         shared = [idx for idx in manifold.layers if idx in hidden_per_layer]
         if not shared:
             return {}
-        total_w = sum(sw.get(idx, 0.0) for idx in shared)
-        if total_w <= _MIN_SHARE_WEIGHT:
-            w_shared = {idx: 1.0 / len(shared) for idx in shared}
-        else:
-            w_shared = {idx: sw.get(idx, 0.0) / total_w for idx in shared}
+        total_w = sum(sw[idx] for idx in shared)
+        w_shared = {idx: sw[idx] / total_w for idx in shared}
 
-        K = probe.node_values_reduced[shared[0]].shape[0]
-        inject_neutral = probe.inject_neutral
         n_dim = manifold.domain.intrinsic_dim
         frac_mean_t: torch.Tensor | None = None
         coords_mean_t: torch.Tensor | None = None
@@ -849,20 +996,6 @@ class Monitor:
                         else mem_mean_t + w * mem_t
                     )
 
-        label_to_idx = {label: idx for idx, label in enumerate(manifold.node_labels)}
-        if inject_neutral:
-            label_to_idx[NEUTRAL_LABEL] = K
-        dist_requests = [
-            (key, label_to_idx[label])
-            for label, key in dist_labels.items()
-            if label in label_to_idx
-        ]
-        assign_requests = [
-            (key, label_to_idx[label])
-            for label, key in assign_labels.items()
-            if label in label_to_idx
-        ]
-
         out: dict[str, float] = {}
         parts: list[torch.Tensor] = []
         slots: list[tuple[str, Any]] = []
@@ -870,7 +1003,7 @@ class Monitor:
             parts.append(frac_mean_t.reshape(1))
             slots.append(("scalar", fraction_key))
         if need_coords and coords_mean_t is not None:
-            for axis, key in sorted(coord_axes.items()):
+            for axis, key in coord_axes:
                 if axis < int(coords_mean_t.numel()):
                     parts.append(coords_mean_t[axis].reshape(1))
                     slots.append(("scalar", key))
@@ -879,10 +1012,10 @@ class Monitor:
             slots.append(("scalar", membership_key))
 
         if need_nearest and dist_requests and dist_acc_t is not None:
-            idx_t = torch.tensor(
-                [idx for _key, idx in dist_requests],
-                device=dist_acc_t.device,
-                dtype=torch.long,
+            idx_t = (
+                plan.dist_index.to(device=dist_acc_t.device, dtype=torch.long)
+                if plan.dist_index is not None
+                else torch.empty(0, device=dist_acc_t.device, dtype=torch.long)
             )
             parts.append(dist_acc_t.index_select(0, idx_t) / probe.label_scale)
             slots.append(("nearest_exact", [key for key, _idx in dist_requests]))
@@ -902,10 +1035,10 @@ class Monitor:
                     + lvb
                 )
                 probs = torch.softmax(logits, dim=0)
-                idx_t = torch.tensor(
-                    [idx for _key, idx in assign_requests],
-                    device=probs.device,
-                    dtype=torch.long,
+                idx_t = (
+                    plan.assign_index.to(device=probs.device, dtype=torch.long)
+                    if plan.assign_index is not None
+                    else torch.empty(0, device=probs.device, dtype=torch.long)
                 )
                 parts.append(probs.index_select(0, idx_t))
                 slots.append(("assignment_exact", [key for key, _idx in assign_requests]))
@@ -932,33 +1065,43 @@ class Monitor:
                     out[key] = float(prob)
         return out
 
+    def score_planned_gate_scalars(
+        self,
+        hidden_per_layer: dict[int, torch.Tensor],
+        plan: tuple[_ProbeGateScalarPlan, ...],
+    ) -> dict[str, float]:
+        """Score a pre-parsed gate scalar plan without rebuilding key maps."""
+        if not hidden_per_layer or not self._probes or not plan:
+            return {}
+        sih_cache: dict[int, torch.Tensor] = {}
+        out: dict[str, float] = {}
+        for item in plan:
+            probe = self._probes.get(item.probe_name)
+            if probe is None:
+                continue
+            out.update(
+                self._score_planned_probe_gate_scalars(
+                    probe, hidden_per_layer, item, sih_cache,
+                )
+            )
+        return out
+
     def score_gate_scalars(
         self,
         hidden_per_layer: dict[int, torch.Tensor],
         gate_keys: set[str],
+        *,
+        probe_names: set[str] | None = None,
     ) -> dict[str, float]:
         """Return exact gate scalar keys without building full readings."""
         if not hidden_per_layer or not self._probes or not gate_keys:
             return {}
-        # Only the probes a gate key actually references do any work (FIX F3):
-        # derive their names once (the prefix before the first ``[`` / ``:`` /
-        # ``@`` / ``~`` channel marker — ``NAME_REGEX`` forbids those in a name)
-        # and dispatch ``_score_probe_gate_scalars`` for those alone, instead of
-        # running it (and its per-probe suffix-dict build) for every probe in the
-        # roster every token.
-        names = {re.split(r"[\[:@~]", k, maxsplit=1)[0] for k in gate_keys}
-        sih_cache: dict[int, torch.Tensor] = {}
-        out: dict[str, float] = {}
-        for name in names:
-            probe = self._probes.get(name)
-            if probe is None:
-                continue
-            out.update(
-                self._score_probe_gate_scalars(
-                    probe, hidden_per_layer, gate_keys, sih_cache,
-                )
-            )
-        return out
+        # Only the probes a gate key actually references do any work (FIX F3).
+        # Compatibility callers build a one-shot plan; generation's
+        # GATING_SUBSET hot path builds this once per generation and calls
+        # ``score_planned_gate_scalars`` each token.
+        plan = self.plan_gate_scalars(gate_keys, probe_names=probe_names)
+        return self.score_planned_gate_scalars(hidden_per_layer, plan)
 
     def _subspace_coords_for(
         self,
@@ -1183,7 +1326,7 @@ class Monitor:
                 for w in whs
             ])
             wt = torch.tensor(
-                [float(self._probes[n].share_weights.get(layer_idx, 0.0))
+                [float(self._probes[n].share_weights[layer_idx])
                  for n in present],
                 device=device, dtype=torch.float32,
             )
@@ -1460,6 +1603,11 @@ class Monitor:
                     (labels[ci][int(round(ai_v[row + j]))], ap_v[row + j])
                     for j in range(top_n)
                 ]
+            depth_com, depth_spread = _depth_stats(
+                coords_per_layer_acc[ci],
+                self._probes[name].share_weights,
+                self._depth_denom,
+            )
             out[name] = ProbeReading(
                 fraction=frac_v[ci],
                 nearest=nearest,
@@ -1470,6 +1618,8 @@ class Monitor:
                 residual_per_layer=residual_per_layer_acc[ci],
                 assignment=assignment,
                 membership=1.0,
+                depth_com=depth_com,
+                depth_spread=depth_spread,
             )
         return out
 
@@ -1499,40 +1649,12 @@ class Monitor:
     def _apply_accumulate(
         self, readings: dict[str, ProbeReading],
     ) -> None:
-        """Fold per-probe aggregate coords into history + per-axis stats.
-
-        ``history`` stores the full coordinate tuple; ``_stats`` keeps
-        axis-0 scalar accumulators (TUI compat) plus per-axis ``sum`` /
-        ``sum_sq`` / ``min`` / ``max`` lists for the session's vectorized
-        :class:`ProbeReadings`.
-        """
+        """Fold per-probe aggregate coordinates into monitor history."""
         for name, reading in readings.items():
             if name not in self.history:
                 continue
             coords = reading.coords or (0.0,)
             self.history[name].append(tuple(coords))
-            s = self._stats[name]
-            s["count"] += 1
-            v0 = coords[0]
-            s["sum"] += v0
-            s["sum_sq"] += v0 * v0
-            if v0 < s["min"]:
-                s["min"] = v0
-            if v0 > s["max"]:
-                s["max"] = v0
-            # Per-axis accumulators (lazily sized to the coord rank).
-            axes = s.setdefault("axes", [])
-            for i, v in enumerate(coords):
-                if i >= len(axes):
-                    axes.append({"sum": 0.0, "sum_sq": 0.0,
-                                 "min": float("inf"), "max": float("-inf")})
-                a = axes[i]
-                a["sum"] += v
-                a["sum_sq"] += v * v
-                if v < a["min"]:
-                    a["min"] = v
-                if v > a["max"]:
-                    a["max"] = v
         self._pending_aggregate = True
 
     def accumulate_readings(
@@ -1835,18 +1957,6 @@ class Monitor:
                 previous[name] = 0.0
         return current, previous
 
-    def get_stats(self, name: str) -> dict[str, Any]:
-        return self._stats.get(name, self._empty_stats())
-
-    def axis_stats(self, name: str) -> list[dict[str, Any]]:
-        """Per-coordinate-axis accumulators for the vectorized readings.
-
-        ``[{sum, sum_sq, min, max}, ...]`` aligned with the coordinate
-        axes; empty until the probe has accumulated a reading.  The
-        session reads this for the per-axis :class:`ProbeReadings`.
-        """
-        return self._stats.get(name, {}).get("axes", [])
-
     def get_sparkline(self, name: str) -> str:
         blocks = " ▁▂▃▄▅▆▇█"
         # Axis-0 coordinate history (TUI compat).
@@ -1873,7 +1983,6 @@ class Monitor:
         self._invalidate_flat_cache()
         if is_new:
             self.history[name] = deque(maxlen=_MAX_HISTORY)
-            self._stats[name] = self._empty_stats()
 
     def remove_probe(self, name: str):
         self._probes.pop(name, None)
@@ -1881,8 +1990,6 @@ class Monitor:
         self._invalidate_flat_cache()
         if name in self.history:
             del self.history[name]
-        if name in self._stats:
-            del self._stats[name]
 
     def attached_probes(self) -> dict[str, "AttachedManifoldProbe"]:
         """Live attached-probe map (read-only view) — name → probe."""
@@ -1900,7 +2007,6 @@ class Monitor:
         """Drop every attached probe (TUI ``/unsteer``-style reset)."""
         self._probes.clear()
         self.history.clear()
-        self._stats.clear()
         self._whitener_factor_cache.clear()
         self._invalidate_flat_cache()
         self._pending_aggregate = False
@@ -1909,7 +2015,6 @@ class Monitor:
     def reset_history(self):
         for name in self._probes:
             self.history[name].clear()
-            self._stats[name] = self._empty_stats()
         self._pending_aggregate = False
         self._pending_per_token = False
 
@@ -2008,7 +2113,7 @@ class Monitor:
                 "pca_rotation": pca_rotation,
                 "explained_variance_pcs": ev_pcs,
                 "mahalanobis_share": float(
-                    manifold.mahalanobis_share.get(layer_idx, 0.0),
+                    manifold.mahalanobis_share[layer_idx],
                 ),
                 "overlay": overlay,
             }

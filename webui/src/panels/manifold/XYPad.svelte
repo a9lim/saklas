@@ -140,9 +140,10 @@
   }
   .axis-row {
     display: grid;
-    grid-template-columns: minmax(3em, auto) 1fr 3em;
+    grid-template-columns: minmax(3em, auto) minmax(0, 1fr) 3em;
     align-items: center;
     gap: var(--space-3);
+    min-width: 0;
   }
   .axis-name {
     color: var(--fg-muted);

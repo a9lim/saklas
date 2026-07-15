@@ -46,24 +46,23 @@ when you work in that directory. Consult them only when editing that layer.
 ## Commands
 
 ```bash
-pip install -e ".[dev]"                         # editable + pytest
+pip install -e ".[dev]"                         # editable + pytest + SAELens
 pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
 pip install -e ".[cuda]"                        # bitsandbytes + kernels (Linux/CUDA)
 pip install -e ".[cuda-experimental]"            # + flash-attn (Linux/CUDA)
-pip install -e ".[sae]"                         # SAELens-backed SAE extraction
 saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete|custom] [--system TEMPLATE] [--samples-per-prompt K] [--seed S]
 saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral] [--max-dim N] [--var-threshold T] [--description TEXT] [-f]   # derive a discover manifold from a standalone template
-saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto] [--max-dim N] [--min-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
-saklas manifold bake <name> <expression> [-m]    # shared grammar: "0.3 ns/a + 0.5 ns/b|ns/c"
+saklas manifold fit <name>|<folder> [-m MODEL] [--sae REL] [--layers L1,L2|workspace|all] [--method pca|spectral|auto] [--max-dim N] [--min-dim N] [--var-threshold T] [--k-nn K] [--bandwidth SIGMA] [--max-subspace-dim R] [--smoothing auto|0|LAMBDA] [--persistence-frac F]  # authored or discover-mode (hyperparams apply only to discover folders; --smoothing curved only, --persistence-frac auto only)
+saklas manifold bake <name> <expression> [-m]    # additive subset: "0.3 ns/a + 0.5 ns/b"
 saklas manifold merge <name> <src...> [-f]           # union discover-mode node corpora
 saklas manifold transfer <name> --from SRC --to TGT [-f]   # cross-model Procrustes
 saklas manifold compare <concepts...> -m MODEL [--ridge-scale R]
 saklas manifold why <concept> -m MODEL [-j]       # per-layer ||baked|| as a 16-bucket histogram
 saklas pack ls [-v|-j] | show <name> [-j]            # list / inspect manifolds
-saklas pack install <target> [-a NS/N] [-f]          # HF coord or local folder (also ports legacy saklas-packs)
+saklas pack install <target> [-a NS/N] [-f]          # HF coord or current local manifold folder
 saklas pack search <query> [-j|-v]                   # search HF hub for saklas-manifold repos
 saklas pack push <name> [-a OWNER/N] [-m MODEL] [--variant raw|sae|all]
 saklas pack rm <name> [-y]                           # remove folder (bundled respawns)
@@ -76,29 +75,34 @@ saklas experiment naturalness <model> "<prompt>" --manifold F -S EXPR  # behavio
 saklas template create <name> --slot TOKEN --values V... --contexts FILE [--description TEXT] [-f]
 saklas template ls [-j] | show <name> [-j] | rm <name> [-y]
 saklas template score <name> -m MODEL [-S EXPR] [--by sum|mean] [-j]   # restricted-choice value distribution
-saklas lens fit <model> [--corpus FILE] [--prompts N] [--seq-len T] [--dim-batch K] [-f]   # per-model Jacobian lens (backward passes; resumes by default)
-saklas lens show <model> [-j] | rm <model> [-y]
+saklas lens fit <model> [--corpus FILE] [--prompts N] [--seq-len T] [--dim-batch K] [--prompt-batch B] [-f]   # per-model Jacobian lens (backward passes; resumes by default)
+saklas lens fetch <model> [neuronpedia] | ls <model> | show <model> [source] | use <model> <source> | rm <model> [source] [-y]
 saklas lens top <model> "<prompt>" [-k K] [--layers L1,L2] [--position P] [-j]   # workspace readout on a raw prompt
 saklas lens decompose <selector> -m MODEL [-k K] [--layers L1,L2] [-j]   # J-space share + tokens of a direction
+saklas sae train <model> <name> [--corpus FILE] [--layer L] [--tokens N] [-f]
+saklas sae fetch <model> saelens:<release> [--layer L] | ls <model> | show <model> [source] | use <model> <source> | rm <model> [source] [-y]
 saklas config show [-c PATH ...] [--no-default] [-m MODEL]
 saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
 ```
 
-The root parser has exactly eight verbs: `tui`, `serve`, `manifold`, `pack`,
-`experiment`, `config`, `template`, `lens`. There is no `vector` alias. `manifold`
+The root parser has exactly nine verbs: `tui`, `serve`, `manifold`, `pack`,
+`experiment`, `config`, `template`, `lens`, `sae`. There is no `vector` alias. `manifold`
 is the unified compute surface
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); `pack` owns
 lifecycle and distribution (ls/show/install/search/push/rm/clear/refresh/export
 gguf), so install via `pack install` and export via `pack export gguf`; `template`
 owns the standalone templated-completion artifact (create/ls/show/score/rm — a slot
 + candidate values + multi-turn contexts, read by both the completion **scorer**
-and a `manifold from-template` fit); `lens` owns the per-model Jacobian-lens
-artifact (fit/show/top/decompose/rm — see "Jacobian lens" below). No `argv[0]`
+and a `manifold from-template` fit); `lens` owns local fitting plus source-aware
+lifecycle/readout (fit/fetch/ls/show/use/top/decompose/rm — see "Jacobian lens"
+below); `sae` owns the parallel local/external lifecycle
+(train/fetch/ls/show/use/rm). Both keep provider-owned payloads in provider
+caches and store only pinned bindings locally. No `argv[0]`
 peeking, no bare-TUI fallback —
 `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
 manifold` / `saklas pack` / `saklas experiment` / `saklas config` / `saklas
-template` / `saklas lens` print help and exit 0.
+template` / `saklas lens` / `saklas sae` print help and exit 0.
 
 Every subcommand that takes `-c/--config` auto-loads `~/.saklas/config.yaml`
 first, then composes explicit `-c` files on top (later overrides earlier). The
@@ -137,8 +141,11 @@ and `.` is used over `~` because HF repo names reject `~`.
 
 ## Steering expression grammar
 
-Every input surface — Python, YAML, HTTP, TUI, `manifold bake` — speaks the
-grammar in `saklas.core.steering_expr`. `parse_expr(text)` → `Steering`;
+Every live steering surface — Python, YAML, HTTP, and TUI — speaks the grammar
+in `saklas.core.steering_expr`. `manifold bake` parses the same syntax but accepts
+only namespace-qualified additive/subtractive scalar terms: dynamic `!`/`%`,
+triggers, multi-coefficients, and Mahalanobis `~`/`|` projections require a live
+model and are rejected offline. `parse_expr(text)` → `Steering`;
 `format_expr` round-trips it back.
 
 ```
@@ -147,7 +154,7 @@ term        := [coeff "*"?] ["!"] selector ["@" trigger]
 selector    := atom (("~" | "|") atom | "%" position)?
 position    := signed_num ("," signed_num)* | label
 label       := NAME                                # a manifold node label
-atom        := [ns "/"] NAME ["." NAME] [":" variant]
+atom        := [ns "/"] NAME ["." NAME] [":" variant] | "sae" "/" INT
 trigger     := preset | gate
 preset      := before | after | both | thinking | response | prompt | generated
 gate        := "when" ":" probe_atom op NUM        # op ∈ > >= < <=
@@ -155,6 +162,8 @@ probe_atom  := [ns "/"] NAME ["." NAME] ["[" INT "]"]  # vector probe (e.g. conf
                                                    # jlens/fake); optional coord axis (personas[3])
              | [ns "/"] NAME ":" "fraction"        # manifold subspace fraction
              | [ns "/"] NAME "@" NAME              # manifold label similarity
+             | "sae" "/" INT                       # resident SAE feature strength (activation /
+                                                   # Neuronpedia maxActApprox when cached; raw otherwise)
 ```
 
 `+`/`-` add terms, `*` attaches a coefficient (omit → 0.5), `~` projects onto a
@@ -167,8 +176,9 @@ that fires only on decode steps where the monitor reading satisfies the comparis
 
 Probe gates accept these identifier shapes against the merged scalars the session
 writes into `TriggerContext.probe_scores`. Every shape also takes an optional
-leading `<ns>/` segment — a J-lens token probe (`@when:jlens/fake > 0.4`, whitened
-coordinate along the lens direction; see "Jacobian lens") or a probe attached
+leading `<ns>/` segment — a J-lens token probe (`@when:jlens/fake > 0.01`, the
+readout-channel mean fitted-layer **probability** — strength, the probe's one
+channel; see "Jacobian lens") or a probe attached
 under a qualified selector (`@when:default/emotions@happy > -0.5`) — stored
 verbatim. Vector probes are concept names whose
 bare form reads coordinate axis 0 (`@when:confident.uncertain > 0.4`) and whose `[i]` form
@@ -278,61 +288,145 @@ The third artifact family, **per-model** rather than per-concept (Gurnee et al.,
 "Verbalizable Representations Form a Global Workspace in Language Models",
 Transformer Circuits 2026). The lens is one matrix per source layer,
 `J_l = E[∂h_final/∂h_l]` — the average first-order effect of a layer's residual
-on the final-layer residual over positions and a web-text corpus — stored at
-`models/<safe_model_id>/jlens.{safetensors,json}` (fp16, `LENS_FORMAT_VERSION = 1`,
-sidecar records the corpus spec + sha256). `lens fit` runs the estimator
-(`core/jlens.py::fit_jacobian_lens` — one forward per prompt with the prompt
-replicated `dim_batch`× and the graph retained, then `ceil(d_model/dim_batch)`
-backwards with one-hot cotangents at every valid target position; the **only**
+on the final-layer residual over positions and a web-text corpus — stored as
+immutable per-layer fp32 shards selected by
+Saklas-fitted lenses use `models/<safe_model_id>/jlens/local/default/manifest.json`
+(`LENS_FORMAT_VERSION = 6`, required exactly). Official Neuronpedia lenses stay
+in the Hugging Face cache behind a commit-pinned
+`jlens/bindings/neuronpedia.json`; `jlens/active.json` selects the runtime source.
+The sidecar records the immutable corpus spec + token-id
+sha256, exact source/live model identities, and one payload sha256 per layer.
+`lens fit` runs the estimator (`core/jlens.py::fit_jacobian_lens` — consecutive
+ragged prompts share one graph, then batched VJPs recover `dim_batch` output rows
+per backward without replicating the forward; unsupported batched VJPs fall back
+to exact replicated row batches; the **only**
 backward passes in saklas — everything else runs under `inference_mode`, so the
-fit seeds a grad leaf at the lowest source block's input via a pre-hook and
-reads per-layer grads from `torch.autograd.grad(final, sources)`, never
-`retain_grad`). Row blocks accumulate in on-device buffers with one host fold
-per prompt — never per pass — and on MPS the pass loop drains the command
+fit attaches transparent mean-position probe leaves at the requested source
+outputs (detaching the lowest one to cut the graph) and reads their already
+position-reduced `[dim_batch,B,D]` grads from
+`torch.autograd.grad(final, probes)`, never `retain_grad`). The final-block hook stops the forward before final norm + LM
+head. Row blocks transfer through byte-budgeted, allocation-adaptive stripes
+directly into the CPU accumulator; an OOM resumes at the first uncommitted row.
+On MPS the pass loop drains the command
 queue every few passes (`_MPS_SYNC_EVERY_PASSES`): Metal reports queue
 exhaustion as an *asynchronous* command-buffer error that silently zeroes the
 work rather than raising, so a fully unsynced loop corrupts the fit (a
-zero-row fold guard converts any escape into the dim_batch-halving retry).
+zero-row fold guard catches any escape).
 `--layers` restricts the fit to a source band and skips all forward *and*
 backward graph work below it. Fits resume by default (corpus-hash +
-source-layer match + checkpoint every 25 prompts); `-f` restarts.
+source-layer + token-id corpus + loaded-model fingerprint match + checkpoint
+every 25 prompts); the default FineWeb-Edu stream pins its Hub dataset commit,
+ordinary corpus extension resumes from a matching token-id prefix; `-f` restarts.
+Checkpoint cadence does not fracture prompt microbatches, and a complete terminal
+checkpoint is promoted durably rather than rewriting the full lens. Exact no-op
+recovery reaps a crash-left checkpoint only when the validated final artifact
+provably subsumes its semantics, layers, and effective prompt progress.
 
-Three read surfaces, one write surface:
+Three read surfaces over either source, plus local fit and external fetch:
 
 - **Readout** — `lens top` / `session.jlens_readout`: `softmax(W_U · norm(J_l h))`
   ranks the vocabulary by what an intermediate activation is disposed to make the
-  model say. `session.enable_live_lens()` streams the top-k per selected layer
-  every decode step (`TokenEvent.lens_readout`, TUI `/lens` → WORKSPACE section);
-  the reader consumes the capture's latest slices post-forward at the token tap —
-  no new forward hooks, so steering fast-path/compile eligibility is untouched.
+  model say. Every readout surface also carries the **layer-aggregated** view
+  (`core/jlens.py::aggregate_readout`, from the same logits — no extra matvec):
+  per-layer softmax calibrates away the cross-layer logit scale, then per token
+  `strength = mean_l p_l(v)` (mean fitted-layer probability, 0..1; uniform layer weights —
+  softmax already lets a confident layer dominate) and a depth center of mass
+  `com` (+ `spread`) weighted by the same per-layer probability `p_l(v)` — the
+  readout is sharp, not diffuse (median per-layer max ≈ 0.8 on gemma-3-4b),
+  and what changes over depth is *which* token leads, so a token's probability
+  profile over depth is its depth signal; one channel backs every readout
+  statistic (a former within-layer salience weighting handed a diffuse noise
+  layer's relative-top token a full vote).
+  Top-k selection runs on
+  the aggregated full-vocab strengths; depth CoM/spread are then computed only
+  for the selected tokens. A live step calibrates the full layer-vocabulary
+  logits once and shares that probability matrix across pinned probes,
+  per-layer cards, and this aggregate. The aggregate and per-layer matrix both
+  cover every requested fitted layer. `session.enable_live_lens()` streams the
+  same top-k width as the generation's logit-alternative readout per
+  selected layer plus the aggregate chip list every decode step
+  (`TokenEvent.lens_readout` / `TokenEvent.lens_aggregate`, TUI `/lens` →
+  WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's
+  latest slices post-forward at the token tap — no new forward hooks, so steering
+  fast-path/compile eligibility is untouched. The default live layer set is
+  **every fitted layer**, and `saklas serve` auto-enables the
+  live lens at startup when the artifact exists (serve-side policy; library +
+  TUI stay opt-in). The dashboard's **J-LENS tab** is
+  the server sibling. Its SOURCE section lists `local:default` and fetched
+  `neuronpedia` bindings, switches an existing source, fetches the official
+  artifact into the Hugging Face cache, or drives the background local fit
+  route `POST /saklas/v1/sessions/{id}/lens/fit` (all layers, polled,
+  cancellable); either successful preparation activates the source and turns
+  the live readout on. The SAE tab has the same SOURCE/STEER/PROBE shape:
+  prepared `local:<name>` / `saelens:<release>` sources, provider fetch/load,
+  or background local training with token progress and cancellation. When the
+  dashboard is served, Saklas restores an explicitly active SAE or attaches the
+  best compatible official provider release, then enables its live readout by
+  default; `--no-web` does not acquire or download an SAE implicitly.
+  `POST /saklas/v1/sessions/{id}/lens/live` toggles the live
+  lens, the native WS `token` frame carries the per-step matrix as
+  `lens_readout` + the chip list as `lens_aggregate`, and session info's
+  `live_lens_layers` rehydrates the toggle across reloads. The tab's STEER
+  section authors `α jlens/<word>` cards into the shared steering expression;
+  its **PROBE section is the merged workspace readout** — pinned
+  `jlens/<word>` token probes (persistent, gate-able; the ■ glyph unpins)
+  above the unpinned live top-k aggregate cards (□ pins), both the same
+  card shape (strength bar + per-layer strength strip + depth CoM chip),
+  one sort control, the card list scrolling under an anchored header +
+  add form, with the live-lens toggle in
+  the section header (live off ⇒ no per-step lens compute; pinned probes
+  settle to the end-of-gen aggregate). The CAA tab's PROBE section carries
+  the symmetric **live toggle** (`POST /saklas/v1/sessions/{id}/probes/live`
+  → `session.set_live_probe_scores`, rehydrated via session info's
+  `live_probe_scores`): off ⇒ per-token monitor scoring is disabled for
+  UI/trait/loom consumers (aggregate-only capture; gates still force the
+  subset they need), so a compute-constrained session can run with neither
+  family live.
   `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
   behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
   sessions/{id}/lens/token-readout`): rebuild the node's prompt render + raw
   decode prefix, one capture forward under the node's recipe steering (exact for
   always-active affine terms — the slide is position-independent; phase/gated
   terms don't reproduce on a bare forward), and read the full fitted-layer top-k
-  matrix at the position that produced the clicked token. On-demand recompute,
-  zero decode-time cost; `steered=false` reads the unsteered counterfactual.
+  matrix + the all-layer aggregate block at the position that produced the
+  clicked token. On-demand recompute, zero decode-time cost; `steered=false`
+  reads the unsteered counterfactual.
 - **Steering atoms** — `jlens/<word>` is an ordinary `ns/name` atom; the J-lens
   direction for vocab id v at layer l is `W_U[v] @ J_l`, a per-layer direction
   registered lazily into the profile registry (`session.register_jlens_direction`,
-  reached from both `ensure_profile_registered` and `_resolve_probe_manifold`)
-  and **restricted to the workspace band** (40–90% depth) — in the motor regime
-  the lens direction converges on the raw unembedding row, so pushing there is
-  token-forcing (live-verified to shatter into token loops at every α), and the
-  early third is noise. `0.3 jlens/orange` pushes, `!jlens/fake` ablates (the
+  reached from `ensure_profile_registered` — steering only; probes read the
+  readout channel instead, see **Probes + gates** below), across every fitted
+  layer. `0.3 jlens/orange` pushes, `!jlens/fake` ablates (the
   paper's eval-awareness ablation), and it composes with every other term.
   Lens atoms run **hotter** than concept vectors: on gemma-3-4b α≈0.3 is the
   coherent sweet spot and α≥0.5 over-steers into repetition (a single sharp
   token direction, not a distributed contrast). Single-token words only —
   a multi-token word raises `MultiTokenWordError` listing the pieces. The `jlens`
   manifold namespace is reserved (authoring under it raises).
-- **Gates** — `@when:jlens/<word> > x` attaches the direction as a rank-1 probe.
-  NOTE the semantics: the gate reads the saklas-native **whitened coordinate**
-  along the lens direction (one gate pipeline, whitener required), not the
-  paper's raw inner product — the paper-faithful raw readout is the top-k lens
-  channel, which is display-only. The `@when:` grammar also accepts a namespaced
-  probe on every channel shape (`default/emotions@happy`).
+- **Probes + gates** — a `jlens/<word>` probe is a **readout-channel** probe,
+  not a linear probe: `add_probe("jlens/<word>")` lands in the session
+  lens-probe registry (never the Monitor — no whitener involved, no direction
+  fold), and the reading is the token's standing in the paper-native
+  `softmax(W_U · norm(J_l h))` over all fitted layers. The reading is ONE
+  channel — `coords = (strength,)`, the **mean fitted-layer probability**
+  `mean_l p_l(v)` ∈ [0,1] (`@when:jlens/fake > 0.01`, the workspace card's
+  `strength`) — objective and apples-to-apples across tokens and layers
+  (a within-layer max normalization isn't; the depth-CoM mass is the same
+  `p_l`, so `p_l` is the one unit behind every lens statistic). The
+  synthesized `ProbeReading` carries the per-layer
+  `(p_l,)` trace; the live per-layer top-k wire also reports per-layer
+  softmax probabilities, so every lens surface reads the same unit.
+  Geometry fields are defaulted (`fraction`/
+  `residual` 0, `nearest` empty). Scoring is post-forward on the lens path:
+  per-step readings ride the live-lens step's own logits (zero extra matvecs),
+  gate scalars come from `session._score_lens_gate_scalars` in the gating
+  score callback (computed once per forward and stashed for the display step
+  to reuse), and the finalize aggregate pools the last content token from the
+  capture tail ring exactly like the monitor roster. A lens gate forces its
+  per-step lens computation regardless of the live toggles (a gate can't fire
+  on aggregates); a lens-only gate does NOT force per-token *monitor* scoring.
+  The `@when:` grammar also accepts a namespaced probe on every channel shape
+  (`default/emotions@happy`).
 - **Decomposition** — `lens decompose` / `session.jspace_decompose`: greedy
   sparse nonnegative pursuit of any steerable direction against the lens
   dictionary `W_U J_l` (never materialized; norm-normalized correlations,
@@ -343,15 +437,15 @@ Three read surfaces, one write surface:
 The fit needs a pretraining-like corpus: `--corpus FILE` (one document per
 line) or, unset, a streamed fineweb-edu sample via the optional `datasets`
 dependency (`pip install 'saklas[hf]'`). ~100 prompts is usable, 1000 is
-paper-parity. The fit is **compute-bound** — each prompt costs ~`d_model × 2`
-forward-equivalents of backward work, and total FLOPs are `--dim-batch`-
-invariant (measured flat on an M5 Max: 93.6/96.9/102.5 s/prompt at
-dim_batch 8/32/64 on gemma-3-4b, identical output — so a full-depth
-100-prompt fit is ~2.6 h, and the knob is a memory dial, not a speed dial).
-The real wall-time levers: `--layers` (a 40–90% workspace-band fit measures
-1.73× faster at 54s/prompt and shrinks the artifact proportionally),
-`--seq-len` (≈linear), or fitting on a CUDA box and letting the per-model
-artifact ride over.
+paper-parity. The fit is **compute-bound** and total backward FLOPs are
+approximately `--dim-batch`-invariant; that knob is principally a memory dial.
+The older replicated, one-prompt M5 Max reference measured 93.6/96.9/102.5
+s/prompt at dim_batch 8/32/64 and 54 s/prompt for a workspace-band fit, but
+those absolute times predate batched VJPs and prompt microbatching. The current
+checked-in workspace benchmark measures two prompts in 49.08 s at
+prompt_batch=2. The real wall-time levers remain `--layers`, `--seq-len`
+(≈linear), prompt batching, or fitting on a CUDA box and letting the artifact
+ride over.
 
 ## Extraction
 
@@ -520,11 +614,22 @@ webui builder (`io.manifold_authoring.create_manifold_folder` /
 `POST .../fit` all run `ManifoldExtractionPipeline`: pool each node's centroid,
 embed coords through the domain (or derive them for discover mode), fit a per-layer
 subspace (flat `fit_affine_subspace` for `fit_mode=pca`, curved
-`fit_layer_subspace` for authored/spectral — whitened/Fisher PCA basis when the
-whitener covers all fit layers, ordinary PCA otherwise), bake the per-layer
+`fit_layer_subspace` for authored/spectral — Mahalanobis/Fisher PCA; the whitener
+must cover every selected layer), bake the per-layer
 Mahalanobis share, write the per-model tensor. `--sae <release>` reconstructs each
-centroid through the SAE before the fit; the fitted subspace is always model-space
-so the hook never touches the SAE. `min_nodes(n) = 2n+1` for a curved fit (a flat
+centroid through the SAE before the fit; SAE weights load one layer at a time and
+the fitted subspace is always model-space, so the hook never touches the SAE.
+Discover fit-mode/hyperparameter overrides are merged into `manifold.json`
+inside the same manifest lock that derives the cache key and publishes the fit;
+CLI/server callers never perform an unlocked pre-fit rewrite.
+Capture is tokenized/length-bucketed once, terminates at the last requested
+transformer block, and writes curved-fit rows to a source-dtype layer-major spool;
+geometry-only refits reuse a digested, size-bounded token-exact per-model
+activation cache. Its v4 centroid/row payloads are per-layer shards, so scoped
+reads touch only requested layers and disjoint top-ups write only new shards;
+eviction waits for any active victim transaction. `--layers`
+can restrict the artifact to explicit indices or the workspace band.
+`min_nodes(n) = 2n+1` for a curved fit (a flat
 `pca` fit needs only `k+1`); authored nodes must be *poised* (affinely span the
 embedding).
 
@@ -731,14 +836,46 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 Key contracts:
 - `generate` / `generate_stream` / `session.steering()` accept `str | Steering |
   None` only — dicts raise `TypeError`. A string is a steering expression.
+- **Cast model** (`core/scene.py`, `docs/plans/dynamic-roles.md`): rendering
+  goes through the per-session **scene grammar** (template autopsy +
+  byte-exact round-trip validation; `session.scene_grammar`, None = legacy
+  fallback). `generate(..., gen_seat="user")` has the model speak the user
+  seat (node lands `role="user"` with a recipe — generated is provenance,
+  not a seat); `generate(None, ...)` continues from the current leaf with no
+  committed turn (a/a, u/u sequences); per-turn `role_label`s are cast
+  labels. Seats stay binary; arbitrary seat *sequences* and labels are free
+  on validated families (gemma-2/3/4, llama, qwen, talkie), raw-marker
+  fallback otherwise. WS: `generate_seat` on the generate frame.
+  **Cast roster** (phase 3): `LoomTree.cast` maps label → `CastMember`
+  (`recipe` + `notes`; `session.set_cast_member(label, steering=…)`
+  validates the expression at authoring time). At generation the gen
+  label's member recipe is the *weakest* tier — fills only unset call
+  kwargs (`steering=""` = explicit unsteered; sampling merges field-wise
+  via `merged_with`; regen overrides still win) — and the effective
+  values are what land on the node's Recipe. Rides tree save (additive
+  `cast` key, still `tree_format` 1) and transcript v2. A steering scope
+  whose role baseline differs from the send's `assistant_role` warns
+  (`RoleBaselineMismatchWarning`; the steering role still wins).
+  **Committed thinking**: `LoomNode.thinking_text` (commits via
+  `append_*_turn(thinking=…)` / WS `commit_thinking`; generated nodes
+  stamped at finalize when the family's think delimiters can re-render
+  it) rides `messages_for(with_labels=True)` as a `"thinking"` key and
+  renders through the stitcher under the family history policy; commit
+  is refused up front (`SceneThinkingUnsupportedError`) on families
+  that can't carry it. Generating into a non-assistant seat appends the
+  seat's close segment as a stop string when it differs from the
+  assistant's (convention 2; shared-terminator families add nothing).
+  Transcript schema is **v2** (`speaker:`/`thinking:` per turn + `cast:`
+  block; v1 files still load; import re-attaches recipe-bearing turns
+  as generated nodes in their recorded seat).
 - `generate`, `generate_batch`, `generate_sweep` always return `RunSet` — list-like,
   carrying `node_ids`/`grid`, with `.first` (the underlying `GenerationResult`) and
   common attributes delegating to it. `session.last_result` is the `GenerationResult`.
 - `extract()` returns `(name, Profile)`; the `Profile` is the folded view of the
   2-node manifold. `extract_vector_from_corpora` is the corpus-in sibling;
   `fit(folder)` fits a multi-node manifold and returns a `Manifold`;
-  `bake(name, expression)` lands a corpus-less baked manifold from a steering
-  expression (the mirror of `manifold bake`). `Profile` wraps `dict[int, Tensor]`
+  `bake(name, expression)` lands a corpus-less baked manifold from qualified
+  additive scalar terms (the mirror of `manifold bake`). `Profile` wraps `dict[int, Tensor]`
   (mapping interface plus `layers`, `metadata`, `save`/`load`, `merged`,
   `projected_away`, `cosine_similarity`).
 - `session.score_choices(messages, choices, *, assistant_prefix="", steering=None)`
@@ -793,10 +930,8 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
                                        # probe-centering mean is its per-layer X.mean(0),
                                        # the whitener covariance is built from the stack
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
-    jlens.{safetensors,json}           # per-model Jacobian lens (fp16 J_l per
-                                       # layer + corpus-spec sidecar; `lens fit`)
-  vectors/<ns>/<concept>/              # LEGACY (pre-4.0) packs only — ported to
-                                       # manifolds/ on first touch; no longer written
+    jlens.json                         # atomic per-model Jacobian-lens pointer
+    jlens.layer-*.gen-*.safetensors    # immutable fp32 J_l layer shards (`lens fit`)
   conversations/<name>.json            # explicit loom-tree saves (no autosave)
 ```
 
@@ -807,10 +942,8 @@ at most one kind per file (no `pca` suffix). `tensor_filename` /
 `parse_tensor_filename` in `io/paths.py` round-trip these (plus a `_role-<slug>`
 form that isn't emitted yet — `extract --role` bakes the role into the corpus and
 writes the canonical tensor).
-`materialize_bundled_manifolds()` is copy-on-miss. A pre-4.0 `vectors/` pack
-(`pack.json.format_version < PACK_FORMAT_VERSION = 3`) is *legacy*: ported to a
-2-node `pca` manifold on first steer touch (`_port_stale_legacy_vector` /
-`scripts/upgrade_packs.py`) and re-fit lazily.
+`materialize_bundled_manifolds()` is copy-on-miss. Current artifacts live only
+under `manifolds/`.
 
 ## Performance invariants
 
@@ -853,7 +986,9 @@ tok/s):
 - **Monitor capture is hook-driven**, inline with generation — no second forward
   pass. The unified `Monitor` reads every probe — flat or curved — as a whitened
   **coordinate**, emitting a full `ProbeReading` (`coords` domain-frame + `fraction`
-  + `nearest` + `residual`, plus per-layer traces). The full-reading *shape* is the
+  + `nearest` + `residual`, plus per-layer traces, plus the per-axis depth stats
+  `depth_com`/`depth_spread` — the share-weighted `Σ_L depth_L·share_L·|coord_L|`
+  center of mass of where in the stack the probe reads, normalized 0..1). The full-reading *shape* is the
   research-tool priority; execution is no-redundancy: the whole **flat** roster is
   scored together (`_score_flat_batched` — one `Σ⁻¹h` Woodbury apply + block-diagonal
   matmuls + a single host transfer per layer), **curved** probes run the per-probe

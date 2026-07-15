@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "4.2.0"
+__version__ = "5.0.0"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "SaklasSession": ("saklas.core.session", "SaklasSession"),
@@ -37,6 +37,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "LoomNode": ("saklas.core.loom", "LoomNode"),
     "LoomMutated": ("saklas.core.loom", "LoomMutated"),
     "Recipe": ("saklas.core.loom", "Recipe"),
+    "CastMember": ("saklas.core.loom", "CastMember"),
     "LoomTreeError": ("saklas.core.loom", "LoomTreeError"),
     "UnknownNodeError": ("saklas.core.loom", "UnknownNodeError"),
     "InvalidNodeOperationError": ("saklas.core.loom", "InvalidNodeOperationError"),
@@ -110,6 +111,7 @@ __all__ = [
     "LoomNode",
     "LoomMutated",
     "Recipe",
+    "CastMember",
     "LoomTreeError",
     "UnknownNodeError",
     "InvalidNodeOperationError",
@@ -180,6 +182,7 @@ if TYPE_CHECKING:
         VectorExtracted as VectorExtracted,
     )
     from saklas.core.loom import (
+        CastMember as CastMember,
         InvalidNodeOperationError as InvalidNodeOperationError,
         LoomMutated as LoomMutated,
         LoomNode as LoomNode,

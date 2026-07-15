@@ -61,6 +61,9 @@
     if (value < 0) return "var(--accent-red)";
     return "var(--fg-muted)";
   });
+
+  // Per-instance gradient id so multiple bars on one page don't collide.
+  const uid = $props.id();
 </script>
 
 <svg
@@ -71,8 +74,16 @@
   preserveAspectRatio="none"
   aria-hidden="true"
 >
+  <defs>
+    <linearGradient id={uid} x1="0" y1="0" x2="0" y2="1">
+      <!-- style= not stop-color=: the attribute form doesn't reliably
+           resolve var()/color-mix; the CSS property does. -->
+      <stop offset="0" style="stop-color: color-mix(in srgb, {fill} 80%, white)" />
+      <stop offset="1" style="stop-color: {fill}" />
+    </linearGradient>
+  </defs>
   <rect x="0" y="0" {width} {height} class="track" />
-  <rect x={fillX} y="0" width={filled} {height} fill={fill} class="fill" />
+  <rect x={fillX} y="0" width={filled} {height} fill="url(#{uid})" class="fill" />
   {#if bipolar}
     <!-- Center tick so users can read sign at a glance even when value
          is exactly 0 (no fill rectangle to anchor the eye). -->
@@ -95,15 +106,35 @@
       stroke-width="0.5"
     />
   {/if}
+  <!-- The high-contrast perimeter keeps the full scale visible while the
+       darker track interior stays distinct from every family fill. -->
+  <rect
+    x="0.5"
+    y="0.5"
+    width={Math.max(0, width - 1)}
+    height={Math.max(0, height - 1)}
+    class="track-outline"
+  />
 </svg>
 
 <style>
   .bar {
     display: inline-block;
     vertical-align: middle;
+    /* Rounded ends via CSS clip on the element box — an SVG rect ``rx``
+     * would distort under preserveAspectRatio="none", this doesn't. */
+    border-radius: 2px;
+    overflow: hidden;
   }
   .track {
-    fill: var(--bg-elev);
+    fill: var(--data-track-fill);
+  }
+  .track-outline {
+    fill: none;
+    stroke: var(--data-track);
+    stroke-width: 1px;
+    vector-effect: non-scaling-stroke;
+    pointer-events: none;
   }
   .fill {
     /* Animate both x and width together — the bipolar bar encodes

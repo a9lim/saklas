@@ -33,7 +33,7 @@ from typing import Any, TYPE_CHECKING
 from saklas import Recipe, SamplingConfig, Steering
 from saklas.core.errors import SaklasError
 from saklas.io.selectors import AmbiguousSelectorError
-from saklas.tui.chat_panel import PendingItem
+from saklas.tui.chat_panel import PendingFan, PendingRegenN
 
 if TYPE_CHECKING:
     from saklas.tui.app import SaklasApp
@@ -43,6 +43,12 @@ class LoomController:
     """Owns the loom slash/worker logic + the auto-regen / prune mode state."""
 
     _AUTO_REGEN_MODES = ("unsteered", "inverted", "reseed", "cool", "hot")
+
+    def set_prune_expr(self, expression: str | None) -> None:
+        self._loom_prune_expr = expression
+
+    def set_auto_regen_enabled(self, enabled: bool) -> None:
+        self._loom_auto_regen_on = enabled
 
     def __init__(self, app: "SaklasApp") -> None:
         self._app = app
@@ -71,7 +77,7 @@ class LoomController:
 
         Esc on the loom screen pops back to the chat screen.  Mutations
         from the loom screen flow into ``session.tree`` directly; the
-        chat screen's `_messages` property (a derived view) picks them
+        chat screen's session-history reads pick them
         up on the next render.
         """
 
@@ -312,7 +318,7 @@ class LoomController:
         # We need a prompt to regen from; if there isn't one yet, lift
         # it off the active path.
         if not prompt:
-            hist = app._messages
+            hist = app._session.tree.messages_for()
             if hist and hist[-1]["role"] == "user":
                 prompt = hist[-1]["content"]
         if not prompt:
@@ -325,7 +331,7 @@ class LoomController:
         if app._is_busy:
             display_text = f"/fan {vector} ({len(alphas)} α)"
             app._enqueue_pending(
-                PendingItem("fan", display_text, (vector, alphas, prompt))
+                PendingFan(display_text, vector, tuple(alphas), prompt)
             )
             return
         # Through the App attr so a test that monkeypatches
@@ -417,7 +423,7 @@ class LoomController:
         if app._is_busy:
             mode_tag = f" {mode}" if isinstance(mode, str) else ""
             app._enqueue_pending(
-                PendingItem("regen_n", f"/regen {n}{mode_tag}", (n, mode))
+                PendingRegenN(f"/regen {n}{mode_tag}", n, mode)
             )
             return
         if mode is not None:
@@ -474,7 +480,7 @@ class LoomController:
         app = self._app
         chat = app._chat_panel
         # Read prompt off the active path.
-        hist = app._messages
+        hist = app._session.tree.messages_for()
         prompt = None
         if hist and hist[-1]["role"] == "user":
             prompt = hist[-1]["content"]

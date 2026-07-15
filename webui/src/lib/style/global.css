@@ -5,12 +5,18 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
-  background: var(--bg);
+  /* The Observatory ambient: a faint blue-violet field high off-canvas
+   * plus a violet breath at the lower corner. Material, not data —
+   * everything readable sits on panels above it. */
+  background:
+    radial-gradient(1200px 560px at 72% -12%, rgba(103, 116, 190, 0.09), transparent 60%),
+    radial-gradient(900px 480px at 6% 108%, rgba(167, 139, 250, 0.05), transparent 65%),
+    var(--bg);
   color: var(--fg);
   font-family: var(--font-ui);
   font-size: var(--text);
+  font-weight: var(--weight-normal);
   letter-spacing: 0;
-  font-variation-settings: "MONO" 0, "CASL" 0;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -32,15 +38,25 @@ button {
   letter-spacing: 0;
 }
 
+/* Data speaks mono — the family switch alone flips the MONO axis (pinned
+ * per-family in fonts.css), so no font-variation-settings needed here. */
 code,
 pre {
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: rgba(237, 239, 247, 0.22);
 }
 
 :focus-visible {
-  outline: 2px solid var(--accent-glow);
+  /* One release-wide keyboard contract. `!important` is intentional: a
+   * number of dense legacy fields locally clear `outline`, and a missing
+   * focus indicator is never an acceptable component-level variation. */
+  outline: 2px solid var(--focus-ring) !important;
   outline-offset: 2px;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -58,12 +74,57 @@ pre {
   height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--bg-alt);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-pill);
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--fg-muted);
+}
+/* Delegated title surface. `lib/tooltips.ts` suppresses the native desktop
+ * bubble during hover/focus and positions this one shared floating layer. */
+.saklas-tooltip {
+  position: fixed;
+  z-index: calc(var(--z-modal) + 20);
+  max-width: min(320px, calc(100vw - 16px));
+  padding: 5px 8px 6px;
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-elev) 96%, transparent);
+  box-shadow: var(--shadow-overlay);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variation-settings: "MONO" 1, "CASL" 0;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, calc(-100% - 2px)) scale(0.98);
+  transform-origin: 50% 100%;
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+
+.saklas-tooltip.visible {
+  opacity: 1;
+  transform: translate(-50%, -100%) scale(1);
+}
+
+.saklas-tooltip.below {
+  transform: translate(-50%, 2px) scale(0.98);
+  transform-origin: 50% 0;
+}
+
+.saklas-tooltip.below.visible {
+  transform: translate(-50%, 0) scale(1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .saklas-tooltip { transition: none; }
 }

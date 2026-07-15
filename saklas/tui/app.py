@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 import queue
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Literal, TYPE_CHECKING, overload
 
 import torch
@@ -19,6 +20,9 @@ from textual import events as _textual_events
 from saklas import Recipe, SamplingConfig, Steering
 from saklas.core.errors import SaklasError
 from saklas.core.generation import supports_thinking, thinking_is_optional
+from saklas.core.results import TokenAlt
+from saklas.core.steering import AlphaEntry
+from saklas.core.steering_expr import ManifoldTerm
 from saklas.io.paths import saklas_home
 from saklas.io.probes_bootstrap import load_default_manifolds as load_defaults
 from saklas.core.results import ResultCollector
@@ -29,7 +33,22 @@ from saklas.tui.chat_panel import (
     _KIND_ENDS_ON_USER_NODE,
     ChatInput,
     ChatPanel,
+    PendingClear,
+    PendingCommitAssistant,
+    PendingCommitUser,
+    PendingExtract,
+    PendingFan,
     PendingItem,
+    PendingManifoldFit,
+    PendingProbe,
+    PendingQuit,
+    PendingRawCommit,
+    PendingRawContinue,
+    PendingRegenerate,
+    PendingRegenN,
+    PendingRewind,
+    PendingSteer,
+    PendingSubmit,
     RawBuffer,
     _AssistantMessage,
     _RawTextArea,
@@ -39,6 +58,7 @@ from saklas.tui.vector_panel import LeftPanel, MAX_ALPHA
 from saklas.tui.trait_panel import TraitPanel
 
 if TYPE_CHECKING:
+    from saklas.core.results import ProbeReading
     from saklas.core.session import SaklasSession
     from saklas.tui.extraction_controller import ExtractionController
     from saklas.tui.input_history_controller import InputHistoryController
@@ -47,6 +67,46 @@ if TYPE_CHECKING:
 DEFAULT_ALPHA = 0.5
 _POLL_FPS = 15
 _TOKEN_DRAIN_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class _UiToken:
+    """One exact token event crossing the generation-thread/UI boundary."""
+
+    text: str
+    thinking: bool
+    perplexity: float | None
+    logprob: float | None
+    widget: RawBuffer | _AssistantMessage
+    shadow: bool
+    probe_readings: dict[str, "ProbeReading"] | None = None
+    lens_readout: dict[int, list[tuple[str, float]]] | None = None
+    lens_aggregate: list[tuple[str, float, float, float]] | None = None
+
+
+@dataclass(frozen=True)
+class _UiFinalize:
+    widget: RawBuffer | _AssistantMessage
+    shadow: bool
+
+
+@dataclass(frozen=True)
+class _UiError:
+    message: str
+    shadow: bool
+
+
+@dataclass(frozen=True)
+class _UiDone:
+    shadow: bool
+
+
+_UiQueueItem = (
+    _UiToken
+    | _UiFinalize
+    | _UiError
+    | _UiDone
+)
 
 _LEFT, _CHAT, _TRAIT = 0, 1, 2
 
@@ -206,13 +266,6 @@ class SaklasApp(App[None]):
     ) -> None:
         super().__init__(ansi_color=True, **kwargs)
         self._session = session
-        # ``_messages`` was a direct reference to ``session._history`` in
-        # v2.2 — a shared mutable list.  Under v2.3 the conversation lives
-        # in :class:`~saklas.core.loom.LoomTree`; ``session.history`` is a
-        # derived view.  We expose the same shape (``list[dict]``) as a
-        # property; the four pop-sites that mutated it in v2.2 now route
-        # through :meth:`_rewind_active_assistant` so the tree stays
-        # consistent with the visible state.
         self._device_str = str(session.device)
 
         # Steering / probe extraction lives on :class:`ExtractionController`;
@@ -295,7 +348,7 @@ class SaklasApp(App[None]):
         self._get_loom_controller()
         # UI-side gen flag.  Tracks the *TUI's* gen lifecycle, which differs
         # slightly from the session's: the TUI counts a gen as "still going"
-        # until the ``("done",)`` sentinel lands on the local ``_ui_token_queue``
+        # until the `_UiDone` event lands on the local ``_ui_token_queue``
         # (see ``_poll_generation``), even after the session has already
         # returned to ``GenState.IDLE``.  Use ``self._session.is_generating``
         # for "is the engine running right now?" — this flag is for UI-only
@@ -312,7 +365,7 @@ class SaklasApp(App[None]):
         self._highlighting: bool = True
         self._highlight_probe: str | None = SURPRISE_PROBE
         self._default_seed: int | None = None
-        self._ui_token_queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._ui_token_queue: queue.SimpleQueue[_UiQueueItem] = queue.SimpleQueue()
 
         self._gen_start_time: float = 0.0
         self._gen_token_count: int = 0
@@ -336,9 +389,8 @@ class SaklasApp(App[None]):
     # The steering/probe extraction state + handlers and the input-history
     # ring + pending queue live on two plain controllers composed onto this
     # App.  ``__init__`` wires them; the ``__new__``-bypassing test stubs (and
-    # any caller) get one built on first touch via these factories — the same
-    # lazy pattern ``SaklasSession._get_steering_composer`` uses — so the proxy
-    # properties below resolve before a full ``__init__`` has run.  Imported
+    # any caller) get one built on first touch via these factories, so the proxy
+    # properties below resolve before a full ``__init__`` has run. Imported
     # lazily to break the import cycle (both controllers reference this module).
 
     def _get_extraction_controller(self) -> "ExtractionController":
@@ -375,28 +427,16 @@ class SaklasApp(App[None]):
     # dicts the moved ``_handle_*`` handlers mutate.
 
     @property
-    def _alphas(self) -> dict[str, float]:
-        return self._get_extraction_controller()._alphas
-
-    @_alphas.setter
-    def _alphas(self, value: dict[str, float]) -> None:
-        self._get_extraction_controller()._alphas = value
+    def _alphas(self) -> Mapping[str, float]:
+        return self._get_extraction_controller().alphas
 
     @property
-    def _enabled(self) -> dict[str, bool]:
-        return self._get_extraction_controller()._enabled
-
-    @_enabled.setter
-    def _enabled(self, value: dict[str, bool]) -> None:
-        self._get_extraction_controller()._enabled = value
+    def _enabled(self) -> Mapping[str, bool]:
+        return self._get_extraction_controller().enabled
 
     @property
-    def _manifold_terms(self) -> dict[str, Any]:
-        return self._get_extraction_controller()._manifold_terms
-
-    @_manifold_terms.setter
-    def _manifold_terms(self, value: dict[str, Any]) -> None:
-        self._get_extraction_controller()._manifold_terms = value
+    def _manifold_terms(self) -> Mapping[str, ManifoldTerm]:
+        return self._get_extraction_controller().manifold_terms
 
     # -- Input-history / pending-queue proxies (own: InputHistoryController)
     #
@@ -409,41 +449,21 @@ class SaklasApp(App[None]):
     def _input_history(self) -> list[str]:
         return self._get_input_history_controller()._input_history
 
-    @_input_history.setter
-    def _input_history(self, value: list[str]) -> None:
-        self._get_input_history_controller()._input_history = value
-
     @property
     def _history_index(self) -> int | None:
         return self._get_input_history_controller()._history_index
-
-    @_history_index.setter
-    def _history_index(self, value: int | None) -> None:
-        self._get_input_history_controller()._history_index = value
 
     @property
     def _history_stash(self) -> str:
         return self._get_input_history_controller()._history_stash
 
-    @_history_stash.setter
-    def _history_stash(self, value: str) -> None:
-        self._get_input_history_controller()._history_stash = value
-
     @property
     def _pulled_slot(self) -> int | None:
         return self._get_input_history_controller()._pulled_slot
 
-    @_pulled_slot.setter
-    def _pulled_slot(self, value: int | None) -> None:
-        self._get_input_history_controller()._pulled_slot = value
-
     @property
-    def _pending_queue(self) -> list[PendingItem]:
-        return self._get_input_history_controller()._pending_queue
-
-    @_pending_queue.setter
-    def _pending_queue(self, value: list[PendingItem]) -> None:
-        self._get_input_history_controller()._pending_queue = value
+    def _pending_queue(self) -> tuple[PendingItem, ...]:
+        return tuple(self._get_input_history_controller()._pending_queue)
 
     # -- Loom-state proxies (own: LoomController) -------------------------
     #
@@ -457,38 +477,13 @@ class SaklasApp(App[None]):
     def _loom_prune_expr(self) -> str | None:
         return self._get_loom_controller()._loom_prune_expr
 
-    @_loom_prune_expr.setter
-    def _loom_prune_expr(self, value: str | None) -> None:
-        self._get_loom_controller()._loom_prune_expr = value
-
     @property
     def _loom_auto_regen_mode(self) -> "str | Recipe":
         return self._get_loom_controller()._loom_auto_regen_mode
 
-    @_loom_auto_regen_mode.setter
-    def _loom_auto_regen_mode(self, value: "str | Recipe") -> None:
-        self._get_loom_controller()._loom_auto_regen_mode = value
-
     @property
     def _loom_auto_regen_on(self) -> bool:
         return self._get_loom_controller()._loom_auto_regen_on
-
-    @_loom_auto_regen_on.setter
-    def _loom_auto_regen_on(self, value: bool) -> None:
-        self._get_loom_controller()._loom_auto_regen_on = value
-
-    @property
-    def _messages(self) -> list[dict[str, str]]:
-        """Compat shim — derived view over the loom tree's active path.
-
-        v2.2 had ``self._messages = session._history`` as a shared list
-        reference; v2.3's tree-backed history returns a fresh list per
-        access.  Reads that took ``[-1]`` or truthiness checks work
-        unchanged; the four pop-sites in regen/rewind paths now route
-        through :meth:`_rewind_active_assistant` instead of mutating
-        this property's return.
-        """
-        return self._session.history
 
     def _rewind_active_assistant(self) -> bool:
         """Move the loom tree's active pointer up one assistant turn.
@@ -497,8 +492,8 @@ class SaklasApp(App[None]):
         rewound; ``False`` when there's nothing to rewind.  Non-
         destructive — the rewound assistant stays in the tree as a now-
         dead branch, navigable via the loom sidebar / screen.  Replaces
-        v2.2's ``self._messages.pop()`` of a trailing assistant turn at
-        regen / rewind sites.
+        Direct list mutation of a trailing assistant turn at regen / rewind
+        sites would desynchronize the tree, so these paths navigate instead.
         """
         tree = self._session.tree
         active = tree.nodes.get(tree.active_node_id)
@@ -509,7 +504,7 @@ class SaklasApp(App[None]):
         tree.navigate(active.parent_id)
         return True
 
-    def _active_alphas(self) -> dict[str, Any]:
+    def _active_alphas(self) -> dict[str, AlphaEntry]:
         """Enabled steering entries for generation — derived off the
         controller's ``_alphas`` / ``_manifold_terms`` / ``_enabled``."""
         return self._get_extraction_controller()._active_alphas()
@@ -520,7 +515,7 @@ class SaklasApp(App[None]):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main-area"):
-            yield LeftPanel(self._session.model_metadata, id="left-panel")
+            yield LeftPanel(self._session.model_info, id="left-panel")
             yield ChatPanel(id="chat-panel")
             yield TraitPanel(categories=self._probe_categories, id="trait-panel")
 
@@ -554,7 +549,7 @@ class SaklasApp(App[None]):
 
         loaded = (
             f"Model loaded: "
-            f"{self._session.model_metadata.get('model_id', 'unknown')}. "
+            f"{self._session.model_info.get('model_id', 'unknown')}. "
         )
         if self._is_base_model:
             loaded += (
@@ -693,9 +688,7 @@ class SaklasApp(App[None]):
         # ``Ctrl+U``, hit ``Enter`` and the slot is removed.  The
         # symmetric "back out without removing" gesture is ``Esc``
         # (handled in ``action_stop_generation``).
-        replace_slot = self._pulled_slot
-        self._pulled_slot = None
-        self._sync_pull_state()
+        replace_slot = self._get_input_history_controller().release_pulled_slot()
         if not text:
             # Reached us only via the pulled-slot cancel path
             # (``ChatInput.allow_empty_submit=True``).  Remove the
@@ -743,7 +736,7 @@ class SaklasApp(App[None]):
             else:
                 queued_target = prefill_target
             self._enqueue_pending(
-                PendingItem("submit", text, (queued_target,)),
+                PendingSubmit(text, queued_target),
                 replace_slot=replace_slot,
             )
             return
@@ -867,7 +860,7 @@ class SaklasApp(App[None]):
             "  /alpha <val> <name>         — adjust existing alpha\n"
             "  /unsteer <name|ns/>         — remove vector(s)\n"
             "Probes:\n"
-            "  /probe <concept>            — add probe (highlight on)\n"
+            "  /probe <selector>           — add any fitted probe (highlight on)\n"
             "  /probe <ns>/                — bulk add namespace as probes\n"
             "  /unprobe <name|ns/>         — remove probe(s)\n"
             "  /extract <concept>          — cache-warm; --role <slug> for role-aug.\n"
@@ -876,8 +869,6 @@ class SaklasApp(App[None]):
             "Manifold:\n"
             "  /steer <c> manifold%x,y     — steer toward a manifold point\n"
             "  /manifold fit <folder>      — fit a manifold pack folder\n"
-            "  /manifold-probe <selector>  — attach a read-side manifold probe\n"
-            "  /manifold-probe-remove <n>  — detach an attached probe\n"
             "Highlight:\n"
             "  ⌃Y / ⌃⇧Y                    — cycle {off → probe → surprise}\n"
             "Commit (no-gen send):\n"
@@ -1015,12 +1006,6 @@ class SaklasApp(App[None]):
     def _handle_manifold(self, text: str) -> None:
         self._get_extraction_controller()._handle_manifold(text)
 
-    def _handle_manifold_probe(self, text: str) -> None:
-        self._get_extraction_controller()._handle_manifold_probe(text)
-
-    def _handle_manifold_probe_remove(self, text: str) -> None:
-        self._get_extraction_controller()._handle_manifold_probe_remove(text)
-
     def _handle_pairs(self, text: str) -> None:
         self._get_extraction_controller()._handle_pairs(text)
 
@@ -1028,11 +1013,6 @@ class SaklasApp(App[None]):
         # Drained from the pending queue by ``_dispatch_pending_action`` for a
         # ``manifold_fit`` item (the deferred ``/manifold fit`` path).
         self._get_extraction_controller()._start_manifold_fit(folder_arg)
-
-    def _start_manifold_probe_attach(self, selector: str) -> None:
-        # Drained from the pending queue by ``_dispatch_pending_action`` for a
-        # ``manifold_probe`` item (the deferred ``/manifold-probe`` path).
-        self._get_extraction_controller()._start_manifold_probe_attach(selector)
 
     def _start_pairs_extract(
         self, name: str, pairs: list[tuple[str, str]],
@@ -1056,7 +1036,7 @@ class SaklasApp(App[None]):
         Errors surface through ``_steer_status`` — ``SaklasError`` via its
         ``user_message()``, ``ValueError`` as a bare string, anything else
         as ``"<Type>: <msg>"`` — and the ``finally`` block enqueues a
-        ``("done", False)`` sentinel so the pending-queue drain keeps
+        `_UiDone(False)` event so the pending-queue drain keeps
         advancing (these handlers run off the gen loop, so no natural
         ``done`` arrives).  Pass ``on_error`` to override the default
         error surfacing entirely.
@@ -1083,7 +1063,7 @@ class SaklasApp(App[None]):
                         self._steer_status, f"{type(e).__name__}: {e}"
                     )
             finally:
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_worker, thread=True)
 
@@ -1091,7 +1071,7 @@ class SaklasApp(App[None]):
         self._chat_panel.add_system_message(msg)
 
     def _on_probe_added(self, name: str) -> None:
-        self._trait_panel.set_active_probes(set(self._session.monitor.probe_names))
+        self._refresh_probe_panels()
         # Per-token highlight default-on when a probe is explicitly added
         # via /probe. Seed to this probe; Ctrl+Y cycles the mode.
         self._highlight_probe = name
@@ -1103,32 +1083,20 @@ class SaklasApp(App[None]):
     def _refresh_left_panel(self) -> None:
         self._left_panel.update_vectors(self._vector_list_for_panel())
 
-    def _on_manifold_added(self, key: str, term: Any) -> None:
+    def _on_manifold_added(self, key: str, term: ManifoldTerm) -> None:
         """Register a validated manifold term and refresh the left panel.
 
         Called back (via ``call_from_thread``) by
         ``ExtractionController._dispatch_manifold_term`` once the artifact has
         loaded + the position arity validated.
         """
-        self._manifold_terms[key] = term
-        self._enabled[key] = True
+        self._get_extraction_controller().register_manifold_term(key, term)
         coords_str = ",".join(f"{c:g}" for c in term.position)
         self._chat_panel.add_system_message(
             f"Manifold '{term.manifold}' % {coords_str} active "
             f"(blend {term.coeff:.2f})"
         )
         self._refresh_left_panel()
-
-    def _on_manifold_probe_added(self, name: str) -> None:
-        """Mirror probe wiring — refresh the trait panel + announce.
-
-        Called back by ``ExtractionController._start_manifold_probe_attach``.
-        """
-        self._refresh_probe_panels()
-        self._refresh_trait_why()
-        self._chat_panel.add_system_message(
-            f"Manifold probe '{name}' active."
-        )
 
     def _refresh_probe_panels(self) -> None:
         """Split the unified monitor's probe set across the trait panel.
@@ -1186,7 +1154,7 @@ class SaklasApp(App[None]):
         # Navigating the loom tree mid-generation logically abandons the
         # in-flight turn — the active pointer has moved elsewhere.  Stop
         # the worker so its tokens stop chasing a widget we're about to
-        # detach; its ``("done",)`` sentinel still drains cleanly through
+        # detach; its `_UiDone` event still drains cleanly through
         # ``_poll_generation`` (which reads ``_current_assistant_widget``,
         # set to ``None`` just below).
         if self._session.is_generating:
@@ -1241,7 +1209,7 @@ class SaklasApp(App[None]):
         self._refresh_input_mode()
 
     def _do_rewind(self) -> None:
-        if not self._messages:
+        if not self._session.tree.messages_for():
             self._chat_panel.add_system_message("Nothing to rewind.")
             return
         self._session.rewind()
@@ -1310,7 +1278,7 @@ class SaklasApp(App[None]):
             # Queue quit behind any in-flight work — preserves "Stop
             # only stops; queue drains on done" semantics.  Hit ``Esc``
             # first if you want to short-circuit.
-            self._enqueue_pending(PendingItem("quit", "/quit"))
+            self._enqueue_pending(PendingQuit())
         else:
             self.exit()
 
@@ -1401,7 +1369,7 @@ class SaklasApp(App[None]):
             # re-send it as input.  Under v2.3 loom, ``add_user_turn``
             # dedups against the existing user-child so no explicit pop
             # is needed; just read the text.
-            hist = self._messages
+            hist = self._session.tree.messages_for()
             if hist and hist[-1]["role"] == "user":
                 user_text = hist[-1]["content"]
             else:
@@ -1470,27 +1438,30 @@ class SaklasApp(App[None]):
                         # attached or ``live_scores`` is off; otherwise the
                         # full per-probe ``ProbeReading`` dict the trait
                         # panel's curved section renders mid-gen.
-                        # Optional 10th slot: the live J-lens workspace
-                        # readout (``/lens``) — None when the live lens is
-                        # off.
-                        ("tok", event.text, event.thinking, event.scores,
-                         event.perplexity, event.logprob, widget, False,
-                         event.probe_readings, event.lens_readout),
+                        # Optional 10th/11th slots: the live J-lens workspace
+                        # readout (``/lens``) + its layer-aggregated chip
+                        # list — None when the live lens is off.
+                        _UiToken(
+                            event.text, event.thinking,
+                            event.perplexity, event.logprob, widget, False,
+                            event.probe_readings, event.lens_readout,
+                            event.lens_aggregate,
+                        ),
                     )
                     self._gen_token_count += 1
                 # Normal completion — pull per-token scores out of the
                 # session and push to the widget for highlight.
-                self._ui_token_queue.put(("finalize", widget, False))
+                self._ui_token_queue.put(_UiFinalize(widget, False))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg, False))
+                self._ui_token_queue.put(_UiError(msg, False))
             finally:
                 if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_generate, thread=True)
 
@@ -1536,7 +1507,7 @@ class SaklasApp(App[None]):
         """
         if self._is_busy:
             self._enqueue_pending(
-                PendingItem("raw_continue", draft), replace_slot=replace_slot,
+                PendingRawContinue(draft), replace_slot=replace_slot,
             )
             return
         tail, parent = self._resolve_raw_divergence(draft)
@@ -1690,18 +1661,24 @@ class SaklasApp(App[None]):
             logprobs=0,
         )
 
-        def _on_token(text: str, is_thinking: bool, tid: Any, lp: Any, top_alts: Any, perplexity: Any) -> None:
-            # Mirrors the ``("tok", …)`` tuple ``_start_generation`` builds
+        def _on_token(
+            text: str, is_thinking: bool, tid: int | None,
+            lp: float | None, top_alts: list[TokenAlt] | None,
+            perplexity: float | None = None,
+        ) -> None:
+            # Mirrors the exact event ``_start_generation`` builds
             # from a ``TokenEvent``.  ``prefill_assistant``'s on_token
             # carries no probe scores (no streaming monitor hook on this
             # path) — pass ``None``; ``_finalize_widget_highlight`` fills
             # the canonical per-token scores in at finalize.  Manifold
-            # readings (final tuple slot) are also unsourced on the
+            # readings (typed probe_readings field) are also unsourced on the
             # prefill path; the trait-panel manifold section refreshes
             # from the end-of-gen aggregate via ``_finalize_widget_highlight``.
             self._ui_token_queue.put(
-                ("tok", text, bool(is_thinking), None, perplexity, lp,
-                 widget, False, None),
+                _UiToken(
+                    text, bool(is_thinking), perplexity, lp,
+                    widget, False,
+                ),
             )
             self._gen_token_count += 1
 
@@ -1713,17 +1690,17 @@ class SaklasApp(App[None]):
                     sampling=sampling,
                     on_token=_on_token,
                 )
-                self._ui_token_queue.put(("finalize", widget, False))
+                self._ui_token_queue.put(_UiFinalize(widget, False))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg, False))
+                self._ui_token_queue.put(_UiError(msg, False))
             finally:
                 if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_prefill, thread=True)
 
@@ -1759,8 +1736,7 @@ class SaklasApp(App[None]):
         self._push_input_history(text)
         # Forward the pulled slot so a re-edited queued item stays at
         # its original position rather than sliding to the queue tail.
-        replace_slot = self._pulled_slot
-        self._pulled_slot = None
+        replace_slot = self._get_input_history_controller().release_pulled_slot()
         self._commit_with_text(text, replace_slot=replace_slot)
 
     def _commit_with_text(self, text: str, *, replace_slot: int | None = None) -> None:
@@ -1789,15 +1765,11 @@ class SaklasApp(App[None]):
             # an earlier queued ``commit_user``) stamps ``ACTIVE_AT_DRAIN``
             # so the dispatcher resolves the parent fresh at drain time.
             if user_node_id is not None:
-                item = PendingItem(
-                    "commit_assistant", text, (user_node_id,),
-                )
+                item = PendingCommitAssistant(text, user_node_id)
             elif self._predicted_on_user_node():
-                item = PendingItem(
-                    "commit_assistant", text, (ACTIVE_AT_DRAIN,),
-                )
+                item = PendingCommitAssistant(text, ACTIVE_AT_DRAIN)
             else:
-                item = PendingItem("commit_user", text)
+                item = PendingCommitUser(text)
             self._enqueue_pending(item, replace_slot=replace_slot)
             return
         if user_node_id is not None:
@@ -1833,7 +1805,7 @@ class SaklasApp(App[None]):
         """Land the raw buffer's divergent span without generating."""
         if self._is_busy:
             self._enqueue_pending(
-                PendingItem("raw_commit", draft), replace_slot=replace_slot,
+                PendingRawCommit(draft), replace_slot=replace_slot,
             )
             return
         self._start_raw_commit(draft)
@@ -1861,7 +1833,7 @@ class SaklasApp(App[None]):
                     f"raw commit failed: {msg}",
                 )
             finally:
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_commit, thread=True)
 
@@ -1874,7 +1846,7 @@ class SaklasApp(App[None]):
         a user node) we surface a system message and skip the mount via
         a post-mount remove.
 
-        The worker enqueues a ``("done", False)`` sentinel in its
+        The worker enqueues a `_UiDone(False)` event in its
         finally block — without it the pending-queue drain loop stalls
         after a queued commit, because commits don't run a generation
         and therefore don't produce a natural ``done`` event.
@@ -1898,7 +1870,7 @@ class SaklasApp(App[None]):
             finally:
                 # Advance the queue drain — commits don't stream so no
                 # natural ``done`` arrives via the gen worker.
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_commit, thread=True)
 
@@ -1910,7 +1882,7 @@ class SaklasApp(App[None]):
         on a worker thread.  Highlight goes plain — authored turns carry
         no per-token scores.
 
-        Worker enqueues ``("done", False)`` in finally so the pending-
+        Worker enqueues `_UiDone(False)` in finally so the pending-
         queue drain advances; see :meth:`_start_commit_user` for the
         rationale.
         """
@@ -1934,7 +1906,7 @@ class SaklasApp(App[None]):
                     self._chat_panel.add_system_message(f"commit failed: {msg}")
                 self.call_from_thread(_rollback)
             finally:
-                self._ui_token_queue.put(("done", False))
+                self._ui_token_queue.put(_UiDone(False))
 
         self.run_worker(_commit, thread=True)
 
@@ -1948,39 +1920,27 @@ class SaklasApp(App[None]):
                 item = self._ui_token_queue.get_nowait()
             except queue.Empty:
                 break
-            kind = item[0]
-            if kind == "tok":
+            if isinstance(item, _UiToken):
                 # Tagged with the target widget + ``is_shadow`` flag so
                 # steered and shadow streams route to the right column
                 # without a global "current" lookup.  Shadow streams
                 # bypass the gen-stat counters (token count, ppl) — those
                 # describe the steered run only.
-                # Logit-pass: 7-element tuple now (logprob between
-                # perplexity and widget).  Drives the surprise highlight
-                # mode + the per-token logprob storage on the widget.
-                # Probe pass: optional 9th slot carries
-                # ``event.probe_readings`` — ``None`` when no probe is
+                # The typed event carries all token channels. Probe readings
+                # are ``None`` when no probe is
                 # attached or ``live_scores`` is off; otherwise the full
                 # per-probe ``ProbeReading`` dict the trait panel's curved
-                # section renders mid-gen.  Falls back to ``None`` for legacy
-                # producers (e.g. test stubs) that emit the 8-element form.
-                manifold_readings = None
-                lens_readout = None
-                if len(item) >= 10:
-                    (
-                        _, token, is_thinking, scores, perplexity, logprob,
-                        widget, is_shadow, manifold_readings, lens_readout,
-                    ) = item
-                elif len(item) >= 9:
-                    (
-                        _, token, is_thinking, scores, perplexity, logprob,
-                        widget, is_shadow, manifold_readings,
-                    ) = item
-                else:
-                    (
-                        _, token, is_thinking, scores, perplexity, logprob,
-                        widget, is_shadow,
-                    ) = item
+                # section renders mid-gen.
+                token = item.text
+                is_thinking = item.thinking
+                scores = item.probe_readings
+                perplexity = item.perplexity
+                logprob = item.logprob
+                widget = item.widget
+                is_shadow = item.shadow
+                manifold_readings = item.probe_readings
+                lens_readout = item.lens_readout
+                lens_aggregate = item.lens_aggregate
                 if manifold_readings is not None and not is_shadow:
                     # Push live readings to the trait panel.  The dict carries
                     # every probe's ``ProbeReading``; only curved probes
@@ -1993,7 +1953,9 @@ class SaklasApp(App[None]):
                 if lens_readout is not None and not is_shadow:
                     # Live J-lens workspace readout (``/lens``): same
                     # shadow-skip rule as the probe rack.
-                    self._trait_panel.update_lens_readout(lens_readout)
+                    self._trait_panel.update_lens_readout(
+                        lens_readout, aggregate=lens_aggregate,
+                    )
                 if widget is not None:
                     if is_thinking:
                         widget.append_thinking_token(token)
@@ -2001,7 +1963,7 @@ class SaklasApp(App[None]):
                         widget.ensure_thinking_collapsed()
                         widget.append_token(token)
                     if scores is not None:
-                        # ``event.scores`` is the full per-probe ``ProbeReading``
+                        # ``event.probe_readings`` is the full per-probe reading
                         # dict now; the highlight markup wants a scalar per
                         # probe, so collapse to coordinate axis 0 (the same
                         # scalar the trait stream + ``@when`` gate channel use).
@@ -2024,17 +1986,15 @@ class SaklasApp(App[None]):
                         self._log_ppl_sum += math.log(perplexity)
                         self._ppl_count += 1
                 tokens_consumed += 1
-            elif kind == "finalize":
+            elif isinstance(item, _UiFinalize):
                 # Normal end — pull per-token scores stashed by session's
                 # _finalize_generation and push to the widget for highlight.
-                _, widget, _is_shadow = item
-                self._finalize_widget_highlight(widget)
-            elif kind == "error":
-                _, msg, is_shadow = item
-                tag = "A/B shadow error" if is_shadow else "generation error"
-                chat.add_system_message(f"{tag}: {msg}")
-            elif kind == "done":
-                _, is_shadow = item
+                self._finalize_widget_highlight(item.widget)
+            elif isinstance(item, _UiError):
+                tag = "A/B shadow error" if item.shadow else "generation error"
+                chat.add_system_message(f"{tag}: {item.message}")
+            else:
+                is_shadow = item.shadow
                 widget = self._current_assistant_widget
                 if widget:
                     widget.ensure_thinking_collapsed()
@@ -2180,13 +2140,11 @@ class SaklasApp(App[None]):
                 # Manifold rows aren't session-registered profiles —
                 # drop the local term and let the next gen rebuild
                 # ``Steering`` without it.
-                self._manifold_terms.pop(name, None)
-                self._enabled.pop(name, None)
+                self._get_extraction_controller().remove_steering_entry(name)
                 self._refresh_left_panel()
                 return
             self._session.unsteer(name)
-            self._alphas.pop(name, None)
-            self._enabled.pop(name, None)
+            self._get_extraction_controller().remove_steering_entry(name)
             self._refresh_left_panel()
 
     def _remove_selected_probe(self) -> None:
@@ -2205,7 +2163,7 @@ class SaklasApp(App[None]):
         sel = lp.get_selected()
         if sel:
             name = sel["name"]
-            self._enabled[name] = not self._enabled.get(name, True)
+            self._get_extraction_controller().toggle_steering_entry(name)
             self._refresh_left_panel()
 
     def _adjust_alpha(self, delta: float) -> None:
@@ -2219,7 +2177,7 @@ class SaklasApp(App[None]):
                 # alpha — ←/→ has nothing to nudge.
                 return
             name = sel["name"]
-            self._alphas[name] = max(-MAX_ALPHA, min(MAX_ALPHA, self._alphas.get(name, 0.0) + delta))
+            self._get_extraction_controller().adjust_vector_alpha(name, delta)
             self._refresh_left_panel()
 
     def action_cycle_highlight_mode(self, direction: int = 1) -> None:
@@ -2331,7 +2289,9 @@ class SaklasApp(App[None]):
             hl_label = self._highlight_probe or "off"
         self._left_panel.update_highlight(hl_label)
 
-    def _finalize_widget_highlight(self, widget: _AssistantMessage) -> None:
+    def _finalize_widget_highlight(
+        self, widget: RawBuffer | _AssistantMessage,
+    ) -> None:
         """Pull per-token scores the session stashed during finalize and
         push to the widget for highlight-mode overlays.
 
@@ -2392,12 +2352,12 @@ class SaklasApp(App[None]):
         probe shape; only curved probes render in the manifold section.
         No-op when no result is cached or no probes are attached.
         """
-        last = getattr(self._session, "last_result", None)
+        last = self._session.last_result
         if last is None:
             return
-        aggregates = getattr(last, "probe_readings", None) or {}
+        aggregates = last.probe_readings
         monitor = self._session.monitor
-        if not aggregates and (monitor is None or not monitor.probe_names):
+        if not aggregates and not monitor.probe_names:
             return
         self._trait_panel.update_manifold_readings(aggregates=aggregates)
 
@@ -2522,7 +2482,7 @@ class SaklasApp(App[None]):
         # The deserialized tree carries no event bus / conflict hook.
         loaded.attach_events(self._session.events)
         loaded.set_conflict_check(self._session.loom_conflict_check)
-        live_model = self._session.model_metadata.get("model_id")
+        live_model = self._session.model_info.get("model_id")
         if loaded.model_id is None:
             loaded.model_id = live_model
         elif live_model is not None and loaded.model_id != live_model:
@@ -2563,7 +2523,7 @@ class SaklasApp(App[None]):
 
     def _handle_model_info(self) -> None:
         chat = self._chat_panel
-        info = self._session.model_metadata
+        info = self._session.model_info
         lines = [
             f"Model: {info.get('model_id', 'unknown')}",
             f"Arch: {info.get('model_type', 'unknown')}  "
@@ -2591,20 +2551,20 @@ class SaklasApp(App[None]):
         """
         probe = self._trait_panel.get_selected_probe()
         monitor = self._session.monitor
-        if probe is None or monitor is None or probe not in monitor.manifolds:
+        if probe is None or probe not in monitor.manifolds:
             self._trait_panel.update_why(None, [])
             return
         manifold = monitor.manifolds[probe]
         layer_norms: list[tuple[int, float]]
-        try:
+        if all(sub.is_affine and sub.rank == 1 for sub in manifold.layers.values()):
             from saklas.core.vectors import folded_vector_directions
             profile = folded_vector_directions(manifold)
             layer_norms = sorted(
                 (int(lidx), float(t.norm().item()))
                 for lidx, t in profile.items()
             )
-        except Exception:
-            share = getattr(manifold, "mahalanobis_share", None) or {}
+        else:
+            share = manifold.mahalanobis_share
             layer_norms = sorted(
                 (int(lidx), float(v)) for lidx, v in share.items()
             )
@@ -2652,30 +2612,28 @@ class SaklasApp(App[None]):
 
     def _dispatch_pending_action(self, item: PendingItem) -> None:
         """Handle a queued action dispatched once the current gen finishes."""
-        kind = item.kind
         text = item.text
-        payload = item.payload
         chat = self._chat_panel
         try:
-            if kind == "regenerate":
+            if isinstance(item, PendingRegenerate):
                 if self._raw_mode:
                     self._run_regen_n_worker(1)
                 else:
                     self._rewind_active_assistant()
                     chat.rewind_last_assistant()
                     self._start_generation()
-            elif kind == "submit":
+            elif isinstance(item, PendingSubmit):
                 # Phase 5 carries the role decision made at submit time
                 # so the deferred dispatch matches whatever the user-row
-                # mount did.  ``payload[0]`` is the optional
-                # ``prefill_target`` node id, or ``ACTIVE_AT_DRAIN`` when
+                # mount did.  ``target`` is the optional prefill node id,
+                # or ``ACTIVE_AT_DRAIN`` when
                 # the queue role-aware path stamped it for late binding
                 # (parent created by an earlier-queued action; resolve
                 # the live active here).  Mount the user row here
                 # (deferred from queueing) so the row appears alongside
                 # the new assistant reply rather than floating above the
                 # previous in-flight one.
-                target = payload[0] if payload else None
+                target = item.target
                 if target == ACTIVE_AT_DRAIN:
                     target = self._prefill_target_node_id()
                 if target is not None:
@@ -2683,7 +2641,7 @@ class SaklasApp(App[None]):
                 else:
                     self._chat_panel.add_user_message(text)
                     self._start_generation(text)
-            elif kind == "raw_continue":
+            elif isinstance(item, PendingRawContinue):
                 # Raw-mode continuation queued behind an in-flight gen.
                 # ``text`` is the full submitted draft; divergence is
                 # resolved fresh here so it binds to the current tree.
@@ -2692,19 +2650,19 @@ class SaklasApp(App[None]):
                     tail, raw_continuation=True,
                     raw_draft=text, raw_parent=parent,
                 )
-            elif kind == "raw_commit":
+            elif isinstance(item, PendingRawCommit):
                 self._start_raw_commit(text)
-            elif kind == "commit_user":
+            elif isinstance(item, PendingCommitUser):
                 # Ctrl+Enter from a non-user active node, queued behind
                 # in-flight gen.  The role decision was made at submit
                 # time so we don't re-resolve it here (the active node
                 # may have shifted during gen).
                 self._start_commit_user(text)
-            elif kind == "commit_assistant":
+            elif isinstance(item, PendingCommitAssistant):
                 # Ctrl+Enter from a user node, queued behind in-flight
-                # gen.  ``payload[0]`` is the user node id, or
+                # gen.  ``parent_id`` is the user node id, or
                 # ``ACTIVE_AT_DRAIN`` for queue role-aware deferral.
-                parent = payload[0]
+                parent = item.parent_id
                 if parent == ACTIVE_AT_DRAIN:
                     parent = self._prefill_target_node_id()
                 if parent is None:
@@ -2714,46 +2672,37 @@ class SaklasApp(App[None]):
                     self._start_commit_user(text)
                 else:
                     self._start_commit_assistant(parent, text)
-            elif kind == "clear":
+            elif isinstance(item, PendingClear):
                 self._do_clear()
-            elif kind == "rewind":
+            elif isinstance(item, PendingRewind):
                 self._rewind_active_assistant()
                 chat.rewind_last_assistant()
                 self._do_rewind()
-            elif kind == "steer":
+            elif isinstance(item, PendingSteer):
                 # ``text`` is the canonical slash form (``/steer …``);
-                # ``payload[0]`` is the raw arg string the handler
-                # actually consumes.
-                self._handle_steer(payload[0] if payload else text)
-            elif kind == "probe":
-                self._handle_probe(payload[0] if payload else text)
-            elif kind == "extract":
-                self._handle_extract_only(payload[0] if payload else text)
-            elif kind == "manifold_fit":
-                # ``payload[0]`` is the folder path; the fit runs on a
-                # worker that enqueues its own ``done`` sentinel.
-                self._start_manifold_fit(payload[0] if payload else text)
-            elif kind == "manifold_probe":
-                # ``payload[0]`` is the selector; attach runs on a
-                # worker that enqueues its own ``done`` sentinel.
-                self._start_manifold_probe_attach(
-                    payload[0] if payload else text,
-                )
-            elif kind == "regen_n":
+                # ``argument`` is the raw string the handler consumes.
+                self._handle_steer(item.argument)
+            elif isinstance(item, PendingProbe):
+                self._handle_probe(item.selector)
+            elif isinstance(item, PendingExtract):
+                self._handle_extract_only(item.argument)
+            elif isinstance(item, PendingManifoldFit):
+                # The fit runs on a worker that enqueues its own ``done`` sentinel.
+                self._start_manifold_fit(item.folder)
+            elif isinstance(item, PendingRegenN):
                 # N-way regen after an interrupting gen completes; phase
                 # 1's engine serializes via ``session.generate(n=N)``.
-                # ``payload = (n, mode_or_None)``.
-                n = payload[0]
-                mode = payload[1] if len(payload) > 1 else None
+                n = item.count
+                mode = item.mode
                 if mode is not None:
                     self._run_regen_modifier_worker(n, mode)
                 else:
                     self._run_regen_n_worker(n)
-            elif kind == "fan":
-                # ``payload = (vector, alphas, prompt)``.
-                vector, alphas, prompt = payload
-                self._run_fan_worker(vector, alphas, prompt)
-            elif kind == "quit":
+            elif isinstance(item, PendingFan):
+                self._run_fan_worker(item.vector, list(item.alphas), item.prompt)
+            else:
+                # Pyright narrows the closed union's final member here.
+                assert isinstance(item, PendingQuit)
                 self.exit()
         except KeyboardInterrupt:
             raise
@@ -2762,11 +2711,9 @@ class SaklasApp(App[None]):
             import traceback
             traceback.print_exc(file=sys.stderr)
             self._ui_gen_active = False
-            self._pending_queue.clear()
-            self._pulled_slot = None
-            self._sync_pull_state()
+            self._get_input_history_controller().clear_pending_edit_state()
             self._current_assistant_widget = None
-            chat.add_system_message(f"error dispatching {kind}: {e}")
+            chat.add_system_message(f"error dispatching {item.kind}: {e}")
 
     def action_toggle_thinking(self) -> None:
         if not self._supports_thinking:
@@ -2801,16 +2748,16 @@ class SaklasApp(App[None]):
     def action_regenerate(self) -> None:
         if self._raw_mode:
             if self._is_busy:
-                self._enqueue_pending(PendingItem("regenerate", "regen"))
+                self._enqueue_pending(PendingRegenerate())
                 return
             self._run_regen_n_worker(1)
             return
-        if not self._messages:
+        if not self._session.tree.messages_for():
             return
         if self._is_busy:
             # Queue the regen — runs after current gen + any earlier
             # pending items finish.  Hit ``Esc`` first to short-circuit.
-            self._enqueue_pending(PendingItem("regenerate", "regen"))
+            self._enqueue_pending(PendingRegenerate())
             return
         # Loom: move active up so the next gen creates a sibling under
         # the user-parent rather than a child of the old assistant.
@@ -2847,7 +2794,7 @@ class SaklasApp(App[None]):
             return
         was_off = not self._ab_mode
         self._ab_mode = not self._ab_mode
-        self._loom_auto_regen_on = self._ab_mode
+        self._get_loom_controller().set_auto_regen_enabled(self._ab_mode)
         chat.set_ab_mode(self._ab_mode)
         chat.add_system_message(
             f"A/B mode {'on' if self._ab_mode else 'off'} "
@@ -2955,21 +2902,24 @@ class SaklasApp(App[None]):
                 )
                 for event in stream:
                     self._ui_token_queue.put(
-                        ("tok", event.text, event.thinking, event.scores,
-                         event.perplexity, event.logprob, widget, True,
-                         event.probe_readings),
+                        _UiToken(
+                            event.text, event.thinking,
+                            event.perplexity, event.logprob, widget, True,
+                            event.probe_readings, event.lens_readout,
+                            event.lens_aggregate,
+                        ),
                     )
-                self._ui_token_queue.put(("finalize", widget, True))
+                self._ui_token_queue.put(_UiFinalize(widget, True))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg, True))
+                self._ui_token_queue.put(_UiError(msg, True))
             finally:
                 if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done", True))
+                self._ui_token_queue.put(_UiDone(True))
 
         self.run_worker(_shadow_generate, thread=True)
 
@@ -3191,20 +3141,23 @@ class SaklasApp(App[None]):
                 )
                 for event in stream:
                     self._ui_token_queue.put(
-                        ("tok", event.text, event.thinking, event.scores,
-                         event.perplexity, event.logprob, widget, True,
-                         event.probe_readings),
+                        _UiToken(
+                            event.text, event.thinking,
+                            event.perplexity, event.logprob, widget, True,
+                            event.probe_readings, event.lens_readout,
+                            event.lens_aggregate,
+                        ),
                     )
-                self._ui_token_queue.put(("finalize", widget, True))
+                self._ui_token_queue.put(_UiFinalize(widget, True))
             except BaseException as e:
                 msg = e.user_message()[1] if isinstance(e, SaklasError) else str(e)
-                self._ui_token_queue.put(("error", msg, True))
+                self._ui_token_queue.put(_UiError(msg, True))
             finally:
                 if self._session.device.type == "mps":
                     try:
                         torch.mps.synchronize()
                     except Exception:
                         pass
-                self._ui_token_queue.put(("done", True))
+                self._ui_token_queue.put(_UiDone(True))
 
         self.run_worker(_stream_worker, thread=True)

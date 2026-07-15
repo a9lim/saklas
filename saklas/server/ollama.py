@@ -26,11 +26,10 @@ from saklas.server.request_helpers import (
     flatten_content,
     merge_steering,
     parse_request_steering,
-    probe_reading_aggregate,
     probe_token_readings,
     strict_model_enabled,
 )
-from saklas.server.streaming import stream_finalizer
+from saklas.server.streaming import probe_reading_aggregate, stream_finalizer
 
 import hashlib
 import json
@@ -44,6 +43,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from saklas.core.errors import SaklasError
+from saklas.core.results import GenerationResult
 from saklas.core.session import ConcurrentGenerationError, SaklasSession
 from saklas.core.steering import Steering
 from saklas.server.model_names import aliases_for_session, known_model_names
@@ -56,16 +56,6 @@ class OllamaBadRequest(ValueError, SaklasError):
 
     def user_message(self) -> tuple[int, str]:
         return 400, str(self)
-
-
-def _aliases_for(session: SaklasSession) -> list[str]:
-    """Backward-compatible wrapper for tests/imports; new code uses model_names."""
-    return aliases_for_session(session)
-
-
-def _known_model_names(session: SaklasSession) -> set[str]:
-    """Backward-compatible wrapper for tests/imports; new code uses model_names."""
-    return known_model_names(session)
 
 
 def _digest_of(name: str) -> str:
@@ -138,7 +128,7 @@ def _tag_entries(session: SaklasSession) -> list[dict[str, Any]]:
     digest = _digest_of(model_id)
 
     names = [model_id]
-    names.extend(_aliases_for(session))
+    names.extend(aliases_for_session(session))
     # Deduplicate while preserving order.
     seen: set[str] = set()
     unique = [n for n in names if not (n in seen or seen.add(n))]
@@ -325,14 +315,14 @@ def _resolve_options(
 # Response assembly
 # ---------------------------------------------------------------------------
 
-def _duration_stats(result: Any, elapsed_ns: int) -> dict[str, int]:
+def _duration_stats(result: GenerationResult, elapsed_ns: int) -> dict[str, int]:
     """Build Ollama's *_duration and *_count fields from a GenerationResult.
 
     All durations are in nanoseconds.  Saklas tracks tokens/sec so we split the
     measured elapsed time proportionally between prompt-eval and eval.
     """
-    prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
-    completion_tokens = int(getattr(result, "token_count", 0) or 0)
+    prompt_tokens = result.prompt_tokens
+    completion_tokens = result.token_count
     total = max(prompt_tokens + completion_tokens, 1)
     prompt_ns = elapsed_ns * prompt_tokens // total
     eval_ns = max(elapsed_ns - prompt_ns, 1)
@@ -437,8 +427,8 @@ def register_ollama_routes(app: FastAPI) -> None:
         # startup, so a true pull is out of scope.
         body = await request.json()
         name = str(body.get("model") or body.get("name") or "")
-        if name and name.lower() not in _known_model_names(session):
-            hosted = ", ".join(sorted({session.model_id, *_aliases_for(session)}))
+        if name and name.lower() not in known_model_names(session):
+            hosted = ", ".join(sorted({session.model_id, *aliases_for_session(session)}))
             return JSONResponse(status_code=404, content={
                 "error": (
                     f"model '{name}' not found. saklas currently hosts: {hosted}. "
@@ -503,8 +493,8 @@ def register_ollama_routes(app: FastAPI) -> None:
         if not strict_model_enabled():
             return
         name = str(body.get("model") or "")
-        if name and name.lower() not in _known_model_names(session):
-            hosted = ", ".join(sorted({session.model_id, *_aliases_for(session)}))
+        if name and name.lower() not in known_model_names(session):
+            hosted = ", ".join(sorted({session.model_id, *aliases_for_session(session)}))
             raise HTTPException(
                 status_code=404,
                 detail=(
@@ -561,7 +551,7 @@ def register_ollama_routes(app: FastAPI) -> None:
                     },
                 )
             try:
-                result = session.generate(input_payload, raw=raw, **gen_kwargs)
+                result = session.generate(input_payload, raw=raw, **gen_kwargs).first
             except ConcurrentGenerationError as e:
                 raise HTTPException(
                     status_code=409, detail="Generation already in progress",
@@ -570,7 +560,7 @@ def register_ollama_routes(app: FastAPI) -> None:
 
         model_name = str(body.get("model") or session.model_id)
         created_at = _now_iso()
-        done_reason = _finish_to_done_reason(getattr(result, "finish_reason", None))
+        done_reason = _finish_to_done_reason(result.finish_reason)
         stats = _duration_stats(result, elapsed_ns)
 
         # Saklas-specific extension: per-attached-manifold-probe aggregate
@@ -663,7 +653,10 @@ def register_ollama_routes(app: FastAPI) -> None:
             start_ns = time.monotonic_ns()
             stream_iter = None
             try:
-                stream_iter = session.generate_stream(input_payload, raw=raw, **gen_kwargs)
+                stream_iter = session.generate_stream(
+                    input_payload, raw=raw, live_scores=False,
+                    live_readouts=False, **gen_kwargs,
+                )
                 for event in stream_iter:
                     # Bail out if the client has hung up — close the inner
                     # generator (handled in ``finally``) and stop spending
@@ -745,15 +738,12 @@ def register_ollama_routes(app: FastAPI) -> None:
                 # (no-op on an exhausted generator), an in-band error, or
                 # an early client-disconnect ``return`` — rather than
                 # leaving it to GC.
-                close = getattr(stream_iter, "close", None)
-                if callable(close):
-                    close()
+                assert stream_iter is not None
+                stream_iter.close()
 
             elapsed_ns = time.monotonic_ns() - start_ns
-            result = (
-                getattr(stream_iter, "result", None)
-                or getattr(session, "last_result", None)
-            )
+            assert stream_iter is not None
+            result = stream_iter.result
             finish_reason, _usage, mf_agg = stream_finalizer(session, result)
             done_reason = _finish_to_done_reason(finish_reason)
             stats = _duration_stats(result, elapsed_ns) if result is not None else {

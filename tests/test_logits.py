@@ -196,16 +196,13 @@ class TestLoomNodeMeanLogprob:
         assert restored.mean_logprob == pytest.approx(-0.7)
         assert restored.mean_surprise == pytest.approx(0.7)
 
-    def test_from_dict_missing_fields_default_none(self):
-        """Replay from a pre-logit-pass transcript snapshot — the keys
-        aren't present in the dict; ``from_dict`` defaults them to
-        ``None`` so the legacy shape loads cleanly."""
-        restored = LoomNode.from_dict({
+    def test_from_dict_rejects_missing_current_fields(self):
+        """Node persistence accepts only the exact current schema."""
+        with pytest.raises(Exception, match="missing required fields"):
+            LoomNode.from_dict({
             "id": "n1", "parent_id": None, "role": "assistant",
             "text": "hi",
-        })
-        assert restored.mean_logprob is None
-        assert restored.mean_surprise is None
+            })
 
 
 class TestFinalizeAssistantStampsLogprobs:

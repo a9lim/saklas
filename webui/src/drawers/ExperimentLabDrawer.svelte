@@ -12,6 +12,7 @@
   } from "../lib/stores.svelte";
   import { serializeExpression } from "../lib/expression";
   import Select from "../lib/Select.svelte";
+  import Button from "../lib/ui/Button.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
@@ -51,7 +52,7 @@
   function lastUserPrompt(): string | null {
     for (let i = chatLog.turns.length - 1; i >= 0; i--) {
       const t = chatLog.turns[i];
-      if (t.role === "user" && t.text.trim()) return t.text;
+      if (!t.generated && t.role !== "system" && t.text.trim()) return t.text;
     }
     return null;
   }
@@ -172,11 +173,14 @@
         }) ?? [1]),
       );
       const t = Math.min(1, Math.max(0, v / max));
-      return `background: color-mix(in srgb, rgba(72, 138, 203, 0.12), rgba(72, 138, 203, 0.55) ${t * 100}%);`;
+      // Unsigned magnitude — experiments carry no pillar hue, so intensity
+      // rides the achromatic --fg wash rather than a hue.
+      return `background: color-mix(in srgb, var(--fg) ${(12 + t * 43).toFixed(1)}%, transparent);`;
     }
     const t = Math.max(-1, Math.min(1, v));
-    const hue = t >= 0 ? "72, 138, 203" : "218, 83, 79";
-    return `background: rgba(${hue}, ${0.14 + Math.abs(t) * 0.48});`;
+    // Signed reading delta: green(+) / red(−), per the hue ontology.
+    const hue = t >= 0 ? "var(--accent-green)" : "var(--accent-red)";
+    return `background: color-mix(in srgb, ${hue} ${((0.14 + Math.abs(t) * 0.48) * 100).toFixed(1)}%, transparent);`;
   }
 
   async function navigate(nodeId: string | null): Promise<void> {
@@ -188,11 +192,10 @@
 
 <section class="drawer-shell" aria-label="Experiment lab drawer">
   <header class="header">
-    <div>
-      <span class="title">experiment lab</span>
-      <p>run alpha grids as loom siblings, then inspect the response surface</p>
+    <div class="title">
+      <span class="eyebrow">experiment lab</span>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">
@@ -204,19 +207,19 @@
 
       <div class="axis-grid">
         <label class="field">
-          <span>x concept</span>
+          <span>x</span>
           <input list="concepts" bind:value={xConcept} placeholder="honest.deceptive" />
         </label>
         <label class="field">
-          <span>x alphas</span>
+          <span>x α</span>
           <input bind:value={xGrid} placeholder="linspace(-1, 1, 9)" />
         </label>
         <label class="field">
-          <span>y concept</span>
+          <span>y</span>
           <input list="concepts" bind:value={yConcept} placeholder="optional" />
         </label>
         <label class="field">
-          <span>y alphas</span>
+          <span>y α</span>
           <input bind:value={yGrid} placeholder="-0.5, 0, 0.5" />
         </label>
       </div>
@@ -235,9 +238,9 @@
             ariaLabel="metric"
           />
         </label>
-        <button type="button" class="primary" disabled={busy} onclick={run}>
+        <Button variant="solid" disabled={busy} onclick={run}>
           {busy ? "running grid…" : "run experiment"}
-        </button>
+        </Button>
       </div>
       {#if errorMsg}
         <p class="error">{errorMsg}</p>
@@ -247,7 +250,7 @@
     <section class="results">
       <div class="result-head">
         <div>
-          <h3>response surface</h3>
+          <h3>surface</h3>
           <p>{response ? `${response.total} runs` : "no run yet"}</p>
         </div>
         {#if response}
@@ -296,45 +299,203 @@
           {/each}
         </div>
       {:else}
-        <div class="empty">
-          alpha grids become loom siblings; each cell can be opened as the active branch after the run.
-        </div>
+        <div class="empty">run an α grid</div>
       {/if}
     </section>
   </div>
 </section>
 
 <style>
-  .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: var(--bg-alt); }
-  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-6) var(--space-6); border-bottom: 1px solid var(--border); background: var(--surface); }
-  .title { color: var(--accent); text-transform: uppercase; letter-spacing: 0; font-size: var(--text-xs); font-weight: var(--weight-bold); }
-  .header p, .result-head p { margin: var(--space-2) 0 0; color: var(--fg-muted); }
-  .close { background: transparent; border: 0; color: var(--fg-muted); font-size: var(--text-md); }
-  .body { display: grid; grid-template-columns: minmax(20rem, 0.78fr) minmax(24rem, 1fr); gap: var(--space-5); padding: var(--space-6); overflow: auto; }
-  .setup, .results { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-5); min-width: 0; }
-  .field { display: grid; gap: var(--space-2); color: var(--fg-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0; }
+  /* v2 sheet interior — the host paints the sheet surface, so the root
+   * stays transparent and chrome speaks sans (data + expressions stay
+   * mono). Experiments carry no pillar hue — chrome stays achromatic. */
+  .drawer-shell {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: transparent;
+    color: var(--fg);
+    font-family: var(--font-ui);
+    font-size: var(--text);
+  }
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+  }
+  .title {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .eyebrow {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .close {
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .close:hover {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
+
+  .body {
+    display: grid;
+    grid-template-columns: minmax(20rem, 0.78fr) minmax(24rem, 1fr);
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    overflow: auto;
+  }
+  .setup,
+  .results {
+    border-radius: var(--radius-lg);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    padding: var(--space-5);
+    min-width: 0;
+  }
+  .field {
+    display: grid;
+    gap: var(--space-2);
+    color: var(--fg-muted);
+    font-size: var(--text-sm);
+  }
   .prompt { margin-bottom: var(--space-5); }
-  input, textarea { width: 100%; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-deep); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); font-size: var(--text-xs); letter-spacing: 0; }
+  input,
+  textarea {
+    width: 100%;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    background: var(--input-well);
+    color: var(--fg);
+    padding: var(--space-4);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
   textarea { resize: vertical; line-height: 1.45; }
-  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  input:focus,
+  textarea:focus {
+    outline: none;
+    border-color: var(--fg-muted);
+  }
   .axis-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-5); }
-  .runbar { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: var(--space-5); margin-top: var(--space-5); }
-  .primary { border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent); color: var(--text-on-accent); padding: var(--space-4) var(--space-5); font-weight: var(--weight-bold); }
-  .primary:disabled { opacity: 0.55; cursor: wait; }
+  .runbar {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: end;
+    gap: var(--space-5);
+    margin-top: var(--space-5);
+  }
   .error { color: var(--accent-red); margin: var(--space-4) 0 0; }
-  .result-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: var(--space-5); }
-  h3 { margin: 0; color: var(--fg); font-size: var(--text); letter-spacing: 0; }
-  code { color: var(--accent-amber); font-family: var(--font-mono); }
-  .heatmap-wrap { overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+  .result-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: var(--space-5);
+  }
+  .result-head p { margin: var(--space-2) 0 0; color: var(--fg-muted); }
+  h3 { margin: 0; color: var(--fg); font-size: var(--text); font-weight: var(--weight-medium); }
+  .result-head code {
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    background: var(--glass-strong);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-3);
+  }
+
+  /* Data well — the response-surface heatmap.  Sticky label cells stay
+   * OPAQUE (they occlude scrolled cells). */
+  .heatmap-wrap {
+    overflow: auto;
+    border-radius: var(--radius);
+    background: var(--bg);
+  }
   .heatmap { border-collapse: collapse; width: 100%; min-width: 32rem; }
-  th { color: var(--fg-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0; background: var(--bg-elev); }
-  th, td { border: 1px solid var(--border); padding: 0; }
-  td button { width: 100%; min-height: 3.4rem; display: grid; gap: var(--space-1); place-items: center; border: 0; background: transparent; color: var(--fg); }
-  td button:hover { outline: 1px solid var(--accent); outline-offset: -1px; }
+  th {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    background: var(--bg);
+  }
+  th, td {
+    padding: 0;
+  }
+  td button {
+    width: 100%;
+    min-height: 3.4rem;
+    display: grid;
+    gap: var(--space-1);
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+  td button:hover { background: var(--bg-hover); }
   td span { color: var(--fg-muted); font-size: var(--text-2xs); }
-  .run-list { display: grid; gap: var(--space-2); margin-top: var(--space-5); max-height: 16rem; overflow: auto; }
-  .run-list button { display: grid; grid-template-columns: auto 1fr auto; gap: var(--space-4); align-items: center; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); color: var(--fg-strong); padding: var(--space-3); text-align: left; }
-  .run-list button:hover { border-color: var(--accent); }
-  .idx { color: var(--accent); font-family: var(--font-mono); }
-  .empty { display: grid; place-items: center; min-height: 18rem; color: var(--fg-muted); text-align: center; border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-8); }
+
+  .run-list {
+    display: grid;
+    gap: var(--space-2);
+    margin-top: var(--space-5);
+    max-height: 16rem;
+    overflow: auto;
+  }
+  .run-list button {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: var(--space-4);
+    align-items: center;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+    color: var(--fg-strong);
+    padding: var(--space-3);
+    text-align: left;
+    font-family: var(--font-mono);
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+  .run-list button:hover { background: var(--bg-hover); }
+  .idx { color: var(--fg); font-family: var(--font-mono); }
+  .empty {
+    display: grid;
+    place-items: center;
+    min-height: 18rem;
+    color: var(--fg-muted);
+    text-align: center;
+    line-height: 1.5;
+    background: var(--bg);
+    border-radius: var(--radius);
+    padding: var(--space-8);
+  }
 </style>

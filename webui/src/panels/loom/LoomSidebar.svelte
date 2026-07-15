@@ -30,11 +30,13 @@
     edgeLabelCache,
     filterState,
     highlightState,
-    loomRegenerateFromUser,
+    loomContinueFromCommitted,
     loomTree,
     loomNavigate,
     loomEdit,
     loomBranch,
+    loomSwapSeat,
+    sessionState,
     loomDelete,
     loomStar,
     loomNote,
@@ -75,20 +77,17 @@
 
   // --------------------------------------- compare bar (active node) --
   //
-  // A single role-aware "compare" — the loom alternates user/assistant,
-  // so "compare siblings" (assistant node) and "compare children" (user
-  // node) were never both live and always meant the same thing: diff
-  // the assistant continuations of one user turn.  We resolve that user
-  // turn from the active node (user → itself, assistant → its parent)
-  // and compare its assistant children.
+  // A single capability-aware "compare": a generated node compares its
+  // siblings; a committed node compares its generated children.  Seat does
+  // not decide which branch is a model result.
 
-  /** The user turn whose assistant continuations the compare acts on. */
+  /** The turn whose generated continuations the compare acts on. */
   const compareUserParentId = $derived.by<string | null>(() => {
     const id = loomTree.active_node_id;
     const n = id ? (loomTree.nodes.get(id) ?? null) : null;
     if (!n) return null;
-    if (n.role === "user") return n.id;
-    if (n.role === "assistant") return n.parent_id;
+    if (n.recipe !== null) return n.parent_id;
+    if (n.role !== "system") return n.id;
     return null;
   });
 
@@ -96,7 +95,7 @@
     if (!compareUserParentId) return [];
     return (loomTree.children_of.get(compareUserParentId) ?? [])
       .map((id) => loomTree.nodes.get(id))
-      .filter((n): n is LoomNodeJSON => n != null && n.role === "assistant");
+      .filter((n): n is LoomNodeJSON => n != null && n.recipe !== null);
   });
 
   function compareBranch(): void {
@@ -208,12 +207,12 @@
   /** Steering-delta label for the edge into ``node`` — read from the
    *  cache LoomEdge populates.  Rendered as a trailing chip on the node
    *  (it used to be an absolutely-positioned edge label that overlapped
-   *  the node text).  Assistant-only: user / system nodes don't carry
+   *  the node text).  Generated-only: committed / system nodes don't carry
    *  steering, so a delta against their steered parent collapses to
    *  "negate the parent's expression" — misleading to render. */
   function steerLabelFor(node: LoomNodeJSON): string | null {
     if (!node.parent_id) return null;
-    if (node.role !== "assistant") return null;
+    if (node.recipe === null) return null;
     return edgeLabelCache.get(`${node.parent_id}|${node.id}`) ?? null;
   }
 
@@ -504,7 +503,7 @@
           // Recipe override carries the per-row alpha for the swept
           // vector.  The engine's modifier resolver accepts a partial
           // recipe expression on the ``steering`` axis.
-          await loomRegenerateFromUser(userId, {
+          await loomContinueFromCommitted(userId, {
             n: 1,
             recipe_override: `${alpha} ${vector}`,
           });
@@ -512,19 +511,20 @@
         break;
       }
       case "regen_mode": {
-        // Manual regen-with-modifier: anchor on the active assistant
-        // (or its user-parent) and dispatch N siblings under the
+        // Manual regen-with-modifier: regenerate a generated node, or
+        // author fresh continuations under a committed node, and dispatch N
+        // siblings under the
         // chosen mode.  Modes are resolved engine-side.
         const node = loomTree.nodes.get(m.nodeId);
         const mode = (m.mode ?? "unsteered").trim();
         const N = Math.max(1, Math.floor(m.n));
-        if (node?.role === "user") {
-          await loomRegenerateFromUser(m.nodeId, {
+        if (node?.recipe === null) {
+          await loomContinueFromCommitted(m.nodeId, {
             n: N,
             recipe_override: mode,
           });
         } else {
-          // Active assistant — set it as active then call regen.
+          // Generated node — set it active then regenerate in its own seat.
           if (loomTree.active_node_id !== m.nodeId) {
             await loomNavigate(m.nodeId);
           }
@@ -638,10 +638,10 @@
   // --------------------------------------- click + global keys --
 
   function onNodeClick(node: LoomNodeJSON, ev: MouseEvent): void {
-    // Ctrl/Cmd-click on an assistant node toggles its multi-select
+    // Ctrl/Cmd-click on a generated node toggles its multi-select
     // membership for the cross-branch diff drawer.  Plain click
     // still navigates.
-    if ((ev.ctrlKey || ev.metaKey) && node.role === "assistant") {
+    if ((ev.ctrlKey || ev.metaKey) && node.recipe !== null) {
       ev.preventDefault();
       ev.stopPropagation();
       toggleNodeSelection(node.id);
@@ -756,6 +756,17 @@
     const node = loomTree.nodes.get(nid);
     await openModal("branch", nid, node?.text ?? "");
   }
+  async function menuSwapSeat(): Promise<void> {
+    // Seat-swap branch (the cast model): a sibling with the same text
+    // and the seat flipped — identical bytes, one seat bit different,
+    // the controlled experiment on the seat prior.  No modal: the text
+    // is by definition unchanged.
+    const nid = menu.nodeId;
+    closeMenu();
+    if (!nid) return;
+    const newId = await loomSwapSeat(nid);
+    if (newId) await loomNavigate(newId);
+  }
   async function menuNavigate(): Promise<void> {
     const nid = menu.nodeId;
     closeMenu();
@@ -797,10 +808,10 @@
     closeMenu();
     if (!nid) return;
     const node = loomTree.nodes.get(nid);
-    // Anchor the fan-out on the user node.  If the user clicked an
-    // assistant node, walk up to its user parent.
+    // Anchor the fan-out on the committed turn.  If the user clicked a
+    // generated node, walk up to its parent.
     let anchorId = nid;
-    if (node?.role === "assistant" && node.parent_id) {
+    if (node && node.recipe !== null && node.parent_id) {
       anchorId = node.parent_id;
     }
     void openModal("fanout", anchorId, "0.0, 0.3, 0.6", 1);
@@ -811,19 +822,18 @@
     closeMenu();
     if (!nid) return;
     const node = loomTree.nodes.get(nid);
-    // Resolve the user turn: a user node compares its own assistant
-    // children; an assistant node compares its sibling set (its
-    // parent's assistant children).
+    // A committed node compares generated children; a generated node
+    // compares its generated sibling set.
     let parentId: string | null = null;
-    if (node?.role === "user") parentId = nid;
-    else if (node?.role === "assistant") parentId = node.parent_id;
+    if (node && node.recipe === null && node.role !== "system") parentId = nid;
+    else if (node && node.recipe !== null) parentId = node.parent_id;
     if (!parentId) return;
-    const assistantChildren = (loomTree.children_of.get(parentId) ?? []).filter(
-      (id) => loomTree.nodes.get(id)?.role === "assistant",
+    const generatedChildren = (loomTree.children_of.get(parentId) ?? []).filter(
+      (id) => loomTree.nodes.get(id)?.recipe !== null,
     );
-    if (assistantChildren.length < 2) return;
+    if (generatedChildren.length < 2) return;
     openDrawer("node_compare", {
-      node_ids: assistantChildren,
+      node_ids: generatedChildren,
       parent_id: parentId,
     });
   }
@@ -884,7 +894,7 @@
       type="button"
       class="action-btn"
       onclick={clearChat}
-      title="Clear chat back to root"
+      title="clear"
     >
       clear
     </button>
@@ -892,7 +902,7 @@
       type="button"
       class="action-btn"
       onclick={() => openDrawer("save_conversation")}
-      title="Save this conversation tree to disk"
+      title="save"
     >
       save
     </button>
@@ -900,7 +910,7 @@
       type="button"
       class="action-btn"
       onclick={() => openDrawer("load_conversation")}
-      title="Load a saved conversation tree"
+      title="load"
     >
       load
     </button>
@@ -908,7 +918,7 @@
       type="button"
       class="icon-btn"
       onclick={fullRefresh}
-      title="Refresh tree from server"
+      title="refresh"
       aria-label="Refresh"
     >↻</button>
   </header>
@@ -921,7 +931,7 @@
       onkeydown={onFilterKey}
       placeholder="filter: agg:angry.calm > 0.4"
       aria-label="Filter expression"
-      title="Filter grammar (click ? for help)"
+      title="filter"
     />
     <!-- Logit-pass (Decision 8): help popover for the filter grammar.
          Clicked-toggle keeps the popover anchored without stealing
@@ -962,18 +972,17 @@
          clicking the ? again or pressing Esc on the sidebar. -->
     <div class="filter-help" role="region" aria-label="Filter grammar help">
       <p>
-        <strong>Grammar:</strong> comma-separated terms; all must match.
+        comma-separated; all match
       </p>
       <ul>
-        <li><code>&lt;probe&gt; &gt; &lt;n&gt;</code>: aggregate reading (e.g. <code>angry.calm &gt; 0.4</code>)</li>
-        <li><code>agg:</code>|<code>any:</code>|<code>last:&lt;probe&gt; &lt;op&gt; &lt;n&gt;</code>: pick aggregator</li>
-        <li><code>starred</code>: only starred nodes</li>
-        <li><code>text:&lt;query&gt;</code>: substring search</li>
-        <li><code>sort:surprise</code>: reorder siblings most-surprising first</li>
-        <li><code>sort:confidence</code>: reorder siblings most-confident first</li>
+        <li><code>&lt;probe&gt; &gt; &lt;n&gt;</code></li>
+        <li><code>agg: | any: | last:</code></li>
+        <li><code>starred</code></li>
+        <li><code>text:&lt;query&gt;</code></li>
+        <li><code>sort:surprise | sort:confidence</code></li>
       </ul>
       <p>
-        <strong>Examples:</strong>
+        examples
       </p>
       <ul class="examples">
         <li><code>agg:angry.calm &gt; 0.4</code></li>
@@ -995,9 +1004,8 @@
     </div>
   {/if}
 
-  <!-- Compare bar — diffs the assistant continuations of the active
-       node's user turn.  One role-aware action: works whether the
-       cursor sits on the user node or one of its assistant replies. -->
+  <!-- Compare bar — diffs generated siblings. The same capability-aware
+       action works from a committed parent or one of its generated replies. -->
   <div class="weight-bar compare-bar">
     <span class="weight-label">compare</span>
     <button
@@ -1005,7 +1013,7 @@
       class="action-btn"
       onclick={compareBranch}
       disabled={comparableNodes.length < 2}
-      title="Compare the assistant continuations of the current user turn"
+      title="Compare generated continuations from the current branch point"
     >
       {comparableNodes.length >= 2
         ? `${comparableNodes.length} continuations`
@@ -1030,19 +1038,14 @@
     </div>
   {/if}
 
-  {#if loomTree.unavailable}
-    <div class="empty">
-      <p>Server doesn't support loom yet.</p>
-      <p class="hint">Update saklas server to v2.3+ to enable the tree view.</p>
-    </div>
-  {:else if loomTree.error}
+  {#if loomTree.error}
     <div class="empty err">
-      <p>tree error: {loomTree.error}</p>
+      <p>tree unavailable</p>
       <button type="button" onclick={fullRefresh}>retry</button>
     </div>
   {:else if rows.length === 0}
     <div class="empty">
-      <p>(empty tree, start a conversation)</p>
+      <p>empty</p>
     </div>
   {:else}
     <div class="tree-scroll">
@@ -1058,8 +1061,8 @@
             <LoomEdge
               active={row.isActivePath}
               dead={row.isDead}
-              parentId={row.node.role === "assistant" ? row.node.parent_id : null}
-              childId={row.node.role === "assistant" ? row.node.id : null}
+              parentId={row.node.recipe !== null ? row.node.parent_id : null}
+              childId={row.node.recipe !== null ? row.node.id : null}
               weight={edgeWeightFor(row.node)}
             />
           {/if}
@@ -1087,14 +1090,14 @@
 {#if menu.open && menu.nodeId}
   {@const menuNode = loomTree.nodes.get(menu.nodeId)}
   {@const cmpParentId =
-    menuNode?.role === "user"
+    menuNode?.recipe === null && menuNode?.role !== "system"
       ? menu.nodeId
-      : menuNode?.role === "assistant"
-        ? menuNode.parent_id
+      : menuNode?.recipe !== null
+        ? (menuNode?.parent_id ?? null)
         : null}
   {@const cmpCount = cmpParentId
     ? (loomTree.children_of.get(cmpParentId) ?? []).filter(
-        (id) => loomTree.nodes.get(id)?.role === "assistant",
+        (id) => loomTree.nodes.get(id)?.recipe !== null,
       ).length
     : 0}
   <div
@@ -1106,6 +1109,14 @@
     <button type="button" role="menuitem" onclick={menuRegenWithMode}>regen N with mode…</button>
     <button type="button" role="menuitem" onclick={menuEdit}>edit…</button>
     <button type="button" role="menuitem" onclick={menuBranch}>branch…</button>
+    {#if (sessionState.info?.scene_mode ?? false) && (menuNode?.role === "user" || menuNode?.role === "assistant")}
+      <button
+        type="button"
+        role="menuitem"
+        title="flip seat"
+        onclick={menuSwapSeat}
+      >swap seat ⇄ branch</button>
+    {/if}
     <button type="button" role="menuitem" onclick={menuNavigate}>navigate</button>
     <hr />
     <button type="button" role="menuitem" onclick={menuStar}>
@@ -1113,7 +1124,7 @@
     </button>
     <button type="button" role="menuitem" onclick={menuNote}>add note…</button>
     <hr />
-    {#if menuNode?.role === "assistant"}
+    {#if menuNode?.recipe !== null}
       <button type="button" role="menuitem" onclick={menuPin}>
         {pinnedComparison.nodeId === menu.nodeId
           ? "unpin from comparison"
@@ -1130,7 +1141,7 @@
       role="menuitem"
       onclick={menuCompareBranch}
       disabled={cmpCount < 2}
-      title={cmpCount < 2 ? "needs ≥2 assistant continuations" : ""}
+      title={cmpCount < 2 ? "needs ≥2 generated continuations" : ""}
     >compare continuations…</button>
     <button type="button" role="menuitem" onclick={menuFanOut}>fan out…</button>
     <hr />
@@ -1177,10 +1188,10 @@
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
-        <p class="hint">Re-runs the active assistant's parent user turn with the current rack.</p>
+        <p class="hint">current rack</p>
       {:else if modal.kind === "delete"}
-        <p>Delete node <code>{(modal.nodeId ?? "").slice(0, 12)}</code> and its entire subtree?</p>
-        <p class="hint danger">This is destructive. Ancestors of the active node cannot be deleted. Please navigate away first.</p>
+        <p>Delete <code>{(modal.nodeId ?? "").slice(0, 12)}</code> and subtree?</p>
+        <p class="hint danger">Permanent. Navigate away from ancestors first.</p>
       {:else if modal.kind === "navpicker" || modal.kind === "search"}
         <input
           bind:this={modalInput as HTMLInputElement}
@@ -1209,7 +1220,7 @@
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
-        <p class="hint">One sibling per α: a comma list, linspace(), or start:stop:step.</p>
+        <p class="hint">comma list, linspace(), or start:stop:step</p>
       {:else if modal.kind === "regen_mode"}
         <label>
           <span>mode</span>
@@ -1238,7 +1249,7 @@
             onkeydown={(ev) => { if (ev.key === "Enter") { ev.preventDefault(); void commitModal(); } }}
           />
         </label>
-        <p class="hint">Recipe-override modifier overlays the parent's recipe.</p>
+        <p class="hint">overlays parent recipe</p>
       {:else}
         <textarea
           bind:this={modalInput as HTMLTextAreaElement}
@@ -1257,7 +1268,7 @@
             }
           }}
         ></textarea>
-        <p class="hint">⌃⏎ / ⌘⏎ to commit</p>
+        <p class="hint">⌃⏎ / ⌘⏎</p>
       {/if}
       {#if modal.error}
         <p class="modal-error" role="alert">{modal.error}</p>
@@ -1288,20 +1299,20 @@
     overflow: hidden;
   }
 
-  /* Section bars are now flat — a border-bottom acts as the separator,
-   * no fill — matching the right-rack's section style. */
+  /* Section bars are borderless — typography + their own padding carry
+   * the divide between them. */
   .filter-bar {
     display: flex;
     gap: var(--space-2);
     align-items: center;
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
   }
   .filter-input {
     flex: 1 1 auto;
-    background: var(--bg-alt);
+    /* Recessed input well — the accent focus ring is the only border. */
+    background: var(--input-well);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-2) var(--space-3);
     font: inherit;
     font-family: var(--font-mono);
@@ -1325,19 +1336,14 @@
   /* Logit-pass: help affordance, help popover, weight-mode picker. */
   .help-btn.on {
     color: var(--accent);
-    border-color: var(--accent);
   }
   .filter-help {
-    border-bottom: 1px solid var(--border);
     padding: var(--space-3) var(--space-4);
     color: var(--fg-dim);
     font-size: var(--text-xs);
     line-height: 1.45;
     max-height: 14em;
     overflow: auto;
-  }
-  .filter-help strong {
-    color: var(--fg);
   }
   .filter-help code {
     color: var(--accent);
@@ -1360,7 +1366,6 @@
     gap: var(--space-3);
     align-items: center;
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
     font-size: var(--text-xs);
     color: var(--fg-dim);
   }
@@ -1374,14 +1379,13 @@
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
     color: var(--accent);
     font-size: var(--text-xs);
   }
   .action-btn {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-1) var(--space-4);
     font: inherit;
     font-family: var(--font-mono);
@@ -1389,12 +1393,11 @@
     cursor: pointer;
   }
   .action-btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--accent);
+    background: var(--glass-strong);
+    color: var(--accent);
   }
   .action-btn:disabled {
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
 
@@ -1404,7 +1407,6 @@
     align-items: center;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
   }
   .title {
     color: var(--accent);
@@ -1457,12 +1459,18 @@
     min-width: 0;
   }
 
-  /* Phase 5 filter dim — distinct from the 30% dead-branch dim. */
-  .tree-row.filtered-out {
-    opacity: 0.5;
+  /* Filter non-matches stay navigable context.  Never fade the whole row:
+   * that compounds with dead-branch state and destroys text contrast. */
+  .tree-row.filtered-out :global(.node) {
+    color: var(--fg-muted);
+    background: transparent;
   }
-  .tree-row.filtered-out:hover {
-    opacity: 0.8;
+  .tree-row.filtered-out:hover :global(.node) {
+    color: var(--fg);
+    background: var(--bg-elev);
+  }
+  .tree-row.filtered-out :global(.edge) {
+    opacity: 0.35;
   }
   /* Multi-select highlight for cross-branch compare. */
   .tree-row.selected :global(.node) {
@@ -1482,22 +1490,22 @@
     flex-direction: column;
     gap: var(--space-3);
   }
-  .empty .hint {
-    font-size: var(--text-xs);
-    color: var(--fg-subtle);
-  }
   .empty.err {
     color: var(--accent-red);
   }
   .empty button {
     align-self: flex-start;
-    background: transparent;
-    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--accent-red) 7%, var(--glass));
+    border: 1px solid transparent;
+    border-radius: var(--radius);
     color: var(--accent-red);
     padding: var(--space-1) var(--space-4);
     cursor: pointer;
     font: inherit;
     font-family: var(--font-mono);
+  }
+  .empty button:hover {
+    background: color-mix(in srgb, var(--accent-red) 14%, var(--glass));
   }
 
   .hint {
@@ -1589,7 +1597,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-4) var(--space-5);
-    border-bottom: 1px solid var(--border);
     color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
@@ -1607,9 +1614,9 @@
   }
   .modal-body input,
   .modal-body textarea {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-4);
     font: inherit;
     font-family: var(--font-mono);
@@ -1634,11 +1641,11 @@
     justify-content: flex-end;
     gap: var(--space-3);
     padding: var(--space-4) var(--space-5);
-    border-top: 1px solid var(--border);
   }
   .modal-footer button {
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
     color: var(--fg-strong);
     padding: var(--space-3) var(--space-5);
     cursor: pointer;
@@ -1646,20 +1653,20 @@
     font-family: var(--font-mono);
   }
   .modal-footer .primary {
-    border-color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 12%, var(--glass));
     color: var(--accent-green);
   }
   .modal-footer .primary:hover {
-    background: rgba(126, 231, 135, 0.12);
+    background: color-mix(in srgb, var(--accent-green) 20%, var(--glass));
   }
   .modal-footer .danger {
-    border-color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 12%, var(--glass));
     color: var(--accent-red);
   }
   .modal-footer .danger:hover {
-    background: rgba(248, 81, 73, 0.12);
+    background: color-mix(in srgb, var(--accent-red) 20%, var(--glass));
   }
   .modal-footer .cancel:hover {
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 </style>

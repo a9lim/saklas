@@ -1,7 +1,7 @@
 """Native vectors route group (``/saklas/v1/sessions/{id}/vectors/*``).
 
-Steering-vector lifecycle under the session: list / profile JSON /
-load-from-disk / delete / extract / bake / diagnostics, plus the
+Steering-vector lifecycle under the session: list / profile JSON / delete /
+extract / bake / diagnostics, plus the
 cross-layer whitened ``pairwise`` matrix and the N×N ``correlation``
 matrix across loaded vectors and probes.
 """
@@ -24,8 +24,6 @@ from saklas.server.sse import ProgressCallback, progress_sse_response
 from saklas.server.vector_models import (
     BakeVectorRequest,
     ExtractRequest,
-    LoadVectorRequest,
-    coerce_corpora,
     extract_registry_name,
     probe_profile_tensors,
     profile_to_json,
@@ -38,7 +36,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors")
     def list_vectors(session_id: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         return {
             "vectors": [
                 profile_to_json(name, profile)
@@ -88,7 +86,7 @@ def register_vector_routes(app: FastAPI) -> None:
         wins the routing match — Starlette matches in registration order
         and ``pairwise`` would otherwise be swallowed by ``{name}``.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         # CPU snapshots only (cached, built once under the exclusive-GPU lock)
         # so this endpoint never issues an MPS->CPU copy on its threadpool
@@ -134,7 +132,7 @@ def register_vector_routes(app: FastAPI) -> None:
         # access).  It must cover every row-layer of ``a`` (each row is
         # framed in its row-layer's covariance) — there is no Euclidean
         # fallback, so a missing / non-covering whitener is a 409.
-        whitener = getattr(session, "whitener", None)
+        whitener = session.whitener
         if whitener is None or not whitener.covers_all(layers_a):
             raise HTTPException(
                 409,
@@ -146,11 +144,7 @@ def register_vector_routes(app: FastAPI) -> None:
         matrix: list[list[float | None]] = []
         for la, va in zip(layers_a, vecs_a, strict=True):
             row: list[float | None] = [None] * len(vecs_b)
-            try:
-                si_va = whitener.apply_inv(la, va).float()
-            except Exception:
-                matrix.append(row)
-                continue
+            si_va = whitener.apply_inv(la, va).float()
             aa = max(
                 float(_torch.dot(va.reshape(-1), si_va.reshape(-1)).item()),
                 0.0,
@@ -174,11 +168,7 @@ def register_vector_routes(app: FastAPI) -> None:
                 continue
 
             block = _torch.stack(b_rows)
-            try:
-                si_block = whitener.apply_inv(la, block).float()
-            except Exception:
-                matrix.append(row)
-                continue
+            si_block = whitener.apply_inv(la, block).float()
             bb = (block.reshape(len(b_rows), -1) * si_block.reshape(
                 len(b_rows), -1,
             )).sum(dim=1).clamp_min(0.0)
@@ -198,26 +188,16 @@ def register_vector_routes(app: FastAPI) -> None:
             "layers_a": layers_a,
             "layers_b": layers_b,
             "matrix": matrix,
-            "model": getattr(session, "model_id", None),
+            "model": session.model_id,
         }
 
     @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}")
     def get_vector(session_id: str, name: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         vectors = session.vectors
         if name not in vectors:
             raise HTTPException(404, f"vector '{name}' not found")
         return profile_to_json(name, vectors[name])
-
-    @app.post("/saklas/v1/sessions/{session_id}/vectors")
-    def load_vector(session_id: str, req: LoadVectorRequest):
-        resolve_session_id(session, session_id)
-        try:
-            profile = session.load_profile(req.source_path)
-        except FileNotFoundError as e:
-            raise HTTPException(400, f"file not found: {req.source_path}") from e
-        session.steer(req.name, profile)
-        return profile_to_json(req.name, profile)
 
     @app.get("/saklas/v1/sessions/{session_id}/correlation")
     def correlation_matrix(session_id: str, names: str | None = None):
@@ -239,7 +219,7 @@ def register_vector_routes(app: FastAPI) -> None:
         server-side so the client doesn't have to ship full per-layer
         tensors over the wire.
         """
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         # Read-side pool of **CPU snapshots**, one per direction (a steering
         # vector wins a same-named probe, matching the historical dedup).
@@ -271,7 +251,7 @@ def register_vector_routes(app: FastAPI) -> None:
         # whitener is a 409 (regenerate the neutral cache).  A pair the
         # whitener doesn't fully cover still raises inside the loop and
         # lands as ``None`` for that cell.
-        whitener = getattr(session, "whitener", None)
+        whitener = session.whitener
         if whitener is None:
             raise HTTPException(
                 409,
@@ -291,12 +271,9 @@ def register_vector_routes(app: FastAPI) -> None:
         for name, prof in pool.items():
             entries: dict[int, tuple[Any, Any, float]] = {}
             for layer, tensor in prof.items():
-                try:
-                    vec = tensor.float().cpu().reshape(-1)
-                    si_vec = whitener.apply_inv(layer, vec).float().reshape(-1)
-                    norm_sq = max(float(_torch.dot(vec, si_vec).item()), 0.0)
-                except Exception:
-                    continue
+                vec = tensor.float().cpu().reshape(-1)
+                si_vec = whitener.apply_inv(layer, vec).float().reshape(-1)
+                norm_sq = max(float(_torch.dot(vec, si_vec).item()), 0.0)
                 entries[int(layer)] = (vec, si_vec, norm_sq)
             white_cache[name] = entries
 
@@ -348,7 +325,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
     @app.delete("/saklas/v1/sessions/{session_id}/vectors/{name}", status_code=204)
     def delete_vector(session_id: str, name: str):
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         if name not in session.vectors:
             raise HTTPException(404, f"vector '{name}' not found")
         session.unsteer(name)
@@ -365,26 +342,13 @@ def register_vector_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/extract")
     async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
-        resolve_session_id(session, session_id)
-        coerced: Any = coerce_corpora(
-            req.source if req.source is not None else req.name
-        )
+        resolve_session_id(session_id)
 
         def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
-            # Two pole corpora -> author + fit directly; a concept name ->
-            # generate the corpora first.  Both land a 2-node ``pca`` manifold.
-            if isinstance(coerced, tuple):
-                positive, negative = coerced
-                return session.extract_vector_from_corpora(
-                    req.name, positive, negative,
-                    on_progress=on_progress,
-                    sae=req.sae, sae_revision=req.sae_revision,
-                    role=req.role, namespace=req.namespace, force=req.force,
-                )
             return session.extract(
-                coerced, req.baseline,
+                req.concept, req.baseline,
                 on_progress=on_progress,
-                sae=req.sae, sae_revision=req.sae_revision,
+                sae=req.sae,
                 role=req.role, namespace=req.namespace, force=req.force,
             )
 
@@ -393,8 +357,7 @@ def register_vector_routes(app: FastAPI) -> None:
             async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
                 canonical, profile = await asyncio.to_thread(_run, on_progress)
                 registry_name = extract_registry_name(canonical, req.namespace)
-                if req.auto_register:
-                    session.steer(registry_name, profile)
+                session.steer(registry_name, profile)
                 return {
                     "done": True,
                     "profile": profile_to_json(registry_name, profile),
@@ -414,8 +377,7 @@ def register_vector_routes(app: FastAPI) -> None:
                 raise HTTPException(503, "session locked")
             canonical, profile = await asyncio.to_thread(_run, progress_msgs.append)
             registry_name = extract_registry_name(canonical, req.namespace)
-            if req.auto_register:
-                session.steer(registry_name, profile)
+            session.steer(registry_name, profile)
         return {
             "canonical": registry_name,
             "profile": profile_to_json(registry_name, profile),
@@ -437,7 +399,7 @@ def register_vector_routes(app: FastAPI) -> None:
         from saklas.core.manifold import load_manifold
         from saklas.core.vectors import folded_vector_directions
         from saklas.server.manifold_routes import _refuse_if_busy
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
 
         async with acquire_session_lock(session) as acquired:
             if not acquired:
@@ -488,7 +450,7 @@ def register_vector_routes(app: FastAPI) -> None:
             summarize_diagnostics,
         )
 
-        resolve_session_id(session, session_id)
+        resolve_session_id(session_id)
         # Probes and steering vectors share the per-layer ``dict[int,
         # Tensor]`` direction shape but live in different registries —
         # session.vectors holds steering profiles; a vector probe lives as a
@@ -498,11 +460,8 @@ def register_vector_routes(app: FastAPI) -> None:
         # in the web UI hits this for every selected name (vector or probe).
         profile = session.vectors.get(name)
         if profile is None:
-            try:
-                folded = probe_profile_tensors(session, name)
-                profile = Profile(folded) if folded is not None else None
-            except Exception:
-                profile = None
+            folded = probe_profile_tensors(session, name)
+            profile = Profile(folded) if folded is not None else None
         if profile is None:
             raise HTTPException(404, f"vector or probe '{name}' not found")
 
@@ -520,7 +479,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
         # ``diagnostics`` is a Profile attribute; a probe folded from its
         # manifold carries no ``diagnostics`` block.  ``getattr`` covers both.
-        diagnostics = getattr(profile, "diagnostics", None)
+        diagnostics = profile.diagnostics
         # ``total_layers`` is the *model's* layer count, not the profile's
         # — the layer-norms drawer in the web UI fills layers absent from
         # the profile with zero so the user can read the DLS pattern.

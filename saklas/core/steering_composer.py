@@ -17,22 +17,19 @@ probe gate); it binds ``capture``/``monitor`` to locals before the inner ``def``
 reads the session's capture state through the back-ref exactly as the unextracted
 body did, so the per-token path gains no new indirection.
 
-The session keeps a thin forwarder for every method here, because
-:class:`_SteeringContext`, ``joint_logprobs.py``, and ~15 tests bind these names on
-the session (monkeypatch / ``__get__`` to a stub / direct call).  The forwarders make
-the extraction behavior- and API-preserving by construction.
+The session exposes the artifact loaders as its public registration API and keeps
+narrow context/generation forwarders where the session boundary is meaningful.
 """
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
 from saklas.core.events import SteeringApplied, SteeringCleared
 from saklas.core.manifold import manifold_is_affine
 from saklas.core.session import (
-    CaptureState,
     ConcurrentGenerationError,
     GenState,
     ManifoldNotRegisteredError,
@@ -55,8 +52,7 @@ class SteeringComposer:
     Instantiated once per :class:`~saklas.core.session.SaklasSession` after the
     state it depends on exists (``_steering`` manager, ``_profiles`` /
     ``_manifolds`` / ``_layer_means``, and the ``_monitor``).  The session holds the
-    instance as ``_steering_composer`` and exposes ``_stack`` through a settable
-    ``session._steering_stack`` property.
+    instance as ``_steering_composer``. The stack has one owner: this collaborator.
     """
 
     def __init__(self, session: "SaklasSession") -> None:
@@ -105,13 +101,19 @@ class SteeringComposer:
         from saklas.core.steering_expr import ProjectedTerm
         from saklas.core.vectors import project_profile
 
-        whitener = self._session.whitener
         profiles = self._session._profiles
 
         snapshots: dict[str, object] = {}
+        whitener = None
         for syn_key, val in steering.alphas.items():
             if not isinstance(val, ProjectedTerm):
                 continue
+            # Do not wake the lazy neutral-activation/whitener pipeline for an
+            # ordinary steering expression.  Plain vector/manifold terms are
+            # normalized later by ``compose_steering_entries``; only an actual
+            # projection needs the whitener at materialization time.
+            if whitener is None:
+                whitener = self._session.whitener
             base_tensors = self.ensure_profile_registered(
                 val.base, role="projection base",
             )
@@ -141,7 +143,8 @@ class SteeringComposer:
         ``key`` is the manifold registry key produced by the grammar:
         ``[ns/]name[:variant]``.  ``raw`` (default) selects the
         residual-stream tensor; ``sae-<release>`` selects the SAE-variant
-        tensor.  A bare name (no namespace) searches every namespace
+        tensor; ``from-*`` selects a cross-model transfer; ``role-*``
+        validates the canonical tensor's role baseline. A bare name searches
         under ``manifolds/``.  The loaded :class:`Manifold` is promoted
         onto the session device (kept fp32 — the spline math wants it).
         Raises :class:`ManifoldNotRegisteredError` on a miss.
@@ -167,15 +170,26 @@ class SteeringComposer:
                 sorted(d.name for d in root.iterdir() if d.is_dir())
                 if root.exists() else []
             )
+        transferred_from: str | None = None
+        requested_role: str | None = None
         if variant == "raw":
             release: str | None = None
         elif variant.startswith("sae-"):
             release = variant[len("sae-"):]
+        elif variant.startswith("from-"):
+            release = None
+            transferred_from = variant[len("from-"):]
+        elif variant.startswith("role-"):
+            release = None
+            requested_role = variant[len("role-"):]
         else:
             raise ManifoldNotRegisteredError(
                 f"manifold '{key}': unsupported variant '{variant}'"
             )
-        fname = tensor_filename(model_id, release=release)
+        fname = tensor_filename(
+            model_id, release=release, transferred_from=transferred_from,
+            transferred_from_is_encoded=transferred_from is not None,
+        )
 
         matches = [
             (ns, manifold_dir(ns, name) / fname)
@@ -196,7 +210,63 @@ class SteeringComposer:
                 f"ambiguous manifold '{name}': matches {qualified}. "
                 f"Qualify it with a namespace."
             )
-        manifold = load_manifold(matches[0][1])
+        tensor_path = matches[0][1]
+        manifold = load_manifold(tensor_path)
+        metadata = manifold.metadata
+        from saklas.core.model import loaded_model_fingerprint
+        from saklas.io.paths import encode_release_id
+
+        live_fingerprint = loaded_model_fingerprint(
+            self._session._model, model_id,
+        )
+        if transferred_from is not None:
+            source_id = metadata.get("source_model_id")
+            if (
+                not isinstance(source_id, str)
+                or encode_release_id(source_id) != transferred_from
+            ):
+                raise ManifoldNotRegisteredError(
+                    f"manifold '{key}' transfer provenance does not match "
+                    f"source {transferred_from!r}; recompute the transfer"
+                )
+        raw_roles = metadata.get("node_roles")
+        roles = (
+            list(raw_roles)
+            if isinstance(raw_roles, list)
+            else [None] * len(manifold.node_labels)
+        )
+        if requested_role is not None and (
+            not roles or not all(role == requested_role for role in roles)
+        ):
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}' was not fitted uniformly with role "
+                f"{requested_role!r}; refit it with that role"
+            )
+        if variant == "raw" and any(role is not None for role in roles):
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}' was fitted with role baseline "
+                f"{roles!r}; steer it as :role-<name> or refit raw"
+            )
+        if metadata.get("model_fingerprint") != live_fingerprint:
+            raise ManifoldNotRegisteredError(
+                f"manifold '{key}' was fitted for different loaded weights "
+                f"under {model_id}; run `saklas manifold fit` again"
+            )
+        if metadata.get("fit_mode", "authored") != "baked":
+            from saklas.core.extraction import prepare_manifold_capture_identity
+            from saklas.io.manifold_folder import ManifoldFolder
+
+            folder_mf = ManifoldFolder.load(
+                tensor_path.parent, verify_manifest=False,
+            )
+            expected_capture = prepare_manifold_capture_identity(
+                self._session, folder_mf, live_fingerprint,
+            )[3]
+            if metadata.get("capture_sha256") != expected_capture:
+                raise ManifoldNotRegisteredError(
+                    f"manifold '{key}' capture inputs changed (tokenizer, chat "
+                    "template, role framing, or baseline prompts); refit it"
+                )
         manifolds[key] = manifold.to(
             device=self._session._device, dtype=torch.float32,
         )
@@ -245,6 +315,58 @@ class SteeringComposer:
             canonical_qualified = (
                 canonical if ns is None else f"{ns}/{canonical}"
             )
+            if variant in {"sae", "from", "role"}:
+                import json
+
+                from saklas.core.errors import (
+                    AmbiguousVariantError, UnknownVariantError,
+                )
+                from saklas.io.paths import (
+                    manifold_dir, manifolds_dir, parse_tensor_filename,
+                    safe_model_id,
+                )
+
+                roots = (
+                    [(ns, manifold_dir(ns, canonical))]
+                    if ns is not None else [
+                        (entry.name, entry / canonical)
+                        for entry in manifolds_dir().iterdir()
+                        if entry.is_dir()
+                    ] if manifolds_dir().exists() else []
+                )
+                concrete: set[str] = set()
+                safe_model = safe_model_id(self._session.model_id)
+                for _candidate_ns, folder in roots:
+                    if variant == "role":
+                        sidecar_path = folder / f"{safe_model}.json"
+                        if not sidecar_path.exists():
+                            continue
+                        with open(sidecar_path) as handle:
+                            raw_sidecar = json.load(handle)
+                        roles = raw_sidecar.get("node_roles") or [
+                            None
+                        ] * int(raw_sidecar.get("node_count", 0))
+                        if roles and all(role == roles[0] for role in roles):
+                            if roles[0] is not None:
+                                concrete.add(f"role-{roles[0]}")
+                        continue
+                    for tensor_path in folder.glob(f"{safe_model}_*.safetensors"):
+                        parsed = parse_tensor_filename(tensor_path.name)
+                        if parsed is None or parsed[1] is None:
+                            continue
+                        parsed_variant = parsed[1]
+                        if parsed_variant.startswith(f"{variant}-"):
+                            concrete.add(parsed_variant)
+                if len(concrete) != 1:
+                    error = (
+                        UnknownVariantError
+                        if not concrete else AmbiguousVariantError
+                    )
+                    raise error(
+                        f"manifold '{canonical_qualified}:{variant}' resolves "
+                        f"to {sorted(concrete) or 'no fitted variants'}"
+                    )
+                variant = next(iter(concrete))
             registry_key = (
                 canonical_qualified
                 if variant == "raw"
@@ -252,8 +374,7 @@ class SteeringComposer:
             )
             if registry_key not in profiles:
                 try:
-                    # Unified resolution: fold a fitted manifold, or port a
-                    # legacy vectors/ folder on first touch.  May raise
+                    # Unified resolution folds the fitted manifold. May raise
                     # Ambiguous/UnknownVariantError — keep the user's original
                     # name in ``out`` so the error surfaces at hook-install
                     # with a clear message.
@@ -276,23 +397,15 @@ class SteeringComposer:
     ) -> dict[int, torch.Tensor]:
         """Direction profile for ``name`` — registered tensor or folded manifold.
 
-        4.0 unifies the sources a steering direction can come from, **manifold
-        first** (the 6e "prefer-manifold" stance):
+        Steering directions come from the current manifold-first runtime:
 
         1. an in-memory baked direction already in ``_profiles`` (ad-hoc
            ``extract``/``clone``/``merge`` results, ``~``/``|`` projection
            derivations) — returned verbatim;
-        2. a fitted 2-node ``pca`` manifold on disk (native, or one a prior
-           steer already ported) — loaded via :meth:`ensure_manifold_loaded`
+        2. a fitted 2-node ``pca`` manifold on disk — loaded via
+           :meth:`ensure_manifold_loaded`
            and folded by :func:`~saklas.core.vectors.folded_vector_directions`,
            then memoized in ``_profiles``;
-        3. a **stale** (`< PACK_FORMAT_VERSION`) statements-bearing legacy
-           ``vectors/<ns>/<name>/`` folder — ported to a 2-node manifold on
-           first touch (:meth:`port_stale_legacy_vector`).  The port is
-           file-only; fitting runs forward passes through the model and can't
-           re-enter the generation lock from dispatch, so a freshly-ported
-           manifold has no tensor yet and the call raises with the exact
-           ``manifold fit`` command to run (or the bulk migration with ``-m``).
 
         Raises :class:`VectorNotRegisteredError` when nothing resolves.
         """
@@ -316,31 +429,20 @@ class SteeringComposer:
             )
             return profiles[registered]
 
-        # (2) Manifold first — native or previously ported.
+        # (1c) Reserved SAE namespace: ``sae/<integer>`` is the resident
+        # release's decoder row at its hook layer. It is a steering-only
+        # profile; feature probes use the encoder readout channel instead.
+        if canonical.startswith("sae/") and variant == "raw":
+            registered = self._session.register_sae_direction(
+                canonical.split("/", 1)[1]
+            )
+            return profiles[registered]
+
+        # (2) Manifold-backed direction.
         folded = self.try_fold_manifold(name)
         if folded is not None:
             profiles[name] = folded
             return folded
-
-        # (3) Stale legacy vectors/ folder → port (file-only) and nudge to fit.
-        if variant == "raw":
-            ported = self.port_stale_legacy_vector(canonical)
-            if ported is not None:
-                folded = self.try_fold_manifold(name)
-                if folded is not None:
-                    profiles[name] = folded
-                    return folded
-                ns, bare = ported
-                model_id = self._session.model_id
-                raise VectorNotRegisteredError(
-                    f"ported legacy vector '{canonical}' to manifold "
-                    f"'{ns}/{bare}' (a 2-node pca subspace), but it has no "
-                    f"fitted tensor for {model_id} yet — porting is "
-                    f"file-only. Fit it: "
-                    f"`saklas manifold fit {ns}/{bare} -m {model_id}` "
-                    f"(or `python scripts/upgrade_packs.py --all -m {model_id}` "
-                    f"to migrate + fit every legacy vector at once)."
-                )
 
         raise VectorNotRegisteredError(
             f"No vector registered for {role} '{name}'"
@@ -368,64 +470,6 @@ class SteeringComposer:
                 f"'{name}' is a manifold that does not fold to a single "
                 f"steering direction (not a 2-node affine subspace): {e}"
             ) from e
-
-    def port_stale_legacy_vector(
-        self, canonical: str,
-    ) -> tuple[str, str] | None:
-        """Port a stale legacy ``vectors/`` folder to a 2-node ``pca`` manifold.
-
-        4.0 6e port-on-detect.  ``canonical`` is a concept name, optionally
-        ``ns/``-qualified.  Scans ``vectors/`` *directly* (not through the
-        resolver, which after the v3 bump skips stale v2 folders) for a
-        statements-bearing folder whose ``pack.json`` is below
-        :data:`~saklas.io.packs.PACK_FORMAT_VERSION`, and ports it via
-        :func:`~saklas.io.manifolds.port_legacy_vector_folder` (file-only — no
-        tensors carried; they re-fit lazily).  Current-version packs are left
-        for the autoload path; tensor-only packs (no ``statements.json``) can't
-        re-fit and are skipped.
-
-        Returns ``(namespace, name)`` when a folder was ported or a matching
-        manifold already exists (so the caller nudges to fit), else ``None``.
-        """
-        import json as _json
-        from saklas.io.packs import PACK_FORMAT_VERSION
-        from saklas.io.paths import vectors_dir, concept_dir, manifold_dir
-        from saklas.io.manifolds import port_legacy_vector_folder
-        from saklas.io.selectors import invalidate as _invalidate_selectors
-
-        if "/" in canonical:
-            ns, bare = canonical.split("/", 1)
-            candidates = [(ns, concept_dir(ns, bare))]
-        else:
-            bare = canonical
-            root = vectors_dir()
-            candidates = (
-                [(nsd.name, nsd / bare) for nsd in sorted(root.iterdir())
-                 if nsd.is_dir() and (nsd / bare).is_dir()]
-                if root.exists() else []
-            )
-
-        for namespace, vfolder in candidates:
-            pack_path = vfolder / "pack.json"
-            if not pack_path.exists():
-                continue
-            if not (vfolder / "statements.json").exists():
-                continue  # tensor-only — can't re-fit, leave to autoload
-            try:
-                fmt = _json.loads(pack_path.read_text()).get("format_version", 1)
-            except (OSError, ValueError):
-                fmt = 1
-            if isinstance(fmt, int) and fmt >= PACK_FORMAT_VERSION:
-                continue  # current — keep its tensor via autoload-fold
-            if (manifold_dir(namespace, bare) / "manifold.json").exists():
-                return (namespace, bare)  # already ported; nudge to fit
-            try:
-                port_legacy_vector_folder(vfolder, namespace=namespace, force=False)
-            except Exception:
-                continue
-            _invalidate_selectors()
-            return (namespace, bare)
-        return None
 
     # -------------------------------------------------------- stack push / pop
 
@@ -478,8 +522,7 @@ class SteeringComposer:
         with session._gen_lock:
             self._stack.append(dict(entries))
             try:
-                # Through the session forwarder so test stubs that override
-                # ``session._rebuild_steering_hooks`` take effect.
+                # Rebuild through the session boundary after the stack mutation.
                 session._rebuild_steering_hooks()
             except BaseException:
                 self._stack.pop()
@@ -524,8 +567,7 @@ class SteeringComposer:
             )
         with session._gen_lock:
             self._stack.pop()
-            # Through the session forwarder so test stubs that override
-            # ``session._rebuild_steering_hooks`` take effect.
+            # Rebuild through the session boundary after the stack mutation.
             session._rebuild_steering_hooks()
             # Symmetric with ``push``: the cached prefix is unsteered,
             # so only invalidate when what remains on the stack still steers the
@@ -546,7 +588,7 @@ class SteeringComposer:
         entries keyed under ``!<target>`` flatten to their ``(coeff,
         trigger)`` pair so subscribers see one uniform tuple shape.
         """
-        flat = self.flatten_steering_stack()
+        flat = self.flatten_stack()
         alphas_only: dict[str, float] = {}
         entries_out: dict[str, tuple[float, Trigger]] = {}
         for name, entry in flat.items():
@@ -560,7 +602,7 @@ class SteeringComposer:
             SteeringApplied(alphas=alphas_only, entries=entries_out)
         )
 
-    def flatten_steering_stack(self) -> dict[str, SteeringStackEntry]:
+    def flatten_stack(self) -> dict[str, SteeringStackEntry]:
         """Collapse the LIFO stack into a single entries dict (later wins)."""
         flat: dict[str, SteeringStackEntry] = {}
         for entry in self._stack:
@@ -576,7 +618,7 @@ class SteeringComposer:
         Cheap pre-flight check that lets ``_generate_core`` decide
         whether to wire the per-step score callback at all.
         """
-        flat = self.flatten_steering_stack()
+        flat = self.flatten_stack()
         for entry in flat.values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 if entry.trigger.gate is not None:
@@ -604,7 +646,7 @@ class SteeringComposer:
         """
         attached = set(self._session._monitor.probe_names)
         out: set[str] = set()
-        for entry in self.flatten_steering_stack().values():
+        for entry in self.flatten_stack().values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
             else:  # (alpha, Trigger)
@@ -623,10 +665,55 @@ class SteeringComposer:
         """Exact monitor scalar keys referenced by active probe gates."""
         attached = set(self._session._monitor.probe_names)
         out: set[str] = set()
-        for entry in self.flatten_steering_stack().values():
+        for entry in self.flatten_stack().values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
             else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            gate = trig.gate
+            if gate is None:
+                continue
+            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
+            if name in attached:
+                out.add(gate.probe)
+        return out
+
+    def gated_lens_probe_keys(self) -> set[str]:
+        """Exact gate scalar keys referencing attached J-lens token probes.
+
+        The lens siblings of :meth:`gated_probe_keys`: lens probes live in the
+        session lens-probe registry (readout channel), not the Monitor, and
+        their gate scalars come from ``session._score_lens_gate_scalars`` in
+        the gating score callback.  Only keys whose base name is an attached
+        lens probe count, mirroring the monitor filter.
+        """
+        attached = set(self._session._lens_probes)
+        if not attached:
+            return set()
+        out: set[str] = set()
+        for entry in self.flatten_stack().values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:  # (alpha, Trigger)
+                _alpha, trig = entry
+            gate = trig.gate
+            if gate is None:
+                continue
+            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
+            if name in attached:
+                out.add(gate.probe)
+        return out
+
+    def gated_sae_probe_keys(self) -> set[str]:
+        """Exact gate scalar keys referencing attached SAE feature probes."""
+        attached = set(self._session._sae_probes)
+        if not attached:
+            return set()
+        out: set[str] = set()
+        for entry in self.flatten_stack().values():
+            if isinstance(entry, (AblationTerm, ManifoldTerm)):
+                trig = entry.trigger
+            else:
                 _alpha, trig = entry
             gate = trig.gate
             if gate is None:
@@ -649,7 +736,7 @@ class SteeringComposer:
         keys on, and the condition under which steering push/pop preserves the
         cache.  Mirrors :meth:`steering_needs_probe_gating`'s stack walk.
         """
-        flat = self.flatten_steering_stack()
+        flat = self.flatten_stack()
         for entry in flat.values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
@@ -678,7 +765,7 @@ class SteeringComposer:
 
         try:
             s = Steering.from_value(
-                value, profile_names=set(getattr(self._session, "_profiles", {})),
+                value, profile_names=set(self._session._profiles),
             )
         except Exception:
             return False
@@ -722,18 +809,62 @@ class SteeringComposer:
         session = self._session
         capture = session._capture
         monitor = session._monitor
+        # J-lens token probes referenced by active gates score on the lens
+        # path (readout-channel strength), not through the Monitor —
+        # detected once per generation here, merged into every return below.
+        monitor_gate_keys = self.gated_probe_keys()
+        lens_gate_keys = self.gated_lens_probe_keys()
+        sae_gate_keys = self.gated_sae_probe_keys()
+        has_lens_gates = bool(lens_gate_keys)
+        has_sae_gates = bool(sae_gate_keys)
+        monitor_gate_plan_cache: dict[
+            tuple[frozenset[str], frozenset[str] | None],
+            Any,
+        ] = {}
 
-        def _score() -> dict[str, float]:
-            incremental_readings = getattr(session, "_incremental_readings", [])
-            incremental_gate_scores = getattr(session, "_incremental_gate_scores", [])
+        def _score_monitor_gate_keys(
+            latest: dict[int, torch.Tensor],
+            gate_keys: set[str],
+            *,
+            probe_names: set[str] | None = None,
+        ) -> dict[str, float]:
+            if not gate_keys:
+                return {}
+            frozen_keys = frozenset(gate_keys)
+            frozen_probes = (
+                frozenset(probe_names) if probe_names is not None else None
+            )
+            cache_key = (frozen_keys, frozen_probes)
+            plan = monitor_gate_plan_cache.get(cache_key)
+            if plan is None:
+                plan = monitor.plan_gate_scalars(
+                    set(frozen_keys),
+                    probe_names=(
+                        set(frozen_probes) if frozen_probes is not None else None
+                    ),
+                )
+                monitor_gate_plan_cache[cache_key] = plan
+            return (
+                cast(dict[str, float], monitor.score_planned_gate_scalars(latest, plan))
+                if plan else {}
+            )
+
+        def _monitor_scalars() -> dict[str, float]:
+            incremental_readings = session._incremental_readings
+            incremental_gate_scores = session._incremental_gate_scores
             # The step sink already scored this token's readings — reuse them so
             # the gate doesn't trigger a second pass.  In gating-only-subset mode
             # (FIX #4) the rows hold just the gated probes, which is exactly the
             # set the gate consults; in the full incremental mode they hold the
             # whole roster.  Both reuse the latest appended row.
-            state = getattr(session, "_capture_state", None) or CaptureState()
+            state = session._capture_state
             gating_subset = state.gating_subset
-            gate_keys = state.gating_keys
+            gate_keys = state.gating_keys or monitor_gate_keys
+            if (
+                not gate_keys
+                and (has_lens_gates or has_sae_gates)
+            ):
+                return {}
             if gating_subset and incremental_gate_scores:
                 return incremental_gate_scores[-1]
             if state.incremental and incremental_readings:
@@ -744,14 +875,24 @@ class SteeringComposer:
                         latest = capture.latest_per_layer()
                         if latest:
                             scalars.update(
-                                monitor.score_gate_scalars(latest, missing)
+                                _score_monitor_gate_keys(
+                                    latest,
+                                    missing,
+                                    probe_names=gating_subset if gating_subset else None,
+                                )
                             )
                 return scalars
+            if not monitor.probe_names:
+                return {}
             latest = capture.latest_per_layer()
             if not latest:
                 return {}
             if gate_keys:
-                return monitor.score_gate_scalars(latest, gate_keys)
+                return _score_monitor_gate_keys(
+                    latest,
+                    gate_keys,
+                    probe_names=gating_subset if gating_subset else None,
+                )
             # Flatten the coordinate readings into gate-callback scalars
             # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
             # ``name@label`` for curved nearest).  Scope to the gated subset
@@ -760,6 +901,20 @@ class SteeringComposer:
                 latest, only=gating_subset if gating_subset else None,
             )
             return monitor.flat_scalars(agg)
+
+        def _score() -> dict[str, float]:
+            out = _monitor_scalars()
+            if has_lens_gates:
+                # Once per forward: band lens logits → strength
+                # scalars (also stashed for the display step to reuse).
+                lens_scalars = session._score_lens_gate_scalars(lens_gate_keys)
+                if lens_scalars:
+                    out = {**out, **lens_scalars}
+            if has_sae_gates:
+                sae_scalars = session._score_sae_gate_scalars(sae_gate_keys)
+                if sae_scalars:
+                    out = {**out, **sae_scalars}
+            return out
 
         return _score
 
@@ -794,25 +949,24 @@ class SteeringComposer:
         steering = session._steering
 
         steering.clear_all()
-        # Raw attr (not the lazily-building ``layer_means`` property): real
-        # sessions populate it at construction / first extraction, and a
-        # model-less context (test stub) keeps an empty dict rather than
-        # triggering a model-dependent build.  An empty anchor ⇒ the synthesizer
-        # skips every layer (no steering), the same degenerate path the old
-        # ablation took without ``layer_means``.
-        neutral_means = session._layer_means
+        neutral_means = session.layer_means
 
         # Whitened push normalization (Mahalanobis-only): hand the synthesizer the
         # session whitener so the per-layer ``along`` budget is the whitened
         # displacement ``‖Δ‖_M`` and the target is a whitened-unit direction —
         # making ``along`` a scale-stable strength knob instead of inheriting each
         # node's raw-Euclidean distance from neutral (which spans ~100× across
-        # targets).  Gated on a real session (means populated): a model-less stub
-        # keeps the Euclidean fallback, and the property soft-fails to ``None``
-        # (covers_all is then false) so a missing whitener degrades, never raises.
-        whitener = session.whitener if neutral_means else None
+        # targets).
+        whitener = session.whitener
 
-        # trigger -> {"push": [(basis_dirs, coord_dirs, coeff)], "ablate": [dirs]}
+        # trigger -> {
+        #   "push": [(basis_dirs, coord_dirs, coeff)],
+        #   "ablate": [(dirs, coeff)],
+        # }
+        #
+        # Ablation coefficients must remain attached to their directions all
+        # the way into synthesis.  Dropping them here silently turned every
+        # partial ablation (``0.15 !x``) into a full ablation.
         grouped: dict[Trigger, dict[str, list[Any]]] = {}
 
         def _bucket(trigger: Trigger) -> dict[str, list[Any]]:
@@ -829,7 +983,9 @@ class SteeringComposer:
                     L: v.to(torch.float32).reshape(-1)
                     for L, v in ablate_prof.items()
                 }
-                _bucket(entry.trigger)["ablate"].append(ablate_dirs)
+                _bucket(entry.trigger)["ablate"].append(
+                    (ablate_dirs, entry.coeff),
+                )
                 continue
             if isinstance(entry, ManifoldTerm):
                 manifold = session._manifolds.get(entry.manifold)
@@ -863,7 +1019,9 @@ class SteeringComposer:
             # one-pole-ray subspace and push label-form, exactly as an affine
             # ``%`` term does.  There is no separate baked-vector fragment.
             prof = self.ensure_profile_registered(name)
-            folded = fold_directions_to_subspace(name, prof, neutral_means)
+            folded = fold_directions_to_subspace(
+                name, prof, neutral_means, whitener=whitener,
+            )
             if not folded.layers:
                 continue
             basis_dirs, coord_dirs = _affine_manifold_push(
@@ -903,15 +1061,13 @@ class SteeringComposer:
         session = self._session
         steering = session._steering
         session._steering_uses_compiled_offsets = False
-        # ``getattr`` defaults keep skeleton sessions (``__new__`` test stubs that
-        # bypass ``__init__``) on the transient path — they never compile.
         if (
-            getattr(session, "_compiled", False)
+            session._compiled
             and session._device.type == "mps"
             and steering.has_compiled_offsets()
             and (
                 not session._monitor.probe_names
-                or getattr(session, "_compiled_clean_eligible", False)
+                or session._compiled_clean_eligible
             )
         ):
             offsets = steering.compute_static_offsets()
@@ -939,7 +1095,7 @@ class SteeringComposer:
         ``SteeringManager.apply_to_model`` lowers them to per-layer
         ``subspace_inject`` groups.
         """
-        flat = self.flatten_steering_stack()
+        flat = self.flatten_stack()
         if not flat:
             self._session._steering.clear_all()
             return
@@ -947,7 +1103,7 @@ class SteeringComposer:
         self.install_composed_steering()
 
     def snapshot_steering_alphas(self) -> dict[str, float]:
-        """Flatten the active steering stack for ``GenerationResult.vectors``.
+        """Flatten the active steering stack for result steering receipts.
 
         For a plain vector entry, ``entry[0]`` is the additive alpha (the
         strength coefficient, typically in ``[0, 1]``).
@@ -961,7 +1117,7 @@ class SteeringComposer:
         should inspect the live ``Steering.alphas`` dict directly.
         """
         snap: dict[str, float] = {}
-        for name, entry in self.flatten_steering_stack().items():
+        for name, entry in self.flatten_stack().items():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 snap[name] = entry.coeff
                 continue

@@ -106,9 +106,11 @@
   let query: string = $state("");
   let searchInputRef: HTMLInputElement | null = $state(null);
 
-  // Per-row node-list collapse.  Node lists default OPEN, so a key
-  // present here means the user explicitly folded that row's nodes.
-  const collapsedNodes = new SvelteSet<string>();
+  // Per-row node-list disclosure.  Keep rows compact by default: opening a
+  // category containing ``personas`` must not immediately render 107 disabled
+  // controls and bury the next manifold several screens away.  Search still
+  // auto-expands matching node lists so discovery remains one-step.
+  const expandedNodes = new SvelteSet<string>();
 
   // Section-prefixed category expansion ("ft:register" / "un:register")
   // so the Fitted / Unfitted sections track open state independently.
@@ -190,19 +192,18 @@
   }
 
   function nodesOpen(key: string): boolean {
-    return searching || !collapsedNodes.has(key);
+    return searching || expandedNodes.has(key);
   }
   function toggleNodes(key: string): void {
-    if (collapsedNodes.has(key)) collapsedNodes.delete(key);
-    else collapsedNodes.add(key);
+    if (expandedNodes.has(key)) expandedNodes.delete(key);
+    else expandedNodes.add(key);
   }
 
   // ----- family filter + section split --------------------------------
 
   /** The family discriminator — subspace admits every flat affine fit
    *  (pca / baked), manifold admits curved fits only (spectral /
-   *  authored).  ``fit_mode`` defaults to ``authored`` (curved) when a
-   *  legacy server omits it.
+   *  authored).
    *
    *  An ``auto`` discover folder resolves its geometry per-model at fit
    *  time, so route it by ``resolved_fit_mode`` once fitted; while it's
@@ -210,7 +211,7 @@
    *  belongs to *both* families until a fit pins it — otherwise an
    *  unfitted auto manifold (personas / emotions) shows in neither drawer. */
   function inFamily(m: ManifoldInfo): boolean {
-    let fm: string = m.fit_mode ?? "authored";
+    let fm: string = m.fit_mode;
     if (fm === "auto") {
       const resolved = m.resolved_fit_mode;
       if (resolved == null) return true; // unresolved → show in both drawers
@@ -322,10 +323,10 @@
     busyKeys.add(key);
     try {
       const info = await attachProbe(key);
-      pushToast(`attached probe ${info.name}`, { kind: "info" });
+      pushToast(`probe ${info.name}`, { kind: "info" });
       closeDrawer();
     } catch (e) {
-      pushToast(`attach failed — ${describeError(e)}`, {
+      pushToast(`attach: ${describeError(e)}`, {
         kind: "error",
         ttlMs: null,
       });
@@ -354,11 +355,11 @@
       if (customAlias.trim()) opts.name = customAlias.trim();
       if (customTopN && customTopN > 0) opts.top_n = customTopN;
       const info = await attachProbe(sel, opts);
-      pushToast(`attached probe ${info.name}`, { kind: "info" });
+      pushToast(`probe ${info.name}`, { kind: "info" });
       customSelector = "";
       customAlias = "";
     } catch (e) {
-      pushToast(`attach failed — ${describeError(e)}`, {
+      pushToast(`attach: ${describeError(e)}`, {
         kind: "error",
         ttlMs: null,
       });
@@ -509,7 +510,7 @@
             class="nodes-toggle"
             aria-expanded={nodesOpen(key)}
             onclick={() => toggleNodes(key)}
-            title={nodesOpen(key) ? "collapse nodes" : "expand nodes"}
+            title={nodesOpen(key) ? "collapse" : "expand"}
           >
             <span class="caret" aria-hidden="true">{nodesOpen(key) ? "▾" : "▸"}</span>
             <span class="nodes-label">nodes</span>
@@ -564,7 +565,7 @@
               class="act inspect"
               aria-expanded={inspecting}
               onclick={() => void toggleInspect(m)}
-              title={inspecting ? "hide diagnostics" : "inspect fit"}
+              title={inspecting ? "hide" : "inspect"}
             >{inspecting ? "▾" : "ⓘ"}</button>
             <button
               type="button"
@@ -575,8 +576,7 @@
                 ? `${key} is already racked`
                 : `rack ${key} for steering`}
             >+steer</button>
-            {#if !probeRack.unavailable}
-              <button
+            <button
                 type="button"
                 class="act probe"
                 disabled={busy || isProbed(m)}
@@ -584,8 +584,7 @@
                 title={isProbed(m)
                   ? `${key} is already attached as a probe`
                   : `attach ${key} as a read-side probe`}
-              >+probe</button>
-            {/if}
+            >+probe</button>
             <button
               type="button"
               class="act fit"
@@ -614,10 +613,7 @@
               {#if isDiscoverMode(detail)}
                 <DiagnosticsPanel manifold={detail} />
               {:else}
-                <p class="muted">
-                  authored manifold — no discover-mode diagnostics
-                  ({detail.domain_label}, dim={detail.intrinsic_dim})
-                </p>
+                <p class="muted">authored · {detail.domain_label} · dim {detail.intrinsic_dim}</p>
               {/if}
             {/if}
           </div>
@@ -667,7 +663,7 @@
     {/if}
 
     <details class="custom-attach">
-      <summary>attach probe by selector</summary>
+      <summary>attach selector</summary>
       <form class="attach-form" onsubmit={onCustomAttachSubmit}>
         <label class="row-label">
           <span>selector</span>
@@ -681,11 +677,11 @@
           />
         </label>
         <label class="row-label">
-          <span>name <span class="optional">(optional)</span></span>
+          <span>name</span>
           <input
             type="text"
             class="text-input"
-            placeholder="registered name"
+            placeholder="name"
             aria-label="Registered probe name (optional)"
             bind:value={customAlias}
             disabled={customAttaching}
@@ -718,7 +714,7 @@
       <span class="build-hint">{launcherHint}</span>
     </button>
 
-    {#if !steerRack.unavailable && familyTotal > 0}
+    {#if familyTotal > 0}
       <div class="search-row">
         <input
           type="search"
@@ -736,7 +732,7 @@
           class="refresh"
           onclick={() => void refreshManifoldList()}
           disabled={steerRack.loading}
-          title="re-fetch"
+          title="refresh"
           aria-label="Refresh"
         >{steerRack.loading ? "…" : "↻"}</button>
       </div>
@@ -746,18 +742,10 @@
       <p class="error" role="alert">{steerRack.error}</p>
     {/if}
 
-    {#if steerRack.unavailable}
-      <p class="muted">
-        this server doesn't expose the manifold API — update saklas to
-        author and fit steering {title === "manifold" ? "manifolds" : "subspaces"}.
-      </p>
-    {:else if steerRack.loading && familyTotal === 0}
+    {#if steerRack.loading && familyTotal === 0}
       <p class="muted">loading…</p>
     {:else if familyTotal === 0}
-      <p class="muted">
-        no {title === "manifold" ? "manifolds" : "subspaces"} yet — use
-        + {launcherLabel} above to author one.
-      </p>
+      <p class="muted">none</p>
     {:else}
       {#if ftSections.length > 0}
         <h2 class="section-title">Fitted</h2>
@@ -793,7 +781,7 @@
       {#if unSections.length > 0}
         <h2 class="section-title">
           Unfitted
-          <span class="section-hint">no tensor for this model yet</span>
+          <span class="section-hint">unfitted</span>
         </h2>
         <div class="catalog">
           {#each unSections as { cat, items } (cat)}
@@ -825,7 +813,7 @@
       {/if}
 
       {#if fitted.length === 0 && unfitted.length === 0}
-        <p class="muted">no {title} or node matches "{query.trim()}".</p>
+        <p class="muted">no matches</p>
       {/if}
     {/if}
   </div>
@@ -838,39 +826,50 @@
     height: 100%;
     min-height: 0;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-4) var(--space-5);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-5) var(--space-6);
   }
   /* Family accent drives the header title colour (and every accented rule
    * below via ``--family-accent``) — white subspace vs purple manifold. */
   .title {
     color: var(--family-accent);
     letter-spacing: 0;
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
-    font-size: var(--text);
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
     line-height: 1;
-    padding: var(--space-2) var(--space-3);
     cursor: pointer;
-    transition: color var(--dur) var(--ease-out);
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--accent-red);
+    color: var(--fg);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: var(--space-4) var(--space-5) var(--space-5);
+    padding: var(--space-5) var(--space-6);
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
@@ -969,7 +968,6 @@
     text-align: left;
     background: transparent;
     border: 0;
-    border-bottom: 1px solid var(--border);
     padding: var(--space-3) var(--space-1) var(--space-2);
     color: var(--fg-muted);
     cursor: pointer;
@@ -1011,13 +1009,13 @@
     flex-direction: column;
     gap: var(--space-2);
     background: var(--bg-deep);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
-    transition: border-color var(--dur) var(--ease-out);
+    transition: background var(--dur) var(--ease-out);
   }
   .row:hover {
-    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 8%, var(--bg-deep));
   }
   .row-line {
     display: grid;
@@ -1033,13 +1031,12 @@
     text-transform: uppercase;
     font-size: var(--text-2xs);
     letter-spacing: 0.04em;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     color: var(--family-accent);
-    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
+    background: color-mix(in srgb, var(--family-accent) 16%, transparent);
   }
   .inspect-body {
     padding-top: var(--space-2);
-    border-top: 1px solid var(--border);
   }
   .inspect-body .error {
     color: var(--accent-error);
@@ -1052,7 +1049,7 @@
   }
   .act.inspect:hover:not(:disabled) {
     color: var(--family-accent);
-    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, var(--glass));
   }
   .meta {
     display: flex;
@@ -1062,6 +1059,7 @@
   }
   .row-name {
     color: var(--fg-strong);
+    font-family: var(--font-mono);
     font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1081,9 +1079,9 @@
     gap: var(--space-2);
   }
   .act {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-dim);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -1092,12 +1090,11 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .act:hover:not(:disabled) {
     color: var(--fg-strong);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .act:disabled {
     opacity: 0.45;
@@ -1113,19 +1110,17 @@
   }
   .act.steer:hover:not(:disabled),
   .act.probe:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
-    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, var(--glass));
   }
   .act.fit {
     color: var(--family-accent);
   }
   .act.fit:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
-    border-color: var(--family-accent);
+    background: color-mix(in srgb, var(--family-accent) 12%, var(--glass));
   }
   .act.del:hover:not(:disabled) {
     color: var(--accent-red);
-    border-color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 12%, var(--glass));
   }
   .act.del.confirm {
     color: var(--accent-red);
@@ -1136,7 +1131,6 @@
   /* Custom-attach disclosure — collapsed by default so it doesn't compete
    * with the catalog rows. */
   .custom-attach {
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-deep);
   }
@@ -1158,7 +1152,6 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-3) var(--space-4) var(--space-4);
-    border-top: 1px solid var(--border);
   }
   .attach-form .row-label {
     display: flex;
@@ -1170,16 +1163,12 @@
   .attach-form .row-label > span {
     flex: 0 0 5.5em;
   }
-  .attach-form .optional {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-  }
   .text-input {
     flex: 1 1 0;
     min-width: 0;
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -1210,9 +1199,9 @@
   .search {
     flex: 1 1 auto;
     min-width: 0;
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
@@ -1225,8 +1214,8 @@
   }
   .refresh {
     flex: 0 0 auto;
-    background: transparent;
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
     color: var(--fg-dim);
     padding: 0 var(--space-4);
     border-radius: var(--radius);
@@ -1235,10 +1224,10 @@
     cursor: pointer;
     transition:
       color var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out);
+      background var(--dur) var(--ease-out);
   }
   .refresh:hover:not(:disabled) {
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
     color: var(--fg);
   }
   .refresh:disabled {
@@ -1249,7 +1238,6 @@
   /* ---- per-row node list ---- */
   .nodes-block {
     padding-top: var(--space-2);
-    border-top: 1px solid var(--border);
   }
   .nodes-toggle {
     display: inline-flex;
@@ -1291,9 +1279,9 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-1) var(--space-3);
     font: inherit;
@@ -1302,13 +1290,11 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .node-chip:hover:not(:disabled) {
     color: var(--family-accent);
-    border-color: var(--family-accent);
-    background: color-mix(in srgb, var(--family-accent) 12%, transparent);
+    background: color-mix(in srgb, var(--family-accent) 16%, var(--glass));
   }
   .node-chip:disabled {
     opacity: 0.5;

@@ -60,22 +60,25 @@ def _require_plotly() -> Any:
 
 
 def _detect_alpha_column(df: "pd.DataFrame") -> str:
-    """Find the unique ``vector_<name>_alpha`` column on a sweep DataFrame.
+    """Find the unique ``steering_<name>_alpha`` column on a sweep DataFrame.
 
-    ``ResultCollector`` writes one ``vector_<name>_alpha`` column per
-    registered vector.  When a sweep moves a single alpha and holds the
+    ``ResultCollector`` writes one ``steering_<name>_alpha`` column per
+    active term. When a sweep moves a single alpha and holds the
     others fixed, the moving one is the unique column with >1 distinct
     value — a robust auto-detection signal that's resilient to users
     adding extra registered vectors at fixed alpha.
 
-    Falls back to "the only ``vector_*_alpha`` column" when the variance
+    Falls back to "the only ``steering_*_alpha`` column" when the variance
     heuristic ties or finds none (e.g. a one-row DataFrame), and raises
     when no candidate exists.
     """
-    candidates = [c for c in df.columns if c.startswith("vector_") and c.endswith("_alpha")]
+    candidates = [
+        c for c in df.columns
+        if c.startswith("steering_") and c.endswith("_alpha")
+    ]
     if not candidates:
         raise ValueError(
-            "plot_alpha_sweep: no 'vector_<name>_alpha' column on the "
+            "plot_alpha_sweep: no 'steering_<name>_alpha' column on the "
             "DataFrame. Ensure each row was added through ResultCollector."
         )
     if len(candidates) == 1:
@@ -110,7 +113,7 @@ def plot_alpha_sweep(
     The alpha column is auto-detected when not specified — see
     :func:`_detect_alpha_column` for the rule.
 
-    Probe traces (left axis) are drawn for every ``probe_<name>_mean``
+    Probe traces (left axis) are drawn for every ``probe_<name>_coord``
     column on the DataFrame; one line per probe, sorted by name.  The
     secondary metric (right axis) defaults to ``tok_per_sec``; pass any
     other column name on your DataFrame (e.g. ``perplexity`` if you
@@ -131,12 +134,15 @@ def plot_alpha_sweep(
     alpha_col = alpha_column or _detect_alpha_column(df)
     df = df.sort_values(alpha_col).reset_index(drop=True)
 
-    probe_cols = sorted(c for c in df.columns if c.startswith("probe_") and c.endswith("_mean"))
+    probe_cols = sorted(
+        c for c in df.columns
+        if c.startswith("probe_") and c.endswith("_coord")
+    )
 
     fig = go.Figure()
     for col in probe_cols:
-        # "probe_<name>_mean" → "<name>" — strip the prefix/suffix exactly.
-        probe_name = col[len("probe_"):-len("_mean")]
+        # "probe_<name>_coord" → "<name>" — strip prefix/suffix exactly.
+        probe_name = col[len("probe_"):-len("_coord")]
         fig.add_trace(go.Scatter(
             x=df[alpha_col],
             y=df[col],

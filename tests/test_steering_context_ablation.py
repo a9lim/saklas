@@ -8,6 +8,7 @@ steering-stack manipulation and hook-manager wiring is exercised.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
@@ -17,8 +18,10 @@ from saklas.core.events import EventBus
 from saklas.core.hooks import SteeringManager
 from saklas.core.session import SaklasSession, VectorNotRegisteredError
 from saklas.core.steering import Steering
+from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import AblationTerm
 from saklas.core.triggers import Trigger
+from tests._whitener import isotropic_whitener
 
 
 @pytest.fixture(autouse=True)
@@ -46,9 +49,9 @@ def _skeleton_session() -> SaklasSession:
     session._device = torch.device("cpu")
     session._dtype = torch.float32
     session._profiles = {}
-    session._layer_means = {}
+    session._layer_means = {1: torch.zeros(3)}
     session._steering = SteeringManager()
-    session._steering_stack = []
+    session._steering_composer = SteeringComposer(session)
     # v2.2: _push_steering / _pop_steering acquire _gen_lock; skeleton
     # mode never runs gen so the lock is uncontended, but the ``with
     # self._gen_lock:`` block needs the attribute to exist.
@@ -58,11 +61,10 @@ def _skeleton_session() -> SaklasSession:
     from saklas.core.session import GenState
     session._gen_phase = GenState.IDLE
     session._internal_steering_pop = False
-    session._whitener = None
-    # Skeleton session has no real model.  These ablation tests don't
-    # materialize ``~``/``|`` projections (which would now require a covering
-    # whitener), so the stub ``whitener`` property returns ``None``.
-    type(session).whitener = property(lambda _self: None)  # pyright: ignore[reportAttributeAccessIssue]  # monkey-patching read-only property on type for skeleton stub
+    session._whitener = isotropic_whitener([1], 3)
+    session._compiled = False
+    session._compiled_clean_eligible = False
+    cast(Any, session)._monitor = type("_Monitor", (), {"probe_names": []})()
     session.events = EventBus()
     session._history = []  # pyright: ignore[reportAttributeAccessIssue]  # skeleton: _history is dynamically set
     return session
@@ -116,3 +118,38 @@ def test_session_steering_string_with_ablation_end_to_end():
         assert session._steering.hooks[1].manifold_groups
 
     assert not session._steering.subspaces
+
+
+@pytest.mark.parametrize("coeff", [0.15, 1.0, -0.3])
+def test_ablation_coefficient_survives_affine_gain(coeff: float) -> None:
+    """The shared affine gain must not amplify mean-ablation coefficients."""
+    session = _skeleton_session()
+    session._profiles["refusal"] = {1: torch.tensor([1.0, 0.0, 0.0])}
+
+    steering = Steering(alphas={
+        "!refusal": AblationTerm(
+            coeff=coeff, trigger=Trigger.BOTH, target="refusal",
+        ),
+    })
+    with session.steering(steering):
+        hook = session._steering.hooks[1]
+        assert len(hook.manifold_groups) == 1
+        group = hook.manifold_groups[0]
+        along = float(group[5])
+        kernel_kappa = group[7]
+        assert isinstance(kernel_kappa, torch.Tensor)
+        assert along * float(kernel_kappa[0]) == pytest.approx(coeff)
+
+
+def test_zero_ablation_coefficient_is_a_true_noop() -> None:
+    session = _skeleton_session()
+    session._profiles["refusal"] = {1: torch.tensor([1.0, 0.0, 0.0])}
+
+    steering = Steering(alphas={
+        "!refusal": AblationTerm(
+            coeff=0.0, trigger=Trigger.BOTH, target="refusal",
+        ),
+    })
+    with session.steering(steering):
+        assert not session._steering.subspaces
+        assert not session._steering.hooks

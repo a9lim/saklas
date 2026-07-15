@@ -1,7 +1,7 @@
 {
-  "format_version": 5,
+  "format_version": 9,
   "name": "personas",
-  "description": "Persona archetypes for discover-mode AUTO-fit manifold steering. 107 nodes spanning everyday and pre-modern human roles, modern social subcultures, institutional and political identities, relational and psychological archetypes, creative and divine figures, fantastical creatures, nonhuman animals, inanimate objects, AI / synthetic personas, and the named harmful cluster. Lineage is Anthropic's Assistant Axis paper (arXiv 2601.10387) plus the Persona Selection Model framing; the 2026-05-31 recut data-pruned redundant / near-baseline nodes (whitened per-node centroid distances, cross-model consistent) and filled previously-empty semantic axes. fit_mode=auto resolves the geometry per-model (select_topology scores a flat affine subspace against a curved RBF surface by GCV, with persistent-homology periodic detection); the persona fan resolves flat \u2014 a low-dim affine subspace over the per-node centroids \u2014 on role-supporting model families.",
+  "description": "Persona archetypes for discover-mode AUTO-fit manifold steering. 107 nodes spanning everyday and pre-modern human roles, modern social subcultures, institutional and political identities, relational and psychological archetypes, creative and divine figures, fantastical creatures, nonhuman animals, inanimate objects, AI / synthetic personas, and the named harmful cluster. Lineage is Anthropic's Assistant Axis paper (arXiv 2601.10387) plus the Persona Selection Model framing; the 2026-05-31 recut data-pruned redundant / near-baseline nodes (whitened per-node centroid distances, cross-model consistent) and filled previously-empty semantic axes. fit_mode=auto resolves the geometry per-model (select_topology scores a flat affine subspace against a curved RBF surface by GCV, with persistent-homology periodic detection); the persona fan resolves flat — a low-dim affine subspace over the per-node centroids — on role-supporting model families.",
   "fit_mode": "auto",
   "hyperparams": {
     "max_dim": 8
@@ -9,432 +9,542 @@
   "nodes": [
     {
       "label": "assistant",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "analyst",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "impostor",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "teacher",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "doctor",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "librarian",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "farmer",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "soldier",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "lawyer",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "chef",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "journalist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "mechanic",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "sailor",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "pilot",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "athlete",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "engineer",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "scientist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "banker",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "salesperson",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "nerd",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "jock",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "gamer",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "furry",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "weeaboo",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "influencer",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "stoner",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "femboy",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "ceo",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "emperor",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "president",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "diplomat",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "judge",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "bureaucrat",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "conservative",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "liberal",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "libertarian",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "communist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "anarchist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "reactionary",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "loner",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "friend",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "rival",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "stranger",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "lover",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "stalker",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "lunatic",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "paranoid",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "detective",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "therapist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "nomad",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "pirate",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "child",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "caveman",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "monk",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "knight",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "alchemist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "blacksmith",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "viking",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "druid",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "poet",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "novelist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "jester",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "philosopher",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "painter",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "musician",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "oracle",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "god",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "angel",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "prophet",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "saint",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "ghost",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "phoenix",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "witch",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "vampire",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "mermaid",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "sphinx",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "banshee",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "golem",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "deer",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "wolf",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "raven",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "serpent",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "lion",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "tree",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "river",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "storm",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "flame",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "mirror",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "clock",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "computer",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "robot",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "cyborg",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "drone",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "mecha",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "alien",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "trickster",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "virus",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "spy",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "narcissist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "demon",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "assassin",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "thief",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "conman",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "hacker",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "cultist",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "tyrant",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     },
     {
       "label": "vandal",
-      "kind": "concrete"
+      "kind": "concrete",
+      "role": null
     }
   ],
-  "files": {}
+  "files": {},
+  "source": "bundled",
+  "tags": [],
+  "template_ref": null
 }

@@ -9,9 +9,11 @@ live in :mod:`saklas.io.manifold_lifecycle` (not corpus authoring).
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import shutil
 import warnings
+from functools import wraps
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -27,14 +29,49 @@ from saklas.io.manifold_folder import (
     _node_filename,
     _node_payload_authored,
     _node_payload_discover,
+    reset_manifold_folder,
     sanitize_hyperparams,
     _validate_node_kind,
     _validate_node_role,
+    validate_manifold_format_version,
     min_nodes,
 )
 from saklas.core.manifold import domain_from_spec
 from saklas.io.packs import NAME_REGEX
 from saklas.io.paths import manifold_dir, manifolds_dir
+
+
+def _lock_namespace_name(func: Any) -> Any:
+    """Serialize a mutation whose first arguments are namespace and name."""
+    signature = inspect.signature(func)
+    first, second = tuple(signature.parameters)[:2]
+
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        from saklas.io.manifold_folder import _locked_manifest
+
+        bound = signature.bind(*args, **kwargs)
+        namespace = str(bound.arguments[first])
+        name = str(bound.arguments[second])
+        with _locked_manifest(manifold_dir(namespace, name)):
+            return func(*args, **kwargs)
+    return wrapped
+
+
+def _lock_folder_arg(func: Any) -> Any:
+    """Serialize a mutation whose first argument is a manifold folder."""
+    signature = inspect.signature(func)
+    first = next(iter(signature.parameters))
+
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        from saklas.io.manifold_folder import _locked_manifest
+
+        bound = signature.bind(*args, **kwargs)
+        folder = Path(bound.arguments[first])
+        with _locked_manifest(Path(folder)):
+            return func(*args, **kwargs)
+    return wrapped
 
 
 # ===================================================== discovery + authoring ===
@@ -53,7 +90,9 @@ def iter_manifold_folders(
 
     Walks ``~/.saklas/manifolds/<ns>/<name>/``; malformed folders are
     skipped rather than raising, so one bad manifold does not break a
-    listing.  Optionally filtered to a single ``namespace``.
+    listing.  Discovery is metadata-only: fitted payload hashes are verified
+    at explicit use/publish/install boundaries, not while routing selectors or
+    rendering inventories.  Optionally filtered to a single ``namespace``.
     """
     root = manifolds_dir()
     if not root.exists():
@@ -67,15 +106,17 @@ def iter_manifold_folders(
             if not (mdir / "manifold.json").exists():
                 continue
             try:
-                yield ns_dir.name, ManifoldFolder.load(mdir)
+                yield ns_dir.name, ManifoldFolder.load(
+                    mdir, verify_manifest=False,
+                )
             except ManifoldFormatError:
                 continue
 
 
-#: Namespaces no manifold may be authored under. ``jlens`` is the steering
-#: grammar's lazily-resolved Jacobian-lens tier (``jlens/<word>`` = a lens
-#: token direction) — a manifold folder there would shadow that resolution.
-RESERVED_NAMESPACES = frozenset({"jlens"})
+#: Namespaces no manifold may be authored under. ``jlens`` and ``sae`` are
+#: lazily-resolved per-model steering tiers; a manifold folder under either
+#: name would shadow that resolution.
+RESERVED_NAMESPACES = frozenset({"jlens", "sae"})
 
 
 def _validate_ns_name(namespace: str, name: str) -> None:
@@ -183,10 +224,11 @@ def _load_with_advisories(folder: Path) -> tuple["ManifoldFolder", list[str]]:
     """Load a manifold folder, returning it plus any authoring-quality warnings."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        mf = ManifoldFolder.load(folder)
+        mf = ManifoldFolder.load(folder, verify_manifest=False)
     return mf, [str(w.message) for w in caught]
 
 
+@_lock_namespace_name
 def create_manifold_folder(
     namespace: str,
     name: str,
@@ -209,7 +251,9 @@ def create_manifold_folder(
     """
     _validate_ns_name(namespace, name)
     try:
-        domain = domain_from_spec(domain_spec)
+        from saklas.core.manifold import normalize_domain_spec
+
+        domain = domain_from_spec(normalize_domain_spec(domain_spec))
     except (ValueError, KeyError) as e:
         raise ManifoldFormatError(f"invalid manifold domain: {e}") from e
     _validate_authored_nodes(name, domain, nodes)
@@ -224,6 +268,7 @@ def create_manifold_folder(
         "format_version": MANIFOLD_FORMAT_VERSION,
         "name": name,
         "description": description,
+        "fit_mode": "authored",
         "domain": domain.to_spec(),
         "nodes": [
             _node_payload_authored(
@@ -233,6 +278,9 @@ def create_manifold_folder(
             for entry in nodes
         ],
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }
     write_json_atomic(folder / "manifold.json", payload)
 
@@ -298,6 +346,7 @@ def _validate_discover_labels(name: str, labels: object) -> list[str]:
     return out
 
 
+@_lock_namespace_name
 def create_manifold_from_template(
     namespace: str,
     name: str,
@@ -323,21 +372,36 @@ def create_manifold_from_template(
     """
     from saklas.io.templates import resolve_template
 
+    _validate_ns_name(namespace, name)
+    if fit_mode not in _FIT_MODES_DISCOVER:
+        raise ManifoldFormatError(
+            f"discover manifold {name!r} fit_mode {fit_mode!r} invalid; "
+            f"expected one of {sorted(_FIT_MODES_DISCOVER)}"
+        )
     tmpl = resolve_template(template_ref)
     node_corpora = tmpl.node_corpora()
+    _validate_discover_labels(name, list(node_corpora))
+    sanitized_hyperparams = sanitize_hyperparams(fit_mode, hyperparams)
     ref = f"{tmpl.path.parent.name}/{tmpl.name}" if tmpl.path else tmpl.name
     folder = manifold_dir(namespace, name)
-    if force and (folder / "manifold.json").exists():
-        shutil.rmtree(folder)
+    if folder.exists():
+        if force:
+            reset_manifold_folder(folder)
+        elif not (folder / "manifold.json").exists():
+            raise FileExistsError(
+                f"manifold {namespace}/{name} has an incomplete folder; "
+                "pass force=True to replace it"
+            )
     return create_discover_manifold_folder(
         namespace, name, description,
         fit_mode=fit_mode,
         node_corpora=node_corpora,
-        hyperparams=hyperparams,
+        hyperparams=sanitized_hyperparams,
         template_ref=ref,
     )
 
 
+@_lock_namespace_name
 def create_discover_manifold_folder(
     namespace: str,
     name: str,
@@ -359,9 +423,7 @@ def create_discover_manifold_folder(
     folder path.
 
     Current A2 conversational corpora use the bundled global baseline prompts,
-    not per-manifold scenario lists. Legacy ``scenarios.json`` writing is kept
-    behind :func:`port_legacy_vector_folder` so old vector packs can be ported
-    faithfully without re-exposing scenario provenance on new authoring paths.
+    not per-manifold scenario lists.
 
     Coords are derived per-model at fit time
     (:func:`saklas.core.manifold.discover_coords` runs over the per-node
@@ -400,13 +462,9 @@ def _create_discover_manifold_folder(
     node_roles: Optional[dict[str, str | None]] = None,
     node_kinds: Optional[dict[str, str | None]] = None,
     template_ref: Optional[str] = None,
-    legacy_scenarios: Optional[list[str]] = None,
+    target_folder: Path | None = None,
 ) -> Path:
-    """Internal discover writer.
-
-    ``legacy_scenarios`` exists only for legacy vector-folder migration. New
-    discover authoring must not write per-manifold scenario provenance.
-    """
+    """Internal discover writer."""
     _validate_ns_name(namespace, name)
     if fit_mode not in _FIT_MODES_DISCOVER:
         raise ManifoldFormatError(
@@ -439,7 +497,10 @@ def _create_discover_manifold_folder(
         for label, kind in node_kinds.items():
             kinds_resolved[label] = _validate_node_kind(name, label, kind)
 
-    folder = manifold_dir(namespace, name)
+    folder = (
+        Path(target_folder) if target_folder is not None
+        else manifold_dir(namespace, name)
+    )
     if (folder / "manifold.json").exists():
         raise FileExistsError(f"manifold {namespace}/{name} already exists")
 
@@ -466,15 +527,15 @@ def _create_discover_manifold_folder(
             for label in node_corpora
         ],
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": template_ref,
     }
-    if template_ref is not None:
-        payload["template_ref"] = template_ref
     write_json_atomic(folder / "manifold.json", payload)
-    if legacy_scenarios is not None:
-        write_manifold_scenarios(folder, legacy_scenarios)
     return folder
 
 
+@_lock_namespace_name
 def create_baked_manifold_folder(
     namespace: str,
     name: str,
@@ -487,6 +548,8 @@ def create_baked_manifold_folder(
     source: str = "local",
     force: bool = False,
     components: Optional[dict[str, Any]] = None,
+    model_fingerprint: str,
+    model_id_is_safe: bool = False,
 ) -> tuple[Path, "ManifoldFolder"]:
     """Persist a corpus-less pre-baked Manifold as a ``fit_mode="baked"`` folder.
 
@@ -506,21 +569,21 @@ def create_baked_manifold_folder(
 
     For a multi-model merge, call this once for the first model and
     :func:`save_baked_manifold_tensor` for each subsequent model (sharing the
-    one ``manifold.json``), then a final :meth:`ManifoldFolder.write_metadata`
-    to fold every tensor into the ``files`` manifest.
+    one ``manifold.json``); each call publishes that pair's ``files`` proof
+    incrementally, so there is no final scan/rewrite over historical tensors.
 
     Raises :class:`ManifoldFormatError` on an invalid name/namespace and
     :class:`FileExistsError` when a manifold already lives at the path and
     ``force`` is ``False``.
     """
     _validate_ns_name(namespace, name)
+    if not model_fingerprint:
+        raise ValueError("baked manifold tensors require a proven model fingerprint")
+    from saklas.io.paths import tensor_filename
 
-    folder = manifold_dir(namespace, name)
-    if (folder / "manifold.json").exists():
-        if not force:
-            raise FileExistsError(f"manifold {namespace}/{name} already exists")
-        shutil.rmtree(folder)
-    folder.mkdir(parents=True, exist_ok=True)
+    # Validate the destination filename before a force reset can remove the
+    # prior corpus-less geometry.
+    tensor_filename(model_id, model_id_is_safe=model_id_is_safe)
 
     labels = list(manifold.node_labels)
     payload: dict[str, Any] = {
@@ -531,22 +594,101 @@ def create_baked_manifold_folder(
         "domain": manifold.domain.to_spec(),
         "nodes": [_node_payload_discover(label, None) for label in labels],
         "files": {},
+        "source": source or "local",
+        "tags": [str(t) for t in (tags or [])],
+        "template_ref": None,
     }
-    if tags:
-        payload["tags"] = [str(t) for t in tags]
-    if source and source != "local":
-        payload["source"] = source
-    write_json_atomic(folder / "manifold.json", payload)
+
+    folder = manifold_dir(namespace, name)
+    manifest_path = folder / "manifold.json"
+    if folder.exists() and not manifest_path.exists():
+        if force:
+            reset_manifold_folder(folder)
+        else:
+            raise FileExistsError(
+                f"manifold {namespace}/{name} has an incomplete folder; "
+                "pass force=True to replace it"
+            )
+    if manifest_path.exists():
+        if force:
+            reset_manifold_folder(folder)
+        elif not _recoverable_baked_first_publication(
+            folder, payload, model_id, model_id_is_safe=model_id_is_safe,
+        ):
+            raise FileExistsError(f"manifold {namespace}/{name} already exists")
+    if not manifest_path.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(manifest_path, payload)
 
     save_baked_manifold_tensor(
         folder, manifold, model_id, method=method, components=components,
+        model_fingerprint=model_fingerprint,
+        model_id_is_safe=model_id_is_safe,
     )
 
-    mf = ManifoldFolder.load(folder)
-    mf.write_metadata()  # back-fill the files integrity manifest
+    # Publication already proved the newly written pair in ``files``.  The
+    # returned object is metadata-only; do not immediately reread every fitted
+    # payload merely to reconstruct it.
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
     return folder, mf
 
 
+def _recoverable_baked_first_publication(
+    folder: Path,
+    expected_manifest: dict[str, Any],
+    model_id: str,
+    *,
+    model_id_is_safe: bool,
+) -> bool:
+    """Whether ``folder`` is the interrupted first write of this baked target."""
+
+    from saklas.io.manifold_folder import manifold_folder_tensor_paths
+    from saklas.io.packs import verify_integrity
+    from saklas.io.paths import parse_tensor_filename, tensor_filename
+
+    try:
+        payload = json.loads((folder / "manifold.json").read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+    # Transaction-only fields are allowed to differ; the authoring identity must
+    # otherwise be exactly the skeleton this request would have created.
+    actual_identity = {
+        key: value for key, value in payload.items()
+        if key not in {"files", "artifact_id", "fit_epochs"}
+    }
+    expected_identity = {
+        key: value for key, value in expected_manifest.items()
+        if key not in {"files", "artifact_id", "fit_epochs"}
+    }
+    if actual_identity != expected_identity:
+        return False
+
+    target = folder / tensor_filename(
+        model_id, model_id_is_safe=model_id_is_safe,
+    )
+    if any(path != target for path in manifold_folder_tensor_paths(folder)):
+        return False
+    pair_names = {target.name, target.with_suffix(".json").name}
+    files = payload.get("files", {})
+    if not isinstance(files, dict):
+        return False
+    expected = {name: files[name] for name in pair_names if name in files}
+    if len(expected) == 2 and verify_integrity(folder, expected)[0]:
+        return False  # a complete, trusted artifact preserves exists semantics
+    # Do not adopt an interrupted skeleton that also carries some other model's
+    # fitted pair; that is a multi-model merge concern with stronger provenance
+    # checks in ``io.merge``.
+    for filename in files:
+        candidate = (
+            Path(filename).with_suffix(".safetensors").name
+            if filename.endswith(".json") else filename
+        )
+        if parse_tensor_filename(candidate) is not None and filename not in pair_names:
+            return False
+    return True
+
+
+@_lock_folder_arg
 def save_baked_manifold_tensor(
     folder: Path,
     manifold: "Any",
@@ -554,14 +696,17 @@ def save_baked_manifold_tensor(
     *,
     method: str,
     components: Optional[dict[str, Any]] = None,
+    model_fingerprint: str,
+    model_id_is_safe: bool = False,
 ) -> Path:
     """Write one per-model tensor + sidecar into a ``fit_mode="baked"`` folder.
 
     Factored out of :func:`create_baked_manifold_folder` so a multi-model merge
     can share one ``manifold.json`` across every target model's tensor.  The
-    caller is responsible for the surrounding ``manifold.json`` write (once) and
-    a final :meth:`ManifoldFolder.write_metadata` (to fold every tensor into the
-    ``files`` manifest).  Returns the tensor path.
+    caller is responsible for the surrounding ``manifold.json`` write once.  Pair
+    publication and its manifest proof happen in this same folder transaction;
+    an interruption between them is repaired by overwriting/adopting the target
+    on the next producer retry.  Returns the tensor path.
     """
     from saklas.core.manifold import save_manifold
     from saklas.io.paths import tensor_filename
@@ -578,134 +723,29 @@ def save_baked_manifold_tensor(
         "fit_mode": "baked",
         "nodes_sha256": nodes_sha,
     }
+    if not model_fingerprint:
+        raise ValueError("baked manifold tensors require a proven model fingerprint")
+    save_meta["model_fingerprint"] = model_fingerprint
     share_metric = manifold.metadata.get("share_metric")
     if share_metric:
         save_meta["share_metric"] = share_metric
     if components:
         save_meta["components"] = components
-    tensor_path = folder / tensor_filename(model_id)
+    if method == "merge":
+        from saklas.io.manifold_folder import MERGE_BAKE_POLICY
+
+        save_meta["bake_policy"] = MERGE_BAKE_POLICY
+    tensor_path = folder / tensor_filename(
+        model_id, model_id_is_safe=model_id_is_safe,
+    )
     save_manifold(manifold, tensor_path, save_meta)
+    ManifoldFolder.load(
+        folder, verify_manifest=False,
+    ).update_file_hashes(tensor_path, tensor_path.with_suffix(".json"))
     return tensor_path
 
 
-def port_legacy_vector_folder(
-    vector_folder: Path,
-    *,
-    namespace: str = "local",
-    name: Optional[str] = None,
-    force: bool = False,
-) -> tuple[Path, "ManifoldFolder"]:
-    """Port a legacy ``vectors/<ns>/<c>/`` folder to a 2-node ``pca`` manifold.
-
-    The 4.0 back-compat primitive (step 6b detect-on-load, step 6e bulk
-    upgrade): a steering vector is the ``K = 2`` case of a flat affine
-    subspace, so a legacy concept folder's ``statements.json`` (a list of
-    ``{positive, negative}`` pairs) + ``scenarios.json`` reconstruct the
-    equivalent manifold authoring — node 0 = the positive corpus, node 1 = the
-    negative — under ``manifolds/<namespace>/<name>/``.  **No tensors are
-    carried**: the per-model subspace re-fits lazily on first steer / probe,
-    so a ported folder never ships a stale or cross-shape baked tensor.
-
-    Labels follow the convert convention: a bipolar name ``pos.neg`` splits to
-    ``(pos, neg)``; a monopolar name ``c`` becomes ``(c, c_neg)``.  ``tags``
-    and ``description`` are carried from the legacy ``pack.json`` when present.
-
-    ``name`` defaults to ``vector_folder.name`` (the in-cache layout) but can be
-    overridden when the source folder isn't named for the concept — e.g. an HF
-    snapshot dir (a commit-SHA path) being imported via ``manifold install``.
-
-    Returns ``(manifold_folder_path, ManifoldFolder)``.  Raises
-    :class:`FileNotFoundError` when the source has no ``statements.json`` and
-    :class:`FileExistsError` when the target manifold already exists and
-    ``force`` is ``False``.
-    """
-    vector_folder = Path(vector_folder)
-    if name is None:
-        name = vector_folder.name
-    stmts_path = vector_folder / "statements.json"
-    if not stmts_path.exists():
-        raise FileNotFoundError(
-            f"legacy vector folder {vector_folder} has no statements.json to port"
-        )
-    pairs = json.loads(stmts_path.read_text())
-    if not isinstance(pairs, list) or not pairs:
-        raise ManifoldFormatError(
-            f"legacy vector folder {vector_folder}: statements.json is not a "
-            f"non-empty list of {{positive, negative}} pairs"
-        )
-    pos_corpus = [p["positive"] for p in pairs]
-    neg_corpus = [p["negative"] for p in pairs]
-
-    if "." in name:
-        pos_label, neg_label = name.split(".", 1)
-    else:
-        pos_label, neg_label = name, f"{name}_neg"
-
-    description = f"Ported steering vector {name} as a 2-node pca subspace."
-    tags: list[str] = []
-    pack_path = vector_folder / "pack.json"
-    if pack_path.exists():
-        try:
-            pack = json.loads(pack_path.read_text())
-            description = pack.get("description", description)
-            tags = [str(t) for t in pack.get("tags", [])]
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    scenarios: list[str] | None = None
-    scn_path = vector_folder / "scenarios.json"
-    if scn_path.exists():
-        try:
-            raw_scn = json.loads(scn_path.read_text())
-            # Vector extraction writes the dict form ``{"scenarios": [...]}``
-            # (``core/extraction.py``); a bare list is tolerated too.
-            if isinstance(raw_scn, dict):
-                raw_scn = raw_scn.get("scenarios")
-            if isinstance(raw_scn, list):
-                scenarios = [str(s) for s in raw_scn]
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    target = manifold_dir(namespace, name)
-    if (target / "manifold.json").exists():
-        if not force:
-            raise FileExistsError(
-                f"manifold {namespace}/{name} already exists; pass force=True "
-                f"to re-port"
-            )
-        shutil.rmtree(target)
-
-    _create_discover_manifold_folder(
-        namespace, name, description,
-        fit_mode="pca",
-        node_corpora={pos_label: pos_corpus, neg_label: neg_corpus},
-        hyperparams={"max_dim": 1, "var_threshold": 0.70},
-        legacy_scenarios=scenarios,
-    )
-    mf = ManifoldFolder.load(target)
-    if tags:
-        mf.tags = tags
-        mf.write_metadata(files=mf.files)
-    return target, mf
-
-
-def write_manifold_scenarios(folder: Path, scenarios: list[str]) -> None:
-    """Persist the shared scenario list to ``<folder>/scenarios.json``.
-
-    Discover-mode generation provenance — the domains the node corpora
-    were generated against — mirroring the ``{"scenarios": [...]}``
-    schema the discover pipeline writes.  The all-at-once
-    :func:`create_discover_manifold_folder` (via its ``scenarios`` kwarg)
-    routes through here; under 4.0 conversational generation the shared
-    baseline prompts are global, so generation no longer writes per-manifold
-    scenarios.
-    """
-    write_json_atomic(
-        folder / "scenarios.json",
-        {"scenarios": [str(s) for s in scenarios]},
-    )
-
-
+@_lock_namespace_name
 def init_discover_manifold_folder(
     namespace: str,
     name: str,
@@ -722,8 +762,7 @@ def init_discover_manifold_folder(
     Writes ``manifold.json`` (label-only nodes, empty ``files``
     manifest) and an empty ``nodes/`` dir, then returns the folder.
     Node corpora are written incrementally via
-    :func:`append_discover_manifold_node` (one file per completed node)
-    and the scenario provenance via :func:`write_manifold_scenarios` —
+    :func:`append_discover_manifold_node` (one file per completed node) —
     the streaming companion to :func:`create_discover_manifold_folder`
     for big-roster generation, where holding every corpus in memory at
     once is wasteful and a crash should keep the nodes already finished.
@@ -780,11 +819,15 @@ def init_discover_manifold_folder(
             for label in labels
         ],
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }
     write_json_atomic(folder / "manifold.json", payload)
     return folder
 
 
+@_lock_folder_arg
 def append_discover_manifold_node(
     folder: Path, index: int, label: str, statements: list[str],
 ) -> None:
@@ -821,29 +864,6 @@ def append_discover_manifold_node(
     )
 
 
-def read_manifold_scenarios(folder: Path) -> list[str] | None:
-    """Return the persisted shared scenario list, or ``None`` if absent.
-
-    Reads the ``{"scenarios": [...]}`` provenance file
-    :func:`write_manifold_scenarios` writes; tolerates the richer
-    CLI/server shape (extra keys alongside ``"scenarios"``).  Returns
-    ``None`` when there is no ``scenarios.json`` or it carries no list —
-    the signal a streaming run uses to lock resumed/added nodes onto the
-    original domains.
-    """
-    p = Path(folder) / "scenarios.json"
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    scn = data.get("scenarios") if isinstance(data, dict) else None
-    if not isinstance(scn, list):
-        return None
-    return [str(s) for s in scn]
-
-
 def _discover_manifest_payload(
     name: str,
     description: str,
@@ -867,14 +887,14 @@ def _discover_manifest_payload(
             for label in labels
         ],
         "files": {},
+        "source": "local",
+        "tags": [str(t) for t in (tags or [])],
+        "template_ref": None,
     }
-    # Category tags ride manifold.json; written only when non-empty so a
-    # tagless manifold stays byte-identical to the pre-tags shape.
-    if tags:
-        payload["tags"] = [str(t) for t in tags]
     return payload
 
 
+@_lock_folder_arg
 def plan_discover_generation(
     folder: Path,
     name: str,
@@ -886,6 +906,7 @@ def plan_discover_generation(
     node_roles: Optional[dict[str, str | None]] = None,
     node_kinds: Optional[dict[str, str | None]] = None,
     tags: Optional[list[str]] = None,
+    force: bool = False,
 ) -> DiscoverGenerationPlan:
     """Ensure a streamable discover skeleton at ``folder`` covering every
     label in ``labels``, and report which node corpora still need writing.
@@ -902,9 +923,8 @@ def plan_discover_generation(
       ``pending`` the declared labels whose ``nodes/NN_<label>.json`` is
       absent — so a run killed half-way resumes the missing nodes instead
       of starting over.
-    - ``scenarios.json`` (when present) is read back into
-      ``plan.scenarios`` so the caller can lock the resumed/added nodes
-      onto the original domains rather than regenerating fresh ones.
+    - ``force=True`` removes the prior folder and publishes the fresh skeleton
+      in the same manifest transaction.
 
     The read is deliberately lenient — it does **not** route through
     :meth:`ManifoldFolder.load`, which rejects a partially-written folder
@@ -939,26 +959,38 @@ def plan_discover_generation(
             f"discover manifold {name!r} node_kinds carries labels not in "
             f"the roster: {sorted(unknown_k)}"
         )
+    # Validate every replacement input before a force reset can remove the
+    # prior folder.  The resolved maps are also reused by the fresh path.
+    roles_resolved = {
+        label: _validate_node_role(name, label, roles_in.get(label))
+        for label in labels
+    }
+    kinds_resolved = {
+        label: _validate_node_kind(name, label, kinds_in.get(label))
+        for label in labels
+    }
+    sanitized_hyperparams = sanitize_hyperparams(fit_mode, hyperparams)
+
+    # Reset and skeleton publication are one manifest transaction.  Keeping
+    # this inside the planner prevents a fitter from snapshotting between an
+    # external ``rmtree`` and the replacement manifest, and prevents a stale
+    # fit from publishing across a concurrent force-regeneration.  Remove even
+    # a partial folder: force is the recovery path for a missing manifest.
+    if force and folder.exists():
+        reset_manifold_folder(folder)
 
     meta_path = folder / "manifold.json"
     nodes_dir = folder / "nodes"
 
     if not meta_path.exists():
         # Fresh skeleton — everything is pending.
-        roles_resolved = {
-            label: _validate_node_role(name, label, roles_in.get(label))
-            for label in labels
-        }
-        kinds_resolved = {
-            label: _validate_node_kind(name, label, kinds_in.get(label))
-            for label in labels
-        }
         folder.mkdir(parents=True, exist_ok=True)
         nodes_dir.mkdir(exist_ok=True)
         write_json_atomic(
             meta_path,
             _discover_manifest_payload(
-                name, description, fit_mode, labels, roles_resolved, hyperparams,
+                name, description, fit_mode, labels, roles_resolved,
+                sanitized_hyperparams,
                 kinds_resolved, tags,
             ),
         )
@@ -966,7 +998,6 @@ def plan_discover_generation(
             folder=folder,
             index_of={label: i for i, label in enumerate(labels)},
             pending=tuple(labels),
-            scenarios=None,
             added=(),
             resumed=False,
         )
@@ -978,13 +1009,87 @@ def plan_discover_generation(
         raise ManifoldFormatError(
             f"manifold.json in {folder} is unreadable: {e}"
         ) from e
-    if data.get("fit_mode", "authored") not in _FIT_MODES_DISCOVER:
+    if not isinstance(data, dict):
+        raise ManifoldFormatError(
+            f"manifold.json in {folder} must be a JSON object"
+        )
+    validate_manifold_format_version(
+        data.get("format_version"), location=f"manifold.json in {folder}",
+    )
+    allowed = {
+        "format_version", "name", "description", "fit_mode", "hyperparams",
+        "nodes", "files", "source", "tags", "artifact_id", "fit_epochs",
+        "template_ref",
+    }
+    unknown_fields = set(data) - allowed
+    if unknown_fields:
+        raise ManifoldFormatError(
+            f"manifold at {folder} has unknown field(s): {sorted(unknown_fields)}"
+        )
+    if data.get("fit_mode") not in _FIT_MODES_DISCOVER:
         raise ManifoldFormatError(
             f"manifold at {folder} is not discover-mode; cannot "
             f"stream-generate into it"
         )
-    existing_nodes = data.get("nodes") or []
-    existing_labels = [n["label"] for n in existing_nodes]
+    if data.get("name") != name:
+        raise ManifoldFormatError(
+            f"manifold at {folder} is named {data.get('name')!r}, not {name!r}"
+        )
+    for key, expected in (
+        ("description", str), ("hyperparams", dict), ("nodes", list),
+        ("files", dict), ("source", str), ("tags", list),
+    ):
+        if not isinstance(data.get(key), expected):
+            raise ManifoldFormatError(
+                f"manifold at {folder} field {key!r} must be {expected.__name__}"
+            )
+    if not data["source"]:
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'source' must be non-empty"
+        )
+    if "artifact_id" in data and (
+        not isinstance(data["artifact_id"], str) or not data["artifact_id"]
+    ):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'artifact_id' must be a non-empty str"
+        )
+    if "fit_epochs" in data and not isinstance(data["fit_epochs"], dict):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'fit_epochs' must be dict"
+        )
+    if not all(isinstance(tag, str) for tag in data["tags"]):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'tags' must be a list of strings"
+        )
+    if "template_ref" not in data or (
+        data["template_ref"] is not None
+        and (not isinstance(data["template_ref"], str) or not data["template_ref"])
+    ):
+        raise ManifoldFormatError(
+            f"manifold at {folder} field 'template_ref' must be str or null"
+        )
+    existing_nodes = data["nodes"]
+    if not existing_nodes:
+        raise ManifoldFormatError(
+            f"manifold at {folder} needs a non-empty 'nodes' list"
+        )
+    for entry in existing_nodes:
+        if not isinstance(entry, dict):
+            raise ManifoldFormatError(
+                f"manifold at {folder} node {entry!r} must be an object"
+            )
+        expected_node = {"label", "role", "kind"}
+        if set(entry) != expected_node:
+            raise ManifoldFormatError(
+                f"manifold at {folder} node fields must be {sorted(expected_node)}"
+            )
+    existing_labels = _validate_discover_labels(
+        name, [entry.get("label") for entry in existing_nodes],
+    )
+    for entry in existing_nodes:
+        label = entry["label"]
+        _validate_node_role(name, label, entry.get("role"))
+        _validate_node_kind(name, label, entry.get("kind"))
     existing_roles: dict[str, str | None] = {
         n["label"]: n.get("role") for n in existing_nodes
     }
@@ -993,10 +1098,8 @@ def plan_discover_generation(
     }
     new_labels = [label for label in labels if label not in existing_labels]
     full_labels = existing_labels + new_labels
-    # Category tags refresh to the caller's value when supplied (None leaves
-    # whatever the folder already carries); written only when non-empty so a
-    # tagless manifold stays byte-identical to the pre-tags shape.
-    desired_tags = [str(t) for t in tags] if tags else None
+    # Category tags refresh to the caller's value when supplied; ``[]`` clears.
+    desired_tags = [str(t) for t in tags] if tags is not None else None
     if new_labels:
         # Add-nodes: append the new labels (validating their roles/kinds) and
         # rewrite manifold.json atomically.  Existing roles/kinds/hyperparams
@@ -1038,17 +1141,16 @@ def plan_discover_generation(
         label for label in full_labels
         if not (nodes_dir / _node_filename(index_of[label], label)).exists()
     )
-    scn = read_manifold_scenarios(folder)
     return DiscoverGenerationPlan(
         folder=folder,
         index_of=index_of,
         pending=pending,
-        scenarios=tuple(scn) if scn is not None else None,
         added=tuple(new_labels),
         resumed=True,
     )
 
 
+@_lock_namespace_name
 def merge_discover_manifolds(
     target_namespace: str,
     target_name: str,
@@ -1087,7 +1189,7 @@ def merge_discover_manifolds(
 
     Hyperparams default to the first source's; an explicit
     ``hyperparams`` arg replaces them wholesale (matches
-    ``create_discover_manifold_folder``'s shape).  ``_sanitize_hyperparams``
+    ``create_discover_manifold_folder``'s shape).  ``sanitize_hyperparams``
     drops cross-method keys at the IO boundary.
 
     The merged folder is written *unfitted* — no per-model tensor is
@@ -1106,7 +1208,7 @@ def merge_discover_manifolds(
             raise FileNotFoundError(
                 f"merge source {ns}/{name} not found at {folder_path}",
             )
-        mf = ManifoldFolder.load(folder_path)
+        mf = ManifoldFolder.load(folder_path, verify_manifest=False)
         if not mf.is_discover:
             raise ManifoldFormatError(
                 f"merge source {ns}/{name} is authored ({mf.fit_mode!r}); "
@@ -1177,7 +1279,7 @@ def merge_discover_manifolds(
                 f"manifold {target_namespace}/{target_name} already exists; "
                 f"pass force=True to overwrite",
             )
-        shutil.rmtree(target_folder)
+        reset_manifold_folder(target_folder)
 
     return create_discover_manifold_folder(
         target_namespace,
@@ -1191,6 +1293,7 @@ def merge_discover_manifolds(
     )
 
 
+@_lock_folder_arg
 def update_manifold_folder(
     folder: Path,
     *,
@@ -1205,7 +1308,7 @@ def update_manifold_folder(
     them.  Returns ``(folder, advisories)``.
     """
     folder = Path(folder)
-    mf = ManifoldFolder.load(folder)
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
     if description is not None:
         mf.description = description
     if nodes is not None:

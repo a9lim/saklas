@@ -13,6 +13,15 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas.core.results import TokenAlt
+from saklas.core.token_callback import TokenCallback
+from saklas.core.scene import (
+    SceneRenderError,
+    SceneTurn,
+    Seat,
+    TurnGrammar,
+    render_scene,
+    render_scene_raw,
+)
 from saklas.core.triggers import TriggerContext
 
 
@@ -618,13 +627,7 @@ class _PenaltyState:
 # prefix repeated 800×) without bloating; small chat lists serialize
 # cheaply to tuples so the per-lookup hash cost is negligible.
 _CHAT_INPUT_CACHE_MAX = 128
-_chat_input_cache: dict[
-    tuple[
-        int, str | None, tuple[tuple[str, str, str | None], ...], bool, bool,
-        str | None,
-    ],
-    torch.Tensor,
-] = {}
+_chat_input_cache: dict[tuple[Any, ...], torch.Tensor] = {}
 
 
 def _chat_input_cache_key(
@@ -634,17 +637,77 @@ def _chat_input_cache_key(
     thinking: bool,
     add_generation_prompt: bool,
     gen_role: str | None = None,
-) -> tuple[
-    int, str | None, tuple[tuple[str, str, str | None], ...], bool, bool, str | None
-]:
+    gen_seat: str = "assistant",
+    scene_mode: bool = False,
+) -> tuple[Any, ...]:
     return (
         id(tokenizer),
         system_prompt,
-        tuple((m["role"], m["content"], m.get("label")) for m in chat),
+        tuple(
+            (m["role"], m["content"], m.get("label"), m.get("thinking"))
+            for m in chat
+        ),
         thinking,
         add_generation_prompt,
         gen_role,
+        gen_seat,
+        scene_mode,
     )
+
+
+def _try_scene_render(
+    tokenizer: PreTrainedTokenizerBase,
+    chat: list[dict[str, Any]],
+    scene: "TurnGrammar | None",
+    *,
+    thinking: bool,
+    add_generation_prompt: bool,
+    gen_role: str | None,
+    gen_seat: str,
+) -> torch.Tensor | None:
+    """Render ``chat`` through the stitcher, or ``None`` for chat-template paths.
+
+    ``None`` means "this render is servable by the chat-template paths":
+    no grammar, a mid-conversation system turn (template semantics differ
+    per family — preserve them), or an assistant-seat render the grammar
+    can't produce (e.g. a missing thinking-mode appendix).  A render the
+    chat-template paths *cannot* serve (non-assistant ``gen_seat``) re-raises
+    instead of degrading.
+    """
+    if scene is None:
+        return None
+    system: str | None = None
+    turn_msgs = chat
+    if chat and chat[0].get("role") == "system":
+        system = str(chat[0].get("content", ""))
+        turn_msgs = chat[1:]
+    if any(m.get("role") not in ("user", "assistant") for m in turn_msgs):
+        return None
+    turns = [
+        SceneTurn(
+            seat=cast("Seat", m["role"]),
+            text=str(m.get("content", "")),
+            label=m.get("label"),
+            thinking=m.get("thinking"),
+        )
+        for m in turn_msgs
+    ]
+    try:
+        text = render_scene(
+            scene, turns,
+            system=system,
+            gen_seat=cast("Seat", gen_seat) if add_generation_prompt else None,
+            gen_label=gen_role if add_generation_prompt else None,
+            gen_thinking=thinking,
+        )
+    except SceneRenderError:
+        if gen_seat == "assistant":
+            return None
+        raise
+    encoded = tokenizer(
+        text, return_tensors="pt", add_special_tokens=False,
+    )["input_ids"]
+    return cast(torch.Tensor, encoded)
 
 
 def build_chat_input(
@@ -656,17 +719,24 @@ def build_chat_input(
     add_generation_prompt: bool = True,
     gen_role: str | None = None,
     model_type: str | None = None,
+    scene: "TurnGrammar | None" = None,
+    gen_seat: str = "assistant",
 ) -> torch.Tensor:
     """Render a chat history to ``input_ids``.
 
-    Per-turn role substitution (the roleplay scaffold): each message may
-    carry a ``"label"`` key — a custom role label for *that* turn — and
-    ``gen_role`` is the label for the generation-prompt assistant header
-    (the turn about to be generated).  When no message carries a label and
-    ``gen_role`` is ``None`` (the common case) this is a zero-overhead
-    pass-through to ``tokenizer.apply_chat_template``.  When any label is
-    present, ``model_type`` is required so the family's role-header registry
-    entry can be looked up; pass ``model.config.model_type``.
+    When ``scene`` (a validated :class:`~saklas.core.scene.TurnGrammar`) is
+    supplied, rendering goes through the **stitcher** — the one render
+    authority of the cast model: per-turn ``"label"`` keys land in
+    constructed headers, seat sequences need not alternate, and
+    ``gen_seat`` selects which seat's header the generation prompt opens
+    (``gen_role`` is its cast label).  Round-trip validation guarantees the
+    stitched bytes match ``apply_chat_template`` on standard alternating
+    conversations, so passing ``scene`` never changes an existing render.
+
+    Without ``scene`` the standard chat-template paths apply: a zero-overhead
+    ``apply_chat_template`` pass-through when no label is present, else the
+    render-then-splice path (``apply_with_per_turn_roles``, requiring
+    ``model_type``).  A non-assistant ``gen_seat`` requires ``scene``.
     """
     chat: list[dict[str, Any]] = []
     if system_prompt:
@@ -681,13 +751,31 @@ def build_chat_input(
         # tagged renders never collide with plain renders of the same chat.
         key = _chat_input_cache_key(
             tokenizer, chat, system_prompt, thinking,
-            add_generation_prompt, gen_role,
+            add_generation_prompt, gen_role, gen_seat,
+            scene is not None,
         )
         cached = _chat_input_cache.get(key)
         if cached is not None:
             # Return a clone — callers (notably ``_prepare_input``) ``.to``
             # device-move the tensor and would otherwise alias the cache.
             return cached.clone()
+        scene_result = _try_scene_render(
+            tokenizer, chat, scene,
+            thinking=thinking,
+            add_generation_prompt=add_generation_prompt,
+            gen_role=gen_role,
+            gen_seat=gen_seat,
+        )
+        if scene_result is not None:
+            if len(_chat_input_cache) >= _CHAT_INPUT_CACHE_MAX:
+                _chat_input_cache.pop(next(iter(_chat_input_cache)))
+            _chat_input_cache[key] = scene_result
+            return scene_result.clone()
+        if gen_seat != "assistant":
+            raise SceneRenderError(
+                f"gen_seat={gen_seat!r} requires a validated scene grammar; "
+                f"the chat-template paths can only open the assistant seat"
+            )
         kwargs: dict[str, Any] = {}
         if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
             kwargs["enable_thinking"] = thinking
@@ -730,12 +818,30 @@ def build_chat_input(
             _chat_input_cache.pop(next(iter(_chat_input_cache)))
         _chat_input_cache[key] = tensor
         return tensor.clone()
-    # Base model without chat template — add minimal role markers.
-    # ``role`` has no chat template to splice into; the base-model
-    # surface is raw-completion and roles are irrelevant.  Silently
-    # ignore the kwarg here rather than raising — the engine routes
-    # base-model traffic to the raw path before this branch fires.
-    text = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in chat) + "\nAssistant:"
+    # Base model without chat template — the cast model's raw-marker
+    # fallback (``render_scene_raw``): ``Label: text`` lines, seats free,
+    # per-turn labels honored.  (The engine routes plain base-model
+    # traffic to the flat raw path before this branch fires; this serves
+    # message-list inputs and scene shapes.)
+    system_txt: str | None = None
+    turn_msgs = chat
+    if chat and chat[0].get("role") == "system":
+        system_txt = str(chat[0].get("content", ""))
+        turn_msgs = chat[1:]
+    raw_turns = [
+        SceneTurn(
+            seat=cast("Seat", m.get("role", "user")),
+            text=str(m.get("content", "")),
+            label=m.get("label"),
+        )
+        for m in turn_msgs
+    ]
+    text = render_scene_raw(
+        raw_turns,
+        system=system_txt,
+        gen_seat=cast("Seat", gen_seat) if add_generation_prompt else None,
+        gen_label=gen_role,
+    )
     return cast(torch.Tensor, tokenizer(text, return_tensors="pt")["input_ids"])  # transformers BatchEncoding str-key subscript
 
 
@@ -745,7 +851,7 @@ def generate_steered(
     input_ids: torch.Tensor,
     config: GenerationConfig,
     state: GenerationState,
-    on_token: Callable[..., None] | None = None,
+    on_token: TokenCallback | None = None,
     thinking: bool = False,
     seed: int | None = None,
     stop: list[str] | None = None,

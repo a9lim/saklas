@@ -10,7 +10,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from saklas.core.results import GenerationResult
+from saklas.core.errors import SaklasError
+from saklas.core.generation import GenerationConfig
+from saklas.core.results import GenerationResult, RunSet
 from saklas.server.ws_models import WSSamplingParams, build_sampling
 
 
@@ -24,22 +26,33 @@ def _mock_session():
         "device": "cpu",
         "dtype": "torch.bfloat16",
     }
+    session.model = MagicMock()
+    session.model.config.model_type = "gemma2"
     session._device = "cpu"
     session._dtype = "torch.bfloat16"
     session._created_ts = 1_700_000_000
 
-    session.config = MagicMock()
-    session.config.temperature = 1.0
-    session.config.top_p = 0.9
-    session.config.top_k = None
-    session.config.max_new_tokens = 1024
-    session.config.system_prompt = None
-    session.config.thinking = None
+    session.config = GenerationConfig()
 
     session.vectors = {}
     session.probes = {}
-    session.history = []
+    session.tree = MagicMock()
+    session.tree.messages_for.return_value = []
+    session.tree.active_node_id = "test-assistant"
+    session.tree.get.return_value.mean_logprob = None
+    session.tree.get.return_value.mean_surprise = None
     session.manifolds = {}
+    session.is_base_model = False
+    session.has_compatible_jlens.return_value = False
+    session.live_lens_layers = None
+    session.sae_info = None
+    session.live_sae = False
+    session.live_probe_scores = True
+    session.scene_grammar = None
+    session.joint_logprob_cache = {}
+    session.lens_probe_names = []
+    session.sae_probe_names = []
+    session.token_probe_payload = {}
 
     monitor = MagicMock()
     monitor.probe_names = []
@@ -54,6 +67,7 @@ def _mock_session():
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
+    gen_state.emit_map = []
     session.generation_state = gen_state
 
     session.build_readings.return_value = {}
@@ -136,6 +150,14 @@ class TestSessions:
         assert resp.status_code == 200
         assert resp.json()["id"] == "default"
 
+    def test_create_rejects_unknown_fields(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        resp = client.post("/saklas/v1/sessions", json={"legacy_id": "old"})
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert error["param"] == "legacy_id"
+        assert error["message"] == "Extra inputs are not permitted"
+
     def test_create_model_mismatch_logs_warning(self, session_and_client: Any, caplog: Any) -> None:
         _, client = session_and_client
         with patch("saklas.server.session_models.supports_thinking", return_value=False):
@@ -149,14 +171,15 @@ class TestSessions:
             resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
         data = resp.json()
-        assert "test__model" in data["aliases"]
+        assert "aliases" not in data
 
-    def test_get_by_safe_model_alias(self, session_and_client: Any) -> None:
+    def test_safe_model_id_is_not_a_session_alias(
+        self, session_and_client: Any,
+    ) -> None:
         _, client = session_and_client
         with patch("saklas.server.session_models.supports_thinking", return_value=False):
             resp = client.get("/saklas/v1/sessions/test__model")
-        assert resp.status_code == 200
-        assert resp.json()["model_id"] == "test/model"
+        assert resp.status_code == 404
 
     def test_get_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
@@ -185,6 +208,73 @@ class TestSessions:
         assert session.config.thinking is False
         assert resp.json()["config"]["thinking"] is False
 
+    def test_patch_top_k_distinguishes_omitted_from_explicit_null(
+        self, session_and_client: Any,
+    ) -> None:
+        """The dashboard's blank top-k field must really disable the cutoff."""
+        from dataclasses import replace
+
+        session, client = session_and_client
+        session.config = replace(session.config, top_k=40)
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
+            preserved = client.patch(
+                "/saklas/v1/sessions/default", json={"temperature": 0.4},
+            )
+            cleared = client.patch(
+                "/saklas/v1/sessions/default", json={"top_k": None},
+            )
+        assert preserved.status_code == 200
+        assert preserved.json()["config"]["top_k"] == 40
+        assert cleared.status_code == 200
+        assert cleared.json()["config"]["top_k"] is None
+        assert session.config.top_k is None
+
+    def test_validate_steering_parses_and_dry_installs(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/steering/validate",
+            json={"expression": "0.2 default/honest.deceptive@response"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "valid": True,
+            "expression": "0.2 default/honest.deceptive%honest@response",
+            "error": None,
+        }
+        session.steering.assert_called_once()
+
+    def test_validate_steering_returns_expected_errors_in_band(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.steering.side_effect = SaklasError(
+            "No vector registered for ablation target 'definitely_missing'",
+        )
+        resp = client.post(
+            "/saklas/v1/sessions/default/steering/validate",
+            json={"expression": "0.5 !definitely_missing"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "valid": False,
+            "expression": "0.5 !definitely_missing",
+            "error": "No vector registered for ablation target 'definitely_missing'",
+        }
+
+    def test_validate_steering_keeps_empty_as_explicit_unsteered(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/steering/validate",
+            json={"expression": "   "},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"valid": True, "expression": "", "error": None}
+        session.steering.assert_not_called()
+
     @staticmethod
     def _set_family(session: Any, model_type: str) -> None:
         """Pin the mock session's resolved model_type so the role-header
@@ -209,6 +299,43 @@ class TestSessions:
         assert body["default_assistant_role"] == "model"
         assert body["default_user_role"] == "user"
 
+    def test_session_info_exposes_scene_capabilities(
+        self, session_and_client: Any,
+    ) -> None:
+        """The composer's seat toggle / thinking box / one-turn warning
+        gate on these three flags — keep them on the wire.  A stub
+        session (no real scene grammar) reads as scene mode off."""
+        session, client = session_and_client
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
+            resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["scene_mode"] is False
+        assert body["thinking_input_supported"] is False
+        assert body["strips_history_thinking"] is False
+
+        # A think-capable strip-family grammar flips all three.
+        from saklas.core.scene import SeatWrapper, TurnGrammar
+
+        session.scene_grammar = TurnGrammar(
+            model_type="qwen3",
+            prelude="",
+            user=SeatWrapper("<t>", "\n", "<end>", "user"),
+            assistant=SeatWrapper("<t>", "\n", "<end>", "assistant"),
+            system=None,
+            system_fold_sep=None,
+            gen_extra="",
+            think_open="<think>",
+            think_close="</think>",
+            strips_history_thinking=True,
+        )
+        with patch("saklas.server.session_models.supports_thinking", return_value=False):
+            resp = client.get("/saklas/v1/sessions/default")
+        body = resp.json()
+        assert body["scene_mode"] is True
+        assert body["thinking_input_supported"] is True
+        assert body["strips_history_thinking"] is True
+
     def test_clear(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post("/saklas/v1/sessions/default/clear")
@@ -217,7 +344,7 @@ class TestSessions:
 
     def test_rewind_empty(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.history = []
+        session.tree.messages_for.return_value = []
         resp = client.post("/saklas/v1/sessions/default/rewind")
         assert resp.status_code == 400
 
@@ -265,13 +392,17 @@ class TestProbes:
 
     def test_attach(self, session_and_client: Any) -> None:
         from types import SimpleNamespace
+        import torch
+
+        from saklas.core.vectors import fold_directions_to_subspace
+        from tests._whitener import isotropic_whitener
 
         session, client = session_and_client
         # Unified attach: body-carried selector → session.add_probe, 201 + info.
-        mani = SimpleNamespace(
-            name="happy", layers={0: None}, node_labels=["+"],
-            feature_space="model",
-            domain=SimpleNamespace(to_spec=lambda: {}, intrinsic_dim=1),
+        means = {0: torch.zeros(2)}
+        mani = fold_directions_to_subspace(
+            "happy", {0: torch.tensor([1.0, 0.0])}, means,
+            whitener=isotropic_whitener(means, 2),
         )
         session.add_probe.return_value = "happy"
         session.monitor.attached_probes.return_value = {
@@ -309,13 +440,16 @@ class TestExtract:
         session.extract.return_value = ("angry.calm", profile)
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
-            json={"name": "angry.calm", "source": "angry", "register": False},
+            json={"concept": "angry", "baseline": "calm"},
         )
         assert resp.status_code == 200
         data = resp.json()
         assert data["canonical"] == "angry.calm"
         assert data["profile"]["layers"] == [0, 1]
         assert "on_progress" in session.extract.call_args.kwargs
+        session.extract.assert_called_once()
+        assert session.extract.call_args.args == ("angry", "calm")
+        session.steer.assert_called_once_with("angry.calm", profile)
 
     def test_extract_json_registers_returned_variant_and_namespace(
         self, session_and_client: Any,
@@ -329,11 +463,10 @@ class TestExtract:
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
             json={
-                "name": "honest.deceptive",
-                "source": "honest",
+                "concept": "honest",
+                "baseline": "deceptive",
                 "role": "pirate",
                 "namespace": "alice",
-                "register": True,
             },
         )
 
@@ -377,7 +510,7 @@ class TestExtract:
         with client.stream(
             "POST",
             "/saklas/v1/sessions/default/extract",
-            json={"name": "angry.calm", "source": "angry", "register": False},
+            json={"concept": "angry", "baseline": "calm"},
             headers={"Accept": "text/event-stream"},
         ) as resp:
             assert resp.status_code == 200
@@ -415,10 +548,9 @@ class TestExtract:
             "POST",
             "/saklas/v1/sessions/default/extract",
             json={
-                "name": "honest.deceptive",
-                "source": "honest",
+                "concept": "honest",
+                "baseline": "deceptive",
                 "role": "pirate",
-                "register": True,
             },
             headers={"Accept": "text/event-stream"},
         ) as resp:
@@ -430,68 +562,31 @@ class TestExtract:
             "honest.deceptive:role-pirate", profile,
         )
 
-    def test_extract_json_coerces_dict_pairs_and_uses_keyword_progress(self, session_and_client: Any) -> None:
-        import torch
-        from saklas.core.profile import Profile
+    def test_extract_rejects_legacy_polymorphic_shape(
+        self, session_and_client: Any,
+    ) -> None:
         session, client = session_and_client
-        profile = Profile({0: torch.ones(4)})
-
-        def _extract(name: Any, positive: Any, negative: Any, *, on_progress: Any = None, **_kwargs: Any) -> Any:
-            # A {pairs:[...]} payload unzips into two pole corpora fed to the
-            # 2-node pca fit — no {positive,negative} pairs, no DataSource.
-            assert name == "custom"
-            assert positive == ["positive text"]
-            assert negative == ["negative text"]
-            assert on_progress is not None
-            on_progress("progress")
-            return "custom", profile
-
-        session.extract_vector_from_corpora.side_effect = _extract
         resp = client.post(
             "/saklas/v1/sessions/default/extract",
             json={
-                "name": "custom",
-                "source": {
-                    "pairs": [
-                        {
-                            "positive": "positive text",
-                            "negative": "negative text",
-                        }
-                    ]
-                },
+                "concept": "custom",
+                "source": {"positive": ["yes"], "negative": ["no"]},
                 "register": False,
             },
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["canonical"] == "custom"
-        assert data["progress"] == ["progress"]
+        assert resp.status_code == 400
+        session.extract.assert_not_called()
 
-    def test_extract_json_coerces_single_pair_dict(self, session_and_client: Any) -> None:
-        # A bare {positive, negative} object — not wrapped in {"pairs": ...}
-        # — coerces to two one-element pole corpora carrying the request name.
-        import torch
-        from saklas.core.profile import Profile
+    def test_raw_profile_load_route_is_removed(
+        self, session_and_client: Any,
+    ) -> None:
         session, client = session_and_client
-        profile = Profile({0: torch.ones(4)})
-
-        def _extract(name: Any, positive: Any, negative: Any, **_kwargs: Any) -> Any:
-            assert name == "mood"
-            assert positive == ["pos one"]
-            assert negative == ["neg one"]
-            return "mood", profile
-
-        session.extract_vector_from_corpora.side_effect = _extract
         resp = client.post(
-            "/saklas/v1/sessions/default/extract",
-            json={
-                "name": "mood",
-                "source": {"positive": "pos one", "negative": "neg one"},
-                "register": False,
-            },
+            "/saklas/v1/sessions/default/vectors",
+            json={"name": "custom", "source_path": "/tmp/profile.pt"},
         )
-        assert resp.status_code == 200
-        assert resp.json()["canonical"] == "mood"
+        assert resp.status_code == 405
+        session.load_profile.assert_not_called()
 
 
 # ---- WebSocket token+probe co-stream ------------------------------------
@@ -508,7 +603,8 @@ class TestWebSocket:
         """Install a fake ``session.generate`` that drives ``on_token``."""
         def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: Any = False, raw: Any = False, thinking: Any = None,
-                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1,
+                 append_same_role: Any = True) -> Any:
             for i, tok in enumerate(tokens):
                 on_token(tok, False, 1000 + i, None, None)  # pyright: ignore[reportOptionalCall]
                 time.sleep(0.001)
@@ -524,7 +620,7 @@ class TestWebSocket:
             }
             session.last_per_token_scores = per_token
             session.last_per_token_scores = per_token
-            return result
+            return RunSet([result])
 
         session.generate.side_effect = _gen
 
@@ -546,9 +642,63 @@ class TestWebSocket:
                     break
             assert tokens == ["Hello", " ", "world"]
             assert done["result"]["finish_reason"] == "stop"
-            ptp = done["result"]["per_token_probes"]
-            assert len(ptp) == 3
-            assert ptp[0]["probes"]["happy"] == pytest.approx(0.1)
+            assert "per_token_probes" not in done["result"]
+
+    def test_generate_worker_typed_error_uses_safe_message(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.generate.side_effect = SaklasError("safe generation detail")
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "hi"})
+            assert ws.receive_json()["type"] == "started"
+            error = ws.receive_json()
+
+        assert error["type"] == "error"
+        assert error["message"] == "safe generation detail"
+        assert error["status"] == 500
+
+    def test_generate_worker_untyped_error_is_scrubbed(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.generate.side_effect = RuntimeError("private backend detail")
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "hi"})
+            assert ws.receive_json()["type"] == "started"
+            error = ws.receive_json()
+
+        assert error["type"] == "error"
+        assert error["message"] == (
+            "Generation failed. Check the server log for details."
+        )
+        assert "private backend detail" not in error["message"]
+        assert error["status"] == 500
+
+    def test_generate_rejects_unknown_fields(self, session_and_client: Any) -> None:
+        _, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "hi", "legacy": True})
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["code"] == "ValidationError"
+        assert "Extra inputs are not permitted" in msg["message"]
+
+    def test_generate_rejects_unknown_nested_message_fields(
+        self, session_and_client: Any,
+    ) -> None:
+        _, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate",
+                "input": [{"role": "user", "content": "hi", "name": "old"}],
+            })
+            msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["code"] == "ValidationError"
+        assert "Extra inputs are not permitted" in msg["message"]
 
     def test_stale_n_way_token_callback_stays_on_original_queue(
         self, session_and_client: Any,
@@ -559,7 +709,8 @@ class TestWebSocket:
 
         def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: Any = False, raw: Any = False, thinking: Any = None,
-                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1,
+                 append_same_role: Any = True) -> Any:
             callbacks.append(on_token)
             idx = len(callbacks) - 1
             if idx == 1:
@@ -578,7 +729,7 @@ class TestWebSocket:
             session.last_result = result
             session.last_per_token_scores = {}
             session.last_per_token_scores = {}
-            return result
+            return RunSet([result])
 
         session.generate.side_effect = _gen
 
@@ -649,7 +800,8 @@ class TestWebSocket:
 
         def _gen(input: Any, *, steering: Any = None, sampling: Any = None,
                  stateless: Any = False, raw: Any = False, thinking: Any = None,
-                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1) -> Any:
+                 on_token: Any = None, parent_node_id: Any = None, n: Any = 1,
+                 append_same_role: Any = True) -> Any:
             calls.append(str(input))
             time.sleep(0.02 if input == "one" else 0.001)
             on_token(str(input), False, 1000 + len(calls), None, None)  # pyright: ignore[reportOptionalCall]
@@ -662,7 +814,7 @@ class TestWebSocket:
             session.last_result = result
             session.last_per_token_scores = {}
             session.last_per_token_scores = {}
-            return result
+            return RunSet([result])
 
         session.generate.side_effect = _gen
 
@@ -844,23 +996,16 @@ class TestTraitsStream:
 
     def test_event_ordering_start_token_done(self):
         """Events are serialized correctly: start → token → done."""
-        from saklas.core.results import ProbeReadings
+        from saklas.core.results import ProbeReading
 
         # Test the serialization logic directly rather than fighting TestClient
         # SSE streaming semantics. Build the events as they'd arrive on the
         # trait queue and verify the JSON output format.
         readings = {
-            "probe_a": ProbeReadings(
-                per_generation=[(0.42,)],
-                mean=(0.30,),
-                std=(0.1,),
-                min=(0.2,),
-                max=(0.42,),
-                delta_per_gen=(0.12,),
-            )
+            "probe_a": ProbeReading(fraction=0.2, nearest=[], coords=(0.30,))
         }
         fake_result = MagicMock()
-        fake_result.readings = readings
+        fake_result.probe_readings = readings
         fake_result.finish_reason = "stop"
 
         # Simulate the tagged tuple protocol.
@@ -889,13 +1034,10 @@ class TestTraitsStream:
             elif tag == "done":
                 result = item[1]
                 agg = {}
-                rd = getattr(result, "readings", None)
+                rd = getattr(result, "probe_readings", None)
                 if rd:
                     for name, r in rd.items():
-                        pg = getattr(r, "per_generation", None)
-                        val = pg[-1] if pg else getattr(r, "mean", 0.0)
-                        if isinstance(val, tuple):
-                            val = val[0] if val else 0.0
+                        val = r.coords[0] if r.coords else 0.0
                         agg[name] = round(val, 6)
                 output_lines.append(json.dumps({
                     "type": "done", "generation_id": generation_id,
@@ -913,8 +1055,7 @@ class TestTraitsStream:
         assert parsed[2]["type"] == "token"
         assert parsed[2]["idx"] == 1
         assert parsed[3]["type"] == "done"
-        # Key assertion: aggregate uses per_generation[-1] (0.42), not mean (0.30)
-        assert parsed[3]["aggregate"]["probe_a"] == 0.42
+        assert parsed[3]["aggregate"]["probe_a"] == 0.30
         assert parsed[3]["finish_reason"] == "stop"
 
     def test_multiple_queues_receive_same_event(self):
@@ -975,7 +1116,6 @@ class TestScoreSingleToken:
         assert isinstance(scores["test_probe"].coords[0], float)
         # History should NOT have been updated.
         assert len(monitor.history["test_probe"]) == 0
-        assert monitor._stats["test_probe"]["count"] == 0
 
     def test_consistent_with_measure_from_hidden(self):
         import torch
@@ -1002,7 +1142,7 @@ class TestScoreSingleToken:
 # NOTE: the ``test_autoload_*`` tests and the three ``test_steering_*``
 # variant/sign-flip tests were deleted in 4.0.  ``SaklasSession.
 # _try_autoload_vector`` (the ``vectors/``-pack safetensors scan) was
-# removed; profile resolution goes through ``_ensure_profile_registered``
+# removed; profile resolution goes through ``ensure_profile_registered``
 # (fold a fitted manifold / port a legacy folder).  ``resolve_pole`` no
 # longer canonicalizes against disk or flips a bipolar-pole sign, so the
 # ``honest`` → ``honest.deceptive`` canonicalization and the ``wolf`` →
@@ -1066,25 +1206,43 @@ class TestManifoldRoutes:
         assert client.post("/saklas/v1/manifolds",
                            json=_box1d_payload()).status_code == 409
 
-    def test_create_templated(self, session_and_client: Any, tmp_path: Any,
-                              monkeypatch: Any) -> None:
+    def test_create_manifold_from_template(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
-        payload = {
+        template_payload = {
             "name": "weekday",
-            "fit_mode": "auto",
             "slot": "[DAY]",
             "values": ["Monday", "Tuesday", "Wednesday"],
-            "pairs": [
-                {"user": "what day is it?", "assistant": "today is [DAY]"},
-                {"user": "which day?", "assistant": "it's [DAY]"},
+            "contexts": [
+                {
+                    "turns": [{"role": "user", "content": "what day is it?"}],
+                    "assistant": "today is [DAY]",
+                },
+                {
+                    "turns": [{"role": "user", "content": "which day?"}],
+                    "assistant": "it's [DAY]",
+                },
             ],
         }
-        resp = client.post("/saklas/v1/manifolds/templated", json=payload)
+        assert client.post(
+            "/saklas/v1/templates", json=template_payload,
+        ).status_code == 201
+        payload = {
+            "name": "calendar",
+            "fit_mode": "auto",
+            "template_ref": "local/weekday",
+        }
+        resp = client.post("/saklas/v1/manifolds/from-template", json=payload)
         assert resp.status_code == 201, resp.text
         body = resp.json()
-        assert body["name"] == "weekday"
+        assert body["name"] == "calendar"
         assert body["fit_mode"] == "auto"
+        manifest = json.loads(
+            (tmp_path / "manifolds/local/calendar/manifold.json").read_text()
+        )
+        assert manifest["template_ref"] == "local/weekday"
         assert body["node_labels"] == ["monday", "tuesday", "wednesday"]
         # Unfitted ``auto`` folder: geometry unresolved on the wire (null), so
         # the rack client shows it in *both* family drawers.  Regression: an
@@ -1093,34 +1251,59 @@ class TestManifoldRoutes:
         assert body["resolved_fit_mode"] is None
         weekday_row = next(
             m for m in client.get("/saklas/v1/manifolds").json()["manifolds"]
-            if m["name"] == "weekday"
+            if m["name"] == "calendar"
         )
         assert weekday_row["resolved_fit_mode"] is None
+        assert weekday_row["domain_label"] == "discover-auto"
 
-        detail = client.get("/saklas/v1/manifolds/local/weekday").json()
+        detail = client.get("/saklas/v1/manifolds/local/calendar").json()
         monday = next(n for n in detail["nodes"] if n["label"] == "monday")
         assert monday["statements"] == ["today is Monday", "it's Monday"]
 
-        conflict = client.post("/saklas/v1/manifolds/templated", json=payload)
+        conflict = client.post("/saklas/v1/manifolds/from-template", json=payload)
         assert conflict.status_code == 409
         forced = client.post(
-            "/saklas/v1/manifolds/templated",
+            "/saklas/v1/manifolds/from-template",
             json={**payload, "force": True},
         )
         assert forced.status_code == 201, forced.text
 
-    def test_create_templated_slot_in_user_rejected(
+    def test_create_manifold_from_template_missing_template(
         self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
     ) -> None:
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
         _session, client = session_and_client
-        resp = client.post("/saklas/v1/manifolds/templated", json={
+        resp = client.post("/saklas/v1/manifolds/from-template", json={
             "name": "bad",
+            "template_ref": "local/missing",
+        })
+        assert resp.status_code == 404
+
+    def test_create_manifold_from_template_ambiguous_template(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        template = {
+            "name": "weekday",
             "slot": "[DAY]",
             "values": ["Monday", "Tuesday"],
-            "pairs": [{"user": "is it [DAY]?", "assistant": "yes [DAY]"}],
+            "contexts": [{
+                "turns": [{"role": "user", "content": "which day?"}],
+                "assistant": "today is [DAY]",
+            }],
+        }
+        assert client.post(
+            "/saklas/v1/templates", json={**template, "namespace": "local"},
+        ).status_code == 201
+        assert client.post(
+            "/saklas/v1/templates", json={**template, "namespace": "other"},
+        ).status_code == 201
+        resp = client.post("/saklas/v1/manifolds/from-template", json={
+            "name": "calendar",
+            "template_ref": "weekday",
         })
-        assert resp.status_code == 400
+        assert resp.status_code == 409
 
     def test_create_too_few_nodes(self, session_and_client: Any, tmp_path: Any,
                                   monkeypatch: Any) -> None:
@@ -1176,12 +1359,15 @@ class TestManifoldRoutes:
         session.fit.return_value = _MM(
             layers={0: 1, 1: 1, 2: 1}, feature_space="raw",
         )
-        resp = client.post("/saklas/v1/manifolds/local/mood/fit", json={})
+        resp = client.post(
+            "/saklas/v1/manifolds/local/mood/fit", json={"layers": [1, 2]},
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["done"] is True
         assert body["layers_fitted"] == 3
         assert body["feature_space"] == "raw"
+        assert session.fit.call_args.kwargs["layers"] == [1, 2]
 
 
 # ---- templates (standalone artifact + scorer) ----------------------------
@@ -1367,8 +1553,13 @@ class TestAnalyticsMultiNodeProbe:
         # one rank-3 multi-node probe (the shape that used to crash), all over
         # layers {0, 1} in dim 4.
         vx = {0: torch.randn(4), 1: torch.randn(4)}
+        g = torch.Generator().manual_seed(11)
+        acts = {L: torch.randn(80, 4, generator=g) for L in (0, 1)}
+        means = {L: torch.zeros(4) for L in (0, 1)}
+        whitener = LayerWhitener.from_neutral_activations(acts, means)
         vp = fold_directions_to_subspace(
-            "vp", {0: torch.randn(4), 1: torch.randn(4)}, None,
+            "vp", {0: torch.randn(4), 1: torch.randn(4)}, means,
+            whitener=whitener,
         )
         K, R, D = 4, 3, 4
         basis, _ = torch.linalg.qr(torch.randn(D, R))
@@ -1406,10 +1597,7 @@ class TestAnalyticsMultiNodeProbe:
             lambda n: SaklasSession.analytics_profile(session, n)
         )
 
-        g = torch.Generator().manual_seed(11)
-        acts = {L: torch.randn(80, 4, generator=g) for L in (0, 1)}
-        means = {L: torch.zeros(4) for L in (0, 1)}
-        session.whitener = LayerWhitener.from_neutral_activations(acts, means)
+        session.whitener = whitener
         return session, cast(TestClient, client)
 
     def test_analytics_names_excludes_multinode(self, session_and_client: Any) -> None:

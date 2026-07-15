@@ -13,6 +13,7 @@
 
   import {
     apiManifolds,
+    apiTemplates,
     apiManifoldFitStream,
     apiManifoldGenerateStream,
     ApiError,
@@ -31,7 +32,8 @@
     AxisSpec,
     CreateDiscoverManifoldRequest,
     CreateManifoldRequest,
-    CreateTemplatedManifoldRequest,
+    CreateManifoldFromTemplateRequest,
+    CreateTemplateRequest,
     GenerateManifoldRequest,
     ManifoldDomain,
   } from "../lib/types";
@@ -226,7 +228,7 @@
   const validation = $derived.by<{ ok: boolean; messages: string[] }>(() => {
     const messages: string[] = [];
     if (!slug(manifoldName)) {
-      messages.push("a manifold name is required");
+      messages.push("name required");
     }
     // Domain-shape validation only fires when the user is hand-authoring
     // coordinates.  auto-domain skips the box / sphere picker entirely
@@ -235,7 +237,7 @@
       for (let i = 0; i < boxDim; i++) {
         const a = axisDrafts[i];
         if (a.hi <= a.lo) {
-          messages.push(`axis "${a.name || i}" needs hi > lo`);
+          messages.push(`axis "${a.name || i}": hi > lo`);
         }
       }
     }
@@ -244,46 +246,42 @@
     // matching the auto-generated tab's discoverValidation).
     if (autoDomain) {
       if (nodes.length < 2) {
-        messages.push(
-          `need at least 2 nodes for auto-domain (have ${nodes.length})`,
-        );
+        messages.push(`nodes: ${nodes.length} / 2`);
       }
     } else if (nodes.length < minNodes) {
-      messages.push(
-        `need at least ${minNodes} nodes for an ${intrinsicDim}D domain (have ${nodes.length})`,
-      );
+      messages.push(`nodes: ${nodes.length} / ${minNodes}`);
     }
     const seenLabels = new Set<string>();
     for (const nd of nodes) {
       const lbl = slug(nd.label);
       if (!lbl) {
-        messages.push("every node needs a label");
+        messages.push("node label required");
       } else if (seenLabels.has(lbl)) {
-        messages.push(`duplicate node label "${lbl}"`);
+        messages.push(`duplicate label "${lbl}"`);
       } else {
         seenLabels.add(lbl);
       }
       if (!autoDomain && !coordsInDomain(nd.coords)) {
-        messages.push(`node "${nd.label}" has out-of-domain coordinates`);
+        messages.push(`"${nd.label}": outside domain`);
       }
       if (statementsOf(nd).length === 0) {
-        messages.push(`node "${nd.label}" needs at least one statement`);
+        messages.push(`"${nd.label}": statement required`);
       }
       const r = nd.role.trim();
       if (r && !ROLE_SLUG_RE.test(r)) {
         messages.push(
-          `node "${nd.label}" role "${r}" must match [a-z0-9._-]+`,
+          `"${nd.label}": invalid role "${r}"`,
         );
       }
     }
     // auto-domain shares hyperparam validation with the auto-generated tab.
     if (autoDomain) {
-      if (discoverMaxDim < 1) messages.push("max_dim must be >= 1");
+      if (discoverMaxDim < 1) messages.push("max dim ≥1");
       if (
         (discoverFitMode === "pca" || discoverFitMode === "auto") &&
         (discoverVarThreshold <= 0 || discoverVarThreshold > 1)
       ) {
-        messages.push("var_threshold must be in (0, 1]");
+        messages.push("variance ∈ (0, 1]");
       }
     }
     return { ok: messages.length === 0, messages };
@@ -431,6 +429,7 @@
   // role validation — concepts that pass ``slug()`` are already in
   // ``[a-z0-9._-]+``.
   let discoverRolePerNode = $state(false);
+  let discoverSaeRelease = $state("");
   let discoverProgress: string | null = $state(null);
   let alsoFit = $state(true);
 
@@ -449,42 +448,39 @@
   }>(() => {
     const messages: string[] = [];
     if (!slug(manifoldName)) {
-      messages.push("a manifold name is required");
+      messages.push("name required");
     }
     if (discoverConcepts.length < 2) {
-      messages.push(
-        `need >= 2 concepts (have ${discoverConcepts.length}) — ` +
-        "a manifold layout needs at least two nodes",
-      );
+      messages.push(`concepts: ${discoverConcepts.length} / 2`);
     }
     const seen = new Set<string>();
     for (const c of discoverConcepts) {
       const s = slug(c);
       if (!s) {
-        messages.push(`bad concept slug: "${c}"`);
+        messages.push(`invalid concept "${c}"`);
       } else if (seen.has(s)) {
-        messages.push(`duplicate concept: "${s}"`);
+        messages.push(`duplicate concept "${s}"`);
       } else {
         seen.add(s);
       }
     }
     if (discoverSamplesPerPrompt <= 0) {
-      messages.push("samples_per_prompt must be > 0");
+      messages.push("samples / prompt > 0");
     }
     if (discoverKind === "custom") {
       const template = discoverCustomSystem.trim();
       if (!template) {
-        messages.push("custom system template is required");
+        messages.push("system template required");
       } else if (!template.includes("{c}")) {
-        messages.push('custom system template must include "{c}"');
+        messages.push('system template needs "{c}"');
       }
     }
-    if (discoverMaxDim < 1) messages.push("max_dim must be >= 1");
+    if (discoverMaxDim < 1) messages.push("max dim ≥1");
     if (
       (discoverFitMode === "pca" || discoverFitMode === "auto") &&
       (discoverVarThreshold <= 0 || discoverVarThreshold > 1)
     ) {
-      messages.push("var_threshold must be in (0, 1]");
+      messages.push("variance ∈ (0, 1]");
     }
     return { ok: messages.length === 0, messages };
   });
@@ -562,6 +558,7 @@
             namespaceSlug,
             nameSlug,
             {
+              sae: discoverSaeRelease.trim() || null,
               fit_mode: discoverFitMode,
               hyperparams: buildDiscoverHyperparams(),
             },
@@ -645,41 +642,38 @@
     messages: string[];
   }>(() => {
     const messages: string[] = [];
-    if (!slug(manifoldName)) messages.push("a manifold name is required");
+    if (!slug(manifoldName)) messages.push("name required");
     const sl = templatedSlot.trim();
-    if (!sl) messages.push("a slot token is required (e.g. [DAY])");
+    if (!sl) messages.push("slot required");
     if (templatedValues.length < 2) {
-      messages.push(
-        `need >= 2 values (have ${templatedValues.length}) — one node per value`,
-      );
+      messages.push(`values: ${templatedValues.length} / 2`);
     }
     const seen = new Set<string>();
     for (const v of templatedValues) {
       const s = slug(v);
-      if (!s) messages.push(`value "${v}" has no valid label slug`);
-      else if (seen.has(s)) messages.push(`duplicate value label: "${s}"`);
+      if (!s) messages.push(`invalid value "${v}"`);
+      else if (seen.has(s)) messages.push(`duplicate value "${s}"`);
       else seen.add(s);
     }
     const pairs = nonEmptyTemplatedPairs();
-    if (pairs.length === 0) messages.push("need at least one template");
+    if (pairs.length === 0) messages.push("template required");
     pairs.forEach((p, i) => {
-      if (!p.user.trim()) messages.push(`template ${i + 1}: user turn is empty`);
+      if (!p.user.trim()) messages.push(`template ${i + 1}: user required`);
       if (!p.assistant.trim()) {
-        messages.push(`template ${i + 1}: assistant turn is empty`);
+        messages.push(`template ${i + 1}: assistant required`);
       } else if (sl && !p.assistant.includes(sl)) {
         messages.push(
-          `template ${i + 1}: assistant turn must contain the slot ${sl}`,
+          `template ${i + 1}: assistant needs ${sl}`,
         );
       }
       if (sl && p.user.includes(sl)) {
         messages.push(
-          `template ${i + 1}: user turn must not contain the slot ` +
-          "(user turns are shared common-mode across nodes)",
+          `template ${i + 1}: user cannot contain ${sl}`,
         );
       }
     });
     if (templatedMaxDim !== null && templatedMaxDim < 1) {
-      messages.push("max_dim must be >= 1");
+      messages.push("max dim ≥1");
     }
     return { ok: messages.length === 0, messages };
   });
@@ -693,17 +687,23 @@
     if (templatedMaxDim !== null && templatedMaxDim >= 1) {
       hyperparams.max_dim = templatedMaxDim;
     }
-    const req: CreateTemplatedManifoldRequest = {
+    const templateReq: CreateTemplateRequest = {
+      namespace: namespaceSlug,
+      name: nameSlug,
+      description: description.trim(),
+      slot: templatedSlot.trim(),
+      values: templatedValues,
+      contexts: nonEmptyTemplatedPairs().map((p) => ({
+        turns: [{ role: "user", content: p.user }],
+        assistant: p.assistant,
+      })),
+    };
+    const manifoldReq: CreateManifoldFromTemplateRequest = {
       namespace: namespaceSlug,
       name: nameSlug,
       description: description.trim(),
       fit_mode: templatedFitMode,
-      slot: templatedSlot.trim(),
-      values: templatedValues,
-      pairs: nonEmptyTemplatedPairs().map((p) => ({
-        user: p.user,
-        assistant: p.assistant,
-      })),
+      template_ref: `${namespaceSlug}/${nameSlug}`,
       hyperparams,
     };
     const toastId = pushToast(
@@ -711,7 +711,8 @@
       { kind: "info", ttlMs: null },
     );
     try {
-      await apiManifolds.createTemplated(req);
+      await apiTemplates.create(templateReq);
+      await apiManifolds.createFromTemplate(manifoldReq);
       dismissToast(toastId);
       if (alsoFit) {
         const fitToastId = pushToast(
@@ -788,38 +789,12 @@
     <ModeTabs
       bind:value={authoringMode}
       tabs={[
-        { value: "discover", label: "auto-generated" },
-        { value: "templated", label: "templated" },
-        { value: "authored", label: "custom nodes" },
+        { value: "discover", label: "auto" },
+        { value: "templated", label: "template" },
+        { value: "authored", label: "custom" },
       ]}
       ariaLabel="Authoring mode"
     />
-
-    {#if authoringMode === "authored"}
-      <p class="hint">
-        author a steering manifold: pick a domain, place labelled nodes
-        with a statement corpus each, then fit it from the manifolds
-        drawer.
-      </p>
-    {:else if authoringMode === "discover"}
-      <p class="hint">
-        hand the model a flat list of concepts; each one answers a shared
-        set of baseline prompts in character (one corpus per node), then
-        the fitter derives node coordinates per-model. leave the fit method
-        on auto unless you know you want flat (pca) or curved (spectral).
-        recommended at 20–48 concepts.
-      </p>
-    {:else}
-      <p class="hint">
-        give a slot token, a list of values (one node each), and a set of
-        (user, assistant) templates with the slot in the assistant turn.
-        the slot fills per value — deterministic, no model — and the
-        templates' user turns become the elicitation prompts the fit pools
-        against. the tool for categories you reference rather than embody
-        (days, months, colours, directions); fit_mode auto detects cyclic
-        layouts.
-      </p>
-    {/if}
 
     <!-- identity -->
     <div class="grid2">
@@ -835,12 +810,12 @@
         />
       </label>
       <label class="field">
-        <span class="label">name <span class="req">required</span></span>
+        <span class="label">name *</span>
         <input
           type="text"
           class="input"
           bind:value={manifoldName}
-          placeholder="e.g. circumplex"
+          placeholder="circumplex"
           autocomplete="off"
           spellcheck="false"
         />
@@ -852,7 +827,7 @@
         type="text"
         class="input"
         bind:value={description}
-        placeholder="what this manifold steers"
+        placeholder="description"
         autocomplete="off"
       />
     </label>
@@ -864,7 +839,7 @@
     <span class="auto-domain-toggle">
       <Checkbox
         bind:checked={autoDomain}
-        label="auto-domain (let the fitter derive coords from corpora)"
+        label="auto-domain"
       />
     </span>
 
@@ -879,15 +854,11 @@
         </div>
         <p class="dim-note">
           {#if discoverFitMode === "auto"}
-            recommended — lets the fitter pick flat / curved per-model and
-            detect periodic axes. the safe choice when you're not sure which
-            geometry your concepts want.
+            choose per model
           {:else if discoverFitMode === "pca"}
-            flat linear layout — picks the smallest prefix whose cumulative
-            variance crosses the threshold, capped at max_dim.
+            flat
           {:else}
-            laplacian eigenmaps — recovers curved-manifold topology that
-            pca flattens. noisy below ~50 nodes.
+            curved · best with ≥50 nodes
           {/if}
         </p>
       </section>
@@ -972,7 +943,7 @@
         </div>
       {:else}
         <label class="field sphere-field">
-          <span class="label">sphere dimension (S^n)</span>
+          <span class="label">sphere dim</span>
           <Select
             value={sphereDim}
             options={[
@@ -986,8 +957,7 @@
         </label>
       {/if}
       <p class="dim-note">
-        intrinsic dimension: <strong>{intrinsicDim}</strong> ·
-        minimum nodes: <strong>{minNodes}</strong>
+        dim <strong>{intrinsicDim}</strong> · min <strong>{minNodes}</strong> nodes
       </p>
     </section>
     {/if}
@@ -997,7 +967,7 @@
       <h2 class="step-title">nodes</h2>
       {#if nodes.length === 0}
         <p class="muted">
-          no nodes yet — add at least {autoDomain ? 2 : minNodes}.
+          add ≥{autoDomain ? 2 : minNodes} nodes
         </p>
       {/if}
       <div class="node-list">
@@ -1046,7 +1016,7 @@
             {#if node.expanded}
               <label class="node-role">
                 <span class="label">
-                  role <span class="opt">optional — role-augmented baseline</span>
+                  role
                 </span>
                 <input
                   type="text"
@@ -1058,7 +1028,7 @@
                       "role",
                       (ev.currentTarget as HTMLInputElement).value,
                     )}
-                  placeholder="e.g. pirate — leave empty for standard assistant baseline"
+                  placeholder="pirate"
                   autocomplete="off"
                   spellcheck="false"
                 />
@@ -1073,7 +1043,7 @@
                     "statements",
                     (ev.currentTarget as HTMLTextAreaElement).value,
                   )}
-                placeholder={"one statement per line — the corpus pooled into this node's centroid"}
+                placeholder="one statement per line"
               ></textarea>
             {/if}
           </div>
@@ -1088,7 +1058,7 @@
       <AdvancedSection bind:expanded={advancedAuthoredOpen}>
         <div class="grid2">
           <label class="field">
-            <span class="label">max_dim</span>
+            <span class="label">max dim</span>
             <NumberInput
               value={discoverMaxDim}
               min={1}
@@ -1100,7 +1070,7 @@
           </label>
           {#if discoverFitMode === "pca" || discoverFitMode === "auto"}
             <label class="field">
-              <span class="label">var_threshold</span>
+              <span class="label">variance</span>
               <NumberInput
                 value={discoverVarThreshold}
                 min={0}
@@ -1113,7 +1083,7 @@
             </label>
           {:else}
             <label class="field">
-              <span class="label">k_nn (blank → auto)</span>
+              <span class="label">k-NN</span>
               <NumberInput
                 value={discoverKNN}
                 min={1}
@@ -1127,7 +1097,7 @@
         </div>
         {#if discoverFitMode === "spectral"}
           <label class="field">
-            <span class="label">bandwidth σ (blank → median k-NN distance)</span>
+            <span class="label">bandwidth σ</span>
             <NumberInput
               value={discoverBandwidth}
               min={0}
@@ -1152,8 +1122,8 @@
       {submitting
         ? "building…"
         : autoDomain
-          ? `build manifold (auto-domain, ${discoverFitMode} fit) → return to list`
-          : "build manifold → return to list"}
+          ? `build · ${discoverFitMode}`
+          : "build"}
     </button>
     {:else if authoringMode === "discover"}
       <!-- auto-generated authoring: LLM-author corpora from a flat
@@ -1162,17 +1132,17 @@
         <h2 class="step-title">concepts</h2>
         <label class="field">
           <span class="label">
-            concept list <span class="req">required (≥2)</span>
+            concepts * · ≥2
           </span>
           <textarea
             class="input"
             rows="4"
-            placeholder={"pirate caveman assistant scholar robot\n(whitespace or comma-separated)"}
+            placeholder="pirate caveman assistant scholar robot"
             bind:value={discoverConceptsText}
             spellcheck="false"
           ></textarea>
           <span class="dim-note">
-            parsed: <strong>{discoverConcepts.length}</strong> concept(s)
+            <strong>{discoverConcepts.length}</strong> parsed
           </span>
         </label>
         <div class="grid2">
@@ -1185,7 +1155,7 @@
             </div>
           </div>
           <label class="field">
-            <span class="label">samples per prompt</span>
+            <span class="label">samples / prompt</span>
             <NumberInput
               value={discoverSamplesPerPrompt}
               min={1}
@@ -1196,11 +1166,6 @@
             />
           </label>
         </div>
-        <p class="dim-note">
-          each concept answers the shared baseline prompts in character —
-          <strong>{discoverKind}</strong> framing,
-          <strong>{discoverSamplesPerPrompt}</strong> response(s) per prompt.
-        </p>
         {#if discoverKind === "custom"}
           <label class="field">
             <span class="label">system template</span>
@@ -1223,24 +1188,28 @@
         </div>
         <p class="dim-note">
           {#if discoverFitMode === "auto"}
-            recommended — lets the fitter pick flat / curved per-model and
-            detect periodic axes. the safe choice when you're not sure which
-            geometry your concepts want.
+            choose per model
           {:else if discoverFitMode === "pca"}
-            flat linear layout — picks the smallest prefix whose cumulative
-            variance crosses the threshold, capped at max_dim. a good fit
-            for most concept heaps.
+            flat
           {:else}
-            laplacian eigenmaps — recovers curved-manifold topology
-            that pca flattens. noisy below ~50 nodes.
+            curved · best with ≥50 nodes
           {/if}
         </p>
       </section>
 
       <AdvancedSection bind:expanded={advancedDiscoverOpen}>
+        <label class="field">
+          <span class="label">SAE release</span>
+          <input
+            class="text-input"
+            bind:value={discoverSaeRelease}
+            placeholder="e.g. gemma-scope-2-4b-it-res"
+            spellcheck="false"
+          />
+        </label>
         <div class="grid2">
           <label class="field">
-            <span class="label">max_dim</span>
+            <span class="label">max dim</span>
             <NumberInput
               value={discoverMaxDim}
               min={1}
@@ -1252,7 +1221,7 @@
           </label>
           {#if discoverFitMode === "pca" || discoverFitMode === "auto"}
             <label class="field">
-              <span class="label">var_threshold</span>
+              <span class="label">variance</span>
               <NumberInput
                 value={discoverVarThreshold}
                 min={0}
@@ -1265,7 +1234,7 @@
             </label>
           {:else}
             <label class="field">
-              <span class="label">k_nn (blank → auto)</span>
+              <span class="label">k-NN</span>
               <NumberInput
                 value={discoverKNN}
                 min={1}
@@ -1281,7 +1250,7 @@
         </div>
         {#if discoverFitMode === "spectral"}
           <label class="field">
-            <span class="label">bandwidth σ (blank → median k-NN distance)</span>
+            <span class="label">bandwidth σ</span>
             <NumberInput
               value={discoverBandwidth}
               min={0}
@@ -1297,25 +1266,20 @@
         <div class="check-stack">
           <Checkbox
             bind:checked={alsoFit}
-            label="fit immediately after generating corpora"
+            label="fit now"
           />
           <Checkbox
             bind:checked={discoverRolePerNode}
-            label="persona manifold (use each concept slug as that node's role)"
+            label="node roles"
           />
           {#if discoverRolePerNode}
             <p class="role-hint">
-              Each node's centroid will be pooled with the chat template's
-              assistant-role label replaced by the concept slug. The fitted
-              manifold lives in persona-baseline activation space; steering
-              through it implies the nearest node's role at decode time.
-              Mistral-3 / talkie families don't support role substitution
-              and raise at fit time.
+              uses each concept as its assistant role; unsupported models fail at fit
             </p>
           {/if}
           <Checkbox
             bind:checked={discoverForce}
-            label="overwrite an existing manifold with this name"
+            label="overwrite"
           />
         </div>
       </AdvancedSection>
@@ -1335,8 +1299,8 @@
         {submitting
           ? "generating…"
           : alsoFit
-            ? "generate corpora + fit"
-            : "generate corpora"}
+            ? "generate + fit"
+            : "generate"}
       </button>
     {:else}
       <!-- templated authoring: slot + values + chat-turn templates;
@@ -1344,7 +1308,7 @@
       <section class="step">
         <h2 class="step-title">slot + values</h2>
         <label class="field">
-          <span class="label">slot token <span class="req">required</span></span>
+          <span class="label">slot *</span>
           <input
             type="text"
             class="input"
@@ -1353,23 +1317,20 @@
             autocomplete="off"
             spellcheck="false"
           />
-          <span class="dim-note">
-            the placeholder filled per value — lives in the assistant turn only
-          </span>
         </label>
         <label class="field">
           <span class="label">
-            values <span class="req">required (≥2)</span>
+            values * · ≥2
           </span>
           <textarea
             class="input"
             rows="3"
-            placeholder={"Monday Tuesday Wednesday Thursday Friday Saturday Sunday\n(whitespace or comma-separated)"}
+            placeholder="Monday Tuesday Wednesday Thursday Friday Saturday Sunday"
             bind:value={templatedValuesText}
             spellcheck="false"
           ></textarea>
           <span class="dim-note">
-            parsed: <strong>{templatedValues.length}</strong> value(s) → one node each
+            <strong>{templatedValues.length}</strong> parsed
           </span>
         </label>
       </section>
@@ -1377,9 +1338,7 @@
       <section class="step">
         <h2 class="step-title">templates</h2>
         <p class="dim-note">
-          {templatedPairs.length} template(s) — each a (user, assistant) turn;
-          the slot fills in the assistant turn. more templates = more samples
-          per node (aim ~10–50).
+          {templatedPairs.length} template(s)
         </p>
         {#each templatedPairs as pair, i (i)}
           <div class="pair-row">
@@ -1388,14 +1347,14 @@
                 type="text"
                 class="input"
                 bind:value={pair.user}
-                placeholder="user — e.g. what day is it?"
+                placeholder="user"
                 spellcheck="false"
               />
               <input
                 type="text"
                 class="input"
                 bind:value={pair.assistant}
-                placeholder={`assistant — e.g. today is ${templatedSlot || "[SLOT]"}`}
+                placeholder={`assistant · ${templatedSlot || "[SLOT]"}`}
                 spellcheck="false"
               />
             </div>
@@ -1409,7 +1368,7 @@
           </div>
         {/each}
         <button type="button" class="add-pair-btn" onclick={addTemplatedPair}>
-          + add template
+          + add
         </button>
       </section>
 
@@ -1422,21 +1381,18 @@
         </div>
         <p class="dim-note">
           {#if templatedFitMode === "auto"}
-            recommended — picks flat / curved per-model and detects periodic
-            axes (the right default for cyclic categories like days / months).
+            choose per model
           {:else if templatedFitMode === "pca"}
-            flat linear layout — pins a straight affine arrangement of the
-            values.
+            flat
           {:else}
-            laplacian eigenmaps — pins a curved RBF surface (use auto if you
-            want periodic axes detected for cyclic categories).
+            curved
           {/if}
         </p>
       </section>
 
       <AdvancedSection bind:expanded={advancedTemplatedOpen}>
         <label class="field">
-          <span class="label">max_dim (blank → auto)</span>
+          <span class="label">max dim</span>
           <NumberInput
             value={templatedMaxDim}
             min={1}
@@ -1451,7 +1407,7 @@
         <div class="check-stack">
           <Checkbox
             bind:checked={alsoFit}
-            label="fit immediately after authoring"
+            label="fit now"
           />
         </div>
       </AdvancedSection>
@@ -1464,7 +1420,7 @@
         disabled={!templatedValidation.ok || submitting}
         onclick={templatedSave}
       >
-        {submitting ? "authoring…" : alsoFit ? "author + fit" : "author"}
+        {submitting ? "building…" : alsoFit ? "build + fit" : "build"}
       </button>
     {/if}
   </div>
@@ -1477,46 +1433,52 @@
     height: 100%;
     min-height: 0;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-4) var(--space-5);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-5) var(--space-6);
   }
   .title {
     color: var(--accent);
     letter-spacing: 0;
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
-    font-size: var(--text);
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
     line-height: 1;
-    padding: var(--space-2) var(--space-3);
     cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--accent-red);
+    color: var(--fg);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: var(--space-4) var(--space-5) var(--space-5);
+    padding: var(--space-5) var(--space-6);
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
     min-height: 0;
-  }
-  .hint {
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    margin: 0;
-    line-height: 1.4;
   }
   .muted {
     color: var(--fg-muted);
@@ -1537,16 +1499,10 @@
     color: var(--fg-muted);
     font-size: var(--text-sm);
   }
-  .req {
-    color: var(--accent-red);
-    font-size: var(--text-xs);
-    font-style: italic;
-    margin-left: var(--space-2);
-  }
   .input {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -1562,7 +1518,6 @@
   }
 
   .step {
-    border-top: 1px solid var(--border);
     padding-top: var(--space-3);
     display: flex;
     flex-direction: column;
@@ -1583,9 +1538,9 @@
     gap: var(--space-2);
   }
   .kind-btn {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-dim);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-4);
     font: inherit;
@@ -1594,15 +1549,14 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .kind-btn:hover {
     color: var(--fg-strong);
+    background: var(--glass-strong);
   }
   .kind-btn.active {
     color: var(--accent);
-    border-color: var(--accent);
     background: var(--accent-subtle);
   }
 
@@ -1616,8 +1570,9 @@
     grid-template-columns: 1.4fr 1fr 1fr auto;
     align-items: end;
     gap: var(--space-2);
-    border: 1px solid var(--border);
     border-radius: var(--radius);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     padding: var(--space-3);
   }
   .axis-field {
@@ -1660,6 +1615,7 @@
   }
   .dim-note strong {
     color: var(--accent);
+    font-family: var(--font-mono);
   }
 
   .node-list {
@@ -1668,7 +1624,6 @@
     gap: var(--space-2);
   }
   .node-card {
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: var(--space-3);
     display: flex;
@@ -1729,9 +1684,9 @@
   .node-statements {
     width: 100%;
     box-sizing: border-box;
-    background: var(--bg-elev);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font-family: var(--font-mono);
@@ -1746,7 +1701,7 @@
   .add-node {
     background: var(--accent-subtle);
     color: var(--accent);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-4);
     font: inherit;
@@ -1791,7 +1746,7 @@
   .add-pair-btn {
     background: var(--accent-subtle);
     color: var(--accent);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-4);
     font: inherit;
@@ -1807,7 +1762,7 @@
   .save-btn {
     background: var(--accent);
     color: var(--text-on-accent);
-    border: 1px solid var(--accent);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-5);
     font: inherit;
@@ -1821,7 +1776,6 @@
   .save-btn:disabled {
     background: var(--bg-elev);
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
 

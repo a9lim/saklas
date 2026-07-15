@@ -12,6 +12,7 @@ Grammar::
     position    := signed_num ("," signed_num)* | label   # coord list | node label
     label       := NAME                                # a manifold node label
     atom        := [ns "/"] NAME ["." NAME] [":" variant]
+                 | "sae" "/" INT
     trigger     := preset | gate
     preset      := "before" | "after" | "both" | "thinking" | "response"
                  | "prompt" | "generated"
@@ -23,6 +24,7 @@ Grammar::
                                                        # fuzzy tube-fit density
                  | NAME "@" NAME                       # manifold label similarity (−dist)
                  | NAME "~" NAME                       # fuzzy soft-assignment prob ∈[0,1]
+                 | "sae" "/" INT                     # resident SAE feature
     op          := ">" | ">=" | "<" | "<="
     coeff       := signed_float ("," signed_float)?  # comma-run of ≤2;
                                                        # >1 value is valid
@@ -571,8 +573,18 @@ class _Parser:
             # namespaced probe; stored verbatim, matching the keys
             # ``Monitor.flat_scalars`` emits.
             self._consume()
-            ns_rhs = self._expect("IDENT")
-            probe = f"{probe}/{ns_rhs.value}"
+            if probe == "sae" and self._peek().kind == "NUM":
+                ns_rhs = self._consume()
+                feature = float(ns_rhs.value)
+                if feature != int(feature) or feature < 0:
+                    raise SteeringExprError(
+                        "SAE feature id must be a non-negative integer",
+                        col=ns_rhs.col,
+                    )
+                probe = f"sae/{int(feature)}"
+            else:
+                ns_rhs = self._expect("IDENT")
+                probe = f"{probe}/{ns_rhs.value}"
         nxt = self._peek().kind
         if nxt == "COLON":
             # Manifold subspace-fraction gate: ``<manifold>:fraction``.
@@ -727,9 +739,19 @@ class _Parser:
         concept = str(first.value)
         if self._peek().kind == "SLASH":
             self._consume()
-            second = self._expect("IDENT")
             namespace = concept
-            concept = str(second.value)
+            if namespace == "sae" and self._peek().kind == "NUM":
+                second = self._consume()
+                feature = float(second.value)
+                if feature != int(feature) or feature < 0:
+                    raise SteeringExprError(
+                        "SAE feature id must be a non-negative integer",
+                        col=second.col,
+                    )
+                concept = str(int(feature))
+            else:
+                second = self._expect("IDENT")
+                concept = str(second.value)
         if self._peek().kind == "DOT":
             self._consume()
             rhs = self._expect("IDENT")

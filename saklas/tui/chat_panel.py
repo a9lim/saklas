@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, ClassVar, Literal, TYPE_CHECKING, TypeAlias
 
 from rich.markup import escape as _rich_escape
 from textual import events as _textual_events
@@ -16,6 +16,9 @@ from textual.widget import Widget
 from textual.message import Message
 
 from saklas.tui.utils import BAR_WIDTH, build_bar
+
+if TYPE_CHECKING:
+    from saklas.core.loom import Recipe
 
 
 # --- Pending queue (mid-gen submissions) ----------------------------------
@@ -47,7 +50,7 @@ _KIND_LABELS: dict[str, str] = {
     "fan": "/fan",
 }
 
-# Sentinel used in a PendingItem payload to defer parent-node resolution
+# Sentinel used by typed pending targets to defer parent-node resolution
 # until drain time.  When a queued commit / prefill should hang under a
 # node that another earlier-queued action will create (e.g. a
 # ``commit_user`` followed by a ``commit_assistant``), capturing the
@@ -91,37 +94,120 @@ _KIND_CHAIN_INLINE: frozenset[str] = frozenset({
 })
 
 
+class _PendingAction:
+    """Shared display contract for the closed pending-action union."""
+
+    text: str
+
+
 @dataclass(frozen=True)
-class PendingItem:
-    """One mid-generation submission deferred until the next ``done``.
+class PendingSubmit(_PendingAction):
+    text: str
+    target: str | None = None
+    kind: ClassVar[Literal["submit"]] = "submit"
 
-    Attributes
-    ----------
-    kind:
-        Dispatch tag consumed by
-        :meth:`SaklasApp._dispatch_pending_action`.  Values mirror the
-        legacy single-tuple ``_pending_action`` shapes one-for-one.
-    text:
-        Verbatim text the user typed (or the canonical re-typeable form
-        for slash-triggered items, e.g. ``"/steer 0.5 angry"``).  Drives
-        the strip display and the up-arrow pull-and-edit path — when the
-        user pulls an item back into the chat input the text shown here
-        is what they see.
-    payload:
-        Kind-specific extras: ``("submit", text, prefill_target)`` becomes
-        ``payload=(prefill_target,)``, ``("commit_assistant", text,
-        user_node_id)`` becomes ``payload=(user_node_id,)``, etc.  Empty
-        tuple when the kind has no extra args.
-    """
 
-    kind: str
-    text: str = ""
-    payload: tuple[Any, ...] = field(default_factory=tuple)
+@dataclass(frozen=True)
+class PendingRawContinue(_PendingAction):
+    text: str
+    kind: ClassVar[Literal["raw_continue"]] = "raw_continue"
 
-    @property
-    def label(self) -> str:
-        """Short bracketed tag — ``msg``, ``commit``, ``/steer``, …"""
-        return _KIND_LABELS.get(self.kind, self.kind)
+
+@dataclass(frozen=True)
+class PendingCommitUser(_PendingAction):
+    text: str
+    kind: ClassVar[Literal["commit_user"]] = "commit_user"
+
+
+@dataclass(frozen=True)
+class PendingCommitAssistant(_PendingAction):
+    text: str
+    parent_id: str
+    kind: ClassVar[Literal["commit_assistant"]] = "commit_assistant"
+
+
+@dataclass(frozen=True)
+class PendingRawCommit(_PendingAction):
+    text: str
+    kind: ClassVar[Literal["raw_commit"]] = "raw_commit"
+
+
+@dataclass(frozen=True)
+class PendingRegenerate(_PendingAction):
+    text: str = "regen"
+    kind: ClassVar[Literal["regenerate"]] = "regenerate"
+
+
+@dataclass(frozen=True)
+class PendingRewind(_PendingAction):
+    text: str = "/rewind"
+    kind: ClassVar[Literal["rewind"]] = "rewind"
+
+
+@dataclass(frozen=True)
+class PendingClear(_PendingAction):
+    text: str = "/clear"
+    kind: ClassVar[Literal["clear"]] = "clear"
+
+
+@dataclass(frozen=True)
+class PendingQuit(_PendingAction):
+    text: str = "/quit"
+    kind: ClassVar[Literal["quit"]] = "quit"
+
+
+@dataclass(frozen=True)
+class PendingSteer(_PendingAction):
+    text: str
+    argument: str
+    kind: ClassVar[Literal["steer"]] = "steer"
+
+
+@dataclass(frozen=True)
+class PendingProbe(_PendingAction):
+    text: str
+    selector: str
+    kind: ClassVar[Literal["probe"]] = "probe"
+
+
+@dataclass(frozen=True)
+class PendingExtract(_PendingAction):
+    text: str
+    argument: str
+    kind: ClassVar[Literal["extract"]] = "extract"
+
+
+@dataclass(frozen=True)
+class PendingManifoldFit(_PendingAction):
+    text: str
+    folder: str
+    kind: ClassVar[Literal["manifold_fit"]] = "manifold_fit"
+
+
+@dataclass(frozen=True)
+class PendingRegenN(_PendingAction):
+    text: str
+    count: int
+    mode: str | Recipe | None
+    kind: ClassVar[Literal["regen_n"]] = "regen_n"
+
+
+@dataclass(frozen=True)
+class PendingFan(_PendingAction):
+    text: str
+    vector: str
+    alphas: tuple[float, ...]
+    prompt: str
+    kind: ClassVar[Literal["fan"]] = "fan"
+
+
+PendingItem: TypeAlias = (
+    PendingSubmit | PendingRawContinue | PendingCommitUser
+    | PendingCommitAssistant | PendingRawCommit | PendingRegenerate
+    | PendingRewind | PendingClear | PendingQuit | PendingSteer
+    | PendingProbe | PendingExtract | PendingManifoldFit | PendingRegenN
+    | PendingFan
+)
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -182,7 +268,7 @@ class PendingStrip(Static):
         n = len(self._queue)
         parts: list[str] = [f"[ansi_yellow]pending {n}[/ansi_yellow]"]
         for i, item in enumerate(self._queue):
-            label_esc = _rich_escape(item.label)
+            label_esc = _rich_escape(_KIND_LABELS[item.kind])
             text_esc = _rich_escape(_truncate(item.text, 48))
             if i == pulled_slot:
                 # Undimmed + ✎ marker so the user can see at a glance

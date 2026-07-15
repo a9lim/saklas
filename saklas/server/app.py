@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 if TYPE_CHECKING:
     from saklas.core.results import GenerationResult
@@ -22,7 +22,7 @@ from pydantic import BaseModel, model_validator
 from starlette.datastructures import Headers
 
 from saklas.core.errors import SaklasError
-from saklas.core.session import ConcurrentGenerationError, SaklasSession
+from saklas.core.session import ConcurrentGenerationError, GenerationStream, SaklasSession
 from saklas.core.steering import Steering
 from saklas.server.request_helpers import (
     UnsupportedContentError,
@@ -30,13 +30,12 @@ from saklas.server.request_helpers import (
     flatten_content as _flatten_content,
     merge_steering as _merge_steering,
     parse_request_steering as _parse_req_steering,
-    probe_reading_aggregate as _probe_reading_aggregate,
-    probe_reading_dict as _probe_reading_dict,
     probe_token_readings as _probe_token_readings,
     strict_model_enabled as _strict_model_enabled,
 )
 from saklas.server.streaming import (
     _usage_dict,
+    probe_reading_aggregate as _probe_reading_aggregate,
     stream_finalizer,
 )
 
@@ -377,7 +376,7 @@ def _render_logprobs_completions(result: GenerationResult, session: SaklasSessio
 
 async def _stream_generation(
     session: SaklasSession,
-    stream_iter: Iterator[Any], rid: str, model_id: str, object_type: str,
+    stream_iter: GenerationStream, rid: str, model_id: str, object_type: str,
     format_delta: Callable[[Any], dict[str, Any]], empty_delta: dict[str, Any],
     include_usage: bool = False, role_delta: bool = False,
     request: Request | None = None,
@@ -460,24 +459,15 @@ async def _stream_generation(
             # + join) on every exit — normal completion (no-op on an exhausted
             # generator), an in-band error, or an early client-disconnect
             # ``return`` — rather than leaving it to GC.
-            close = getattr(stream_iter, "close", None)
-            if callable(close):
-                close()
+            stream_iter.close()
 
-        last_result = (
-            getattr(stream_iter, "result", None)
-            or getattr(session, "last_result", None)
-        )
+        last_result = stream_iter.result
         finish_reason, usage, mf_agg = stream_finalizer(session, last_result)
         final_choice: dict[str, Any] = {
             "index": 0, **empty_delta, "finish_reason": finish_reason,
         }
         if mf_agg:
             final_choice["x-saklas-probe-readings"] = mf_agg
-        compat_probe_readings = _probe_reading_dict(
-            session,
-            readings=getattr(last_result, "readings", None) if last_result is not None else None,
-        )
         final = {
             "id": rid,
             "object": object_type,
@@ -485,8 +475,6 @@ async def _stream_generation(
             "model": model_id,
             "choices": [final_choice],
         }
-        if compat_probe_readings:
-            final["probe_readings"] = compat_probe_readings
         yield f"data: {json.dumps(final)}\n\n"
 
         if include_usage and usage is not None:
@@ -558,7 +546,7 @@ def create_app(session: SaklasSession,
     from saklas.server.ollama import register_ollama_routes
     register_ollama_routes(app)
 
-    from saklas.server.saklas_api import register_saklas_routes
+    from saklas.server.native_routes import register_saklas_routes
     register_saklas_routes(app)
 
     # Mount the Svelte+Vite SPA dashboard last so its catch-all route
@@ -649,7 +637,7 @@ def _register_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 return _error(503, "Server busy", "server_error")
-            return session.generate(prompt_or_messages, raw=raw, **gen_kwargs)
+            return session.generate(prompt_or_messages, raw=raw, **gen_kwargs).first
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):
@@ -668,7 +656,9 @@ def _register_routes(app: FastAPI) -> None:
                     d["content"] = event.text
                 return {"delta": d}
 
-            stream_iter = session.generate_stream(messages, **gen_kwargs)
+            stream_iter = session.generate_stream(
+                messages, live_scores=False, live_readouts=False, **gen_kwargs,
+            )
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return StreamingResponse(
                 _stream_generation(session,
@@ -702,9 +692,6 @@ def _register_routes(app: FastAPI) -> None:
             "choices": [chat_choice],
             "usage": _usage_dict(result),
         }
-        compat_probe_readings = _probe_reading_dict(session, readings=result.readings)
-        if compat_probe_readings:
-            body["probe_readings"] = compat_probe_readings
         return body
 
     # -----------------------------------------------------------------------
@@ -719,7 +706,10 @@ def _register_routes(app: FastAPI) -> None:
         gen_kwargs = _sampling_kwargs(req, app.state.default_steering)
 
         if req.stream:
-            stream_iter = session.generate_stream(req.prompt, raw=True, **gen_kwargs)
+            stream_iter = session.generate_stream(
+                req.prompt, raw=True, live_scores=False, live_readouts=False,
+                **gen_kwargs,
+            )
             include_usage = bool(req.stream_options and req.stream_options.include_usage)
             return StreamingResponse(
                 _stream_generation(session,
@@ -753,7 +743,4 @@ def _register_routes(app: FastAPI) -> None:
             "choices": [completion_choice],
             "usage": _usage_dict(result),
         }
-        compat_probe_readings = _probe_reading_dict(session, readings=result.readings)
-        if compat_probe_readings:
-            body["probe_readings"] = compat_probe_readings
         return body

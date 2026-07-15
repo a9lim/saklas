@@ -24,6 +24,8 @@
 // the per-card ``along[,onto]`` for manifold terms.
 
 import type {
+  JLensSteerEntry,
+  SaeSteerEntry,
   ManifoldSteerEntry,
   SteerEntry,
   SubspaceSteerEntry,
@@ -65,6 +67,16 @@ export function serializeExpression(
     }
   }
   for (const [name, entry] of rack) {
+    if (entry.enabled && entry.mode === "jlens") {
+      parts.push(formatJLensTerm(name, entry));
+    }
+  }
+  for (const [name, entry] of rack) {
+    if (entry.enabled && entry.mode === "sae") {
+      parts.push(formatSaeTerm(name, entry));
+    }
+  }
+  for (const [name, entry] of rack) {
     if (entry.enabled && entry.mode === "manifold") {
       parts.push(formatManifoldTerm(name, entry));
     }
@@ -87,7 +99,7 @@ export function serializeExpression(
  *  relative weight between them lives in how far each position sits from
  *  neutral.  ``<pos>`` is the label form (``personas%hacker``) when
  *  ``entry.label`` is set, else the comma-joined coord list. */
-function formatSubspaceTerm(
+export function formatSubspaceTerm(
   name: string,
   entry: SubspaceSteerEntry,
   subspaceAlong: number,
@@ -113,12 +125,24 @@ function formatTriggerSuffix(trigger: Trigger): string {
   return kw ? `@${kw}` : "";
 }
 
+/** Render one J-lens token term — the plain atom ``<alpha> jlens/<word>``
+ *  plus an optional ``@trigger``.  The rack key is the full atom (the
+ *  engine resolves it through ``register_jlens_direction``); per-chip
+ *  ``alpha`` because lens atoms run hotter than concept vectors. */
+export function formatJLensTerm(name: string, entry: JLensSteerEntry): string {
+  return `${formatCoeff(entry.alpha)} ${name}${formatTriggerSuffix(entry.trigger)}`;
+}
+
+export function formatSaeTerm(name: string, entry: SaeSteerEntry): string {
+  return `${formatCoeff(entry.alpha)} ${name}${formatTriggerSuffix(entry.trigger)}`;
+}
+
 /** Render one manifold (curved) rack entry — ``<along[,onto]>
  *  <name>[:variant]%<position>`` plus an optional ``@trigger`` suffix.
  *  Coefficient is the per-card blend fraction (``-`` rides the joiner).
  *  ``<position>`` is the label form (``emotions%happy``) when ``entry.label`` is
  *  set; otherwise the comma-joined coord list (``emotions%0.3,0.8``). */
-function formatManifoldTerm(name: string, entry: ManifoldSteerEntry): string {
+export function formatManifoldTerm(name: string, entry: ManifoldSteerEntry): string {
   const position = entry.label
     ? entry.label
     : entry.coords.map((c) => formatCoeff(c)).join(",");

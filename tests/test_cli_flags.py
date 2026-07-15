@@ -2,11 +2,29 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
 from saklas import cli
 from saklas.cli import runners as cli_runners
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["tui", "model", "--top-k-alts", "-1"],
+        ["serve", "model", "--top-k-alts", "257"],
+        ["tui", "model", "--max-tokens", "0"],
+        ["serve", "model", "--port", "70000"],
+        ["manifold", "fit", "m", "--max-dim", "0"],
+        ["manifold", "fit", "m", "--k-nn", "-2"],
+        ["sae", "load", "release", "-m", "model", "--layer", "-1"],
+    ],
+)
+def test_numeric_flags_reject_out_of_range_values(argv: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +108,12 @@ def test_lens_layers_empty_string_errors(capsys: pytest.CaptureFixture[str]):
         cli_runners._parse_layer_list("")
     assert ex.value.code == 2
     assert "at least one source layer" in capsys.readouterr().err
+
+
+def test_lens_layers_named_modes_parse() -> None:
+    assert cli_runners._parse_layer_list("workspace") == "workspace"
+    assert cli_runners._parse_layer_list("band") == "band"
+    assert cli_runners._parse_layer_list("all") == "all"
 
 
 # ---------------------------------------------------------------------------
@@ -221,18 +245,20 @@ def test_yaml_compile_invalid_type_errors(monkeypatch: pytest.MonkeyPatch, tmp_p
 # Runners
 # ---------------------------------------------------------------------------
 
-def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+def test_run_extract_corrupt_tensor_does_not_short_circuit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
     from saklas.io.paths import manifold_dir, tensor_filename
     model_id = "fake/model"
     # A steering vector is a 2-node pca manifold (4.0); extract lands it under
     # ``manifolds/<ns>/<canonical>/``.  A present per-model tensor is the
-    # cache-hit marker the runner checks (no manifold load needed).
+    # A bare corrupt tensor must not be treated as a validated cache hit.
     folder = manifold_dir("local", "happy.sad")
     folder.mkdir(parents=True, exist_ok=True)
     tensor = folder / tensor_filename(model_id)
     tensor.write_bytes(b"")
+
+    called = {"extract": 0}
 
     class FakeSession:
         def __init__(self, **kw: Any) -> None:
@@ -242,18 +268,208 @@ def test_run_extract_cache_hit_prints_already_extracted(monkeypatch: pytest.Monk
             self.probes = {}
 
         def extract(self, *a: Any, **kw: Any) -> Any:
-            raise AssertionError("extract() must not be called on cache hit")
+            called["extract"] += 1
+            return "happy.sad", object()
 
-    monkeypatch.setattr(cli_runners, "_make_session", lambda args: FakeSession())
+    monkeypatch.setattr(
+        cli_runners, "_make_session", lambda args, **_kwargs: FakeSession(),
+    )
     monkeypatch.setattr(cli_runners, "_print_model_info", lambda s: None)
     monkeypatch.setattr(cli_runners, "_print_startup", lambda args: None)
 
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["manifold", "extract", "happy.sad", "-m", model_id])
-    assert excinfo.value.code == 0
+    cli.main(["manifold", "extract", "happy.sad", "-m", model_id])
+    assert called["extract"] == 1
     out = capsys.readouterr().out
-    assert "already extracted at" in out
-    assert str(tensor) in out
+    assert "extracted happy.sad" in out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["manifold", "extract", "happy", "-m", "fake/model",
+         "--sae-revision", "rev"],
+        ["manifold", "fit", "missing", "-m", "fake/model",
+         "--sae-revision", "rev"],
+    ],
+)
+def test_sae_revision_flag_is_not_advertised(argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(argv)
+    assert exc.value.code == 2
+
+
+def test_fit_smoothing_override_is_delegated_to_fit_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.manifold import CustomDomain
+    from saklas.io.manifold_authoring import create_discover_manifold_folder
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    folder = create_discover_manifold_folder(
+        "local", "roles", "", fit_mode="auto",
+        node_corpora={"pirate": ["arrr"], "scholar": ["indeed"]},
+        node_roles={"pirate": "pirate", "scholar": "scholar"},
+        node_kinds={"pirate": "concrete", "scholar": "abstract"},
+    )
+    fake_manifold = SimpleNamespace(
+        name="roles", layers={0: object()}, node_labels=["pirate", "scholar"],
+        domain=CustomDomain(1), feature_space="raw",
+        metadata={"fit_mode": "auto"},
+    )
+    fit_kwargs: dict[str, Any] = {}
+
+    class _FakeSession:
+        model_info = {}
+
+        def fit(self, *_args: Any, **kwargs: Any) -> Any:
+            fit_kwargs.update(kwargs)
+            return fake_manifold
+
+    monkeypatch.setattr(
+        cli_runners, "_make_session", lambda *_args, **_kwargs: _FakeSession(),
+    )
+    monkeypatch.setattr(cli_runners, "_print_startup", lambda _args: None)
+    monkeypatch.setattr(cli_runners, "_print_model_info", lambda _session: None)
+    args = cli.parse_args([
+        "manifold", "fit", str(folder), "-m", "fake/model",
+        "--smoothing", "0.25",
+    ])
+    cli_runners._run_manifold_fit(args)
+    assert fit_kwargs["fit_mode"] is None
+    assert fit_kwargs["hyperparams"] == {"smoothing": 0.25}
+
+
+def test_serve_stale_lens_gate_uses_weight_compatibility() -> None:
+    class _Session:
+        enabled = False
+
+        def has_compatible_jlens(self) -> bool:
+            return False
+
+        def enable_live_lens(self, **_kwargs: Any) -> None:
+            self.enabled = True
+
+    session = _Session()
+    assert not cli_runners._enable_serve_live_lens_if_compatible(session)
+    assert not session.enabled
+
+
+def test_serve_selects_cached_lens_when_active_pointer_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        model_id = "org/model"
+        selected: str | None = None
+        live_enabled = False
+
+        def has_compatible_jlens(self) -> bool:
+            return self.selected == "local:default"
+
+        def select_jlens_source(self, source: str) -> None:
+            self.selected = source
+
+        def enable_live_lens(self) -> list[int]:
+            self.live_enabled = True
+            return [4, 5]
+
+    monkeypatch.setattr(
+        "saklas.io.lens_sources.list_lens_sources",
+        lambda _model: [{
+            "source": "local:default", "kind": "local", "active": False,
+        }],
+    )
+    session = _Session()
+    assert cli_runners._enable_serve_live_lens_if_compatible(session)
+    assert session.selected == "local:default"
+    assert session.live_enabled
+
+
+def test_best_serve_sae_release_prefers_official_canonical_provider() -> None:
+    rows = [
+        {
+            "release": "third-party-canonical", "source": "saelens",
+            "repo_id": "someone/sae", "neuronpedia": True,
+        },
+        {
+            "release": "gemma-scope-res-all", "source": "saelens",
+            "repo_id": "google/gemma-scope", "neuronpedia": True,
+        },
+        {
+            "release": "gemma-scope-res-canonical", "source": "saelens",
+            "repo_id": "google/gemma-scope", "neuronpedia": True,
+        },
+    ]
+    assert cli_runners._best_serve_sae_release(rows) == (
+        "gemma-scope-res-canonical"
+    )
+
+
+def test_serve_attaches_best_sae_and_enables_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        model_id = "google/gemma-3-4b-it"
+        sae_info = None
+        loaded: str | None = None
+        live_top_k: int | None = None
+
+        def load_sae(self, release: str) -> dict[str, Any]:
+            self.loaded = release
+            return {"release": release, "layer": 22, "width": 16_384}
+
+        def enable_live_sae(self, *, top_k: int) -> dict[str, int]:
+            self.live_top_k = top_k
+            return {"layer": 22, "top_k": top_k}
+
+    monkeypatch.setattr(
+        "saklas.io.sae.list_sae_sources",
+        lambda _model: [],
+    )
+    monkeypatch.setattr(
+        "saklas.core.sae.list_sae_releases",
+        lambda _model: [{
+            "release": "gemma-scope-2-4b-it-res",
+            "source": "saelens",
+            "repo_id": "google/gemma-scope-2-4b-it",
+            "neuronpedia": True,
+        }],
+    )
+    session = _Session()
+    assert cli_runners._enable_serve_live_sae_if_available(session)
+    assert session.loaded == "gemma-scope-2-4b-it-res"
+    assert session.live_top_k == 12
+
+
+def test_serve_prefers_cached_sae_over_registry_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        model_id = "google/gemma-3-4b-it"
+        sae_info = None
+        loaded: str | None = None
+
+        def load_sae(self, release: str) -> dict[str, Any]:
+            self.loaded = release
+            return {"release": release, "layer": 22, "width": 16_384}
+
+        def enable_live_sae(self, *, top_k: int) -> dict[str, int]:
+            return {"layer": 22, "top_k": top_k}
+
+    monkeypatch.setattr(
+        "saklas.io.sae.list_sae_sources",
+        lambda _model: [{
+            "source": "local:cached", "kind": "local", "active": False,
+        }],
+    )
+    monkeypatch.setattr(
+        "saklas.core.sae.list_sae_releases",
+        lambda _model: (_ for _ in ()).throw(
+            AssertionError("registry should not be consulted")
+        ),
+    )
+    session = _Session()
+    assert cli_runners._enable_serve_live_sae_if_available(session)
+    assert session.loaded == "local:cached"
 
 
 def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -805,7 +1021,7 @@ def test_config_bare_pole_resolves_canonical(monkeypatch: pytest.MonkeyPatch, tm
 
 
 # ---------------------------------------------------------------------------
-# vector extract --sae / --sae-revision
+# vector extract --sae
 # ---------------------------------------------------------------------------
 
 def test_vector_extract_parses_sae_flag():
@@ -816,18 +1032,16 @@ def test_vector_extract_parses_sae_flag():
         "--sae", "gemma-scope-2b-pt-res-canonical",
     ])
     assert args.sae == "gemma-scope-2b-pt-res-canonical"
-    assert args.sae_revision is None
+    assert not hasattr(args, "sae_revision")
 
 
-def test_vector_extract_sae_revision():
-    args = cli.parse_args([
-        "manifold","extract", "honest.deceptive",
-        "-m", "google/gemma-2-2b-it",
-        "--sae", "release-x",
-        "--sae-revision", "v1.0",
-    ])
-    assert args.sae == "release-x"
-    assert args.sae_revision == "v1.0"
+def test_vector_extract_sae_revision_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.parse_args([
+            "manifold", "extract", "honest.deceptive",
+            "-m", "google/gemma-2-2b-it", "--sae", "release-x",
+            "--sae-revision", "v1.0",
+        ])
 
 
 def test_vector_extract_no_sae_defaults_to_none():
@@ -835,7 +1049,7 @@ def test_vector_extract_no_sae_defaults_to_none():
         "manifold","extract", "honest.deceptive", "-m", "model",
     ])
     assert args.sae is None
-    assert args.sae_revision is None
+    assert not hasattr(args, "sae_revision")
 
 
 def test_vector_extract_sae_requires_value():

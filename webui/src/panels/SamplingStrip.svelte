@@ -19,7 +19,6 @@
     setSampling,
     patchSessionDefaults,
     openDrawer,
-    effectiveRawMode,
   } from "../lib/stores.svelte";
   import Slider from "../lib/Slider.svelte";
   import NumberInput from "../lib/NumberInput.svelte";
@@ -32,7 +31,6 @@
   const PLACEHOLDER = {
     temperature: 1.0,
     top_p: 1.0,
-    top_k: 1024,
     max_tokens: 512,
   };
 
@@ -64,38 +62,15 @@
   /** True iff the user can actually turn thinking off (the chat template
    *  has an ``enable_thinking`` switch).  Forced-thinking models leave
    *  the toggle locked and read-only so the user knows clicking it
-   *  is a no-op.  Older servers omit the field; default to ``true``
+   *  is a no-op.  The field is required by the current session contract
    *  so we don't lock controls against backends that pre-date the
    *  field. */
   const thinkingOptional = $derived(
-    sessionState.info?.thinking_is_optional ?? true,
+    sessionState.info?.thinking_is_optional === true,
   );
 
-  /** Per-message role boxes gate on family support + chat mode.  Base /
-   *  completion models (no chat template) and label-free families (Mistral
-   *  / talkie) can't relabel turns; raw mode has no roles either. */
-  const rawMode = $derived(effectiveRawMode());
-  const isBaseModel = $derived(sessionState.info?.is_base_model ?? false);
-  const userRoleSupported = $derived(
-    !isBaseModel &&
-      !rawMode &&
-      (sessionState.info?.user_role_supported ?? false),
-  );
-  const assistantRoleSupported = $derived(
-    !isBaseModel &&
-      !rawMode &&
-      (sessionState.info?.role_substitution_supported ?? false),
-  );
-
-  const ROLE_SLUG_RE = /^[a-z0-9._-]+$/;
-  const userRoleValid = $derived(
-    samplingState.user_role.trim() === "" ||
-      ROLE_SLUG_RE.test(samplingState.user_role.trim()),
-  );
-  const assistantRoleValid = $derived(
-    samplingState.assistant_role.trim() === "" ||
-      ROLE_SLUG_RE.test(samplingState.assistant_role.trim()),
-  );
+  // (The per-message role boxes moved to the composer's cast row —
+  // Chat.svelte ``speaking as`` / ``reply as`` chips, same client state.)
 
   /** Tri-state for the title attribute and disabled gate. */
   const thinkingForced = $derived(
@@ -110,7 +85,7 @@
 
   const tempView = $derived(samplingState.temperature ?? PLACEHOLDER.temperature);
   const topPView = $derived(samplingState.top_p ?? PLACEHOLDER.top_p);
-  const topKView = $derived(samplingState.top_k ?? PLACEHOLDER.top_k);
+  const topKView = $derived<number | null>(samplingState.top_k);
   const maxView = $derived(samplingState.max_tokens || PLACEHOLDER.max_tokens);
   const presenceView = $derived(samplingState.presence_penalty);
   const frequencyView = $derived(samplingState.frequency_penalty);
@@ -128,7 +103,7 @@
     body: Partial<{
       temperature: number;
       top_p: number;
-      top_k: number;
+      top_k: number | null;
       max_tokens: number;
       thinking: boolean;
     }>,
@@ -151,7 +126,11 @@
   }
 
   function onTopK(raw: number | null): void {
-    if (raw === null) return;
+    if (raw === null) {
+      setSampling("top_k", null);
+      void persistDefault({ top_k: null });
+      return;
+    }
     const v = Math.max(TOP_K_MIN, Math.min(TOP_K_MAX, Math.floor(raw)));
     setSampling("top_k", v);
     void persistDefault({ top_k: v });
@@ -216,7 +195,7 @@
 <section class="sampling-strip" aria-label="sampling controls">
   <!-- Row 1: temperature + top-p sliders -->
   <div class="row sliders">
-    <label class="control" title="Sampling temperature (0=greedy, 2=chaos)">
+    <label class="control" title="temperature">
       <span class="label">T</span>
       <span class="slider-cell">
         <Slider
@@ -232,7 +211,7 @@
       <span class="value">{tempView.toFixed(2)}</span>
     </label>
 
-    <label class="control" title="Top-p (nucleus) cumulative probability cutoff">
+    <label class="control" title="top-p">
       <span class="label">P</span>
       <span class="slider-cell">
         <Slider
@@ -251,7 +230,7 @@
 
   <!-- Row 2: top-k, repetition (frequency) penalty, presence penalty -->
   <div class="row">
-    <label class="control" title="Top-k hard cap on candidate vocab size">
+    <label class="control" title="top-k (blank = disabled)">
       <span class="label">K</span>
       <span class="num-cell">
         <NumberInput
@@ -259,6 +238,8 @@
           min={TOP_K_MIN}
           max={TOP_K_MAX}
           step={1}
+          placeholder="—"
+          allowEmpty
           disabled={!ready}
           onchange={onTopK}
           ariaLabel="top-k"
@@ -268,7 +249,7 @@
 
     <label
       class="control"
-      title="Repetition (frequency) penalty: discourages tokens by repeat count (−2…2)"
+      title="frequency penalty"
     >
       <span class="label">rep</span>
       <span class="num-cell">
@@ -286,7 +267,7 @@
 
     <label
       class="control"
-      title="Presence penalty: discourages tokens already present (−2…2)"
+      title="presence penalty"
     >
       <span class="label">pres</span>
       <span class="num-cell">
@@ -303,52 +284,11 @@
     </label>
   </div>
 
-  <!-- Row 3: per-message role labels (roleplay scaffold).  Whatever's in
-       the box rides the next send and is stamped onto that turn —
-       immutable afterward.  Empty = standard role label. -->
-  <div class="row roles">
-    <div
-      class="control role"
-      title={userRoleSupported
-        ? "user-turn role label — sent with each message, stamped on that turn"
-        : "user-role substitution unavailable for this model / mode"}
-    >
-      <span class="label">user role</span>
-      <input
-        type="text"
-        class="role-input"
-        class:invalid={!userRoleValid}
-        bind:value={samplingState.user_role}
-        disabled={!ready || !userRoleSupported}
-        placeholder="—"
-        spellcheck="false"
-        aria-label="user role label"
-      />
-    </div>
-
-    <div
-      class="control role"
-      title={assistantRoleSupported
-        ? "assistant-turn role label — the persona the model generates the reply under"
-        : "assistant-role substitution unavailable for this model / mode"}
-    >
-      <span class="label">asst role</span>
-      <input
-        type="text"
-        class="role-input"
-        class:invalid={!assistantRoleValid}
-        bind:value={samplingState.assistant_role}
-        disabled={!ready || !assistantRoleSupported}
-        placeholder="—"
-        spellcheck="false"
-        aria-label="assistant role label"
-      />
-    </div>
-  </div>
+  <!-- (Per-message role labels moved to the composer's cast row.) -->
 
   <!-- Row 4: max tokens, alts (top-K capture), seed -->
   <div class="row">
-    <label class="control" title="Maximum tokens to generate">
+    <label class="control" title="max tokens">
       <span class="label">max</span>
       <span class="num-cell">
         <NumberInput
@@ -368,7 +308,7 @@
          mode.  Default 8 per Decision 1. -->
     <label
       class="control"
-      title="Top-K alternative tokens to capture per position (0 disables; feeds the drilldown logits tab + surprise highlight)"
+      title="captured alternatives"
     >
       <span class="label">alts</span>
       <span class="num-cell">
@@ -384,7 +324,7 @@
       </span>
     </label>
 
-    <label class="control" title="RNG seed: empty means the model picks (clear the field to unpin)">
+    <label class="control" title="seed">
       <span class="label">seed</span>
       <span class="num-cell">
         <NumberInput
@@ -408,7 +348,7 @@
       class="sys-btn"
       disabled={!ready}
       onclick={openAdvanced}
-      title="Open stop strings, logit bias, and numeric top-K alternatives"
+      title="more sampling"
     >
       advanced
     </button>
@@ -418,19 +358,19 @@
       class="sys-btn"
       disabled={!ready}
       onclick={openSystemPrompt}
-      title="Edit system prompt"
+      title="system prompt"
     >
-      <span aria-hidden="true">⚙</span> system prompt
+      <span aria-hidden="true">⚙</span> system
     </button>
 
     <label
       class="control toggle"
       class:forced={thinkingForced}
       title={!thinkingSupported
-        ? "This model doesn't support thinking"
+        ? "unsupported"
         : !thinkingOptional
-          ? "This model always thinks"
-          : "Force chain-of-thought thinking on/off (overrides auto)"}
+          ? "always on"
+          : "thinking"}
     >
       <span class="label think-label">think{thinkingForced ? " (forced)" : ""}</span>
       <Checkbox
@@ -449,8 +389,6 @@
     flex-direction: column;
     gap: var(--space-4);
     padding: var(--space-3) var(--space-5);
-    border-top: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     color: var(--fg-strong);
@@ -483,15 +421,6 @@
   .row.actions > * {
     flex: 0 0 auto;
   }
-  /* Role labels are longer than the 3em label gutter the other rows
-   * reserve, so they'd otherwise start at the column's left edge instead
-   * of where the sliders / number boxes begin.  Indent each role control
-   * by one gutter so "USER ROLE" lines up with the slider's left edge;
-   * the box shortens from the left to match. */
-  .row.roles .control {
-    padding-left: calc(3em + var(--space-2));
-  }
-
   .control {
     display: flex;
     align-items: center;
@@ -544,9 +473,9 @@
   }
 
   .sys-btn {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-1) var(--space-4);
     font-family: var(--font-mono);
@@ -554,44 +483,12 @@
     line-height: 1.3;
   }
   .sys-btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
     color: var(--accent);
   }
   .sys-btn:disabled {
     color: var(--fg-muted);
-    border-color: var(--border);
     cursor: not-allowed;
   }
-  /* Per-message role inputs — text boxes matched to the themed
-     NumberInput cells (``.sk-number-input``) so height / background /
-     border / type read identically across the strip.  They fill their
-     grown control like the numeric cells do. */
-  .role-input {
-    box-sizing: border-box;
-    flex: 1 1 0;
-    min-width: 0;
-    background: var(--bg-elev);
-    color: var(--fg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--space-2) var(--space-3);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-  }
-  .role-input::placeholder {
-    color: var(--fg-dim);
-  }
-  .role-input:focus-visible {
-    outline: none;
-    border-color: var(--accent);
-  }
-  .role-input:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
-  }
-  .role-input.invalid {
-    border-color: var(--accent-error);
-  }
+  /* (Role-input styles moved to Chat.svelte's cast row.) */
 </style>

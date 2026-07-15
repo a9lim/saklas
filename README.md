@@ -54,7 +54,7 @@ from saklas import SaklasSession
 
 with SaklasSession.from_pretrained("google/gemma-4-31b-it") as s:
     name, profile = s.extract("formal.casual")       # a bundled bipolar concept
-    print(s.generate("What makes a good day?", steering=f"0.3 {name}").text)
+    print(s.generate("What makes a good day?", steering=f"0.3 {name}").first.text)
 ```
 
 ---
@@ -76,9 +76,8 @@ Extraction is difference-of-means per [Im & Li, 2025](https://arxiv.org/abs/2502
 ## Install
 
 ```bash
-pip install saklas                  # everything needed to run it
+pip install saklas                  # everything needed to run it, including SAELens
 pip install saklas[gguf]            # adds the gguf package for llama.cpp interchange
-pip install saklas[sae]             # adds sae-lens for SAE-backed extraction
 pip install saklas[research]        # adds datasets and pandas for dataset loading and DataFrames
 pip install saklas[notebook]        # adds plotly, pandas, and kaleido for Jupyter figure helpers
 pip install saklas[cuda]            # adds bitsandbytes and HF kernels for CUDA acceleration
@@ -124,7 +123,8 @@ The two many-node manifolds are **`personas`** (107 archetype nodes from `assist
 
 ### The steering grammar
 
-Every surface (Python, YAML, HTTP, the TUI, `manifold bake`) speaks the same grammar.
+Every live steering surface (Python, YAML, HTTP, the TUI) speaks the same grammar.
+`manifold bake` accepts its namespace-qualified additive scalar subset.
 
 ```python
 session.generate("...", steering="0.3 honest + 0.4 warm")   # add two concepts
@@ -169,7 +169,7 @@ The `%` coefficient slot is `along[,onto]`: `along` is how far to slide toward t
 
 > **Experimental.** This path is less tested than raw extraction.
 
-Install `saklas[sae]` and pass `--sae <release>` to `manifold extract` or `manifold fit` to run extraction in feature space. Saklas routes through SAELens, so any published release it covers (GemmaScope, the Eleuther Meta-LLaMA-3.1 SAEs, Joseph Bloom's, Apollo, Goodfire) should work. The fitted subspace is always model-space, so the hook never touches the SAE.
+Pass `--sae <source>` to `manifold extract` or `manifold fit` to run extraction in feature space. `saelens:<release>` uses a published SAELens release; `local:<name>` uses an SAE trained by Saklas. The fitted subspace is always model-space, so the generation hook never touches the SAE.
 
 ### Cross-model transfer
 
@@ -185,7 +185,7 @@ saklas serve google/gemma-4-31b-it
 
 Open `http://localhost:8000/`.
 
-The chat is a branching loom tree, so any turn can fork into siblings. Hitting Enter commits your message as a user node and runs the model, or, when the selected node is a user node, prefills the model's turn and generates from there. Holding Ctrl, Cmd, or Option while you submit commits without running the model. Submissions during generation get queued.
+The chat is a branching loom tree, so any turn can fork into siblings. The composer is selection-agnostic: normally, Enter commits the draft in the **human** seat and generates the **model** seat; **swap seats** reverses both. With an empty draft, Enter simply continues the generated seat. Holding Ctrl, Cmd, or Option affects non-empty drafts only and commits without generating. Prefill remains an explicit loom action rather than an implicit composer mode. Submissions during generation get queued.
 
 You can select a probe (or `surprise (logprob)`) to color tokens by score live, and you can compare two probes at once. Every generated token is clickable, and clicking shows all probe scores at all layers for that token, plus the top alternatives the model considered. The probe inspector renders each probe's geometry in the whitened metric, and the activation atlas extends the per-token view across the whole conversation.
 
@@ -285,17 +285,16 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
         "What makes a good day?",
         steering=f"0.3 {name}",
         sampling=SamplingConfig(temperature=0.7, max_tokens=256, seed=42),
-    )
-    # generate() returns a RunSet. Single-run attributes delegate to .first.
+    ).first
     print(result.text)
     print(result.readings)                          # live probe readings
     print(result.applied_steering)                  # canonical expression receipt
 
     # Scoped steering with pole and manifold-label resolution
     with session.steering("0.4 casual"):            # bare pole resolves to formal.casual at -0.4
-        print(session.generate("Describe a rainy afternoon.").text)
+        print(session.generate("Describe a rainy afternoon.").first.text)
     with session.steering("0.5 pirate"):            # bare label resolves to personas%pirate
-        print(session.generate("Describe a forest.").text)
+        print(session.generate("Describe a forest.").first.text)
 
     # Compare concepts
     other_name, other_profile = session.extract("warm.clinical")
@@ -492,7 +491,7 @@ saklas manifold compare <concepts...> -m MODEL
 saklas manifold why <concept> -m MODEL [-j]
 ```
 
-`manifold extract` writes a 2-node concept; `manifold bake` lands a corpus-less manifold straight from a steering expression. Bake and merge share the steering grammar, so `saklas manifold bake honest_unsyco "0.8 honest.deceptive | sycophantic.blunt"` gives you honesty with sycophancy projected out.
+`manifold extract` writes a 2-node concept; `manifold bake` lands a corpus-less manifold from namespace-qualified additive/subtractive scalar terms, for example `saklas manifold bake balanced "0.8 default/honest.deceptive - 0.2 default/sycophantic.blunt"`. Dynamic terms and `~`/`|` projection are rejected offline because live projection is Mahalanobis-only and requires the loaded model's whitener.
 
 Selectors are shared across surfaces: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `model:<m>`, `default`, `all`, optionally suffixed with a variant (`:raw`, `:sae`, `:sae-<release>`, `:from-<safe_src>`, `:role-<slug>`). Bare names resolve across namespaces and error if ambiguous.
 
@@ -502,16 +501,58 @@ Selectors are shared across surfaces: `<name>`, `<ns>/<name>`, `tag:<tag>`, `nam
 
 The Jacobian lens ([Gurnee et al. 2026](https://transformer-circuits.pub/2026/workspace/index.html)) reads out what an intermediate activation is disposed to make the model *say*: a per-layer matrix transports the residual into the final-layer basis, and the model's own unembedding decodes it into ranked vocabulary tokens. The paper shows these verbalizable directions form the model's global workspace — the small subspace its flexible reasoning routes through.
 
-Fit it once per model, then read, steer, gate, and decompose:
+Fetch an official Neuronpedia lens when the model is supported, or fit one
+locally, then read, steer, gate, and decompose:
 
 ```bash
-saklas lens fit google/gemma-3-4b-it --prompts 100        # one-time; resumes if interrupted
+saklas lens fetch google/gemma-3-4b-it                    # provider payload stays in HF cache
+# unsupported model:
+saklas lens fit org/model --prompts 100                   # local/default; resumes if interrupted
+saklas lens ls google/gemma-3-4b-it
+saklas lens use google/gemma-3-4b-it neuronpedia
 saklas lens top google/gemma-3-4b-it "Fact: the currency used in the country shaped like a boot is"
 saklas lens decompose confident.uncertain -m google/gemma-3-4b-it   # how verbalizable is a concept vector?
 saklas serve google/gemma-3-4b-it -S "!jlens/fake"        # ablate a lens direction
 ```
 
 `jlens/<word>` works anywhere a concept does: `0.3 jlens/orange` steers toward a token's lens direction, `!jlens/fake` ablates it, and `@when:jlens/fake > 0.4` gates another term on it. Lens directions run hotter than concept vectors — start around 0.3 rather than 0.5. In the TUI, `/lens` streams the top workspace tokens per layer live while the model generates. The fit needs a web-text corpus — pass `--corpus FILE` or `pip install 'saklas[hf]'` to stream a default sample.
+
+---
+
+## Sparse autoencoders
+
+Use a published SAELens release, or train a local residual-post SAE when the
+model has no compatible release:
+
+```bash
+saklas sae fetch google/gemma-3-4b-it saelens:gemma-scope-2-4b-it-res
+
+# Unsupported model: train on FineWeb-Edu, or pass --corpus FILE.
+pip install 'saklas[hf]'
+saklas sae train org/model my-sae --layer 20 --tokens 1000000
+saklas sae use org/model local:my-sae
+saklas sae ls org/model
+saklas serve org/model
+```
+
+Saklas owns artifacts it computes: local lenses and SAEs live below
+`$SAKLAS_HOME/models/<model>/jlens/local/` and `sae/local/`. External lens and
+SAE weights remain in Hugging Face/SAELens caches; Saklas stores only a pinned
+binding and the active-source selection. `lens rm` / `sae rm` therefore delete
+local payloads or forget bindings, but never purge provider caches.
+
+The dashboard's SAE and J-LENS tabs share one source lifecycle: select an
+already prepared source, fetch provider-owned weights into their normal cache,
+or start a Saklas-owned local train/fit with polled progress and cancellation.
+Successful preparation activates the source and turns its live readout on.
+The SAE tab then streams top feature activations and pins features as probes;
+the J-LENS tab exposes the symmetric token workspace. `0.3 sae/9143` steers on
+decoder row 9143; `!sae/9143` uses saklas's ordinary directional
+mean-ablation; `@when:sae/9143 > 3` gates on the raw post-nonlinearity encoder
+activation. V1 keeps one deterministic hook layer resident (nearest 65% depth,
+workspace band preferred); pass `--layer` to `sae fetch` or `sae train` to select a different
+covered layer. Feature labels are fetched lazily from Neuronpedia when the
+selected SAELens registry entry provides an id, and reads remain offline-first.
 
 ---
 

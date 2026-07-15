@@ -1,5 +1,5 @@
 {
-  "format_version": 5,
+  "format_version": 9,
   "name": "creative.conventional",
   "description": "Bipolar axis: creative (+) vs conventional (-). Steer with negative alpha for the opposite pole.",
   "fit_mode": "pca",
@@ -10,15 +10,19 @@
   "nodes": [
     {
       "label": "creative",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     },
     {
       "label": "conventional",
-      "kind": "abstract"
+      "kind": "abstract",
+      "role": null
     }
   ],
   "files": {},
   "tags": [
     "register"
-  ]
+  ],
+  "source": "bundled",
+  "template_ref": null
 }

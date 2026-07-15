@@ -7,6 +7,7 @@ consumption time via :func:`saklas.core.steering_expr.parse_expr`.
 """
 from __future__ import annotations
 
+import math
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -108,8 +109,49 @@ class ConfigFile:
             raise ConfigFileError(f"{path}: top-level must be a mapping")
 
         unknown = set(data.keys()) - _KNOWN_KEYS
-        for k in unknown:
-            log.warning("unknown key %r in %s (ignored)", k, path)
+        if unknown:
+            names = ", ".join(repr(k) for k in sorted(unknown, key=str))
+            raise ConfigFileError(f"{path}: unknown config key(s): {names}")
+
+        model_v = data.get("model")
+        if model_v is not None and (
+            not isinstance(model_v, str) or not model_v.strip()
+        ):
+            raise ConfigFileError(f"{path}: model must be a non-empty string")
+
+        thinking_v = data.get("thinking")
+        if thinking_v is not None and not isinstance(thinking_v, bool):
+            raise ConfigFileError(f"{path}: thinking must be a boolean")
+
+        system_prompt_v = data.get("system_prompt")
+        if system_prompt_v is not None and not isinstance(system_prompt_v, str):
+            raise ConfigFileError(f"{path}: system_prompt must be a string")
+
+        def finite_number(key: str) -> float | None:
+            value = data.get(key)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigFileError(f"{path}: {key} must be a finite number")
+            number = float(value)
+            if not math.isfinite(number):
+                raise ConfigFileError(f"{path}: {key} must be a finite number")
+            return number
+
+        temperature_v = finite_number("temperature")
+        if temperature_v is not None and temperature_v < 0:
+            raise ConfigFileError(f"{path}: temperature must be >= 0")
+        top_p_v = finite_number("top_p")
+        if top_p_v is not None and not 0 < top_p_v <= 1:
+            raise ConfigFileError(f"{path}: top_p must be in (0, 1]")
+
+        max_tokens_v = data.get("max_tokens")
+        if max_tokens_v is not None and (
+            isinstance(max_tokens_v, bool)
+            or not isinstance(max_tokens_v, int)
+            or max_tokens_v <= 0
+        ):
+            raise ConfigFileError(f"{path}: max_tokens must be a positive integer")
 
         vectors_raw = data.get("vectors")
         vectors: Optional[str] = None
@@ -171,13 +213,13 @@ class ConfigFile:
                 )
 
         return cls(
-            model=data.get("model"),
+            model=model_v,
             vectors=vectors,
-            thinking=data.get("thinking"),
-            temperature=data.get("temperature"),
-            top_p=data.get("top_p"),
-            max_tokens=data.get("max_tokens"),
-            system_prompt=data.get("system_prompt"),
+            thinking=thinking_v,
+            temperature=temperature_v,
+            top_p=top_p_v,
+            max_tokens=max_tokens_v,
+            system_prompt=system_prompt_v,
             compile=compile_v,
             cuda_graphs=cuda_graphs_v,
             return_top_k=return_top_k_v,

@@ -8,14 +8,13 @@ both :mod:`saklas.io.manifold_authoring` and
 :mod:`saklas.io.manifold_lifecycle` import from here.
 
 A *manifold* is a set of labeled nodes — each node a small corpus of
-statements — placed at authoring coordinates on a :class:`ManifoldDomain`
+responses — placed at authoring coordinates on a :class:`ManifoldDomain`
 (an n-dimensional intrinsic manifold of some topology: a box/disk, a
 cylinder, a torus, a sphere, or an explicit immersion).  Fitting a
 manifold against a model produces a per-model RBF artifact (see
 :mod:`saklas.core.manifold`).  Manifolds live under their own root,
-``~/.saklas/manifolds/<ns>/<name>/``, parallel to the legacy ``vectors/``
-port root — a manifold carries N labeled nodes on a domain, not a single
-bipolar concept (the retired pack/concept folder shape).
+``~/.saklas/manifolds/<ns>/<name>/``. A manifold carries N labeled nodes on a
+domain; a two-node flat manifold is the bipolar-concept case.
 
 ```
 ~/.saklas/manifolds/<ns>/<name>/
@@ -35,8 +34,11 @@ this module owns folder discovery, the node corpus, and integrity.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
+from collections.abc import Mapping
 import hashlib
 import json
+import math
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -65,7 +67,7 @@ _LABEL_REGEX = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 # Discover-mode fit modes — set as ``manifold.json::fit_mode`` for
 # manifolds whose node coordinates are derived from the model's
 # activations rather than authored by hand.  Authored manifolds carry
-# ``fit_mode == "authored"`` (or omit the field, which means the same).
+# ``fit_mode == "authored"``. Current manifests always carry the discriminator.
 # ``auto`` is a discover mode whose *resolved* geometry (flat ``pca`` vs curved
 # ``spectral``, plus periodic ``BoxDomain`` axes) is chosen per-model at fit
 # time by ``core.manifold.select_topology`` — the folder declares only the
@@ -82,6 +84,102 @@ _FIT_MODES_BAKED: frozenset[str] = frozenset({"baked"})
 _FIT_MODES_ALL: frozenset[str] = (
     frozenset({"authored"}) | _FIT_MODES_DISCOVER | _FIT_MODES_BAKED
 )
+MERGE_BAKE_POLICY = "additive_union_v1"
+
+
+@contextmanager
+def _locked_manifest(folder: Path):
+    """Serialize cross-process manifest read-modify-write for one folder."""
+    from saklas.io.atomic import artifact_lock
+
+    with artifact_lock(folder.parent / f"{folder.name}.manifest"):
+        yield
+
+
+def manifold_pair_lock_path(tensor_path: Path) -> Path:
+    """Stable, bounded logical lock path for one fitted tensor pair.
+
+    The lock lives under the manifold namespace rather than inside the
+    removable manifold folder.  Consequently ``rm`` and stage-swap refreshes
+    cannot unlink the held lock inode and let a later process acquire a fresh
+    inode for the same logical pair.  The digest also bounds the filename for
+    long model/release-derived tensor names.
+    """
+
+    tensor_path = Path(tensor_path).expanduser().resolve(strict=False)
+    identity = f"{tensor_path.parent}\0{tensor_path.name}".encode()
+    digest = hashlib.sha256(identity).hexdigest()
+    return tensor_path.parent.parent / f".saklas-pair-{digest}"
+
+
+@contextmanager
+def manifold_pair_lock(tensor_path: Path):
+    """Lock a fitted tensor/sidecar pair using stable external identity."""
+
+    from saklas.io.atomic import artifact_lock
+
+    with artifact_lock(manifold_pair_lock_path(tensor_path)):
+        yield
+
+
+def manifold_folder_tensor_paths(folder: Path) -> list[Path]:
+    """Return canonical tensor paths for every fitted/orphan pair in ``folder``.
+
+    Destructive folder replacement cannot trust ``manifold.json::files``: the
+    operation is also the recovery path for an interrupted publication whose
+    tensor or sidecar never acquired a manifest proof.  Scan both halves and
+    canonicalize sidecars back to their tensor path so each logical pair is
+    locked exactly once.
+    """
+
+    from saklas.io.paths import parse_tensor_filename
+
+    folder = Path(folder)
+    candidates = list(folder.glob("*.safetensors")) + [
+        sidecar
+        for sidecar in folder.glob("*.json")
+        if sidecar.name != "manifold.json"
+    ]
+    tensors: set[Path] = set()
+    for candidate in candidates:
+        tensor = (
+            candidate.with_suffix(".safetensors")
+            if candidate.suffix == ".json" else candidate
+        )
+        if parse_tensor_filename(tensor.name) is not None:
+            tensors.add(tensor)
+    return sorted(tensors)
+
+
+@contextmanager
+def destructive_manifold_folder_transaction(folder: Path):
+    """Quiesce fitted readers before a whole-folder reset or stage swap.
+
+    Global mutation order is manifest then stable pair locks, with pair locks in
+    deterministic tensor-path order.  The pair locks live outside the removable
+    folder, so holding this context across ``rmtree``/rename/recreation prevents
+    a new inode from bypassing a reader that still owns the old logical pair.
+    The manifest lock is re-entrant, allowing authoring entry points that already
+    serialize their destination to use this one shared destructive seam.
+    """
+
+    folder = Path(folder)
+    with _locked_manifest(folder):
+        with ExitStack() as stack:
+            for tensor_path in manifold_folder_tensor_paths(folder):
+                stack.enter_context(manifold_pair_lock(tensor_path))
+            yield
+
+
+def reset_manifold_folder(folder: Path) -> None:
+    """Remove ``folder`` only after all extant fitted pairs are quiescent."""
+
+    import shutil
+
+    folder = Path(folder)
+    with destructive_manifold_folder_transaction(folder):
+        if folder.exists():
+            shutil.rmtree(folder)
 
 # Per-method hyperparameter whitelists.  Anything outside the whitelist
 # for a given fit_mode is dropped at folder-create time so a user
@@ -142,52 +240,404 @@ def domain_label(spec: dict[str, Any]) -> str:
 def sanitize_hyperparams(
     fit_mode: str, hyperparams: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Drop hyperparam keys that don't apply to ``fit_mode``.
+    """Validate and return hyperparameters for one exact fit mode.
 
     Single source of truth for the per-method whitelist; both the create
     and the fit-override paths funnel through this so the folder
-    manifest never carries a key that would crash the dispatcher.  An
-    unknown ``fit_mode`` (already validated upstream) passes through
-    unchanged — better to land a soft "extra key" warning at fit time
-    than to silently drop everything.
+    manifest never accepts a key that the selected dispatcher would ignore.
     """
     if hyperparams is None:
         return {}
     allowed = _HYPERPARAMS_BY_MODE.get(fit_mode)
     if allowed is None:
-        return dict(hyperparams)
-    return {k: v for k, v in hyperparams.items() if k in allowed}
+        raise ManifoldFormatError(f"unknown fit_mode {fit_mode!r}")
+    invalid = set(hyperparams) - allowed
+    if invalid:
+        names = ", ".join(sorted(invalid))
+        raise ManifoldFormatError(
+            f"fit_mode {fit_mode!r} does not accept hyperparameter(s): {names}"
+        )
+    return dict(hyperparams)
 
 
-# Back-compat alias: the function was renamed to the public ``sanitize_hyperparams``.
-_sanitize_hyperparams = sanitize_hyperparams
+# Current manifold artifact format. v7 makes manifest defaults and per-node
+# provenance explicit, yielding one canonical payload shape. v6 added an optional per-layer
+# ``affine_map`` tensor for flat fitted
+# subspaces.  Ordinary fits omit it (identity); rectangular/non-isometric
+# cross-model transfers persist the exact authoring-to-orthonormal-reduced
+# reparameterization.  Old readers would otherwise ignore that tensor and
+# silently move manifold world points, so this is a real format boundary.
+MANIFOLD_FORMAT_VERSION = 9
 
-# Manifold artifact format version.  Decoupled from concept packs'
-# ``PACK_FORMAT_VERSION`` so the two formats can churn independently.
-# v3 is the arbitrary-dimensional / arbitrary-topology format (domain
-# spec + per-node coordinates); v2 and earlier were the 1-D cyclic-spline
-# format and must be converted with ``scripts/upgrade_manifolds.py``.
-# v4 added a per-layer ``explained_variance_per_layer`` sidecar field
-# (a fit-quality ratio).  It is no longer read — cross-layer read
-# weighting now rides the Mahalanobis ``share`` (the same per-layer
-# budget that drives steering), so EV is neither baked nor loaded.  An
-# old sidecar that still carries the key loads fine (it's ignored); a
-# refit simply drops it.
-# v5 adds the per-layer ``origin_per_layer`` sidecar field (the per-layer
-# authoring-coordinate foot of the neutral mean, ``{str(L): [coord, ...]}``,
-# the cold-start foot seed).  Loading stays back-compatible — an absent
-# field loads as an empty dict (the apply path seeds a zero-coord foot per
-# layer), so no migration is needed; the bump just forces
-# materialize_bundled_manifolds to refresh the bundled fit so the origins
-# get baked on the next fit.
-MANIFOLD_FORMAT_VERSION = 5
+MANIFOLD_SIDECAR_FIELDS = {
+    "format_version", "name", "method", "saklas_version", "domain",
+    "node_count", "node_labels", "feature_space", "fit_mode", "hyperparams",
+    "diagnostics", "node_spread_per_layer", "mahalanobis_share_per_layer",
+    "origin_per_layer", "nodes_sha256", "sae_release", "sae_revision",
+    "sae_fingerprint", "sae_ids_by_layer", "sae_full_coverage",
+    "model_fingerprint", "capture_sha256", "fitted_layers",
+    "fit_policy_version", "share_metric", "subspace_metric",
+    "rbf_smoothing_per_layer", "sigma_field_per_layer", "resolved_fit_mode",
+    "topology_winner", "topology_candidates", "node_roles", "node_kinds",
+    "components", "bake_policy", "source_model_id",
+    "source_model_fingerprint", "transfer_quality_estimate",
+}
+
+MANIFOLD_METHOD_FIT_MODES: dict[str, frozenset[str]] = {
+    "manifold_pca": frozenset({"authored"}),
+    "manifold_sae": frozenset({"authored"}),
+    "manifold_monopolar": frozenset({"authored"}),
+    "manifold_monopolar_sae": frozenset({"authored"}),
+    "manifold_discover_auto": frozenset({"auto"}),
+    "manifold_discover_pca": frozenset({"pca"}),
+    "manifold_discover_spectral": frozenset({"spectral"}),
+    "manifold_discover_sae": frozenset({"pca", "spectral", "auto"}),
+    "manifold_procrustes_transfer": frozenset(_FIT_MODES_ALL),
+    "merge": frozenset({"baked"}),
+    "folded_vector": frozenset({"baked"}),
+}
+
+
+def _finite_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
+
+
+def _validate_layer_map(
+    value: Any, *, location: str, field: str, fitted: set[int],
+    validate_value: Any, require_fitted: bool = True,
+) -> None:
+    if not isinstance(value, dict):
+        raise ManifoldFormatError(f"{location} field {field!r} must be an object")
+    for raw_layer, item in value.items():
+        if (
+            not isinstance(raw_layer, str)
+            or not raw_layer.isascii()
+            or not raw_layer.isdecimal()
+            or str(int(raw_layer)) != raw_layer
+            or require_fitted and int(raw_layer) not in fitted
+        ):
+            raise ManifoldFormatError(
+                f"{location} field {field!r} has invalid fitted-layer key {raw_layer!r}"
+            )
+        if not validate_value(item):
+            raise ManifoldFormatError(
+                f"{location} field {field!r} has invalid value for layer {raw_layer}"
+            )
+
+
+def _validate_hyperparams(data: dict[str, Any], *, location: str) -> None:
+    params = data["hyperparams"]
+    mode = data["fit_mode"]
+    if not isinstance(params, dict):
+        raise ManifoldFormatError(f"{location} hyperparams must be an object")
+    if mode in {"authored", "baked"}:
+        if params:
+            raise ManifoldFormatError(f"{location} {mode} fit cannot carry hyperparams")
+        return
+    sanitize_hyperparams(mode, params)
+    int_keys = {"max_dim", "min_dim", "k_nn", "max_subspace_dim"}
+    float_keys = {"var_threshold", "bandwidth", "persistence_frac"}
+    for key, value in params.items():
+        valid = (
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            if key in int_keys else
+            _finite_number(value)
+            if key in float_keys else
+            value == "auto" or _finite_number(value)
+            if key == "smoothing" else False
+        )
+        if not valid:
+            raise ManifoldFormatError(
+                f"{location} hyperparameter {key!r} has invalid value {value!r}"
+            )
+
+
+def _validate_diagnostics(value: Any, *, location: str) -> None:
+    if not isinstance(value, dict):
+        raise ManifoldFormatError(f"{location} diagnostics must be an object")
+    allowed = {
+        "per_component_variance", "cumulative_variance", "eigenvalues",
+        "picked_k", "gap_index", "k_nn", "component_count", "heuristic_k",
+        "threshold", "gap_magnitude", "bandwidth", "pinned", "min_dim",
+    }
+    if set(value) - allowed:
+        raise ManifoldFormatError(f"{location} diagnostics has unknown fields")
+    list_keys = {"per_component_variance", "cumulative_variance", "eigenvalues"}
+    int_keys = {"picked_k", "gap_index", "k_nn", "component_count", "heuristic_k", "min_dim"}
+    for key, item in value.items():
+        valid = (
+            isinstance(item, list) and bool(item) and all(_finite_number(v) for v in item)
+            if key in list_keys else
+            isinstance(item, int) and not isinstance(item, bool) and item >= 0
+            if key in int_keys else
+            isinstance(item, bool)
+            if key == "pinned" else
+            _finite_number(item)
+        )
+        if not valid:
+            raise ManifoldFormatError(f"{location} diagnostics field {key!r} is invalid")
+
+
+def _validate_topology_candidates(value: Any, *, location: str) -> None:
+    if not isinstance(value, list):
+        raise ManifoldFormatError(f"{location} topology_candidates must be an array")
+    fields = {"name", "fit_mode", "intrinsic_dim", "score", "viable", "reason"}
+    for candidate in value:
+        if not isinstance(candidate, dict) or set(candidate) != fields:
+            raise ManifoldFormatError(f"{location} has invalid topology candidate schema")
+        if (
+            not isinstance(candidate["name"], str) or not candidate["name"]
+            or candidate["fit_mode"] not in {"pca", "spectral"}
+            or isinstance(candidate["intrinsic_dim"], bool)
+            or not isinstance(candidate["intrinsic_dim"], int)
+            or candidate["intrinsic_dim"] < 1
+            or candidate["score"] is not None and not _finite_number(candidate["score"])
+            or not isinstance(candidate["viable"], bool)
+            or candidate["reason"] is not None and not isinstance(candidate["reason"], str)
+        ):
+            raise ManifoldFormatError(f"{location} has invalid topology candidate values")
+
+
+def _validate_components(value: Any, *, location: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or not value:
+        raise ManifoldFormatError(f"{location} components must be null or non-empty object")
+    fields = {"selector", "alpha", "tensor_sha256"}
+    for coord, item in value.items():
+        if (
+            not isinstance(coord, str) or not coord
+            or not isinstance(item, dict) or set(item) != fields
+            or not isinstance(item["selector"], str) or not item["selector"]
+            or not _finite_number(item["alpha"])
+            or (
+                not isinstance(item["tensor_sha256"], str)
+                or len(item["tensor_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in item["tensor_sha256"])
+            )
+        ):
+            raise ManifoldFormatError(f"{location} has invalid component provenance")
+
+
+def validate_manifold_sidecar_payload(
+    data: Any, *, location: str = "manifold sidecar",
+) -> dict[str, Any]:
+    """Validate every field of the exact current fitted-sidecar contract."""
+    if not isinstance(data, dict) or set(data) != MANIFOLD_SIDECAR_FIELDS:
+        raise ManifoldFormatError(f"{location} does not match the current exact schema")
+    validate_manifold_format_version(data["format_version"], location=location)
+    from saklas.core.manifold import validate_domain_spec
+
+    validate_domain_spec(data["domain"])
+    for key in ("name", "method", "saklas_version", "feature_space", "fit_mode"):
+        if not isinstance(data[key], str) or not data[key]:
+            raise ManifoldFormatError(f"{location} field {key!r} must be non-empty str")
+    if data["fit_mode"] not in _FIT_MODES_ALL:
+        raise ManifoldFormatError(f"{location} has invalid fit_mode")
+    allowed_fit_modes = MANIFOLD_METHOD_FIT_MODES.get(data["method"])
+    if allowed_fit_modes is None or data["fit_mode"] not in allowed_fit_modes:
+        raise ManifoldFormatError(
+            f"{location} has invalid method/fit_mode combination"
+        )
+    labels = data["node_labels"]
+    if (
+        isinstance(data["node_count"], bool)
+        or not isinstance(data["node_count"], int)
+        or not isinstance(labels, list)
+        or not labels
+        or data["node_count"] != len(labels)
+        or any(not isinstance(label, str) or not _LABEL_REGEX.match(label) for label in labels)
+        or len(set(labels)) != len(labels)
+    ):
+        raise ManifoldFormatError(f"{location} has invalid node identity")
+    _validate_hyperparams(data, location=location)
+    _validate_diagnostics(data["diagnostics"], location=location)
+    if not isinstance(data["sae_full_coverage"], bool):
+        raise ManifoldFormatError(f"{location} sae_full_coverage must be bool")
+    nullable_strings = (
+        "nodes_sha256", "sae_release", "sae_revision", "sae_fingerprint",
+        "model_fingerprint", "capture_sha256", "share_metric",
+        "subspace_metric", "resolved_fit_mode", "topology_winner",
+        "bake_policy", "source_model_id", "source_model_fingerprint",
+    )
+    if any(
+        data[key] is not None and (not isinstance(data[key], str) or not data[key])
+        for key in nullable_strings
+    ):
+        raise ManifoldFormatError(f"{location} has invalid nullable string metadata")
+    if data["fit_policy_version"] is not None and (
+        isinstance(data["fit_policy_version"], bool)
+        or not isinstance(data["fit_policy_version"], int)
+        or data["fit_policy_version"] < 0
+    ):
+        raise ManifoldFormatError(f"{location} has invalid fit_policy_version")
+    quality = data["transfer_quality_estimate"]
+    if quality is not None and (
+        isinstance(quality, bool)
+        or not isinstance(quality, (int, float))
+        or not math.isfinite(float(quality))
+    ):
+        raise ManifoldFormatError(f"{location} has invalid transfer quality")
+    fitted = data["fitted_layers"]
+    if (
+        not isinstance(fitted, list)
+        or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in fitted)
+        or fitted != sorted(set(fitted))
+    ):
+        raise ManifoldFormatError(f"{location} has invalid fitted_layers")
+    fitted_set = set(fitted)
+    # ``node_spread_per_layer`` is measured before DLS prunes axes/layers, so
+    # it records the complete *evaluated* layer roster.  Its keys may therefore
+    # be a strict superset of ``fitted_layers`` (the exact tensor roster).
+    # Keeping that distinction is what lets a cache prove that a dropped layer
+    # was evaluated rather than accidentally omitted.  Apply-time bakes remain
+    # tensor-bound and must use fitted-layer keys only.
+    _validate_layer_map(
+        data["node_spread_per_layer"], location=location,
+        field="node_spread_per_layer", fitted=fitted_set,
+        validate_value=lambda value: _finite_number(value) and float(value) >= 0,
+        require_fitted=False,
+    )
+    _validate_layer_map(
+        data["mahalanobis_share_per_layer"], location=location,
+        field="mahalanobis_share_per_layer", fitted=fitted_set,
+        validate_value=lambda value: _finite_number(value) and float(value) >= 0,
+    )
+    _validate_layer_map(
+        data["origin_per_layer"], location=location, field="origin_per_layer",
+        fitted=fitted_set,
+        validate_value=lambda value: (
+            isinstance(value, list) and bool(value)
+            and all(_finite_number(coord) for coord in value)
+        ),
+    )
+    _validate_layer_map(
+        data["sae_ids_by_layer"], location=location, field="sae_ids_by_layer",
+        fitted=fitted_set,
+        validate_value=lambda value: (
+            isinstance(value, str) and bool(value)
+        ),
+        require_fitted=False,
+    )
+    _validate_layer_map(
+        data["rbf_smoothing_per_layer"], location=location,
+        field="rbf_smoothing_per_layer", fitted=fitted_set,
+        validate_value=lambda value: (
+            isinstance(value, dict) and set(value) == {"lambda", "edf", "gcv"}
+            and all(_finite_number(item) for item in value.values())
+        ),
+    )
+    _validate_layer_map(
+        data["sigma_field_per_layer"], location=location,
+        field="sigma_field_per_layer", fitted=fitted_set,
+        validate_value=lambda value: (
+            isinstance(value, dict)
+            and set(value) == {"sigma_mean", "sigma_min", "sigma_max", "lambda"}
+            and all(_finite_number(item) and float(item) >= 0 for item in value.values())
+        ),
+    )
+    roles, kinds = data["node_roles"], data["node_kinds"]
+    if not isinstance(roles, list) or not isinstance(kinds, list) or len(roles) != len(labels) or len(kinds) != len(labels):
+        raise ManifoldFormatError(f"{location} node provenance is misaligned")
+    for label, role, kind in zip(labels, roles, kinds, strict=True):
+        _validate_node_role(data["name"], label, role)
+        _validate_node_kind(data["name"], label, kind)
+    _validate_topology_candidates(data["topology_candidates"], location=location)
+    _validate_components(data["components"], location=location)
+    is_auto = data["fit_mode"] == "auto"
+    if is_auto != bool(
+        data["resolved_fit_mode"] is not None
+        and data["topology_winner"] is not None
+        and data["topology_candidates"]
+    ):
+        raise ManifoldFormatError(f"{location} has inconsistent auto-topology provenance")
+    if not is_auto and any(
+        value is not None
+        for value in (data["resolved_fit_mode"], data["topology_winner"])
+    ) or not is_auto and data["topology_candidates"]:
+        raise ManifoldFormatError(f"{location} non-auto fit carries topology provenance")
+    is_merge = data["method"] == "merge"
+    if is_merge:
+        if data["fit_mode"] != "baked" or data["components"] is None or data["bake_policy"] != MERGE_BAKE_POLICY:
+            raise ManifoldFormatError(f"{location} has incomplete merge provenance")
+    elif data["components"] is not None or data["bake_policy"] is not None:
+        raise ManifoldFormatError(f"{location} non-merge fit carries merge provenance")
+    is_transfer = data["method"] == "manifold_procrustes_transfer"
+    transfer_values = (
+        data["source_model_id"], data["source_model_fingerprint"],
+        data["transfer_quality_estimate"],
+    )
+    if is_transfer:
+        if transfer_values[0] is None or transfer_values[1] is None:
+            raise ManifoldFormatError(f"{location} has incomplete transfer provenance")
+    elif any(value is not None for value in transfer_values):
+        raise ManifoldFormatError(f"{location} non-transfer fit carries transfer provenance")
+    sae_values = (
+        data["sae_release"], data["sae_revision"], data["sae_fingerprint"],
+    )
+    if data["feature_space"] == "raw":
+        if any(value is not None for value in sae_values) or data["sae_ids_by_layer"] or data["sae_full_coverage"]:
+            raise ManifoldFormatError(f"{location} raw fit carries SAE provenance")
+    elif (
+        not data["feature_space"].startswith("sae-")
+        or data["sae_release"] is None
+        or not data["sae_ids_by_layer"]
+    ):
+        raise ManifoldFormatError(f"{location} has incomplete SAE provenance")
+    return data
+
+
+def canonical_manifold_sidecar_payload(
+    *, name: str, method: str, saklas_version: str, domain: dict[str, Any],
+    node_labels: list[str], feature_space: str, fit_mode: str,
+    hyperparams: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+    node_spread_per_layer: dict[str, Any] | None = None,
+    fitted_layers: list[int] | None = None,
+    semantic_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the one exact current fitted-manifold sidecar shape."""
+    count = len(node_labels)
+    payload = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": name, "method": method, "saklas_version": saklas_version,
+        "domain": domain, "node_count": count, "node_labels": node_labels,
+        "feature_space": feature_space, "fit_mode": fit_mode,
+        "hyperparams": dict(hyperparams or {}),
+        "diagnostics": dict(diagnostics or {}),
+        "node_spread_per_layer": dict(node_spread_per_layer or {}),
+        "mahalanobis_share_per_layer": {}, "origin_per_layer": {},
+        "nodes_sha256": None, "sae_release": None, "sae_revision": None,
+        "sae_fingerprint": None, "sae_ids_by_layer": {},
+        "sae_full_coverage": False, "model_fingerprint": None,
+        "capture_sha256": None, "fitted_layers": list(fitted_layers or []),
+        "fit_policy_version": None, "share_metric": None,
+        "subspace_metric": None, "rbf_smoothing_per_layer": {},
+        "sigma_field_per_layer": {}, "resolved_fit_mode": None,
+        "topology_winner": None, "topology_candidates": [],
+        "node_roles": [None] * count, "node_kinds": [None] * count,
+        "components": None, "bake_policy": None, "source_model_id": None,
+        "source_model_fingerprint": None, "transfer_quality_estimate": None,
+    }
+    for key in (
+        "sae_release", "sae_revision", "sae_fingerprint", "sae_ids_by_layer",
+        "sae_full_coverage", "resolved_fit_mode", "topology_winner",
+        "topology_candidates", "components", "bake_policy", "source_model_id",
+        "source_model_fingerprint", "transfer_quality_estimate",
+    ):
+        if semantic_metadata is not None and key in semantic_metadata:
+            payload[key] = semantic_metadata[key]
+    return validate_manifold_sidecar_payload(payload)
 
 
 def _validate_node_role(name: str, label: str, role: Any) -> str | None:
     """Validate an optional per-node ``role`` field.
 
-    ``None`` / missing means "use the standard assistant baseline" (the
-    legacy shape, same as today).  A non-empty string must match
+    ``None`` means "use the standard assistant baseline". A non-empty string must match
     :data:`saklas.core.role_templates._ROLE_SLUG_RE`
     (``[a-z0-9._-]+``).  Family-unsupported (Mistral-3) is *not*
     checked here — the folder is model-agnostic; the check fires when
@@ -209,7 +659,7 @@ _NODE_KINDS = ("abstract", "concrete", "custom")
 def _validate_node_kind(name: str, label: str, kind: Any) -> str | None:
     """Validate an optional per-node ``kind`` field.
 
-    ``None`` / missing means "unspecified".  A non-empty value must be one of
+    ``None`` means "unspecified". A non-empty value must be one of
     :data:`_NODE_KINDS` (``"abstract"`` / ``"concrete"`` / ``"custom"``).
     Generation-time provenance only — it selects the system template and
     elicitation role label when authoring a node's conversational corpus
@@ -228,6 +678,23 @@ def _validate_node_kind(name: str, label: str, kind: Any) -> str | None:
 
 class ManifoldFormatError(ValueError, SaklasError):
     """Raised when a manifold folder is malformed or fails integrity."""
+
+
+def validate_manifold_format_version(
+    value: Any, *, location: str = "manifold",
+) -> int:
+    """Validate the shared readable/writable manifold format boundary."""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value != MANIFOLD_FORMAT_VERSION
+    ):
+        raise ManifoldFormatError(
+            f"{location} has format_version={value!r}; "
+            f"need exactly {MANIFOLD_FORMAT_VERSION}. Regenerate or re-fit it "
+            "with the current saklas."
+        )
+    return value
 
 
 class BakedManifoldError(ValueError, SaklasError):
@@ -311,6 +778,13 @@ class ManifoldSidecar:
     nodes_sha256: Optional[str] = None
     sae_release: Optional[str] = None
     sae_revision: Optional[str] = None
+    sae_fingerprint: Optional[str] = None
+    sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
+    sae_full_coverage: bool = False
+    model_fingerprint: Optional[str] = None
+    capture_sha256: Optional[str] = None
+    fitted_layers: list[int] = field(default_factory=list)
+    fit_policy_version: Optional[int] = None
     # Discover-mode-only fields.  ``None`` on authored fits.
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
@@ -320,18 +794,19 @@ class ManifoldSidecar:
     # background-σ² units (comparable across layers).  A diagnostic readout
     # of "where does this concept live", distinct from the apply-time
     # ``mahalanobis_share`` (which restricts the same whitened spread to the
-    # steerable subspace).  Empty on fits that predate it.
+    # steerable subspace).  Empty when the current fit has no measurements.
     node_spread_per_layer: dict[str, Any] = field(default_factory=dict)
     # Merge provenance on a ``fit_mode="baked"`` manifold — the
-    # ``{coord: {alpha, project_away, tensor_sha256}}`` map written by
+    # ``{coord: {alpha, tensor_sha256}}`` map written by
     # :func:`saklas.io.merge.merge_into_manifold`.  ``None`` on every fit that
     # isn't a merge (the common case).  Informational only — a baked
     # manifold never re-fits, so nothing branches on it.
     components: Optional[dict[str, Any]] = None
+    bake_policy: Optional[str] = None
     # Per-node assistant-role substitution used at fit time, in
     # ``node_labels`` index order.  ``None`` for a given node (and an
     # empty list as a whole) = "standard assistant baseline" — the
-    # default, byte-identical to today's non-role manifolds.  The same
+    # default. The same
     # information rides ``ManifoldFolder.node_roles`` but the sidecar
     # carries an independent copy so a downstream consumer
     # (``manifold show``, the webui inspector) doesn't have to
@@ -342,33 +817,128 @@ class ManifoldSidecar:
     # Mirrors ``node_roles``' independent-copy rationale; generation provenance.
     node_kinds: list[str | None] = field(default_factory=list)
 
+    @property
+    def evaluated_layers(self) -> list[int]:
+        """Layers evaluated by the fit before DLS pruning.
+
+        Multi-node activation fits always measure ``node_spread_per_layer``
+        before selecting the retained tensor layers.  Artifact kinds without
+        that diagnostic (for example baked and monopolar manifolds) evaluate
+        exactly their fitted tensor roster.
+        """
+        if self.node_spread_per_layer:
+            return sorted(int(layer) for layer in self.node_spread_per_layer)
+        return list(self.fitted_layers)
+
     @classmethod
     def load(cls, path: Path) -> "ManifoldSidecar":
+        data = load_manifold_sidecar_data(path)
+        return cls(
+            method=data["method"],
+            saklas_version=data["saklas_version"],
+            domain=data["domain"],
+            node_count=data["node_count"],
+            node_labels=data["node_labels"],
+            feature_space=data["feature_space"],
+            nodes_sha256=data["nodes_sha256"],
+            sae_release=data["sae_release"],
+            sae_revision=data["sae_revision"],
+            sae_fingerprint=data["sae_fingerprint"],
+            sae_ids_by_layer=dict(data["sae_ids_by_layer"]),
+            sae_full_coverage=data["sae_full_coverage"],
+            model_fingerprint=data["model_fingerprint"],
+            capture_sha256=data["capture_sha256"],
+            fitted_layers=list(data["fitted_layers"]),
+            fit_policy_version=data["fit_policy_version"],
+            fit_mode=data["fit_mode"],
+            hyperparams=dict(data["hyperparams"]),
+            diagnostics=dict(data["diagnostics"]),
+            node_spread_per_layer=dict(data["node_spread_per_layer"]),
+            node_roles=list(data["node_roles"]),
+            node_kinds=list(data["node_kinds"]),
+            components=data["components"],
+            bake_policy=data["bake_policy"],
+        )
+
+
+def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
+    """Read and validate the exact current fitted-manifold sidecar shape."""
+    try:
         with open(path) as f:
             data = json.load(f)
-        domain = data.get("domain")
-        if not isinstance(domain, dict):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} has no 'domain' object"
-            )
-        return cls(
-            method=data.get("method", "manifold_pca"),
-            saklas_version=data.get("saklas_version", "0"),
-            domain=domain,
-            node_count=int(data.get("node_count", 0)),
-            node_labels=list(data.get("node_labels", [])),
-            feature_space=data.get("feature_space", "raw"),
-            nodes_sha256=data.get("nodes_sha256"),
-            sae_release=data.get("sae_release"),
-            sae_revision=data.get("sae_revision"),
-            fit_mode=data.get("fit_mode", "authored"),
-            hyperparams=dict(data.get("hyperparams", {})),
-            diagnostics=dict(data.get("diagnostics", {})),
-            node_spread_per_layer=dict(data.get("node_spread_per_layer", {})),
-            node_roles=list(data.get("node_roles", [])),
-            node_kinds=list(data.get("node_kinds", [])),
-            components=data.get("components"),
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} is unreadable: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} must be a JSON object"
         )
+    validate_manifold_format_version(
+        data.get("format_version"), location=f"manifold sidecar {path}",
+    )
+    if set(data) != MANIFOLD_SIDECAR_FIELDS:
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} does not match the current exact schema"
+        )
+    validate_manifold_sidecar_payload(data, location=f"manifold sidecar {path}")
+    required_types: dict[str, type] = {
+        "name": str,
+        "method": str,
+        "saklas_version": str,
+        "domain": dict,
+        "node_count": int,
+        "node_labels": list,
+        "feature_space": str,
+        "fit_mode": str,
+        "hyperparams": dict,
+        "diagnostics": dict,
+        "node_spread_per_layer": dict,
+    }
+    for key, expected in required_types.items():
+        value = data.get(key)
+        if not isinstance(value, expected) or (
+            expected is int and isinstance(value, bool)
+        ):
+            raise ManifoldFormatError(
+                f"manifold sidecar {path} field {key!r} must be "
+                f"{expected.__name__}"
+            )
+    if data["fit_mode"] not in {
+        "authored", "pca", "spectral", "auto", "baked",
+    }:
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} has invalid "
+            f"fit_mode={data['fit_mode']!r}"
+        )
+    labels = data["node_labels"]
+    if any(not isinstance(label, str) for label in labels):
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} node_labels must contain only strings"
+        )
+    if data["node_count"] != len(labels):
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} node_count does not match node_labels"
+        )
+    for key in (
+        "sae_ids_by_layer", "hyperparams", "diagnostics",
+        "node_spread_per_layer", "mahalanobis_share_per_layer",
+        "origin_per_layer", "rbf_smoothing_per_layer", "sigma_field_per_layer",
+    ):
+        if not isinstance(data[key], dict):
+            raise ManifoldFormatError(
+                f"manifold sidecar {path} field {key!r} must be an object"
+            )
+    for key in ("fitted_layers", "node_roles", "node_kinds", "topology_candidates"):
+        if not isinstance(data[key], list):
+            raise ManifoldFormatError(
+                f"manifold sidecar {path} field {key!r} must be an array"
+            )
+    if len(data["node_roles"]) != len(labels) or len(data["node_kinds"]) != len(labels):
+        raise ManifoldFormatError(
+            f"manifold sidecar {path} node provenance does not match node_labels"
+        )
+    return data
 
 
 @dataclass
@@ -380,7 +950,7 @@ class ManifoldFolder:
 
     Two folder shapes share this class via the ``fit_mode`` field:
 
-    - ``fit_mode == "authored"`` (default for legacy v3 manifolds): the
+    - ``fit_mode == "authored"``: the
       user supplied per-node ``coords`` on a declared ``domain``.  The
       fit pipeline embeds the coords and runs straight into
       ``fit_layer_subspace``.
@@ -421,23 +991,20 @@ class ManifoldFolder:
     # Per-node assistant-role substitution for role-augmented manifolds
     # (e.g. a persona manifold where each node is a persona).  Aligned
     # with ``node_labels`` index-by-index.  ``None`` for a given node =
-    # "use the standard assistant baseline" (the legacy shape, what every
-    # pre-role-differential manifold carries).  An all-``None`` list is
-    # semantically identical to today's behavior — the centroid pooling
+    # "use the standard assistant baseline". An all-``None`` list keeps the
+    # ordinary behavior — the centroid pooling
     # just goes through the default chat-template branch.
     node_roles: list[str | None] = field(default_factory=list)
     # Per-node conceptual ``kind`` — ``"abstract"`` (trait) or ``"concrete"``
     # (entity), aligned with ``node_labels`` index-by-index.  ``None`` =
     # unspecified.  Generation-time only (system template + elicitation role
-    # label); never consumed by the fit.  An all-``None`` list is byte-identical
-    # to a folder authored before the distinction existed.
+    # label); never consumed by the fit.
     node_kinds: list[str | None] = field(default_factory=list)
     # Category tags, mirroring :attr:`saklas.io.packs.PackMetadata.tags`.
     # Carried so category-grouped probe bootstrap
     # (``load_default_manifolds`` -> ``_bootstrap_manifold_probes``) keeps
     # working once a steering vector lives as a 2-node ``pca`` manifold.
-    # Optional/additive — the
-    # loader defaults ``[]``; a tagless manifold stays byte-identical.
+    # Always explicit in the manifest; empty means uncategorized.
     tags: list[str] = field(default_factory=list)
     # Reference to a standalone template artifact
     # (``saklas.io.templates.TemplateFolder``, ``<ns>/<name>`` or bare name).
@@ -447,8 +1014,7 @@ class ManifoldFolder:
     # the fit can resolve the template's **multi-turn contexts** as the
     # per-manifold elicitation prefixes (the template analogue of the shared
     # baseline prompts). The template is the single authoring source; the corpus
-    # is its materialization. ``None`` for every non-templated manifold, which
-    # keeps the manifest byte-identical to the pre-template shape. The resolved
+    # is its materialization. ``None`` marks every non-templated manifold. The resolved
     # template's content hash folds into ``nodes_sha256`` (a context edit re-fits)
     # and the ref is preserved across re-fits by ``write_metadata``.
     template_ref: str | None = None
@@ -461,7 +1027,19 @@ class ManifoldFolder:
         return self.fit_mode in _FIT_MODES_DISCOVER
 
     @classmethod
-    def load(cls, folder: Path) -> "ManifoldFolder":
+    def load(
+        cls, folder: Path, *, verify_manifest: bool = True,
+    ) -> "ManifoldFolder":
+        """Parse a manifold folder.
+
+        Runtime/install/push callers keep the default full integrity walk.
+        Metadata-only inventory, authoring, and lifecycle routing callers may set
+        ``verify_manifest=False``; fit callers do likewise, hashing the live
+        corpus into ``nodes_sha256`` and validating only the requested fitted
+        tensor.  This avoids rereading every historical model/SAE payload when no
+        payload is being consumed.  Structural checks and tensor/sidecar pairing
+        still run either way.
+        """
         folder = Path(folder)
         meta_path = folder / "manifold.json"
         if not meta_path.exists():
@@ -476,42 +1054,66 @@ class ManifoldFolder:
             raise ManifoldFormatError(
                 f"manifold.json in {folder} is unreadable: {e}"
             ) from e
-
-        fmt = data.get("format_version", 1)
-        if not isinstance(fmt, int) or fmt < MANIFOLD_FORMAT_VERSION:
+        if not isinstance(data, dict):
             raise ManifoldFormatError(
-                f"manifold.json in {folder} has format_version={fmt!r}; "
-                f"need >= {MANIFOLD_FORMAT_VERSION}. Regenerate it with the "
-                f"current saklas — run scripts/upgrade_manifolds.py for a legacy "
-                f"pack, or re-fit a discover manifold."
-            )
-        if fmt > MANIFOLD_FORMAT_VERSION:
-            # Symmetric upper bound, mirroring ``PackMetadata.load`` — a
-            # manifold authored by a newer saklas may use fields this
-            # reader can't safely interpret, so refuse rather than load
-            # it silently.
-            raise ManifoldFormatError(
-                f"manifold.json in {folder} was created by a newer saklas "
-                f"(format v{fmt} > local v{MANIFOLD_FORMAT_VERSION}); "
-                f"upgrade saklas."
+                f"manifold.json in {folder} must be a JSON object"
             )
 
-        name = data.get("name", folder.name)
+        validate_manifold_format_version(
+            data.get("format_version"),
+            location=f"manifold.json in {folder}",
+        )
+
+        common_fields = {
+            "format_version", "name", "description", "fit_mode", "nodes",
+            "files", "source", "tags", "artifact_id", "fit_epochs",
+            "template_ref",
+        }
+
+        name = data.get("name")
         if not isinstance(name, str) or not NAME_REGEX.match(name):
             raise ManifoldFormatError(
                 f"manifold name {name!r} invalid; must match {NAME_REGEX.pattern}"
             )
 
-        # Authored vs discover.  Authored = the historical shape:
-        # ``domain`` + per-node ``coords``.  Discover = no ``domain`` and
-        # nodes carry ``{label}`` only; coords are derived per-model at
-        # fit time.  Default ``"authored"`` keeps every pre-discover v3
-        # manifold loading unchanged.
-        fit_mode = data.get("fit_mode", "authored")
+        # Authored manifolds carry ``domain`` + per-node ``coords``. Discover
+        # manifolds omit ``domain`` and derive coordinates per model at fit time.
+        fit_mode = data.get("fit_mode")
         if fit_mode not in _FIT_MODES_ALL:
             raise ManifoldFormatError(
                 f"manifold {name!r} fit_mode {fit_mode!r} invalid; "
                 f"expected one of {sorted(_FIT_MODES_ALL)}"
+            )
+        mode_fields = (
+            {"domain"} if fit_mode in {"authored", "baked"}
+            else {"hyperparams"}
+        )
+        unknown = set(data) - common_fields - mode_fields
+        if unknown:
+            raise ManifoldFormatError(
+                f"manifold {name!r} has unknown field(s): {sorted(unknown)}"
+            )
+        for key, expected in (
+            ("description", str), ("files", dict), ("source", str),
+            ("tags", list),
+        ):
+            if not isinstance(data.get(key), expected):
+                raise ManifoldFormatError(
+                    f"manifold {name!r} field {key!r} must be {expected.__name__}"
+                )
+        if not data["source"]:
+            raise ManifoldFormatError(
+                f"manifold {name!r} field 'source' must be non-empty"
+            )
+        if "artifact_id" in data and (
+            not isinstance(data["artifact_id"], str) or not data["artifact_id"]
+        ):
+            raise ManifoldFormatError(
+                f"manifold {name!r} field 'artifact_id' must be a non-empty str"
+            )
+        if "fit_epochs" in data and not isinstance(data["fit_epochs"], dict):
+            raise ManifoldFormatError(
+                f"manifold {name!r} field 'fit_epochs' must be dict"
             )
 
         nodes = data.get("nodes")
@@ -552,6 +1154,12 @@ class ManifoldFolder:
                     raise ManifoldFormatError(
                         f"manifold {name!r} node {entry!r} must be an "
                         f"object with 'label' and 'coords'"
+                    )
+                expected_node = {"label", "coords", "role", "kind"}
+                if set(entry) != expected_node:
+                    raise ManifoldFormatError(
+                        f"manifold {name!r} node fields must be "
+                        f"{sorted(expected_node)}"
                     )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
@@ -603,6 +1211,12 @@ class ManifoldFolder:
                         f"baked manifold {name!r} node {entry!r} must be an "
                         f"object with 'label'"
                     )
+                expected_node = {"label", "role", "kind"}
+                if set(entry) != expected_node:
+                    raise ManifoldFormatError(
+                        f"baked manifold {name!r} node fields must be "
+                        f"{sorted(expected_node)}"
+                    )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
                     raise ManifoldFormatError(
@@ -631,12 +1245,23 @@ class ManifoldFolder:
                     f"fit time"
                 )
             domain_spec = {}
-            hyperparams = dict(data.get("hyperparams", {}))
+            raw_hyperparams = data.get("hyperparams")
+            if not isinstance(raw_hyperparams, dict):
+                raise ManifoldFormatError(
+                    f"discover manifold {name!r} field 'hyperparams' must be dict"
+                )
+            hyperparams = dict(raw_hyperparams)
             for entry in nodes:
                 if not isinstance(entry, dict):
                     raise ManifoldFormatError(
                         f"discover manifold {name!r} node {entry!r} must "
                         f"be an object with 'label'"
+                    )
+                expected_node = {"label", "role", "kind"}
+                if set(entry) != expected_node:
+                    raise ManifoldFormatError(
+                        f"discover manifold {name!r} node fields must be "
+                        f"{sorted(expected_node)}"
                     )
                 label = entry.get("label")
                 if not isinstance(label, str) or not _LABEL_REGEX.match(label):
@@ -662,14 +1287,14 @@ class ManifoldFolder:
                 f"manifold {name!r} has duplicate node labels"
             )
 
-        files = data.get("files", {})
+        files = data["files"]
         if not isinstance(files, dict):
             raise ManifoldFormatError(
                 f"manifold {name!r} 'files' must be an object"
             )
         # Verify only a populated manifest — a freshly hand-authored
         # manifold has no hashes yet; `fit` back-fills them.
-        if files:
+        if files and verify_manifest:
             ok, bad = verify_integrity(folder, files)
             if not ok:
                 raise ManifoldFormatError(
@@ -677,7 +1302,7 @@ class ManifoldFolder:
                     f"tampered/missing {bad}"
                 )
 
-        raw_tags = data.get("tags", [])
+        raw_tags = data["tags"]
         if not isinstance(raw_tags, list) or not all(
             isinstance(t, str) for t in raw_tags
         ):
@@ -690,7 +1315,11 @@ class ManifoldFolder:
         # authoring time and live in ``nodes/`` like any discover folder; this
         # ref lets the fit resolve the template's multi-turn contexts as the
         # elicitation prefixes. Only discover folders may carry it.
-        raw_template_ref = data.get("template_ref")
+        if "template_ref" not in data:
+            raise ManifoldFormatError(
+                f"manifold {name!r} needs explicit 'template_ref'"
+            )
+        raw_template_ref = data["template_ref"]
         template_ref: str | None = None
         if raw_template_ref is not None:
             if not isinstance(raw_template_ref, str) or not raw_template_ref:
@@ -708,14 +1337,14 @@ class ManifoldFolder:
         inst = cls(
             folder=folder,
             name=name,
-            description=data.get("description", ""),
+            description=data["description"],
             domain=domain_spec,
             node_labels=node_labels,
             node_coords=node_coords,
             files=files,
             fit_mode=fit_mode,
             hyperparams=hyperparams,
-            source=str(data.get("source", "local")),
+            source=data["source"],
             node_roles=node_roles,
             node_kinds=node_kinds,
             tags=[str(t) for t in raw_tags],
@@ -787,7 +1416,9 @@ class ManifoldFolder:
             groups.append((label, list(statements)))
         return groups
 
-    def nodes_sha256(self) -> str:
+    def nodes_sha256(
+        self, *, resolved_template_sha256: str | None = None,
+    ) -> str:
         """Stable hash of the inputs that determine a fit's output.
 
         The staleness key: a fitted tensor's sidecar records this, and a
@@ -801,8 +1432,7 @@ class ManifoldFolder:
         ``k_nn``, ``bandwidth`` for spectral) — changing any of those
         invalidates a cached fit.
 
-        The field name is unchanged for backward compat with v3
-        sidecars; the semantics naturally extends in the discover case.
+        The current hash covers the complete canonical fit input shape.
         """
         h = hashlib.sha256()
         if self.fit_mode == "baked":
@@ -814,6 +1444,11 @@ class ManifoldFolder:
                 "node_labels": list(self.node_labels),
             }))
             return h.hexdigest()
+        # Labels are part of the fitted artifact (steering-by-label, nearest
+        # reads, roles/kinds alignment).  Node filenames are index-based, so a
+        # rename can leave every corpus byte unchanged unless labels themselves
+        # participate in the staleness key.
+        h.update(_canonical_json(list(self.node_labels)))
         for idx in range(len(self.node_labels)):
             h.update(self.node_path(idx).read_bytes())
         if self.fit_mode == "authored":
@@ -827,16 +1462,11 @@ class ManifoldFolder:
         # Per-node roles are inputs that determine the fit's geometry
         # (each node's centroid is pooled under its role's chat-template
         # substitution), so a role edit must invalidate a cached fit.
-        # All-``None`` (legacy / non-role) hashes to the same value
-        # whether the field is missing or explicit-None — same shape.
-        if any(r is not None for r in self.node_roles):
-            h.update(_canonical_json(self.node_roles))
+        h.update(_canonical_json(self.node_roles))
         # Per-node kind selects the generation system template + elicitation
         # role label, so it shapes the corpus a re-fit would pool — a kind edit
-        # must invalidate a cached fit.  All-``None`` hashes identically to a
-        # missing field (same legacy shape).
-        if any(k is not None for k in self.node_kinds):
-            h.update(_canonical_json(self.node_kinds))
+        # must invalidate a cached fit.
+        h.update(_canonical_json(self.node_kinds))
         # A templated manifold's elicitation prefixes are the referenced
         # template's multi-turn contexts (a fit input that the node corpus files
         # above don't capture — they're only the slotted assistant turns), so a
@@ -846,6 +1476,9 @@ class ManifoldFolder:
         # ``None`` (every non-templated manifold) hashes identically to a missing
         # field.
         if self.template_ref is not None:
+            if resolved_template_sha256 is not None:
+                h.update(resolved_template_sha256.encode())
+                return h.hexdigest()
             from saklas.io.templates import (
                 AmbiguousTemplateError,
                 TemplateNotFoundError,
@@ -878,74 +1511,130 @@ class ManifoldFolder:
     # -- manifest ----------------------------------------------------------
 
     def write_metadata(self, *, files: Optional[dict[str, str]] = None) -> None:
-        """Rewrite ``manifold.json``, re-hashing the ``files`` manifest.
+        """Rewrite authoring metadata while preserving trusted fitted hashes.
 
-        Called by the fit step after writing a new per-model tensor so the
-        integrity manifest covers every fitted artifact.
+        Fitted writers must call :meth:`update_file_hashes` with their exact
+        outputs. A metadata-only rewrite never scans and blesses unrelated
+        top-level files. The locked latest manifest supplies ``files`` when an
+        explicit trusted mapping is not provided.
         """
-        if files is None:
-            files = hash_manifold_files(self.folder)
-        self.files = files
-        payload: dict[str, Any] = {
-            "format_version": MANIFOLD_FORMAT_VERSION,
-            "name": self.name,
-            "description": self.description,
-            "fit_mode": self.fit_mode,
-            "files": files,
-        }
-        # Preserve provenance across re-fits, mirroring how a pack's
-        # ``source`` survives ``PackMetadata.write``.  Only the default
-        # ``"local"`` is omitted, so a hand-authored / generated folder
-        # stays byte-identical to the pre-source shape; an ``hf://`` or
-        # ``bundled`` tier is written so ``refresh_manifold`` can find it
-        # after a fit has rewritten the manifest.
-        if self.source and self.source != "local":
-            payload["source"] = self.source
-        # Category tags survive re-fit, written only when non-empty so a
-        # tagless manifold stays byte-identical to the pre-tags shape.
-        if self.tags:
-            payload["tags"] = list(self.tags)
-        # The template reference is fit-time provenance (its multi-turn contexts
-        # are the elicitation prefixes), so it must survive the post-fit manifest
-        # rewrite — written only when set, keeping non-templated manifests
-        # byte-identical.
-        if self.template_ref is not None:
-            payload["template_ref"] = self.template_ref
-        # Per-node ``role`` is written only when set — keeps the legacy
-        # shape (every node carries ``{label, coords}`` or ``{label}``
-        # only) byte-identical for non-role manifolds, and a stray
-        # ``role: null`` doesn't leak into the manifest for a node that
-        # opted out.
-        if self.fit_mode == "authored":
-            payload["domain"] = self.domain
-            payload["nodes"] = [
-                _node_payload_authored(label, coords, role, kind)
-                for label, coords, role, kind in zip(
-                    self.node_labels, self.node_coords,
-                    self._roles_padded(), self._kinds_padded(),
-                    strict=True,
+        with _locked_manifest(self.folder):
+            manifest_path = self.folder / "manifold.json"
+            try:
+                with open(manifest_path) as handle:
+                    latest_payload = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ManifoldFormatError(
+                    f"cannot update unreadable manifest at {manifest_path}: {exc}"
+                ) from exc
+            if not isinstance(latest_payload, dict):
+                raise ManifoldFormatError(
+                    f"manifold manifest at {manifest_path} must be a JSON object"
                 )
-            ]
-        elif self.fit_mode == "baked":
-            # Display domain + label-only nodes (no coords, no hyperparams).
-            payload["domain"] = self.domain
-            payload["nodes"] = [
-                _node_payload_discover(label, role, kind)
-                for label, role, kind in zip(
-                    self.node_labels, self._roles_padded(), self._kinds_padded(),
-                    strict=True,
+            validate_manifold_format_version(
+                latest_payload.get("format_version"), location=str(manifest_path),
+            )
+            if files is None:
+                latest = latest_payload.get("files", {})
+                if not isinstance(latest, dict):
+                    raise ManifoldFormatError(
+                        "manifold files manifest is not an object"
+                    )
+                files = dict(latest)
+            self.files = files
+            payload: dict[str, Any] = {
+                "format_version": MANIFOLD_FORMAT_VERSION,
+                "name": self.name,
+                "description": self.description,
+                "fit_mode": self.fit_mode,
+                "files": files,
+                "source": self.source or "local",
+                "tags": list(self.tags),
+                "template_ref": self.template_ref,
+            }
+            for key in ("artifact_id", "fit_epochs"):
+                if key in latest_payload:
+                    payload[key] = latest_payload[key]
+            if self.fit_mode == "authored":
+                payload["domain"] = self.domain
+                payload["nodes"] = [
+                    _node_payload_authored(label, coords, role, kind)
+                    for label, coords, role, kind in zip(
+                        self.node_labels, self.node_coords,
+                        self._roles_padded(), self._kinds_padded(),
+                        strict=True,
+                    )
+                ]
+            elif self.fit_mode == "baked":
+                # Display domain + label-only nodes (no coords, no hyperparams).
+                payload["domain"] = self.domain
+                payload["nodes"] = [
+                    _node_payload_discover(label, role, kind)
+                    for label, role, kind in zip(
+                        self.node_labels, self._roles_padded(),
+                        self._kinds_padded(), strict=True,
+                    )
+                ]
+            else:
+                payload["hyperparams"] = self.hyperparams
+                payload["nodes"] = [
+                    _node_payload_discover(label, role, kind)
+                    for label, role, kind in zip(
+                        self.node_labels, self._roles_padded(),
+                        self._kinds_padded(), strict=True,
+                    )
+                ]
+            write_json_atomic(self.folder / "manifold.json", payload)
+
+    def update_file_hashes(self, *paths: Path) -> None:
+        """Refresh only newly written fitted artifacts in the integrity manifest.
+
+        A fit replaces one tensor/sidecar pair.  Re-reading every historical
+        model and variant in the folder makes persistence scale with old
+        artifacts rather than the work just completed; the existing manifest
+        was already verified by :meth:`load`, so unchanged entries can be kept.
+        Starting from an empty manifest still records only the paths named by
+        the successful writer.  Unrelated pre-existing pairs remain untrusted;
+        implicitly hashing them here would launder an interrupted or tampered
+        artifact merely because another model was fitted.
+        """
+        resolved_paths = [Path(path) for path in paths]
+        for resolved in resolved_paths:
+            if resolved.parent != self.folder or not resolved.is_file():
+                raise ValueError(
+                    f"manifest update path must be a fitted file in {self.folder}: "
+                    f"{resolved}"
                 )
-            ]
-        else:
-            payload["hyperparams"] = self.hyperparams
-            payload["nodes"] = [
-                _node_payload_discover(label, role, kind)
-                for label, role, kind in zip(
-                    self.node_labels, self._roles_padded(), self._kinds_padded(),
-                    strict=True,
+        with _locked_manifest(self.folder):
+            manifest_path = self.folder / "manifold.json"
+            try:
+                with open(manifest_path) as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ManifoldFormatError(
+                    f"cannot update unreadable manifest at {manifest_path}: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ManifoldFormatError(
+                    f"manifold manifest at {manifest_path} must be a JSON object"
                 )
-            ]
-        write_json_atomic(self.folder / "manifold.json", payload)
+            # Reject an unknown schema before interpreting even familiar fields:
+            # a future writer may have changed their shape or semantics.
+            validate_manifold_format_version(
+                payload.get("format_version"), location=str(manifest_path),
+            )
+            latest = payload.get("files", {})
+            if not isinstance(latest, dict):
+                raise ManifoldFormatError("manifold files manifest is not an object")
+            # A newly published pair is always written by the current tensor
+            # writer. Preserve the exact current format in the same locked CAS.
+            files = dict(latest)
+            for resolved in resolved_paths:
+                files[resolved.name] = hash_file(resolved)
+            payload["format_version"] = MANIFOLD_FORMAT_VERSION
+            payload["files"] = files
+            write_json_atomic(manifest_path, payload)
+            self.files = files
 
     def _roles_padded(self) -> list[str | None]:
         """Return ``node_roles`` padded to ``len(node_labels)`` with ``None``s.
@@ -975,27 +1664,19 @@ def _node_payload_authored(
 ) -> dict[str, Any]:
     """Build one authored-mode node entry for ``manifold.json``.
 
-    ``role`` / ``kind`` are emitted only when set, so the legacy
-    ``{label, coords}`` shape stays byte-identical for plain manifolds.
+    ``role`` and ``kind`` are explicit, including ``None``.
     """
-    out: dict[str, Any] = {"label": label, "coords": [float(c) for c in coords]}
-    if role is not None:
-        out["role"] = role
-    if kind is not None:
-        out["kind"] = kind
-    return out
+    return {
+        "label": label, "coords": [float(c) for c in coords],
+        "role": role, "kind": kind,
+    }
 
 
 def _node_payload_discover(
     label: str, role: str | None, kind: str | None = None,
 ) -> dict[str, Any]:
     """Build one discover-mode node entry for ``manifold.json``."""
-    out: dict[str, Any] = {"label": label}
-    if role is not None:
-        out["role"] = role
-    if kind is not None:
-        out["kind"] = kind
-    return out
+    return {"label": label, "role": role, "kind": kind}
 
 
 def _warn_authoring_quality(
@@ -1043,15 +1724,13 @@ class DiscoverGenerationPlan:
     ``index_of`` maps each label to its on-disk node index (the ``NN_``
     filename prefix); ``pending`` is the declared labels whose corpus file
     is not yet on disk (the ones a run still needs to generate, in node
-    order); ``scenarios`` is the locked domain list read back from
-    ``scenarios.json`` (``None`` on a fresh folder); ``added`` is the
-    labels appended to ``manifold.json`` this call (the add-nodes case);
+    order); ``added`` is the labels appended to ``manifold.json`` this call
+    (the add-nodes case);
     ``resumed`` is ``True`` when an existing ``manifold.json`` was found.
     """
 
     folder: Path
     index_of: dict[str, int]
     pending: tuple[str, ...]
-    scenarios: tuple[str, ...] | None
     added: tuple[str, ...]
     resumed: bool

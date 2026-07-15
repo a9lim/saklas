@@ -37,6 +37,26 @@ def test_recovers_planted_sparse_combination() -> None:
     assert dec.share > 0.99
 
 
+def test_positive_tiny_solve_skips_projected_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    d = 8
+    jacobian = torch.eye(d)
+    unembed = torch.eye(d)
+    target = 2.0 * unembed[2] + 1.5 * unembed[5]
+
+    def _explode(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("positive NNLS case should not need eigvalsh/PGD")
+
+    monkeypatch.setattr(torch.linalg, "eigvalsh", _explode)
+    dec = sparse_nonneg_decompose(target, jacobian, unembed, layer=0, k=2)
+
+    got = dict(dec.tokens)
+    assert got[2] == pytest.approx(2.0, abs=1e-5)
+    assert got[5] == pytest.approx(1.5, abs=1e-5)
+    assert dec.share == pytest.approx(1.0)
+
+
 def test_share_low_for_offspace_direction() -> None:
     jacobian, unembed = _dictionary()
     # a direction orthogonal to every atom's positive span is unreachable
@@ -73,13 +93,12 @@ def test_session_jspace_decompose_on_registered_profile(_isolated_home: None) ->
     # register the direction for toy-vocab token 'g', then decompose it —
     # the decomposition should attribute it (near-)fully to that atom.
     name = session.register_jlens_direction("g")
-    session._ensure_profile_registered = lambda sel: session._profiles[sel]  # type: ignore[attr-defined]
+    session.ensure_profile_registered = lambda sel: session._profiles[sel]  # type: ignore[attr-defined]
     from saklas.core.session import SaklasSession
 
     out = SaklasSession.jspace_decompose(session, name, k=4)  # type: ignore[arg-type]
     del lens
-    # the registered profile is workspace-band restricted (toy band = layer 1)
-    assert set(out) == {1}
+    assert set(out) == {0, 1}
     for share, tokens in out.values():
         assert share > 0.99
         assert tokens and tokens[0][0] == "g"

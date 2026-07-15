@@ -21,7 +21,8 @@ activation covariance:
   to plain Gram-Schmidt projection when ``Σ = I``.
 
 Storage discipline: **no new persistent cache.**  :class:`LayerWhitener`
-is built from the ``neutral_activations.safetensors`` cache under
+is built from the immutable per-layer shards selected by the
+``neutral_activations.json`` cache pointer under
 ``~/.saklas/models/<id>/`` (the per-layer centering mean is derived from
 those neutrals as ``X.mean(0)`` — there is no separate ``layer_means`` cache).
 The 90 neutral statements give ``X ∈ ℝ^(N=90, D)`` per layer; ``Σ`` is
@@ -55,7 +56,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 import torch
 
@@ -108,7 +109,7 @@ def _decode_layer_tensor_map(
 
 def _require_fp32_neutral_cache(
     model_id: str,
-    acts_raw: Mapping[str, torch.Tensor],
+    acts_raw: Mapping[Any, torch.Tensor],
 ) -> None:
     if any(v.dtype != torch.float32 for v in acts_raw.values()):
         raise WhitenerError(
@@ -132,23 +133,32 @@ class LayerWhitener:
     iterate via ``in`` / :attr:`layers` see only the covered set.
     """
 
-    __slots__ = ("_K", "_X", "_dim", "_lambda")
+    __slots__ = ("_K", "_X", "_dim", "_lambda", "_mean")
 
     def __init__(
         self,
         centered: Mapping[int, torch.Tensor],
         small_inv: Mapping[int, torch.Tensor],
         ridge: Mapping[int, float],
+        layer_means: Mapping[int, torch.Tensor],
     ) -> None:
         if not centered:
             raise WhitenerError("LayerWhitener requires at least one layer")
-        if set(centered) != set(small_inv) or set(centered) != set(ridge):
+        if (
+            set(centered) != set(small_inv)
+            or set(centered) != set(ridge)
+            or set(centered) != set(layer_means)
+        ):
             raise WhitenerError(
                 "centered / small_inv / ridge must cover the same layer set"
             )
         self._X: dict[int, torch.Tensor] = dict(centered)
         self._K: dict[int, torch.Tensor] = dict(small_inv)
         self._lambda: dict[int, float] = dict(ridge)
+        self._mean = {
+            layer: mean.to(device="cpu", dtype=torch.float32).reshape(-1)
+            for layer, mean in layer_means.items()
+        }
         # Cache hidden-dim per layer for input-shape validation.  Allowing
         # mismatched dims would silently corrupt the matvec.
         self._dim: dict[int, int] = {
@@ -234,7 +244,7 @@ class LayerWhitener:
             G.diagonal().add_(n * lam)
             try:
                 chol = torch.linalg.cholesky(G)
-            except torch.linalg.LinAlgError:
+            except torch.linalg.LinAlgError:  # pyright: ignore[reportPrivateImportUsage]  # public runtime exception, absent from torch stubs
                 eye = torch.eye(n, dtype=G.dtype)
                 jitter = 1e-8 * float(G.diagonal().mean().clamp_min(1e-12))
                 chol = torch.linalg.cholesky(G + jitter * eye)
@@ -252,7 +262,15 @@ class LayerWhitener:
             raise WhitenerError(
                 "no layers shared between neutral_activations and layer_means"
             )
-        return cls(centered, small_inv, ridge)
+        return cls(
+            centered, small_inv, ridge,
+            {layer: layer_means[layer] for layer in centered},
+        )
+
+    @property
+    def layer_means(self) -> dict[int, torch.Tensor]:
+        """Defensive copy of the neutral means defining this metric."""
+        return {layer: mean.clone() for layer, mean in self._mean.items()}
 
     @classmethod
     def from_cache(
@@ -260,12 +278,13 @@ class LayerWhitener:
         model_id: str,
         *,
         ridge_scale: float = DEFAULT_RIDGE_SCALE,
+        expected_identity: dict[str, Any] | None = None,
     ) -> "LayerWhitener":
-        """Load a whitener from ``neutral_activations.safetensors`` alone (no model load).
+        """Load a whitener from the neutral-activation pointer (no model load).
 
         The single offline whitener loader — used by ``manifold compare`` and
         the cross-model transfer rebake.  Reads only
-        ``neutral_activations.safetensors`` from ``~/.saklas/models/<safe_id>/``
+        ``neutral_activations.json`` from ``~/.saklas/models/<safe_id>/``
         and derives the per-layer centering mean from the activations
         themselves (``X.mean(0)``): the neutral mean *is* the probe-centering
         baseline (same corpus, same pooling), so there is no separate
@@ -276,20 +295,31 @@ class LayerWhitener:
         Use :meth:`from_neutral_activations` instead when the activations are
         already in memory (e.g. inside a live ``SaklasSession``).
         """
-        from safetensors.torch import load_file
         from saklas.io.paths import model_dir
+        from saklas.io.alignment import load_validated_neutral_cache
 
         md = model_dir(model_id)
-        acts_path = md / "neutral_activations.safetensors"
-        if not acts_path.is_file():
+        pointer_path = md / "neutral_activations.json"
+        if not pointer_path.is_file():
             raise WhitenerError(
                 f"whitener cache missing for {model_id} "
-                f"(expected {acts_path.name} under {md}); populate via any flow "
+                f"(expected {pointer_path.name} under {md}); populate via any flow "
                 f"that loads the model + neutral activations (e.g. run any "
                 f"session-level extract on this model, or prepare a transfer "
                 f"that targets {model_id})"
             )
-        acts_raw = load_file(str(acts_path))
+        try:
+            acts_raw, sidecar = load_validated_neutral_cache(model_id)
+            if expected_identity is not None:
+                from saklas.io.alignment import neutral_cache_identity
+
+                if neutral_cache_identity(sidecar) != expected_identity:
+                    raise ValueError("neutral cache identity changed")
+        except Exception as exc:
+            raise WhitenerError(
+                f"whitener cache for {model_id} is stale, corrupt, or legacy; "
+                "load the model once to regenerate neutral activations"
+            ) from exc
         # Refuse a legacy non-fp32 neutral-activation store (the pre-fp32
         # bf16/fp16 cache).  Unlike ``load_or_compute_neutral_activations``,
         # which invalidates + recomputes such a cache, ``from_cache`` has no
@@ -308,9 +338,7 @@ class LayerWhitener:
         # activation channel) rather than poisoning the inverse, leaving that
         # layer uncovered — so a corrupt cache makes ``covers_all`` False and
         # consumers raise (no Euclidean path), it doesn't silently degrade.
-        acts = _decode_layer_tensor_map(
-            acts_raw, label=f"{model_id} neutral_activations",
-        )
+        acts = {layer: tensor.float() for layer, tensor in acts_raw.items()}
         means = {layer: tensor.mean(dim=0) for layer, tensor in acts.items()}
         return cls.from_neutral_activations(
             acts, means, ridge_scale=ridge_scale,

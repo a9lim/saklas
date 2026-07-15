@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -68,9 +68,9 @@ def _make_app():
 
     app._session = session
     app._device_str = "cpu"
-    app._alphas = {}
-    app._enabled = {}
-    app._manifold_terms = {}
+    app._get_extraction_controller()._alphas = {}
+    app._get_extraction_controller()._enabled = {}
+    app._get_extraction_controller()._manifold_terms = {}
     app._supports_thinking = False
     app._is_base_model = False
     app._render_mode = "chat"
@@ -86,21 +86,21 @@ def _make_app():
     # ``_pulled_slot`` tracks an in-progress ↑-pull-and-edit; default
     # None means "no slot pulled."  Tests inspect ``_pending_queue``
     # directly or build :class:`PendingItem` instances for dispatch.
-    app._pending_queue = []
-    app._pulled_slot = None
+    app._get_input_history_controller()._pending_queue = []
+    app._get_input_history_controller()._pulled_slot = None
     app._ui_gen_active = False
     app._focused_panel_idx = 1
     app._highlighting = False
     app._highlight_probe = None
     app._default_seed = None
-    app._loom_prune_expr = None
-    app._loom_auto_regen_mode = "unsteered"
-    app._loom_auto_regen_on = False
+    app._get_loom_controller()._loom_prune_expr = None
+    app._get_loom_controller()._loom_auto_regen_mode = "unsteered"
+    app._get_loom_controller()._loom_auto_regen_on = False
     import queue as _queue
     app._ui_token_queue = _queue.SimpleQueue()
-    app._input_history = []
-    app._history_index = None
-    app._history_stash = ""
+    app._get_input_history_controller()._input_history = []
+    app._get_input_history_controller()._history_index = None
+    app._get_input_history_controller()._history_stash = ""
     app._gen_start_time = 0.0
     app._gen_token_count = 0
     app._last_tok_per_sec = 0.0
@@ -431,7 +431,7 @@ def test_format_compare_renders_sibling_diff():
     session = SimpleNamespace(tree=tree)
     _wire_real_diff(session, tree)
 
-    out = format_compare(session, bid)
+    out = format_compare(cast(Any, session), bid)
     assert "compare" in out
     assert aid[:8] in out          # the sibling is listed
     assert "honest" in out         # steering delta term
@@ -449,8 +449,8 @@ def test_format_compare_one_reply_is_advisory():
     session = SimpleNamespace(tree=tree)
     # A turn with a single reply has nothing to compare — same advisory
     # whether the cursor sits on the assistant reply or the user node.
-    assert "one assistant reply" in format_compare(session, aid)
-    assert "one assistant reply" in format_compare(session, uid)
+    assert "one assistant reply" in format_compare(cast(Any, session), aid)
+    assert "one assistant reply" in format_compare(cast(Any, session), uid)
 
 
 def test_format_compare_user_turn_with_no_replies_is_advisory():
@@ -459,7 +459,7 @@ def test_format_compare_user_turn_with_no_replies_is_advisory():
     tree = LoomTree()
     uid = tree.add_user_turn("hi")
     session = SimpleNamespace(tree=tree)
-    out = format_compare(session, uid)
+    out = format_compare(cast(Any, session), uid)
     assert "no assistant replies" in out
 
 
@@ -478,7 +478,7 @@ def test_format_compare_from_user_node_diffs_replies():
     session = SimpleNamespace(tree=tree)
     _wire_real_diff(session, tree)
 
-    out = format_compare(session, uid)
+    out = format_compare(cast(Any, session), uid)
     assert "compare" in out
     assert "honest" in out         # steering delta term
     assert "calm" in out           # reading delta
@@ -697,8 +697,8 @@ def test_fire_auto_regen_streams_into_shadow_column():
     uid, aid = _seed_tree(app._session.tree)
 
     # Auto-regen state: on, with a non-unsteered mode.
-    app._loom_auto_regen_on = True
-    app._loom_auto_regen_mode = "inverted"
+    app._get_loom_controller()._loom_auto_regen_on = True
+    app._get_loom_controller()._loom_auto_regen_mode = "inverted"
 
     # Stub the chat panel's shadow widget mount.  We only need an
     # object with the highlight method; the worker pushes events into
@@ -709,7 +709,7 @@ def test_fire_auto_regen_streams_into_shadow_column():
     row = MagicMock()
 
     # Stub ``generate_stream`` to yield two token events synchronously.
-    # ``scores`` is now a back-compat property; pass ``probe_readings`` instead.
+    # Construct the current rich probe-reading channel directly.
     fake_events = [
         TokenEvent(text="hi", token_id=1, index=0, thinking=False,
                    probe_readings=None, perplexity=None),
@@ -745,13 +745,11 @@ def test_fire_auto_regen_streams_into_shadow_column():
     items = []
     while not app._ui_token_queue.empty():
         items.append(app._ui_token_queue.get_nowait())
-    tok_items = [it for it in items if it[0] == "tok"]
+    from saklas.tui.app import _UiToken
+
+    tok_items = [it for it in items if isinstance(it, _UiToken)]
     assert len(tok_items) == 2, items
-    # Position 7 is the ``is_shadow`` tag.  Tuple shape:
-    # (kind, text, thinking, scores, perplexity, logprob, widget,
-    # is_shadow, probe_readings) — nine elements, the unified per-token
-    # ``ProbeReading`` dict in the tail slot.
-    assert all(it[7] is True for it in tok_items)
+    assert all(it.shadow is True for it in tok_items)
     # And the right column had its shadow widget mounted.
     app._chat_panel.start_shadow_message.assert_called_once_with(row)
 
@@ -845,7 +843,7 @@ def test_prune_parses_and_stashes_expression():
     aid = tree.begin_assistant(uid)
     tree.finalize_assistant(aid, text="x", aggregate_readings={"angry.calm": 0.5})
     app._handle_command("/prune agg:angry.calm > 0.4")
-    assert app._loom_prune_expr == "agg:angry.calm > 0.4"
+    assert app._get_loom_controller()._loom_prune_expr == "agg:angry.calm > 0.4"
     assert any("/prune active" in m for m in app._chat_panel.messages)
     # Empty arg clears.
     app._handle_command("/prune")
@@ -870,7 +868,7 @@ def test_auto_regen_no_args_reports_state():
 def test_auto_regen_sets_mode():
     app = _make_app()
     app._handle_command("/auto-regen inverted")
-    assert app._loom_auto_regen_mode == "inverted"
+    assert app._get_loom_controller()._loom_auto_regen_mode == "inverted"
 
 
 def test_auto_regen_on_off():
@@ -886,7 +884,7 @@ def test_auto_regen_unknown_mode_rejects():
     app._handle_command("/auto-regen bogus")
     assert any("unknown mode" in m for m in app._chat_panel.messages)
     # Mode unchanged from default.
-    assert app._loom_auto_regen_mode == "unsteered"
+    assert app._get_loom_controller()._loom_auto_regen_mode == "unsteered"
 
 
 def test_auto_regen_custom_parses_into_recipe():
@@ -909,11 +907,11 @@ def test_auto_regen_custom_parses_into_recipe():
 def test_auto_regen_custom_parse_error_keeps_mode_unchanged():
     """A bad ``custom:`` expression posts to chat and leaves mode alone."""
     app = _make_app()
-    app._loom_auto_regen_mode = "inverted"
+    app._get_loom_controller()._loom_auto_regen_mode = "inverted"
     app._handle_command("/auto-regen custom: ::: gibberish :::")
     assert any("custom parse error" in m or "expression"  in m
                for m in app._chat_panel.messages)
-    assert app._loom_auto_regen_mode == "inverted"
+    assert app._get_loom_controller()._loom_auto_regen_mode == "inverted"
 
 
 def test_auto_regen_custom_empty_expression():
@@ -921,7 +919,7 @@ def test_auto_regen_custom_empty_expression():
     app = _make_app()
     app._handle_command("/auto-regen custom:")
     assert any("needs an expression" in m for m in app._chat_panel.messages)
-    assert app._loom_auto_regen_mode == "unsteered"
+    assert app._get_loom_controller()._loom_auto_regen_mode == "unsteered"
 
 
 def test_fan_parses_alpha_grid_and_kicks_worker():
@@ -1143,7 +1141,7 @@ def test_user_submitted_on_user_node_defers_prefill_target_in_pending():
     can't re-resolve against a shifted active node.  Per the v2.x queue
     semantics the in-flight gen is *not* interrupted — the new item
     waits for the current ``done`` and drains FIFO."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
     tree = app._session.tree
@@ -1153,8 +1151,8 @@ def test_user_submitted_on_user_node_defers_prefill_target_in_pending():
     app._session.stop = MagicMock()
     app._start_prefill = MagicMock()
     app.on_chat_panel_user_submitted(SimpleNamespace(text="seed it"))  # pyright: ignore[reportArgumentType]  # SimpleNamespace used as UserSubmitted test double
-    assert app._pending_queue == [
-        PendingItem("submit", "seed it", (uid,)),
+    assert app._get_input_history_controller()._pending_queue == [
+        PendingSubmit("seed it", uid),
     ]
     app._start_prefill.assert_not_called()
     # Stop is NOT called — queue model preserves in-flight tokens.
@@ -1228,14 +1226,14 @@ def test_commit_action_empty_input_is_noop():
     app._start_commit_user.assert_not_called()
     app._start_commit_assistant.assert_not_called()
     assert inp.text == "   "
-    assert app._input_history == []
+    assert app._get_input_history_controller()._input_history == []
 
 
 def test_commit_action_during_gen_queues_commit_user():
     """Mid-gen Ctrl+Enter on a non-user node enqueues a commit so the
     deferred dispatch lands it once the streaming sibling finishes.
     The queue model leaves the in-flight gen alone — no ``stop()``."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitUser
 
     app = _make_app()
     tree = app._session.tree
@@ -1246,7 +1244,7 @@ def test_commit_action_during_gen_queues_commit_user():
     app._session.stop = MagicMock()
     app._start_commit_user = MagicMock()
     app.action_commit_text()
-    assert app._pending_queue == [PendingItem("commit_user", "next bit")]
+    assert app._get_input_history_controller()._pending_queue == [PendingCommitUser("next bit")]
     app._start_commit_user.assert_not_called()
     app._session.stop.assert_not_called()
 
@@ -1254,7 +1252,7 @@ def test_commit_action_during_gen_queues_commit_user():
 def test_commit_action_during_gen_queues_commit_assistant_with_target():
     """Mid-gen Ctrl+Enter on a user node enqueues the user-node target so
     the deferred dispatch can't re-resolve against a shifted active node."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitAssistant
 
     app = _make_app()
     tree = app._session.tree
@@ -1265,8 +1263,8 @@ def test_commit_action_during_gen_queues_commit_assistant_with_target():
     app._session.stop = MagicMock()
     app._start_commit_assistant = MagicMock()
     app.action_commit_text()
-    assert app._pending_queue == [
-        PendingItem("commit_assistant", "the canned reply", (uid,)),
+    assert app._get_input_history_controller()._pending_queue == [
+        PendingCommitAssistant("the canned reply", uid),
     ]
     app._start_commit_assistant.assert_not_called()
     app._session.stop.assert_not_called()
@@ -1288,12 +1286,12 @@ def test_raw_commit_action_uses_buffer_draft():
 
 
 def test_dispatch_pending_raw_commit_routes_correctly():
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingRawCommit
 
     app = _make_app()
     app._start_raw_commit = MagicMock()
 
-    app._dispatch_pending_action(PendingItem("raw_commit", "queued flat text"))
+    app._dispatch_pending_action(PendingRawCommit("queued flat text"))
 
     app._start_raw_commit.assert_called_once_with("queued flat text")
 
@@ -1326,27 +1324,27 @@ def test_raw_edit_resyncs_buffer_after_tree_mutation():
 
 
 def test_dispatch_pending_commit_user_routes_correctly():
-    """``_dispatch_pending_action(PendingItem("commit_user", text))`` calls
+    """``_dispatch_pending_action(PendingCommitUser(text))`` calls
     ``_start_commit_user`` — the post-gen wakeup path."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitUser
 
     app = _make_app()
     app._start_commit_user = MagicMock()
-    app._dispatch_pending_action(PendingItem("commit_user", "queued text"))
+    app._dispatch_pending_action(PendingCommitUser("queued text"))
     app._start_commit_user.assert_called_once_with("queued text")
 
 
 def test_dispatch_pending_commit_assistant_routes_correctly():
-    """``_dispatch_pending_action(PendingItem("commit_assistant", text, (uid,)))``
+    """``_dispatch_pending_action(PendingCommitAssistant(text, uid))``
     calls ``_start_commit_assistant`` with the stashed user-node target."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitAssistant
 
     app = _make_app()
     tree = app._session.tree
     uid, _aid = _seed_tree(tree)
     app._start_commit_assistant = MagicMock()
     app._dispatch_pending_action(
-        PendingItem("commit_assistant", "the reply", (uid,))
+        PendingCommitAssistant("the reply", uid)
     )
     app._start_commit_assistant.assert_called_once_with(uid, "the reply")
 

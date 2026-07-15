@@ -19,11 +19,14 @@ from saklas.core.joint_logprobs import (
     JointLogprobRow,
     JointLogprobs,
     _approx_kl_topk,
+    _branch_inputs,
     _cache_key,
     _compute_rows,
     _shared_prefix_len,
     reorient_for_request,
 )
+from saklas.core.generation import GenerationConfig
+from saklas.core.triggers import TriggerContext
 from tests.conftest import FakeLogitsModel
 
 
@@ -313,11 +316,14 @@ class _MockTree:
 
         # parent (user node) and two assistant children with different
         # assistant text.  The base-model fallback in build_chat_input
-        # serializes as ``"Role: content\nRole: content\nAssistant:"``.
+        # serializes via ``render_scene_raw`` ("Role: content" lines).
+        # The shared "end" tail gives the byte-offset walker a genuinely
+        # aligned position after the a/b divergence (the closed render
+        # carries no trailing generation header to align on).
         root = LoomNode(id="root", parent_id=None, role="system", text="")
         user = LoomNode(id="u1", parent_id="root", role="user", text="ask")
-        a1 = LoomNode(id="a1", parent_id="u1", role="assistant", text="hello a")
-        a2 = LoomNode(id="a2", parent_id="u1", role="assistant", text="hello b")
+        a1 = LoomNode(id="a1", parent_id="u1", role="assistant", text="hello a end")
+        a2 = LoomNode(id="a2", parent_id="u1", role="assistant", text="hello b end")
         self.nodes = {"root": root, "u1": user, "a1": a1, "a2": a2}
 
     def messages_for(self, leaf_id: str, *, include_system: bool = False):
@@ -340,10 +346,6 @@ class _MockTree:
         return out
 
 
-class _MockConfig:
-    system_prompt: str | None = None
-
-
 class _MockSession:
     """Just enough surface for ``compute_joint_logprobs`` to run."""
 
@@ -351,12 +353,23 @@ class _MockSession:
         self.tokenizer = _MockTokenizer()
         # Build a vocabulary that covers the strings we'll feed.  The
         # decode path needs every id to round-trip.
-        for word in ("User:", "ask", "Assistant:", "hello", "a", "b"):
+        for word in ("User:", "ask", "Assistant:", "hello", "a", "b", "end"):
             self.tokenizer._intern(word)
         self._model = _MockModel(vocab=len(self.tokenizer._vocab) + 16)
         self.model = self._model
         self.tree = _MockTree()
-        self.config = _MockConfig()
+        self.config = GenerationConfig()
+        self.profiles: dict[str, Any] = {}
+        self._steering = type("SteeringState", (), {"ctx": TriggerContext()})()
+        self._monitor = type(
+            "MonitorState", (),
+            {"begin_live": lambda _self: None, "end_live": lambda _self: None},
+        )()
+        self._compose_gen_config = lambda _sampling: self.config
+        self._begin_capture = lambda **_kwargs: None
+        self._end_capture = lambda: None
+        self._steering_needs_probe_gating = lambda: False
+        self._build_gating_score_callback = lambda: None
 
 
 def test_compute_joint_logprobs_runs_end_to_end_on_mock():
@@ -407,3 +420,29 @@ def test_compute_joint_logprobs_to_dict_round_trip():
     }
     for row in payload["rows"]:
         assert set(row.keys()) == expected_keys
+
+
+def test_branch_inputs_rebuilds_generated_human_seat_prompt():
+    session: Any = _MockSession()
+    node = session.tree.nodes["a1"]
+    node.role = "user"
+    node.role_label = "narrator"
+    node.tokens = [{"token_id": 2, "text": "reply"}]
+    seen: dict[str, Any] = {}
+
+    def prepare_input(input: Any, **kwargs: Any) -> torch.Tensor:
+        seen["input"] = input
+        seen.update(kwargs)
+        return torch.tensor([[0, 1]], dtype=torch.long)
+
+    session._prepare_input = prepare_input
+    branch = _branch_inputs(session, "a1")
+
+    assert branch.prompt_ids == [0, 1]
+    assert branch.response_ids == [2]
+    assert seen["input"] is None
+    assert seen["parent_node_id"] == "u1"
+    assert seen["gen_seat"] == "user"
+    assert seen["user_role"] == "narrator"
+    assert seen["assistant_role"] is None
+    assert seen["to_device"] is False

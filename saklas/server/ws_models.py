@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
-
-from saklas.core.results import GenerationResult, RunSet
+from saklas.core.results import GenerationResult
 from saklas.core.sampling import SamplingConfig
-from saklas.core.session import SaklasSession
+from saklas.server.native_common import NativeRequest
 
 
-class WSSamplingParams(BaseModel):
+class WSSamplingParams(NativeRequest):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -29,9 +27,16 @@ class WSSamplingParams(BaseModel):
     assistant_role: str | None = None
 
 
-class WSGenerateMessage(BaseModel):
-    type: str
-    input: Any = None
+class WSInputMessage(NativeRequest):
+    """One current chat message accepted by the native generation stream."""
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class WSGenerateMessage(NativeRequest):
+    type: Literal["generate"]
+    input: str | list[WSInputMessage] | None = None
     steering: str | None = None
     sampling: WSSamplingParams | None = None
     thinking: bool | None = None
@@ -39,7 +44,7 @@ class WSGenerateMessage(BaseModel):
     raw: bool = False
     parent_node_id: str | None = None
     n: int = 1
-    recipe_override: Any = None
+    recipe_override: str | None = None
     fork_node_id: str | None = None
     fork_raw_index: int | None = None
     fork_alt_token_id: int | None = None
@@ -47,6 +52,39 @@ class WSGenerateMessage(BaseModel):
     prefill_text: str | None = None
     commit_role: Literal["user", "assistant"] | None = None
     commit_text: str | None = None
+    # Optional committed thinking block riding a commit (any seat) —
+    # rendered through the family think delimiters by the scene
+    # stitcher; rejected with 400 when the family can't carry it.
+    commit_thinking: str | None = None
+    # Cast model: which seat the generated turn occupies.  ``"user"``
+    # renders the generation prompt as a user-seat header and lands the
+    # node with ``role="user"`` + a stamped recipe (generated is
+    # provenance, not a seat).  ``None`` = assistant (the classic flow).
+    # Pair with ``input: null`` for a continue — no committed turn, the
+    # model speaks next from the current leaf (a/a and u/u sequences).
+    generate_seat: Literal["user", "assistant"] | None = None
+
+
+class WSSubmitMessage(NativeRequest):
+    """Native role-neutral chat submission.
+
+    ``text`` plus ``authored_role`` appends a span.  ``generated_role`` then
+    optionally asks the model to continue from it; omit it for append-only.
+    With no text, ``generated_role`` is a bare continue from the selected leaf.
+    """
+
+    type: Literal["submit"]
+    text: str | None = None
+    authored_role: Literal["user", "assistant"] | None = None
+    generated_role: Literal["user", "assistant"] | None = None
+    steering: str | None = None
+    sampling: WSSamplingParams | None = None
+    thinking: bool | None = None
+    authored_thinking: str | None = None
+    raw: bool = False
+    parent_node_id: str | None = None
+    n: int = 1
+    recipe_override: str | None = None
 
 
 def build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
@@ -72,43 +110,25 @@ def build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
     )
 
 
-def result_to_json(result: GenerationResult | RunSet | None) -> dict[str, Any]:
-    if result is None:
-        return {}
-    prompt_tokens = getattr(result, "prompt_tokens", 0) or 0
-    completion = getattr(result, "token_count", 0) or 0
+def build_input(
+    body: str | list[WSInputMessage] | None,
+) -> str | list[dict[str, str]] | None:
+    """Lower the strict wire message objects to the engine's mapping shape."""
+    if not isinstance(body, list):
+        return body
+    return [message.model_dump() for message in body]
+
+
+def result_to_json(result: GenerationResult) -> dict[str, Any]:
+    prompt_tokens = result.prompt_tokens
+    completion = result.token_count
     return {
-        "text": getattr(result, "text", ""),
+        "text": result.text,
         "tokens": completion,
-        "finish_reason": getattr(result, "finish_reason", "stop"),
+        "finish_reason": result.finish_reason,
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion,
             "total_tokens": prompt_tokens + completion,
         },
     }
-
-
-def per_token_probes(
-    session: SaklasSession, n_tokens: int,
-) -> list[dict[str, Any]]:
-    scores = session.last_per_token_scores
-    if not scores:
-        return []
-    return [
-        {
-            "token_idx": i,
-            "probes": {
-                name: float(vals[i])
-                for name, vals in scores.items()
-                if i < len(vals)
-            },
-        }
-        for i in range(n_tokens)
-    ]
-
-
-# Backcompat aliases for the old ``saklas_api.py`` import surface.
-_build_sampling = build_sampling
-_result_to_json = result_to_json
-_per_token_probes = per_token_probes

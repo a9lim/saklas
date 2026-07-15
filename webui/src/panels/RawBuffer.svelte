@@ -5,7 +5,7 @@
   // pre-wrap``.  Per-token tinting is preserved for the assistant span
   // when a highlight probe is selected.
   //
-  // "continue" generates with ``raw: true`` from the active leaf — the
+  // "generate" runs with ``raw: true`` from the active leaf — the
   // whole buffer is effectively a prefill.  A mid-buffer edit lands as
   // a ``loomEdit`` (active leaf) or ``loomBranch`` (interior node)
   // first; toggling render mode never mutates the tree, only generation
@@ -17,17 +17,21 @@
   import {
     chatLog,
     loomTree,
-    sendCommit,
     genStatus,
-    sendGenerate,
+    sendSubmit,
     sendStop,
     highlightState,
     openDrawer,
     highlightScale,
+    beginTokenHover,
+    endTokenHover,
   } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
+  import Button from "../lib/ui/Button.svelte";
+  import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
   import {
     scoreToRgb,
+    highlightHue,
     surpriseScore,
     SURPRISE_TARGET,
     probeScoreForTarget,
@@ -36,18 +40,17 @@
   // ---------- buffer text ----------
 
   /** The conversation flattened to one string — every turn's text
-   *  concatenated in order.  This is what the model sees as a prefill
-   *  on "continue". */
+   *  concatenated in order. This is the raw prefix the model extends. */
   const bufferText = $derived(
     chatLog.turns.map((t) => t.text ?? "").join(""),
   );
 
   // Local editable mirror.  Synced from ``bufferText`` whenever the
   // tree changes and the user isn't mid-edit; user edits write here
-  // and "continue" / "commit edit" land them on the tree.
+  // and send / append land them on the tree.
   let draft = $state("");
   let dirty = $state(false);
-  // Set the moment a continue/commit is fired: the tree hasn't caught
+  // Set the moment a send/append is fired: the tree hasn't caught
   // up to the locally-edited draft yet, so the buffer→draft sync below
   // is held until ``bufferText`` reaches the draft — without this the
   // draft would briefly snap back to the pre-edit text (a flash of the
@@ -62,10 +65,10 @@
   $effect(() => {
     const text = bufferText;
     if (committing) {
-      // Hold until the tree genuinely carries the committed draft as a
+      // Hold until the tree genuinely carries the submitted draft as a
       // prefix — a *content* check, not a length one.  A length compare
-      // releases early when a fast-streaming continuation fills the
-      // buffer to the right size before the committed span has landed
+      // releases early when a fast-streaming generation fills the
+      // buffer to the right size before the authored span has landed
       // (or under a transient wrong-parent active path), snapping the
       // draft onto text that doesn't contain what the user wrote.
       if (!text.startsWith(draft)) return;
@@ -79,11 +82,11 @@
   function onInput(ev: Event): void {
     draft = (ev.currentTarget as HTMLTextAreaElement).value;
     dirty = draft !== bufferText;
-    // Any keystroke supersedes a pending commit — resume live sync.
+    // Any keystroke supersedes a pending submission — resume live sync.
     committing = false;
   }
 
-  // ---------- continue / commit ----------
+  // ---------- send / generate / append ----------
   //
   // Flat mode is non-linear: editing text anywhere in the buffer is the
   // same operation as appending to the end.  Both collapse to a single
@@ -94,9 +97,9 @@
   // fresh span branched at that point.  Appending is just the special
   // case where the divergence sits at the very end of the buffer.
 
-  /** The active leaf node — what a clean continuation extends. */
+  /** The active leaf node — what a clean generation extends. */
   const activeLeaf = $derived(
-    loomTree.rev > 0 ? (loomTree.active_node_id ?? null) : null,
+    loomTree.loaded ? (loomTree.active_node_id ?? null) : null,
   );
 
   interface Divergence {
@@ -104,7 +107,7 @@
     tail: string;
     /** Where the new span hangs: the diverging node's parent for a
      *  mid-buffer edit, the active leaf for a pure append.
-     *  ``undefined`` means the buffer is clean — continue from the leaf
+     *  ``undefined`` means the buffer is clean — generate from the leaf
      *  with no new span at all. */
     parentNodeId: string | null | undefined;
   }
@@ -136,32 +139,42 @@
     return { tail: draft.slice(startOffset), parentNodeId: activeLeaf ?? null };
   }
 
-  function continueGen(): void {
+  function submitBuffer(): void {
     if (genStatus.active) return;
     const d = resolveDivergence();
-    // The divergence tail rides as raw input: the engine records it as
-    // a node and continues from the flat active-path text.  A clean
-    // buffer sends "" — a bare continuation from the active leaf.
+    // The divergence tail is an authored user span; generation occupies the
+    // assistant role. A clean buffer omits the authored half entirely.
+    const text = d.tail === "" ? null : d.tail;
     committing = true;
     dirty = false;
-    void sendGenerate(d.tail, { raw: true, parent_node_id: d.parentNodeId });
+    void sendSubmit(
+      text,
+      text === null ? null : "user",
+      "assistant",
+      { raw: true, parent_node_id: d.parentNodeId },
+    );
   }
 
-  // ---------- edit (commit without generating) ----------
+  // ---------- append without generating ----------
 
   /** Land the pending edit on the tree without generating — the same
-   *  divergence branch ``continueGen`` would take, minus the decode. */
-  async function commitEdit(): Promise<void> {
+   *  divergence branch ``submitBuffer`` would take, minus the decode. */
+  async function appendEdit(): Promise<void> {
     if (!dirty) return;
     const d = resolveDivergence();
     dirty = false;
     if (d.tail === "") {
       // Pure truncation back to a node boundary — nothing new to land;
-      // the boundary node already holds the committed text.
+      // the boundary node already holds the settled text.
       return;
     }
     committing = true;
-    await sendCommit("user", d.parentNodeId ?? null, d.tail, { raw: true });
+    await sendSubmit(
+      d.tail,
+      "user",
+      null,
+      { raw: true, parent_node_id: d.parentNodeId ?? null },
+    );
   }
 
   function revertEdit(): void {
@@ -171,14 +184,12 @@
   }
 
   function onKeydown(ev: KeyboardEvent): void {
-    // Bare Enter continues; Ctrl/Cmd/Option-Enter commits the edit
-    // without generating; Shift-Enter is a literal newline; Escape
-    // stops an in-flight gen.
+    // Enter sends or generates; Shift-Enter is a literal newline.  Append is
+    // an explicit button beside the dirty-buffer state, never a key mode.
     if (ev.key === "Enter") {
       if (ev.shiftKey) return;
       ev.preventDefault();
-      if (ev.ctrlKey || ev.metaKey || ev.altKey) void commitEdit();
-      else continueGen();
+      submitBuffer();
       return;
     }
     if (ev.key === "Escape" && genStatus.active) {
@@ -265,7 +276,11 @@
   }
 
   function tintStyle(t: TokenScore): string {
-    const bg = scoreToRgb(tokenScore(t), highlightScale(highlightState.target));
+    const bg = scoreToRgb(
+      tokenScore(t),
+      highlightScale(highlightState.target),
+      highlightHue(highlightState.target),
+    );
     return bg === "transparent" ? "" : `background-color: ${bg}`;
   }
 
@@ -288,6 +303,19 @@
   /** Inspect is offered only on a settled buffer — a pending edit or an
    *  in-flight commit would make the read-only view lag the textarea. */
   const canInspect = $derived(hasClickableTokens && !dirty && !committing);
+  const modeItems = $derived([
+    { value: "edit" as const, label: "edit", title: "edit" },
+    {
+      value: "inspect" as const,
+      label: "inspect",
+      disabled: mode !== "inspect" && !canInspect,
+      title: canInspect || mode === "inspect"
+        ? "inspect tokens — click any token for alternatives + fork"
+        : dirty || committing
+          ? "append or revert the edit to inspect tokens"
+          : "generate tokens first",
+    },
+  ]);
 
   /** Fall back to edit when nothing remains to inspect (buffer cleared,
    *  conversation reset) so the surface never strands on an empty view. */
@@ -321,6 +349,11 @@
     });
   }
 
+  function hoverToken(v: RawToken): void {
+    if (!v.tok || v.turnIdx === null) return;
+    beginTokenHover(v.tok, chatLog.turns[v.turnIdx]?.nodeId);
+  }
+
   let logRef: HTMLDivElement | null = $state(null);
   let scrolledUp = $state(false);
   function onScroll(ev: Event): void {
@@ -343,30 +376,8 @@
 
 <div class="raw-buffer" aria-label="Completion buffer">
   <div class="raw-head">
-    <span class="head-label">completion buffer</span>
-    <div class="mode-toggle" role="tablist" aria-label="Buffer mode">
-      <button
-        type="button"
-        role="tab"
-        aria-selected={mode === "edit"}
-        class:active={mode === "edit"}
-        onclick={() => (mode = "edit")}
-        title="edit the raw completion text"
-      >edit</button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={mode === "inspect"}
-        class:active={mode === "inspect"}
-        disabled={mode !== "inspect" && !canInspect}
-        onclick={() => (mode = "inspect")}
-        title={canInspect || mode === "inspect"
-          ? "inspect tokens — click any token for alternatives + fork"
-          : dirty || committing
-            ? "commit or revert the edit to inspect tokens"
-            : "generate tokens first"}
-      >inspect</button>
-    </div>
+    <span class="head-label">buffer</span>
+    <SegmentedTabs bind:value={mode} items={modeItems} ariaLabel="Buffer mode" />
   </div>
 
   <div class="surface" bind:this={logRef} onscroll={onScroll}>
@@ -384,6 +395,10 @@
               title={inspectTooltip(v)}
               role="button"
               tabindex="-1"
+              onpointerenter={() => hoverToken(v)}
+              onpointerleave={endTokenHover}
+              onfocus={() => hoverToken(v)}
+              onblur={endTokenHover}
               onclick={() => openToken(v)}
               onkeydown={(ev) => {
                 if (ev.key === "Enter" || ev.key === " ") {
@@ -411,7 +426,7 @@
         oninput={onInput}
         onkeydown={onKeydown}
         spellcheck="false"
-        placeholder="(empty completion buffer — type a prompt and continue)"
+        placeholder="prompt…"
         aria-label="Editable completion buffer"
       ></textarea>
     {/if}
@@ -422,35 +437,32 @@
 
   <div class="actions">
     {#if dirty}
-      <span class="dirty-flag" title="the buffer has uncommitted edits">
+      <span class="dirty-flag" title="uncommitted">
         edited
       </span>
-      <button
-        type="button"
-        class="act commit"
-        onclick={() => void commitEdit()}
-        title="⌃⏎ — land the edit on the tree without generating"
+      <Button
+        accent="var(--accent-green)"
+        onclick={() => void appendEdit()}
+        title="append without generating"
       >
-        commit edit
-      </button>
-      <button type="button" class="act revert" onclick={revertEdit}>
+        append
+      </Button>
+      <Button onclick={revertEdit}>
         revert
-      </button>
+      </Button>
     {/if}
-    <button
-      type="button"
-      class="act continue"
-      onclick={continueGen}
+    <Button
+      accent="var(--accent-green)"
+      onclick={submitBuffer}
       disabled={genStatus.active}
-      title="⏎ — generate a raw continuation from the buffer (⇧⏎ for a newline)"
-    >continue</button>
-    <button
-      type="button"
-      class="act stop"
+      title="⏎ submit"
+    >{dirty ? "send" : "generate"}</Button>
+    <Button
+      variant="danger"
       onclick={sendStop}
       disabled={!genStatus.active}
       title="Esc"
-    >stop</button>
+    >stop</Button>
   </div>
 </div>
 
@@ -470,8 +482,9 @@
     position: relative;
     overflow-y: auto;
     min-height: 0;
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    /* Recessed input well — this is the editable completion surface. */
+    background: var(--input-well);
+    border: 1px solid transparent;
     border-radius: var(--radius);
   }
   /* The tinted read-only mirror and the textarea share identical
@@ -543,51 +556,6 @@
     text-transform: uppercase;
     letter-spacing: 0;
   }
-  /* Segmented control — mirrors the house ``.sk-mode-tabs`` (ModeTabs)
-   * and render-mode shape: borderless segments inside one bordered
-   * ``--bg-elev`` track, --text-sm, accent-subtle active fill, fast
-   * transitions.  Kept local (not the shared component) so the inspect
-   * segment can carry a conditional ``disabled`` + dynamic tooltip. */
-  .mode-toggle {
-    display: flex;
-    gap: var(--space-1);
-    padding: var(--space-1);
-    background: var(--bg-elev);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-  }
-  .mode-toggle button {
-    background: transparent;
-    color: var(--fg-dim);
-    border: 0;
-    border-radius: var(--radius);
-    padding: var(--space-2) var(--space-4);
-    cursor: pointer;
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    text-transform: lowercase;
-    transition:
-      background var(--dur-fast) var(--ease-out),
-      color var(--dur-fast) var(--ease-out);
-  }
-  .mode-toggle button:hover:not(:disabled):not(.active) {
-    color: var(--fg);
-    background: var(--bg-hover);
-  }
-  .mode-toggle button.active {
-    color: var(--accent);
-    background: var(--accent-subtle);
-  }
-  .mode-toggle button:focus-visible {
-    outline: 2px solid var(--accent-glow);
-    outline-offset: 1px;
-  }
-  .mode-toggle button:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
-    opacity: 0.6;
-  }
   .buffer-text {
     position: relative;
     width: 100%;
@@ -620,35 +588,5 @@
     color: var(--accent-yellow);
     font-size: var(--text-xs);
     margin-right: auto;
-  }
-  .act {
-    background: var(--bg-alt);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    padding: var(--space-2) var(--space-5);
-    cursor: pointer;
-    font: inherit;
-    font-family: var(--font-mono);
-    border-radius: var(--radius);
-  }
-  .act:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
-  }
-  .act:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
-  }
-  .act.continue {
-    color: var(--accent-green);
-  }
-  .act.stop {
-    color: var(--accent-red);
-  }
-  .act.commit {
-    color: var(--accent);
-  }
-  .act.revert {
-    color: var(--fg-dim);
   }
 </style>

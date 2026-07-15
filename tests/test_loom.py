@@ -24,7 +24,7 @@ from saklas import (
     UnknownNodeError,
     derive_seed_schedule,
 )
-from saklas.core.loom import TREE_FORMAT_VERSION
+from saklas.core.loom import TOKEN_SIDECAR_FORMAT_VERSION, TREE_FORMAT_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +87,37 @@ def test_begin_and_finalize_assistant():
     assert t.nodes[aid].text == "hi back"
     assert t.nodes[aid].aggregate_readings == {"angry": 0.1}
     assert t.nodes[aid].finish_reason == "stop"
+
+
+def test_set_authored_token_scores_is_one_tree_mutation():
+    bus = EventBus()
+    seen: list[LoomMutated] = []
+    bus.subscribe(lambda e: seen.append(e) if isinstance(e, LoomMutated) else None)
+    t = LoomTree(events=bus)
+    uid = t.add_user_turn("hello")
+    before = t.rev
+
+    t.set_authored_token_scores(uid, [
+        {
+            "token_id": 7,
+            "text": "hello",
+            "captured": {
+                "probes": {
+                    "provenance": "captured",
+                    "scores": {"formal": 0.25},
+                },
+            },
+        },
+    ])
+
+    assert t.rev == before + 1
+    tokens = t.nodes[uid].tokens
+    assert tokens is not None
+    assert tokens[0]["captured"]["probes"]["scores"] == {
+        "formal": 0.25,
+    }
+    assert seen[-1].op == "capture_authored"
+    assert seen[-1].updated == (uid,)
 
 
 def test_messages_for_active_path():
@@ -589,6 +620,9 @@ def _bind_commit_methods(tree: LoomTree, tokenizer: Any):
             # stub so the lookup chain resolves.
             "_check_user_send_target":
                 SaklasSession._check_user_send_target,
+            # Real sessions always expose ``scene_grammar``; None keeps
+            # the legacy commit-seating guards active for these tests.
+            "scene_grammar": None,
         },
     )()
     return (
@@ -607,15 +641,18 @@ def test_append_user_turn_lands_under_root():
     assert t.active_node_id == new_id
 
 
-def test_append_user_turn_refuses_under_user_node():
-    """D15 — sending a user turn under a user node is forbidden, same
-    rule the normal-send path enforces."""
+def test_append_user_turn_coalesces_under_same_role_node():
+    """A same-role authored span extends the active message in place."""
     from unittest.mock import MagicMock
     t = LoomTree()
-    t.add_user_turn("hi")  # active = u1, a user node
-    append_user, _ = _bind_commit_methods(t, MagicMock())
-    with pytest.raises(InvalidNodeOperationError, match="cannot send a new user turn"):
-        append_user(None, "more")
+    uid = t.add_user_turn("hi")
+    tok = MagicMock()
+    tok.encode.return_value = [1, 2, 3]
+    append_user, _ = _bind_commit_methods(t, tok)
+    appended = append_user(None, " more")
+    assert appended == uid
+    assert t.nodes[uid].text == "hi more"
+    assert [node.id for node in t.active_path()] == [t.root_id, uid]
 
 
 def test_append_user_turn_dedups_same_text_sibling():
@@ -669,13 +706,61 @@ def test_append_assistant_turn_lands_under_user_with_tokenization():
     tok.encode.assert_called_once_with("the reply", add_special_tokens=False)
 
 
-def test_append_assistant_turn_refuses_non_user_parent():
+def test_append_assistant_turn_coalesces_under_same_role_node():
     from unittest.mock import MagicMock
     t = _seed_tree()  # leaf is an assistant
     aid = t.active_node_id
-    _, append_assistant = _bind_commit_methods(t, MagicMock())
-    with pytest.raises(InvalidNodeOperationError, match="not a user node"):
-        append_assistant(aid, "reply")
+    tok = MagicMock()
+    tok.encode.return_value = [1, 2, 3]
+    _, append_assistant = _bind_commit_methods(t, tok)
+    appended = append_assistant(aid, " reply")
+    assert appended == aid
+    assert t.nodes[aid].text == "hello reply"
+    assert t.nodes[aid].recipe is None
+    assert [node.id for node in t.active_path()] == [
+        t.root_id, t.nodes[aid].parent_id, aid,
+    ]
+
+
+def test_append_authored_clears_stale_generation_receipt():
+    t = LoomTree()
+    uid = t.add_user_turn("prompt")
+    aid = t.begin_assistant(uid, recipe=Recipe(steering="0.2 formal"))
+    t.append_token(aid, {"token_id": 10, "text": "answer"})
+    t.finalize_assistant(
+        aid, text="answer", aggregate_readings={"formal": 0.4},
+        applied_steering="0.2 formal", finish_reason="stop",
+        mean_logprob=-0.2, mean_surprise=0.2, raw_token_ids=[10],
+    )
+
+    returned = t.append_authored(aid, " edited", raw_token_ids=[10, 11])
+
+    node = t.nodes[aid]
+    assert returned == aid
+    assert node.text == "answer edited"
+    assert node.recipe is None
+    assert node.tokens is None
+    assert node.aggregate_readings == {}
+    assert node.applied_steering is None
+    assert node.raw_token_ids == [10, 11]
+
+
+def test_begin_continuation_reuses_and_resets_node():
+    t = LoomTree()
+    uid = t.add_user_turn("prompt")
+    aid = t.begin_assistant(uid, recipe=Recipe())
+    t.finalize_assistant(aid, text="prefix", raw_token_ids=[1, 2])
+
+    returned = t.begin_continuation(aid, Recipe(steering="0.1 warm"))
+
+    node = t.nodes[aid]
+    assert returned == aid
+    assert node.parent_id == uid
+    assert node.text == ""
+    assert node.recipe == Recipe(steering="0.1 warm")
+    assert node.tokens == []
+    assert node.raw_token_ids is None
+    assert t.active_node_id == aid
 
 
 def test_append_assistant_turn_empty_text_raises():
@@ -775,7 +860,7 @@ def test_save_load_round_trips_token_sidecar(tmp_path: Path):
     sidecar = path.with_name("tree.tokens.json.gz")
     with gzip.open(sidecar, "rt", encoding="utf-8") as f:
         token_payload = json.load(f)
-    assert token_payload["token_sidecar_format"] == 1
+    assert token_payload["token_sidecar_format"] == TOKEN_SIDECAR_FORMAT_VERSION
     assert token_payload["nodes"][aid]["tokens"][0]["token_id"] == 42
 
     t2 = LoomTree.load(path)
@@ -988,6 +1073,39 @@ def test_load_refuses_future_format(tmp_path: Path):
         LoomTree.load(path)
 
 
+def test_load_refuses_missing_tree_format(tmp_path: Path):
+    raw = _seed_tree().to_dict()
+    del raw["tree_format"]
+    path = tmp_path / "tree.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(Exception, match="tree_format"):
+        LoomTree.load(path)
+
+
+def test_load_refuses_structurally_inconsistent_tree(tmp_path: Path):
+    raw = _seed_tree().to_dict()
+    child = next(node for node in raw["nodes"] if node["id"] != raw["root_id"])
+    child["parent_id"] = "not-the-parent"
+    path = tmp_path / "tree.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(Exception, match="disagrees with children_of"):
+        LoomTree.load(path)
+
+
+def test_sidecar_preserves_explicit_null_raw_token_ids(tmp_path: Path):
+    tree = _seed_tree()
+    node = tree.nodes[tree.active_node_id]
+    node.tokens = [{"token_id": 7, "text": "x"}]
+    node.raw_token_ids = None
+    path = tmp_path / "tree.json"
+    tree.save(path)
+
+    with gzip.open(tmp_path / "tree.tokens.json.gz", "rt", encoding="utf-8") as f:
+        payload = json.load(f)
+    assert payload["nodes"][node.id]["raw_token_ids"] is None
+    assert LoomTree.load(path).nodes[node.id].raw_token_ids is None
+
+
 # ---------------------------------------------------------------------------
 # Per-turn role labels (roleplay scaffold)
 # ---------------------------------------------------------------------------
@@ -1022,3 +1140,101 @@ def test_messages_for_with_labels():
     # Default shape stays {role, content} — no label key.
     plain = t.messages_for()
     assert "label" not in plain[0]
+
+
+# ---------------------------------------------------------------------------
+# Cast roster (phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_cast_member_round_trip():
+    from saklas import CastMember
+
+    full = CastMember(
+        recipe=Recipe(steering="0.5 personas%pirate", thinking=False),
+        notes="the ship's captain",
+    )
+    d = full.to_dict()
+    back = CastMember.from_dict(d)
+    assert back == full
+    # A bare named label still emits the exact current member shape.
+    bare = CastMember()
+    assert bare.to_dict() == {"recipe": None, "notes": ""}
+    assert CastMember.from_dict(bare.to_dict()) == bare
+
+
+def test_cast_roster_crud_and_events():
+    from saklas import CastMember, EventBus
+
+    bus = EventBus()
+    seen: list[LoomMutated] = []
+    bus.subscribe(lambda e: seen.append(e) if isinstance(e, LoomMutated) else None)
+    t = LoomTree(events=bus)
+    member = CastMember(recipe=Recipe(steering="0.3 honest"))
+    t.set_cast_member("deer", member)
+    assert t.cast["deer"] == member
+    assert seen and seen[-1].op == "cast"
+    rev_after_set = t.rev
+
+    # Idempotent set: same member → no rev bump, no event.
+    seen.clear()
+    t.set_cast_member("deer", CastMember(recipe=Recipe(steering="0.3 honest")))
+    assert t.rev == rev_after_set
+    assert not seen
+
+    # Replace with a different member bumps.
+    t.set_cast_member("deer", CastMember(recipe=Recipe(steering="0.9 honest")))
+    assert t.rev == rev_after_set + 1
+    assert seen[-1].op == "cast"
+
+    t.remove_cast_member("deer")
+    assert "deer" not in t.cast
+    assert seen[-1].op == "cast"
+    rev_after_remove = t.rev
+
+    # Removing an absent member is a no-op.
+    seen.clear()
+    t.remove_cast_member("deer")
+    assert t.rev == rev_after_remove
+    assert not seen
+
+
+def test_cast_roster_derives_structural_and_observed_roles():
+    t = LoomTree()
+    user_id = t.add_user_turn("hello", role_label="captain")
+    t.begin_assistant(user_id, role_label="oracle")
+
+    assert list(t.cast_roster()) == ["user", "assistant", "captain", "oracle"]
+    assert t.cast == {}  # derived identity is not persisted as configuration
+
+
+def test_cast_label_validated():
+    from saklas import CastMember
+    from saklas.core.role_templates import InvalidRoleError
+
+    t = LoomTree()
+    with pytest.raises(InvalidRoleError):
+        t.set_cast_member("Not A Slug", CastMember())
+    with pytest.raises(InvalidRoleError):
+        t.set_cast_member("", CastMember())
+
+
+def test_cast_rides_save_load(tmp_path: Path):
+    from saklas import CastMember
+
+    t = _seed_tree()
+    # The current schema always carries the cast roster, including empty.
+    path = tmp_path / "tree.json"
+    t.save(path)
+    assert json.loads(path.read_text())["cast"] == {}
+
+    t.set_cast_member(
+        "deer", CastMember(recipe=Recipe(steering="0.5 skittish"))
+    )
+    t.set_cast_member("narrator", CastMember(notes="stage voice"))
+    t.save(path)
+    raw = json.loads(path.read_text())
+    assert set(raw["cast"]) == {"deer", "narrator"}
+
+    t2 = LoomTree.load(path)
+    assert t2.cast == t.cast

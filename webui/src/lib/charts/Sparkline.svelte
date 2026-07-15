@@ -8,6 +8,8 @@
   // No interactivity, no axes — pure decoration to give a sense of
   // probe trend without a full chart.
 
+  import { onMount } from "svelte";
+
   interface Props {
     points: number[];
     width?: number;
@@ -52,6 +54,37 @@
     }
     return segs.join(" ");
   });
+
+  // Area fill under the line — the same trace closed down to the baseline
+  // and back, rendered behind the stroke at low opacity.  Skipped for the
+  // degenerate 0/1-point case (no meaningful area to shade).
+  const area = $derived.by(() => {
+    if (!points || points.length < 2) return "";
+    const clamped = points.map((v) =>
+      Math.max(-cap, Math.min(cap, Number.isFinite(v) ? v : 0)),
+    );
+    const yFor = (v: number) => ((cap - v) / (2 * cap)) * height;
+    const step = width / (points.length - 1);
+    const segs: string[] = [];
+    for (let i = 0; i < clamped.length; i++) {
+      const x = i * step;
+      const y = yFor(clamped[i]);
+      segs.push(`${i === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`);
+    }
+    segs.push(`L ${width.toFixed(2)} ${height.toFixed(2)}`);
+    segs.push(`L 0 ${height.toFixed(2)}`);
+    segs.push("Z");
+    return segs.join(" ");
+  });
+
+  // Draw-in runs once, gated on mount — this component re-renders every
+  // streamed token, so the animation is bound to a class flipped a single
+  // time (never to the per-tick data), and the dasharray uses a fixed
+  // over-length value so path updates can't restart it.
+  let mounted = $state(false);
+  onMount(() => {
+    mounted = true;
+  });
 </script>
 
 <svg
@@ -62,8 +95,18 @@
   preserveAspectRatio="none"
   aria-hidden="true"
 >
+  {#if area}
+    <path d={area} fill={stroke} fill-opacity="0.14" stroke="none" />
+  {/if}
   {#if path}
-    <path d={path} fill="none" stroke={stroke} stroke-width="1" />
+    <path
+      class="sparkline-line"
+      class:draw={mounted}
+      d={path}
+      fill="none"
+      stroke={stroke}
+      stroke-width="1"
+    />
   {/if}
 </svg>
 
@@ -71,5 +114,23 @@
   .sparkline {
     display: inline-block;
     vertical-align: middle;
+  }
+  /* Fixed over-length dash (path is ≪400 units) so per-token ``d`` updates
+     never re-measure or restart the draw-in; the animation is carried by
+     the ``.draw`` class, applied once on mount. */
+  .sparkline-line {
+    stroke-dasharray: 400;
+    stroke-dashoffset: 0;
+  }
+  .sparkline-line.draw {
+    animation: sparkline-draw 0.9s var(--ease-out);
+  }
+  @keyframes sparkline-draw {
+    from {
+      stroke-dashoffset: 400;
+    }
+    to {
+      stroke-dashoffset: 0;
+    }
   }
 </style>

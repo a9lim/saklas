@@ -1,6 +1,6 @@
 // Shared types for the saklas webui.  Every panel/drawer/store imports
 // from here so renames stay one-shot.  Mirrors the JSON shapes in
-// saklas/server/saklas_api.py and the steering grammar in
+// saklas/server route models and the steering grammar in
 // saklas/core/steering_expr.py.
 
 // ---------------------------------------------------------- triggers --
@@ -44,7 +44,6 @@ export interface SamplingFields {
 
 export interface SessionInfo {
   id: string;
-  aliases?: string[];
   model_id: string;
   device: string;
   dtype: string;
@@ -59,45 +58,72 @@ export interface SessionInfo {
    *  families (gpt-oss / Mistral-3 Reasoning / Qwen3-Thinking) ship
    *  ``supports_thinking=true`` but ``thinking_is_optional=false`` so
    *  the UI can lock the toggle and explain why pressing it is a
-   *  no-op.  Older servers may omit this field; clients should treat
-   *  ``undefined`` as ``true`` (the historical default — most thinking
-   *  models were toggleable). */
-  thinking_is_optional?: boolean;
+   *  no-op. */
+  thinking_is_optional: boolean;
   default_steering: string | null;
-  /** Non-canonical: optional architecture string surfaced for the
-   * yellow-banner warning when ``model_type`` isn't in
-   * ``_TESTED_ARCHS``.  Server may or may not populate this; clients
-   * should tolerate ``undefined``. */
-  architecture?: string;
-  /** True iff the loaded model has no chat template — generation runs
-   *  as flat completion (no roles, no bubbles).  Older servers omit
-   *  this; clients treat ``undefined`` as ``false`` (chat model). */
-  is_base_model?: boolean;
+  /** True iff the loaded model has no chat template. */
+  is_base_model: boolean;
   /** True iff a Jacobian lens artifact is fitted for the loaded model
    *  (a server-side path check, not a load).  Gates the token
-   *  drilldown's j-lens tab; ``undefined`` (older server) reads as
-   *  ``false`` and the tab shows the fit hint. */
-  jlens_fitted?: boolean;
+   *  drilldown's j-lens tab. */
+  jlens_fitted: boolean;
+  /** Live workspace-readout state (``POST .../lens/live``): the resolved
+   *  layer list while the live lens is enabled, ``null`` while off.
+   *  Rehydrates the WORKSPACE panel toggle across page reloads. */
+  live_lens_layers: number[] | null;
+  /** Resident SAE runtime capability and identity. */
+  sae_loaded: boolean;
+  sae_info: {
+    release: string;
+    revision?: string | null;
+    fingerprint?: string | null;
+    layer: number;
+    width: number;
+    sae_id?: string | null;
+    repo_id?: string | null;
+    neuronpedia_id?: string | null;
+  } | null;
+  /** True while per-token SAE discovery readout is enabled. */
+  live_sae: boolean;
+  /** CAA live toggle state (``POST .../probes/live``): whether per-token
+   *  monitor scoring feeds live consumers.  Off ⇒ probes report only the
+   *  end-of-gen aggregate (gates still force what they need). */
+  live_probe_scores: boolean;
   /** True iff the loaded model family supports assistant-role
    *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
-   *  talkie no). Drives whether the roles control is enabled. Older
-   *  servers omit this; treat ``undefined`` as ``false``. */
-  role_substitution_supported?: boolean;
-  /** True iff the family supports *user*-role substitution. Same family
-   *  set as the assistant side today. Treat ``undefined`` as ``false``. */
-  user_role_supported?: boolean;
+   *  talkie no). Drives whether the roles control is enabled. */
+  role_substitution_supported: boolean;
+  /** True iff the family supports *user*-role substitution. */
+  user_role_supported: boolean;
   /** The family's *standard* assistant-role label (e.g. Gemma ``model``,
-   *  ChatML ``assistant``), or ``null``/``undefined`` when the family can't
+   *  ChatML ``assistant``), or ``null`` when the family can't
    *  substitute the assistant side.  Seeds the assistant-role box so it
    *  shows the live default; a box value equal to this is treated as "no
    *  override" on send. */
-  default_assistant_role?: string | null;
+  default_assistant_role: string | null;
   /** The family's *standard* user-role label (``user`` everywhere today),
-   *  or ``null``/``undefined`` when unsupported.  Seeds the user-role box. */
-  default_user_role?: string | null;
+   *  or ``null`` when unsupported.  Seeds the user-role box. */
+  default_user_role: string | null;
+  /** True iff the session's validated scene grammar is active (the cast
+   *  model's stitcher renders — arbitrary seat sequences, seat toggle,
+   *  free commit seating). */
+  scene_mode: boolean;
+  /** True iff a committed thinking block can be rendered (scene mode +
+   *  family think delimiters).  Gates the composer's thinking box. */
+  thinking_input_supported: boolean;
+  /** True when the family template strips history thinking — a committed
+   *  thinking block lasts one turn.  Drives the composer warning. */
+  strips_history_thinking: boolean;
 }
 
 // -------------------------------------------------- jacobian lens --
+
+/** ``POST /sessions/{id}/lens/token/validate`` — a read-only check that a
+ *  J-lens word resolves to exactly one vocabulary token. */
+export interface LensTokenValidationJSON {
+  word: string;
+  token_id: number;
+}
 
 /** One vocabulary entry of a per-layer J-lens readout row. */
 export interface LensReadoutTokenJSON {
@@ -108,17 +134,24 @@ export interface LensReadoutTokenJSON {
   logprob: number;
 }
 
-/** One layer row of the workspace readout matrix. */
+/** One layer row of the J-lens readout matrix. */
 export interface LensReadoutLayerJSON {
   layer: number;
-  /** True iff the layer sits in the 40–90% depth workspace band (the
-   *  regime where the lens reads a verbalizable workspace rather than
-   *  early noise / late motor-copy). */
-  in_band: boolean;
   tokens: LensReadoutTokenJSON[];
 }
 
-/** ``GET /sessions/{id}/lens/token-readout`` — the J-lens workspace
+/** One token of the layer-aggregated J-lens readout: per-layer softmax
+ *  → mean probability (``strength``, 0..1) + the probability-mass-
+ *  weighted depth center of mass (``com``, 0 = first block, 1 = last) and
+ *  its std (``spread``). */
+export interface LensAggregateTokenJSON {
+  token: string;
+  strength: number;
+  com: number;
+  spread: number;
+}
+
+/** ``GET /sessions/{id}/lens/token-readout`` — the J-lens
  *  readout at one decode step of a loom node (the forward that produced
  *  the clicked token). */
 export interface LensTokenReadoutJSON {
@@ -130,7 +163,143 @@ export interface LensTokenReadoutJSON {
   /** The steering expression the replay ran under, or ``null`` for an
    *  unsteered read (no recipe steering, or ``steered=false``). */
   steering: string | null;
+  /** Layer-aggregated view of the same logits across all requested layers,
+   *  strength-descending.  Empty from a pre-aggregate server. */
+  aggregate?: LensAggregateTokenJSON[];
   layers: LensReadoutLayerJSON[];
+}
+
+/** ``POST/GET /sessions/{id}/lens/fit`` — the background lens fit's
+ *  polled status.  ``running`` false + ``finished_at`` set + no
+ *  ``error`` = the fit landed (refresh session info for
+ *  ``jlens_fitted``). */
+export interface LensFitStatusJSON {
+  running: boolean;
+  prompts_done: number;
+  prompts_total: number;
+  message: string | null;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  /** Layers the post-fit auto-enable turned live, when it ran. */
+  live_layers: number[] | null;
+}
+
+/** One usable artifact source. The ``source`` string is deliberately the
+ * same identifier accepted by the sibling ``use`` action. */
+export interface InstrumentSourceJSON {
+  source: string;
+  kind: "local" | "huggingface" | "saelens";
+  name: string;
+  active: boolean;
+  path?: string;
+  provider?: string;
+  repo_id?: string;
+  repo_revision?: string;
+  checkpoint?: string;
+  layer?: number;
+  features?: number;
+}
+
+export interface LensFetchStatusJSON {
+  running: boolean;
+  source: string | null;
+  message: string | null;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  live_layers: number[] | null;
+}
+
+// ------------------------------------------------ sparse autoencoder --
+
+export interface SaeFeatureJSON {
+  id: number;
+  activation: number;
+  label?: string | null;
+  /** Cached Neuronpedia ``maxActApprox`` — the strength unit.  Render
+   *  ``activation / max_act`` as the normalized 0..1 strength; ``null``
+   *  until the metadata backfill lands (then bars fall back to the
+   *  panel-shared raw scale). */
+  max_act?: number | null;
+}
+
+/** ``POST .../sae/features/metadata`` — the discovery backfill.  Fetches
+ *  and caches Neuronpedia metadata for up to 64 feature ids; ids without
+ *  metadata after the fetch are absent from the response. */
+export interface SaeFeatureMetaResponse {
+  features: Record<string, { label: string | null; max_act: number | null }>;
+}
+
+export interface SaeLoadStatusJSON {
+  running: boolean;
+  release: string | null;
+  message: string | null;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  info: SessionInfo["sae_info"];
+}
+
+export interface SaeTrainStatusJSON {
+  running: boolean;
+  name: string | null;
+  tokens_done: number;
+  tokens_total: number;
+  message: string | null;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  info: SessionInfo["sae_info"];
+}
+
+export interface SaeTokenReadoutJSON {
+  node_id: string;
+  raw_index: number;
+  token_id: number;
+  token_text: string;
+  steering: string | null;
+  layer: number;
+  features: SaeFeatureJSON[];
+}
+
+// --------------------------------------- loom-owned token captures --
+
+export type TokenReadoutProvenance = "captured" | "replayed";
+
+/** Probe measurements recorded by the generation that authored the token. */
+export interface CapturedProbeReadoutJSON {
+  provenance: TokenReadoutProvenance;
+  scores?: Record<string, number>;
+  per_layer_scores?: Record<string, Record<string, number>>;
+  readings?: Record<string, ProbeReadingJSON>;
+}
+
+/** J-LENS measurements recorded at the original decode step.  ``layers``
+ * deliberately matches the token-readout endpoint shape, so historical UI
+ * surfaces do not need a second cache-only representation. */
+export interface CapturedLensReadoutJSON {
+  provenance: TokenReadoutProvenance;
+  source: string | null;
+  steering: string | null;
+  layers: LensReadoutLayerJSON[];
+  aggregate: LensAggregateTokenJSON[];
+}
+
+/** SAE measurements recorded at the original decode step. */
+export interface CapturedSaeReadoutJSON {
+  provenance: TokenReadoutProvenance;
+  source: string | null;
+  steering: string | null;
+  layer: number | null;
+  features: SaeFeatureJSON[];
+}
+
+/** Canonical rich measurement record owned by a loom token row. */
+export interface TokenCapturedJSON {
+  probes?: CapturedProbeReadoutJSON;
+  lens?: CapturedLensReadoutJSON;
+  sae?: CapturedSaeReadoutJSON;
 }
 
 // ----------------------------------------------------- manifolds --
@@ -209,12 +378,11 @@ export interface ManifoldFitInfo {
   method: string;
   feature_space: string;
   node_count: number;
-  nodes_sha256?: string;
+  nodes_sha256: string;
   /** Discriminator: ``authored`` for hand-placed coords, ``pca`` /
    *  ``spectral`` for coords derived from per-node activations, ``baked``
-   *  for a corpus-less precomputed direction.  Older servers may omit
-   *  this; treat ``undefined`` as ``"authored"``. */
-  fit_mode?: "authored" | "pca" | "spectral" | "auto" | "baked";
+   *  for a corpus-less precomputed direction. */
+  fit_mode: "authored" | "pca" | "spectral" | "auto" | "baked";
   /** Discover-mode only.  ``max_dim``/``var_threshold`` for PCA;
    *  ``max_dim``/``k_nn``/``bandwidth``/``reference_layer`` for spectral. */
   hyperparams?: Record<string, number | string>;
@@ -238,11 +406,10 @@ export interface ManifoldInfo {
   node_coords: number[][];
   /** Per-node assistant-role substitution recorded on the manifold,
    *  aligned with ``node_labels``.  ``null`` for a given node means
-   *  "pooled under the standard assistant baseline" (the legacy
-   *  default).  An all-``null`` array (or absent) marks a non-role
+   *  "pooled under the standard assistant baseline".  An all-``null`` array marks a non-role
    *  manifold; any non-``null`` entry marks a persona / role-paired
    *  manifold. */
-  node_roles?: (string | null)[];
+  node_roles: (string | null)[];
   fitted_models: string[];
   /** True iff a tensor for the loaded session model is present. */
   fitted_for_session: boolean;
@@ -253,25 +420,20 @@ export interface ManifoldInfo {
    *  ``spectral`` for coords derived per-model from activations, ``auto``
    *  for a discover folder whose flat-vs-curved geometry is resolved
    *  per-model at fit time, ``baked`` for a corpus-less precomputed
-   *  direction.  Older servers may omit this; treat ``undefined`` as
-   *  ``"authored"``. */
-  fit_mode?: "authored" | "pca" | "spectral" | "auto" | "baked";
+   *  direction. */
+  fit_mode: "authored" | "pca" | "spectral" | "auto" | "baked";
   /** The geometry an ``auto`` folder resolved to for the loaded model —
    *  ``"pca"`` (flat) / ``"spectral"`` (curved) once fitted, ``null`` when
    *  not yet fitted (geometry unknown → show in both rack drawers).  For a
-   *  non-``auto`` folder this mirrors ``fit_mode``.  Absent on older
-   *  servers. */
-  resolved_fit_mode?: "pca" | "spectral" | "authored" | "baked" | null;
+   *  non-``auto`` folder this mirrors ``fit_mode``. */
+  resolved_fit_mode: "pca" | "spectral" | "authored" | "baked" | null;
   /** True for ``pca`` / ``spectral`` (coords derived per-model), false
-   *  for ``authored``.  Server-supplied; absent on older servers. */
-  is_discover?: boolean;
+   *  for ``authored``. */
+  is_discover: boolean;
   /** Category-valued tags off ``manifold.json`` (e.g. ``register`` /
    *  ``cultural``).  Drives the category grouping in the shared RackDrawer.
-   *  NOTE: the ``GET /manifolds`` list serializer currently omits this
-   *  (``manifold_summary`` doesn't emit ``tags``), so it's usually
-   *  absent on the wire today — grouping degrades to "Other" until the
-   *  server adds the field. */
-  tags?: string[];
+   *  Current list and detail routes always emit it. */
+  tags: string[];
   /** Resting steering coefficient hint for a concept axis.  Read by
    *  ``recommendedAlpha`` (defaults to 0.5 when absent).  Not currently
    *  emitted by the list serializer — provenance for a future field. */
@@ -279,7 +441,7 @@ export interface ManifoldInfo {
   /** Discover-mode only: the knobs the fit (will) use.  Empty / absent
    *  on authored folders.  PCA accepts ``max_dim`` / ``var_threshold``;
    *  spectral accepts ``max_dim`` / ``k_nn`` / ``bandwidth``. */
-  hyperparams?: Record<string, number | string>;
+  hyperparams: Record<string, number | string>;
   /** Detail-only: full node specs with statement corpora.  In discover
    *  mode each node's ``coords`` is either the derived per-model layout
    *  (when a fit exists) or ``null`` (pending fit). */
@@ -395,32 +557,15 @@ export interface CreateDiscoverManifoldRequest {
   hyperparams?: Record<string, number | string>;
 }
 
-/** One ``{user, assistant}`` chat-turn template. The slot token lives in
- *  the assistant turn (read off its last content token); the user turn is
- *  shared common-mode across nodes and carries no slot. */
-export interface TemplatePairSpec {
-  user: string;
-  assistant: string;
-}
-
-/** Body for POST /saklas/v1/manifolds/templated.
- *
- *  Author a *templated* discover manifold: the server fills ``slot`` across
- *  ``values`` (one node per value) over every ``pairs`` template, so the node
- *  corpora are the slot-filled assistant turns and the templates' user turns
- *  become the per-manifold elicitation prompts the fit pools against. The
- *  tool for categories one references rather than embodies — days, months,
- *  colours, directions. Pair with ``POST .../fit`` (``fit_mode`` auto suits
- *  cyclic categories). */
-export interface CreateTemplatedManifoldRequest {
+/** Body for POST /saklas/v1/manifolds/from-template. */
+export interface CreateManifoldFromTemplateRequest {
   namespace?: string;
   name: string;
   description?: string;
   fit_mode: "pca" | "spectral" | "auto";
-  slot: string;
-  values: string[];
-  pairs: TemplatePairSpec[];
+  template_ref: string;
   hyperparams?: Record<string, number | string>;
+  force?: boolean;
 }
 
 // ---- standalone templated-completion artifact (/saklas/v1/templates) ----
@@ -526,13 +671,14 @@ export interface GenerateManifoldRequest {
 
 /** Body for POST /saklas/v1/manifolds/{ns}/{name}/fit.
  *
- *  Authored folders only consume ``sae`` / ``sae_revision``; discover
+ *  Authored folders consume ``sae`` plus layer/force controls; discover
  *  folders additionally accept ``fit_mode`` / ``hyperparams`` overrides
  *  that get persisted into the folder before the fit runs so the cache
  *  key reflects the actual inputs. */
 export interface FitManifoldRequest {
   sae?: string | null;
-  sae_revision?: string | null;
+  layers?: number[] | "workspace" | "all" | null;
+  force?: boolean;
   fit_mode?: "pca" | "spectral" | "auto" | null;
   hyperparams?: Record<string, number | string> | null;
 }
@@ -557,35 +703,27 @@ export interface VectorListResponse {
 }
 
 export interface ExtractRequest {
-  name: string;
-  /** Either a string (concept name like "happy.sad"), a {pos, neg} pair,
-   * or a {pairs: [{positive, negative}, ...]} bundle. */
-  source?: unknown;
+  /** Concept represented by the positive node (or sole monopolar node). */
+  concept: string;
   baseline?: string | null;
-  dls?: boolean | null;
   sae?: string | null;
-  sae_revision?: string | null;
   /** Role-augmented extraction: replace the assistant-role label in
    * the chat template with this slug at extract time (e.g. "pirate").
    * The same substitution rides at steer time so the extract baseline
-   * matches the steer baseline.  The tensor lands under a
-   * ``_role-<slug>`` filename suffix and is steerable via the matching
-   * ``:role-<slug>`` variant.  Slug must match ``[a-z0-9._-]+``;
+   * matches the steer baseline.  The canonical tensor records the uniform
+   * role and is addressed via the matching ``:role-<slug>`` alias; the
+   * reserved ``_role-*`` filename is not written. Slug must match
+   * ``[a-z0-9._-]+``;
    * mutually exclusive with ``sae``. */
   role?: string | null;
-  /** Destination namespace for the extracted vector folder.  ``null`` /
-   *  unset lands the vector under ``~/.saklas/vectors/local/<canonical>/``
-   *  — the historical behavior.  Any other value relocates the folder
-   *  to ``~/.saklas/vectors/<namespace>/<canonical>/``.  Parity with
-   *  the manifold builder's namespace control. */
+  /** Destination namespace for the extracted 1/2-node manifold folder.
+   *  ``null`` / unset lands under
+   *  ``~/.saklas/manifolds/local/<canonical>/``; another value selects
+   *  ``manifolds/<namespace>/<canonical>/``. */
   namespace?: string | null;
-  /** Force a fresh extraction even if a cached tensor / statements
-   *  file exists at the destination.  Wires to the engine's
-   *  ``force_statements`` flag.  Default ``false`` keeps the cache-hit
-   *  short-circuit.  Parity with the manifold builder's overwrite
-   *  control. */
+  /** Regenerate/re-author the manifold corpus and refit even when a valid
+   *  fitted tensor exists. Default false keeps the exact cache hit. */
   force?: boolean;
-  register?: boolean;
 }
 
 export interface ExtractResponse {
@@ -656,6 +794,23 @@ export interface ProbeInfo {
    *  Backs the mini-map node dots + per-token trajectory lookup.  ``null``
    *  on an unfitted discover manifold (no per-model layout yet). */
   node_coords?: number[][] | null;
+  /** True for a pinned J-lens token probe (the READOUT channel — the one
+   *  coordinate axis is ``strength`` in [0,1], the mean fitted-layer probability;
+   *  per-layer traces are ``(p_l,)`` over all fitted layers; no subspace
+   *  geometry behind it). */
+  lens?: boolean;
+  /** The lens probe's word (``jlens/<word>``). */
+  word?: string;
+  /** The lens probe's resolved single-token vocabulary id. */
+  token_id?: number | null;
+  /** True for a pinned resident SAE feature probe. */
+  sae?: boolean;
+  feature_id?: number | null;
+  label?: string | null;
+  /** SAE probes only — the strength unit.  Coords (and so sparklines /
+   *  gate scalars) are ``activation / max_act`` when set, raw activation
+   *  when null (no Neuronpedia metadata). */
+  max_act?: number | null;
 }
 
 export interface ProbeListResponse {
@@ -689,6 +844,14 @@ export interface ProbeReadingJSON {
   fraction_per_layer: Record<string, number>;
   coords_per_layer: Record<string, number[]>;
   residual_per_layer: Record<string, number>;
+  /** Per-axis depth center of mass (+ std) of the per-layer coordinate
+   *  trace — where in the layer stack the probe reads, in normalized
+   *  depth (0 = first block, 1 = last).  Mass per layer is
+   *  ``share_weight_L · |coord_L|``.  Aligned with ``coords``; empty when
+   *  the reading carries no per-layer trace (lean per-token modes) or the
+   *  server predates the field. */
+  depth_com?: number[];
+  depth_spread?: number[];
   /** Per-layer whitened subspace coords (the live point + trail for the
    *  probe-inspector geometry plot).  Keyed by layer-index string -> that
    *  layer's ``(R,)`` whitened coords, in the same frame as the geometry
@@ -867,20 +1030,48 @@ export interface WSGenerateRequest {
    *  together. */
   commit_role?: "user" | "assistant" | null;
   commit_text?: string | null;
+  /** Optional committed thinking block riding a commit (any seat) —
+   *  stored on the node's ``thinking_text`` and rendered through the
+   *  family think delimiters (400 when the family can't carry it). */
+  commit_thinking?: string | null;
+  /** Cast model: which seat the generated turn occupies.  ``"user"``
+   *  renders the generation prompt as a user-seat header (labeled by
+   *  ``sampling.user_role``) and lands the node with ``role="user"`` +
+   *  a stamped recipe.  Absent/null = assistant.  Needs scene mode. */
+  generate_seat?: "user" | "assistant" | null;
+}
+
+export type ChatRole = "user" | "assistant";
+
+/** Native composer submission. The authored and generated structural roles
+ * are independent; omit ``generated_role`` for an append-only action. */
+export interface WSSubmitRequest {
+  type: "submit";
+  text?: string | null;
+  authored_role?: ChatRole | null;
+  generated_role?: ChatRole | null;
+  steering?: string | null;
+  sampling?: WSSampling | null;
+  thinking?: boolean | null;
+  authored_thinking?: string | null;
+  raw?: boolean;
+  parent_node_id?: string | null;
+  n?: number;
+  recipe_override?: string | null;
 }
 
 export interface WSStopRequest {
   type: "stop";
 }
 
-export type WSClientMessage = WSGenerateRequest | WSStopRequest;
+export type WSClientMessage = WSGenerateRequest | WSSubmitRequest | WSStopRequest;
 
 export interface WSStartedEvent {
   type: "started";
   generation_id: string;
-  /** Loom: node id receiving this gen's tokens.  Optional for backward
-   * compat with the pre-phase-2 single-path server. */
-  node_id?: string | null;
+  node_id: string | null;
+  sibling_index: number;
+  sibling_count: number;
 }
 
 /** Logit-pass (v2.3): one alternative the model considered at this
@@ -911,8 +1102,12 @@ export interface WSTokenEvent {
   /** Logit-pass: chosen-token logprob under the post-sampler distribution.
    *  Populated whenever the engine's log_softmax ran (any ``on_token``
    *  consumer or an explicit ``logprobs``/``return_top_k`` request).
-   *  Absent on legacy / replayed events. */
+   *  Absent on current uncaptured events. */
   logprob?: number | null;
+  /** Per-token perplexity under the sampled distribution.  The native WS
+   *  explicitly opts into this channel so the workbench status and exported
+   *  turn provenance are backed by the engine rather than reconstructed. */
+  perplexity?: number | null;
   /** Logit-pass: top-K alternatives sorted by descending logprob.  Length
    *  matches ``SamplingConfig.return_top_k`` when populated, else absent.
    *  The chosen token may or may not appear in this list depending on
@@ -920,22 +1115,36 @@ export interface WSTokenEvent {
   top_alts?: TokenAltJSON[] | null;
   /** Logit-pass: raw decode-step index — the join key a logit fork slices
    *  ``raw_token_ids`` on.  Rides the ``token`` event directly; absent on
-   *  legacy / replayed events. */
+   *  current uncaptured events. */
   raw_index?: number | null;
   /** Loom: node id this token belongs to.  Routes the token to the right
    * sibling render during n-way regen.  Optional. */
-  node_id?: string | null;
+  node_id: string | null;
+  /** Canonical rich measurement record. The identical object is persisted on
+   * the loom token row; legacy scalar/readout fields below remain temporary
+   * compatibility aliases. */
+  captured?: TokenCapturedJSON;
   /** Per-attached-probe reading for this token — every probe shape (a
    *  2-node concept axis is the rank-1 case).  Keys are probe names; values
    *  are the full ``ProbeReadingJSON``.  Omitted entirely when no probe is
    *  attached, so clients read it defensively.  Distinct from ``scores``
    *  (the magnitude-weighted axis-0 scalar the highlight tint still uses). */
   probe_readings?: Record<string, ProbeReadingJSON>;
-}
-
-export interface WSDoneResultPerToken {
-  token_idx: number;
-  probes: Record<string, number>;
+  /** Live J-lens readout for this decode step — present only
+   *  while the session's live lens is enabled (``POST .../lens/live``).
+   *  Keys are layer-index strings (same convention as
+   *  ``per_layer_scores``); values the top-k ``[token, score]`` pairs,
+   *  descending by per-layer softmax probability. Feeds the WORKSPACE panel. */
+  lens_readout?: Record<string, [string, number][]>;
+  /** Layer-aggregated view of the same step's lens readout —
+   *  ``[token, strength, com, spread]`` 4-arrays, strength-descending
+   *  (mean fitted-layer probability + probability-mass-weighted depth center of
+   *  mass).  Present under the same conditions as ``lens_readout``. */
+  lens_aggregate?: [string, number, number, number][];
+  /** Resident SAE top-k feature activations for this decode step.  Rows
+   *  carry the raw activation plus the cached ``max_act`` strength unit
+   *  (see :type:`SaeFeatureJSON`). */
+  sae_readout?: SaeFeatureJSON[];
 }
 
 export interface WSDoneResult {
@@ -947,11 +1156,11 @@ export interface WSDoneResult {
     completion_tokens: number;
     total_tokens: number;
   };
-  per_token_probes: WSDoneResultPerToken[];
   /** Logit-pass: per-turn mean chosen-token logprob over the assistant
    *  response span (thinking tokens excluded by construction).  Null when
    *  logprob capture wasn't live (replay / no on_token consumer). */
   mean_logprob?: number | null;
+  mean_surprise?: number | null;
   /** End-of-generation per-attached-probe aggregate — the same
    *  ``ProbeReadingJSON`` shape as the per-token stream (the aggregate is the
    *  reading pooled at the last-content token).  Keys are probe names.
@@ -963,7 +1172,9 @@ export interface WSDoneEvent {
   type: "done";
   result: WSDoneResult;
   /** Loom: node id this gen finalised. */
-  node_id?: string | null;
+  node_id: string | null;
+  sibling_index: number;
+  sibling_count: number;
 }
 
 export interface WSErrorEvent {
@@ -978,18 +1189,19 @@ export interface WSErrorEvent {
 /** Wire-shape mirror of saklas.core.loom.LoomNode.  Optional fields are
  * absent on the wire when null/empty server-side to keep payloads slim. */
 /** One token-row inside a node's ``tokens`` / ``thinking_tokens`` array.
- *  Server-side ``TokenScoreDict`` is loose (``dict[str, Any]``); the
+ *  Server-side token rows have required identity/score fields plus
+ *  feature-dependent optional capture channels; the
  *  fields below are the ones :meth:`session._token_tap` stamps and the
  *  ones the webui knows how to consume.  All optional because the engine
  *  legitimately omits some on certain paths (e.g. ``top_alts`` only when
  *  ``return_top_k > 0``; ``probes`` / ``per_layer_scores`` only when the
  *  monitor has probes loaded; ``raw_index`` is stamped at finalize and
- *  absent for legacy / transcript-loaded nodes). */
+ *  absent for transcript-imported nodes). */
 export interface LoomTokenRowJSON {
-  token_id?: number;
-  text?: string;
-  logprob?: number | null;
-  perplexity?: number | null;
+  token_id: number;
+  text: string;
+  logprob: number | null;
+  perplexity: number | null;
   top_alts?: { id: number; text: string; logprob: number }[];
   raw_index?: number | null;
   /** Per-token magnitude-weighted aggregate probe score
@@ -1000,6 +1212,9 @@ export interface LoomTokenRowJSON {
    *  keyed by stringified layer index.  Drives the token-drilldown
    *  drawer's heatmap on rehydrated turns. */
   per_layer_scores?: Record<string, Record<string, number>>;
+  /** Rich channels captured by the original generation. This survives tree
+   * rehydration and explicit loom save/load without replaying the model. */
+  captured?: TokenCapturedJSON;
 }
 
 export interface LoomNodeJSON {
@@ -1010,43 +1225,48 @@ export interface LoomNodeJSON {
   /** Per-turn role-substitution label (roleplay scaffold) — the custom
    *  role this turn was *sent* with (e.g. "captain" / "pirate"), or null
    *  for the standard role.  Drives the bubble heading + loom glyph.
-   *  Older servers omit this; treat undefined as null. */
-  role_label?: string | null;
-  /** Assistant nodes only.  Mirrors saklas.core.loom.Recipe. */
-  recipe?: {
-    steering?: string | null;
-    sampling?: WSSampling | null;
-    thinking?: boolean | null;
-    seed?: number | null;
-    probes?: string[];
-    probe_hashes?: Record<string, string>;
+   *  Null means the standard role. */
+  role_label: string | null;
+  /** The turn's verbatim thinking block — committed by the author, or the
+   *  decoded thinking channel of a generated node (stamped at finalize).
+   *  Strip families re-render it for one turn only. Null means no block. */
+  thinking_text: string | null;
+  /** Generated nodes only, irrespective of structural role. Mirrors Recipe. */
+  recipe: {
+    steering: string | null;
+    sampling: WSSampling | null;
+    thinking: boolean | null;
+    seed: number | null;
+    probes: string[];
+    probe_hashes: Record<string, string>;
   } | null;
-  aggregate_readings?: Record<string, number>;
-  applied_steering?: string | null;
-  finish_reason?: string | null;
-  starred?: boolean;
-  notes?: string;
-  created_at?: number;
-  edited_at?: number | null;
-  edit_count?: number;
+  aggregate_readings: Record<string, number>;
+  applied_steering: string | null;
+  finish_reason: string | null;
+  starred: boolean;
+  notes: string;
+  created_at: number;
+  edited_at: number | null;
+  edit_count: number;
   /** Logit-pass: mean chosen-token logprob over the response span when
-   *  logprob capture was live; absent on legacy / replayed nodes.  Drives
+   *  logprob capture was live; absent on current uncaptured nodes.  Drives
    *  the loom sidebar's surprise edge-weighting and the
    *  ``sort:surprise`` / ``sort:confidence`` filter grammar. */
-  mean_logprob?: number | null;
+  mean_logprob: number | null;
+  mean_surprise: number | null;
   /** Per-token response-span rows captured during streaming.  Present
    *  when the server serializes the tree with ``include_tokens=True``
-   *  (the webui tree GET path).  Absent on legacy / transcript-loaded
+   *  (the webui tree GET path).  Absent on transcript-imported
    *  nodes that never streamed under the v2.4 token-row schema. */
-  tokens?: LoomTokenRowJSON[] | null;
+  tokens: LoomTokenRowJSON[] | null;
   /** Per-token thinking-span rows.  Same shape as ``tokens``; populated
    *  only when the engine emitted thinking content for the node. */
-  thinking_tokens?: LoomTokenRowJSON[] | null;
+  thinking_tokens: LoomTokenRowJSON[] | null;
   /** Raw decode-step ids the engine sampled, including suppressed
    *  delimiters and unmerged partial-UTF-8 bytes.  The forceable prefix
-   *  a logit fork replays from; ``null`` on legacy / transcript-loaded
+   *  a logit fork replays from; ``null`` on transcript-imported
    *  nodes, in which case the fork affordance falls back to disabled. */
-  raw_token_ids?: number[] | null;
+  raw_token_ids: number[] | null;
 }
 
 /** Full tree dump returned by GET /sessions/{id}/tree.
@@ -1056,7 +1276,8 @@ export interface LoomNodeJSON {
  *  child-id map.  Clients pivot the node list into a dict keyed by id
  *  for the in-memory cache. */
 export interface LoomTreeJSON {
-  tree_format?: number;
+  tree_format: number;
+  saklas_version: string;
   root_id: string;
   active_node_id: string;
   rev: number;
@@ -1064,9 +1285,24 @@ export interface LoomTreeJSON {
   /** parent_id → ordered list of child ids. */
   children_of: Record<string, string[]>;
   /** Optional model identifier the tree was generated against. */
-  model_id?: string | null;
-  session_id?: string | null;
-  name?: string | null;
+  model_id: string | null;
+  session_id: string | null;
+  name: string | null;
+  /** Cast roster (phase 3): label → member.  Absent when empty. */
+  cast: Record<string, CastMemberJSON>;
+}
+
+/** One cast-roster member — a named label plus its standing recipe
+ *  fragment (the weakest steering tier at generation).  Mirrors
+ *  ``saklas.core.loom.CastMember``. */
+export interface CastMemberJSON {
+  recipe?: {
+    steering?: string | null;
+    thinking?: boolean | null;
+    seed?: number | null;
+  } | null;
+  notes?: string;
+  origin?: "structural" | "observed" | "configured";
 }
 
 /** Phase-5 cross-branch diff response (server side: NodeDiff +
@@ -1211,31 +1447,26 @@ export interface WSTreeMutatedEvent {
     | "begin_assistant"
     | "add_user"
     | "finalize"
+    | "cast"
     | string;
   added?: LoomNodeJSON[];
   removed?: string[];
   updated?: LoomNodeJSON[];
   active_node_id?: string | null;
   rev: number;
+  /** ``op="cast"`` only: the full roster inlined (label → member) so
+   *  clients reconcile without a refetch. */
+  cast?: Record<string, CastMemberJSON>;
 }
 
 /** Fired at the start of each branch in an n-way generate so the client
  * can allocate render slots before token events arrive. */
-export interface WSNodeCreatedEvent {
-  type: "node_created";
-  node_id: string;
-  parent_id: string | null;
-  role: "user" | "assistant" | "system";
-  rev: number;
-}
-
 export type WSServerMessage =
   | WSStartedEvent
   | WSTokenEvent
   | WSDoneEvent
   | WSErrorEvent
-  | WSTreeMutatedEvent
-  | WSNodeCreatedEvent;
+  | WSTreeMutatedEvent;
 
 // ----------------------------------------------------- chat / UI --
 
@@ -1253,19 +1484,17 @@ export interface TokenScore {
   /** Full per-axis domain-frame coordinates per probe, captured live from the
    *  ``probe_readings`` wire channel.  Backs per-PC token highlighting (the
    *  ``personas[3]`` axis targets) — axis 0 already lives in ``probes``, so
-   *  this is populated only for multi-axis (rank-R) probes.  The end-of-gen
-   *  ``per_token_probes`` pass is axis-0 only, so it survives ``done`` and
-   *  in-session navigation (held by reference in ``tokenScoreCache``) but is
-   *  absent after a transcript / localStorage reload. */
+   *  this is populated only for multi-axis (rank-R) probes.  It survives
+   *  in-session navigation by reference in ``tokenScoreCache`` but is absent
+   *  after a transcript / localStorage reload. */
   coordsByProbe?: Record<string, number[]>;
   /** Token-id from the WS event when available — useful for debugging. */
   tokenId?: number | null;
   /** Per-layer × per-probe heatmap data captured during streaming.
    * Drives the click-token drilldown drawer. */
   perLayerScores?: Record<string, Record<string, number>>;
-  /** Logit-pass: chosen-token post-sampler logprob.  Absent on legacy /
-   *  replayed turns when ``return_top_k`` wasn't enabled and the engine
-   *  didn't run log_softmax.  Drives the inline ``surprise`` highlight
+  /** Logit-pass: chosen-token post-sampler logprob. Absent on imported
+   *  turns and when no consumer requested log-softmax capture. Drives the inline ``surprise`` highlight
    *  mode and the token drilldown's logits tab. */
   logprob?: number | null;
   /** Logit-pass: top-K alternatives captured at this position (descending
@@ -1273,9 +1502,11 @@ export interface TokenScore {
   topAlts?: TokenAltJSON[] | null;
   /** Raw decode-step index of this token in the backing node's
    *  ``raw_token_ids`` — the join key a logit fork slices on.  Absent on
-   *  legacy / transcript-loaded nodes (engine pre-dates raw-id capture),
+   *  transcript-imported nodes (engine pre-dates raw-id capture),
    *  in which case the token can't be forked. */
   rawIndex?: number | null;
+  /** Loom-owned rich measurements from the original decode step. */
+  captured?: TokenCapturedJSON;
 }
 
 export interface ChatTurn {
@@ -1287,6 +1518,9 @@ export interface ChatTurn {
   roleLabel?: string | null;
   /** Loom node backing this turn, when the server tree is active. */
   nodeId?: string | null;
+  /** Whether a model run authored this turn. Used for generation artifacts
+   *  and analysis only; never to name, style, or gate rerolling the role. */
+  generated?: boolean;
   /** True iff any thinking content was emitted. */
   thinking?: boolean;
   /** Visible response tokens with score data. */
@@ -1294,8 +1528,7 @@ export interface ChatTurn {
   /** Thinking-only tokens with score data (rendered inside the
    * <Collapsible> equivalent). */
   thinkingTokens?: TokenScore[];
-  /** A/B-mode pair: the unsteered shadow turn, rendered side-by-side
-   * when present.  Always role: "assistant". */
+  /** A/B-mode pair: the unsteered same-seat shadow turn. */
   abPair?: ChatTurn;
   /** Steering expression applied — round-trips through parseExpression. */
   appliedSteering?: string | null;
@@ -1310,7 +1543,7 @@ export interface ChatTurn {
   perplexity?: number;
   /** Logit-pass: per-turn mean chosen-token logprob (response span only,
    *  thinking excluded).  Populated from the WS ``done`` event; absent for
-   *  legacy / replayed turns. */
+   *  current uncaptured turns. */
   meanLogprob?: number | null;
 }
 
@@ -1383,8 +1616,35 @@ export interface ManifoldSteerEntry {
   enabled: boolean;
 }
 
-/** A racked steering term — subspace (flat) or manifold (curved). */
-export type SteerEntry = SubspaceSteerEntry | ManifoldSteerEntry;
+/** J-lens token steering term — pushes along the lens direction
+ *  ``W_U[v] @ J_l`` over all fitted layers (``α jlens/<word>``). The rack
+ *  key is the full ``jlens/<word>`` atom.  Per-chip ``alpha`` (not the
+ *  shared ``subspaceAlong`` master): lens atoms run hotter than concept
+ *  vectors — α≈0.3 is the coherent sweet spot, α≥0.5 over-steers into
+ *  repetition — so each token needs its own dial. */
+export interface JLensSteerEntry {
+  mode: "jlens";
+  /** Push coefficient (the plain-atom α slot). */
+  alpha: number;
+  trigger: Trigger;
+  enabled: boolean;
+}
+
+/** Resident SAE decoder-row steering term (``α sae/<id>``). */
+export interface SaeSteerEntry {
+  mode: "sae";
+  alpha: number;
+  trigger: Trigger;
+  enabled: boolean;
+}
+
+/** A racked steering term — subspace (flat), manifold (curved), or a
+ *  J-lens token atom. */
+export type SteerEntry =
+  | SubspaceSteerEntry
+  | ManifoldSteerEntry
+  | JLensSteerEntry
+  | SaeSteerEntry;
 
 // ----------------------------------------------------- extract pairs --
 
@@ -1419,6 +1679,10 @@ export interface ProbeRackEntry {
   /** End-of-gen aggregate the ``done`` event lands — the settled reading.
    *  Null between gens; set on ``done``, cleared on the next ``started``. */
   aggregate: ProbeReadingJSON | null;
+  /** Scalar aggregate restored from the selected saved Loom node.  The tree
+   * keeps this portable summary but not the full per-layer reading; cards use
+   * it instead of presenting a false zero after reload/navigation. */
+  savedAggregate: number | null;
   /** Most-recent per-token nearest list (ascending distance).  Drives the
    *  inline nearest readout + mini-map hover; empty until the first token. */
   nearest: [string, number][];
@@ -1565,7 +1829,11 @@ export type DrawerName =
    *  + multi-turn contexts) and score the restricted-choice value
    *  distribution (steering-aware before/after). Reached from the workspace
    *  rail's "manifolds → templates…" entry. */
-  | "template_lab";
+  | "template_lab"
+  /** Cast manager (phase 3) — the tree's roster of named labels with
+   *  standing steering recipes.  Reached from the composer cast row's
+   *  "cast…" launcher.  A steering surface, not a chat feature. */
+  | "cast";
 
 export interface DrawerState {
   open: DrawerName | null;

@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from saklas.io.paths import safe_model_id
+from saklas.io.paths import safe_model_id, unsafe_model_id
 from saklas.io.selectors import invalidate as _invalidate_selector_cache
 
 
@@ -28,7 +28,7 @@ def _resolve_model_hint(safe_id: str) -> str:
     resolved — callers should surface the ``--model-hint`` flag as the
     escape hatch.
     """
-    hf_id = safe_id.replace("__", "/")
+    hf_id = unsafe_model_id(safe_id)
     try:
         from transformers import AutoConfig
     except ImportError as e:  # pragma: no cover — transformers is a hard dep
@@ -72,7 +72,7 @@ def export_gguf_manifold(
         whose folder is restored on refresh)
     """
     from saklas.io.gguf_io import write_gguf_profile
-    from saklas.io.manifolds import ManifoldFolder, hash_manifold_files
+    from saklas.io.manifolds import ManifoldFolder
     from saklas.io.paths import (
         manifold_dir, parse_tensor_filename, tensor_filename,
     )
@@ -80,7 +80,10 @@ def export_gguf_manifold(
     from saklas.core.vectors import folded_vector_directions
 
     mdir = manifold_dir(ns, name)
-    mf = ManifoldFolder.load(mdir)
+    # Preflight needs folder identity/source and fitted filenames only.  Each
+    # selected raw tensor is integrity-checked by ``load_manifold`` below; do
+    # not eagerly hash unrelated models, SAE variants, or prior GGUF exports.
+    mf = ManifoldFolder.load(mdir, verify_manifest=False)
 
     raw_models: set[str] = set()
     for tensor in mdir.glob("*.safetensors"):
@@ -116,7 +119,11 @@ def export_gguf_manifold(
 
     written: list[Path] = []
     for sid in targets:
-        manifold = load_manifold(mdir / tensor_filename(sid, release=None))
+        manifold = load_manifold(
+            mdir / tensor_filename(
+                sid, release=None, model_id_is_safe=True,
+            )
+        )
         try:
             profile = folded_vector_directions(manifold)
         except Exception as e:
@@ -136,7 +143,7 @@ def export_gguf_manifold(
         written.append(dest)
 
     if any(p.parent == mdir for p in written):
-        mf.write_metadata(files=hash_manifold_files(mdir))
+        mf.update_file_hashes(*(p for p in written if p.parent == mdir))
         _invalidate_selector_cache()
 
     return written

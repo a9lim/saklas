@@ -23,6 +23,7 @@ from saklas.core.mahalanobis import WhitenerError
 from saklas.core.session import (
     SaklasSession, VectorNotRegisteredError,
 )
+from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import parse_expr
 from saklas.core.triggers import Trigger
 from saklas.core.vectors import project_profile
@@ -186,7 +187,6 @@ class _Stub(SaklasSession):
     def __init__(self, profiles: dict[str, Any]) -> None:
         import threading
         self._profiles = dict(profiles)
-        self._steering_stack = []
         # v2.2: _push_steering / _pop_steering acquire _gen_lock and
         # consult _gen_phase + _internal_steering_pop.
         self._gen_lock = threading.RLock()
@@ -197,6 +197,7 @@ class _Stub(SaklasSession):
         self.events = EventBus()
         self._rebuild_calls: list[dict[str, Any]] = []
         self._rebuild_entries: list[dict[str, Any]] = []
+        self._steering_composer = SteeringComposer(self)
         # Build a covering whitener over the union of profile layers/dim so
         # the projection materializer → ``project_profile`` has its mandatory
         # whitener.  ``None`` when there are no profiles (degenerate stub).
@@ -213,7 +214,7 @@ class _Stub(SaklasSession):
         return self._stub_whitener
 
     def _rebuild_steering_hooks(self) -> None:
-        flat = self._get_steering_composer().flatten_steering_stack()
+        flat = self._steering_composer.flatten_stack()
         for name in flat:
             if name not in self._profiles:
                 raise VectorNotRegisteredError(f"No vector registered for '{name}'")
@@ -380,6 +381,35 @@ class TestLayerMeansLazy:
         out2 = SaklasSession.layer_means.fget(s)  # pyright: ignore[reportOptionalCall]  # same as above
         assert out2 is built
         assert len(calls) == 1
+
+    def test_whitener_derives_means_from_single_neutral_load(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Whitener bootstrap shares one neutral-cache read with mean derivation."""
+        from saklas.core.session import SaklasSession
+        from saklas.io import alignment as alignment_mod
+
+        s = _Stub({"a": _profile_a()})
+        s._model = object()  # pyright: ignore[reportAttributeAccessIssue]
+        s._tokenizer = object()  # pyright: ignore[reportAttributeAccessIssue]
+        s._layers = []  # pyright: ignore[reportAttributeAccessIssue]
+        s._model_info = {"model_id": "test/model"}
+        s._layer_means = {}
+        calls: list[str] = []
+        acts = {0: torch.tensor([[1.0, 2.0], [3.0, 6.0], [5.0, 10.0]])}
+
+        def _load(*args: Any, **kwargs: Any) -> dict[int, torch.Tensor]:
+            calls.append(kwargs["model_id"])
+            return acts
+
+        monkeypatch.setattr(
+            alignment_mod, "load_or_compute_neutral_activations", _load,
+        )
+        whitener = SaklasSession._build_whitener_from_cache_or_compute(s)
+
+        assert whitener is not None
+        assert calls == ["test/model"]
+        assert torch.equal(s._layer_means[0], acts[0].mean(dim=0))
 
 
 class TestComputeDlsAxesBipolarGuard:

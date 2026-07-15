@@ -41,20 +41,30 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import tempfile
 from abc import ABC, abstractmethod
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence, cast
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from saklas.core.errors import SaklasError
+from saklas.core.errors import SaklasError, is_out_of_memory_error
 
 if TYPE_CHECKING:
     from saklas.core.mahalanobis import LayerWhitener
+    from saklas.io.alignment import LayerAlignment
 
 log = logging.getLogger(__name__)
+
+# Numerical fitting semantics are independent of the folder/tensor wire
+# format. Bump this whenever PCA/Fisher selection, topology choice, RBF/sigma
+# fitting, DLS, or share allocation changes incompatibly.
+MANIFOLD_FIT_POLICY_VERSION = 1
 
 
 class UnknownManifoldLabelError(KeyError, SaklasError):
@@ -578,32 +588,115 @@ class CustomDomain(ManifoldDomain):
         return coords
 
     def to_spec(self) -> dict[str, Any]:
-        spec: dict[str, Any] = {"type": "custom", "embed_dim": self._embed_dim}
-        if self._bounds is not None:
-            spec["bounds"] = [[lo, hi] for lo, hi in self._bounds]
-        return spec
+        return {
+            "type": "custom",
+            "embed_dim": self._embed_dim,
+            "bounds": (
+                None
+                if self._bounds is None
+                else [[lo, hi] for lo, hi in self._bounds]
+            ),
+        }
+
+
+def validate_domain_spec(spec: Any) -> dict[str, Any]:
+    """Validate the exact current tagged-union domain wire shape."""
+    if not isinstance(spec, dict):
+        raise ValueError("manifold domain must be an object")
+    kind = spec.get("type")
+    if kind == "box":
+        if set(spec) != {"type", "axes"} or not isinstance(spec["axes"], list) or not spec["axes"]:
+            raise ValueError("box domain requires exactly type + non-empty axes")
+        for index, axis in enumerate(spec["axes"]):
+            if not isinstance(axis, dict) or set(axis) != {
+                "name", "periodic", "period", "lo", "hi",
+            }:
+                raise ValueError(f"box axis {index} has a non-current schema")
+            if not isinstance(axis["name"], str) or not axis["name"]:
+                raise ValueError(f"box axis {index} name must be non-empty")
+            if not isinstance(axis["periodic"], bool):
+                raise ValueError(f"box axis {index} periodic must be bool")
+            for key in ("period", "lo", "hi"):
+                value = axis[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise ValueError(f"box axis {index} {key} must be finite")
+            if float(axis["period"]) <= 0 or float(axis["hi"]) <= float(axis["lo"]):
+                raise ValueError(f"box axis {index} has invalid bounds/period")
+    elif kind == "sphere":
+        if set(spec) != {"type", "dim"} or isinstance(spec["dim"], bool) or not isinstance(spec["dim"], int) or spec["dim"] < 1:
+            raise ValueError("sphere domain requires exactly type + positive integer dim")
+    elif kind == "custom":
+        if set(spec) != {"type", "embed_dim", "bounds"}:
+            raise ValueError("custom domain requires exactly type, embed_dim, bounds")
+        dim = spec["embed_dim"]
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1:
+            raise ValueError("custom domain embed_dim must be a positive integer")
+        bounds = spec["bounds"]
+        if bounds is not None and (
+            not isinstance(bounds, list)
+            or len(bounds) != dim
+            or any(
+                not isinstance(row, list)
+                or len(row) != 2
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) for v in row)
+                or float(row[1]) <= float(row[0])
+                for row in bounds
+            )
+        ):
+            raise ValueError("custom domain bounds must be null or one finite [lo, hi] pair per dimension")
+    else:
+        raise ValueError(f"unknown manifold domain type {kind!r}")
+    return spec
+
+
+def normalize_domain_spec(spec: Any) -> dict[str, Any]:
+    """Normalize ergonomic authoring input into the exact persisted union."""
+    if not isinstance(spec, dict):
+        raise ValueError("manifold domain must be an object")
+    kind = spec.get("type")
+    if kind == "box" and set(spec) == {"type", "axes"} and isinstance(spec["axes"], list):
+        normalized = {
+            "type": "box",
+            "axes": [
+                {
+                    "name": axis.get("name", f"axis{index}"),
+                    "periodic": axis.get("periodic", False),
+                    "period": axis.get("period", 1.0),
+                    "lo": axis.get("lo", 0.0),
+                    "hi": axis.get("hi", 1.0),
+                }
+                for index, axis in enumerate(spec["axes"])
+                if isinstance(axis, dict)
+            ],
+        }
+    elif kind == "custom" and set(spec) <= {"type", "embed_dim", "bounds"}:
+        normalized = {**spec, "bounds": spec.get("bounds")}
+    else:
+        normalized = dict(spec)
+    return validate_domain_spec(normalized)
 
 
 def domain_from_spec(spec: dict[str, Any]) -> ManifoldDomain:
     """Build a :class:`ManifoldDomain` from a ``manifold.json`` domain object."""
-    kind = spec.get("type")
+    spec = validate_domain_spec(spec)
+    kind = spec["type"]
     if kind == "box":
         axes = [
             BoxAxis(
-                name=str(a.get("name", f"axis{i}")),
-                periodic=bool(a.get("periodic", False)),
-                period=float(a.get("period", 1.0)),
-                lo=float(a.get("lo", 0.0)),
-                hi=float(a.get("hi", 1.0)),
+                name=a["name"],
+                periodic=a["periodic"],
+                period=float(a["period"]),
+                lo=float(a["lo"]),
+                hi=float(a["hi"]),
             )
-            for i, a in enumerate(spec.get("axes", []))
+            for a in spec["axes"]
         ]
         return BoxDomain(axes)
     if kind == "sphere":
         return SphereDomain(int(spec["dim"]))
     if kind == "custom":
         return CustomDomain(
-            int(spec["embed_dim"]), bounds=spec.get("bounds"),
+            spec["embed_dim"], bounds=spec["bounds"],
         )
     raise ValueError(f"unknown manifold domain type {kind!r}")
 
@@ -720,6 +813,99 @@ def _rbf_saddle(
     return torch.linalg.solve(M, rhs)
 
 
+@dataclass(frozen=True)
+class RbfFitPlan:
+    """Fit-wide geometry shared by every layer over one node layout.
+
+    ``node_params`` is already unit-box normalized.  The kernel/polynomial
+    blocks, Demmler-Reinsch eigensystem, λ grid, and (for an exact/fixed-λ
+    surface) saddle LU depend only on this geometry—not on a layer's activation
+    targets.  Building them once turns the per-layer fit into RHS work instead
+    of repeating cubic QR/eigh/factorization for every layer and again for the
+    sigma field.
+    """
+
+    node_params: torch.Tensor
+    coord_offset: torch.Tensor
+    coord_scale: torch.Tensor
+    E: torch.Tensor
+    Q: torch.Tensor
+    grid: torch.Tensor
+    q2: torch.Tensor
+    gamma: torch.Tensor
+    eigenvectors: torch.Tensor
+    fixed_lambda: float | None
+    fixed_lu: torch.Tensor | None
+    fixed_pivots: torch.Tensor | None
+
+
+def prepare_rbf_fit_plan(
+    node_params: torch.Tensor,
+    *,
+    smoothing: float | str | None,
+) -> RbfFitPlan:
+    """Precompute layout-only RBF work for a multi-layer curved fit."""
+    raw = node_params.to(device="cpu", dtype=torch.float32)
+    _rbf_poised(raw)
+    lo = raw.min(dim=0).values
+    hi = raw.max(dim=0).values
+    scale = (hi - lo).clamp(min=1e-9)
+    normalized = ((raw - lo) / scale).contiguous()
+    K = int(normalized.shape[0])
+    E = torch.cdist(normalized, normalized).pow(3)
+    Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), normalized], dim=1)
+    denom = K * K - K
+    e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
+    if not math.isfinite(e_scale) or e_scale <= 0.0:
+        e_scale = 1.0
+    grid = e_scale * torch.logspace(-6.0, 3.0, 40, dtype=E.dtype)
+    mp1 = int(Q.shape[1])
+    if K > mp1:
+        q_full, _ = torch.linalg.qr(Q, mode="complete")
+        q2 = q_full[:, mp1:]
+        g = q2.transpose(0, 1) @ E @ q2
+        g = 0.5 * (g + g.transpose(0, 1))
+        gamma, eigenvectors = torch.linalg.eigh(g)
+        gamma = gamma.clamp_min(0.0)
+    else:
+        q2 = torch.empty(K, 0, dtype=E.dtype)
+        gamma = torch.empty(0, dtype=E.dtype)
+        eigenvectors = torch.empty(0, 0, dtype=E.dtype)
+
+    fixed_lambda: float | None = None
+    if smoothing is None:
+        fixed_lambda = 0.0
+    elif isinstance(smoothing, (int, float)):
+        fixed_lambda = float(smoothing) * e_scale
+    fixed_lu: torch.Tensor | None = None
+    fixed_pivots: torch.Tensor | None = None
+    if fixed_lambda is not None:
+        A = E + fixed_lambda * torch.eye(K, dtype=E.dtype)
+        mp1 = int(Q.shape[1])
+        M = torch.cat([
+            torch.cat([A, Q], dim=1),
+            torch.cat([
+                Q.transpose(0, 1),
+                torch.zeros(mp1, mp1, dtype=E.dtype),
+            ], dim=1),
+        ], dim=0)
+        fixed_lu, fixed_pivots = torch.linalg.lu_factor(M)
+    return RbfFitPlan(
+        node_params=normalized,
+        coord_offset=lo,
+        coord_scale=scale,
+        E=E,
+        Q=Q,
+        grid=grid,
+        q2=q2,
+        gamma=gamma,
+        eigenvectors=eigenvectors,
+        fixed_lambda=fixed_lambda,
+        fixed_lu=fixed_lu,
+        fixed_pivots=fixed_pivots,
+    )
+
+
 def _rbf_smoother_matrix(
     E: torch.Tensor, Q: torch.Tensor, lam: float,
 ) -> torch.Tensor:
@@ -744,7 +930,7 @@ def _rbf_smoother_matrix(
 
 def _gcv_select_lambda(
     E: torch.Tensor, Q: torch.Tensor, values: torch.Tensor,
-    *, n_grid: int = 40,
+    *, n_grid: int = 40, plan: RbfFitPlan | None = None,
 ) -> tuple[float, float, float]:
     """Pick the smoothing ``λ`` minimizing generalized cross-validation.
 
@@ -772,26 +958,34 @@ def _gcv_select_lambda(
     """
     K = int(E.shape[0])
     mp1 = int(Q.shape[1])
-    # Scale the grid by the mean off-diagonal kernel magnitude (diag(E) = 0),
-    # so the search range is invariant to coordinate scale.
-    denom = K * K - K
-    e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
-    if not math.isfinite(e_scale) or e_scale <= 0.0:
-        e_scale = 1.0
-    grid = e_scale * torch.logspace(-6.0, 3.0, n_grid, dtype=E.dtype)
     null_dim = K - mp1
+    if plan is not None and n_grid == 40:
+        grid = plan.grid
+    else:
+        # Scale the grid by the mean off-diagonal kernel magnitude (diag(E) = 0),
+        # so the search range is invariant to coordinate scale.
+        denom = K * K - K
+        e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
+        if not math.isfinite(e_scale) or e_scale <= 0.0:
+            e_scale = 1.0
+        grid = e_scale * torch.logspace(-6.0, 3.0, n_grid, dtype=E.dtype)
     if null_dim <= 0:
         # Q full-rank square ⇒ no penalized null space; the polynomial fits
         # every node exactly (S = I) and GCV is the indeterminate 0/0 over the
         # whole grid.  Match the all-skipped loop: smallest λ at interp edf.
         return float(grid[0].item()), float(K), math.inf
     # Q2: an orthonormal basis of null(Qᵀ) from a complete QR of Q.
-    q_full, _ = torch.linalg.qr(Q, mode="complete")        # (K, K)
-    q2 = q_full[:, mp1:]                                    # (K, null_dim)
-    g = q2.transpose(0, 1) @ E @ q2                         # (null_dim, null_dim)
-    g = 0.5 * (g + g.transpose(0, 1))                       # symmetrize vs roundoff
-    gamma, u = torch.linalg.eigh(g)                         # γⱼ ≥ 0 (cond. PSD)
-    gamma = gamma.clamp_min(0.0)
+    if plan is not None:
+        q2 = plan.q2
+        gamma = plan.gamma
+        u = plan.eigenvectors
+    else:
+        q_full, _ = torch.linalg.qr(Q, mode="complete")    # (K, K)
+        q2 = q_full[:, mp1:]                                # (K, null_dim)
+        g = q2.transpose(0, 1) @ E @ q2                     # (null_dim, null_dim)
+        g = 0.5 * (g + g.transpose(0, 1))                   # symmetrize vs roundoff
+        gamma, u = torch.linalg.eigh(g)                     # γⱼ ≥ 0 (cond. PSD)
+        gamma = gamma.clamp_min(0.0)
     b = u.transpose(0, 1) @ (q2.transpose(0, 1) @ values)  # (null_dim, R)
     b_sq = b.pow(2).sum(dim=1)                              # Σ_r bⱼᵣ²  (null_dim,)
     # ratios[i, j] = λᵢ / (γⱼ + λᵢ) — the eigenvalues of (I − S_{λᵢ}).
@@ -812,6 +1006,7 @@ def fit_rbf_smoothed(
     values: torch.Tensor,
     *,
     smoothing: float | str | None = "auto",
+    plan: RbfFitPlan | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """Fit a *penalized* ``r**3`` polyharmonic RBF — the smoothing generalization.
 
@@ -850,16 +1045,29 @@ def fit_rbf_smoothed(
     # Exact path: delegate so ``λ = 0`` reproduces ``fit_rbf_interpolant``
     # bit-for-bit (the cardinal-weight + interpolation tests pin this).
     if smoothing is None or (isinstance(smoothing, (int, float)) and float(smoothing) == 0.0):
-        w, c = fit_rbf_interpolant(node_params, values)
+        if plan is not None and plan.fixed_lambda == 0.0:
+            assert plan.fixed_lu is not None and plan.fixed_pivots is not None
+            mp1 = plan.Q.shape[1]
+            rhs = torch.cat([
+                values,
+                torch.zeros(mp1, values.shape[1], dtype=values.dtype),
+            ], dim=0)
+            sol = torch.linalg.lu_solve(plan.fixed_lu, plan.fixed_pivots, rhs)
+            w, c = sol[:node_params.shape[0]], sol[node_params.shape[0]:]
+        else:
+            w, c = fit_rbf_interpolant(node_params, values)
         return w, c, {"lambda": 0.0, "edf": float(node_params.shape[0]), "gcv": -1.0}
 
     K, _ = _rbf_poised(node_params)
-    dist = torch.cdist(node_params, node_params)
-    E = dist.pow(3)
-    Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), node_params], dim=1)
+    if plan is not None:
+        E, Q = plan.E, plan.Q
+    else:
+        dist = torch.cdist(node_params, node_params)
+        E = dist.pow(3)
+        Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), node_params], dim=1)
 
     if smoothing == "auto":
-        lam, edf, gcv = _gcv_select_lambda(E, Q, values)
+        lam, edf, gcv = _gcv_select_lambda(E, Q, values, plan=plan)
     elif isinstance(smoothing, (int, float)):
         denom = K * K - K
         e_scale = float(E.abs().sum() / denom) if denom > 0 else 1.0
@@ -872,8 +1080,21 @@ def fit_rbf_smoothed(
             f"smoothing must be 'auto', a float, or 0/None; got {smoothing!r}"
         )
 
-    A = E + lam * torch.eye(K, dtype=torch.float32)
-    sol = _rbf_saddle(A, Q, values)
+    if (
+        plan is not None
+        and plan.fixed_lambda is not None
+        and math.isclose(lam, plan.fixed_lambda, rel_tol=0.0, abs_tol=0.0)
+    ):
+        assert plan.fixed_lu is not None and plan.fixed_pivots is not None
+        mp1 = Q.shape[1]
+        rhs = torch.cat([
+            values,
+            torch.zeros(mp1, values.shape[1], dtype=values.dtype),
+        ], dim=0)
+        sol = torch.linalg.lu_solve(plan.fixed_lu, plan.fixed_pivots, rhs)
+    else:
+        A = E + lam * torch.eye(K, dtype=torch.float32)
+        sol = _rbf_saddle(A, Q, values)
     w, c = sol[:K].contiguous(), sol[K:].contiguous()
     return w, c, {"lambda": float(lam), "edf": float(edf), "gcv": float(gcv)}
 
@@ -986,8 +1207,10 @@ class LayerSubspace:
     **Affine (flat) case.**  When ``node_params`` / ``rbf_weights`` /
     ``poly_coeffs`` are ``None`` the subspace carries no RBF surface — the
     "surface" *is* the whole affine subspace (a folded steering vector at
-    ``n = R``), so the reduced coordinates equal the authoring coordinates
-    by an identity map and ``manifold_point(c) = mean + c @ basis``.  The
+    ``n = R``).  Ordinary fits use the identity authoring→reduced map;
+    rectangular cross-model transfers may carry an explicit ``affine_map`` so
+    ``manifold_point(c) = mean + c @ affine_map @ basis`` while ``basis`` stays
+    orthonormal.  The
     affine case has ``H_n ≡ 0`` (the surface fills its subspace), so
     ``subspace_inject`` takes an analytic shortcut that skips the
     Gauss-Newton foot solve, the RBF eval, and the tangent Gram-solve —
@@ -1013,10 +1236,16 @@ class LayerSubspace:
     # origin here, so the synthesizer reads ``node_coords[index]`` per layer
     # as the ``along`` target.  The shared ``Manifold.node_coords`` stays the
     # label/display layout; *these* are the geometry (§5 neutral-anchor).
+    affine_map: torch.Tensor | None = None
+    # (m, R) authoring-to-reduced coordinate map for affine subspaces.  ``None``
+    # is the canonical identity map (m == R). Cross-model transfer may need a
+    # non-isometric map after orthonormalizing a rectangular mapped basis; this
+    # explicit factor preserves the exact world surface without weakening the
+    # runtime's orthonormal-basis invariant.
     sigma_rbf_weights: torch.Tensor | None = None
     sigma_poly_coeffs: torch.Tensor | None = None
-    # The **fuzzy-manifold σ-field** (curved subspaces only; ``None`` =
-    # zero-thickness wire = legacy behavior).  A *separate* ``r**3`` RBF over
+    # The **fuzzy-manifold σ-field** (raw curved subspaces only). A separate
+    # ``r**3`` RBF over
     # the **same** normalized ``node_params`` that interpolates per-node
     # ``log σ`` — the within-node off-surface activation spread (the corpus a
     # node produces scatters off the mean surface; ``σ`` is that scatter's
@@ -1024,10 +1253,9 @@ class LayerSubspace:
     # RBF (rather than appended as an extra value column) so the ``(R,)``-shape
     # contracts the surface consumers rely on are untouched; ``sigma_at`` is the
     # one extra ``eval_rbf`` (``O(K)``) paid only on the already-slow curved
-    # path.  ``sigma_rbf_weights`` is ``(K, 1)``, ``sigma_poly_coeffs`` is
-    # ``(m+1, 1)``.  ``None`` (affine, legacy, or a curved fit predating the
-    # σ-field) ⇒ ``sigma_at`` returns ``0`` ⇒ soft-onto degenerates to the hard
-    # collapse and the read bandwidth degenerates to argmax — exact legacy.
+    # path. ``sigma_rbf_weights`` is ``(K, 1)``, ``sigma_poly_coeffs`` is
+    # ``(m+1, 1)``. Affine and SAE-curved fits do not model a raw-activation
+    # tube and therefore carry neither sigma tensor.
 
     @property
     def rank(self) -> int:
@@ -1045,6 +1273,72 @@ class LayerSubspace:
         """
         return self.node_params is None
 
+    def validate_structure(
+        self, *, feature_space: str, expected_node_count: int,
+    ) -> None:
+        """Validate the exact affine/curved discriminated tensor shape."""
+        if self.mean.ndim != 1:
+            raise ValueError("LayerSubspace mean must have shape (D,)")
+        if self.basis.ndim != 2 or self.basis.shape[0] < 1:
+            raise ValueError("LayerSubspace basis must have shape (R, D) with R >= 1")
+        rank, dim = self.basis.shape
+        if self.mean.shape[0] != dim:
+            raise ValueError("LayerSubspace mean dimension must match basis width")
+        if self.coord_offset.ndim != 1 or self.coord_scale.ndim != 1:
+            raise ValueError("LayerSubspace coordinate normalization must be vectors")
+        if self.coord_offset.shape != self.coord_scale.shape:
+            raise ValueError("LayerSubspace coord_offset/coord_scale shapes must match")
+        embed_dim = int(self.coord_offset.shape[0])
+        surface = (self.node_params, self.rbf_weights, self.poly_coeffs)
+        surface_present = tuple(value is not None for value in surface)
+        sigma_present = (
+            self.sigma_rbf_weights is not None,
+            self.sigma_poly_coeffs is not None,
+        )
+        if any(surface_present) and not all(surface_present):
+            raise ValueError("curved LayerSubspace requires the complete RBF triple")
+        if sigma_present[0] != sigma_present[1]:
+            raise ValueError("LayerSubspace sigma tensors must be present as a pair")
+        if not any(surface_present):
+            if self.node_coords is None:
+                raise ValueError("affine LayerSubspace requires node_coords")
+            if self.node_coords.shape != (expected_node_count, rank):
+                raise ValueError(
+                    "affine LayerSubspace node_coords must have shape (K, R)"
+                )
+            if self.affine_map is None:
+                if embed_dim != rank:
+                    raise ValueError(
+                        "affine LayerSubspace without affine_map requires m == R"
+                    )
+            elif self.affine_map.shape != (embed_dim, rank):
+                raise ValueError("affine_map must have shape (m, R)")
+            if any(sigma_present):
+                raise ValueError("affine LayerSubspace cannot carry a sigma field")
+            return
+        if self.node_coords is not None or self.affine_map is not None:
+            raise ValueError(
+                "curved LayerSubspace cannot carry affine node_coords/affine_map"
+            )
+        if feature_space == "raw" and not all(sigma_present):
+            raise ValueError("raw curved LayerSubspace requires a sigma field")
+        assert self.node_params is not None
+        assert self.rbf_weights is not None
+        assert self.poly_coeffs is not None
+        if self.node_params.shape != (expected_node_count, embed_dim):
+            raise ValueError("curved node_params must have shape (K, m)")
+        if self.rbf_weights.shape != (expected_node_count, rank):
+            raise ValueError("curved rbf_weights must have shape (K, R)")
+        if self.poly_coeffs.shape != (embed_dim + 1, rank):
+            raise ValueError("curved poly_coeffs must have shape (m + 1, R)")
+        if all(sigma_present):
+            assert self.sigma_rbf_weights is not None
+            assert self.sigma_poly_coeffs is not None
+            if self.sigma_rbf_weights.shape != (expected_node_count, 1):
+                raise ValueError("sigma_rbf_weights must have shape (K, 1)")
+            if self.sigma_poly_coeffs.shape != (embed_dim + 1, 1):
+                raise ValueError("sigma_poly_coeffs must have shape (m + 1, 1)")
+
     @classmethod
     def affine(
         cls,
@@ -1052,12 +1346,15 @@ class LayerSubspace:
         basis: torch.Tensor,
         *,
         node_coords: torch.Tensor | None = None,
+        affine_map: torch.Tensor | None = None,
     ) -> "LayerSubspace":
         """Build a flat (affine, no-RBF) subspace from ``mean`` + ``basis``.
 
-        The authoring coordinates map to reduced coordinates by identity
+        By default authoring coordinates map to reduced coordinates by identity
         (``coord_offset = 0``, ``coord_scale = 1``), so
-        ``eval_at(c) = c @ basis + mean`` exactly.  ``basis`` is ``(R, D)``;
+        ``eval_at(c) = c @ basis + mean`` exactly.  ``affine_map`` optionally
+        supplies an ``(m, R)`` map after cross-model reparameterization.
+        ``basis`` is ``(R, D)``;
         the implied intrinsic dimension is ``n = R`` (the surface fills the
         span).  Backs the folded-vector / flat-subspace representation
         (Phase 2 §1).  ``node_coords`` ``(K, R)`` carries the per-layer real
@@ -1065,15 +1362,24 @@ class LayerSubspace:
         ``None`` for a bare span with no associated nodes.
         """
         r = int(basis.shape[0])
+        m = r
+        if affine_map is not None:
+            if affine_map.ndim != 2 or affine_map.shape[1] != r:
+                raise ValueError(
+                    f"affine_map must have shape (m, {r}), got "
+                    f"{tuple(affine_map.shape)}"
+                )
+            m = int(affine_map.shape[0])
         return cls(
             mean=mean,
             basis=basis,
             node_params=None,
             rbf_weights=None,
             poly_coeffs=None,
-            coord_offset=torch.zeros(r, device=mean.device, dtype=mean.dtype),
-            coord_scale=torch.ones(r, device=mean.device, dtype=mean.dtype),
+            coord_offset=torch.zeros(m, device=mean.device, dtype=mean.dtype),
+            coord_scale=torch.ones(m, device=mean.device, dtype=mean.dtype),
             node_coords=node_coords,
+            affine_map=affine_map,
         )
 
     def select_axes(self, kept: Sequence[int]) -> "LayerSubspace":
@@ -1108,7 +1414,13 @@ class LayerSubspace:
             self.node_coords[:, idx].contiguous()
             if self.node_coords is not None else None
         )
-        return LayerSubspace.affine(mean_k, basis_k, node_coords=nc_k)
+        amap_k = (
+            self.affine_map[:, idx].contiguous()
+            if self.affine_map is not None else None
+        )
+        return LayerSubspace.affine(
+            mean_k, basis_k, node_coords=nc_k, affine_map=amap_k,
+        )
 
     def rbf_params(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The validated ``(node_params, rbf_weights, poly_coeffs)`` triple.
@@ -1141,6 +1453,7 @@ class LayerSubspace:
             coord_offset=self.coord_offset.to(device=device, dtype=dtype),
             coord_scale=self.coord_scale.to(device=device, dtype=dtype),
             node_coords=_cast(self.node_coords),
+            affine_map=_cast(self.affine_map),
             sigma_rbf_weights=_cast(self.sigma_rbf_weights),
             sigma_poly_coeffs=_cast(self.sigma_poly_coeffs),
         )
@@ -1149,10 +1462,8 @@ class LayerSubspace:
     def has_sigma(self) -> bool:
         """True iff this subspace carries a fuzzy-manifold σ-field.
 
-        A curved subspace fitted with the within-node spread pass; ``False``
-        for affine fits, legacy curved fits, and any subspace where the σ-RBF
-        wasn't built.  Gates :meth:`sigma_at` (which returns ``0`` when absent)
-        so every σ consumer degrades to the exact zero-thickness behavior.
+        A raw curved subspace fitted with the within-node spread pass; ``False``
+        for affine and SAE-curved fits, which do not model raw tube density.
         """
         return self.sigma_rbf_weights is not None and self.sigma_poly_coeffs is not None
 
@@ -1162,9 +1473,11 @@ class LayerSubspace:
     def eval_at(self, embedded: torch.Tensor) -> torch.Tensor:
         """World-space activation ``(.., D)`` at embedded domain coords ``(.., m)``."""
         if self.is_affine:
-            # Flat: reduced coords == authoring coords (identity map), the
-            # surface fills the subspace ⇒ pure affine, no RBF eval.
-            return embedded @ self.basis + self.mean
+            # Flat: the canonical representation has an identity
+            # authoring→reduced map.  Rectangular cross-model transfer may
+            # carry an explicit map after orthonormalizing the target basis.
+            reduced = embedded if self.affine_map is None else embedded @ self.affine_map
+            return reduced @ self.basis + self.mean
         reduced = eval_rbf(*self.rbf_params(), self._normalize(embedded))
         return reduced @ self.basis + self.mean
 
@@ -1176,8 +1489,7 @@ class LayerSubspace:
         a positive ``(..,)`` thickness in the layer's reduced-coordinate units
         (the same units ``H_n`` is measured in, since the basis is
         orthonormal).  Returns an all-zeros ``(..,)`` when the subspace carries
-        no σ-field (:attr:`has_sigma` false): affine fits, legacy curved fits,
-        the degenerate-but-safe path that makes every σ consumer exact-legacy.
+        no σ-field (:attr:`has_sigma` false): affine and SAE-curved fits.
         Hot-path safe (one extra ``eval_rbf``, no ``.item()`` / host sync).
         """
         lead = embedded.shape[:-1]
@@ -1194,9 +1506,11 @@ class LayerSubspace:
     def jacobian_at(self, embedded: torch.Tensor) -> torch.Tensor:
         """Activation Jacobian ``d activation / d embedded``: ``(m,) -> (D, m)``."""
         if self.is_affine:
-            # d(embedded @ basis + mean)/d embedded = basis.T, position-
-            # independent; broadcast across any leading batch dims.
-            jac = self.basis.transpose(-1, -2)  # (D, R) == (D, m)
+            # d(embedded @ A @ basis + mean)/d embedded = basis.T @ A.T,
+            # position-independent.  ``A`` is identity on ordinary fits.
+            jac = self.basis.transpose(-1, -2)
+            if self.affine_map is not None:
+                jac = jac @ self.affine_map.transpose(-1, -2)
             if embedded.ndim > 1:
                 jac = jac.expand(*embedded.shape[:-1], *jac.shape)
             return jac
@@ -1214,6 +1528,7 @@ def _pca_basis(
     whitener: "LayerWhitener | None" = None,
     layer: int | None = None,
     whitened_gram: torch.Tensor | None = None,
+    whitened_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, float]:
     """μ-centered PCA basis — Euclidean (default) or whitened/Fisher.
 
@@ -1237,7 +1552,10 @@ def _pca_basis(
 
     ``whitened_gram`` may provide a precomputed ``X Σ⁻¹ Xᵀ`` for fit
     callers that already built the same Gram for diagnostics or discover
-    coordinate derivation, avoiding a second Woodbury pass over the layer.
+    coordinate derivation. ``whitened_rows`` is the matching precomputed
+    ``Σ⁻¹X`` row batch; when both are supplied the Fisher directions are
+    ``Aᵀ(Σ⁻¹X)`` directly, so Gram construction, PCA, and neutral-layout
+    anchoring share one Woodbury application over the node scatter.
     """
     K = int(X.shape[0])
     if whitener is not None and layer is not None:
@@ -1259,10 +1577,19 @@ def _pca_basis(
         rank = int((mu_pos > 1e-6 * mu_pos[-1].clamp(min=1e-12)).sum().item())
         R = max(1, min(n_components, K - 1, rank))
         top = torch.argsort(mu, descending=True)[:R]
-        XtA = X.transpose(0, 1) @ A[:, top]             # (D, R) = Xᵀ a_r
-        directions = whitener.apply_inv(
-            layer, XtA.transpose(0, 1).contiguous(),
-        )                                               # (R, D) = Σ⁻¹ Xᵀ a_r
+        if whitened_rows is not None:
+            sinv_x = whitened_rows.to(dtype=torch.float32, device="cpu")
+            if sinv_x.shape != X.shape:
+                raise ValueError(
+                    f"whitened_rows shape {tuple(sinv_x.shape)} does not match "
+                    f"centered scatter shape {tuple(X.shape)}"
+                )
+            directions = A[:, top].transpose(0, 1) @ sinv_x
+        else:
+            XtA = X.transpose(0, 1) @ A[:, top]         # (D, R) = Xᵀ a_r
+            directions = whitener.apply_inv(
+                layer, XtA.transpose(0, 1).contiguous(),
+            )                                           # (R, D) = Σ⁻¹ Xᵀ a_r
         # QR → orthonormal column span identical to the discriminant span;
         # transpose back to (R, D) rows the LayerSubspace expects.
         basis = torch.linalg.qr(
@@ -1294,7 +1621,9 @@ def fit_affine_subspace(
     whitener: "LayerWhitener | None" = None,
     layer: int | None = None,
     whitened_gram: torch.Tensor | None = None,
+    whitened_rows: torch.Tensor | None = None,
     orient_to: int | None = 0,
+    basis_override: torch.Tensor | None = None,
 ) -> tuple[LayerSubspace, torch.Tensor, float]:
     """Fit a flat (affine, no-RBF) subspace from per-node centroids (§5).
 
@@ -1338,10 +1667,16 @@ def fit_affine_subspace(
         raise ValueError(f"an affine subspace needs >= 2 nodes, got {K}")
     mu = centroids.mean(dim=0)
     X = centroids - mu  # (K, D) μ-centered
-    basis, ev_ratio = _pca_basis(
-        X, n_components=n_components, whitener=whitener, layer=layer,
-        whitened_gram=whitened_gram,
-    )
+    if basis_override is None:
+        basis, ev_ratio = _pca_basis(
+            X, n_components=n_components, whitener=whitener, layer=layer,
+            whitened_gram=whitened_gram, whitened_rows=whitened_rows,
+        )
+    else:
+        basis = basis_override[: min(n_components, basis_override.shape[0])].to(
+            device="cpu", dtype=torch.float32,
+        ).contiguous()
+        ev_ratio = 1.0  # diagnostic is unused by planned pipeline callers
     if orient_to is not None:
         proj = basis @ (centroids[orient_to] - mu)      # (R,)
         signs = torch.where(proj < 0, -1.0, 1.0)        # flip rows facing away
@@ -1399,8 +1734,12 @@ def fit_layer_subspace(
     layer: int | None = None,
     neutral_mean: torch.Tensor | None = None,
     whitened_gram: torch.Tensor | None = None,
+    whitened_rows: torch.Tensor | None = None,
     smoothing: float | str | None = None,
     rbf_info: dict[str, float] | None = None,
+    rbf_plan: RbfFitPlan | None = None,
+    basis_override: torch.Tensor | None = None,
+    fit_result: dict[str, torch.Tensor] | None = None,
 ) -> tuple[LayerSubspace, float]:
     """Fit a PCA subspace + RBF interpolant for one layer (curved).
 
@@ -1471,10 +1810,16 @@ def fit_layer_subspace(
     # ``fit_affine_subspace`` via ``_pca_basis`` so both pick the subspace
     # identically; only what's built on top (RBF surface vs. analytic affine)
     # differs.
-    basis, ev_ratio = _pca_basis(
-        X, n_components=n_components, whitener=whitener, layer=layer,
-        whitened_gram=whitened_gram,
-    )
+    if basis_override is None:
+        basis, ev_ratio = _pca_basis(
+            X, n_components=n_components, whitener=whitener, layer=layer,
+            whitened_gram=whitened_gram, whitened_rows=whitened_rows,
+        )
+    else:
+        basis = basis_override[: min(n_components, basis_override.shape[0])].to(
+            device="cpu", dtype=torch.float32,
+        ).contiguous()
+        ev_ratio = 1.0  # diagnostic is unused by planned pipeline callers
     # Neutral-anchor the frame (§5): ``mean = P_basis(anchor)`` and the RBF
     # interpolates **anchor-relative** reduced coords, so neutral lands at
     # reduced-coord 0 and ``eval_at(node_i) = P_basis(centroid_i)`` (the
@@ -1488,13 +1833,20 @@ def fit_layer_subspace(
     else:
         anchor = mu
     mean = (anchor @ basis.T) @ basis           # P_basis(anchor) (D,)
-    coords = (centroids - anchor) @ basis.T     # (K, R) anchor-relative RBF targets
+    # Project the μ-centered roster exactly once. This is the historical share
+    # computation order; anchor-relative RBF targets differ only by one reduced
+    # offset, so they do not need a second K×D by D×R product.
+    mu_coords = X @ basis.T
+    coords = mu_coords + ((mu - anchor) @ basis.T)
+    if fit_result is not None:
+        fit_result["mu_coords"] = mu_coords
 
-    lo = node_params.min(dim=0).values
-    hi = node_params.max(dim=0).values
-    coord_offset = lo
-    coord_scale = (hi - lo).clamp(min=1e-9)
-    normalized = (node_params - coord_offset) / coord_scale
+    plan = rbf_plan or prepare_rbf_fit_plan(
+        node_params, smoothing=smoothing,
+    )
+    coord_offset = plan.coord_offset
+    coord_scale = plan.coord_scale
+    normalized = plan.node_params
 
     # Exact interpolation by default (``smoothing=None``) — every existing
     # caller (authored fits, the behavior-manifold naturalness fit, the test
@@ -1503,22 +1855,31 @@ def fit_layer_subspace(
     # ``λ``/edf flow back through the optional ``rbf_info`` out-dict for the
     # sidecar, leaving the 2-tuple return arity untouched.
     if smoothing is None:
-        rbf_weights, poly_coeffs = fit_rbf_interpolant(normalized, coords)
+        rbf_weights, poly_coeffs, _ = fit_rbf_smoothed(
+            normalized, coords, smoothing=0.0, plan=plan,
+        )
     else:
         rbf_weights, poly_coeffs, _info = fit_rbf_smoothed(
-            normalized, coords, smoothing=smoothing,
+            normalized, coords, smoothing=smoothing, plan=plan,
         )
         if rbf_info is not None:
             rbf_info.update(_info)
     sub = LayerSubspace(
-        mean=mean, basis=basis, node_params=normalized,
+        # Geometry is shared through ``rbf_plan`` while fitting, but each layer's
+        # persistent payload owns these tiny tensors: safetensors deliberately
+        # rejects aliases across keys.
+        mean=mean, basis=basis, node_params=normalized.clone(),
         rbf_weights=rbf_weights, poly_coeffs=poly_coeffs,
-        coord_offset=coord_offset, coord_scale=coord_scale,
+        coord_offset=coord_offset.clone(), coord_scale=coord_scale.clone(),
     )
     return sub, ev_ratio
 
 
 # =============================================================== manifold ===
+
+class _OmittedNodeRoster(list[str | None]):
+    """Distinct default: an explicitly supplied empty roster is malformed."""
+
 
 @dataclass
 class Manifold:
@@ -1546,7 +1907,7 @@ class Manifold:
     # the standard assistant baseline" (the legacy shape, what every
     # non-role manifold carries).  Used by
     # :meth:`Manifold.nearest_node_role` for role-paired steering.
-    node_roles: list[str | None] = field(default_factory=list)
+    node_roles: list[str | None] = field(default_factory=_OmittedNodeRoster)
     # Per-node conceptual ``kind`` — ``"abstract"`` (a trait/quality, e.g.
     # ``happy``) or ``"concrete"`` (an entity, e.g. ``pirate``), aligned with
     # ``node_labels``.  ``None`` = unspecified.  A *generation-time* attribute
@@ -1555,15 +1916,12 @@ class Manifold:
     # conversational corpus.  It does NOT feed the fit — extraction pools in
     # standard-assistant space (swap-back) regardless — so it is carried for
     # provenance / regeneration, not consumed by ``compute_node_centroid``.
-    node_kinds: list[str | None] = field(default_factory=list)
-    # Per-layer Mahalanobis share weight recorded at fit time when a
-    # whitener was available — ``share_L = ‖Bᵀ coords_k‖_M`` summed over
+    node_kinds: list[str | None] = field(default_factory=_OmittedNodeRoster)
+    # Per-layer Mahalanobis share weight recorded at fit time —
+    # ``share_L = ‖Bᵀ coords_k‖_M`` summed over
     # nodes, the subspace-restricted analogue of vector steering's
-    # ``‖d‖_M`` bake score (see ``LayerWhitener.subspace_gram``).  When
-    # populated *and* covering every layer, ``hooks._manifold_layer_shares``
-    # uses it in place of the Euclidean centroid-spread; an empty dict
-    # (no whitener at fit time, e.g. CPU test stubs, or partial layer
-    # coverage) falls back to the Euclidean ``‖coords‖_F`` weighting.
+    # ``‖d‖_M`` bake score (see ``LayerWhitener.subspace_gram``). Coverage is
+    # exact: every fitted layer has one share value.
     # These are raw per-layer scalars with two normalized consumers: the
     # apply-time **steer** weight (normalized to mean 1, ``Σ_L share_L =
     # n_layers``) in ``_manifold_layer_shares``, and the **read** weight
@@ -1588,9 +1946,88 @@ class Manifold:
     # path then seeds that layer's foot at the coord-space origin ``zeros(n)``.
     origin: dict[int, torch.Tensor] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # The programmatic constructor emits the same exact full-length roster
+        # as the current wire format. ``None`` is a real per-node value; an
+        # omitted constructor argument is not a second in-memory shape.
+        if isinstance(self.node_roles, _OmittedNodeRoster):
+            self.node_roles = [None] * len(self.node_labels)
+        if isinstance(self.node_kinds, _OmittedNodeRoster):
+            self.node_kinds = [None] * len(self.node_labels)
+
     @property
     def layer_indices(self) -> list[int]:
         return sorted(self.layers)
+
+    def validate_runtime_geometry(self) -> None:
+        """Require the complete fitted geometry consumed by live steering.
+
+        Persistence readers validate their wire schema; this closes the same
+        contract over programmatically constructed objects before they enter a
+        hot path.  Optionality remains structural only: affine layers have no
+        RBF or tube, and SAE-space curved fits deliberately have no raw-space
+        tube.  Missing bakes are never interpreted as an older representation.
+        """
+        if not self.layers:
+            raise ValueError(f"manifold {self.name!r} has no fitted layers")
+        node_count = len(self.node_labels)
+        intrinsic_dim = int(self.domain.intrinsic_dim)
+        if self.node_coords.ndim != 2 or self.node_coords.shape != (
+            node_count, intrinsic_dim,
+        ):
+            raise ValueError(
+                f"manifold {self.name!r} node_coords must have shape (K, n)"
+            )
+        for field_name, values in (
+            ("node_roles", self.node_roles),
+            ("node_kinds", self.node_kinds),
+        ):
+            if len(values) != len(self.node_labels):
+                raise ValueError(
+                    f"manifold {self.name!r} {field_name} must align exactly "
+                    "with node_labels"
+                )
+        layer_keys = set(self.layers)
+        if set(self.mahalanobis_share) != layer_keys:
+            raise ValueError(
+                f"manifold {self.name!r} Mahalanobis shares must cover exactly "
+                "its fitted layers"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime-loaded artifacts can violate annotations
+            or not math.isfinite(value)
+            or value <= 0.0
+            for value in self.mahalanobis_share.values()
+        ):
+            raise ValueError(
+                f"manifold {self.name!r} Mahalanobis shares must be finite and positive"
+            )
+        curved = {idx: sub for idx, sub in self.layers.items() if not sub.is_affine}
+        if curved and len(curved) != len(self.layers):
+            raise ValueError(
+                f"manifold {self.name!r} cannot mix affine and curved layers"
+            )
+        if set(self.origin) != set(curved):
+            raise ValueError(
+                f"manifold {self.name!r} origins must cover exactly its curved layers"
+            )
+        for idx, value in self.origin.items():
+            if value.ndim != 1 or value.shape != (intrinsic_dim,):
+                raise ValueError(
+                    f"manifold {self.name!r} origin for layer {idx} must "
+                    "have shape (n,)"
+                )
+        for idx, sub in self.layers.items():
+            try:
+                sub.validate_structure(
+                    feature_space=self.feature_space,
+                    expected_node_count=len(self.node_labels),
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"manifold {self.name!r} layer {idx}: {exc}"
+                ) from exc
 
     def to(self, *, device: torch.device, dtype: torch.dtype) -> "Manifold":
         """Return a copy with every layer tensor on ``device`` in ``dtype``."""
@@ -1746,22 +2183,13 @@ class Manifold:
     ) -> str | None:
         """Role of the node nearest ``position`` — or ``None``.
 
-        Returns ``None`` when the nearest node carries no role (legacy
-        nodes, or nodes that opted out of role substitution).  The
+        Returns ``None`` when the nearest node opts out of role substitution. The
         return value rides through to ``session._active_role`` so the
         generation prefill re-applies the substitution at decode time,
-        producing role-paired manifold steering (Phase A.3).
-
-        ``node_roles`` may be empty on a legacy fitted manifold whose
-        sidecar predates the per-node-role schema — that case also
-        returns ``None`` (treat the whole manifold as standard
-        assistant baseline).
+        producing role-paired manifold steering (Phase A.3). The role roster is
+        exact and aligned with :attr:`node_labels`.
         """
-        if not self.node_roles:
-            return None
         idx = self.nearest_node_index(position)
-        if idx >= len(self.node_roles):
-            return None
         return self.node_roles[idx]
 
     def tangent(
@@ -1875,18 +2303,20 @@ class SynthesizedSubspace:
     Per layer the subspace spans the union of every active term's directions
     (push + ablation).  The ``along`` step **translates** the foot by the
     ``target_coord`` offset on each *push* axis (preserving the per-token
-    spread → coherent strong steer) and **collapses** the foot to ``0`` on each
-    *ablation* axis (removing the ablated component).  ``kappa`` is the per-axis
-    blend that selects which is which (``0`` push / translate, ``1`` ablate /
-    collapse): the kernel applies ``target − κ⊙q``, so push axes ignore ``q``
-    (fixed offset) while ablation axes drive ``q`` toward ``0``.  ``share`` is the
+    spread → coherent strong steer) and **collapses** the foot toward ``0`` on
+    each *ablation* axis (removing the requested fraction of that component).
+    ``kappa`` stores the requested per-axis ablation coefficient: ``0`` on push
+    axes, ``1`` for full mean replacement, fractional for partial ablation, and
+    signed/outside ``[0, 1]`` for the grammar's extrapolating forms.  The hook
+    divides it by the affine push gain before calling the shared kernel, so the
+    kernel's ``along · kappa`` product is exactly the user coefficient rather
+    than the affine steering gain.  ``share`` is the
     un-normalized per-layer budget weight — the push-displacement magnitude
-    ``‖Δ_L‖_M`` (whitened) when a covering ``whitener`` is supplied, else the
-    raw-Euclidean ``‖Δ_L‖₂``; a pure-ablation layer weights by the summed
+    ``‖Δ_L‖_M`` under the required covering whitener; a pure-ablation layer
+    weights by the summed
     ablation magnitude instead.  The apply path normalizes it across layers
     (mean-1).  ``target_coord`` is correspondingly a whitened-unit direction on
-    the whitened path (magnitude carried by ``share``) or the raw reduced
-    displacement on the Euclidean fallback.
+    the whitened path, with magnitude carried by ``share``.
 
     Fields are keyed by layer index; only layers carrying at least one
     non-degenerate active direction (and present in ``neutral_means``) appear.
@@ -1895,19 +2325,91 @@ class SynthesizedSubspace:
     layers: dict[int, "LayerSubspace"]        # affine: mean = neutral_L, basis = ortho span
     target_coord: dict[int, torch.Tensor]     # (R_L,) the along target (poles / 0)
     share: dict[int, float]                   # ‖Δ_L‖, un-normalized budget weight
-    kappa: dict[int, torch.Tensor] = field(   # (R_L,) per-axis: 0 push (translate), 1 ablate (collapse)
+    kappa: dict[int, torch.Tensor] = field(   # (R_L,) per-axis requested ablation coefficient
         default_factory=dict
     )
+
+    def __post_init__(self) -> None:
+        # An empty synth is the explicit no-op result when every active
+        # fragment cancels or degenerates; SteeringManager skips it.
+        keys = set(self.layers)
+        for name, mapping in (
+            ("target_coord", self.target_coord),
+            ("share", self.share),
+            ("kappa", self.kappa),
+        ):
+            if set(mapping) != keys:
+                raise ValueError(
+                    f"SynthesizedSubspace {name} must cover exactly its layers"
+                )
+        for layer, sub in self.layers.items():
+            if not sub.is_affine:
+                raise ValueError("SynthesizedSubspace layers must be affine")
+            if sub.mean.ndim != 1:
+                raise ValueError("synthesized mean must have shape (D,)")
+            if sub.basis.ndim != 2 or sub.basis.shape[0] < 1:
+                raise ValueError("synthesized basis must have shape (R, D), R >= 1")
+            rank = sub.rank
+            dim = int(sub.basis.shape[1])
+            if sub.mean.shape != (dim,):
+                raise ValueError("synthesized mean width must match basis width")
+            if sub.coord_offset.shape != (rank,) or sub.coord_scale.shape != (rank,):
+                raise ValueError(
+                    "synthesized coord_offset/coord_scale must have shape (R,)"
+                )
+            if (
+                sub.node_coords is not None
+                or sub.affine_map is not None
+                or sub.sigma_rbf_weights is not None
+                or sub.sigma_poly_coeffs is not None
+                or sub.node_params is not None
+                or sub.rbf_weights is not None
+                or sub.poly_coeffs is not None
+            ):
+                raise ValueError(
+                    "synthesized affine spans cannot carry artifact surface fields"
+                )
+            gram = sub.basis @ sub.basis.T
+            identity = torch.eye(rank, dtype=gram.dtype, device=gram.device)
+            if not torch.allclose(gram, identity, atol=1e-5, rtol=1e-5):
+                raise ValueError("synthesized basis rows must be orthonormal")
+            if self.target_coord[layer].shape != (rank,):
+                raise ValueError("SynthesizedSubspace target_coord must have shape (R,)")
+            if self.kappa[layer].shape != (rank,):
+                raise ValueError("SynthesizedSubspace kappa must have shape (R,)")
+            # Do not concatenate these device tensors just to validate them.
+            # PyTorch 2.12's MPS ``cat`` can segfault in the Metal blit path
+            # for the mixed view/stride shapes produced by dispatch-time
+            # synthesis, taking the whole server down before generation.  Four
+            # cold-path finite reductions are cheap and keep validation on the
+            # tensors' native device without allocating a joined buffer.
+            finite_parts = (
+                sub.mean,
+                sub.basis,
+                self.target_coord[layer],
+                self.kappa[layer],
+            )
+            if not all(bool(torch.isfinite(part).all()) for part in finite_parts):
+                raise ValueError("SynthesizedSubspace tensors must be finite")
+            if (
+                isinstance(self.share[layer], bool)
+                or not isinstance(self.share[layer], (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime-loaded values can violate annotations
+                or not math.isfinite(self.share[layer])
+                or self.share[layer] <= 0.0
+            ):
+                raise ValueError(
+                    "SynthesizedSubspace shares must be finite and positive"
+                )
 
 
 def synthesize_subspace(
     push: Sequence[
         tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], float]
     ],
-    ablate: Sequence[dict[int, torch.Tensor]],
+    ablate: Sequence[tuple[dict[int, torch.Tensor], float]],
     neutral_means: dict[int, torch.Tensor],
     *,
-    whitener: "LayerWhitener | None" = None,
+    whitener: "LayerWhitener",
     eps: float = 1e-9,
 ) -> SynthesizedSubspace:
     """Compose an active steering term set into one affine subspace per layer.
@@ -1921,29 +2423,30 @@ def synthesize_subspace(
       own basis* (a pole / node coordinate, origin-relative).
     - ``coeff`` — the signed strength (the blend fraction / α).
 
-    Each **ablation** term is a per-layer ``(R_i, D)`` (or ``(D,)``) direction
-    set to remove; its target is the origin (``0``).  ``neutral_means`` supplies
-    each layer's anchor (``mean``); a layer absent from it is skipped (no
-    anchor ⇒ no subspace).
+    Each **ablation** term is ``(directions, coeff)``: a per-layer ``(R_i, D)``
+    (or ``(D,)``) direction set plus the signed fraction to remove.  Its target
+    is the origin (``0``).  ``neutral_means`` supplies each layer's anchor
+    (``mean``); it must cover every participating layer.
 
     Per layer (over the union of layers any term touches):
 
-    - Flatten every present push term's basis rows, then every ablation term's
-      rows, into one ordered list (push first); orthonormalize the union
-      (:func:`_ortho_basis`) → the merged ``(R, D)`` basis ``B``.
+    - Orthonormalize the push span, project ablation directions out of it (push
+      wins a shared direction), and build the reduced symmetric ablation
+      operator ``A = Σ coeffᵢ uᵢuᵢᵀ`` on the remaining span.  Diagonalizing
+      ``A`` gives an orthonormal ablation basis and one exact collapse
+      coefficient per axis, including partial, repeated, and negative terms.
     - World push displacement ``Δ = Σ_push coeffᵢ·(coord_targetᵢ @ basis_rowsᵢ)``
       — each fragment's own ``(R_i,) @ (R_i, D) = (D,)`` world vector, scaled by
       its coeff.  ``target = B @ Δ`` is its coordinate in the merged basis.
       Because ``Δ`` lives in the push span and the ablation-only axes are its
       orthogonal complement, those axes get ``target ≈ 0``.
-    - Per-axis collapse mask ``kappa`` ``(R,)`` — ``0`` on the push span, ``1`` on
-      the ablation-only complement (``κ = 1 − ‖proj onto push span‖²``).  The
-      kernel *translates* push axes by the fixed offset but *collapses* ``κ=1``
-      axes toward 0 (``p_new = q + a·(target − κ·q)``): post translate-not-
-      collapse a ``target ≈ 0`` alone no longer removes an ablated direction (a
-      pure translate by 0 is a no-op), so ``κ`` is what carries the ablation.
+    - Per-axis ``kappa`` ``(R,)`` — ``0`` on the push span and the eigenvalues of
+      ``A`` on the ablation-only complement.  The apply path gain-compensates
+      these coefficients before the kernel evaluates
+      ``p_new = q + along·(target − kappa·q)``.
     - ``share = ‖Δ‖`` (the world displacement magnitude); a pure-ablation layer
-      weights by the summed ablation-row magnitude instead.
+      uses a positive magnitude proxy because gain compensation makes the
+      resulting collapse independent of cross-layer share normalization.
 
     **Whitened normalization (``whitener`` given).**  The push magnitude used to
     be the *raw-Euclidean* node displacement ``‖Δ_L‖₂``, which is not a
@@ -1967,16 +2470,10 @@ def synthesize_subspace(
       budget (``Σ_L eff_along_L = gain·n_layers``), distributed across layers by
       where its signal lives; ``along`` becomes a scale-stable strength knob.
 
-    This is all-or-nothing (Mahalanobis-only): a partially-covering / absent
-    whitener falls back to the raw-Euclidean ``‖Δ‖₂`` path below (CPU stubs,
-    degenerate fits), never mixing the two metrics across layers within one
-    steer (a mixed cross-layer profile would be meaningless under the mean-1
-    normalization).
-
-    Because the basis is orthonormal, ``‖target‖₂ = ‖Δ‖₂`` on the Euclidean
-    fallback (the per-layer budget weight and the steered coordinate sit on one
-    scale); the whitened path instead decouples them — ``share`` carries the
-    per-layer magnitude, ``target`` carries only the unit direction.
+    This is all-or-nothing (Mahalanobis-only): missing neutral means or partial
+    whitener coverage raise before synthesis, so a cross-layer profile can
+    never mix metrics. ``share`` carries the per-layer magnitude and ``target``
+    carries only the whitened-unit direction.
 
     The strengths live in ``target`` (per-axis), not in a single ``along`` — the
     caller picks ``along`` (the overall slide, the existing manifold-``%``
@@ -1988,22 +2485,24 @@ def synthesize_subspace(
     all_layers: set[int] = set()
     for basis_dirs, _coords, _c in push:
         all_layers |= basis_dirs.keys()
-    for dirs in ablate:
+    for dirs, _coeff in ablate:
         all_layers |= dirs.keys()
 
-    # All-or-nothing whitened normalization: only when the whitener covers every
-    # layer that will actually be synthesized (present in ``neutral_means``).  A
-    # mixed whitened/Euclidean cross-layer profile is meaningless under the
-    # apply-time mean-1 share normalization, so gate the whole synth on one
-    # ``covers_all`` rather than per-layer.
-    present_layers = sorted(L for L in all_layers if L in neutral_means)
-    maha = (
-        whitener
-        if whitener is not None
-        and present_layers
-        and whitener.covers_all(present_layers)
-        else None
-    )
+    from saklas.core.mahalanobis import WhitenerError
+
+    present_layers = sorted(all_layers)
+    missing_means = sorted(all_layers - set(neutral_means))
+    if missing_means:
+        raise WhitenerError(
+            f"steering synthesis requires neutral means for every layer; "
+            f"missing {missing_means}"
+        )
+    if whitener is None or not whitener.covers_all(present_layers):
+        raise WhitenerError(
+            "steering synthesis requires a Mahalanobis whitener covering "
+            f"every layer {present_layers}"
+        )
+    maha = whitener
 
     layers: dict[int, "LayerSubspace"] = {}
     target_coord: dict[int, torch.Tensor] = {}
@@ -2011,8 +2510,6 @@ def synthesize_subspace(
     kappa: dict[int, torch.Tensor] = {}
 
     for L in sorted(all_layers):
-        if L not in neutral_means:
-            continue
         mean = neutral_means[L].to(torch.float32).reshape(-1)
 
         # Push fragments present at this layer: their basis rows (for the span)
@@ -2024,10 +2521,20 @@ def synthesize_subspace(
         push_rows: list[torch.Tensor] = []          # individual (D,) basis rows
         push_frags: list[tuple[float, torch.Tensor]] = []   # (coeff, world_dir (D,))
         for basis_dirs, coord_dirs, coeff in push:
+            if abs(float(coeff)) < eps:
+                continue
             B_i = basis_dirs.get(L)
             if B_i is None:
                 continue
-            B_i = B_i.to(torch.float32)
+            # ``synthesize_subspace`` is the join point for profiles from
+            # several artifact families.  Fitted manifolds already follow the
+            # model device, while external J-lens shards and provider SAE
+            # payloads are CPU-backed and may be promoted lazily.  Treat the
+            # neutral mean as the canonical per-layer runtime device and
+            # co-locate every fragment here; merely changing dtype preserves a
+            # stray CPU device and makes a valid mixed J-lens + SAE recipe fail
+            # before its first token.
+            B_i = B_i.to(device=mean.device, dtype=torch.float32)
             if B_i.ndim == 1:
                 B_i = B_i.reshape(1, -1)
             if float(torch.linalg.matrix_norm(B_i)) < eps:
@@ -2037,81 +2544,110 @@ def synthesize_subspace(
                 # No target coords for this layer ⇒ no displacement, but the
                 # rows still join the span (a degenerate push = ablation).
                 c_i = B_i.new_zeros(B_i.shape[0])
-            c_i = c_i.to(torch.float32).reshape(-1)
+            c_i = c_i.to(device=mean.device, dtype=torch.float32).reshape(-1)
             push_rows.extend(B_i)
             push_frags.append((float(coeff), c_i @ B_i))    # (D,) raw world dir
 
-        ablate_rows: list[torch.Tensor] = []        # individual (D,) basis rows
-        ablate_raw: list[torch.Tensor] = []         # raw rows (magnitude → share)
-        for dirs in ablate:
+        ablate_frags: list[tuple[float, torch.Tensor]] = []
+        ablate_share = 0.0
+        for dirs, coeff in ablate:
+            coeff_f = float(coeff)
+            if abs(coeff_f) < eps:
+                continue
             d = dirs.get(L)
             if d is None:
                 continue
-            d = d.to(torch.float32)
+            d = d.to(device=mean.device, dtype=torch.float32)
             if d.ndim == 1:
                 d = d.reshape(1, -1)
             for row in d:
                 if float(torch.linalg.vector_norm(row)) < eps:
                     continue
-                ablate_rows.append(row)
-                ablate_raw.append(row)
+                row_norm = float(torch.linalg.vector_norm(row))
+                unit = row / row_norm
+                ablate_frags.append((coeff_f, unit))
+                # A strictly positive proxy is sufficient here: hook-time gain
+                # compensation cancels share from the actual ablation amount.
+                ablate_share += abs(coeff_f) * max(
+                    float(maha.mahalanobis_norm(L, row)), eps,
+                )
 
-        ordered = push_rows + ablate_rows
-        if not ordered:
-            continue
-        # ``_ortho_basis`` uses its own scale-free dependency tolerance; ``eps``
-        # here is only the degenerate-direction prefilter (applied above).
-        basis, _kept = _ortho_basis(ordered)
-        if basis.shape[0] == 0:
-            continue
+        # Build the active push target in world coordinates first.  If all
+        # pushes cancel, they must not suppress an ablation on the same axis.
+        world_target = mean.new_zeros(mean.shape)
+        raw_delta = mean.new_zeros(mean.shape)
+        for cf, wd in push_frags:
+            wn = float(maha.mahalanobis_norm(L, wd))
+            raw_delta = raw_delta + cf * wd
+            if wn > eps:
+                world_target = world_target + (cf / wn) * wd
+        has_push = float(torch.linalg.vector_norm(world_target)) >= eps
 
-        if push_frags:
+        if has_push:
+            B_push, _ = _ortho_basis(push_rows)
+        else:
+            B_push = mean.new_zeros((0, mean.numel()))
+
+        # Push wins shared directions.  The remaining ablation operator is
+        # diagonalized in its own small span so coefficients survive exactly;
+        # a per-axis mask cannot represent unequal non-orthogonal terms.
+        projected_ablate: list[tuple[float, torch.Tensor]] = []
+        for coeff_f, unit in ablate_frags:
+            residual = unit
+            if B_push.shape[0]:
+                residual = residual - (residual @ B_push.T) @ B_push
+            rn = float(torch.linalg.vector_norm(residual))
+            if rn >= eps:
+                projected_ablate.append((coeff_f, residual / rn))
+
+        B_ab = mean.new_zeros((0, mean.numel()))
+        ablate_eigenvalues = mean.new_zeros((0,))
+        if projected_ablate:
+            B_ab_span, _ = _ortho_basis([row for _cf, row in projected_ablate])
+            reduced = B_ab_span.new_zeros((B_ab_span.shape[0], B_ab_span.shape[0]))
+            for coeff_f, row in projected_ablate:
+                coord = B_ab_span @ row
+                reduced = reduced + coeff_f * torch.outer(coord, coord)
+            # ``torch.linalg.eigh`` is still unavailable on MPS.  This is a
+            # tiny rank-by-rank compose-time matrix (never a decode hot-path
+            # operation), so diagonalize it on CPU and return the result to
+            # the originating device.  Keeping this explicit also avoids
+            # requiring users to opt into PyTorch's process-wide MPS fallback
+            # just to author an ablation term.
+            eig_device = reduced.device
+            eigenvalues, eigenvectors = torch.linalg.eigh(reduced.cpu())
+            eigenvalues = eigenvalues.to(eig_device)
+            eigenvectors = eigenvectors.to(eig_device)
+            keep = eigenvalues.abs() >= eps
+            if bool(keep.any()):
+                ablate_eigenvalues = eigenvalues[keep]
+                B_ab = eigenvectors[:, keep].T @ B_ab_span
+
+        if B_push.shape[0] == 0 and B_ab.shape[0] == 0:
+            continue
+        basis = torch.cat((B_push, B_ab), dim=0)
+
+        if has_push:
             # Raw coeff-weighted displacement — its (whitened) magnitude is the
             # per-layer **profile** weight (``share``); the absolute node-distance
             # scale cancels under the apply-time mean-1 normalization, leaving
             # only the relative across-layer shape (steer where the signal is).
-            raw_delta = torch.stack([cf * wd for cf, wd in push_frags]).sum(0)
-            if maha is not None:
-                share_L = float(maha.mahalanobis_norm(L, raw_delta))
-                # Target = Σ_i coeff_i · (B @ world_dir_i)/‖world_dir_i‖_M — each
-                # fragment a **whitened-unit** direction (node-distance stripped,
-                # so scale-stable across targets) scaled by its user coeff (the
-                # strength knob the mean-1 ``share`` would otherwise cancel).
-                tc = basis.new_zeros(basis.shape[0])
-                for cf, wd in push_frags:
-                    wn = float(maha.mahalanobis_norm(L, wd))
-                    if wn > eps:
-                        tc = tc + (cf / wn) * (basis @ wd)
-                if float(torch.linalg.vector_norm(tc)) < eps:
-                    # Every fragment degenerate in the whitened metric here —
-                    # fall back to the raw reduced target so the layer still steers.
-                    tc = basis @ raw_delta
-                    share_L = float(torch.linalg.vector_norm(raw_delta))
-            else:
-                tc = basis @ raw_delta                    # Euclidean fallback
-                share_L = float(torch.linalg.vector_norm(raw_delta))
-            target_coord[L] = tc                          # ablation axes ≈ 0
+            share_L = float(maha.mahalanobis_norm(L, raw_delta))
+            if share_L < eps:
+                share_L = sum(
+                    abs(cf) * float(maha.mahalanobis_norm(L, wd))
+                    for cf, wd in push_frags
+                )
+            target_coord[L] = basis @ world_target       # ablation axes ≈ 0
         else:
-            ablate_sum = torch.stack(ablate_raw).sum(0)
-            share_L = (
-                float(maha.mahalanobis_norm(L, ablate_sum))
-                if maha is not None
-                else float(torch.linalg.vector_norm(ablate_sum))
-            )
+            share_L = ablate_share
             target_coord[L] = basis.new_zeros(basis.shape[0])   # (R,) all ≈ 0
-        # Per-axis collapse weight κ: 0 on the push span (translate — preserve
-        # the per-token in-subspace spread), 1 on the ablate-only complement
-        # (collapse the component to 0).  Derived by projecting each merged-basis
-        # axis onto the push span (``κ = 1 − ‖proj‖²``), so it is robust to the
-        # orthonormalization order.  Pure push → all 0; pure ablation → all 1.
-        if push_rows and ablate_rows:
-            B_push, _ = _ortho_basis(push_rows)             # (k_push, D)
-            proj = basis @ B_push.T                          # (R, k_push)
-            kappa[L] = (1.0 - (proj * proj).sum(-1)).clamp(0.0, 1.0)  # (R,)
-        elif ablate_rows:
-            kappa[L] = basis.new_ones(basis.shape[0])
-        else:
-            kappa[L] = basis.new_zeros(basis.shape[0])
+        if share_L < eps:
+            continue
+        kappa[L] = torch.cat((
+            basis.new_zeros(B_push.shape[0]),
+            ablate_eigenvalues.to(dtype=basis.dtype, device=basis.device),
+        ))
         layers[L] = LayerSubspace.affine(mean=mean, basis=basis)
         share[L] = share_L
 
@@ -2360,10 +2896,13 @@ def subspace_inject(
 
     if subspace.is_affine:
         # --- flat (folded-vector) shortcut --------------------------------
-        # The surface fills the subspace, so reduced coords *are* authoring
-        # coords (identity map): the foot is ``q`` exactly, ``H_n ≡ 0`` and
-        # ``onto`` is vacuous (ignored).  No GN solve, no RBF eval, no
-        # tangent Gram-solve — the cost the common steering case can't pay.
+        # The surface fills the subspace, so the injected target is already in
+        # the layer's orthonormal reduced frame: the foot is ``q`` exactly,
+        # ``H_n ≡ 0`` and ``onto`` is vacuous (ignored).  Ordinary fits have an
+        # identity authoring→reduced map; rectangular transfers bake their
+        # explicit map into the resolved per-layer target before this kernel.
+        # No GN solve, no RBF eval, no tangent Gram-solve — the cost the common
+        # steering case can't pay.
         #
         # ``q = (h − mean)·basisᵀ = h·basisᵀ − mean·basisᵀ`` is computed
         # **without** the full-width ``centered = h − mean`` temporary: the
@@ -2827,6 +3366,7 @@ def derive_spectral_coords(
     min_dim: int | None = None,
     k_nn: int | None = None,
     bandwidth: float | None = None,
+    _eigen_result: tuple[torch.Tensor, torch.Tensor, int, float] | None = None,
 ) -> tuple[torch.Tensor, SpectralDiagnostics]:
     """Derive node coordinates from a Laplacian-eigenmaps spectral embedding.
 
@@ -2899,9 +3439,12 @@ def derive_spectral_coords(
     # sphere/torus spectral derivations.  The square + ``K < 4`` validation
     # above stays here so the spectral-specific error messages are preserved;
     # ``_laplacian_eigen`` re-checks defensively for its other callers.
-    nontrivial_vals, nontrivial_vecs, k_nn, bandwidth = _laplacian_eigen(
-        gram, k_nn=k_nn, bandwidth=bandwidth,
-    )
+    if _eigen_result is None:
+        nontrivial_vals, nontrivial_vecs, k_nn, bandwidth = _laplacian_eigen(
+            gram, k_nn=k_nn, bandwidth=bandwidth,
+        )
+    else:
+        nontrivial_vals, nontrivial_vecs, k_nn, bandwidth = _eigen_result
 
     # Pick k by the eigenvalue-ratio heuristic.  For each candidate
     # ``k`` in ``[1, cap]`` the ratio ``nontrivial[k] / nontrivial[k-1]``
@@ -3030,7 +3573,12 @@ class TopologyChoice:
     # Laplacian eigenpairs the spectral/periodic embedding rode), or ``None``
     # when unavailable.  Lets an ``auto`` fit emit a diagnostics block so the
     # inspector renders the same bars a pinned ``pca``/``spectral`` fit does.
-    diagnostics: "object | None" = None
+    diagnostics: "PcaDiagnostics | SpectralDiagnostics | None" = None
+    # Curved winner's already-normalized, factorized layout plan.  Auto-mode
+    # spends this work while scoring the candidate; the final per-layer fit can
+    # reuse it instead of repeating QR/eigh/LU over the same node geometry.
+    rbf_plan: "RbfFitPlan | None" = None
+    fisher_bases: "dict[int, torch.Tensor]" = field(default_factory=dict)
 
 
 def _gcv_value(rss: float, edf: float, K: int) -> float:
@@ -3073,6 +3621,7 @@ def _rbf_gcv_score(
     targets: dict[int, torch.Tensor],
     *,
     smoothing: float | str,
+    plan: RbfFitPlan | None = None,
 ) -> float:
     """Summed GCV of the penalized RBF surface over a layout.
 
@@ -3089,20 +3638,24 @@ def _rbf_gcv_score(
     hi = node_params.max(dim=0).values
     norm = (node_params - lo) / (hi - lo).clamp(min=1e-9)
     K = norm.shape[0]
-    E = torch.cdist(norm, norm).pow(3)
-    Q = torch.cat([torch.ones(K, 1, dtype=torch.float32), norm], dim=1)
+    plan = plan or prepare_rbf_fit_plan(norm, smoothing=smoothing)
+    E, Q = plan.E, plan.Q
+    fixed_smoother: torch.Tensor | None = None
+    fixed_edf = 0.0
+    if smoothing != "auto":
+        denom_e = K * K - K
+        e_scale = float(E.abs().sum() / denom_e) if denom_e > 0 else 1.0
+        lam = float(smoothing) * (e_scale if e_scale > 0.0 else 1.0)
+        fixed_smoother = _rbf_smoother_matrix(E, Q, lam)
+        fixed_edf = float(fixed_smoother.diagonal().sum().item())
     total = 0.0
     for y in targets.values():
         if smoothing == "auto":
-            _lam, _edf, gcv = _gcv_select_lambda(E, Q, y)
+            _lam, _edf, gcv = _gcv_select_lambda(E, Q, y, plan=plan)
         else:
-            denom_e = K * K - K
-            e_scale = float(E.abs().sum() / denom_e) if denom_e > 0 else 1.0
-            lam = float(smoothing) * (e_scale if e_scale > 0.0 else 1.0)
-            S = _rbf_smoother_matrix(E, Q, lam)
-            edf = float(S.diagonal().sum().item())
-            rss = float((y - S @ y).pow(2).sum().item())
-            gcv = _gcv_value(rss, edf, K)
+            assert fixed_smoother is not None
+            rss = float((y - fixed_smoother @ y).pow(2).sum().item())
+            gcv = _gcv_value(rss, fixed_edf, K)
         total += gcv
     return total
 
@@ -3228,23 +3781,27 @@ def _rips_h1_persistence(
     # H1 deaths: reduce triangle columns over edge rows (global edge indices, so
     # the pivot respects filtration order).  A reduced low on a positive edge
     # pairs that loop's birth with this triangle's death.
-    low_inv: dict[int, set[int]] = {}     # pivot edge-global → reduced column
+    # Python integers are compact C-level bitsets over edge rows.  Symmetric
+    # difference becomes one XOR and the pivot is ``bit_length()-1``; this is
+    # the identical GF(2) reduction without allocating/copying Python sets for
+    # every triangle column on dense auto-topology heaps.
+    low_inv: dict[int, int] = {}          # pivot edge-global → reduced bit column
     killed: dict[int, float] = {}         # edge filtration index → death filtration
     for fl, i, j, k in triangles:
-        col = {
-            eg(edge_id[(min(i, j), max(i, j))]),
-            eg(edge_id[(min(i, k), max(i, k))]),
-            eg(edge_id[(min(j, k), max(j, k))]),
-        }
+        col = (
+            (1 << eg(edge_id[(min(i, j), max(i, j))]))
+            | (1 << eg(edge_id[(min(i, k), max(i, k))]))
+            | (1 << eg(edge_id[(min(j, k), max(j, k))]))
+        )
         while col:
-            piv = max(col)
+            piv = col.bit_length() - 1
             if piv in low_inv:
                 col ^= low_inv[piv]
             else:
                 break
         if not col:
             continue  # triangle creates an H2 void — irrelevant to H1
-        piv = max(col)
+        piv = col.bit_length() - 1
         low_inv[piv] = col
         edge_idx = piv - K
         if edge_idx in positive_edges and edge_idx not in killed:
@@ -3313,6 +3870,14 @@ def _count_persistent_loops(
     if eps_c <= 0.0:
         return 0
     eps_max = 2.0 * eps_c
+    # At the ceiling a complete Rips graph has the full simplex as its clique
+    # complex, hence trivial H1.  This is exactly the outlier-inflated personas
+    # case and lets the loop *counter* skip constructing/reducing O(K^3)
+    # triangles.  ``_rips_h1_persistence`` itself keeps its full finite-pair
+    # contract; this shortcut is valid here because the caller only counts
+    # classes still essential at ``eps_max``.
+    if bool((lens <= eps_max).all()):
+        return 0
     pairs = _rips_h1_persistence(distances, eps_max)
     threshold = persistence_frac * eps_c
     count = 0
@@ -3578,6 +4143,7 @@ def select_topology(
     consensus_gram: torch.Tensor,
     *,
     whitener: "LayerWhitener",
+    whitened_rows: dict[int, torch.Tensor] | None = None,
     max_dim: int = 8,
     smoothing: float | str = "auto",
     score_dim: int | None = None,
@@ -3631,13 +4197,18 @@ def select_topology(
     # predicts the *same* y in the *same* metric, so the comparison isolates
     # the coordinate geometry + surface, not the basis (common-mode).
     targets: dict[int, torch.Tensor] = {}
+    fisher_bases: dict[int, torch.Tensor] = {}
     for L in fit_layers:
         X = stacks[L].to(torch.float32)
         X = X - X.mean(dim=0, keepdim=True)
         basis, _ev = _pca_basis(
             X, n_components=R, whitener=whitener, layer=L,
             whitened_gram=layer_grams[L],
+            whitened_rows=(
+                whitened_rows.get(L) if whitened_rows is not None else None
+            ),
         )
+        fisher_bases[L] = basis
         targets[L] = (X @ basis.transpose(0, 1)).contiguous()      # (K, R)
 
     candidates: list[TopologyCandidate] = []
@@ -3650,8 +4221,9 @@ def select_topology(
 
     # (a) Curved Euclidean (spectral) — may fail on a tiny / disconnected heap.
     gcv_curved = math.inf
-    curved: tuple[torch.Tensor, ManifoldDomain] | None = None
+    curved: tuple[torch.Tensor, ManifoldDomain, RbfFitPlan] | None = None
     spec_diag: object | None = None
+    spectral_eigen: tuple[torch.Tensor, torch.Tensor, int, float] | None = None
     try:
         # Floor the curved candidate's intrinsic dim to the flat PCA dim so flat
         # and curved are compared at *matched expressiveness*.  The spectral
@@ -3667,28 +4239,40 @@ def select_topology(
         # makes the flat-vs-curved verdict trustworthy rather than an artifact of
         # the dim mismatch.  (The periodic path sets its own dim from the H1 loop
         # count, so it is unaffected.)
+        spectral_eigen = _laplacian_eigen(
+            consensus_gram, k_nn=k_nn, bandwidth=bandwidth,
+        )
         coords_spec, spec_diag = derive_spectral_coords(
             consensus_gram, max_dim=max_dim, min_dim=k_flat,
             k_nn=k_nn, bandwidth=bandwidth,
+            _eigen_result=spectral_eigen,
         )
         k_spec = int(coords_spec.shape[1])
         if (2 * k_spec + 1) > K:
             raise ValueError(f"poisedness floor 2n+1={2 * k_spec + 1} exceeds K={K}")
+        spec_plan = prepare_rbf_fit_plan(
+            coords_spec.to(torch.float32), smoothing=smoothing,
+        )
         gcv_curved = _rbf_gcv_score(
             coords_spec.to(torch.float32), targets, smoothing=smoothing,
+            plan=spec_plan,
         )
-        curved = (coords_spec, CustomDomain(k_spec))
+        curved = (coords_spec, CustomDomain(k_spec), spec_plan)
         candidates.append(TopologyCandidate("spectral", "spectral", k_spec, gcv_curved, True))
     except (ValueError, RuntimeError) as e:  # _LinAlgError ⊂ RuntimeError
         candidates.append(TopologyCandidate("spectral", "spectral", 0, math.inf, False, str(e)))
 
     # (b) Periodic (circle / torus) detection — persistent homology counts the
     # loops (ellipse/noise-robust), spectral eigenpairs coordinate them.
-    periodic: tuple[torch.Tensor, ManifoldDomain, float] | None = None
+    periodic: tuple[
+        torch.Tensor, ManifoldDomain, float, RbfFitPlan,
+    ] | None = None
     try:
-        _vals, eigvecs, _knn, _bw = _laplacian_eigen(
-            consensus_gram, k_nn=k_nn, bandwidth=bandwidth,
-        )
+        if spectral_eigen is None:
+            spectral_eigen = _laplacian_eigen(
+                consensus_gram, k_nn=k_nn, bandwidth=bandwidth,
+            )
+        _vals, eigvecs, _knn, _bw = spectral_eigen
         # Whitened pairwise distances off the consensus Gram (same metric the
         # eigenmap embeds): d²_ij = G_ii + G_jj − 2 G_ij.
         cg = 0.5 * (consensus_gram + consensus_gram.transpose(0, 1))
@@ -3709,15 +4293,19 @@ def select_topology(
                     for i in range(d)
                 ]
                 p_domain = BoxDomain(axes)
+                p_params = p_domain.embed(p_coords).to(torch.float32)
+                periodic_plan = prepare_rbf_fit_plan(
+                    p_params, smoothing=smoothing,
+                )
                 gcv_p = _rbf_gcv_score(
-                    p_domain.embed(p_coords).to(torch.float32),
-                    targets, smoothing=smoothing,
+                    p_params, targets, smoothing=smoothing,
+                    plan=periodic_plan,
                 )
                 note = f"H1 persistent loops = {n_loops}"
                 candidates.append(TopologyCandidate(
                     f"torus-T{d}", "spectral", d, gcv_p, True, note,
                 ))
-                periodic = (p_coords, p_domain, gcv_p)
+                periodic = (p_coords, p_domain, gcv_p, periodic_plan)
     except (ValueError, RuntimeError):
         pass  # no clean eigenmap ⇒ no periodic candidate
 
@@ -3732,7 +4320,7 @@ def select_topology(
     # guarded only against a degenerate (non-finite) periodic fit.  Absent a
     # circle, the lower-GCV of flat vs curved wins.
     if periodic is not None and math.isfinite(periodic[2]):
-        p_coords, p_domain, _gcv_p = periodic
+        p_coords, p_domain, _gcv_p, winner_plan = periodic
         win_name = f"torus-T{int(p_coords.shape[1])}"
         win_mode, win_coords, win_domain = "spectral", p_coords, p_domain
         win_diag = spec_diag  # periodic rides the spectral eigenpairs
@@ -3740,10 +4328,12 @@ def select_topology(
         win_name = "spectral"
         win_mode, win_coords, win_domain = "spectral", curved[0], curved[1]
         win_diag = spec_diag
+        winner_plan = curved[2]
     else:
         win_name = "flat-pca"
         win_mode, win_coords, win_domain = "pca", coords_flat, CustomDomain(k_flat)
         win_diag = pca_diag
+        winner_plan = None
 
     candidates.sort(key=lambda c: (not c.viable, c.score))
     return TopologyChoice(
@@ -3753,6 +4343,8 @@ def select_topology(
         domain=win_domain,
         candidates=tuple(candidates),
         diagnostics=win_diag,
+        rbf_plan=winner_plan,
+        fisher_bases=fisher_bases,
     )
 
 
@@ -3842,6 +4434,576 @@ def compute_node_centroid(
     return {idx: sums[idx] / n for idx in capture_layers}
 
 
+def compute_node_activation_rows(
+    model: torch.nn.Module,
+    tokenizer: object,
+    layers: torch.nn.ModuleList,
+    device: torch.device,
+    responses: list[str],
+    prompts: "list[str] | list[list[dict[str, str]]]",
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+    layer_indices: Sequence[int] | None = None,
+) -> dict[int, torch.Tensor]:
+    """Per-response pooled activations for one node, fp32 on CPU.
+
+    This is the row-retaining sibling of :func:`compute_node_centroid`: same
+    conversational rendering, batching, last-content pooling, role handling, and
+    MPS cache discipline, but it returns ``{layer: (N, D)}`` instead of reducing
+    to a centroid.  Curved raw manifold fits use it to derive both centroids and
+    the fuzzy-manifold σ-field from one capture pass.
+    """
+    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
+
+    if not responses:
+        raise ValueError("manifold node has no responses")
+    if not prompts:
+        raise ValueError("conversational capture needs at least one baseline prompt")
+    k = len(prompts)
+    if len(responses) % k != 0:
+        raise ValueError(
+            f"node corpus ({len(responses)} responses) must be a multiple of "
+            f"the baseline prompt set ({k}); responses align response[i] -> "
+            f"prompt[i % k]"
+        )
+
+    capture_layers = (
+        list(range(len(layers)))
+        if layer_indices is None
+        else [int(idx) for idx in layer_indices]
+    )
+    rows_by_layer: dict[int, torch.Tensor] = {}
+    is_mps = getattr(device, "type", None) == "mps"
+    n = len(responses)
+    aligned_prompts = [prompts[i % k] for i in range(n)]
+
+    for start in range(0, n, _CAPTURE_BATCH):
+        end = min(start + _CAPTURE_BATCH, n)
+        per_layer = _encode_and_capture_all_batch(
+            model, tokenizer,
+            aligned_prompts[start:end], responses[start:end],
+            layers, device, role=role, model_type=model_type,
+            layer_indices=capture_layers,
+        )
+        for idx in capture_layers:
+            chunk = per_layer[idx].detach().to("cpu", torch.float32)
+            if idx not in rows_by_layer:
+                rows_by_layer[idx] = torch.empty(
+                    n, chunk.shape[1], dtype=torch.float32,
+                )
+            rows_by_layer[idx][start:end].copy_(chunk)
+        del per_layer
+        if is_mps:
+            torch.mps.empty_cache()
+
+    return rows_by_layer
+
+
+class ActivationRowStore:
+    """Temporary layer-major pooled-row spool for curved manifold fitting.
+
+    A curved fit needs per-response rows only after the centroid-derived basis
+    exists.  Keeping ``nodes × responses × layers × d_model`` in resident fp32
+    is a multi-GiB cliff, while dropping it makes auto-curved fitting repeat the
+    complete model pass.  This store writes one mmap-backed tensor per layer in
+    the model output dtype, indexed by the original flat corpus row.  fp16/bf16
+    storage is lossless relative to the source residual; fp32 promotion happens
+    only when covariance math consumes a node slice.
+    """
+
+    def __init__(self, node_sizes: Sequence[int]) -> None:
+        self.node_sizes = [int(size) for size in node_sizes]
+        self.offsets: list[int] = []
+        offset = 0
+        for size in self.node_sizes:
+            self.offsets.append(offset)
+            offset += size
+        self.total_rows = offset
+        self._tmp: tempfile.TemporaryDirectory[str] | None = (
+            tempfile.TemporaryDirectory(prefix="saklas-manifold-rows-")
+        )
+        self._layers: dict[int, torch.Tensor] = {}
+        self._owners: list[ActivationRowStore] = []
+        self._closed = False
+
+    @classmethod
+    def load(
+        cls, path: Path, node_sizes: Sequence[int], *,
+        layer_indices: Sequence[int] | None = None,
+    ) -> "ActivationRowStore":
+        store = cls.__new__(cls)
+        store.node_sizes = [int(size) for size in node_sizes]
+        store.offsets = []
+        offset = 0
+        for size in store.node_sizes:
+            store.offsets.append(offset)
+            offset += size
+        store.total_rows = offset
+        selected = (
+            None if layer_indices is None
+            else {int(idx) for idx in layer_indices}
+        )
+        store._layers = {}
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            layer_keys: dict[int, str] = {}
+            for key in tensors.keys():
+                if not key.startswith("layer_"):
+                    raise ValueError(
+                        f"invalid activation-row cache key {key!r} at {path}"
+                    )
+                try:
+                    idx = int(key.split("_", 1)[1])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid activation-row cache key {key!r} at {path}"
+                    ) from exc
+                shape = tuple(int(dim) for dim in tensors.get_slice(key).get_shape())
+                if len(shape) != 2 or shape[0] != store.total_rows:
+                    raise ValueError(
+                        f"invalid activation-row cache tensor {key!r} at {path}"
+                    )
+                layer_keys[idx] = key
+                if selected is None or idx in selected:
+                    store._layers[idx] = tensors.get_tensor(key)
+            if not layer_keys:
+                raise ValueError(f"empty activation-row cache at {path}")
+        if not store._layers or any(
+            rows.ndim != 2 or int(rows.shape[0]) != store.total_rows
+            for rows in store._layers.values()
+        ):
+            raise ValueError(f"invalid activation-row cache at {path}")
+        if selected is not None and set(store._layers) != selected:
+            raise ValueError(
+                f"activation-row cache at {path} has layers "
+                f"{sorted(store._layers)}, need {sorted(selected)}"
+            )
+        store._tmp = None
+        store._owners = []
+        store._closed = False
+        return store
+
+    @classmethod
+    def load_shards(
+        cls,
+        paths: "dict[int, Path]",
+        node_sizes: Sequence[int],
+    ) -> "ActivationRowStore":
+        """Load independently persisted per-layer activation-row shards.
+
+        Capture-cache v4 stores one safetensors file per layer so a scoped fit
+        neither maps nor rewrites unrelated multi-GiB row payloads.  Every
+        shard must carry exactly its named ``layer_<L>`` tensor; the caller
+        validates the tensor's exact digest against the atomically published
+        capture metadata.
+        """
+        if not paths:
+            raise ValueError("activation-row shard selection must not be empty")
+        store = cls.__new__(cls)
+        store.node_sizes = [int(size) for size in node_sizes]
+        store.offsets = []
+        offset = 0
+        for size in store.node_sizes:
+            store.offsets.append(offset)
+            offset += size
+        store.total_rows = offset
+        store._layers = {}
+        for idx, path in sorted(paths.items()):
+            expected_key = f"layer_{int(idx)}"
+            with safe_open(str(path), framework="pt", device="cpu") as tensors:
+                keys = list(tensors.keys())
+                if keys != [expected_key]:
+                    raise ValueError(
+                        f"activation-row shard at {path} has keys {keys}, "
+                        f"expected [{expected_key!r}]"
+                    )
+                shape = tuple(
+                    int(dim) for dim in tensors.get_slice(expected_key).get_shape()
+                )
+                if len(shape) != 2 or shape[0] != store.total_rows:
+                    raise ValueError(
+                        f"invalid activation-row shard tensor {expected_key!r} "
+                        f"at {path}"
+                    )
+                store._layers[int(idx)] = tensors.get_tensor(expected_key)
+        store._tmp = None
+        store._owners = []
+        store._closed = False
+        return store
+
+    @classmethod
+    def combine_disjoint(
+        cls, stores: Sequence["ActivationRowStore"],
+    ) -> "ActivationRowStore":
+        """Combine disjoint layer stores by view, transferring ownership.
+
+        Sharded cache top-ups often pair many immutable cached layers with one
+        newly captured temporary layer. Copying all ``N x D`` rows into a third
+        mmap merely to present one layer-major roster doubles multi-GiB I/O.
+        This composite aliases the existing tensors and keeps their stores
+        alive until the composite closes; no payload bytes move.
+        """
+        if not stores:
+            raise ValueError("activation-row combine needs at least one store")
+        node_sizes = list(stores[0].node_sizes)
+        if any(store._closed for store in stores):
+            raise RuntimeError("cannot combine a closed activation-row store")
+        if any(store.node_sizes != node_sizes for store in stores[1:]):
+            raise ValueError("activation-row stores must share node sizes")
+        layers: dict[int, torch.Tensor] = {}
+        for store in stores:
+            overlap = set(layers) & set(store._layers)
+            if overlap:
+                raise ValueError(
+                    f"activation-row stores overlap layers {sorted(overlap)}"
+                )
+            layers.update(store._layers)
+        combined = cls.__new__(cls)
+        combined.node_sizes = node_sizes
+        combined.offsets = list(stores[0].offsets)
+        combined.total_rows = stores[0].total_rows
+        combined._tmp = None
+        combined._layers = layers
+        combined._owners = list(stores)
+        combined._closed = False
+        return combined
+
+    def _layer(self, idx: int, *, dim: int, dtype: torch.dtype) -> torch.Tensor:
+        existing = self._layers.get(idx)
+        if existing is not None:
+            if existing.shape != (self.total_rows, dim) or existing.dtype != dtype:
+                raise ValueError(f"activation-row shape/dtype changed at layer {idx}")
+            return existing
+        if self._closed:
+            raise RuntimeError("activation-row store is closed")
+        assert self._tmp is not None
+        path = Path(self._tmp.name) / f"layer_{idx}.bin"
+        rows = torch.from_file(
+            str(path), shared=True, size=self.total_rows * dim, dtype=dtype,
+        ).reshape(self.total_rows, dim)
+        self._layers[idx] = rows
+        return rows
+
+    def write(
+        self, idx: int, flat_indices: torch.Tensor, rows: torch.Tensor,
+    ) -> None:
+        host = rows.detach().to(device="cpu")
+        target = self._layer(idx, dim=int(host.shape[1]), dtype=host.dtype)
+        target.index_copy_(0, flat_indices.to(dtype=torch.long, device="cpu"), host)
+
+    def node_rows(self, node_idx: int) -> dict[int, torch.Tensor]:
+        start = self.offsets[node_idx]
+        end = start + self.node_sizes[node_idx]
+        return {idx: rows[start:end] for idx, rows in self._layers.items()}
+
+    @property
+    def layer_indices(self) -> list[int]:
+        return sorted(self._layers)
+
+    def flat_rows(self, idx: int) -> torch.Tensor:
+        return self._layers[idx]
+
+    def persist(self, path: Path) -> None:
+        if self._closed:
+            raise RuntimeError("activation-row store is closed")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+        )
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            save_file(
+                {
+                    f"layer_{idx}": rows.contiguous()
+                    for idx, rows in self._layers.items()
+                },
+                str(tmp),
+            )
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def __iter__(self) -> Iterator[dict[int, torch.Tensor]]:
+        for node_idx in range(len(self.node_sizes)):
+            yield self.node_rows(node_idx)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._layers.clear()
+        owners = getattr(self, "_owners", [])
+        self._owners = []
+        for owner in owners:
+            owner.close()
+        if self._tmp is not None:
+            self._tmp.cleanup()
+        self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def compute_manifold_node_stats(
+    model: torch.nn.Module,
+    tokenizer: object,
+    layers: torch.nn.ModuleList,
+    device: torch.device,
+    node_groups: "Sequence[tuple[str, list[str]]]",
+    prompts: "Sequence[str | list[dict[str, str]]]",
+    *,
+    roles: "Sequence[str | None]",
+    model_type: str | None = None,
+    layer_indices: Sequence[int] | None = None,
+    retain_rows: bool = False,
+    prepared_rows: "Sequence[tuple[torch.Tensor, int]] | None" = None,
+    capture_context: "Any | None" = None,
+) -> tuple[dict[int, torch.Tensor], ActivationRowStore | None]:
+    """Fit-wide batched capture for all manifold nodes.
+
+    Rows carry their node/within-node indices through one stream, so short
+    template corpora share batches across node boundaries instead of paying one
+    underfilled model forward per node.  Standard 48-response nodes retain the
+    same chunking, while OOM backoff halves the active batch and cautiously grows
+    it again. Returns layer-major ``(K, D)`` fp32 centroid stacks plus optional
+    retained rows in the capture source dtype.  Keeping the result layer-major
+    matches every fit consumer and avoids rebuilding each stack from ``K`` row
+    views immediately after capture.
+    """
+    from saklas.core.vectors import (
+        _CAPTURE_BATCH_MAX,
+        _encode_and_capture_all_batch,
+        _prepare_capture_batch,
+    )
+
+    if not prompts:
+        raise ValueError("conversational capture needs at least one baseline prompt")
+    if len(node_groups) != len(roles):
+        raise ValueError("node_groups and roles must be aligned")
+    capture_layers = (
+        list(range(len(layers)))
+        if layer_indices is None else [int(idx) for idx in layer_indices]
+    )
+    k = len(prompts)
+    flat: list[
+        tuple[int, int, str | list[dict[str, str]], str, str | None]
+    ] = []
+    node_sizes: list[int] = []
+    for node_idx, ((_label, responses), role) in enumerate(
+        zip(node_groups, roles, strict=True),
+    ):
+        if not responses or len(responses) % k != 0:
+            raise ValueError(
+                f"node corpus ({len(responses)} responses) must be a non-empty "
+                f"multiple of the baseline prompt set ({k})"
+            )
+        node_sizes.append(len(responses))
+        flat.extend(
+            (node_idx, row_idx, prompts[row_idx % k], response, role)
+            for row_idx, response in enumerate(responses)
+        )
+
+    sums: dict[int, torch.Tensor] = {}
+    retained = ActivationRowStore(node_sizes) if retain_rows else None
+    # Render/tokenize once, then group similar lengths so right-padding does not
+    # make every row pay the longest response's quadratic attention cost.  Tiny
+    # CPU test tokenizers are intentionally non-callable and keep the legacy
+    # seam; production HF tokenizers always take the prepared path.
+    prepared: list[tuple[torch.Tensor, int]] | None = (
+        list(prepared_rows) if prepared_rows is not None else None
+    )
+    if prepared is not None and len(prepared) != len(flat):
+        raise ValueError("prepared_rows must align with the flattened manifold corpus")
+    if prepared is None and callable(tokenizer):
+        prepared = _prepare_capture_batch(
+            tokenizer,
+            [row[2] for row in flat],
+            [row[3] for row in flat],
+            roles=[row[4] for row in flat],
+            model_type=model_type,
+        )
+    order = (
+        sorted(range(len(flat)), key=lambda i: int(prepared[i][0].shape[1]))
+        if prepared is not None else list(range(len(flat)))
+    )
+    # Optimistically try the proven maximum and halve on OOM. Starting at the
+    # old conservative 16 made a 107-node fit spend four successful forwards
+    # merely climbing to the width that the same device had already shown it
+    # could run.
+    active_batch = _CAPTURE_BATCH_MAX
+    start = 0
+    is_mps = getattr(device, "type", None) == "mps"
+    while start < len(order):
+        end = min(start + active_batch, len(order))
+        chunk_indices = order[start:end]
+        chunk = [flat[i] for i in chunk_indices]
+        try:
+            per_layer = _encode_and_capture_all_batch(
+                model, tokenizer,
+                [row[2] for row in chunk],
+                [row[3] for row in chunk],
+                layers, device,
+                roles=[row[4] for row in chunk],
+                model_type=model_type,
+                layer_indices=capture_layers,
+                rendered=(
+                    [prepared[i] for i in chunk_indices]
+                    if prepared is not None else None
+                ),
+                promote_pooled=not retain_rows,
+                capture_context=capture_context,
+            )
+        except RuntimeError as exc:
+            if not is_out_of_memory_error(exc) or active_batch <= 1:
+                raise
+            active_batch = max(1, active_batch // 2)
+            if is_mps:
+                torch.mps.empty_cache()
+            elif getattr(device, "type", None) == "cuda":
+                torch.cuda.empty_cache()
+            continue
+
+        node_ids_cpu = torch.tensor([row[0] for row in chunk], dtype=torch.long)
+        flat_indices_cpu = torch.tensor(chunk_indices, dtype=torch.long)
+        unique = inverse = None
+        if retained is None:
+            node_ids = node_ids_cpu.to(device)
+            unique, inverse = torch.unique(
+                node_ids, sorted=True, return_inverse=True,
+            )
+        for idx in capture_layers:
+            captured = per_layer[idx].detach()
+            if idx not in sums:
+                sums[idx] = torch.zeros(
+                    len(node_groups), captured.shape[1], dtype=torch.float32,
+                )
+            if retained is not None:
+                # Raw rows must cross the boundary for the later sigma fit, but
+                # stay in source dtype in the mmap.  Accumulate their promoted
+                # host values while they are already present.
+                host = captured.to(device="cpu")
+                retained.write(idx, flat_indices_cpu, host)
+                sums[idx].index_add_(
+                    0, node_ids_cpu, host.to(torch.float32),
+                )
+            else:
+                # Centroid-only fits need one partial sum per node, not every
+                # response row.  Reduce on-device in fp32 and transfer U×D
+                # (usually 1×D) instead of B×D.
+                assert unique is not None and inverse is not None
+                partial = torch.zeros(
+                    unique.numel(), captured.shape[1],
+                    dtype=torch.float32, device=captured.device,
+                )
+                partial.index_add_(0, inverse, captured.to(torch.float32))
+                sums[idx].index_add_(
+                    0, unique.to(device="cpu"), partial.to(device="cpu"),
+                )
+        del per_layer
+        start = end
+        if is_mps:
+            torch.mps.empty_cache()
+
+    divisors = torch.tensor(node_sizes, dtype=torch.float32).reshape(-1, 1)
+    # The accumulators already have the final layer-major K×D shape and sole
+    # ownership here. Normalize them in place instead of allocating a second
+    # complete fp32 centroid roster at the capture/fitting boundary.
+    for idx in capture_layers:
+        sums[idx].div_(divisors)
+    return sums, retained
+
+
+def compute_node_reduced_covariance_from_rows(
+    activation_rows: dict[int, torch.Tensor],
+    layer_subs: "dict[int, LayerSubspace]",
+) -> dict[int, torch.Tensor]:
+    """Within-node reduced covariance from retained pooled activations.
+
+    ``activation_rows`` must carry the same ``{layer: (N, D)}`` rows returned by
+    :func:`compute_node_activation_rows`.  The result is identical to
+    :func:`compute_node_reduced_covariance` without re-running the model.
+    """
+    covs: dict[int, torch.Tensor] = {}
+    for idx, sub in layer_subs.items():
+        rows = activation_rows[idx].to("cpu", torch.float32)
+        n = int(rows.shape[0])
+        mean = sub.mean.to(torch.float32)
+        basis = sub.basis.to(torch.float32)
+        z = (rows - mean) @ basis.T
+        if n <= 1:
+            covs[idx] = torch.zeros(
+                (sub.rank, sub.rank), dtype=torch.float32,
+            )
+            continue
+        centered = z - z.mean(dim=0, keepdim=True)
+        covs[idx] = centered.T @ centered / float(n - 1)
+    return covs
+
+
+def compute_store_reduced_covariances(
+    store: ActivationRowStore,
+    layer_subs: "dict[int, LayerSubspace]",
+    *,
+    row_chunk: int = 2048,
+) -> list[dict[int, torch.Tensor]]:
+    """Project a layer-major activation spool into per-node covariances.
+
+    The legacy helper above is useful for one standalone node, but iterating it
+    over an :class:`ActivationRowStore` visits a layer-major mmap in node-major
+    order and launches one ``(N_node,D) @ (D,R)`` projection per node and layer.
+    This fit-wide sibling streams each layer once in bounded row chunks, performs
+    large projection GEMMs, and segments only the small ``(N,R)`` results by the
+    store's contiguous node boundaries.  Covariance is translation-invariant, so
+    projecting raw rows is exactly equivalent to subtracting ``sub.mean`` first
+    and then centering the reduced rows.
+    """
+    if row_chunk <= 0:
+        raise ValueError("row_chunk must be > 0")
+    if not set(layer_subs) <= set(store.layer_indices):
+        raise ValueError(
+            "activation-row store must cover every fitted subspace layer"
+        )
+
+    n_nodes = len(store.node_sizes)
+    out: list[dict[int, torch.Tensor]] = [dict() for _ in range(n_nodes)]
+    boundaries = [
+        (offset, offset + size)
+        for offset, size in zip(store.offsets, store.node_sizes, strict=True)
+    ]
+    for idx, sub in layer_subs.items():
+        basis_t = sub.basis.to(device="cpu", dtype=torch.float32).transpose(0, 1)
+        rank = sub.rank
+        rows = store.flat_rows(idx)
+        reduced_rows = torch.empty(store.total_rows, rank, dtype=torch.float32)
+        mean = sub.mean.to(device="cpu", dtype=torch.float32)
+        centered_buffer = torch.empty(
+            min(row_chunk, store.total_rows), rows.shape[1], dtype=torch.float32,
+        )
+        for start in range(0, store.total_rows, row_chunk):
+            end = min(start + row_chunk, store.total_rows)
+            centered = centered_buffer[:end - start]
+            # Center before projection for numerical stability at the large
+            # common-mode offsets residual streams can carry. ``out=`` keeps
+            # the operation bounded and out-of-place even when the source row
+            # store is already fp32 (where ``.to(float32)`` would alias it).
+            torch.sub(rows[start:end], mean, out=centered)
+            reduced_rows[start:end] = centered @ basis_t
+
+        for k, (start, end) in enumerate(boundaries):
+            size = end - start
+            if size <= 1:
+                cov = torch.zeros(rank, rank, dtype=torch.float32)
+            else:
+                node_reduced = reduced_rows[start:end]
+                centered = node_reduced - node_reduced.mean(dim=0, keepdim=True)
+                cov = centered.transpose(0, 1) @ centered / float(size - 1)
+            out[k][idx] = cov
+    return out
+
+
 def compute_node_reduced_covariance(
     model: torch.nn.Module,
     tokenizer: object,
@@ -3856,7 +5018,7 @@ def compute_node_reduced_covariance(
 ) -> dict[int, torch.Tensor]:
     """Within-node **reduced** covariance ``(R, R)`` per layer for one node.
 
-    The fuzzy-manifold second pass (curved fits only).  Re-captures the node's
+    The fuzzy-manifold fallback pass (curved fits only).  Re-captures the node's
     corpus exactly as :func:`compute_node_centroid` does — same conversational
     ``[directive, prompt, response]`` framing, same last-content-token fp32
     pooling — but instead of pooling to the centroid it projects every sample
@@ -3866,14 +5028,13 @@ def compute_node_reduced_covariance(
     ``count − 1`` denominator; zeros for a single-sample node).
 
     This needs the per-layer ``mean``/``basis`` (hence ``layer_subs``), which
-    only exist *after* the surface fit — so it is a deliberate **second
-    fit-time forward pass** over the corpus, run only for curved manifolds
-    (``emotions``-shaped), where the reduced dim ``R`` keeps the accumulators tiny
-    (``(R, R)`` with ``R ≤ 64``, ``O(1)`` memory vs. the activation width).
-    The "no second forward pass" invariant governs generation / monitoring, not
-    the rare off-hot-path fit.  The off-surface reduction of these covariances
-    into per-node ``σ`` lives in the extraction pipeline (it needs the surface
-    tangent too).  fp32 on CPU, same MPS ``empty_cache`` discipline.
+    only exist *after* the surface fit.  When the extraction pipeline already
+    retained first-pass activation rows it uses
+    :func:`compute_node_reduced_covariance_from_rows` instead; this function is
+    the low-memory fallback for paths that did not retain them (notably
+    auto-topology fits that resolved curved after centroid pooling).  The
+    off-surface reduction of these covariances into per-node ``σ`` lives in the
+    extraction pipeline.  fp32 on CPU, same MPS ``empty_cache`` discipline.
     """
     from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
 
@@ -3960,20 +5121,26 @@ def _off_surface_var(
 
     ``cov`` is the node's reduced ``(R, R)`` within-node covariance, ``tangent``
     its ``(R, n)`` surface tangent.  Projects ``cov`` onto the normal complement
-    ``P = I − t(tᵀt)⁺tᵀ`` and returns ``tr(P cov)/(R − n)`` — the part of the
+    ``P = I − tt⁺`` and returns ``tr(P cov)/(R − rank(t))`` — the part of the
     node's scatter that lives *off* the mean surface, which is what the tube
     thickness should be (tangential scatter is the node sliding *along* the
     surface, expected and not thickness).  Degenerates to the full isotropic
-    ``tr(cov)/R`` when the surface fills its subspace (``R ≤ n``, no normal
-    complement).  Clamped non-negative (sample-covariance round-off).
+    ``tr(cov)/R`` only when the actual tangent range fills the reduced subspace.
+    Clamped non-negative (sample-covariance round-off).
     """
-    if R <= n:
-        return float(torch.diagonal(cov).sum() / max(R, 1))
-    tt = tangent.T @ tangent                                   # (n, n)
-    proj = tangent @ torch.linalg.pinv(tt) @ tangent.T          # (R, R) onto tangent
-    normal = torch.eye(R, dtype=cov.dtype) - proj               # onto normal complement
-    var = torch.trace(normal @ cov) / float(R - n)
-    return float(var.clamp(min=0.0))
+    if cov.shape != (R, R):
+        raise ValueError(
+            f"covariance must have shape ({R}, {R}), got {tuple(cov.shape)}"
+        )
+    if tangent.shape != (R, n):
+        raise ValueError(
+            f"tangent must have shape ({R}, {n}), got {tuple(tangent.shape)}"
+        )
+    return float(
+        _off_surface_vars(
+            cov.reshape(1, R, R), tangent.reshape(1, R, n), R, n,
+        )[0]
+    )
 
 
 def _off_surface_vars(
@@ -3982,16 +5149,39 @@ def _off_surface_vars(
     """Batched counterpart to :func:`_off_surface_var`.
 
     ``covs`` is ``(K, R, R)`` and ``tangents`` is ``(K, R, n)``.  Returns one
-    non-negative off-surface variance per node, keeping the small pseudoinverse
-    solve batched on CPU during σ-field fitting.
+    non-negative off-surface variance per node, keeping the economy SVD batched
+    on CPU during σ-field fitting.
     """
-    if R <= n:
-        return torch.diagonal(covs, dim1=-2, dim2=-1).sum(dim=-1) / max(R, 1)
-    tt = tangents.transpose(-1, -2) @ tangents                  # (K, n, n)
-    proj = tangents @ torch.linalg.pinv(tt) @ tangents.transpose(-1, -2)
+    if covs.ndim != 3 or covs.shape[-2:] != (R, R):
+        raise ValueError(
+            f"covariances must have shape (K, {R}, {R}), got {tuple(covs.shape)}"
+        )
+    if tangents.shape != (covs.shape[0], R, n):
+        raise ValueError(
+            f"tangents must have shape ({covs.shape[0]}, {R}, {n}), "
+            f"got {tuple(tangents.shape)}"
+        )
+    # One economy SVD supplies both the numerical rank and the projector onto
+    # the *actual* local tangent range.  An RBF surface may have a fold/pinch
+    # where rank(T) < n; using nominal ``R-n`` there overstates tube variance.
+    # Match ``torch.linalg.matrix_rank``'s default relative tolerance so this
+    # fused path preserves the old rank boundary without a second decomposition.
+    U, singular_values, _ = torch.linalg.svd(tangents, full_matrices=False)
+    relative_tol = (
+        singular_values[..., :1]
+        * (max(R, n) * torch.finfo(singular_values.dtype).eps)
+    )
+    active = singular_values > relative_tol
+    tangent_rank = active.sum(dim=-1)
+    tangent_frame = U * active.unsqueeze(-2)
+    proj = tangent_frame @ U.transpose(-1, -2)
     normal = torch.eye(R, dtype=covs.dtype, device=covs.device) - proj
-    var = torch.einsum("kij,kji->k", normal, covs) / float(R - n)
-    return var.clamp(min=0.0)
+    normal_dof = R - tangent_rank
+    normal_var = torch.einsum("kij,kji->k", normal, covs) / normal_dof.clamp_min(1)
+    # A full-row-rank tangent fills the fitted subspace: there is no normal
+    # direction to average. Preserve the established isotropic fallback.
+    isotropic = torch.diagonal(covs, dim1=-2, dim2=-1).sum(dim=-1) / max(R, 1)
+    return torch.where(normal_dof > 0, normal_var, isotropic).clamp(min=0.0)
 
 
 def fit_sigma_field(
@@ -4002,6 +5192,7 @@ def fit_sigma_field(
     *,
     smoothing: float | str | None = "auto",
     floor_frac: float = 1e-3,
+    rbf_plan: RbfFitPlan | None = None,
 ) -> dict[int, dict[str, float]]:
     """Attach a fuzzy-manifold ``log σ`` RBF to each curved layer (mutates them).
 
@@ -4023,6 +5214,10 @@ def fit_sigma_field(
     n = int(domain.intrinsic_dim)
     coords_f = node_coords.to(torch.float32)
     info: dict[int, dict[str, float]] = {}
+    if rbf_plan is None and layer_subs:
+        first = next(iter(layer_subs.values()))
+        np_, _rw, _pc = first.rbf_params()
+        rbf_plan = prepare_rbf_fit_plan(np_, smoothing=smoothing)
     for idx, sub in layer_subs.items():
         R = sub.rank
         covs = torch.stack(
@@ -4037,6 +5232,7 @@ def fit_sigma_field(
         np_, _rw, _pc = sub.rbf_params()
         w, c, rinfo = fit_rbf_smoothed(
             np_.to(torch.float32), log_sigma, smoothing=smoothing,
+            plan=rbf_plan,
         )
         sub.sigma_rbf_weights = w
         sub.sigma_poly_coeffs = c
@@ -4050,6 +5246,11 @@ def fit_sigma_field(
 
 
 # ------------------------------------------------------------- save/load ---
+
+def _replace_manifold_file(source: Path, target: Path) -> None:
+    """Atomic replace seam used by publication failure-injection tests."""
+
+    os.replace(source, target)
 
 def save_manifold(
     manifold: Manifold, path: str | Path, metadata: dict[str, object],
@@ -4065,17 +5266,21 @@ def save_manifold(
     ``origin_per_layer`` (the authoring-coordinate foot of the neutral mean,
     keyed by layer), plus the provenance fields in ``metadata``.
 
-    **Affine (flat / folded-vector) layers** write only ``layer_<L>.mean`` +
-    ``layer_<L>.basis`` — there is no RBF triple and the coord normalization
-    is identity (reconstructed from the basis shape by
+    **Affine (flat / folded-vector) layers** write ``layer_<L>.mean`` +
+    ``layer_<L>.basis`` and optional ``layer_<L>.affine_map`` — there is no RBF
+    triple and ordinary-fit coord normalization is identity (reconstructed by
     :meth:`LayerSubspace.affine` on load).  The *absence* of ``node_params``
     on disk is the read-side affine marker ``load_manifold`` keys on, so a
     folded-vector artifact and a fitted manifold share one save/load path.
     """
-    from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
+    from saklas.io.manifold_folder import (
+        MANIFOLD_SIDECAR_FIELDS, canonical_manifold_sidecar_payload,
+        validate_manifold_sidecar_payload,
+    )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    manifold.validate_runtime_geometry()
 
     # Every saklas safetensor artifact is stored fp32 (cast at the writer);
     # fits already produce fp32, so the casts are idempotent guarantees.
@@ -4091,11 +5296,14 @@ def save_manifold(
             # by ``LayerSubspace.affine`` on load.  Persist mean + basis (the
             # *absence* of ``node_params`` on disk is the affine marker), plus
             # the per-layer **real, neutral-anchored** node coords ``(K, R)``
-            # when present — the steer-target source (§5).  Older affine
-            # artifacts without it load with ``node_coords=None``.
+            # when present — the steer-target source (§5).
             if sub.node_coords is not None:
                 tensors[f"layer_{idx}.node_coords"] = (
                     sub.node_coords.contiguous().to(torch.float32).cpu()
+                )
+            if sub.affine_map is not None:
+                tensors[f"layer_{idx}.affine_map"] = (
+                    sub.affine_map.contiguous().to(torch.float32).cpu()
                 )
             continue
         np_, rw, pc = sub.rbf_params()
@@ -4106,9 +5314,7 @@ def save_manifold(
         tensors[f"layer_{idx}.coord_scale"] = sub.coord_scale.contiguous().to(torch.float32).cpu()
         # Fuzzy-manifold σ-field (curved fits with the within-node spread pass).
         # The log-σ RBF over the same normalized ``node_params``; its *absence*
-        # on disk is the read-side "zero-thickness wire" marker (legacy curved
-        # fits and SAE fits skip it), so a fuzzy and a legacy manifold share one
-        # save/load path exactly as affine/curved do.
+        # on disk is the current SAE-space "zero-thickness wire" marker.
         if sub.sigma_rbf_weights is not None and sub.sigma_poly_coeffs is not None:
             tensors[f"layer_{idx}.sigma_rbf_weights"] = (
                 sub.sigma_rbf_weights.contiguous().to(torch.float32).cpu()
@@ -4116,20 +5322,24 @@ def save_manifold(
             tensors[f"layer_{idx}.sigma_poly_coeffs"] = (
                 sub.sigma_poly_coeffs.contiguous().to(torch.float32).cpu()
             )
-    save_file(tensors, str(path))
-
     from saklas import __version__ as _saklas_version
 
-    sidecar: dict[str, object] = {
-        "format_version": MANIFOLD_FORMAT_VERSION,
-        "method": metadata.get("method", "manifold_pca"),
-        "saklas_version": _saklas_version,
-        "name": manifold.name,
-        "domain": manifold.domain.to_spec(),
-        "node_labels": list(manifold.node_labels),
-        "node_count": len(manifold.node_labels),
-        "feature_space": manifold.feature_space,
-    }
+    sidecar: dict[str, object] = canonical_manifold_sidecar_payload(
+        name=manifold.name,
+        method=cast(str, metadata.get("method", "manifold_pca")),
+        saklas_version=_saklas_version,
+        domain=manifold.domain.to_spec(),
+        node_labels=list(manifold.node_labels),
+        feature_space=manifold.feature_space,
+        fit_mode=cast(str, metadata.get("fit_mode", "authored")),
+        hyperparams=cast(dict[str, Any], metadata.get("hyperparams", {})),
+        diagnostics=cast(dict[str, Any], metadata.get("diagnostics", {})),
+        node_spread_per_layer=cast(
+            dict[str, Any], metadata.get("node_spread_per_layer", {}),
+        ),
+        fitted_layers=sorted(manifold.layers),
+        semantic_metadata=metadata,
+    )
     # Per-layer Mahalanobis share weight (whitened bake-score analogue).
     # Stored as ``{str(idx): float}`` like EV; absent when no whitener was
     # available at fit time, in which case the apply-time share weighting
@@ -4148,7 +5358,11 @@ def save_manifold(
             for idx, o in manifold.origin.items()
         }
     for key in (
-        "nodes_sha256", "sae_release", "sae_revision", "sae_ids_by_layer",
+        "nodes_sha256", "sae_release", "sae_revision", "sae_fingerprint",
+        "sae_ids_by_layer",
+        "sae_full_coverage",
+        "model_fingerprint", "capture_sha256",
+        "fit_policy_version",
         # Share-weighting metric ("mahalanobis" / "euclidean") — the
         # manifold analogue of the vector sidecar's ``bake`` field.
         "share_metric",
@@ -4160,10 +5374,8 @@ def save_manifold(
         "subspace_metric",
         # Per-layer whitened between-node spread ``{str(L): tr(G_L)}`` — the
         # concept's signal-concentration profile across the stack (the
-        # consensus Gram's per-layer summand traces).  Diagnostic only; absent
-        # on fits that predate it (loads as an empty dict).  Surfaced by
-        # `manifold show`.
-        "node_spread_per_layer",
+        # consensus Gram's per-layer summand traces).  Diagnostic only;
+        # surfaced by `manifold show`.
         # Penalized-RBF provenance ``{str(L): {lambda, edf, gcv}}`` (curved
         # discover fits) and the fuzzy-manifold σ-field summary
         # ``{str(L): {sigma_mean, sigma_min, sigma_max, lambda}}`` (curved fits
@@ -4178,7 +5390,6 @@ def save_manifold(
         # bandwidth) for reproducibility; ``diagnostics`` carries the
         # per-method PCA variance bars or spectral spectrum for the
         # CLI / webui inspector.  All absent for authored fits.
-        "fit_mode", "hyperparams", "diagnostics",
         # Topology-selection provenance (``fit_mode="auto"`` only): the
         # geometry ``select_topology`` resolved to (``resolved_fit_mode`` ∈
         # pca/spectral + the winning ``topology_winner`` name) and the full
@@ -4199,44 +5410,207 @@ def save_manifold(
         # ``node_labels``.  Generation-time provenance (system template +
         # elicitation role label); absent when no node carries a kind.
         "node_kinds",
-        # Merge provenance ({coord: {alpha, project_away, tensor_sha256}}),
+        # Merge provenance ({coord: {alpha, tensor_sha256}}),
         # carried on a ``fit_mode="baked"`` manifold produced by
         # :func:`saklas.io.merge.merge_into_manifold`.  Informational only — a
         # baked manifold never re-fits, so nothing branches on it; surfaced
         # by the inspector the way the legacy pack sidecar's ``components``
         # was.  Absent on every non-merge fit.
-        "components",
+        "components", "bake_policy",
+        # Cross-model transfer provenance. Persisted in the initial sidecar so
+        # pair publication has no post-save patch crash window.
+        "source_model_id", "source_model_fingerprint",
+        "transfer_quality_estimate",
     ):
         if key in metadata:
             sidecar[key] = metadata[key]
 
-    from saklas.io.atomic import write_json_atomic
+    if set(sidecar) != MANIFOLD_SIDECAR_FIELDS:
+        raise ValueError("manifold writer produced a non-canonical sidecar")
+    validate_manifold_sidecar_payload(sidecar, location="manifold writer sidecar")
 
-    write_json_atomic(path.with_suffix(".json"), sidecar)
+    from saklas.io.manifold_folder import manifold_pair_lock
+
+    with manifold_pair_lock(path):
+        sidecar_path = path.with_suffix(".json")
+        tensor_fd, tensor_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+        )
+        os.close(tensor_fd)
+        sidecar_fd, sidecar_name = tempfile.mkstemp(
+            prefix=f".{sidecar_path.name}.", suffix=".tmp", dir=path.parent,
+        )
+        tensor_tmp = Path(tensor_name)
+        sidecar_tmp = Path(sidecar_name)
+        try:
+            # Stage and fsync *both* payloads before replacing either canonical
+            # path.  Commit the sidecar first: an interruption on a first fit
+            # then leaves an ignored orphan sidecar, never the tensor-without-
+            # sidecar shape the folder loader must reject.  On replacement an
+            # interrupted mixed pair fails its old manifest proof and the next
+            # target fit deterministically overwrites it.
+            save_file(tensors, str(tensor_tmp))
+            with open(tensor_tmp, "rb") as handle:
+                os.fsync(handle.fileno())
+            sidecar_bytes = (json.dumps(sidecar, indent=2) + "\n").encode()
+            with os.fdopen(sidecar_fd, "wb", closefd=True) as handle:
+                sidecar_fd = -1
+                handle.write(sidecar_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _replace_manifold_file(sidecar_tmp, sidecar_path)
+            _replace_manifold_file(tensor_tmp, path)
+            # Make both directory entries durable before the manifest CAS can
+            # publish their hashes as the current pair.
+            try:
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                # Directory fsync is unavailable on some platforms; both files
+                # themselves are still fsynced and retry recovery remains safe.
+                pass
+        finally:
+            if sidecar_fd >= 0:
+                os.close(sidecar_fd)
+            tensor_tmp.unlink(missing_ok=True)
+            sidecar_tmp.unlink(missing_ok=True)
     log.info("Saved manifold %r (%d layers) to %s",
              manifold.name, len(manifold.layers), path)
 
 
-def load_manifold(path: str | Path) -> Manifold:
-    """Load a fitted manifold and its sidecar metadata."""
-    path = Path(path)
-    tensors = load_file(str(path))
-    with open(path.with_suffix(".json")) as f:
-        sidecar = json.load(f)
+def load_manifold(
+    path: str | Path, *, verify_manifest: bool = True,
+) -> Manifold:
+    """Load a fitted manifold, verifying its targeted manifest pair by default."""
+    from saklas.io.manifold_folder import _locked_manifest, manifold_pair_lock
 
+    resolved = Path(path)
+    if verify_manifest:
+        # Global lock order for fitted artifacts is folder -> tensor pair.
+        # Fit/publication already uses this order; readers must match it or a
+        # reader holding the pair can deadlock a fitter holding the folder.
+        with _locked_manifest(resolved.parent):
+            with manifold_pair_lock(resolved):
+                return _load_manifold_locked(
+                    resolved, verify_manifest=verify_manifest,
+                )
+    with manifold_pair_lock(resolved):
+        return _load_manifold_locked(resolved, verify_manifest=False)
+
+
+def _load_manifold_locked(
+    path: str | Path, *, verify_manifest: bool = True,
+) -> Manifold:
+    """Read one fitted manifold while its tensor/sidecar pair lock is held."""
+    from saklas.io.manifold_folder import (
+        ManifoldFormatError,
+        load_manifold_sidecar_data,
+    )
+
+    path = Path(path)
+    manifest_path = path.parent / "manifold.json"
+    verified_tensor_sha256: str | None = None
+    folder_view: Any | None = None
+    if verify_manifest and manifest_path.exists():
+        from saklas.io.packs import verify_integrity
+        from saklas.io.manifold_folder import ManifoldFolder
+
+        folder_view = ManifoldFolder.load(path.parent, verify_manifest=False)
+        files = folder_view.files
+        pair_names = (path.name, path.with_suffix(".json").name)
+        missing = [name for name in pair_names if name not in files]
+        if missing:
+            raise ManifoldFormatError(
+                f"manifold integrity manifest has no proof for {missing}"
+            )
+        expected = {name: files[name] for name in pair_names}
+        for name, digest in expected.items():
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise ManifoldFormatError(
+                    f"manifold integrity manifest has invalid sha256 for "
+                    f"selected file {name!r}"
+                )
+        ok, bad = verify_integrity(path.parent, expected)
+        if not ok:
+            raise ManifoldFormatError(
+                f"manifold integrity check failed for {path.name}: {bad}"
+            )
+        verified_tensor_sha256 = str(expected[path.name])
+    tensors = load_file(str(path))
+    sidecar_path = path.with_suffix(".json")
+    sidecar = load_manifold_sidecar_data(sidecar_path)
+    if verified_tensor_sha256 is not None:
+        sidecar["_tensor_sha256"] = verified_tensor_sha256
+    if (
+        verify_manifest
+        and manifest_path.exists()
+        and sidecar["fit_mode"] != "baked"
+    ):
+        # ``load_manifold`` holds the folder lock outside the pair lock.
+        if folder_view is None:
+            raise AssertionError("validated manifold folder view is unavailable")
+        current_nodes = folder_view.nodes_sha256()
+        if sidecar.get("nodes_sha256") != current_nodes:
+            raise ManifoldFormatError(
+                f"fitted manifold {path.name} is stale for the live corpus/"
+                "domain/template inputs; refit before loading"
+            )
+        if sidecar.get("fit_policy_version") != MANIFOLD_FIT_POLICY_VERSION:
+            raise ManifoldFormatError(
+                f"fitted manifold {path.name} uses an older numerical fit "
+                "policy; refit it with the current saklas"
+            )
     # The shared, layer-agnostic node_coords tensor — pop it before the
     # per-layer key split, which assumes ``layer_<idx>.<field>``.
+    from saklas.io.manifold_folder import ManifoldFormatError
+
     node_coords = tensors.pop("node_coords", None)
+    if node_coords is None:
+        raise ManifoldFormatError("fitted manifold tensor is missing node_coords")
 
     by_layer: dict[int, dict[str, torch.Tensor]] = {}
+    allowed_fields = {
+        "mean", "basis", "node_coords", "affine_map", "node_params",
+        "rbf_weights", "poly_coeffs", "coord_offset", "coord_scale",
+        "sigma_rbf_weights", "sigma_poly_coeffs",
+    }
     for key, tensor in tensors.items():
-        head, field_name = key.rsplit(".", 1)
-        idx = int(head.split("_", 1)[1])
+        if key.count(".") != 1:
+            raise ManifoldFormatError(f"invalid fitted manifold tensor key {key!r}")
+        head, field_name = key.split(".", 1)
+        raw_layer = head.removeprefix("layer_")
+        if (
+            not head.startswith("layer_") or not raw_layer.isascii()
+            or not raw_layer.isdecimal() or str(int(raw_layer)) != raw_layer
+            or field_name not in allowed_fields
+        ):
+            raise ManifoldFormatError(f"invalid fitted manifold tensor key {key!r}")
+        idx = int(raw_layer)
         by_layer.setdefault(idx, {})[field_name] = tensor
+
+    tensor_layers = set(by_layer)
+    sidecar_layers = set(sidecar["fitted_layers"])
+    if not tensor_layers or tensor_layers != sidecar_layers:
+        raise ManifoldFormatError(
+            "fitted manifold tensor layers do not match sidecar fitted_layers"
+        )
 
     layers: dict[int, LayerSubspace] = {}
     for idx, parts in by_layer.items():
         if "node_params" not in parts:
+            if not {"mean", "basis"}.issubset(parts) or set(parts) - {
+                "mean", "basis", "node_coords", "affine_map",
+            }:
+                raise ManifoldFormatError(
+                    f"affine manifold layer {idx} has invalid tensor fields"
+                )
             # Affine (flat / folded-vector) layer — only mean + basis on disk
             # (the coord normalization is identity, rebuilt from the basis
             # shape), plus the per-layer real node coords when the writer
@@ -4244,8 +5618,22 @@ def load_manifold(path: str | Path) -> Manifold:
             layers[idx] = LayerSubspace.affine(
                 mean=parts["mean"], basis=parts["basis"],
                 node_coords=parts.get("node_coords"),
+                affine_map=parts.get("affine_map"),
             )
             continue
+        required_curved = {
+            "mean", "basis", "node_params", "rbf_weights", "poly_coeffs",
+            "coord_offset", "coord_scale",
+        }
+        sigma_fields = {"sigma_rbf_weights", "sigma_poly_coeffs"}
+        if (
+            not required_curved.issubset(parts)
+            or set(parts) - required_curved - sigma_fields
+            or bool(set(parts) & sigma_fields) != sigma_fields.issubset(parts)
+        ):
+            raise ManifoldFormatError(
+                f"curved manifold layer {idx} has invalid tensor fields"
+            )
         layers[idx] = LayerSubspace(
             mean=parts["mean"],
             basis=parts["basis"],
@@ -4254,9 +5642,8 @@ def load_manifold(path: str | Path) -> Manifold:
             poly_coeffs=parts["poly_coeffs"],
             coord_offset=parts["coord_offset"],
             coord_scale=parts["coord_scale"],
-            # Fuzzy-manifold σ-field — present only on curved fits run with the
-            # within-node spread pass; absent ⇒ ``None`` ⇒ zero-thickness wire
-            # (the exact legacy curved behavior).
+            # Fuzzy-manifold σ-field. Current raw curved fits require this
+            # pair; SAE-space curved fits deliberately omit the raw-space tube.
             sigma_rbf_weights=parts.get("sigma_rbf_weights"),
             sigma_poly_coeffs=parts.get("sigma_poly_coeffs"),
         )
@@ -4265,43 +5652,41 @@ def load_manifold(path: str | Path) -> Manifold:
     if node_coords is None:
         node_coords = torch.zeros(0, domain.intrinsic_dim)
 
-    maha_raw = sidecar.get("mahalanobis_share_per_layer") or {}
+    maha_raw = sidecar["mahalanobis_share_per_layer"]
     mahalanobis_share: dict[int, float] = {
         int(k): float(v) for k, v in maha_raw.items()
     }
 
-    # Per-layer origin ``O_L`` (authoring-coordinate foot of neutral).  Absent
-    # on a pre-origin fit → empty dict; the apply path seeds at ``zeros(n)``.
-    origin_raw = sidecar.get("origin_per_layer") or {}
+    # Per-layer origin ``O_L`` (authoring-coordinate foot of neutral).
+    origin_raw = sidecar["origin_per_layer"]
     origin: dict[int, torch.Tensor] = {
         int(k): torch.tensor([float(c) for c in v], dtype=torch.float32)
         for k, v in origin_raw.items()
     }
 
-    return Manifold(
-        name=sidecar.get("name", path.parent.name),
+    manifold = Manifold(
+        name=sidecar["name"],
         domain=domain,
-        node_labels=list(sidecar.get("node_labels", [])),
+        node_labels=list(sidecar["node_labels"]),
         node_coords=node_coords,
         layers=layers,
-        feature_space=sidecar.get("feature_space", "raw"),
+        feature_space=sidecar["feature_space"],
         metadata=sidecar,
-        # ``node_roles`` is absent on non-role manifolds (every
-        # pre-Phase-A fit); the loaded list stays empty in that case.
-        node_roles=list(sidecar.get("node_roles", [])),
-        # ``node_kinds`` is absent on manifolds authored without the
-        # abstract/concrete distinction; the loaded list stays empty then.
-        node_kinds=list(sidecar.get("node_kinds", [])),
+        node_roles=list(sidecar["node_roles"]),
+        node_kinds=list(sidecar["node_kinds"]),
         mahalanobis_share=mahalanobis_share,
         origin=origin,
     )
+    manifold.validate_runtime_geometry()
+    return manifold
 
 
 def transfer_manifold_subspaces(
     src: Manifold,
-    alignment: dict[int, torch.Tensor],
+    alignment: Mapping[int, "LayerAlignment"],
     *,
     whitener: "LayerWhitener | None",
+    target_layer_means: Mapping[int, torch.Tensor],
     from_model: str,
     to_model: str,
 ) -> Manifold:
@@ -4310,19 +5695,21 @@ def transfer_manifold_subspaces(
     The pure-tensor core of the cross-model Procrustes transfer (the folder
     read/write orchestration stays in :func:`saklas.io.manifold_lifecycle.
     transfer_manifold`).  Takes the already-loaded **source** ``Manifold``, a
-    per-layer alignment map ``{layer: M_L}`` (``v_tgt = M_L @ v_src``, the shape
-    :func:`saklas.io.alignment.fit_alignment` produces), and the **target**
-    model's whitener, and returns a new ``Manifold`` whose subspaces live in
-    target space.
+    per-layer affine alignment map (the compact factorized
+    :class:`saklas.io.alignment.LayerAlignment` returned by
+    :func:`saklas.io.alignment.fit_alignment`), and the **target** model's
+    whitener, and returns a new
+    ``Manifold`` whose subspaces live in target space.
 
-    Each covered layer's affine subspace maps as ``mean_tgt = M_L @ mean_src``
-    and ``basis_tgt = basis_src @ M_Lᵀ`` (each basis row transforms like a
-    vector).  Layers the alignment doesn't cover are dropped.  The RBF
-    interpolant fields (``node_params`` / ``rbf_weights`` / ``poly_coeffs`` /
-    ``coord_offset`` / ``coord_scale``) and the shared ``node_coords`` live in
-    subspace/authoring-coordinate space, not model space, so they ride through
-    untouched — the subspace relocates via the transformed ``mean``/``basis``
-    and the in-subspace parameterization is invariant.
+    Means and manifold points use the affine map (linear factor plus fitted
+    translation); basis rows and direction profiles use only its linear factor.
+    The mapped rows are QR-reparameterized to an orthonormal target frame and
+    every affine/RBF reduced-coordinate coefficient is transformed by the exact
+    companion matrix, preserving world points. A collapsed source span is
+    rejected. Curved transfer requires that companion map to be an isometry:
+    a non-isometric map turns the scalar tube thickness anisotropic, which the
+    current manifold representation cannot encode. Layers the alignment doesn't
+    cover drop.
 
     **Target-metric share re-bake (mandatory).**  The source fit's per-layer
     Mahalanobis ``share`` is a per-model quantity (``Σ`` belongs to
@@ -4332,18 +5719,21 @@ def transfer_manifold_subspaces(
     :func:`subspace_share` (``sqrt(Σ_k coordsᵀ (B_tgt Σ_tgt⁻¹ B_tgtᵀ) coords)``
     — the same formula the fit pipeline bakes).  A missing or non-covering
     whitener raises :class:`~saklas.core.mahalanobis.WhitenerError`; there is no
-    Euclidean rebake.  ``origin`` (the per-layer foot of the *source* neutral
-    mean) is per-model too, so it is cleared — the apply path falls back to a
-    zero-coord seed per layer.
+    Euclidean rebake. For curved layers, the target neutral mean is projected
+    into the transferred frame and inverted on the transferred surface,
+    yielding the target-model origin directly.
 
     Folder-level format guards (empty alignment, source fit missing) are the
     caller's concern; this function raises only :class:`~saklas.core.
     mahalanobis.WhitenerError` (missing / partial target whitener) and
-    ``ValueError`` when ``alignment`` covers none of the source's fitted layers.
+    ``ValueError`` for unrepresentable geometry or when ``alignment`` covers
+    none of the source's fitted layers.
     """
     from dataclasses import replace as _dc_replace
 
     from saklas.core.mahalanobis import WhitenerError
+
+    src.validate_runtime_geometry()
 
     # Map each covered layer's subspace into target space.  ``M_L`` is
     # ``(D_tgt, D_src)`` so ``mean_tgt = M_L @ mean_src`` and each basis row
@@ -4353,12 +5743,93 @@ def transfer_manifold_subspaces(
         M_L = alignment.get(layer)
         if M_L is None:
             continue
-        M = M_L.to(dtype=torch.float32)
         mean_f = sub.mean.to(torch.float32)
         basis_f = sub.basis.to(torch.float32)
-        mean_tgt = (M @ mean_f).to(dtype=sub.mean.dtype)
-        basis_tgt = (basis_f @ M.transpose(0, 1)).to(dtype=sub.basis.dtype)
-        new_layers[layer] = _dc_replace(sub, mean=mean_tgt, basis=basis_tgt)
+        raw_basis = M_L.apply_vectors(basis_f)
+        mean_tgt_f = M_L.apply_points(mean_f)
+
+        rank = int(raw_basis.shape[0])
+        if raw_basis.ndim != 2 or raw_basis.shape[1] < rank:
+            raise ValueError(
+                f"alignment for layer {layer} cannot carry rank-{rank} source "
+                f"subspace into target shape {tuple(raw_basis.shape)}"
+            )
+        # Reparameterize B_raw = A @ B_ortho.  Runtime projection/injection
+        # requires orthonormal basis rows, while multiplying every reduced output
+        # by A preserves each mapped world-space manifold point exactly.
+        raw_gram = raw_basis @ raw_basis.transpose(0, 1)
+        identity = torch.eye(rank, dtype=raw_gram.dtype, device=raw_gram.device)
+        if torch.allclose(raw_gram, identity, atol=1e-5, rtol=1e-5):
+            # Preserve an already-orthonormal map byte-for-byte (identity and
+            # square Procrustes rotations need no coordinate change).
+            basis_tgt_f = raw_basis.contiguous()
+            reduced_map = identity
+        else:
+            Q, R = torch.linalg.qr(raw_basis.transpose(0, 1), mode="reduced")
+            # Unpivoted QR diagonals are not rank-revealing for oblique
+            # dependencies. Rank-test only this small R×R factor with singular
+            # values before publishing a supposedly orthonormal frame.
+            singular_values = torch.linalg.svdvals(R)
+            tol = (
+                torch.finfo(R.dtype).eps * max(raw_basis.shape)
+                * float(singular_values.max())
+            )
+            if (
+                singular_values.numel() != rank
+                or bool((singular_values <= tol).any())
+            ):
+                raise ValueError(
+                    f"alignment for layer {layer} collapses the rank-{rank} manifold "
+                    "subspace; refusing a rank-deficient transfer"
+                )
+            basis_tgt_f = Q.transpose(0, 1).contiguous()
+            reduced_map = R.transpose(0, 1).contiguous()
+        kwargs: dict[str, Any] = {
+            "mean": mean_tgt_f.to(dtype=sub.mean.dtype),
+            "basis": basis_tgt_f.to(dtype=sub.basis.dtype),
+        }
+        if sub.is_affine:
+            source_map = (
+                torch.eye(
+                    sub.rank, dtype=torch.float32, device=reduced_map.device,
+                )
+                if sub.affine_map is None
+                else sub.affine_map.to(
+                    device=reduced_map.device, dtype=torch.float32,
+                )
+            )
+            kwargs["affine_map"] = (source_map @ reduced_map).to(
+                dtype=sub.basis.dtype,
+            )
+            kwargs["node_coords"] = (
+                None if sub.node_coords is None
+                else (sub.node_coords.to(torch.float32) @ reduced_map).to(
+                    dtype=sub.node_coords.dtype,
+                )
+            )
+        else:
+            assert sub.rbf_weights is not None and sub.poly_coeffs is not None
+            kwargs["rbf_weights"] = (
+                sub.rbf_weights.to(torch.float32) @ reduced_map
+            ).to(dtype=sub.rbf_weights.dtype)
+            kwargs["poly_coeffs"] = (
+                sub.poly_coeffs.to(torch.float32) @ reduced_map
+            ).to(dtype=sub.poly_coeffs.dtype)
+            # A scalar isotropic tube thickness is invariant only under an
+            # isometry of this reduced frame. The current representation has no
+            # anisotropic tube field, so reject an unrepresentable transfer.
+            gram = reduced_map @ reduced_map.transpose(0, 1)
+            isometric = torch.allclose(
+                gram, torch.eye(rank, dtype=gram.dtype, device=gram.device),
+                atol=1e-4, rtol=1e-4,
+            )
+            if not isometric:
+                raise ValueError(
+                    f"alignment for layer {layer} is non-isometric in curved "
+                    "manifold coordinates; anisotropic tube transfer is not "
+                    "representable by the current scalar sigma field"
+                )
+        new_layers[layer] = _dc_replace(sub, **kwargs)
 
     if not new_layers:
         raise ValueError(
@@ -4378,13 +5849,24 @@ def transfer_manifold_subspaces(
             f"transferred layer {sorted(new_layers.keys())}; generate neutral "
             "activations for the TARGET model first (the Euclidean path is gone)"
         )
+    curved_layers = {
+        layer for layer, subspace in new_layers.items() if not subspace.is_affine
+    }
+    missing_means = sorted(curved_layers - set(target_layer_means))
+    if missing_means:
+        raise WhitenerError(
+            "manifold transfer requires target neutral means covering every "
+            f"transferred layer; missing {missing_means}"
+        )
 
     new_share: dict[int, float] = {}
     for layer, sub_tgt in new_layers.items():
         sub_f = sub_tgt.to(device=torch.device("cpu"), dtype=torch.float32)
-        # ``coords`` are the reduced node values in subspace-coordinate space —
-        # invariant under the model-space alignment, so identical to the source
-        # fit.  ``subspace_share`` computes the μ-centered whitened spread
+        # ``coords`` are the reduced node values in subspace-coordinate space.
+        # For a K=1 affine folded ray there is no node cloud to μ-center: its
+        # share is the target-metric norm of the actual neutral→pole world
+        # direction. For K>=2 affine and every curved fit, ``subspace_share``
+        # computes the μ-centered whitened spread
         # ``sqrt(Σ_k c_kᵀ M_R c_k)`` (``M_R = B_tgt Σ_tgt⁻¹ B_tgtᵀ`` via
         # ``subspace_gram``, the *target* Σ⁻¹ restricted to the transferred
         # basis) — the same formula the fit pipeline bakes, now in target space.
@@ -4398,6 +5880,12 @@ def transfer_manifold_subspaces(
                     "transfer_manifold_subspaces: affine LayerSubspace has"
                     " node_coords=None — the saved manifold sidecar may be corrupt"
                 )
+            if coords.shape[0] == 1:
+                world_direction = coords[0] @ sub_f.basis
+                new_share[layer] = float(
+                    whitener.mahalanobis_norm(layer, world_direction)
+                )
+                continue
         else:
             _np, _rw, _pc = sub_f.rbf_params()
             coords = eval_rbf(_np, _rw, _pc, _np)  # (K, R)
@@ -4406,14 +5894,32 @@ def transfer_manifold_subspaces(
             mu_coords, sub_f.basis, whitener=whitener, layer=layer,
         )
 
-    return _dc_replace(
+    new_origin: dict[int, torch.Tensor] = {}
+    for layer, sub_tgt in new_layers.items():
+        if sub_tgt.is_affine:
+            continue
+        sub_f = sub_tgt.to(device=torch.device("cpu"), dtype=torch.float32)
+        target_mean = target_layer_means[layer].to(
+            device="cpu", dtype=torch.float32,
+        ).reshape(-1)
+        if target_mean.shape != sub_f.mean.shape:
+            raise ValueError(
+                f"target neutral mean for layer {layer} has shape "
+                f"{tuple(target_mean.shape)}, expected {tuple(sub_f.mean.shape)}"
+            )
+        query = (target_mean - sub_f.mean) @ sub_f.basis.T
+        origin, _distance = invert_parameterization(
+            sub_f, src.domain, query, src.node_coords.to(torch.float32),
+        )
+        new_origin[layer] = origin.reshape(-1).to(torch.float32)
+
+    transferred = _dc_replace(
         src, layers=new_layers,
         mahalanobis_share=new_share,
-        # ``origin`` is the per-layer foot of the *source* model's neutral mean
-        # — a per-model quantity invalid in target space (same reason the share
-        # is cleared); the apply path falls back to a zero-coord seed per layer.
-        origin={},
+        origin=new_origin,
     )
+    transferred.validate_runtime_geometry()
+    return transferred
 
 
 def _gn_step(
@@ -4587,10 +6093,8 @@ def manifold_is_affine(manifold: "Manifold") -> bool:
     A fit is all-affine (``fit_mode=pca``) or all-curved (authored / spectral);
     a curved ``%`` gets its own two-op instead.
     """
-    layers = getattr(manifold, "layers", None)
-    if not layers:
-        return False
-    return all(sub.is_affine for sub in layers.values())
+    manifold.validate_runtime_geometry()
+    return next(iter(manifold.layers.values())).is_affine
 
 
 __all__ = [
@@ -4605,6 +6109,8 @@ __all__ = [
     "Manifold",
     "fit_rbf_interpolant",
     "fit_rbf_smoothed",
+    "RbfFitPlan",
+    "prepare_rbf_fit_plan",
     "eval_rbf",
     "eval_rbf_jacobian",
     "rbf_cardinal_weights",
@@ -4621,6 +6127,10 @@ __all__ = [
     "neutral_layout_coord",
     "select_topology",
     "compute_node_centroid",
+    "compute_node_activation_rows",
+    "compute_manifold_node_stats",
+    "compute_node_reduced_covariance_from_rows",
+    "compute_store_reduced_covariances",
     "save_manifold",
     "load_manifold",
     "invert_parameterization",

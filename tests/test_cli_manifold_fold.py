@@ -15,7 +15,7 @@ runner's ``LayerWhitener.from_cache`` build.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator, cast
 
 import pytest
 import torch
@@ -23,7 +23,8 @@ import torch
 from saklas import cli
 from saklas.cli.runners import _run_manifold_compare, _run_manifold_why
 from saklas.core.manifold import (
-    CustomDomain, Manifold, fit_affine_subspace, save_manifold, subspace_share,
+    MANIFOLD_FIT_POLICY_VERSION, CustomDomain, Manifold,
+    fit_affine_subspace, save_manifold, subspace_share,
 )
 from saklas.io.paths import manifold_dir, model_dir, tensor_filename
 
@@ -53,12 +54,14 @@ def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
 
     ``manifold compare`` builds its (mandatory) whitener via
     ``LayerWhitener.from_cache(model_id)`` — there is no Euclidean path — so the
-    disk cache (``neutral_activations.safetensors``, keyed ``layer_<idx>``,
-    fp32) must exist for the layers the folded manifolds occupy.  The
+    sharded disk cache must exist for the layers the folded manifolds occupy. The
     probe-centering mean is derived from these activations (``X.mean(0)``), so
     there is no separate ``layer_means`` cache to seed.
     """
+    import json
+
     from safetensors.torch import save_file
+    from saklas.io.packs import hash_file
 
     md = model_dir(model_id)
     md.mkdir(parents=True, exist_ok=True)
@@ -69,7 +72,33 @@ def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
         mu = torch.randn(_DIM, generator=g, dtype=torch.float32) * 0.1
         X = torch.randn(n, _DIM, generator=g, dtype=torch.float32) * scale + mu
         acts[f"layer_{L}"] = X
-    save_file(acts, str(md / "neutral_activations.safetensors"))
+    tensor_files: dict[str, str] = {}
+    tensor_sha256: dict[str, str] = {}
+    for layer in _LAYERS:
+        tensor_path = md / f"neutral_activations.layer-{layer}.gen-test.safetensors"
+        save_file({f"layer_{layer}": acts[f"layer_{layer}"]}, str(tensor_path))
+        tensor_files[str(layer)] = tensor_path.name
+        tensor_sha256[str(layer)] = hash_file(tensor_path)
+    (md / "neutral_activations.json").write_text(json.dumps({
+        "method": "neutral_activations",
+        "format_version": 4,
+        "capture_version": 1,
+        "capture_sha256": "test-capture",
+        "model_fingerprint": "test-fingerprint",
+        "model_source_fingerprint": "test-source",
+        "tensor_sha256": tensor_sha256,
+        "tensor_files": tensor_files,
+        "layers": list(_LAYERS),
+        "tensor_schema": {
+            str(layer): {
+                "shape": list(acts[f"layer_{layer}"].shape),
+                "dtype": "torch.float32",
+            }
+            for layer in _LAYERS
+        },
+        "n_prompts": n,
+        "n_layers": len(_LAYERS),
+    }))
 
 
 def _write_fitted_manifold(
@@ -106,11 +135,35 @@ def _write_fitted_manifold(
         layers=layers,
         mahalanobis_share=share,
     )
+    from saklas.io.manifolds import create_discover_manifold_folder
+
     folder = manifold_dir(ns, name)
-    folder.mkdir(parents=True, exist_ok=True)
+    if not (folder / "manifold.json").exists():
+        folder = create_discover_manifold_folder(
+            ns, name, "", fit_mode="pca",
+            node_corpora={pos_label: ["positive"], neg_label: ["negative"]},
+        )
     path = folder / tensor_filename(_MODEL, release=None)
-    save_manifold(mfld, path, {"method": "folded_vector",
-                               "share_metric": "euclidean"})
+    metadata: dict[str, object] = {
+        "method": "manifold_discover_pca", "fit_mode": "pca",
+        "share_metric": "euclidean",
+        "model_fingerprint": "test-fingerprint",
+    }
+    manifest = folder / "manifold.json"
+    if manifest.exists():
+        from saklas.io.manifolds import ManifoldFolder
+
+        metadata["nodes_sha256"] = ManifoldFolder.load(
+            folder, verify_manifest=False,
+        ).nodes_sha256()
+        metadata["fit_policy_version"] = MANIFOLD_FIT_POLICY_VERSION
+    save_manifold(mfld, path, metadata)
+    if manifest.exists():
+        from saklas.io.manifolds import ManifoldFolder
+
+        ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+            path, path.with_suffix(".json"),
+        )
     return path
 
 
@@ -367,3 +420,89 @@ class TestGgufFold:
                 model_scope=_MODEL, output=str(tmp_path / "x.gguf"),
                 model_hint="llama",
             )
+
+    def test_export_preflight_skips_unrelated_variant_hashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from saklas.io import gguf_io, packs
+        from saklas.io.cache_ops import export_gguf_manifold
+        from saklas.io.manifolds import ManifoldFolder
+
+        folder = _make_full_manifold("default", "happy.sad")
+        raw = folder / tensor_filename(_MODEL)
+        unrelated = folder / tensor_filename(_MODEL, release="unrelated")
+        unrelated.write_bytes(raw.read_bytes())
+        unrelated.with_suffix(".json").write_bytes(
+            raw.with_suffix(".json").read_bytes()
+        )
+        ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+            unrelated, unrelated.with_suffix(".json"),
+        )
+        packs._FINGERPRINT_CACHE.clear()
+        real_hash = packs.hash_file
+        hashed: list[str] = []
+
+        def track_hash(path: Path) -> str:
+            hashed.append(Path(path).name)
+            return real_hash(Path(path))
+
+        def fake_write(_profile: object, path: Path, **_kwargs: object) -> None:
+            Path(path).write_bytes(b"gguf")
+
+        monkeypatch.setattr(packs, "hash_file", track_hash)
+        monkeypatch.setattr(gguf_io, "write_gguf_profile", fake_write)
+        export_gguf_manifold(
+            "default", "happy.sad", model_scope=_MODEL,
+            output=str(tmp_path / "out.gguf"), model_hint="llama",
+        )
+
+        assert raw.name in hashed and raw.with_suffix(".json").name in hashed
+        assert unrelated.name not in hashed
+        assert unrelated.with_suffix(".json").name not in hashed
+
+
+def test_default_probe_preflight_skips_unrelated_variant_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.manifold import load_manifold
+    from saklas.core.session import SaklasSession
+    from saklas.io import packs
+    from saklas.io.manifolds import ManifoldFolder
+    import saklas.io.manifolds as manifolds_module
+    import saklas.io.probes_bootstrap as probes_module
+
+    folder = _make_full_manifold("default", "probe")
+    raw = folder / tensor_filename(_MODEL)
+    unrelated = folder / tensor_filename(_MODEL, release="unrelated")
+    unrelated.write_bytes(raw.read_bytes())
+    unrelated.with_suffix(".json").write_bytes(raw.with_suffix(".json").read_bytes())
+    ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
+        unrelated, unrelated.with_suffix(".json"),
+    )
+    packs._FINGERPRINT_CACHE.clear()
+    real_hash = packs.hash_file
+    hashed: list[str] = []
+
+    def track_hash(path: Path) -> str:
+        hashed.append(Path(path).name)
+        return real_hash(Path(path))
+
+    class StubSession:
+        model_id = _MODEL
+        _manifolds: dict[str, Manifold] = {}
+
+        def ensure_manifold_loaded(self, key: str) -> None:
+            self._manifolds[key] = load_manifold(raw)
+
+    monkeypatch.setattr(packs, "hash_file", track_hash)
+    monkeypatch.setattr(probes_module, "load_default_manifolds", lambda: {})
+    monkeypatch.setattr(manifolds_module, "bundled_manifold_names", lambda: ["probe"])
+    session = StubSession()
+    probes = SaklasSession._bootstrap_manifold_probes(
+        cast(Any, session), [], include_fitted_defaults=True,
+    )
+
+    assert "default/probe" in probes
+    assert raw.name in hashed and raw.with_suffix(".json").name in hashed
+    assert unrelated.name not in hashed
+    assert unrelated.with_suffix(".json").name not in hashed

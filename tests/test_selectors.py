@@ -7,7 +7,10 @@ from pathlib import Path
 import json
 
 from saklas.io import selectors as sel
-from saklas.io.manifolds import create_discover_manifold_folder
+from saklas.io.manifolds import (
+    create_discover_manifold_folder,
+)
+from saklas.io.manifold_folder import canonical_manifold_sidecar_payload
 
 
 def test_parse_bare_name():
@@ -138,24 +141,20 @@ def test_resolve_all(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 def _fake_fitted_tensor(folder: Path, filename: str) -> None:
-    """Write a placeholder tensor + minimal sidecar so the manifold loads.
+    """Write a placeholder tensor + current sidecar so the manifold loads.
 
     ``model:`` resolution only checks tensor *filenames*, never tensor
     contents, so the bytes can be junk — but ``ManifoldFolder.load`` demands
-    a ``.json`` sidecar beside every ``.safetensors``, so we write a lean
-    one (a ``domain`` object is the only hard requirement of
-    ``ManifoldSidecar.load``).
+    a current ``.json`` sidecar beside every ``.safetensors``.
     """
     (folder / filename).write_bytes(b"x")
     sidecar = Path(folder) / (Path(filename).stem + ".json")
-    sidecar.write_text(json.dumps({
-        "method": "manifold_pca",
-        "saklas_version": "0",
-        "domain": {"kind": "custom", "dim": 1},
-        "node_count": 2,
-        "node_labels": ["pos", "neg"],
-        "fit_mode": "pca",
-    }))
+    sidecar.write_text(json.dumps(canonical_manifold_sidecar_payload(
+        name=folder.name, method="manifold_discover_pca", saklas_version="0",
+        domain={"type": "custom", "embed_dim": 1, "bounds": None},
+        node_labels=["pos", "neg"],
+        feature_space="raw", fit_mode="pca",
+    )))
 
 
 def test_resolve_model_matches_raw_and_sae_tensors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

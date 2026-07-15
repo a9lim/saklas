@@ -31,34 +31,28 @@
 
   <div class="body">
     <section class="block">
-      <h3>keyboard shortcuts</h3>
+      <h3>shortcuts</h3>
       <table class="kb">
         <tbody>
           <tr>
             <td><kbd>Esc</kbd></td>
-            <td>stop in-flight generation; close drawer when idle</td>
+            <td>stop / close</td>
           </tr>
           <tr>
             <td><kbd>Enter</kbd></td>
-            <td>send message</td>
+            <td>send</td>
           </tr>
           <tr>
             <td><kbd>Shift</kbd> + <kbd>Enter</kbd></td>
-            <td>newline in chat input</td>
+            <td>newline</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>Enter</kbd></td>
-            <td>send message (alternate)</td>
-          </tr>
-          <tr>
-            <td>
-              <kbd>{modKey}</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd>
-            </td>
-            <td>regenerate last response (reserved, not yet wired)</td>
+            <td>commit</td>
           </tr>
           <tr>
             <td>click token</td>
-            <td>open per-layer × per-probe drilldown for that token</td>
+            <td>token details</td>
           </tr>
         </tbody>
       </table>
@@ -66,56 +60,51 @@
 
     <section class="block">
       <h3>loom tree</h3>
-      <p class="prose">
-        the single-letter keys fire while the loom sidebar is focused;
-        the <kbd>{modKey}</kbd>-combos act on the active node from
-        anywhere.
-      </p>
       <table class="kb">
         <tbody>
           <tr>
             <td><kbd>j</kbd> / <kbd>k</kbd></td>
-            <td>focus the previous / next sibling</td>
+            <td>previous / next sibling</td>
           </tr>
           <tr>
             <td><kbd>h</kbd> / <kbd>l</kbd></td>
-            <td>focus the parent / first child</td>
+            <td>parent / first child</td>
           </tr>
           <tr>
             <td><kbd>Enter</kbd></td>
-            <td>activate the focused node</td>
+            <td>activate</td>
           </tr>
           <tr>
             <td><kbd>s</kbd></td>
-            <td>star / unstar the focused node</td>
+            <td>star</td>
           </tr>
           <tr>
             <td><kbd>n</kbd></td>
-            <td>add or edit a note</td>
+            <td>note</td>
           </tr>
           <tr>
             <td><kbd>/</kbd></td>
-            <td>search node text</td>
+            <td>search</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>R</kbd></td>
-            <td>regenerate the active node</td>
+            <td>regenerate</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>E</kbd></td>
-            <td>edit the active node's text</td>
+            <td>edit</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>B</kbd></td>
-            <td>branch a new sibling</td>
+            <td>branch</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>N</kbd></td>
-            <td>navigate by node-id prefix</td>
+            <td>navigate</td>
           </tr>
           <tr>
             <td><kbd>{modKey}</kbd> + <kbd>D</kbd></td>
-            <td>delete the active node's subtree</td>
+            <td>delete subtree</td>
           </tr>
         </tbody>
       </table>
@@ -123,11 +112,6 @@
 
     <section class="block">
       <h3>steering grammar</h3>
-      <p class="prose">
-        the same grammar speaks Python, YAML, the chat input, and this UI's
-        rack.  Server-side parser lives in
-        <code>saklas.core.steering_expr</code>.
-      </p>
       <pre class="grammar">{`expr      := term (("+" | "-") term)*
 term      := [coeff "*"?] ["!"] selector ["@" trigger]
 selector  := atom (("~" | "|") atom | "%" position)?
@@ -139,7 +123,7 @@ variant   := raw | sae | sae-<release>
              | role | role-<name> | from | from-<source>
 `}</pre>
 
-      <p class="prose">examples</p>
+      <h3>examples</h3>
       <pre class="grammar">{`0.3 honest                   # plain additive, default coeff = 0.5
 0.4 warm@after               # active only after </think>
 -0.5 wolf                    # bare pole resolves to deer.wolf @ -0.5
@@ -154,57 +138,6 @@ variant   := raw | sae | sae-<release>
 0.3 a + 0.5 b@thinking - 0.2 c|d   # compose
 `}</pre>
 
-      <table class="kb">
-        <tbody>
-          <tr>
-            <td><code>+</code> / <code>-</code></td>
-            <td>add / subtract terms</td>
-          </tr>
-          <tr>
-            <td><code>*</code></td>
-            <td>attach explicit coefficient (optional)</td>
-          </tr>
-          <tr>
-            <td><code>!</code></td>
-            <td>mean-ablate; does not compose with projection</td>
-          </tr>
-          <tr>
-            <td><code>~</code></td>
-            <td>project onto direction (keep shared component)</td>
-          </tr>
-          <tr>
-            <td><code>|</code></td>
-            <td>project orthogonal (remove shared component)</td>
-          </tr>
-          <tr>
-            <td><code>@trigger</code></td>
-            <td>per-term trigger override</td>
-          </tr>
-          <tr>
-            <td><code>:variant</code></td>
-            <td>route to SAE tensor (raw is default)</td>
-          </tr>
-        </tbody>
-      </table>
-    </section>
-
-    <section class="block">
-      <h3>tips</h3>
-      <ul class="prose-list">
-        <li>
-          bare pole names (<code>wolf</code>) resolve cross-namespace and
-          flip sign automatically; <code>ns/concept</code> disambiguates.
-        </li>
-        <li>
-          dotted bipolar names (<code>happy.sad</code>) are first-class;
-          <code>.</code> and <code>_</code> are the only allowed
-          punctuation in concept identifiers.
-        </li>
-        <li>
-          mid-generation rack edits queue as pending actions and apply on
-          the next <code>done</code> event (or instantly with apply-now).
-        </li>
-      </ul>
     </section>
   </div>
 
@@ -222,30 +155,44 @@ variant   := raw | sae | sae-<release>
     height: 100%;
     min-height: 0;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-6);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-5) var(--space-6);
   }
   .title {
     color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    padding: var(--space-2) var(--space-3);
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--accent-red);
+    color: var(--fg);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
@@ -272,7 +219,6 @@ variant   := raw | sae | sae-<release>
   .kb td {
     padding: var(--space-2) var(--space-3);
     vertical-align: top;
-    border-bottom: 1px solid var(--border);
   }
   .kb td:first-child {
     color: var(--fg-dim);
@@ -281,51 +227,34 @@ variant   := raw | sae | sae-<release>
   }
   kbd {
     background: var(--bg-elev);
-    border: 1px solid var(--border);
     color: var(--fg-strong);
     padding: 0 var(--space-2);
     border-radius: var(--radius);
     font-family: inherit;
     font-size: var(--text-xs);
   }
-  code {
-    color: var(--accent);
-  }
   .grammar {
     background: var(--bg-deep);
-    border: 1px solid var(--border);
     padding: var(--space-3) var(--space-4);
     margin: var(--space-3) 0;
     color: var(--fg-strong);
+    font-family: var(--font-mono);
     font-size: var(--text-sm);
     line-height: 1.4;
     overflow-x: auto;
     white-space: pre;
   }
-  .prose {
-    margin: var(--space-2) 0;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.4;
-  }
-  .prose-list {
-    margin: var(--space-2) 0 0;
-    padding-left: 1.2em;
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    line-height: 1.5;
-  }
   .footer {
     display: flex;
     justify-content: flex-end;
     gap: var(--space-3);
-    padding: var(--space-6);
-    border-top: 1px solid var(--border);
+    padding: var(--space-3) var(--space-6);
+    color: var(--fg-muted);
   }
   .btn {
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-5);
     font: inherit;
     font-family: var(--font-mono);
@@ -334,10 +263,10 @@ variant   := raw | sae | sae-<release>
   .btn.primary {
     background: var(--accent);
     color: var(--text-on-accent);
-    border-color: var(--accent);
+    border-color: transparent;
   }
   .btn.primary:hover {
     background: var(--accent-light);
-    border-color: var(--accent-light);
+    border-color: transparent;
   }
 </style>

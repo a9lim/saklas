@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from saklas.core.manifold import (
+    ActivationRowStore,
     BoxAxis,
     BoxDomain,
     CustomDomain,
@@ -26,6 +27,10 @@ from saklas.core.manifold import (
     fit_rbf_interpolant,
     fit_rbf_smoothed,
     fit_sigma_field,
+    compute_node_reduced_covariance_from_rows,
+    compute_manifold_node_stats,
+    compute_store_reduced_covariances,
+    prepare_rbf_fit_plan,
     _gcv_select_lambda,
     _off_surface_var,
     _off_surface_vars,
@@ -276,6 +281,25 @@ def test_fit_rbf_smoothed_gcv_picks_interior_lambda():
     assert math.isfinite(info["gcv"]) and info["gcv"] > 0.0
 
 
+@pytest.mark.parametrize("smoothing", [None, 0.25, "auto"])
+def test_rbf_fit_plan_matches_standalone_fit(smoothing: float | str | None):
+    torch.manual_seed(41)
+    node = torch.rand(14, 2)
+    values = torch.randn(14, 5)
+    plan = prepare_rbf_fit_plan(node, smoothing=smoothing)
+
+    expected = fit_rbf_smoothed(
+        plan.node_params, values, smoothing=smoothing,
+    )
+    actual = fit_rbf_smoothed(
+        plan.node_params, values, smoothing=smoothing, plan=plan,
+    )
+
+    assert torch.allclose(actual[0], expected[0], atol=2e-5, rtol=2e-5)
+    assert torch.allclose(actual[1], expected[1], atol=2e-5, rtol=2e-5)
+    assert actual[2] == pytest.approx(expected[2], rel=2e-5, abs=2e-5)
+
+
 def test_fit_rbf_smoothed_edf_monotone_to_polynomial():
     # The rigorous correctness check on the penalty form: as λ grows the
     # effective dof tr(S_λ) must fall monotonically from K (interpolation) to
@@ -494,12 +518,14 @@ def test_fit_affine_subspace_reuses_precomputed_whitened_gram():
         def __init__(self, inner: Any) -> None:
             self.inner = inner
             self.subspace_gram_calls = 0
+            self.apply_inv_calls = 0
 
         def subspace_gram(self, *args: Any, **kwargs: Any) -> torch.Tensor:
             self.subspace_gram_calls += 1
             return self.inner.subspace_gram(*args, **kwargs)
 
         def apply_inv(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+            self.apply_inv_calls += 1
             return self.inner.apply_inv(*args, **kwargs)
 
     counting = CountingWhitener(base)
@@ -510,6 +536,7 @@ def test_fit_affine_subspace_reuses_precomputed_whitened_gram():
         whitener=counting,  # type: ignore[arg-type]
         layer=0,
         whitened_gram=gram,
+        whitened_rows=base.apply_inv(0, X),
     )
     ref_sub, ref_mu_coords, ref_ev = fit_affine_subspace(
         centroids,
@@ -520,6 +547,7 @@ def test_fit_affine_subspace_reuses_precomputed_whitened_gram():
     )
 
     assert counting.subspace_gram_calls == 0
+    assert counting.apply_inv_calls == 0
     assert torch.allclose(sub.basis, ref_sub.basis, atol=1e-5)
     assert torch.allclose(mu_coords, ref_mu_coords, atol=1e-5)
     assert ev == pytest.approx(ref_ev, abs=1e-6)
@@ -528,6 +556,36 @@ def test_fit_affine_subspace_reuses_precomputed_whitened_gram():
 def test_fit_layer_subspace_rejects_too_few_nodes():
     with pytest.raises(ValueError):
         fit_layer_subspace(torch.randn(2, 8), torch.rand(2, 1))
+
+
+def test_fit_layer_subspace_returns_reusable_mu_centered_coords():
+    generator = torch.Generator().manual_seed(91)
+    centroids = 100_000.0 + torch.randn(7, 12, generator=generator)
+    neutral = -70_000.0 + torch.randn(12, generator=generator)
+    node_params = torch.linspace(0.0, 1.0, 7).reshape(-1, 1)
+    fit_result: dict[str, torch.Tensor] = {}
+
+    sub, _ = _fit_layer_subspace_with_ev(
+        centroids, node_params, neutral_mean=neutral, fit_result=fit_result,
+    )
+
+    expected = (
+        (centroids.float() - centroids.float().mean(dim=0))
+        @ sub.basis.float().T
+    )
+    assert torch.equal(fit_result["mu_coords"], expected)
+    expected_anchor_coords = (
+        (centroids.float() - neutral.float()) @ sub.basis.float().T
+    )
+    assert sub.node_params is not None
+    assert sub.rbf_weights is not None
+    assert sub.poly_coeffs is not None
+    fitted_anchor_coords = eval_rbf(
+        sub.node_params, sub.rbf_weights, sub.poly_coeffs, sub.node_params,
+    )
+    assert torch.allclose(
+        fitted_anchor_coords, expected_anchor_coords, atol=0.1, rtol=1e-6,
+    )
 
 
 def test_fit_layer_subspace_returns_ev_ratio():
@@ -633,6 +691,8 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
         # is 1-D, so each ``O_L`` is ``(1,)``).
         origin={4: torch.tensor([0.42]), 9: torch.tensor([0.55])},
     )
+    for sub in manifold.layers.values():
+        _attach_constant_sigma(sub, 0.1)
     path = tmp_path / "mood" / "model.safetensors"
     save_manifold(manifold, path, {"method": "manifold_pca",
                                    "nodes_sha256": "abc123",
@@ -670,12 +730,10 @@ def test_save_load_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
     )
 
 
-def test_load_manifold_without_share_fields_defaults_empty(
+def test_save_rejects_manifold_with_empty_share_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fit with no whitener (no ``mahalanobis_share`` / ``share_metric``)
-    round-trips with an empty share dict and no crash — the apply path
-    then falls back to the Euclidean spread."""
+    """Persistence rejects geometry without complete Mahalanobis shares."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     ca, domain, node_params = _circle(7, dim=20)
     manifold = Manifold(
@@ -687,15 +745,9 @@ def test_load_manifold_without_share_fields_defaults_empty(
         feature_space="raw",
     )  # no mahalanobis_share
     path = tmp_path / "mood" / "model.safetensors"
-    save_manifold(manifold, path, {"method": "manifold_pca",
-                                   "nodes_sha256": "abc"})
-    loaded = load_manifold(path)
-    assert loaded.mahalanobis_share == {}
-    assert "share_metric" not in loaded.metadata
-    assert "mahalanobis_share_per_layer" not in loaded.metadata
-    # A manifold saved with ``origin=None`` round-trips with absence
-    # preserved — no ``origin`` tensor written, loads back as ``None``.
-    assert loaded.origin == {}
+    with pytest.raises(ValueError, match="Mahalanobis shares"):
+        save_manifold(manifold, path, {"method": "manifold_pca",
+                                       "nodes_sha256": "abc"})
 
 
 def test_layer_subspace_to_device_dtype():
@@ -935,6 +987,107 @@ def test_inject_norm_cap_bounds_output():
 # residual toward ``σ`` (the typical set) instead of to the zero-thickness
 # wire.  Absent ⇒ ``sigma_at`` returns 0 ⇒ exact legacy behavior.
 
+
+def test_activation_row_store_combines_disjoint_layers_without_copy() -> None:
+    left = ActivationRowStore([2, 1])
+    right = ActivationRowStore([2, 1])
+    indices = torch.arange(3)
+    left.write(0, indices, torch.randn(3, 5))
+    right.write(2, indices, torch.randn(3, 5))
+    left_ptr = left.flat_rows(0).data_ptr()
+    right_ptr = right.flat_rows(2).data_ptr()
+
+    combined = ActivationRowStore.combine_disjoint([left, right])
+
+    assert combined.layer_indices == [0, 2]
+    assert combined.flat_rows(0).data_ptr() == left_ptr
+    assert combined.flat_rows(2).data_ptr() == right_ptr
+    combined.close()
+    assert left._closed and right._closed
+
+
+def test_node_stats_returns_normalized_accumulator_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Centroid normalization does not allocate a second K x D roster."""
+    import saklas.core.manifold as manifold_module
+    from saklas.core import vectors
+
+    captured_accumulators: list[torch.Tensor] = []
+    real_zeros = torch.zeros
+
+    def tracked_zeros(*args: Any, **kwargs: Any) -> torch.Tensor:
+        result = real_zeros(*args, **kwargs)
+        if args[:2] == (2, 2) and kwargs.get("device") is None:
+            captured_accumulators.append(result)
+        return result
+
+    def fake_capture(*_args: Any, **_kwargs: Any) -> dict[int, torch.Tensor]:
+        return {0: torch.tensor([
+            [1.0, 3.0], [3.0, 5.0], [10.0, 14.0], [14.0, 18.0],
+        ])}
+
+    monkeypatch.setattr(manifold_module.torch, "zeros", tracked_zeros)
+    monkeypatch.setattr(vectors, "_encode_and_capture_all_batch", fake_capture)
+    centroids, retained = compute_manifold_node_stats(
+        torch.nn.Linear(1, 1), object(),
+        torch.nn.ModuleList([torch.nn.Identity()]), torch.device("cpu"),
+        [("a", ["a1", "a2"]), ("b", ["b1", "b2"])], ["prompt"],
+        roles=[None, None], layer_indices=[0], retain_rows=False,
+        prepared_rows=[(torch.tensor([[1]]), 0)] * 4,
+    )
+
+    assert retained is None
+    assert len(captured_accumulators) == 1
+    assert centroids[0] is captured_accumulators[0]
+    assert torch.equal(centroids[0], torch.tensor([[2.0, 4.0], [12.0, 16.0]]))
+
+
+def test_layer_major_store_covariances_match_node_reference() -> None:
+    torch.manual_seed(4)
+    node_sizes = [2, 3, 1]
+    store = ActivationRowStore(node_sizes)
+    total = sum(node_sizes)
+    indices = torch.arange(total)
+    layer_subs: dict[int, LayerSubspace] = {}
+    for layer in (0, 1, 2):
+        rows = (
+            torch.full((total, 7), 1_000_000.0) + 10.0 * torch.randn(total, 7)
+            if layer == 2
+            else torch.randn(total, 7, dtype=torch.float16)
+        )
+        store.write(layer, indices, rows)
+        basis = torch.linalg.qr(torch.randn(7, 3)).Q.T.contiguous()
+        layer_subs[layer] = LayerSubspace.affine(
+            (
+                torch.full((7,), 1_000_000.0)
+                if layer == 2 else torch.randn(7)
+            ),
+            basis,
+        )
+
+    before = {
+        layer: store.flat_rows(layer).clone() for layer in store.layer_indices
+    }
+    expected = [
+        compute_node_reduced_covariance_from_rows(rows, layer_subs)
+        for rows in store
+    ]
+    actual = compute_store_reduced_covariances(
+        store, layer_subs, row_chunk=4,
+    )
+
+    for expected_node, actual_node in zip(expected, actual, strict=True):
+        for layer in layer_subs:
+            assert torch.allclose(
+                actual_node[layer], expected_node[layer], atol=1e-6,
+            )
+    for layer, original in before.items():
+        assert torch.equal(store.flat_rows(layer), original), (
+            "covariance projection mutated the activation-row store"
+        )
+    store.close()
+
 def _attach_constant_sigma(sub: Any, value: float) -> None:
     """Fit a σ-RBF interpolating a constant ``σ = value`` over the layout.
 
@@ -1063,6 +1216,76 @@ def test_off_surface_vars_matches_scalar_helper():
     assert torch.allclose(batched, scalar, atol=1e-6)
 
 
+def test_off_surface_variance_uses_actual_rank_at_fold() -> None:
+    # Nominal n=2, but a local fold collapses the tangent to rank 1.  The
+    # actual normal complement is 2-D, so isotropic unit covariance stays 1.
+    cov = torch.eye(3)
+    tangent = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+    ])
+    assert _off_surface_var(cov, tangent, R=3, n=2) == pytest.approx(1.0)
+    assert _off_surface_vars(
+        cov.unsqueeze(0), tangent.unsqueeze(0), R=3, n=2,
+    ).item() == pytest.approx(1.0)
+
+
+def test_off_surface_variance_rank_deficient_when_r_le_n() -> None:
+    # Even when nominal n fills R, a rank-1 tangent leaves a real normal axis;
+    # sigma must isolate its variance instead of averaging tangent+normal.
+    cov = torch.diag(torch.tensor([3.0, 7.0]))
+    tangent = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+    assert _off_surface_var(cov, tangent, R=2, n=2) == pytest.approx(7.0)
+    assert _off_surface_vars(
+        cov.unsqueeze(0), tangent.unsqueeze(0), R=2, n=2,
+    ).item() == pytest.approx(7.0)
+
+
+def test_off_surface_variance_fuses_rank_and_projector_svd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fused SVD uses the matrix-rank tolerance at a near-rank fold."""
+    R = n = 2
+    eps = torch.finfo(torch.float32).eps
+    threshold = max(R, n) * eps
+    tangents = torch.stack([
+        torch.diag(torch.tensor([1.0, threshold * 2.0])),
+        torch.diag(torch.tensor([1.0, threshold * 0.5])),
+        torch.zeros(2, 2),
+    ])
+    covs = torch.stack([
+        torch.diag(torch.tensor([3.0, 7.0])),
+        torch.diag(torch.tensor([3.0, 7.0])),
+        torch.diag(torch.tensor([3.0, 7.0])),
+    ])
+
+    original_svd = torch.linalg.svd
+    calls = 0
+
+    def counted_svd(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return original_svd(*args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "svd", counted_svd)
+    monkeypatch.setattr(
+        torch.linalg, "pinv",
+        lambda *_args, **_kwargs: pytest.fail("projector repeated the SVD"),
+    )
+    monkeypatch.setattr(
+        torch.linalg, "matrix_rank",
+        lambda *_args, **_kwargs: pytest.fail("rank repeated the SVD"),
+    )
+
+    result = _off_surface_vars(covs, tangents, R, n)
+
+    assert calls == 1
+    # Above tolerance the tangent fills R, selecting the isotropic fallback;
+    # below it the second axis is normal and its variance is isolated.
+    assert result.tolist() == pytest.approx([5.0, 7.0, 5.0])
+
+
 def test_fit_sigma_field_interpolates_node_thickness():
     # fit_sigma_field reduces per-node covariances to off-surface σ and attaches
     # a log-σ RBF; sigma_at at a node recovers that node's off-surface std.
@@ -1099,9 +1322,12 @@ def test_sigma_field_save_load_round_trip(tmp_path: Path):
         name="fuzzy", domain=domain,
         node_labels=[f"n{i}" for i in range(9)],
         node_coords=coords, layers={0: sub},
+        mahalanobis_share={0: 1.0}, origin={0: torch.zeros(2)},
     )
     path = tmp_path / "fuzzy.safetensors"
-    save_manifold(man, path, {"method": "manifold_spectral"})
+    save_manifold(man, path, {
+        "method": "manifold_discover_spectral", "fit_mode": "spectral",
+    })
     loaded = load_manifold(path)
     lsub = loaded.layers[0]
     assert lsub.has_sigma
@@ -1110,9 +1336,7 @@ def test_sigma_field_save_load_round_trip(tmp_path: Path):
         assert abs(float(lsub.sigma_at(z)) - float(sub.sigma_at(z))) < 1e-4
 
 
-def test_legacy_curved_manifold_loads_without_sigma(tmp_path: Path):
-    # A curved manifold saved with no σ-field loads with σ absent (back-compat):
-    # sigma_at returns 0, soft onto degenerates to the hard collapse.
+def test_curved_manifold_without_sigma_is_rejected(tmp_path: Path):
     sub, domain = _grid_manifold()
     coords = torch.tensor(
         [[u, v] for u in (0.0, 0.5, 1.0) for v in (0.0, 0.5, 1.0)]
@@ -1121,13 +1345,13 @@ def test_legacy_curved_manifold_loads_without_sigma(tmp_path: Path):
         name="legacy", domain=domain,
         node_labels=[f"n{i}" for i in range(9)],
         node_coords=coords, layers={0: sub},
+        mahalanobis_share={0: 1.0}, origin={0: torch.zeros(2)},
     )
     path = tmp_path / "legacy.safetensors"
-    save_manifold(man, path, {"method": "manifold_spectral"})
-    loaded = load_manifold(path)
-    assert not loaded.layers[0].has_sigma
-    z = domain.embed(torch.tensor([0.4, 0.4]))
-    assert float(loaded.layers[0].sigma_at(z)) == 0.0
+    with pytest.raises(ValueError, match="requires a sigma field"):
+        save_manifold(man, path, {
+            "method": "manifold_discover_spectral", "fit_mode": "spectral",
+        })
 
 
 # ------------------------------------------------- affine (flat) subspace ---
@@ -1276,19 +1500,24 @@ def test_save_load_affine_manifold_round_trip(
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     sub_a, _ = _folded_vector(dim=18, seed=1)
     sub_b, _ = _folded_vector(dim=18, seed=2)
+    real_node_coords = torch.tensor([[0.8], [-0.8]])
+    sub_a.node_coords = real_node_coords.clone()
+    sub_b.node_coords = real_node_coords.clone()
     manifold = Manifold(
         name="folded",
         domain=CustomDomain(1),
         node_labels=["pos", "neg"],
-        node_coords=torch.tensor([[0.8], [-0.8]]),
+        node_coords=real_node_coords,
         layers={5: sub_a, 11: sub_b},
         feature_space="raw",
         mahalanobis_share={5: 1.2, 11: 0.7},
-        origin={5: torch.tensor([0.0]), 11: torch.tensor([0.0])},
+        origin={},
     )
     path = tmp_path / "folded" / "model.safetensors"
-    save_manifold(manifold, path, {"method": "folded_vector",
-                                   "share_metric": "mahalanobis"})
+    save_manifold(manifold, path, {
+        "method": "folded_vector", "fit_mode": "baked",
+        "share_metric": "mahalanobis",
+    })
 
     # The on-disk payload omits the RBF triple + coord normalization for the
     # flat layers — only mean + basis (plus the shared node_coords).
@@ -1324,3 +1553,63 @@ def test_save_load_affine_manifold_round_trip(
                 manifold.manifold_point(idx, (c,)),
                 atol=1e-4,
             )
+
+
+@pytest.mark.parametrize("node_coords", [torch.zeros(1, 2), torch.zeros(2, 1)])
+def test_affine_runtime_geometry_requires_exact_k_by_r(
+    node_coords: torch.Tensor,
+) -> None:
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.eye(2, 4), node_coords=node_coords,
+    )
+    manifold = Manifold(
+        name="bad-affine", domain=CustomDomain(2),
+        node_labels=["a", "b"], node_coords=torch.zeros(2, 2),
+        layers={0: sub}, mahalanobis_share={0: 1.0},
+    )
+    with pytest.raises(ValueError, match="node_coords must have shape"):
+        manifold.validate_runtime_geometry()
+
+
+def test_runtime_geometry_rejects_explicit_empty_node_roster() -> None:
+    coords = torch.tensor([[1.0], [-1.0]])
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.ones(1, 4) / 2, node_coords=coords,
+    )
+    manifold = Manifold(
+        name="bad-roster", domain=CustomDomain(1),
+        node_labels=["a", "b"], node_coords=coords, layers={0: sub},
+        node_roles=[], node_kinds=[None, None],
+        mahalanobis_share={0: 1.0},
+    )
+    with pytest.raises(ValueError, match="node_roles must align exactly"):
+        manifold.validate_runtime_geometry()
+
+
+def test_runtime_geometry_rejects_wrong_shared_authoring_arity() -> None:
+    per_layer = torch.tensor([[1.0], [-1.0]])
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.ones(1, 4) / 2, node_coords=per_layer,
+    )
+    manifold = Manifold(
+        name="bad-domain", domain=CustomDomain(1),
+        node_labels=["a", "b"], node_coords=torch.zeros(2, 2),
+        layers={0: sub}, mahalanobis_share={0: 1.0},
+    )
+    with pytest.raises(ValueError, match=r"shape \(K, n\)"):
+        manifold.validate_runtime_geometry()
+
+
+@pytest.mark.parametrize("share", [0.0, -1.0, float("nan"), True, "1.0"])
+def test_runtime_geometry_rejects_invalid_share_scalar(share: object) -> None:
+    coords = torch.tensor([[1.0], [-1.0]])
+    sub = LayerSubspace.affine(
+        torch.zeros(4), torch.ones(1, 4) / 2, node_coords=coords,
+    )
+    manifold = Manifold(
+        name="bad-share", domain=CustomDomain(1),
+        node_labels=["a", "b"], node_coords=coords, layers={0: sub},
+        mahalanobis_share={0: share},  # type: ignore[dict-item]
+    )
+    with pytest.raises(ValueError, match="finite and positive"):
+        manifold.validate_runtime_geometry()

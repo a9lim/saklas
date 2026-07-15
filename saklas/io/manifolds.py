@@ -27,8 +27,7 @@ statements — placed at authoring coordinates on a :class:`ManifoldDomain`
 cylinder, a torus, a sphere, or an explicit immersion).  Fitting a
 manifold against a model produces a per-model RBF artifact (see
 :mod:`saklas.core.manifold`).  Manifolds live under their own root,
-``~/.saklas/manifolds/<ns>/<name>/``, parallel to the legacy ``vectors/``
-port root.
+``~/.saklas/manifolds/<ns>/<name>/``.
 """
 from __future__ import annotations
 
@@ -40,7 +39,7 @@ from importlib import resources as _resources
 from pathlib import Path
 from typing import Any
 
-from saklas.io.atomic import write_bytes_atomic
+from saklas.io.atomic import write_bytes_atomic, write_json_atomic
 from saklas.io.paths import manifolds_dir, saklas_home
 
 # -- format core ---------------------------------------------------------
@@ -70,17 +69,16 @@ from saklas.io.manifold_authoring import (
     iter_manifold_folders,
     merge_discover_manifolds,
     plan_discover_generation,
-    port_legacy_vector_folder,
-    read_manifold_scenarios,
     save_baked_manifold_tensor,
     update_manifold_folder,
-    write_manifold_scenarios,
 )
 
 # -- lifecycle / transfer / summary -------------------------------------
 from saklas.io.manifold_lifecycle import (
+    TransferSourceProof,
     clear_manifold_tensors,
     manifold_summary,
+    preflight_transfer_manifold,
     refresh_manifold,
     remove_manifold_folder,
     transfer_manifold,
@@ -96,6 +94,10 @@ _log = logging.getLogger("saklas.io.manifolds")
 # it via ``saklas.io.manifolds._materialized_this_process`` (see the module
 # docstring).
 _materialized_this_process: bool = False
+# The no-op is scoped to one artifact root, not blindly to the Python process.
+# Tests, embedded callers, and notebook workflows may intentionally switch
+# ``SAKLAS_HOME`` in-process; that new root still needs a fresh bootstrap.
+_materialized_home: Path | None = None
 
 
 # ====================================================== bundled materialization ===
@@ -160,19 +162,29 @@ def bundled_manifold_names() -> list[str]:
     )
 
 
-def _canonical_json_sha256(data: bytes) -> str:
-    """Content-stable sha256 of a JSON byte payload.
+def _manifest_content_sha256(data: bytes) -> str:
+    """Bundle-drift sha of a manifest payload — canonical JSON (sorted
+    keys, no whitespace, so cosmetic differences compare equal) with local
+    fit-transaction state (``files`` / ``artifact_id`` / ``fit_epochs``)
+    stripped before hashing.
 
-    Hashes the canonical-JSON form (sorted keys, no surrounding
-    whitespace) so cosmetic-only differences (key order, indent, trailing
-    newline) compare equal.  Falls back to a raw sha256 if the bytes don't
-    parse as JSON, so unparseable on-disk content is treated as "user
-    edited" rather than silently overwritten.
+    ``files`` accumulates per-model fit proofs *locally*
+    (:meth:`ManifoldFolder.update_file_hashes` after every fit), so it is
+    local state, not bundle content.  Comparing the raw manifest against
+    the shipped one misreads every fit as a bundle update; the refresh
+    then clobbered the manifest with the shipped bytes (whose ``files`` is
+    empty), orphaning the fitted tensors — the strict per-tensor loader
+    refuses a tensor with no proof.  Falls back to a raw sha256 if the
+    bytes don't parse as JSON, so unparseable on-disk content is treated
+    as "user edited" rather than silently overwritten.
     """
     try:
         parsed = json.loads(data)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return hashlib.sha256(data).hexdigest()
+    if isinstance(parsed, dict):
+        for key in ("files", "artifact_id", "fit_epochs"):
+            parsed.pop(key, None)
     return hashlib.sha256(_canonical_json(parsed)).hexdigest()
 
 
@@ -185,7 +197,7 @@ def _copy_bundled_manifold_fresh(pkg_root: Any, target: Path) -> None:
     """Fresh install of a bundled manifold — copy JSON payloads only."""
     target.mkdir(parents=True, exist_ok=True)
     for entry in pkg_root.iterdir():
-        if _is_bundled_json_file(entry):
+        if entry.is_file() and entry.name == "manifold.json":
             write_bytes_atomic(target / entry.name, entry.read_bytes())
         elif entry.is_dir() and entry.name == "nodes":
             nodes_dir = target / "nodes"
@@ -228,6 +240,106 @@ def _refresh_all_bundled_nodes(pkg_root: Any, target: Path) -> None:
             stale.unlink()
 
 
+def _materialize_one_bundled_manifold(default_dir: Path, name: str) -> None:
+    """Refresh one bundled folder under the same lock used by fitting."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    target = default_dir / name
+    pkg_root = _resources.files("saklas.data.manifolds").joinpath(name)
+    with _locked_manifest(target):
+        if not target.exists():
+            _copy_bundled_manifold_fresh(pkg_root, target)
+            return
+
+        on_disk_manifest = target / "manifold.json"
+        if not on_disk_manifest.exists():
+            return
+        try:
+            with open(on_disk_manifest) as f:
+                on_disk_payload = json.load(f)
+        except Exception:
+            return
+
+        bundled_manifest_bytes = (pkg_root / "manifold.json").read_bytes()
+        on_disk_manifest_bytes = on_disk_manifest.read_bytes()
+        # Drift-compare with the local ``files`` integrity map stripped —
+        # fit proofs are local state, and comparing them against the
+        # shipped manifest made every fitted bundled manifold read as a
+        # bundle update on the next launch (the refresh then wiped the
+        # proofs, orphaning the tensors).
+        manifest_changed = (
+            _manifest_content_sha256(on_disk_manifest_bytes)
+            != _manifest_content_sha256(bundled_manifest_bytes)
+        )
+        fmt = on_disk_payload.get("format_version")
+        format_stale = (
+            not isinstance(fmt, int)
+            or isinstance(fmt, bool)
+            or fmt != MANIFOLD_FORMAT_VERSION
+        )
+        if not manifest_changed and not format_stale:
+            return
+
+        write_bytes_atomic(
+            on_disk_manifest.with_suffix(".json.bak"), on_disk_manifest_bytes,
+        )
+        # A genuine bundle update: take the shipped manifest, but carry the
+        # per-model fit proofs forward for artifacts still on disk that the
+        # bundle doesn't ship (fitted tensors + sidecars).  The tensors
+        # deliberately stay put across bundle updates; without their proofs
+        # the strict loader can't read them, and re-verification against
+        # the carried hash still runs on every load — nothing is laundered,
+        # while the per-tensor ``nodes_sha256`` staleness check remains the
+        # thing that decides whether an old fit is still current.
+        try:
+            merged_payload = json.loads(bundled_manifest_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            merged_payload = None
+        old_files = on_disk_payload.get("files", {})
+        if isinstance(merged_payload, dict) and isinstance(old_files, dict):
+            shipped = {
+                entry.name for entry in pkg_root.iterdir()
+                if _is_bundled_json_file(entry)
+            }
+            carried = {
+                fname: digest
+                for fname, digest in old_files.items()
+                if isinstance(fname, str)
+                and fname not in shipped
+                and (target / fname).is_file()
+            }
+            bundled_files = merged_payload.get("files", {})
+            merged_payload["files"] = {
+                **carried,
+                **(bundled_files if isinstance(bundled_files, dict) else {}),
+            }
+            write_json_atomic(on_disk_manifest, merged_payload)
+        else:
+            write_bytes_atomic(on_disk_manifest, bundled_manifest_bytes)
+        _refresh_all_bundled_nodes(pkg_root, target)
+        for entry in pkg_root.iterdir():
+            if not _is_bundled_json_file(entry) or entry.name == "manifold.json":
+                continue
+            write_bytes_atomic(target / entry.name, entry.read_bytes())
+
+        reason = (
+            f"v{fmt}->v{MANIFOLD_FORMAT_VERSION} (format_version)"
+            if format_stale else "manifest content changed"
+        )
+        warnings.warn(
+            f"materialize_bundled_manifolds: refreshed default/{name} — "
+            f"{reason}; any local edits to its node corpus were overwritten "
+            f"(fork under local/ to keep a custom corpus)",
+            UserWarning,
+            stacklevel=3,
+        )
+        _log.warning(
+            "materialize_bundled_manifolds: refreshed default/%s — %s "
+            "(node corpus re-copied, local edits overwritten)",
+            name, reason,
+        )
+
+
 def materialize_bundled_manifolds() -> None:
     """Copy bundled manifolds into ``~/.saklas/manifolds/default/``.
 
@@ -243,8 +355,8 @@ def materialize_bundled_manifolds() -> None:
     - **Fresh install** (target dir doesn't exist) — copy every shipped
       file atomically.
     - **Bundle update** (canonical-JSON hash of bundled ``manifold.json``
-      differs from materialized, OR on-disk ``format_version`` is older
-      than :data:`MANIFOLD_FORMAT_VERSION`) — re-copy ``manifold.json``
+      differs from materialized, OR on-disk ``format_version`` is not exactly
+      :data:`MANIFOLD_FORMAT_VERSION`) — re-copy ``manifold.json``
       in place (writing a ``.bak``), re-copy every node file
       unconditionally, re-copy any other top-level shipped files.
     - **No change** (manifest hashes match AND format_version is
@@ -263,8 +375,8 @@ def materialize_bundled_manifolds() -> None:
     they're expensive to refit and the per-tensor ``nodes_sha256``
     check invalidates them automatically on next discover/fit.
 
-    **Process-scoped no-op after first call.**  Subsequent calls within
-    the same process return immediately without touching disk.  This
+    **Per-home process-scoped no-op after first call.**  Subsequent calls within
+    the same process and for the same ``SAKLAS_HOME`` return immediately without touching disk.  This
     prevents a second materialize (from e.g. ``SaklasSession.from_pretrained``
     later in the same CLI invocation) from clobbering CLI-set
     hyperparams that the runner wrote between the two calls — the
@@ -275,90 +387,19 @@ def materialize_bundled_manifolds() -> None:
     update mid-process would need a restart; this is not a real use
     case (bundle updates ship via pip and require restart anyway).
     """
-    global _materialized_this_process
-    if _materialized_this_process:
+    global _materialized_this_process, _materialized_home
+    home = saklas_home()
+    if _materialized_this_process and _materialized_home == home:
         return
     _materialized_this_process = True
+    _materialized_home = home
 
-    home = saklas_home()
     home.mkdir(parents=True, exist_ok=True)
 
     default_dir = manifolds_dir() / "default"
     default_dir.mkdir(parents=True, exist_ok=True)
     for name in bundled_manifold_names():
-        target = default_dir / name
-        pkg_root = _resources.files("saklas.data.manifolds").joinpath(name)
-
-        if not target.exists():
-            _copy_bundled_manifold_fresh(pkg_root, target)
-            continue
-
-        on_disk_manifest = target / "manifold.json"
-        if not on_disk_manifest.exists():
-            # Folder exists without a manifold.json — refuse to fabricate one.
-            continue
-
-        try:
-            with open(on_disk_manifest) as f:
-                on_disk_payload = json.load(f)
-        except Exception:
-            # Corrupt; don't stomp user state.
-            continue
-
-        bundled_manifest_bytes = (pkg_root / "manifold.json").read_bytes()
-        on_disk_manifest_bytes = on_disk_manifest.read_bytes()
-        manifest_changed = (
-            _canonical_json_sha256(on_disk_manifest_bytes)
-            != _canonical_json_sha256(bundled_manifest_bytes)
-        )
-        fmt = on_disk_payload.get("format_version")
-        format_stale = isinstance(fmt, int) and fmt < MANIFOLD_FORMAT_VERSION
-
-        if not manifest_changed and not format_stale:
-            # Same bundle, current format — nothing to do.
-            continue
-
-        # Bundle update — manifest moved or format_version bumped.  Both
-        # cases want the new bundled state to win; user node-edits are
-        # interpreted as stale-against-old-bundle and replaced.
-        write_bytes_atomic(
-            on_disk_manifest.with_suffix(".json.bak"), on_disk_manifest_bytes,
-        )
-        write_bytes_atomic(on_disk_manifest, bundled_manifest_bytes)
-
-        _refresh_all_bundled_nodes(pkg_root, target)
-
-        # Re-copy other top-level shipped JSON files (e.g. scenarios.json
-        # provenance) that aren't manifold.json or under nodes/.
-        for entry in pkg_root.iterdir():
-            if not _is_bundled_json_file(entry) or entry.name == "manifold.json":
-                continue
-            write_bytes_atomic(target / entry.name, entry.read_bytes())
-
-        reason = (
-            f"v{fmt}->v{MANIFOLD_FORMAT_VERSION} (format_version)"
-            if format_stale
-            else "manifest content changed"
-        )
-        # Unlike ``packs.materialize_bundled`` (which preserves a
-        # user-edited ``statements.json``), the bundle-update path here
-        # re-copies every node file unconditionally — a node "edit" is
-        # stale-against-old-bundle once the manifest moves.  That clobber
-        # is intentional, but a user who hand-edited a bundled node corpus
-        # deserves to *see* that their edit was overwritten, so this is a
-        # user-facing warning rather than an INFO log they'd never notice.
-        warnings.warn(
-            f"materialize_bundled_manifolds: refreshed default/{name} — "
-            f"{reason}; any local edits to its node corpus were overwritten "
-            f"(fork under local/ to keep a custom corpus)",
-            UserWarning,
-            stacklevel=2,
-        )
-        _log.warning(
-            "materialize_bundled_manifolds: refreshed default/%s — %s "
-            "(node corpus re-copied, local edits overwritten)",
-            name, reason,
-        )
+        _materialize_one_bundled_manifold(default_dir, name)
 
 
 __all__ = [
@@ -375,11 +416,8 @@ __all__ = [
     "create_discover_manifold_folder",
     "create_baked_manifold_folder",
     "save_baked_manifold_tensor",
-    "port_legacy_vector_folder",
     "init_discover_manifold_folder",
     "append_discover_manifold_node",
-    "write_manifold_scenarios",
-    "read_manifold_scenarios",
     "plan_discover_generation",
     "DiscoverGenerationPlan",
     "merge_discover_manifolds",
@@ -387,6 +425,8 @@ __all__ = [
     "clear_manifold_tensors",
     "remove_manifold_folder",
     "refresh_manifold",
+    "TransferSourceProof",
+    "preflight_transfer_manifold",
     "transfer_manifold",
     "manifold_summary",
     "domain_label",

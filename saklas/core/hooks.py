@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -11,10 +13,10 @@ from saklas.core.manifold import (
     BoxDomain,
     CustomDomain,
     LayerSubspace,
+    Manifold,
     ManifoldDomain,
     SynthesizedSubspace,
     _ortho_basis,
-    eval_rbf,
     subspace_inject,
 )
 from saklas.core.triggers import Trigger, TriggerContext
@@ -85,6 +87,7 @@ class HiddenCapture:
         # per forward at the max layer) so ``tail_slice_at`` can map a
         # generated-token index to its ring slot.
         self._tail_depth: int = 1
+        self._tail_layers: frozenset[int] | None = None
         self._forward_count: int = 0
         # Persistent compile-clean capture source: when capture rides the
         # always-on pre-compile capture hooks (``install_persistent_capture_hooks``)
@@ -101,6 +104,13 @@ class HiddenCapture:
         # forward.  The normal single-row paths keep using ``_per_layer``.
         self._batch_per_layer: dict[int, list[torch.Tensor]] = {}
         self._batch_forward_count: int = 0
+        # Selective prompt capture.  Decode-time measurements retain only the
+        # last position, but a loom-attached generation may also ask for the
+        # producer positions of visible authored tokens from the first prefill
+        # forward.  Keeping only those rows avoids cloning the full [T, D]
+        # prompt at every measured layer.
+        self._prompt_positions: tuple[int, ...] = ()
+        self._prompt_per_layer: dict[int, torch.Tensor] = {}
 
     def attach(
         self, layers: "torch.nn.ModuleList", layer_indices: list[int]
@@ -115,17 +125,40 @@ class HiddenCapture:
         self._step_sink = None
         self._max_layer = None
         self._tail_depth = 1
+        self._tail_layers = None
         self._forward_count = 0
         self._persistent_buffers = {}
+        self._prompt_positions = ()
+        self._prompt_per_layer = {}
         for idx in layer_indices:
             bucket = self._per_layer[idx]
 
             def _make(bucket_ref: list[torch.Tensor], layer_idx: int) -> Any:
                 def _hook(module: Any, input: Any, output: Any) -> None:
                     h = output if isinstance(output, torch.Tensor) else output[0]
+                    if (
+                        self._prompt_positions
+                        and layer_idx not in self._prompt_per_layer
+                        and int(h.shape[1]) > self._prompt_positions[-1]
+                    ):
+                        positions = torch.tensor(
+                            self._prompt_positions,
+                            device=h.device,
+                            dtype=torch.long,
+                        )
+                        self._prompt_per_layer[layer_idx] = (
+                            h[0].index_select(0, positions).detach().clone()
+                        )
                     src = h[0, -1, :].detach()
                     if self._incremental:
-                        if self._tail_depth <= 1:
+                        keep_deep_tail = (
+                            self._tail_depth > 1
+                            and (
+                                self._tail_layers is None
+                                or layer_idx in self._tail_layers
+                            )
+                        )
+                        if not keep_deep_tail:
                             # Overwrite into a single preallocated (D,) buffer per
                             # layer — ``copy_`` the latest slice in instead of
                             # allocating a fresh clone every step, so the per-token
@@ -222,6 +255,7 @@ class HiddenCapture:
         """
         self._incremental = True
         self._tail_depth = 1
+        self._tail_layers = None
         self._step_sink = step_sink
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
@@ -238,10 +272,15 @@ class HiddenCapture:
         self._incremental = True
         self._step_sink = None
         self._tail_depth = max(1, int(depth))
+        self._tail_layers = None
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
     def set_tail_with_sink(
-        self, depth: int, step_sink: Callable[[dict[int, torch.Tensor]], None],
+        self,
+        depth: int,
+        step_sink: Callable[[dict[int, torch.Tensor]], None],
+        *,
+        tail_layers: set[int] | frozenset[int] | None = None,
     ) -> None:
         """Bounded-tail ring PLUS a per-token step sink (gating-subset / lean).
 
@@ -253,9 +292,17 @@ class HiddenCapture:
         :meth:`attach`'s ``_hook``).  Used by the GATING_SUBSET (gated-subset
         scalar scoring) and LEAN_INCREMENTAL (``coords_only`` per-token scoring)
         capture modes, both of which still pool the FULL roster once at finalize
-        from the retained ring.
+        from the retained ring. ``tail_layers`` optionally restricts the deep
+        ring to layers a final readout aggregate can consume; other layers stay
+        length-1 latest-slice buffers and are omitted from
+        :meth:`tail_slice_at`.
         """
         self.set_aggregate_tail(depth)
+        self._tail_layers = (
+            frozenset(int(layer) for layer in tail_layers)
+            if tail_layers is not None
+            else None
+        )
         self._step_sink = step_sink
 
     def attach_persistent(
@@ -280,6 +327,7 @@ class HiddenCapture:
         self._step_sink = None
         self._max_layer = None
         self._tail_depth = 1
+        self._tail_layers = None
         self._forward_count = 0
         self._persistent_buffers = {
             idx: buffers[idx] for idx in layer_indices if idx in buffers
@@ -306,7 +354,14 @@ class HiddenCapture:
             if src is None:
                 continue
             if self._incremental:
-                if self._tail_depth <= 1:
+                keep_deep_tail = (
+                    self._tail_depth > 1
+                    and (
+                        self._tail_layers is None
+                        or idx in self._tail_layers
+                    )
+                )
+                if not keep_deep_tail:
                     # Length-1 overwrite: clone once, then ``copy_`` the latest
                     # persistent slice in each step (zero steady-state allocation,
                     # bucket stays length-1 so ``[-1]`` reads the latest).
@@ -335,6 +390,8 @@ class HiddenCapture:
         # Drop the persistent-buffer source so a later transient capture (or a
         # no-probe gen) can't read stale slices through ``ingest_persistent``.
         self._persistent_buffers = {}
+        self._prompt_positions = ()
+        self._prompt_per_layer = {}
 
     def clear(self) -> None:
         self._per_layer = {}
@@ -344,9 +401,28 @@ class HiddenCapture:
         self._step_sink = None
         self._max_layer = None
         self._tail_depth = 1
+        self._tail_layers = None
         self._forward_count = 0
         self._batch_forward_count = 0
         self._persistent_buffers = {}
+        self._prompt_positions = ()
+        self._prompt_per_layer = {}
+
+    def set_prompt_positions(self, positions: list[int]) -> None:
+        """Retain selected rows from the first multi-token prefill forward.
+
+        Positions are local to the ``input_ids`` passed into that forward.  A
+        caller using a KV prefix therefore subtracts the cached prefix length
+        before arming the capture.  Persistent latest-slice buffers cannot
+        provide prompt rows; the session forces this mode onto transient hooks.
+        """
+        normalized = tuple(sorted({int(pos) for pos in positions if pos >= 0}))
+        self._prompt_positions = normalized
+        self._prompt_per_layer = {}
+
+    def prompt_stacked(self) -> dict[int, torch.Tensor]:
+        """Return selected prefill rows as ``{layer: [positions, D]}``."""
+        return dict(self._prompt_per_layer)
 
     def tail_slice_at(self, forward_index: int) -> dict[int, torch.Tensor]:
         """Per-layer ``[D]`` slice for decode ``forward_index`` from the tail ring.
@@ -363,6 +439,8 @@ class HiddenCapture:
         F = self._forward_count
         for idx, bucket in self._per_layer.items():
             if not bucket:
+                continue
+            if self._tail_layers is not None and idx not in self._tail_layers:
                 continue
             start = F - len(bucket)            # forward index of bucket[0]
             pos = forward_index - start
@@ -514,11 +592,13 @@ class SteeringHook:
         # Model-dtype low-rank fast path for the single-affine mixed
         # push+ablation case.  The full ``subspace_inject`` fallback casts the
         # entire residual stream to fp32 and copies a full-width result back.
-        # For an affine subspace the update is exactly low-rank:
-        # ``q = h Bᵀ - μBᵀ`` and ``h += (along·(target - κq))B``.  Keeping the
-        # small reduced-space math in the model dtype avoids the full fp32
-        # residual copy while preserving the same geometry; pure-push still uses
-        # the even cheaper constant-add path above this.
+        # For an affine subspace the update is exactly low-rank.  Split its
+        # fixed push from its activation-dependent ablation at recompose time:
+        # ``h += c_push - along·(κₐ⊙(hBₐᵀ-μBₐᵀ))Bₐ``.  ``Bₐ`` contains
+        # only nonzero-κ rows, so a push + one ablation (the usual mixed
+        # expression) projects one axis instead of the entire merged span.  The
+        # rank-1 hot path below further lowers that projection to an elementwise
+        # dot + axpy, which is about 3x cheaper than two tiny MPS matmuls.
         self._single_affine_lowrank: tuple[
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
             torch.Tensor, float,
@@ -732,23 +812,40 @@ class SteeringHook:
         device: torch.device,
         dtype: "torch.dtype | None",
     ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float] | None":
-        """Precompute model-dtype tensors for mixed affine push+ablation."""
+        """Precompute the fixed push and compact ablation-only projection.
+
+        The exact affine update is ``along·target@B -
+        along·(κ⊙q)@B``.  Its first term is constant and rows where
+        ``κ == 0`` never contribute to the second, so carrying the complete
+        merged rank through both hot-path matmuls is avoidable duplication.
+        """
         if dtype is None:
             return None
         if isinstance(kappa, torch.Tensor):
             kappa_tensor = cast(torch.Tensor, kappa)
             if not bool(kappa_tensor.any()):
                 return None
-            kappa_t = kappa_tensor.to(device=device, dtype=dtype)
+            kappa_f32 = kappa_tensor.to(device=device, dtype=torch.float32)
         else:
             if float(kappa) == 0.0:
                 return None
-            kappa_t = torch.full_like(target, float(kappa), device=device, dtype=dtype)
-        basis = sub.basis.to(device=device, dtype=dtype)       # (R, D)
-        basis_t = basis.T.contiguous()                         # (D, R)
-        target_t = target.to(device=device, dtype=dtype)       # (R,)
-        mean_proj_t = mean_proj.to(device=device, dtype=dtype) # (R,)
-        return basis, basis_t, target_t, kappa_t, mean_proj_t, float(along)
+            kappa_f32 = torch.full_like(
+                target, float(kappa), device=device, dtype=torch.float32,
+            )
+        basis_f32 = sub.basis.to(device=device, dtype=torch.float32)  # (R, D)
+        target_f32 = target.to(device=device, dtype=torch.float32)    # (R,)
+        const = ((float(along) * target_f32) @ basis_f32).to(dtype)   # (D,)
+        active = kappa_f32 != 0
+        ablate_basis = basis_f32[active].to(dtype).contiguous()       # (Ra, D)
+        ablate_basis_t = ablate_basis.T.contiguous()                  # (D, Ra)
+        ablate_kappa = kappa_f32[active].to(dtype)                    # (Ra,)
+        ablate_mean_proj = mean_proj.to(device=device, dtype=torch.float32)[
+            active
+        ].to(dtype)                                                    # (Ra,)
+        return (
+            ablate_basis, ablate_basis_t, ablate_kappa,
+            ablate_mean_proj, const, float(along),
+        )
 
     def hook_fn(self, module: Any, input: Any, output: Any) -> Any:
         # Constant-add fast path: one always-active **pure-push** affine group
@@ -764,15 +861,23 @@ class SteeringHook:
         lowrank = self._single_affine_lowrank
         if lowrank is not None:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
-            basis, basis_t, target, kappa, mean_proj, along = lowrank
+            basis, basis_t, kappa, mean_proj, const, along = lowrank
             if hidden.dtype != basis.dtype:
                 basis = basis.to(hidden.dtype)
                 basis_t = basis.T.contiguous()
-                target = target.to(hidden.dtype)
                 kappa = kappa.to(hidden.dtype)
                 mean_proj = mean_proj.to(hidden.dtype)
-            q = hidden @ basis_t - mean_proj
-            delta = (along * (target - kappa * q)) @ basis
+                const = const.to(hidden.dtype)
+            if basis.shape[0] == 1:
+                # MPS dispatch dominates a rank-1 GEMM.  Express the same
+                # projection as a dot + axpy so Metal can use elementwise
+                # kernels and avoid allocating the full merged-rank ``q``.
+                row = basis[0]
+                q = (hidden * row).sum(dim=-1, keepdim=True) - mean_proj[0]
+                delta = const - (along * kappa[0]) * q * row
+            else:
+                q = hidden @ basis_t - mean_proj
+                delta = const - (along * (kappa * q)) @ basis
             hidden.add_(delta)
             return output
         # Fast path: one always-active affine group (the common steering case).
@@ -922,7 +1027,7 @@ class SteeringHook:
 # beyond 1 would overshoot through the zero-thickness wire or σ-tube).
 #
 # This is the **onto** (off-surface collapse) gain only: ``eff_onto_L =
-# clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)``.  On a legacy zero-thickness
+# clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)``.  On an SAE-space
 # curved fit the kernel scales the off-surface residual by ``(1 − eff_onto)``; on
 # a fuzzy σ-field fit it instead shrinks residual norm toward the local tube
 # thickness.  That residual carries the per-token content variation, so combined
@@ -1069,61 +1174,37 @@ def _normalize_shares_mean1(raw: dict[int, float]) -> dict[int, float]:
 
     So ``eff_along_L = share_L · base`` is a clean per-layer slide fraction
     ≈ ``base`` on a typical layer and n_layers-invariant (see
-    ``_MANIFOLD_ONTO_GAIN``).  Degenerate guard: an all-zero / near-zero total
-    falls back to a uniform ``1.0`` per layer.
+    ``_MANIFOLD_ONTO_GAIN``). Inputs are exact positive current geometry.
     """
-    n_layers = max(1, len(raw))
+    if not raw or any(not math.isfinite(s) or s <= 0.0 for s in raw.values()):
+        raise ValueError("layer shares must be a nonempty finite positive mapping")
+    n_layers = len(raw)
     total = sum(raw.values())
-    if total <= 1e-12:
-        return dict.fromkeys(raw, 1.0)
     return {L: s / total * n_layers for L, s in raw.items()}
 
 
-def _manifold_layer_shares(manifold: Any) -> dict[int, float]:
+def _manifold_layer_shares(manifold: Manifold) -> dict[int, float]:
     # Prefer the whitened (Mahalanobis) per-layer share baked at fit time —
     # the subspace-restricted analogue of vector steering's ``‖d‖_M`` bake
     # score (see ``LayerWhitener.subspace_gram`` /
     # ``ManifoldExtractionPipeline.fit``).  Requires *full* layer coverage:
     # the share is a cross-layer-normalized weight, so mixing whitened and
     # Euclidean scalars across layers would compare incommensurable
-    # metrics.  When the baked share is absent (no whitener at fit time —
-    # CPU test stubs) or partial, fall back to the Euclidean centroid-
-    # spread ``‖coords‖_F``.  Normalized to **mean 1** (``Σ_L share_L =
+    # metrics. Normalized to **mean 1** (``Σ_L share_L =
     # n_layers``, not 1) so ``eff_along_L = share_L · base_gain`` is a clean
     # per-layer slide fraction ≈ ``base`` on a typical layer and
     # n_layers-invariant — see ``_MANIFOLD_ONTO_GAIN``.
-    baked = getattr(manifold, "mahalanobis_share", None)
-    if baked and all(layer_idx in baked for layer_idx in manifold.layers):
-        layer_scores: dict[int, float] = {
-            layer_idx: float(baked[layer_idx]) for layer_idx in manifold.layers
-        }
-    else:
-        # Euclidean centroid-spread fallback: used only when no whitener was
-        # present at fit time (CPU test stubs without a neutral cache).
-        # Guard on ``is_affine`` first — ``rbf_params()`` raises on flat
-        # subspaces (documented in core/AGENTS.md), so we must never call it
-        # on concepts / personas / any pca-fit manifold (T1.5 fix).
-        layer_scores = {}
-        for layer_idx, sub in manifold.layers.items():
-            if sub.is_affine:
-                # Flat subspace: use the Euclidean norm of the per-layer
-                # real node coords (K, R) stored on every affine LayerSubspace.
-                # Falls back to 1.0 when node_coords is absent (degenerate stub).
-                nc = sub.node_coords
-                score = (
-                    float(torch.linalg.vector_norm(nc.to(torch.float32)).item())
-                    if nc is not None
-                    else 1.0
-                )
-            else:
-                # Curved subspace: eval the RBF at the fit nodes to get the
-                # (K, R) reduced coords and use their Frobenius norm as a spread.
-                _np, _rw, _pc = sub.rbf_params()
-                node_coords = eval_rbf(
-                    _np, _rw, _pc, _np,
-                )  # (K, R) — exact centered coords at the fit nodes
-                score = float(torch.linalg.vector_norm(node_coords).item())
-            layer_scores[layer_idx] = score
+    baked = manifold.mahalanobis_share
+    missing = set(manifold.layers) - set(baked)
+    extra = set(baked) - set(manifold.layers)
+    if missing or extra:
+        raise ValueError(
+            f"manifold {manifold.name!r} has non-canonical Mahalanobis shares "
+            f"(missing={sorted(missing)}, extra={sorted(extra)})"
+        )
+    layer_scores = {
+        layer_idx: float(baked[layer_idx]) for layer_idx in manifold.layers
+    }
     return _normalize_shares_mean1(layer_scores)
 
 
@@ -1198,7 +1279,7 @@ class SteeringManager:
     def add_manifold(
         self,
         name: str,
-        manifold: object,
+        manifold: Manifold,
         position: tuple[float, ...] | str,
         along: float,
         onto: float,
@@ -1228,21 +1309,10 @@ class SteeringManager:
         in-subspace residual.  The off-subspace residual is always kept
         verbatim (the old ``toward`` op is removed).
         """
-        resolve = getattr(manifold, "resolve_position", None)
-        if resolve is not None:
-            resolved = resolve(position)
-        elif isinstance(position, str):
-            # Defensive: a manifold-shaped object without
-            # ``resolve_position`` (e.g. a test double) can't resolve
-            # labels.  Raise rather than guess.
-            raise TypeError(
-                f"manifold {name!r} cannot resolve a label-form position "
-                f"({position!r}) — the manifold lacks resolve_position()"
-            )
-        else:
-            resolved = tuple(float(c) for c in position)
-        domain = getattr(manifold, "domain", None)
-        if domain is not None and len(resolved) != domain.intrinsic_dim:
+        manifold.validate_runtime_geometry()
+        resolved = manifold.resolve_position(position)
+        domain = manifold.domain
+        if len(resolved) != domain.intrinsic_dim:
             from saklas.core.errors import ManifoldArityError
             raise ManifoldArityError(
                 f"manifold {name!r} has a {domain.intrinsic_dim}-dimensional "
@@ -1377,11 +1447,10 @@ class SteeringManager:
             # Target is layer-independent (one authoring position); clamp it
             # into the domain once.  The cold-start origin seed ``O_L`` is
             # per-layer (each layer's neutral foot) — picked inside the loop.
-            n_dim = domain.intrinsic_dim
             target_coord = domain.clamp_position(
                 torch.tensor([float(c) for c in position], dtype=torch.float32)
             )
-            mfld_origins = getattr(manifold, "origin", None) or {}
+            mfld_origins = manifold.origin
 
             for layer_idx, sub in manifold.layers.items():
                 B_new = sub.basis.to(torch.float32)
@@ -1403,15 +1472,14 @@ class SteeringManager:
                 else:
                     curved_basis_by_layer[layer_idx] = B_new
                     curved_owner[layer_idx] = mname
-                # ``O_L`` (this layer's neutral foot) or ``zeros(n)`` when the
-                # layer baked no origin (CPU stub / pre-origin fit).
-                O_L = mfld_origins.get(layer_idx)
-                if O_L is None:
-                    origin_coord = torch.zeros(n_dim, dtype=torch.float32)
-                else:
-                    origin_coord = domain.clamp_position(
-                        O_L.reshape(-1).to(torch.float32)
+                if layer_idx not in mfld_origins:
+                    raise ValueError(
+                        f"curved manifold {manifold.name!r} has no neutral "
+                        f"origin for layer {layer_idx}"
                     )
+                origin_coord = domain.clamp_position(
+                    mfld_origins[layer_idx].reshape(-1).to(torch.float32)
+                )
                 manifold_by_layer.setdefault(layer_idx, []).append((
                     sub, domain, target_coord, origin_coord,
                     eff_along[layer_idx], eff_onto[layer_idx], 0.0, trigger,
@@ -1440,19 +1508,19 @@ class SteeringManager:
             # is a clean per-layer slide fraction and n_layers-invariant (one
             # covered layer and a 30-layer fit both put ≈ ``base`` of slide on
             # each contributing layer; A⊂B steers its shared axis identically).
-            raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
+            raw_share = {L: float(synth.share[L]) for L in layer_set}
             shares = _normalize_shares_mean1(raw_share)
 
             for L in layer_set:
                 sub_L = synth.layers[L]
                 sub_target = synth.target_coord[L].to(torch.float32)
-                # Per-axis collapse mask κ (0 push / translate, 1 ablate /
-                # collapse) — default all-translate when a synth predates it.
-                sub_kappa = synth.kappa.get(L)
-                sub_kappa = (
-                    sub_kappa.to(torch.float32) if sub_kappa is not None
-                    else torch.zeros(sub_L.rank, dtype=torch.float32)
-                )
+                # Per-axis requested ablation coefficient (0 on push axes).
+                # ``subspace_inject`` multiplies it by ``along``; compensate
+                # for the affine push gain below so ``0.15 !x`` removes 15%,
+                # not ``16×`` that amount.  Orthogonalization runs on the
+                # user-space coefficients first, then this one scalar division
+                # preserves the resulting operator exactly.
+                requested_kappa = synth.kappa[L].to(torch.float32)
                 # Orthogonalize the affine subspace against any curved manifold
                 # sharing this layer (curved wins the shared directions); κ rides
                 # through the re-orthonormalization.  Drop the layer if the affine
@@ -1460,11 +1528,11 @@ class SteeringManager:
                 curved = curved_basis_by_layer.get(L)
                 if curved is not None:
                     res = _orthogonalize_affine_against(
-                        sub_L, sub_target, sub_kappa, curved,
+                        sub_L, sub_target, requested_kappa, curved,
                     )
                     if res is None:
                         continue
-                    sub_L, sub_target, sub_kappa = res
+                    sub_L, sub_target, requested_kappa = res
                 r_l = sub_L.rank
                 sub_domain = CustomDomain(r_l)
                 # Affine origin is span-coord 0 (neutral → coord 0, §5); the
@@ -1475,6 +1543,7 @@ class SteeringManager:
                 # share-weighted ``eff_along`` is unclamped (``norm_cap`` bounds
                 # it in ``subspace_inject``).
                 eff_along_L = shares[L] * _SUBSPACE_GAIN
+                sub_kappa = requested_kappa / eff_along_L
                 manifold_by_layer.setdefault(L, []).append((
                     sub_L, sub_domain, sub_target, sub_origin,
                     eff_along_L, 0.0, sub_kappa, sub_trigger,
@@ -1560,12 +1629,12 @@ class SteeringManager:
             layer_set = list(synth.layers)
             if not layer_set:
                 continue
-            raw_share = {L: float(synth.share.get(L, 0.0)) for L in layer_set}
+            raw_share = {L: float(synth.share[L]) for L in layer_set}
             shares = _normalize_shares_mean1(raw_share)
             for L in layer_set:
                 sub_L = synth.layers[L]
-                kappa = synth.kappa.get(L)
-                if kappa is not None and bool((kappa.abs() > 0).any()):
+                kappa = synth.kappa[L]
+                if bool((kappa.abs() > 0).any()):
                     return None  # ablation: injection depends on h, not a const
                 target = synth.target_coord[L].to(torch.float32)
                 basis = sub_L.basis.to(torch.float32)              # (R, D)

@@ -25,14 +25,14 @@ Wipes `../saklas/web/dist/` and writes the compiled bundle there. The committed 
 
 This is a desktop research cockpit, not a landing page and not a thin chat wrapper. The first viewport should answer five questions without mode-switching: which branch am I on, what prompt/sampling state will run next, what steering recipe is active, what probes are reading, and where do I open deeper analysis. The fixed shell is:
 
-- far-left workspace rail — a loom-sidebar toggle plus three category icons (vectors / analysis / session) that open fly-out tool lists; this is the single home for the ~19 tool drawers
+- no launcher chrome — the ⌘K command palette is the single home for the ~19 tool drawers (a ⌘K chip in the chat header is the visible hint; the former far-left workspace rail is gone)
 - optional loom sidebar for tree navigation and filtering
 - center branch canvas plus chat/token surface — the chat panel header carries a ⋮ menu for the live conversation actions (clear / rewind / transcript / auto-regen) and the input row carries send / stop / regen
 - right inspector — one flat panel split into two edge-to-edge sections, the steering rack above the probe rack, divided by a single hairline
 - a thin topbar holding only the brand, session status, and the pending-actions badge
 - drawer overlays for tools that need width or dense tables — sized narrow (~480px) for forms and pickers, wide (~980px) for analysis views
 
-The visual language is one flat dark theme, dark mode only. Surfaces separate by background shade rather than outlines; the only border is a single faint hairline, and corners stay a sharp 2px throughout. A blue accent is the one chrome hue — selection, focus, and primary actions — while green, amber, red, yellow, and purple are reserved for state and data, never decoration. Type comes from the `--text-*` scale, spacing from `--space-*`, weight from `--weight-*`; all of it lives in `src/lib/style/tokens.css`, which is the source of truth and documents the rules in its header. Colour values and motion curves still mirror a9l.im's dark palette (`shared-tokens.js`), but the webui drops the site's magma-red accent and its film-grain texture for a calmer, fully flat surface. Keep the interface information-rich, but keep controls visible and directly operable with the mouse.
+The visual language is the **Observatory+ system** (tokens v2, 2026-07-10 — dark only, by standing decision): a deep blue-black ground with a faint ambient field, translucent glass cards lit from above, and a hue ontology where **color answers "which space am I looking at?"** — subspace white (shared with chrome, deliberately), manifold violet, SAE gold (the only saturated warm), lens + surprise blue (the logit-space family), green for live/probe+, red for error/probe−. Roles carry no hue (the cast model). Gradients are material, never data: fills sheen *across* the value axis; along-axis gradients only where the gradient *is* the data (depth strips, time trails). Glow is reserved for what is alive right now. The surface is **borderless by default** (Phase 6): separation comes from space, then fill contrast on the surface ladder, then light (top-light, shadow, `--shadow-sticky` under sticky headers) — hairlines survive only as meaning (focus rings, state rings, floating-surface edges, dashed pending-ghosts, control glyph strokes), and inputs recess to `--input-well` with a ring on focus only. Type is Recursive in both voices — one self-hosted variable woff2 exposed as "Recursive Sans" (chrome) and "Recursive Mono" (data) with axes pinned per-family in `src/lib/style/fonts.css`. Tokens live in `src/lib/style/tokens.css` (source of truth, rules in its header); v2 primitives in `src/lib/ui/`; the living specimen page is served at **`/styleguide`**. Keep the interface information-rich, but keep controls visible and directly operable with the mouse.
 
 ## Layout
 
@@ -55,7 +55,6 @@ src/
     style/               # tokens.css (design tokens) + global.css (resets)
   panels/
     Topbar.svelte                # thin strip: brand · session status · pending-actions badge
-    WorkspaceRail.svelte         # left rail: loom toggle + vectors/analysis/session fly-outs
     BranchCanvas.svelte          # active path + sibling/child lanes + fan/compare actions
     InspectorPanel.svelte        # runtime meters + sampling + steering/probe racks
     StatusFooter.svelte          # ● gen N/M [bar] · t/s · elapsed · ppl
@@ -90,7 +89,7 @@ src/
 1. New `src/drawers/FooDrawer.svelte`. Take `params: unknown` via `$props()` — the host forwards `drawerState.params`.
 2. Add the name to the `DrawerName` union in `lib/types.ts`; add it to `NARROW_DRAWERS` in `App.svelte` if it is a form/picker rather than an analysis view.
 3. Add a branch to `App.svelte`'s drawer switch and re-export from `drawers/index.ts` when the host references it through the barrel.
-4. Decide how users reach it: add it to the matching category in `WorkspaceRail.svelte`'s fly-out lists, or an inline button in the panel that owns the workflow.
+4. Decide how users reach it: add it to the matching `RAIL_CATEGORIES` group in `lib/commands.ts` (the ⌘K palette), or an inline button in the panel that owns the workflow.
 
 ## Reactivity gotcha
 
@@ -111,7 +110,7 @@ The dashboard speaks the existing `/saklas/v1/*` native API:
 * `POST /saklas/v1/sessions/default/tree/{navigate,edit,branch,star,note,reset}` and `DELETE /tree/{node_id}` — loom mutations
 * `GET /saklas/v1/sessions/default/tree/{edge_label,filter}` — branch labels and search/filter support
 * `POST /saklas/v1/sessions/default/tree/{diff,joint_logprobs,transcript,transcript/load}` — compare branches and import/export transcripts
-* `WS /saklas/v1/sessions/default/stream` — token + probe co-stream; the `token` event carries optional `scores` (magnitude-weighted aggregate, drives the live inline highlight) + `per_layer_scores` (per-layer heatmap for the drilldown), and the `done` event carries `per_token_probes`
+* `WS /saklas/v1/sessions/default/stream` — token + probe co-stream; the `token` event carries optional `scores` (magnitude-weighted aggregate, drives the live inline highlight), `per_layer_scores` (per-layer heatmap for the drilldown), and rich `probe_readings`; the `done` event carries settled aggregate `probe_readings` in the same shape
 * `GET /saklas/v1/sessions/default/traits/stream` — live per-token probe SSE
 
-See `saklas/server/saklas_api.py` for the Python side.
+See `saklas/server/native_routes.py` for the Python route registrar.

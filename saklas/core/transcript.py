@@ -10,19 +10,29 @@ The per-node thing remains :class:`Recipe`; the file/export concept is
 :class:`Transcript` so docs and CLI stop overloading (decision 17 in
 ``docs/plans/loom.md``).
 
-Schema::
+Schema (v2 — the cast model)::
 
-    saklas_transcript: 1
+    saklas_transcript: 2
     model_id: <hf-id>
     system_prompt: <str>
+    cast:                  # optional; the tree's cast roster
+      <label>: {recipe: {...}, notes: <str>}
     probes:
       - name: <probe>
         sha256: <hex>
     turns:
-      - role: user|assistant|system
+      - role: user|assistant     # the seat (system turns are skipped on import)
+        speaker: <label>         # optional; the turn's cast label
         text: <str>
-        recipe: {...}      # for assistant only
-        readings: {...}    # for assistant only
+        thinking: <str>          # optional; the turn's thinking block
+        recipe: {...}            # generated turns (either seat); provenance
+        readings: {...}          # generated turns
+
+On import, a turn with a ``recipe`` re-attaches as a *generated* node in its
+recorded seat (provenance = recipe presence, the cast model's invariant); a
+recipe-less turn is a committed one. Cast entries merge into the
+session tree's roster; a label the live roster already holds with a
+*different* member is left alone and flagged in the guard notes.
 
 Three import modes (decision 11):
 
@@ -51,11 +61,10 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from saklas.core.errors import SaklasError
-from saklas.core.loom import LoomTree, Recipe
+from saklas.core.loom import CastMember, LoomTree, Recipe
 
 
-SAKLAS_TRANSCRIPT_VERSION = 1
-
+SAKLAS_TRANSCRIPT_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -99,15 +108,27 @@ class ProbeRef:
 
 @dataclass
 class Turn:
-    """One conversation turn captured for replay."""
+    """One conversation turn captured for replay.
+
+    ``role`` is the *seat*; ``speaker`` the cast label the turn was
+    rendered with (``None`` = the family's standard label).  Provenance
+    is recipe presence — a generated turn carries its :class:`Recipe`
+    whatever its seat.
+    """
 
     role: Literal["user", "assistant", "system"]
     text: str
+    speaker: str | None = None
+    thinking: str | None = None
     recipe: Recipe | None = None
     readings: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"role": self.role, "text": self.text}
+        if self.speaker is not None:
+            out["speaker"] = self.speaker
+        if self.thinking is not None:
+            out["thinking"] = self.thinking
         if self.recipe is not None:
             out["recipe"] = self.recipe.to_dict()
         if self.readings:
@@ -126,9 +147,13 @@ class Turn:
                 readings[str(name)] = float(val)
             except (TypeError, ValueError):
                 continue
+        speaker = data.get("speaker")
+        thinking = data.get("thinking")
         return cls(
             role=str(data.get("role", "user")),  # pyright: ignore[reportArgumentType]  # str narrowed to Literal at runtime
             text=str(data.get("text", "")),
+            speaker=str(speaker) if speaker is not None else None,
+            thinking=str(thinking) if thinking is not None else None,
             recipe=recipe,
             readings=readings,
         )
@@ -147,6 +172,8 @@ class Transcript:
     system_prompt: str | None
     probes: list[ProbeRef]
     turns: list[Turn]
+    # Cast roster (v2): label → member, mirrored from the tree at export.
+    cast: dict[str, CastMember] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Construction from a session path
@@ -174,16 +201,17 @@ class Transcript:
             turn = Turn(
                 role=node.role,
                 text=node.text or "",
+                speaker=node.role_label,
+                thinking=node.thinking_text,
                 recipe=node.recipe,
                 readings=dict(node.aggregate_readings or {}),
             )
             turns.append(turn)
 
-        probes: list[ProbeRef] = []
-        for name in getattr(session._monitor, "probe_names", ()):
-            digest = session._probe_hash(name)
-            if digest is not None:
-                probes.append(ProbeRef(name=name, sha256=digest))
+        probes = [
+            ProbeRef(name=name, sha256=digest)
+            for name, digest in session.probe_hashes().items()
+        ]
 
         return cls(
             model_id=getattr(session, "model_id", None)
@@ -191,6 +219,7 @@ class Transcript:
             system_prompt=getattr(session.config, "system_prompt", None),
             probes=probes,
             turns=turns,
+            cast=dict(getattr(session.tree, "cast", {}) or {}),
         )
 
     # ------------------------------------------------------------------
@@ -198,15 +227,20 @@ class Transcript:
     # ------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "saklas_transcript": SAKLAS_TRANSCRIPT_VERSION,
             "model_id": self.model_id,
             "system_prompt": self.system_prompt,
-            "probes": [
-                {"name": p.name, "sha256": p.sha256} for p in self.probes
-            ],
-            "turns": [t.to_dict() for t in self.turns],
         }
+        if self.cast:
+            out["cast"] = {
+                label: m.to_dict() for label, m in self.cast.items()
+            }
+        out["probes"] = [
+            {"name": p.name, "sha256": p.sha256} for p in self.probes
+        ]
+        out["turns"] = [t.to_dict() for t in self.turns]
+        return out
 
     def to_yaml(self) -> str:
         """Render to YAML (pyyaml is a hard saklas dependency)."""
@@ -237,7 +271,7 @@ class Transcript:
         if version != SAKLAS_TRANSCRIPT_VERSION:
             raise TranscriptFormatError(
                 f"unsupported saklas_transcript version {version!r} "
-                f"(this build supports {SAKLAS_TRANSCRIPT_VERSION})"
+                f"(this build requires {SAKLAS_TRANSCRIPT_VERSION})"
             )
         probes = [
             ProbeRef(name=str(p["name"]), sha256=str(p.get("sha256", "")))
@@ -245,11 +279,16 @@ class Transcript:
             if isinstance(p, dict) and "name" in p
         ]
         turns = [Turn.from_dict(t) for t in (data.get("turns") or [])]
+        cast = {
+            str(label): CastMember.from_dict(dict(raw))
+            for label, raw in (data.get("cast") or {}).items()
+        }
         return cls(
             model_id=data.get("model_id"),
             system_prompt=data.get("system_prompt"),
             probes=probes,
             turns=turns,
+            cast=cast,
         )
 
     def save(self, path: str | Path) -> None:
@@ -285,6 +324,27 @@ class Transcript:
         probe hash difference when ``strict=True``.
         """
         guard_notes = self._collect_guard_notes(session, mode=mode, strict=strict)
+
+        # Merge the transcript's cast roster into the tree's: absent
+        # labels land, matching members are a no-op, and a label the
+        # live roster holds with a *different* member is left alone —
+        # the session's standing roster wins, with a guard note so the
+        # conflict is visible on the imported branch.
+        cast_conflicts: list[str] = []
+        for label, member in self.cast.items():
+            existing = session.tree.cast.get(label)
+            if existing is None:
+                session.tree.set_cast_member(label, member)
+            elif existing != member:
+                cast_conflicts.append(label)
+        if cast_conflicts:
+            msg = (
+                f"transcript cast differs from the session roster for: "
+                f"{', '.join(sorted(cast_conflicts))}; keeping the "
+                f"session's members"
+            )
+            warnings.warn(msg, UserWarning, stacklevel=2)
+            guard_notes.append(f"cast_conflict: {sorted(cast_conflicts)}")
 
         attach_parent = self._resolve_attach_parent(session, mode=mode)
         return self._attach_turns_under(
@@ -332,10 +392,7 @@ class Transcript:
                 f"system_prompt_mismatch: original was {self.system_prompt!r}"
             )
 
-        session_hashes = {
-            name: session._probe_hash(name)
-            for name in getattr(session._monitor, "probe_names", ())
-        }
+        session_hashes = session.probe_hashes()
         drift: list[str] = []
         missing: list[str] = []
         for ref in self.probes:
@@ -467,16 +524,25 @@ class Transcript:
                     # without writing — re-attaching here would create
                     # a duplicate user node as a child of the anchor.
                     continue
+            elif users_seen < skip_count:
+                # Assistant interleaved inside the matched prefix
+                # region — drop on the floor (see docstring).
+                continue
+            if turn.role == "user" and turn.recipe is None:
+                # Committed user turn — the plain shape.
                 new_id = tree.add_user_turn(
-                    turn.text, parent_id=current_parent, dedup_existing=False,
+                    turn.text, parent_id=current_parent,
+                    dedup_existing=False, role_label=turn.speaker,
+                    thinking_text=turn.thinking,
                 )
-            else:  # assistant
-                if users_seen < skip_count:
-                    # Assistant interleaved inside the matched prefix
-                    # region — drop on the floor (see docstring).
-                    continue
+            else:
+                # A generated turn re-attaches in its recorded seat
+                # (provenance = recipe presence — a user-seat gen keeps
+                # its recipe); a recipe-less assistant turn is an
+                # authored one and lands the same way with recipe=None.
                 new_id = tree.begin_assistant(
                     current_parent, recipe=turn.recipe,
+                    role_label=turn.speaker, seat=turn.role,
                 )
                 tree.finalize_assistant(
                     new_id,
@@ -484,6 +550,7 @@ class Transcript:
                     aggregate_readings=dict(turn.readings),
                     applied_steering=(turn.recipe.steering if turn.recipe else None),
                     finish_reason=None,
+                    thinking_text=turn.thinking,
                 )
             current_parent = new_id
             leaf_id = new_id

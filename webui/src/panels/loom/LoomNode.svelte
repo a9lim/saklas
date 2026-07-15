@@ -1,6 +1,6 @@
 <script lang="ts">
   // A single-node chip in the loom sidebar.  Role glyph, first ~40 chars of
-  // text, active-path bolded, dead branches dimmed, plus steering-delta edge
+  // text, active-path bolded, inactive branches subdued, plus steering-delta edge
   // labels, probe-aggregate ring decoration, star/note glyphs, and pin
   // affordances — the sidebar feeds all of these live (LoomSidebar's
   // ringFor / weightBadgeFor / steerLabelFor).
@@ -14,7 +14,7 @@
     onActivePath: boolean;
     /** Current focused node for sidebar keyboard nav (j/k/h/l). */
     focused: boolean;
-    /** Dead branch (not on active path) — render at reduced opacity. */
+    /** Dead branch (not on active path) — retain readable text, quiet the chrome. */
     dead: boolean;
     /** In-flight target — pulse the node so the user sees streaming. */
     streaming: boolean;
@@ -100,10 +100,10 @@
   {/if}
   <span class="preview">{preview}</span>
   {#if steerLabel}
-    <span class="steer" title="steering delta from parent">{steerLabel}</span>
+    <span class="steer" title="steering delta">{steerLabel}</span>
   {/if}
   {#if weightBadge != null}
-    <span class="weight" title="mean chosen-token logprob (response span)">
+    <span class="weight" title="mean logprob">
       {weightBadge.toFixed(2)}
     </span>
   {/if}
@@ -122,7 +122,6 @@
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-1) var(--space-3);
-    border-left: 2px solid transparent;
     border-radius: var(--radius);
     cursor: pointer;
     font: inherit;
@@ -140,44 +139,46 @@
   }
   .node.focused {
     background: var(--accent-subtle);
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -1px;
   }
   .node.active {
     font-weight: var(--weight-medium);
     color: var(--fg);
-    border-left-color: var(--accent-green);
+    background: var(--glass);
+    border-radius: var(--radius-sm);
   }
   .node.dead {
-    opacity: 0.3;
+    color: var(--fg-muted);
+    background: transparent;
   }
   .node.dead:hover {
-    opacity: 0.6;
+    color: var(--fg);
+    background: var(--bg-elev);
+  }
+  .node.dead .glyph,
+  .node.dead .ring {
+    opacity: 0.55;
   }
   .node.streaming {
-    background: rgba(126, 231, 135, 0.08);
+    background: color-mix(in srgb, var(--live) 8%, transparent);
+    box-shadow: var(--glow-live);
   }
-  .node.user {
-    border-left-color: var(--accent-blue);
-  }
-  .node.user .glyph {
-    color: var(--accent-blue);
-  }
-  .node.assistant {
-    border-left-color: var(--accent-green);
-  }
-  .node.assistant .glyph {
-    color: var(--accent-green);
-  }
-  .node.system {
-    border-left-color: var(--fg-muted);
-  }
-  .node.system .glyph {
-    color: var(--fg-muted);
-  }
+  /* No stripes at all (cast model: roles carry no hue — identity is the
+     glyph letter alone; the active path reads from the glass fill +
+     weight, and the streaming node from its live glow). */
   .glyph {
     font-weight: var(--weight-bold);
-    width: 1ch;
-    text-align: center;
-    font-size: var(--text-xs);
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--fg);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    flex: none;
     text-transform: uppercase;
   }
   .preview {
@@ -187,19 +188,22 @@
     min-width: 0;
   }
   .star {
-    color: var(--accent-yellow);
+    color: var(--fg-dim);
     font-size: var(--text-xs);
   }
   /* Steering-delta chip — trailing, truncated so a long delta can't
-   * blow out the row or collide with the preview text.  No own
-   * background: the chip inherits whatever the node row paints
-   * (transparent / hover / selected / streaming), so it always blends
-   * into the row's highlight state. */
+   * blow out the row or collide with the preview text.  This is where
+   * the edge label actually renders (LoomEdge only fetches/caches it),
+   * so it wears the "edge label chip" look: a borderless glass-strong
+   * pill, mono 2xs. */
   .steer {
-    color: var(--accent-yellow);
-    font-size: var(--text-xs);
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
     font-variant-numeric: tabular-nums;
-    padding: 0 var(--space-2);
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    background: var(--glass-strong);
     max-width: 11ch;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -225,7 +229,7 @@
      them; subdued color so the badge reads as metadata, not content.
      Like .steer, no own background — inherits the row's highlight. */
   .weight {
-    color: var(--fg-dim);
+    color: var(--fg-muted);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     padding: 0 var(--space-2);

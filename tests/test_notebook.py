@@ -27,6 +27,7 @@ from saklas.notebook import (  # noqa: E402
 from saklas.core.profile import Profile  # noqa: E402
 from saklas.core.results import (  # noqa: E402
     GenerationResult,
+    ProbeReading,
     ProbeReadings,
     ResultCollector,
 )
@@ -51,17 +52,12 @@ def _make_result(
         token_count=3,
         tok_per_sec=tok_per_sec,
         elapsed=0.06,
-        readings={
-            "honest": ProbeReadings(
-                per_generation=[(probe_mean - 0.05,), (probe_mean,), (probe_mean + 0.05,)],
-                mean=(probe_mean,),
-                std=(0.05,),
-                min=(probe_mean - 0.05,),
-                max=(probe_mean + 0.05,),
-                delta_per_gen=(0.0,),
+        probe_readings={
+            "honest": ProbeReading(
+                fraction=0.0, nearest=[], coords=(probe_mean,),
             ),
         },
-        vectors={"honest.deceptive": alpha},
+        steering_alphas={"honest.deceptive": alpha},
     )
 
 
@@ -85,8 +81,8 @@ class TestToDataFrame:
         rc.add(_make_result(alpha=0.3, probe_mean=0.4), alpha=0.3)
 
         df = to_dataframe(rc)
-        assert "vector_honest.deceptive_alpha" in df.columns
-        assert "probe_honest_mean" in df.columns
+        assert "steering_honest.deceptive_alpha" in df.columns
+        assert "probe_honest_coord" in df.columns
         assert len(df) == 2
 
     def test_from_list_of_results(self) -> None:
@@ -95,17 +91,17 @@ class TestToDataFrame:
             _make_result(alpha=0.5, probe_mean=0.6),
         ]
         df = to_dataframe(results)
-        assert "vector_honest.deceptive_alpha" in df.columns
-        assert "probe_honest_mean" in df.columns
+        assert "steering_honest.deceptive_alpha" in df.columns
+        assert "probe_honest_coord" in df.columns
         assert len(df) == 2
 
     def test_from_list_of_dicts(self) -> None:
         rows = [
-            {"alpha": 0.0, "probe_honest_mean": 0.1},
-            {"alpha": 0.3, "probe_honest_mean": 0.4},
+            {"alpha": 0.0, "probe_honest_coord": 0.1},
+            {"alpha": 0.3, "probe_honest_coord": 0.4},
         ]
         df = to_dataframe(rows)
-        assert list(df.columns) == ["alpha", "probe_honest_mean"]
+        assert list(df.columns) == ["alpha", "probe_honest_coord"]
         assert len(df) == 2
 
     def test_dataframe_passes_through(self) -> None:
@@ -151,32 +147,32 @@ class TestPlotAlphaSweep:
         # Two vectors registered: honest swept, sycophantic fixed.
         rows = [
             {
-                "vector_honest_alpha": 0.0,
-                "vector_sycophantic_alpha": 0.5,
-                "probe_honest_mean": 0.1,
+                "steering_honest_alpha": 0.0,
+                "steering_sycophantic_alpha": 0.5,
+                "probe_honest_coord": 0.1,
                 "tok_per_sec": 50.0,
             },
             {
-                "vector_honest_alpha": 0.3,
-                "vector_sycophantic_alpha": 0.5,
-                "probe_honest_mean": 0.4,
+                "steering_honest_alpha": 0.3,
+                "steering_sycophantic_alpha": 0.5,
+                "probe_honest_coord": 0.4,
                 "tok_per_sec": 48.0,
             },
             {
-                "vector_honest_alpha": 0.6,
-                "vector_sycophantic_alpha": 0.5,
-                "probe_honest_mean": 0.7,
+                "steering_honest_alpha": 0.6,
+                "steering_sycophantic_alpha": 0.5,
+                "probe_honest_coord": 0.7,
                 "tok_per_sec": 47.0,
             },
         ]
         fig = plot_alpha_sweep(pd.DataFrame(rows))
         # X-axis points at the swept column
-        assert fig.layout.xaxis.title.text == "vector_honest_alpha"
+        assert fig.layout.xaxis.title.text == "steering_honest_alpha"
 
     def test_explicit_alpha_column_overrides_detection(self) -> None:
         rows = [
-            {"alpha_a": 0.0, "alpha_b": 0.0, "probe_x_mean": 0.1, "tok_per_sec": 50.0},
-            {"alpha_a": 0.0, "alpha_b": 0.5, "probe_x_mean": 0.4, "tok_per_sec": 48.0},
+            {"alpha_a": 0.0, "alpha_b": 0.0, "probe_x_coord": 0.1, "tok_per_sec": 50.0},
+            {"alpha_a": 0.0, "alpha_b": 0.5, "probe_x_coord": 0.4, "tok_per_sec": 48.0},
         ]
         fig = plot_alpha_sweep(pd.DataFrame(rows), alpha_column="alpha_b")
         assert fig.layout.xaxis.title.text == "alpha_b"
@@ -186,14 +182,14 @@ class TestPlotAlphaSweep:
             plot_alpha_sweep(ResultCollector())
 
     def test_no_alpha_column_raises(self) -> None:
-        df = pd.DataFrame({"probe_x_mean": [0.1, 0.2], "tok_per_sec": [50.0, 48.0]})
-        with pytest.raises(ValueError, match="no 'vector_<name>_alpha'"):
+        df = pd.DataFrame({"probe_x_coord": [0.1, 0.2], "tok_per_sec": [50.0, 48.0]})
+        with pytest.raises(ValueError, match="no 'steering_<name>_alpha'"):
             plot_alpha_sweep(df)
 
     def test_ambiguous_alpha_columns_raise(self) -> None:
         rows = [
-            {"vector_a_alpha": 0.0, "vector_b_alpha": 0.0, "probe_x_mean": 0.1, "tok_per_sec": 50.0},
-            {"vector_a_alpha": 0.3, "vector_b_alpha": 0.5, "probe_x_mean": 0.4, "tok_per_sec": 48.0},
+            {"steering_a_alpha": 0.0, "steering_b_alpha": 0.0, "probe_x_coord": 0.1, "tok_per_sec": 50.0},
+            {"steering_a_alpha": 0.3, "steering_b_alpha": 0.5, "probe_x_coord": 0.4, "tok_per_sec": 48.0},
         ]
         with pytest.raises(ValueError, match="multiple alpha columns vary"):
             plot_alpha_sweep(pd.DataFrame(rows))

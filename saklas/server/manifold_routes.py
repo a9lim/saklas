@@ -14,20 +14,17 @@ artifact lazily on scope entry.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import shutil
 from typing import Any, Callable, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, Field
 
 from saklas.core.manifold import domain_from_spec, manifold_is_affine
 from saklas.core.session import (
     ConcurrentExtractionError,
     SaklasSession,
 )
-from saklas.io.atomic import write_json_atomic
 from saklas.io.hf_manifolds import (
     HFError as ManifoldHFError,
     ManifoldInstallConflict,
@@ -37,7 +34,6 @@ from saklas.io.hf_manifolds import (
 from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
-    sanitize_hyperparams,
     append_discover_manifold_node,
     create_discover_manifold_folder,
     create_manifold_folder,
@@ -51,8 +47,10 @@ from saklas.io.manifolds import (
     remove_manifold_folder,
     update_manifold_folder,
 )
-from saklas.io.paths import manifold_dir, safe_model_id
+from saklas.io.paths import manifold_dir
+from saklas.io.templates import AmbiguousTemplateError, TemplateNotFoundError
 from saklas.server.app import acquire_session_lock
+from saklas.server.native_common import NativeRequest
 from saklas.server.sse import ProgressCallback, progress_sse_response
 
 log = logging.getLogger("saklas.api")
@@ -60,7 +58,7 @@ log = logging.getLogger("saklas.api")
 
 # ----------------------------------------------------------- request models ---
 
-class BoxAxisSpec(BaseModel):
+class BoxAxisSpec(NativeRequest):
     name: str = "axis"
     periodic: bool = False
     period: float = 1.0
@@ -68,7 +66,7 @@ class BoxAxisSpec(BaseModel):
     hi: float = 1.0
 
 
-class DomainSpec(BaseModel):
+class DomainSpec(NativeRequest):
     """A manifold domain — box or sphere only (custom is JSON-authored)."""
 
     type: Literal["box", "sphere"]
@@ -76,7 +74,7 @@ class DomainSpec(BaseModel):
     dim: int | None = None
 
 
-class NodeSpec(BaseModel):
+class NodeSpec(NativeRequest):
     label: str
     coords: list[float]
     statements: list[str]
@@ -88,7 +86,7 @@ class NodeSpec(BaseModel):
     role: str | None = None
 
 
-class DiscoverNodeSpec(BaseModel):
+class DiscoverNodeSpec(NativeRequest):
     """A node in a discover-mode authoring payload — label + statements only.
 
     No ``coords``: coords are derived per-model at fit time from the
@@ -101,7 +99,7 @@ class DiscoverNodeSpec(BaseModel):
     role: str | None = None
 
 
-class CreateManifoldRequest(BaseModel):
+class CreateManifoldRequest(NativeRequest):
     namespace: str = "local"
     name: str
     description: str = ""
@@ -109,7 +107,7 @@ class CreateManifoldRequest(BaseModel):
     nodes: list[NodeSpec]
 
 
-class CreateDiscoverManifoldRequest(BaseModel):
+class CreateDiscoverManifoldRequest(NativeRequest):
     """Author a discover-mode manifold from supplied per-concept corpora.
 
     The user provides labeled statement corpora; the fit derives node
@@ -125,37 +123,19 @@ class CreateDiscoverManifoldRequest(BaseModel):
     hyperparams: dict[str, Any] = {}
 
 
-class TemplatePairSpec(BaseModel):
-    """One ``{user, assistant}`` chat-turn template. The slot lives in the
-    assistant turn (read off its last content token); the user turn is shared
-    common-mode across nodes (no slot)."""
-
-    user: str
-    assistant: str
-
-
-class CreateTemplatedManifoldRequest(BaseModel):
-    """Author a templated discover manifold from a slot + values + pair set.
-
-    The server writes a standalone template, expands ``slot`` across ``values``
-    into per-value node corpora, and writes a discover folder carrying a
-    ``template_ref`` back to that source template. The right tool for categories
-    one references rather than embodies (days, months, colours, directions).
-    Pair with ``POST .../fit`` (``fit_mode`` auto suits cyclic categories).
-    """
+class CreateManifoldFromTemplateRequest(NativeRequest):
+    """Author a discover manifold derived from a standalone template."""
 
     namespace: str = "local"
     name: str
     description: str = ""
     fit_mode: Literal["pca", "spectral", "auto"] = "auto"
-    slot: str
-    values: list[str]
-    pairs: list[TemplatePairSpec]
+    template_ref: str
     hyperparams: dict[str, Any] = {}
     force: bool = False
 
 
-class GenerateManifoldRequest(BaseModel):
+class GenerateManifoldRequest(NativeRequest):
     """LLM-author a discover-mode manifold from a flat concept list.
 
     Wraps :meth:`SaklasSession.generate_responses` — produces one
@@ -184,15 +164,15 @@ class GenerateManifoldRequest(BaseModel):
     role_per_node: bool = False
 
 
-class UpdateManifoldRequest(BaseModel):
+class UpdateManifoldRequest(NativeRequest):
     description: str | None = None
     nodes: list[NodeSpec] | None = None
 
 
-class FitManifoldRequest(BaseModel):
+class FitManifoldRequest(NativeRequest):
     """Body for ``POST /manifolds/{ns}/{name}/fit``.
 
-    For authored manifolds only ``sae`` / ``sae_revision`` are honored.
+    For authored manifolds only ``sae`` is honored.
     For discover-mode manifolds ``fit_mode`` and ``hyperparams`` can
     override the folder's stored values; when provided, the folder
     manifest is rewritten *before* the fit so the cache key reflects
@@ -200,13 +180,14 @@ class FitManifoldRequest(BaseModel):
     """
 
     sae: str | None = None
-    sae_revision: str | None = None
+    layers: list[int] | Literal["workspace", "all"] | None = None
+    force: bool = False
     # Discover-mode override fields — ignored when the folder is authored.
     fit_mode: Literal["pca", "spectral", "auto"] | None = None
     hyperparams: dict[str, Any] | None = None
 
 
-class InstallManifoldRequest(BaseModel):
+class InstallManifoldRequest(NativeRequest):
     """Body for ``POST /manifolds/install``.
 
     ``target`` is an HF coord (``owner/name[@revision]``) or a local folder path;
@@ -218,17 +199,17 @@ class InstallManifoldRequest(BaseModel):
     as_: str | None = Field(default=None, alias="as")
     force: bool = False
 
-    model_config = {"populate_by_name": True}
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
-class MergeManifoldSource(BaseModel):
+class MergeManifoldSource(NativeRequest):
     """One source folder in a manifold merge — fully qualified ``ns/name``."""
 
     namespace: str
     name: str
 
 
-class MergeManifoldRequest(BaseModel):
+class MergeManifoldRequest(NativeRequest):
     """Body for ``POST /manifolds/merge``.
 
     Restricted to discover-mode (autofitted) sources by design — see
@@ -315,7 +296,9 @@ def _manifold_json(
     folder = manifold_dir(namespace, mf.name)
     out: dict[str, Any] = manifold_summary(folder)
 
-    session_stem = safe_model_id(session.model_id)
+    from saklas.io.paths import tensor_filename
+
+    session_stem = tensor_filename(session.model_id).removesuffix(".safetensors")
     fitted_models = out["fitted_models"]
     fitted_for_session = session_stem in fitted_models
     n, effective_domain = _resolve_intrinsic_dim(mf, session_stem)
@@ -323,9 +306,16 @@ def _manifold_json(
     stale = False
     if fitted_for_session:
         try:
-            stale = mf.sidecar(session_stem).nodes_sha256 != mf.nodes_sha256()
+            from saklas.core.model import loaded_model_fingerprint
+
+            sidecar = mf.sidecar(session_stem)
+            stale = (
+                sidecar.nodes_sha256 != mf.nodes_sha256()
+                or sidecar.model_fingerprint
+                != loaded_model_fingerprint(session.model, session.model_id)
+            )
         except (KeyError, ManifoldFormatError, OSError):
-            stale = False
+            stale = True
 
     # Roles are index-aligned with ``node_labels``; ``manifold_summary``
     # already padded them via ``_roles_padded`` so a consumer can ``zip``
@@ -364,7 +354,10 @@ def _manifold_json(
         out["domain"] = effective_domain
         out["domain_label"] = (
             domain_label(effective_domain)
-            if effective_domain else domain_label(mf.domain)
+            # An unfitted discover folder has no geometry yet.  Preserve the
+            # summary's useful ``discover-<mode>`` label instead of replacing
+            # it with the technically-derived but user-hostile ``?(0d)``.
+            if effective_domain else out["domain_label"]
         )
         out["intrinsic_dim"] = n
         out["min_nodes"] = min_nodes(n) if n > 0 else None
@@ -452,7 +445,7 @@ def _find_manifold(
     if not (folder / "manifold.json").exists():
         raise HTTPException(404, f"manifold {namespace}/{name} not found")
     try:
-        return namespace, ManifoldFolder.load(folder)
+        return namespace, ManifoldFolder.load(folder, verify_manifest=False)
     except ManifoldFormatError as e:
         raise HTTPException(
             400, f"manifold {namespace}/{name} is malformed: {e}",
@@ -566,40 +559,26 @@ def register_manifold_routes(app: FastAPI) -> None:
         mf = ManifoldFolder.load(folder)
         return _manifold_json(req.namespace, mf, session, full=True)
 
-    @app.post("/saklas/v1/manifolds/templated", status_code=201)
-    def create_templated_manifold(req: CreateTemplatedManifoldRequest):
-        """Author a templated manifold from a slot + values + pair set.
-
-        Bridge over the standalone-template artifact: writes a
-        ``~/.saklas/templates/<ns>/<name>/`` template (single-turn contexts from
-        the ``pairs``) then a discover manifold that ``template_ref``-erences it.
-        The template is the authoring source of truth; the manifold derives its
-        node corpora from it. Pair with ``POST .../fit`` to run discovery + fit.
-        (Multi-turn contexts + the completion scorer ride the dedicated template
-        routes / ``saklas template`` CLI.)
-        """
-        from saklas.io.templates import TemplateFormatError, create_template_folder
-
-        contexts = [
-            {"turns": [{"role": "user", "content": p.user}], "assistant": p.assistant}
-            for p in req.pairs
-        ]
+    @app.post("/saklas/v1/manifolds/from-template", status_code=201)
+    def create_manifold_from_template_route(
+        req: CreateManifoldFromTemplateRequest,
+    ):
+        """Author a discover manifold from an existing template artifact."""
         try:
-            create_template_folder(
-                req.namespace, req.name,
-                slot=req.slot, values=list(req.values), contexts=contexts,
-                description=req.description, force=req.force,
-            )
             folder = create_manifold_from_template(
                 req.namespace, req.name, req.description,
-                template_ref=f"{req.namespace}/{req.name}",
+                template_ref=req.template_ref,
                 fit_mode=req.fit_mode,
                 hyperparams=req.hyperparams or None,
                 force=req.force,
             )
         except FileExistsError as e:
             raise HTTPException(409, str(e)) from e
-        except (ManifoldFormatError, TemplateFormatError) as e:
+        except TemplateNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        except AmbiguousTemplateError as e:
+            raise HTTPException(409, str(e)) from e
+        except ManifoldFormatError as e:
             raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
         return _manifold_json(req.namespace, mf, session, full=True)
@@ -762,14 +741,13 @@ def register_manifold_routes(app: FastAPI) -> None:
         def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
             # ``force`` is a clean slate; the default *resumes* — fill missing
             # nodes + append any concepts new to the roster.
-            if req.force and (folder / "manifold.json").exists():
-                shutil.rmtree(folder)
             try:
                 plan = plan_discover_generation(
                     folder, req.name, req.description,
                     fit_mode=req.fit_mode, labels=list(req.concepts),
                     hyperparams=req.hyperparams, node_roles=node_roles_map,
                     node_kinds=node_kinds_map,
+                    force=req.force,
                 )
             except ManifoldFormatError as e:
                 raise HTTPException(400, str(e)) from e
@@ -925,43 +903,13 @@ def register_manifold_routes(app: FastAPI) -> None:
         if not (folder / "manifold.json").exists():
             raise HTTPException(404, f"manifold {namespace}/{name} not found")
 
-        def _apply_fit_overrides() -> None:
-            if req.fit_mode is None and req.hyperparams is None:
-                return
-            pre_mf = ManifoldFolder.load(folder)
-            if not pre_mf.is_discover and (
-                req.fit_mode is not None or req.hyperparams is not None
-            ):
-                raise ValueError(
-                    f"fit_mode/hyperparams overrides are discover-mode "
-                    f"only; {namespace}/{name} is authored",
-                )
-            new_fit_mode = req.fit_mode or pre_mf.fit_mode
-            new_hp = dict(pre_mf.hyperparams)
-            if req.hyperparams is not None:
-                new_hp.update(req.hyperparams)
-            # Method-incompatible knobs get dropped at the IO boundary.
-            new_hp = sanitize_hyperparams(new_fit_mode, new_hp)
-            data = json.loads((folder / "manifold.json").read_text())
-            data["fit_mode"] = new_fit_mode
-            data["hyperparams"] = new_hp
-            data["nodes"] = [{"label": label} for label in pre_mf.node_labels]
-            data.pop("domain", None)
-            # Staged write — a crash mid-rewrite would corrupt the
-            # manifest and 400 every subsequent route call.  Same
-            # discipline ``io.manifolds`` uses for every other manifest
-            # write; this override path was the lone outlier.
-            write_json_atomic(folder / "manifold.json", data)
-
         def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
-            # Discover-mode hyperparam overrides must happen inside the same
-            # session lock as the fit.  The manifest rewrite changes the fit
-            # cache key, so racing it against generation/extraction can make a
-            # request observe one set of inputs while the tensor cache records
-            # another.
-            _apply_fit_overrides()
             manifold = session.fit(
-                folder, sae=req.sae, sae_revision=req.sae_revision,
+                folder, sae=req.sae,
+                layers=req.layers,
+                fit_mode=req.fit_mode,
+                hyperparams=req.hyperparams,
+                force=req.force,
                 on_progress=on_progress,
             )
             _evict_manifold(session, namespace, name)

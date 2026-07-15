@@ -20,6 +20,8 @@ import {
   apiVectors,
   apiProbes,
   apiManifolds,
+  apiLens,
+  apiSae,
   apiTree,
   ApiError,
   connectWs,
@@ -35,8 +37,14 @@ import type {
   WSServerMessage,
 } from "./api";
 import type {
+  CastMemberJSON,
+  CapturedLensReadoutJSON,
   ChatTurn,
   GenStatus,
+  InstrumentSourceJSON,
+  JLensSteerEntry,
+  SaeFeatureJSON,
+  SaeSteerEntry,
   ManifoldSteerEntry,
   PendingAction,
   ProbeInfo,
@@ -48,6 +56,7 @@ import type {
   TokenScore,
   Trigger,
   Variant,
+  ChatRole,
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
@@ -92,17 +101,866 @@ export async function refreshSession(): Promise<void> {
     sessionState.lastRefresh = Date.now();
     sessionState.error = null;
     _hydrateSamplingFromInfo();
+    // Rehydrate the PROBE-section toggles from server state (both are
+    // session-side, so a page reload must reflect the server exactly.
+    lensState.layers = info.live_lens_layers;
+    saeState.live = info.live_sae;
+    // Feature ids (and their metadata) belong to the resident release —
+    // reset the discovery/metadata state when it changes.
+    const release = info.sae_info?.release ?? null;
+    const layer = info.sae_info?.layer ?? null;
+    if (release !== saeState.release || layer !== saeState.layer) {
+      saeState.release = release;
+      saeState.layer = layer;
+      saeState.readout = [];
+      saeState.history.clear();
+      saeState.meta.clear();
+      _saeMetaRequested.clear();
+    }
+    probesLiveState.enabled = info.live_probe_scores;
   } catch (e) {
     sessionState.error = e instanceof Error ? e.message : String(e);
   }
 }
 
-/** One-shot guard: the role boxes are client-sticky (they ride each send),
- *  unlike the numeric sampling defaults which mirror server config on every
- *  patch.  We seed them from the family's standard role labels exactly once,
- *  on the first session-info load — re-seeding on later patches would clobber
- *  a value the user typed. */
-let _roleDefaultsSeeded = false;
+// ======================================================== live lens ====
+
+export interface LensState {
+  /** Resolved fitted-layer list while the live J-lens readout is
+   * enabled; ``null`` while off.  Mirrors the server's
+   * ``live_lens_layers`` — the panel toggle reads this, not a local
+   * boolean, so reloads and multi-tab stay honest. */
+  layers: number[] | null;
+  /** Latest decode step's readout: layer-index string → descending
+   * ``[token, p]`` top-k (per-layer softmax probability — the one
+   * strength unit every lens surface reports).  Overwritten per token
+   * frame; kept after ``done`` so the settled matrix stays readable. */
+  readout: Record<string, [string, number][]> | null;
+  /** Layer-aggregated chip list riding the same step — ``[token,
+   * strength, com, spread]`` strength-descending (mean fitted-layer probability
+   * + probability-mass-weighted depth center of mass).  Same lifecycle as
+   * ``readout``. */
+  aggregate: [string, number, number, number][] | null;
+  /** Rolling buffer of recent aggregate frames (``[token, strength]``
+   * pairs per step, newest last, capped like the probe sparklines) —
+   * backs the workspace token cards' sparklines.  Carries across
+   * generations like probe sparklines; cleared on live-lens disable. */
+  aggHistory: [string, number][][];
+  /** Presentation order for the aggregate workspace cards.  Kept in the
+   * shared lens state so switching inspector tabs does not reset it. */
+  workspaceSortMode: LensWorkspaceSortMode;
+  /** In-flight toggle guard (the enable moves J_l device-resident and
+   * waits on the session lock, so it can lag behind a long stream). */
+  busy: boolean;
+}
+
+export type LensWorkspaceSortMode = "strength" | "name" | "depth";
+
+export const lensState: LensState = $state({
+  layers: null,
+  readout: null,
+  aggregate: null,
+  aggHistory: [],
+  workspaceSortMode: "strength",
+  busy: false,
+});
+
+export const lensSourceState: {
+  sources: InstrumentSourceJSON[];
+  loading: boolean;
+  busy: boolean;
+  error: string | null;
+} = $state({ sources: [], loading: false, busy: false, error: null });
+
+export async function refreshLensSources(): Promise<void> {
+  if (lensSourceState.loading) return;
+  lensSourceState.loading = true;
+  try {
+    lensSourceState.sources = (await apiLens.sources()).sources;
+    lensSourceState.error = null;
+  } catch (e) {
+    lensSourceState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    lensSourceState.loading = false;
+  }
+}
+
+export async function useLensSource(source: string): Promise<void> {
+  if (lensSourceState.busy || !source) return;
+  lensSourceState.busy = true;
+  try {
+    const out = await apiLens.use(source);
+    lensState.layers = out.live_layers;
+    await refreshSession();
+    await refreshLensSources();
+    pushToast(`J-lens · ${source}`, { kind: "info" });
+  } catch (e) {
+    pushToast(
+      `J-lens source: ${e instanceof Error ? e.message : String(e)}`,
+      { kind: "error" },
+    );
+  } finally {
+    lensSourceState.busy = false;
+  }
+}
+
+export function setLensWorkspaceSortMode(mode: LensWorkspaceSortMode): void {
+  lensState.workspaceSortMode = mode;
+}
+
+// ========================================================= live SAE ====
+
+export interface SaeState {
+  live: boolean;
+  readout: SaeFeatureJSON[];
+  /** Raw activation history per feature id (drives the sparklines; the
+   *  bars derive their scale from ``meta`` instead). */
+  history: Map<number, number[]>;
+  /** Session-side Neuronpedia metadata per feature id — merged from the
+   *  token frames' cached values and the between-generation backfill.
+   *  ``max_act`` is the strength unit: bars render
+   *  ``activation / max_act`` on the absolute 0..1 scale (the lens-card
+   *  convention); features without it fall back to the panel-shared raw
+   *  scale. */
+  meta: Map<number, { label: string | null; max_act: number | null }>;
+  /** Resident release the discovery state belongs to (reset key). */
+  release: string | null;
+  /** Resident hook layer; changing it invalidates feature ids/history too. */
+  layer: number | null;
+  /** Presentation order shared across tab switches, mirroring the lens
+   *  workspace sorter. */
+  sortMode: SaeSortMode;
+  busy: boolean;
+  loading: boolean;
+  loadMessage: string | null;
+  loadError: string | null;
+}
+
+export const saeState: SaeState = $state({
+  live: false,
+  readout: [],
+  history: new SvelteMap<number, number[]>(),
+  meta: new SvelteMap<number, { label: string | null; max_act: number | null }>(),
+  release: null,
+  layer: null,
+  sortMode: "strength",
+  busy: false,
+  loading: false,
+  loadMessage: null,
+  loadError: null,
+});
+
+// ================================================= token hover readout ====
+
+/** A non-destructive, token-anchored view of the three read channels shown in
+ * the inspector.  Panels read this overlay while a transcript token is under
+ * the pointer, then fall back to their ordinary live/settled state on leave. */
+export interface TokenHoverState {
+  active: boolean;
+  key: string | null;
+  tokenText: string;
+  probeReadings: Record<string, ProbeReadingJSON> | null;
+  probes: Record<string, number> | null;
+  coordsByProbe: Record<string, number[]> | null;
+  perLayerScores: Record<string, Record<string, number>> | null;
+  lensReadout: Record<string, [string, number][]> | null;
+  lensAggregate: [string, number, number, number][] | null;
+  saeReadout: SaeFeatureJSON[] | null;
+  lensLoading: boolean;
+  saeLoading: boolean;
+}
+
+export const tokenHoverState: TokenHoverState = $state({
+  active: false,
+  key: null,
+  tokenText: "",
+  probeReadings: null,
+  probes: null,
+  coordsByProbe: null,
+  perLayerScores: null,
+  lensReadout: null,
+  lensAggregate: null,
+  saeReadout: null,
+  lensLoading: false,
+  saeLoading: false,
+});
+
+interface LensHoverSnapshot {
+  readout: Record<string, [string, number][]>;
+  aggregate: [string, number, number, number][];
+}
+
+const TOKEN_HOVER_DELAY_MS = 140;
+let _hoverFetchTimer: ReturnType<typeof setTimeout> | null = null;
+let _hoverClearTimer: ReturnType<typeof setTimeout> | null = null;
+
+function _hoverTokenKey(nodeId: string, rawIndex: number, raw: boolean): string {
+  const modelKey = sessionState.info?.model_id ?? "unknown-model";
+  return `${modelKey}:${nodeId}:${rawIndex}:${raw ? 1 : 0}`;
+}
+
+function _lensHoverSnapshot(captured: CapturedLensReadoutJSON): LensHoverSnapshot {
+  return {
+    readout: Object.fromEntries(captured.layers.map((row) => [
+      String(row.layer),
+      row.tokens.map((token) => [token.token, Math.exp(token.logprob)]),
+    ])),
+    aggregate: captured.aggregate.map((token) => [
+      token.token,
+      token.strength,
+      token.com,
+      token.spread,
+    ]),
+  };
+}
+
+function _fetchLensHover(
+  nodeId: string,
+  rawIndex: number,
+  raw: boolean,
+): Promise<LensHoverSnapshot> {
+  return apiLens.tokenReadout(nodeId, rawIndex, {
+    topK: Math.max(samplingState.return_top_k, 12),
+    steered: true,
+    raw,
+    layers: "all",
+  }).then((data) => {
+    return {
+      readout: Object.fromEntries(data.layers.map((row) => [
+        String(row.layer),
+        row.tokens.map((token) => [token.token, Math.exp(token.logprob)]),
+      ])),
+      aggregate: (data.aggregate ?? []).map((token) => [
+        token.token,
+        token.strength,
+        token.com,
+        token.spread,
+      ]),
+    };
+  });
+}
+
+function _fetchSaeHover(
+  nodeId: string,
+  rawIndex: number,
+  raw: boolean,
+): Promise<SaeFeatureJSON[]> {
+  return apiSae.tokenReadout(nodeId, rawIndex, {
+    topK: 12,
+    steered: true,
+    raw,
+  }).then((data) => data.features);
+}
+
+/** Begin showing one transcript token in the inspector. Loom-owned captures
+ * land synchronously; a channel absent from the original generation may be
+ * replayed after a short dwell, but replay results are not substituted for or
+ * retained as original capture data. */
+export function beginTokenHover(
+  token: TokenScore,
+  nodeId: string | null | undefined,
+): void {
+  if (_hoverClearTimer !== null) clearTimeout(_hoverClearTimer);
+  if (_hoverFetchTimer !== null) clearTimeout(_hoverFetchTimer);
+  _hoverClearTimer = null;
+  _hoverFetchTimer = null;
+
+  const raw = effectiveRawMode();
+  const rawIndex = token.rawIndex ?? null;
+  const modelKey = sessionState.info?.model_id ?? "unknown-model";
+  const key = nodeId && rawIndex !== null
+    ? _hoverTokenKey(nodeId, rawIndex, raw)
+    : `live:${modelKey}:${nodeId ?? "none"}:${rawIndex ?? "none"}:${token.tokenId ?? "none"}`;
+  const capturedProbes = token.captured?.probes;
+  const capturedLens = token.captured?.lens;
+  const capturedSae = token.captured?.sae;
+  tokenHoverState.active = true;
+  tokenHoverState.key = key;
+  tokenHoverState.tokenText = token.text;
+  tokenHoverState.probeReadings = capturedProbes?.readings ?? null;
+  tokenHoverState.probes = capturedProbes?.scores ?? token.probes ?? null;
+  tokenHoverState.coordsByProbe = token.coordsByProbe ?? null;
+  tokenHoverState.perLayerScores =
+    capturedProbes?.per_layer_scores ?? token.perLayerScores ?? null;
+  tokenHoverState.lensReadout = null;
+  tokenHoverState.lensAggregate = null;
+  tokenHoverState.saeReadout = capturedSae?.features ?? null;
+  tokenHoverState.lensLoading = false;
+  tokenHoverState.saeLoading = false;
+
+  if (capturedLens) {
+    const snapshot = _lensHoverSnapshot(capturedLens);
+    tokenHoverState.lensReadout = snapshot.readout;
+    tokenHoverState.lensAggregate = snapshot.aggregate;
+  }
+
+  if (!nodeId || rawIndex === null) return;
+  const needsLens = capturedLens === undefined &&
+    sessionState.info?.jlens_fitted === true;
+  const needsSae = capturedSae === undefined &&
+    sessionState.info?.sae_loaded === true;
+  tokenHoverState.lensLoading = needsLens;
+  tokenHoverState.saeLoading = needsSae;
+  if (!needsLens && !needsSae) return;
+
+  _hoverFetchTimer = setTimeout(() => {
+    _hoverFetchTimer = null;
+    if (needsLens) {
+      void _fetchLensHover(nodeId, rawIndex, raw)
+        .then((snapshot) => {
+          if (!tokenHoverState.active || tokenHoverState.key !== key) return;
+          tokenHoverState.lensReadout = snapshot.readout;
+          tokenHoverState.lensAggregate = snapshot.aggregate;
+        })
+        .catch(() => { /* Opportunistic hover read: fall through to the empty hint. */ })
+        .finally(() => {
+          if (tokenHoverState.active && tokenHoverState.key === key) {
+            tokenHoverState.lensLoading = false;
+          }
+        });
+    }
+    if (needsSae) {
+      void _fetchSaeHover(nodeId, rawIndex, raw)
+        .then((features) => {
+          if (!tokenHoverState.active || tokenHoverState.key !== key) return;
+          tokenHoverState.saeReadout = features;
+        })
+        .catch(() => { /* Opportunistic hover read: fall through to the empty hint. */ })
+        .finally(() => {
+          if (tokenHoverState.active && tokenHoverState.key === key) {
+            tokenHoverState.saeLoading = false;
+          }
+        });
+    }
+  }, TOKEN_HOVER_DELAY_MS);
+}
+
+/** Delay the clear just enough to cross the whitespace between adjacent token
+ * spans without flashing the inspector back to the settled generation. */
+export function endTokenHover(): void {
+  if (_hoverFetchTimer !== null) clearTimeout(_hoverFetchTimer);
+  if (_hoverClearTimer !== null) clearTimeout(_hoverClearTimer);
+  _hoverFetchTimer = null;
+  _hoverClearTimer = setTimeout(() => {
+    tokenHoverState.active = false;
+    tokenHoverState.key = null;
+    tokenHoverState.tokenText = "";
+    tokenHoverState.lensLoading = false;
+    tokenHoverState.saeLoading = false;
+    _hoverClearTimer = null;
+  }, 45);
+}
+
+export function lensReadoutForDisplay(): Record<string, [string, number][]> | null {
+  return tokenHoverState.active ? tokenHoverState.lensReadout : lensState.readout;
+}
+
+export function lensAggregateForDisplay(): [string, number, number, number][] | null {
+  return tokenHoverState.active ? tokenHoverState.lensAggregate : lensState.aggregate;
+}
+
+export function saeReadoutForDisplay(): SaeFeatureJSON[] {
+  return tokenHoverState.active ? (tokenHoverState.saeReadout ?? []) : saeState.readout;
+}
+
+export const saeSourceState: {
+  sources: InstrumentSourceJSON[];
+  loading: boolean;
+  error: string | null;
+} = $state({ sources: [], loading: false, error: null });
+
+export async function refreshSaeSources(): Promise<void> {
+  if (saeSourceState.loading) return;
+  saeSourceState.loading = true;
+  try {
+    saeSourceState.sources = (await apiSae.sources()).sources;
+    saeSourceState.error = null;
+  } catch (e) {
+    saeSourceState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    saeSourceState.loading = false;
+  }
+}
+
+export type SaeSortMode = "strength" | "name";
+
+export function setSaeSortMode(mode: SaeSortMode): void {
+  saeState.sortMode = mode;
+}
+
+/** Ids already sent to the metadata backfill this session — a miss on
+ *  Neuronpedia stays a miss, so don't re-ask every generation.  Not
+ *  reactive state (never rendered). */
+const _saeMetaRequested = new Set<number>();
+
+/** Between-generation discovery backfill: fetch-and-cache Neuronpedia
+ *  metadata (label + maxActApprox) for every feature the live top-k
+ *  surfaced that has none yet.  Fire-and-forget from the ``done``
+ *  handler — never per token. */
+export async function backfillSaeMeta(): Promise<void> {
+  if (!sessionState.info?.sae_loaded) return;
+  const wanted: number[] = [];
+  for (const id of saeState.history.keys()) {
+    if (saeState.meta.get(id)?.max_act != null) continue;
+    if (_saeMetaRequested.has(id)) continue;
+    wanted.push(id);
+    if (wanted.length >= 64) break;
+  }
+  if (wanted.length === 0) return;
+  for (const id of wanted) _saeMetaRequested.add(id);
+  try {
+    const out = await apiSae.featuresMetadata(wanted);
+    for (const [key, entry] of Object.entries(out.features)) {
+      saeState.meta.set(Number(key), {
+        label: entry.label ?? null,
+        max_act: entry.max_act ?? null,
+      });
+    }
+  } catch {
+    // Best-effort — allow a retry on the next generation.
+    for (const id of wanted) _saeMetaRequested.delete(id);
+  }
+}
+
+export async function setLiveSae(enabled: boolean): Promise<void> {
+  if (saeState.busy) return;
+  saeState.busy = true;
+  try {
+    const out = await apiSae.setLive({ enabled, top_k: 12 });
+    saeState.live = out.enabled;
+    if (!out.enabled) {
+      saeState.readout = [];
+      saeState.history.clear();
+    }
+  } catch (e) {
+    pushToast(
+      `SAE live: ` +
+        (e instanceof Error ? e.message : String(e)),
+      { kind: "error" },
+    );
+  } finally {
+    saeState.busy = false;
+  }
+}
+
+async function pollSaeLoad(): Promise<void> {
+  for (;;) {
+    const status = await apiSae.loadStatus();
+    saeState.loading = status.running;
+    saeState.loadMessage = status.message;
+    saeState.loadError = status.error;
+    if (!status.running) {
+      await refreshSession();
+      await refreshSaeSources();
+      await refreshProbeList();
+      if (!status.error && status.finished_at !== null) {
+        pushToast("SAE loaded", { kind: "info" });
+      }
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
+export async function loadSae(
+  release: string,
+  layer: number | null = null,
+): Promise<void> {
+  if (saeState.loading || !release.trim()) return;
+  try {
+    const status = await apiSae.load({ release: release.trim(), layer });
+    saeState.loading = status.running;
+    saeState.loadMessage = status.message;
+    saeState.loadError = status.error;
+    await pollSaeLoad();
+  } catch (e) {
+    saeState.loading = false;
+    saeState.loadError = e instanceof Error ? e.message : String(e);
+    pushToast(`SAE load: ${saeState.loadError}`, { kind: "error" });
+  }
+}
+
+export interface SaeTrainState {
+  running: boolean;
+  tokensDone: number;
+  tokensTotal: number;
+  message: string | null;
+  error: string | null;
+  polling: boolean;
+  cancelling: boolean;
+}
+
+export const saeTrainState: SaeTrainState = $state({
+  running: false,
+  tokensDone: 0,
+  tokensTotal: 0,
+  message: null,
+  error: null,
+  polling: false,
+  cancelling: false,
+});
+
+function _applySaeTrainStatus(st: {
+  running: boolean;
+  tokens_done: number;
+  tokens_total: number;
+  message: string | null;
+  error: string | null;
+}): void {
+  saeTrainState.running = st.running;
+  saeTrainState.tokensDone = st.tokens_done;
+  saeTrainState.tokensTotal = st.tokens_total;
+  saeTrainState.message = st.message;
+  saeTrainState.error = st.error;
+  if (!st.running) saeTrainState.cancelling = false;
+}
+
+export async function pollSaeTrain(): Promise<void> {
+  if (saeTrainState.polling) return;
+  saeTrainState.polling = true;
+  try {
+    for (;;) {
+      const st = await apiSae.trainStatus();
+      _applySaeTrainStatus(st);
+      if (!st.running) {
+        await refreshSession();
+        await refreshSaeSources();
+        await refreshProbeList();
+        if (st.finished_at !== null) {
+          if (st.message === "cancelled") {
+            pushToast("SAE train cancelled", { kind: "info" });
+          } else {
+            pushToast(
+              st.error ? `SAE train: ${st.error}` : "SAE trained · live",
+              { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
+            );
+          }
+        }
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  } catch (e) {
+    saeTrainState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    saeTrainState.polling = false;
+  }
+}
+
+export async function startSaeTrain(body: {
+  name: string;
+  layer?: number | null;
+  tokens?: number;
+  width?: number | null;
+}): Promise<void> {
+  if (saeTrainState.running || saeTrainState.polling) return;
+  try {
+    _applySaeTrainStatus(await apiSae.train(body));
+    void pollSaeTrain();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    saeTrainState.error = message;
+    pushToast(`SAE train: ${message}`, { kind: "error" });
+  }
+}
+
+export async function cancelSaeTrain(): Promise<void> {
+  if (!saeTrainState.running || saeTrainState.cancelling) return;
+  saeTrainState.cancelling = true;
+  try {
+    _applySaeTrainStatus(await apiSae.cancelTrain());
+  } catch (e) {
+    saeTrainState.cancelling = false;
+    pushToast(
+      `SAE cancel: ${e instanceof Error ? e.message : String(e)}`,
+      { kind: "error" },
+    );
+  }
+}
+
+export async function checkSaeTrain(): Promise<void> {
+  if (saeTrainState.polling) return;
+  try {
+    const st = await apiSae.trainStatus();
+    _applySaeTrainStatus(st);
+    if (st.running) void pollSaeTrain();
+  } catch {
+    // Source setup remains usable when no background status is available.
+  }
+}
+
+// ================================================== CAA live toggle ====
+
+/** CAA PROBE-section live toggle — whether per-token monitor scoring
+ *  feeds live consumers.  The J-lens sibling is ``lensState.layers``
+ *  (the live lens); with both off a compute-constrained session pays no
+ *  per-token scoring at all, and every probe still reports its
+ *  end-of-gen aggregate. */
+export const probesLiveState: { enabled: boolean; busy: boolean } = $state({
+  enabled: true,
+  busy: false,
+});
+
+export async function setLiveProbes(enabled: boolean): Promise<void> {
+  if (probesLiveState.busy) return;
+  probesLiveState.busy = true;
+  try {
+    const out = await apiProbes.setLive({ enabled });
+    probesLiveState.enabled = out.enabled;
+  } catch (e) {
+    pushToast(
+      `probe live: ` +
+        (e instanceof Error ? e.message : String(e)),
+      { kind: "error" },
+    );
+  } finally {
+    probesLiveState.busy = false;
+  }
+}
+
+/** Inspector-column mode — the four instrument pillars.  All four tabs are
+ *  views over the ONE steering expression / probe roster; the split is
+ *  presentational (each tab shows its own term/probe family):
+ *    subspace — flat/affine fits (concept axes, personas)
+ *    manifold — curved fits (emotions, months)
+ *    sae      — resident sparse-autoencoder feature space
+ *    lens     — the Jacobian-lens surface (JLensPanel) */
+export type InspectorTab = "subspace" | "manifold" | "sae" | "lens";
+
+export const inspectorState: { tab: InspectorTab } = $state({
+  tab: "subspace",
+});
+
+export function setInspectorTab(tab: InspectorTab): void {
+  inspectorState.tab = tab;
+}
+
+/** Toggle the live J-lens readout server-side. Its token width follows the
+ * same per-generation ``return_top_k`` value as the logit alternatives. */
+export async function setLiveLens(enabled: boolean): Promise<void> {
+  if (lensState.busy) return;
+  lensState.busy = true;
+  try {
+    const out = await apiLens.setLive({ enabled });
+    lensState.layers = out.enabled ? (out.layers ?? []) : null;
+    if (!out.enabled) {
+      lensState.readout = null;
+      lensState.aggregate = null;
+      lensState.aggHistory = [];
+    }
+  } catch (e) {
+    pushToast(
+      `lens live: ` +
+        (e instanceof Error ? e.message : String(e)),
+      { kind: "error" },
+    );
+  } finally {
+    lensState.busy = false;
+  }
+}
+
+export interface LensFetchState {
+  running: boolean;
+  message: string | null;
+  error: string | null;
+  polling: boolean;
+}
+
+export const lensFetchState: LensFetchState = $state({
+  running: false,
+  message: null,
+  error: null,
+  polling: false,
+});
+
+function _applyLensFetchStatus(st: {
+  running: boolean;
+  message: string | null;
+  error: string | null;
+}): void {
+  lensFetchState.running = st.running;
+  lensFetchState.message = st.message;
+  lensFetchState.error = st.error;
+}
+
+export async function pollLensFetch(): Promise<void> {
+  if (lensFetchState.polling) return;
+  lensFetchState.polling = true;
+  try {
+    for (;;) {
+      const st = await apiLens.fetchStatus();
+      _applyLensFetchStatus(st);
+      if (!st.running) {
+        await refreshSession();
+        await refreshLensSources();
+        if (st.finished_at !== null) {
+          pushToast(
+            st.error ? `J-lens fetch: ${st.error}` : "J-lens active · live",
+            { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
+          );
+        }
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  } catch (e) {
+    lensFetchState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    lensFetchState.polling = false;
+  }
+}
+
+export async function startLensFetch(
+  source: string = "neuronpedia",
+): Promise<void> {
+  if (lensFetchState.running || lensFetchState.polling) return;
+  try {
+    _applyLensFetchStatus(await apiLens.fetch({ source }));
+    void pollLensFetch();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    lensFetchState.error = message;
+    pushToast(`J-lens fetch: ${message}`, { kind: "error" });
+  }
+}
+
+export async function checkLensFetch(): Promise<void> {
+  if (lensFetchState.polling) return;
+  try {
+    const st = await apiLens.fetchStatus();
+    _applyLensFetchStatus(st);
+    if (st.running) void pollLensFetch();
+  } catch {
+    // A fetch status is optional setup state; leave the rest of the panel live.
+  }
+}
+
+// ------------------------------------------------- lens fit (button) --
+
+export interface LensFitState {
+  /** Mirrors the server's background-fit status (polled). */
+  running: boolean;
+  promptsDone: number;
+  promptsTotal: number;
+  message: string | null;
+  error: string | null;
+  /** Poll-loop guard — one interval regardless of how many panels ask. */
+  polling: boolean;
+  cancelling: boolean;
+}
+
+export const lensFitState: LensFitState = $state({
+  running: false,
+  promptsDone: 0,
+  promptsTotal: 0,
+  message: null,
+  error: null,
+  polling: false,
+  cancelling: false,
+});
+
+const LENS_FIT_POLL_MS = 3000;
+
+function _applyFitStatus(st: {
+  running: boolean;
+  prompts_done: number;
+  prompts_total: number;
+  message: string | null;
+  error: string | null;
+  finished_at: number | null;
+}): void {
+  lensFitState.running = st.running;
+  lensFitState.promptsDone = st.prompts_done;
+  lensFitState.promptsTotal = st.prompts_total;
+  lensFitState.message = st.message;
+  lensFitState.error = st.error;
+  if (!st.running) lensFitState.cancelling = false;
+}
+
+/** Poll the background lens fit until it settles.  On completion the
+ *  session info is refreshed (``jlens_fitted`` flips, and the server's
+ *  post-fit auto-enable lands in ``live_lens_layers`` → the WORKSPACE
+ *  toggle reads on). */
+export async function pollLensFit(): Promise<void> {
+  if (lensFitState.polling) return;
+  lensFitState.polling = true;
+  try {
+    for (;;) {
+      const st = await apiLens.fitStatus();
+      _applyFitStatus(st);
+      if (!st.running) {
+        if (st.finished_at !== null) {
+          if (st.message === "cancelled") {
+            pushToast("J-lens fit cancelled", { kind: "info" });
+          } else if (st.error) {
+            pushToast(`J-lens fit: ${st.error}`, {
+              kind: "error",
+              ttlMs: null,
+            });
+          } else {
+            pushToast("J-lens fitted · live", { kind: "info" });
+          }
+          await refreshSession();
+          await refreshLensSources();
+        }
+        return;
+      }
+      await new Promise((r) => setTimeout(r, LENS_FIT_POLL_MS));
+    }
+  } catch (e) {
+    lensFitState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    lensFitState.polling = false;
+  }
+}
+
+/** Kick off the background Jacobian-lens fit (the "fit j-lens" button) and
+ *  start polling. Server defaults: 100 fineweb-edu prompts, all source
+ *  layers, resume-if-matching. */
+export async function startLensFit(
+  body: { prompts?: number; layers?: string } = {},
+): Promise<void> {
+  if (lensFitState.running || lensFitState.polling) return;
+  try {
+    const st = await apiLens.fit(body);
+    _applyFitStatus(st);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    pushToast(`J-lens fit: ${msg}`, { kind: "error" });
+    return;
+  }
+  void pollLensFit();
+}
+
+/** Ask the background worker to stop after its current provider read or
+ * estimator pass. Any prior complete checkpoint remains resumable. */
+export async function cancelLensFit(): Promise<void> {
+  if (!lensFitState.running || lensFitState.cancelling) return;
+  lensFitState.cancelling = true;
+  try {
+    const st = await apiLens.cancelFit();
+    _applyFitStatus(st);
+    pushToast("J-lens cancelling…", { kind: "info" });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    pushToast(`J-lens cancel: ${msg}`, { kind: "error" });
+    lensFitState.cancelling = false;
+  }
+}
+
+/** Resume-visibility check for panel mount: if a fit is already running
+ *  server-side (page reload mid-fit), pick up the polling loop. */
+export async function checkLensFit(): Promise<void> {
+  if (lensFitState.polling) return;
+  try {
+    const st = await apiLens.fitStatus();
+    _applyFitStatus(st);
+    if (st.running) void pollLensFit();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    pushToast(`J-lens status: ${msg}`, { kind: "error" });
+  }
+}
 
 /** Mirror the server's session.config defaults into the local
  * ``samplingState``.  The local store was previously pre-seeded with its
@@ -111,19 +969,17 @@ let _roleDefaultsSeeded = false;
  * so the gen-status footer rendered ``gen N/256`` even when the engine
  * was running against a 1024-token cap.  Sync once on every refresh so
  * the displayed cap matches what generation actually used. */
+let _roleDefaultsModelId: string | null = null;
+
 function _hydrateSamplingFromInfo(): void {
   const info = sessionState.info;
-  // Seed the sticky role boxes once, so they show e.g. ``user`` / ``model``
-  // instead of an empty ``—`` placeholder.  Only fills an empty box, so a
-  // value already in hand (typed before info landed) is never overwritten.
-  if (!_roleDefaultsSeeded && info) {
-    _roleDefaultsSeeded = true;
-    if (samplingState.user_role === "" && info.default_user_role) {
-      samplingState.user_role = info.default_user_role;
-    }
-    if (samplingState.assistant_role === "" && info.default_assistant_role) {
-      samplingState.assistant_role = info.default_assistant_role;
-    }
+  // The editable values are the actual labels used by this model family's
+  // chat template. Seed once per
+  // loaded model so ordinary refreshes never erase a custom cast label.
+  if (info && _roleDefaultsModelId !== info.model_id) {
+    _roleDefaultsModelId = info.model_id;
+    samplingState.user_role = info.default_user_role ?? "user";
+    samplingState.assistant_role = info.default_assistant_role ?? "assistant";
   }
   const cfg = info?.config;
   if (!cfg) return;
@@ -136,9 +992,9 @@ function _hydrateSamplingFromInfo(): void {
   if (typeof cfg.top_p === "number") {
     samplingState.top_p = cfg.top_p;
   }
-  if (typeof cfg.top_k === "number") {
-    samplingState.top_k = cfg.top_k;
-  }
+  // ``null`` is meaningful: no top-k cutoff.  Assign it rather than keeping a
+  // stale local number after the user clears the field.
+  samplingState.top_k = cfg.top_k;
   if (typeof cfg.system_prompt === "string") {
     samplingState.system_prompt = cfg.system_prompt;
   }
@@ -151,7 +1007,7 @@ export async function patchSessionDefaults(
   body: Partial<{
     temperature: number;
     top_p: number;
-    top_k: number;
+    top_k: number | null;
     max_tokens: number;
     system_prompt: string;
     thinking: boolean;
@@ -166,12 +1022,19 @@ export async function patchSessionDefaults(
 /** Display label for a turn, honoring its per-message role-substitution
  *  label (the roleplay scaffold stamped at send time).  ``roleLabel`` —
  *  the node's ``role_label`` — wins when set; otherwise the structural
- *  ``role`` (user / assistant / system) is shown verbatim. */
+ *  ``role`` falls back to the model family's actual chat-template label. */
 export function roleDisplayLabel(
   role: string,
   roleLabel?: string | null,
 ): string {
-  return roleLabel || role;
+  if (roleLabel) return roleLabel;
+  if (role === "user") {
+    return sessionState.info?.default_user_role ?? "user";
+  }
+  if (role === "assistant") {
+    return sessionState.info?.default_assistant_role ?? "assistant";
+  }
+  return role;
 }
 
 /** Single-character glyph for the loom node badge — first char of the
@@ -191,9 +1054,7 @@ export function roleGlyphLetter(
  *  destroying every existing branch.  Earlier conversation paths stay
  *  reachable from the sidebar.
  *
- *  Falls back to the destructive ``apiSessions.clear()`` only when the
- *  server has no loom (legacy/unavailable) — without that branch the
- *  button would be a no-op there. */
+ */
 export async function resetChatToRoot(): Promise<void> {
   const root = loomTree.root_id;
   if (root !== null) {
@@ -204,11 +1065,7 @@ export async function resetChatToRoot(): Promise<void> {
     await loomNavigate(root);
     return;
   }
-  if (loomTree.unavailable) {
-    await apiSessions.clear();
-    await refreshSession();
-    chatLog.turns = [];
-  }
+  throw new Error("Cannot clear chat before the tree root is loaded");
 }
 
 /** Clear the chat back to root.  Lifted out of Chat.svelte so the
@@ -256,7 +1113,7 @@ export async function rewindSession(): Promise<void> {
 // ``subspaceAlong`` master (the merged affine subspace slides once); manifold
 // (curved) terms keep their per-card along/onto.  The sidecars live here too:
 // ``profiles`` + ``correlation`` (vector metadata) and ``catalog`` +
-// ``unavailable`` / ``loading`` / ``error`` (the manifold HTTP surface).
+// ``loading`` / ``error`` (the required manifold HTTP surface).
 
 /** Default shared subspace-along master — the ~0.5 coherent sweet spot
  *  (matches the engine's ``_SUBSPACE_GAIN`` calibration so a freshly
@@ -269,6 +1126,9 @@ export interface SteerRack {
    *  (flat) vs manifold (curved).  Variant lives on the entry, not the key —
    *  matching the saklas parser's Steering.alphas semantics. */
   entries: Map<string, SteerEntry>;
+  /** Advanced full-grammar expression. ``null`` means serialize the visual
+   * rack; a string (including empty = explicitly unsteered) is authoritative. */
+  customExpression: string | null;
   /** Shared "subspace along" master — the single slide magnitude every
    *  subspace (flat) term serializes with (the merged affine subspace has one
    *  slide).  Unclamped (a high-share layer is meant to overshoot; the engine
@@ -279,12 +1139,8 @@ export interface SteerRack {
   profiles: Map<string, VectorInfo>;
   /** Cosine matrix from GET /correlation; refreshed after each generation. */
   correlation: CorrelationData | null;
-  /** Server-side catalog of available manifolds — refreshed by
-   *  ``refreshManifoldList``.  Empty (and ``unavailable`` true) on servers
-   *  that pre-date the manifold HTTP surface. */
+  /** Server-side catalog of available manifolds. */
   catalog: ManifoldInfo[];
-  /** True when the manifold list route 404s — older server. */
-  unavailable: boolean;
   loading: boolean;
   error: string | null;
 }
@@ -296,11 +1152,11 @@ export interface SteerRack {
 // callers that mutate an entry must reassign via .set(name, {...e, …}).
 export const steerRack: SteerRack = $state({
   entries: new SvelteMap(),
+  customExpression: null,
   subspaceAlong: DEFAULT_SUBSPACE_ALONG,
   profiles: new SvelteMap(),
   correlation: null,
   catalog: [],
-  unavailable: false,
   loading: false,
   error: null,
 });
@@ -420,6 +1276,7 @@ export function setSubspaceEnabled(name: string, enabled: boolean): void {
  *  shared ``subspaceAlong`` master, not per-card. */
 export function addSubspaceToRack(name: string): void {
   if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
   const info = manifoldByName(name);
   let coords: number[] = [];
   let label: string | null = null;
@@ -443,27 +1300,38 @@ export function removeSubspaceFromRack(name: string): void {
  * Recomputed on demand; cheap.  Subspace terms first (at the shared
  * ``subspaceAlong`` master), then manifold (curved) terms. */
 export function currentSteeringExpression(): string {
-  return serializeExpression(steerRack.entries, steerRack.subspaceAlong);
+  return steerRack.customExpression
+    ?? serializeExpression(steerRack.entries, steerRack.subspaceAlong);
+}
+
+/** Make a validated full-grammar expression authoritative.  The visual rack
+ * cannot faithfully represent every binary projection/gate form, so mixing
+ * the two would lie about what generation uses; switching modes clears it. */
+export function applyCustomSteeringExpression(expression: string): void {
+  enqueueOrApply("apply custom steering expression", () => {
+    steerRack.entries.clear();
+    steerRack.customExpression = expression;
+  });
+}
+
+export function useVisualSteeringRack(): void {
+  enqueueOrApply("use visual steering rack", () => {
+    steerRack.customExpression = null;
+  });
 }
 
 // ------------------------------------------------------ manifold catalog
 
-/** Fetch the manifold catalog.  Tolerates a 404 from an older server —
- *  flips ``unavailable`` and leaves the catalog empty. */
+/** Fetch the manifold catalog. */
 export async function refreshManifoldList(): Promise<void> {
   steerRack.loading = true;
   try {
     const r = await apiManifolds.list();
     steerRack.catalog = r.manifolds;
-    steerRack.unavailable = false;
     steerRack.error = null;
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) {
-      steerRack.unavailable = true;
-      steerRack.catalog = [];
-    } else {
-      steerRack.error = e instanceof Error ? e.message : String(e);
-    }
+    steerRack.catalog = [];
+    steerRack.error = e instanceof Error ? e.message : String(e);
   } finally {
     steerRack.loading = false;
   }
@@ -505,6 +1373,7 @@ function mutateManifold(
 /** Add a curved manifold to the rack at its domain centroid, along 0.5. */
 export function addManifoldToRack(name: string): void {
   if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
   const info = manifoldByName(name);
   const coords = info ? manifoldCentroid(info) : [];
   steerRack.entries.set(name, {
@@ -521,6 +1390,109 @@ export function addManifoldToRack(name: string): void {
 
 export function removeManifoldFromRack(name: string): void {
   steerRack.entries.delete(name);
+}
+
+// ---------------------------------------------------- j-lens-mode mutators
+
+/** Default α for a fresh J-lens token chip — lens atoms run hotter than
+ *  concept vectors (a single sharp token direction, not a distributed
+ *  contrast): ≈0.3 is the coherent sweet spot, ≥0.5 over-steers into
+ *  repetition. */
+export const JLENS_DEFAULT_ALPHA = 0.3;
+
+/** Reassign a jlens-mode entry through ``fn``; no-op on absent / other-mode. */
+function mutateJLens(
+  name: string,
+  fn: (e: JLensSteerEntry) => JLensSteerEntry,
+): void {
+  const e = steerRack.entries.get(name);
+  if (e && e.mode === "jlens") steerRack.entries.set(name, fn(e));
+}
+
+/** Add a J-lens token steering chip (``α jlens/<word>``).  Accepts a bare
+ *  word or a full ``jlens/…`` atom; the rack key is the full atom.
+ *  Dashboard callers validate through ``apiLens.validateToken`` before this
+ *  local mutation; the engine revalidates when it resolves the atom. */
+export function addJLensToRack(word: string): void {
+  const bare = word.trim().replace(/^jlens\//, "");
+  if (!bare) return;
+  const name = `jlens/${bare}`;
+  if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
+  steerRack.entries.set(name, {
+    mode: "jlens",
+    alpha: JLENS_DEFAULT_ALPHA,
+    trigger: "BOTH",
+    enabled: true,
+  });
+}
+
+export function removeJLensFromRack(name: string): void {
+  steerRack.entries.delete(name);
+}
+
+export function setJLensAlpha(name: string, alpha: number): void {
+  enqueueOrApply(`jlens alpha ${name} ${alpha.toFixed(3)}`, () => {
+    mutateJLens(name, (e) => ({ ...e, alpha }));
+  });
+}
+
+export function setJLensEnabled(name: string, enabled: boolean): void {
+  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
+    mutateJLens(name, (e) => ({ ...e, enabled }));
+  });
+}
+
+export function setJLensTrigger(name: string, trigger: Trigger): void {
+  enqueueOrApply(`jlens trigger ${name} ${trigger}`, () => {
+    mutateJLens(name, (e) => ({ ...e, trigger }));
+  });
+}
+
+// -------------------------------------------------------- SAE mutators
+
+export const SAE_DEFAULT_ALPHA = 0.3;
+
+function mutateSae(
+  name: string,
+  fn: (entry: SaeSteerEntry) => SaeSteerEntry,
+): void {
+  const entry = steerRack.entries.get(name);
+  if (entry?.mode === "sae") steerRack.entries.set(name, fn(entry));
+}
+
+export function addSaeToRack(featureId: number): void {
+  const name = `sae/${featureId}`;
+  if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
+  steerRack.entries.set(name, {
+    mode: "sae",
+    alpha: SAE_DEFAULT_ALPHA,
+    trigger: "BOTH",
+    enabled: true,
+  });
+}
+
+export function removeSaeFromRack(name: string): void {
+  steerRack.entries.delete(name);
+}
+
+export function setSaeAlpha(name: string, alpha: number): void {
+  enqueueOrApply(`SAE alpha ${name} ${alpha.toFixed(3)}`, () => {
+    mutateSae(name, (entry) => ({ ...entry, alpha }));
+  });
+}
+
+export function setSaeEnabled(name: string, enabled: boolean): void {
+  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
+    mutateSae(name, (entry) => ({ ...entry, enabled }));
+  });
+}
+
+export function setSaeTrigger(name: string, trigger: Trigger): void {
+  enqueueOrApply(`SAE trigger ${name} ${trigger}`, () => {
+    mutateSae(name, (entry) => ({ ...entry, trigger }));
+  });
 }
 
 export function setManifoldBlend(name: string, blend: number): void {
@@ -609,8 +1581,6 @@ export interface ProbeRackState {
   sortMode: ProbeSortMode;
   /** Attached probe names (every listed probe is attached/active). */
   active: string[];
-  /** True when the server's probe route 404s (pre-read-side server). */
-  unavailable: boolean;
   loading: boolean;
   error: string | null;
 }
@@ -621,31 +1591,132 @@ export const probeRack: ProbeRackState = $state({
   // value / change is a dropdown opt-in.
   sortMode: "name",
   active: [],
-  unavailable: false,
   loading: false,
   error: null,
 });
 
 /** Primary scalar a probe's sparkline / sort tracks: the signed axis-0
- *  coordinate for a flat (subspace) probe, the [0,1] subspace fraction for
- *  a curved (manifold) probe. */
+ *  coordinate for a flat (subspace) probe, the [0,1] readout strength
+ *  (axis 0 — mean fitted-layer probability) for a J-lens token probe, the [0,1]
+ *  subspace fraction for a curved (manifold) probe. */
 function _primaryScalar(info: ProbeInfo, reading: ProbeReadingJSON): number {
-  if (info.is_affine) return reading.coords.length > 0 ? reading.coords[0] : 0;
+  if (info.is_affine || info.lens || info.sae) {
+    return reading.coords.length > 0 ? reading.coords[0] : 0;
+  }
   return reading.fraction;
 }
 
 /** Per-layer column for the expanded layer strip: axis-0 ``coords_per_layer``
- *  for a flat probe, ``fraction_per_layer`` for a curved one. */
+ *  for a flat or J-lens probe (band-layer probability ``p_l`` for the
+ *  latter — the strip's cell values), ``fraction_per_layer`` for a curved
+ *  one. */
 function _primaryPerLayer(
   info: ProbeInfo,
   reading: ProbeReadingJSON,
 ): Record<string, number> {
-  if (!info.is_affine) return reading.fraction_per_layer ?? {};
+  if (!info.is_affine && !info.lens && !info.sae) return reading.fraction_per_layer ?? {};
   const out: Record<string, number> = {};
   for (const [layer, c] of Object.entries(reading.coords_per_layer ?? {})) {
     out[layer] = Array.isArray(c) && c.length > 0 ? c[0] : 0;
   }
   return out;
+}
+
+/** Read one probe card through the token-hover overlay. Token rows retain the
+ * primary scalar, multi-axis coordinates, and layer strip; lens/SAE cards can
+ * additionally fill from retained live/on-demand hover snapshots. */
+export function probeEntryForDisplay(name: string): ProbeRackEntry | undefined {
+  const base = probeRack.entries.get(name);
+  if (!base || !tokenHoverState.active) return base;
+
+  let reading: ProbeReadingJSON | null = tokenHoverState.probeReadings?.[name] ?? null;
+  if (!reading) {
+    let scalar = tokenHoverState.probes?.[name];
+    const tokenCoords = tokenHoverState.coordsByProbe?.[name];
+    if (scalar === undefined && tokenCoords?.[0] !== undefined) {
+      scalar = tokenCoords[0];
+    }
+    const perLayer: Record<string, number> = {};
+    for (const [layer, scores] of Object.entries(tokenHoverState.perLayerScores ?? {})) {
+      const value = scores[name];
+      if (typeof value === "number" && Number.isFinite(value)) perLayer[layer] = value;
+    }
+
+    if (scalar === undefined && name.startsWith("jlens/")) {
+      const word = name.slice("jlens/".length);
+      const aggregate = tokenHoverState.lensAggregate?.find(
+        ([token]) => token === word || token.trim() === word,
+      );
+      if (aggregate) {
+        scalar = aggregate[1];
+        for (const [layer, tokens] of Object.entries(tokenHoverState.lensReadout ?? {})) {
+          const hit = tokens.find(([token]) => token === word || token.trim() === word);
+          if (hit) perLayer[layer] = hit[1];
+        }
+      }
+    }
+    if (scalar === undefined && name.startsWith("sae/")) {
+      const id = Number(name.slice("sae/".length));
+      const feature = tokenHoverState.saeReadout?.find((row) => row.id === id);
+      if (feature) {
+        scalar = base.info.max_act != null && base.info.max_act > 0
+          ? feature.activation / base.info.max_act
+          : feature.activation;
+        const layer = base.info.layers[0];
+        if (layer !== undefined) perLayer[String(layer)] = scalar;
+      }
+    }
+
+    if (scalar !== undefined || Object.keys(perLayer).length > 0) {
+      const value = scalar ?? 0;
+      const usesCoords = base.info.is_affine || base.info.lens || base.info.sae;
+      const coords = usesCoords
+        ? (tokenCoords ?? [value])
+        : [];
+      const coordsPerLayer = Object.fromEntries(
+        Object.entries(perLayer).map(([layer, v]) => [layer, [v]]),
+      );
+      reading = {
+        fraction: usesCoords ? 0 : value,
+        nearest: [],
+        coords,
+        residual: 0,
+        fraction_per_layer: usesCoords ? {} : perLayer,
+        coords_per_layer: usesCoords ? coordsPerLayer : {},
+        residual_per_layer: {},
+      };
+    }
+  }
+
+  if (!reading) {
+    return {
+      ...base,
+      current: 0,
+      previous: 0,
+      sparkline: [],
+      perLayer: {},
+      reading: null,
+      aggregate: null,
+      savedAggregate: null,
+      nearest: [],
+      trajectory: [],
+    };
+  }
+  const current = _primaryScalar(base.info, reading);
+  return {
+    ...base,
+    current,
+    previous: current,
+    sparkline: [current],
+    perLayer: _primaryPerLayer(base.info, reading),
+    reading,
+    // ProbeCard's settled-only fields (residual and mini-map dot) should also
+    // describe the hovered token, so the ephemeral view fills both slots.
+    aggregate: reading,
+    savedAggregate: null,
+    nearest: reading.nearest,
+    trajectory: [],
+  };
 }
 
 /** A probe targets a 2-D-authored ``BoxDomain`` — the regime the mini-map
@@ -677,6 +1748,7 @@ function _emptyProbeEntry(info: ProbeInfo): ProbeRackEntry {
     perLayer: {},
     reading: null,
     aggregate: null,
+    savedAggregate: null,
     nearest: [],
     trajectory: [],
     subspaceTrail: [],
@@ -692,6 +1764,28 @@ export function probeAxisScale(name: string, axis = 0): number {
   return nodeCoordExtent(probeRack.entries.get(name)?.info?.node_coords, axis);
 }
 
+/** Shared raw-activation unit for SAE features without Neuronpedia
+ *  ``maxActApprox`` metadata.  The SAE panel and transcript tint must use
+ *  the same denominator: metadata-backed probes already arrive normalized
+ *  from the server, while unhosted/local features remain raw and use the
+ *  largest currently visible raw activation as their absolute 0..1 unit. */
+export function saeRawFallbackScale(): number {
+  let max = 0;
+  for (const name of probeRack.active) {
+    if (!name.startsWith("sae/")) continue;
+    const entry = probeRack.entries.get(name);
+    if (!entry || entry.info.max_act != null) continue;
+    const reading = entry.aggregate ?? entry.reading;
+    max = Math.max(max, reading?.coords?.[0] ?? entry.current ?? 0);
+  }
+  for (const feature of saeReadoutForDisplay()) {
+    const meta = saeState.meta.get(feature.id);
+    if ((feature.max_act ?? meta?.max_act) != null) continue;
+    max = Math.max(max, feature.activation);
+  }
+  return Math.max(max, 1);
+}
+
 /** Saturation scale for a highlight target.  The surprise sentinel keeps the
  *  fixed ``HIGHLIGHT_SAT`` cutoff (``surpriseScore`` is pre-scaled to it); a
  *  real probe normalizes by its per-axis node extent — an axis target
@@ -699,6 +1793,12 @@ export function probeAxisScale(name: string, axis = 0): number {
  *  axis isn't pinned saturated by a wider sibling axis. */
 export function highlightScale(target: string | null): number {
   if (!target || target === SURPRISE_TARGET) return HIGHLIGHT_SAT;
+  if (target.startsWith("jlens/")) return 1;
+  if (target.startsWith("sae/")) {
+    return probeRack.entries.get(target)?.info.max_act != null
+      ? 1
+      : saeRawFallbackScale();
+  }
   const { base, axis } = parseProbeTarget(target);
   return probeAxisScale(base, axis);
 }
@@ -727,8 +1827,7 @@ export function activeProbeNames(): string[] {
   return arr;
 }
 
-/** Fetch the attached-probe catalog.  Tolerates a 404 from an older server
- *  — flips ``unavailable`` and leaves the rack empty. */
+/** Fetch the attached-probe catalog. */
 export async function refreshProbeList(): Promise<void> {
   probeRack.loading = true;
   try {
@@ -749,16 +1848,12 @@ export async function refreshProbeList(): Promise<void> {
       if (!seen.has(name)) probeRack.entries.delete(name);
     }
     probeRack.active = r.probes.map((p) => p.name);
-    probeRack.unavailable = false;
+    hydrateProbeRackFromActiveNode();
     probeRack.error = null;
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) {
-      probeRack.unavailable = true;
-      probeRack.entries.clear();
-      probeRack.active = [];
-    } else {
-      probeRack.error = e instanceof Error ? e.message : String(e);
-    }
+    probeRack.entries.clear();
+    probeRack.active = [];
+    probeRack.error = e instanceof Error ? e.message : String(e);
   } finally {
     probeRack.loading = false;
   }
@@ -792,6 +1887,34 @@ export async function attachProbe(
   return info;
 }
 
+/** Preserve a discovery card's visible reading when it becomes a pinned
+ * probe. Attaching is server-authoritative but the first real probe event
+ * arrives on the next generation; without this bridge, pinning a live card
+ * made it flash to 0 and lose its sparkline/layer context. */
+export function seedProbeDisplay(
+  name: string,
+  seed: {
+    current: number;
+    sparkline?: number[];
+    perLayer?: Record<string, number>;
+    reading?: ProbeReadingJSON | null;
+    aggregate?: ProbeReadingJSON | null;
+  },
+): void {
+  const prev = probeRack.entries.get(name);
+  if (!prev) return;
+  probeRack.entries.set(name, {
+    ...prev,
+    current: seed.current,
+    previous: seed.current,
+    sparkline: seed.sparkline ? [...seed.sparkline] : prev.sparkline,
+    perLayer: seed.perLayer ? { ...seed.perLayer } : prev.perLayer,
+    reading: seed.reading === undefined ? prev.reading : seed.reading,
+    aggregate: seed.aggregate === undefined ? prev.aggregate : seed.aggregate,
+    savedAggregate: null,
+  });
+}
+
 /** Detach a probe by registered name. */
 export async function detachProbe(name: string): Promise<void> {
   await apiProbes.detach(name);
@@ -814,6 +1937,7 @@ export function resetProbeStreams(): void {
       ...e,
       nearest: [],
       aggregate: null,
+      savedAggregate: null,
       trajectory: [],
       subspaceTrail: [],
     });
@@ -870,6 +1994,7 @@ export function updateProbesFromReadings(
       previous: prev.current,
       perLayer: _primaryPerLayer(prev.info, reading),
       reading,
+      savedAggregate: null,
       nearest: reading.nearest,
       trajectory,
       subspaceTrail,
@@ -889,6 +2014,7 @@ export function setProbeAggregates(
     probeRack.entries.set(name, {
       ...prev,
       aggregate: agg,
+      savedAggregate: null,
       current: _primaryScalar(prev.info, agg),
       perLayer: _primaryPerLayer(prev.info, agg),
       nearest: agg.nearest,
@@ -929,15 +2055,18 @@ export const chatLog: ChatLogState = $state({
 // from the active path via ``syncChatLogFromTree`` whenever ``loomTree``
 // changes (rev-driven).
 //
-// Until the server exposes /tree (a saklas server older than v2.3 will
-// 404 on the bootstrap fetch), ``loomTree.rev`` stays at 0 and the
-// legacy non-loom write paths in ``handleWsMessage`` continue to own
-// ``chatLog.turns``.  Once rev > 0 the sidebar is the truth and
-// ``handleWsMessage`` is a no-op for tree-shape concerns; we still keep
-// the legacy writers for streaming-token append (the token deltas
-// arrive as ``token`` events, not as ``tree_mutated`` deltas).
+// The current server tree is authoritative.  ``chatLog.turns`` is a
+// projection of its active path; token deltas enrich that projection.
 
 export interface LoomTreeState {
+  /** True after the authoritative tree snapshot has loaded successfully.
+   * A pristine server tree legitimately has revision 0, so revision cannot
+   * double as an initialization sentinel. */
+  loaded: boolean;
+  tree_format: number | null;
+  saklas_version: string | null;
+  session_id: string | null;
+  name: string | null;
   root_id: string | null;
   active_node_id: string | null;
   /** Per-node cache.  SvelteMap so ``set``/``delete`` trigger reactivity
@@ -945,11 +2074,10 @@ export interface LoomTreeState {
   nodes: Map<string, LoomNodeJSON>;
   /** parent_id → ordered child ids.  Same SvelteMap pattern. */
   children_of: Map<string, string[]>;
-  /** Monotonic revision cursor.  0 means "no server tree fetched yet"
-   *  — the UI falls back to legacy single-path rendering until > 0. */
+  /** Monotonic server revision cursor.  A freshly loaded tree is revision 0. */
   rev: number;
   /** Pending in-flight gen target id (when known).  Reflects the
-   *  ``started`` / ``node_created`` event's ``node_id`` field; null
+   *  ``started`` / ``tree_mutated`` event node identity; null
    *  between gens. */
   pendingNodeId: string | null;
   /** Cached active path as an ordered list of node ids.  Recomputed on
@@ -958,14 +2086,16 @@ export interface LoomTreeState {
   /** Last seen server-side model id; used to invalidate cache across
    *  model swaps. */
   modelId: string | null;
-  /** Set when the server tree fetch fails 404 or otherwise — UI hides
-   *  the loom sidebar toggle when the server doesn't support loom. */
-  unavailable: boolean;
   /** Last fetch error message; surfaced in the sidebar. */
   error: string | null;
 }
 
 export const loomTree: LoomTreeState = $state({
+  loaded: false,
+  tree_format: null,
+  saklas_version: null,
+  session_id: null,
+  name: null,
   root_id: null,
   active_node_id: null,
   nodes: new SvelteMap(),
@@ -974,8 +2104,14 @@ export const loomTree: LoomTreeState = $state({
   pendingNodeId: null,
   activePath: [],
   modelId: null,
-  unavailable: false,
   error: null,
+});
+
+/** Cast roster (phase 3): label → member (standing recipe + notes).
+ *  Hydrated from the full-tree GET (``cast`` key) and reconciled from
+ *  ``op="cast"`` ``tree_mutated`` frames (roster inlined — no refetch). */
+export const castState: { roster: Record<string, CastMemberJSON> } = $state({
+  roster: {},
 });
 
 /** Walk from root to ``active_node_id`` and produce the ordered list of
@@ -1006,16 +2142,31 @@ function recomputeActivePath(): void {
  *  are bit-identical to the live-streamed shape so the highlight / click
  *  / fork affordances behave the same way. */
 function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): TokenScore {
+  const capturedProbes = row.captured?.probes;
   const out: TokenScore = {
-    text: row.text ?? "",
+    text: row.text,
     thinking: false,
   };
   if (row.token_id !== undefined) out.tokenId = row.token_id;
   if (row.logprob !== undefined) out.logprob = row.logprob;
   if (row.top_alts) out.topAlts = row.top_alts;
   if (row.raw_index !== undefined) out.rawIndex = row.raw_index;
-  if (row.probes) out.probes = row.probes;
-  if (row.per_layer_scores) out.perLayerScores = row.per_layer_scores;
+  if (capturedProbes?.scores ?? row.probes) {
+    out.probes = capturedProbes?.scores ?? row.probes;
+  }
+  if (capturedProbes?.per_layer_scores ?? row.per_layer_scores) {
+    out.perLayerScores =
+      capturedProbes?.per_layer_scores ?? row.per_layer_scores;
+  }
+  if (row.captured) out.captured = row.captured;
+  const readings = capturedProbes?.readings;
+  if (readings) {
+    const byProbe: Record<string, number[]> = {};
+    for (const [name, reading] of Object.entries(readings)) {
+      if (reading.coords.length > 1) byProbe[name] = reading.coords;
+    }
+    if (Object.keys(byProbe).length > 0) out.coordsByProbe = byProbe;
+  }
   return out;
 }
 
@@ -1028,9 +2179,10 @@ function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): Toke
 function nodeToTurn(n: LoomNodeJSON): ChatTurn {
   const turn: ChatTurn = {
     role: n.role,
-    text: n.text ?? "",
-    roleLabel: n.role_label ?? null,
+    text: n.text,
+    roleLabel: n.role_label,
     nodeId: n.id,
+    generated: n.recipe !== null,
     appliedSteering: n.applied_steering ?? null,
     aggregateReadings: n.aggregate_readings ?? undefined,
     finishReason: n.finish_reason ?? undefined,
@@ -1042,6 +2194,17 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
       return s;
     });
   }
+  const persistedPpl = [...(n.thinking_tokens ?? []), ...(n.tokens ?? [])]
+    .map((row) => row.perplexity)
+    .filter((value): value is number => (
+      typeof value === "number" && Number.isFinite(value) && value > 0
+    ));
+  if (persistedPpl.length > 0) {
+    turn.perplexity = Math.exp(
+      persistedPpl.reduce((sum, value) => sum + Math.log(value), 0)
+      / persistedPpl.length,
+    );
+  }
   if (n.thinking_tokens && n.thinking_tokens.length > 0) {
     turn.thinkingTokens = n.thinking_tokens.map((r) => {
       const s = tokenRowToScore(r);
@@ -1049,26 +2212,15 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
       return s;
     });
     turn.thinking = true;
+  } else if (n.thinking_text) {
+    // Committed thinking block (no token rows — the author typed it):
+    // one synthesized row renders it through the same collapsible the
+    // streamed thinking channel uses.
+    turn.thinkingTokens = [{ text: n.thinking_text, thinking: true }];
+    turn.thinking = true;
   }
   return turn;
 }
-
-/** Per-node cache of streamed per-token score data.
- *
- *  The loom tree (``LoomNodeJSON``) carries no per-token probe scores —
- *  only aggregate readings.  ``syncChatLogFromTree`` rebuilds
- *  ``chatLog.turns`` from the tree on every navigation, so without this
- *  cache the inline highlight tint vanishes the moment you navigate away
- *  from a branch and back (the rebuilt turn has no ``tokens``).
- *
- *  Keyed by node id (ULIDs are unique per node, so a regenerated node
- *  never collides with a cached predecessor).  Plain Map — it holds the
- *  same token-array references the turns already use, no reactivity
- *  needed. */
-const tokenScoreCache = new Map<
-  string,
-  { tokens?: TokenScore[]; thinkingTokens?: TokenScore[] }
->();
 
 function attachChild(parentId: string | null, childId: string): void {
   if (parentId === null) return;
@@ -1079,8 +2231,17 @@ function attachChild(parentId: string | null, childId: string): void {
 }
 
 function upsertLoomNode(raw: LoomNodeJSON & { children?: string[] }): LoomNodeJSON {
-  const { children: _children, ...node } = raw;
+  const { children, ...node } = raw;
   loomTree.nodes.set(node.id, node);
+  // Portable Loom snapshots require ``children_of`` to contain one key for
+  // *every* node, including leaves.  Live deltas only need to extend the
+  // parent list, so newly generated leaves previously had no own empty entry:
+  // exporting that otherwise-correct live tree produced a file the server
+  // refused to import.  Preserve an existing list on updates; seed a new node
+  // from the serializer's optional children field (normally ``[]``).
+  if (!loomTree.children_of.has(node.id)) {
+    loomTree.children_of.set(node.id, [...(children ?? [])]);
+  }
   if (node.parent_id !== null) {
     attachChild(node.parent_id, node.id);
   } else {
@@ -1100,28 +2261,13 @@ function upsertLoomNode(raw: LoomNodeJSON & { children?: string[] }): LoomNodeJS
  *  between "tree is authoritative" and "live tokens land on an existing
  *  turn object." */
 function syncChatLogFromTree(): void {
-  if (loomTree.rev <= 0) return;
+  if (!loomTree.loaded) return;
   const path = loomTree.activePath;
   if (path.length === 0) {
     chatLog.turns = [];
     chatLog.pendingIndex = null;
     return;
   }
-  // Harvest per-token score data from the turns we're about to drop, so
-  // navigating away from a branch and back can restore the inline
-  // highlight (the tree itself carries no per-token scores).
-  for (const t of chatLog.turns) {
-    if (
-      t.nodeId &&
-      ((t.tokens?.length ?? 0) > 0 || (t.thinkingTokens?.length ?? 0) > 0)
-    ) {
-      tokenScoreCache.set(t.nodeId, {
-        tokens: t.tokens,
-        thinkingTokens: t.thinkingTokens,
-      });
-    }
-  }
-
   const out: ChatTurn[] = [];
   let pendingIdx: number | null = null;
   for (const nid of path) {
@@ -1132,63 +2278,37 @@ function syncChatLogFromTree(): void {
     if (node.parent_id === null && node.role === "system" && !node.text) continue;
     // Try to keep the existing turn object if it already represents this
     // node (token-stream preservation for the live target).
-    const prevByNode = chatLog.turns.find((t) => t.nodeId === nid);
-    const prev = prevByNode ?? chatLog.turns[out.length];
+    const prev = chatLog.turns.find((t) => t.nodeId === nid);
     let turn: ChatTurn;
     if (
       prev &&
       prev.role === node.role &&
-      (prev.nodeId === nid ||
-        // Same text or live-stream-of-text on the active in-flight turn.
-        prev.text === node.text ||
-        (loomTree.pendingNodeId === nid && prev.role === "assistant"))
+      prev.nodeId === nid
     ) {
       // Mutate-in-place so the streaming token arrays survive.
       prev.nodeId = nid;
-      const nextText = node.text ?? "";
-      if (
-        !(
-          loomTree.pendingNodeId === nid &&
-          prev.role === "assistant" &&
-          nextText === ""
-        )
-      ) {
-        prev.text = nextText;
-      }
+      // A same-role generated continuation deliberately clears and reuses
+      // its existing node before replaying the old text as a forced prefix.
+      // The tree snapshot is authoritative even when that temporary value is
+      // empty; preserving the prior UI text here would duplicate the prefix
+      // as streamed tokens arrive.
+      prev.text = node.text;
+      prev.generated = node.recipe !== null;
       prev.appliedSteering = node.applied_steering ?? prev.appliedSteering ?? null;
       prev.aggregateReadings = node.aggregate_readings ?? prev.aggregateReadings;
       prev.finishReason = node.finish_reason ?? prev.finishReason;
-      // Restore per-token scores if this reused turn lost them
-      // (positional fallback from a different node, or first-paint
-      // hydration from a localStorage snapshot that pre-dates the
-      // per-token persistence).  Server-shipped node tokens win over
-      // the in-memory cache — they're authoritative and include the
-      // ``probes`` + ``per_layer_scores`` the cache may not have.
+      // Server-shipped node tokens are authoritative. Preserve the live
+      // arrays only until the finalized node snapshot carries them.
       if ((prev.tokens?.length ?? 0) === 0) {
         const fromNode = nodeToTurn(node);
         if (fromNode.tokens || fromNode.thinkingTokens) {
           prev.tokens = fromNode.tokens;
           prev.thinkingTokens = fromNode.thinkingTokens;
-        } else {
-          const cached = tokenScoreCache.get(nid);
-          if (cached) {
-            prev.tokens = cached.tokens;
-            prev.thinkingTokens = cached.thinkingTokens;
-          }
         }
       }
       turn = prev;
     } else {
       turn = nodeToTurn(node);
-      // Cache fallback for branch nav across nodes the server hasn't
-      // serialized with tokens (legacy / transcript-loaded).
-      if (!turn.tokens && !turn.thinkingTokens) {
-        const cached = tokenScoreCache.get(nid);
-        if (cached) {
-          turn.tokens = cached.tokens;
-          turn.thinkingTokens = cached.thinkingTokens;
-        }
-      }
     }
     if (loomTree.pendingNodeId === nid) pendingIdx = out.length;
     out.push(turn);
@@ -1197,45 +2317,102 @@ function syncChatLogFromTree(): void {
   chatLog.pendingIndex = pendingIdx;
 }
 
-/** Replace the in-memory tree with a freshly fetched server snapshot.
- *  Drops stale per-node entries; resets activePath; sync chat log.
+/** Rehydrate the scalar probe summary persisted on the selected Loom node.
  *
- *  ``snap.nodes`` is a flat list (server's ``LoomTree.to_dict`` shape).
- *  We pivot to id-keyed for the in-memory cache.  Tolerant of older or
- *  alternative shapes that pass a record keyed by id — phase-2 server
- *  is the list shape; v1 migration in this file produces the dict shape
- *  on disk for legacy snapshots, which is also accepted. */
+ * Rich per-layer ``ProbeReading`` payloads intentionally do not live in the
+ * portable tree, but the aggregate scalar does.  Without this bridge a page
+ * reload or branch navigation reset every attached card to a fake zero and
+ * told the user to generate a token even while a generated node with saved
+ * readings was selected.  Keep the scalar honest and mark it as historical;
+ * ``ProbeCard`` explains why the layer strip is unavailable. */
+function hydrateProbeRackFromActiveNode(): void {
+  if (!loomTree.loaded || genStatus.active) return;
+  const node = loomTree.active_node_id
+    ? loomTree.nodes.get(loomTree.active_node_id)
+    : undefined;
+  const readings = node?.aggregate_readings ?? {};
+  for (const [name, prev] of probeRack.entries) {
+    const raw = readings[name];
+    const value = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+    probeRack.entries.set(name, {
+      ...prev,
+      current: value ?? 0,
+      previous: prev.current,
+      perLayer: {},
+      reading: null,
+      aggregate: null,
+      savedAggregate: value,
+      nearest: [],
+      trajectory: [],
+      subspaceTrail: [],
+    });
+  }
+}
+
+/** Replace the in-memory tree with a current server snapshot. */
 function applyTreeSnapshot(snap: LoomTreeJSON): void {
+  loomTree.loaded = true;
+  loomTree.tree_format = snap.tree_format;
+  loomTree.saklas_version = snap.saklas_version;
+  loomTree.session_id = snap.session_id;
+  loomTree.name = snap.name;
   loomTree.root_id = snap.root_id;
   loomTree.active_node_id = snap.active_node_id;
   loomTree.rev = snap.rev;
-  loomTree.modelId = snap.model_id ?? loomTree.modelId;
-  loomTree.unavailable = false;
+  loomTree.modelId = snap.model_id;
   loomTree.error = null;
   loomTree.nodes.clear();
-  if (Array.isArray(snap.nodes)) {
-    for (const n of snap.nodes) loomTree.nodes.set(n.id, n);
-  } else if (snap.nodes && typeof snap.nodes === "object") {
-    for (const [id, n] of Object.entries(snap.nodes as Record<string, LoomNodeJSON>)) {
-      loomTree.nodes.set(id, n);
-    }
-  }
+  for (const n of snap.nodes) loomTree.nodes.set(n.id, n);
   loomTree.children_of.clear();
   for (const [pid, ids] of Object.entries(snap.children_of)) {
     loomTree.children_of.set(pid, [...ids]);
   }
+  castState.roster = snap.cast;
   recomputeActivePath();
   syncChatLogFromTree();
+  hydrateProbeRackFromActiveNode();
+}
+
+/** Materialize the reactive Loom slice in the server's portable JSON shape.
+ *  Used by explicit v4 whole-conversation export. */
+export function currentLoomTreeSnapshot(): LoomTreeJSON | null {
+  if (
+    !loomTree.loaded || !loomTree.root_id || !loomTree.active_node_id ||
+    loomTree.tree_format === null || loomTree.saklas_version === null
+  ) return null;
+  const nodes: LoomNodeJSON[] = [];
+  for (const [, node] of loomTree.nodes) nodes.push(node);
+  const children_of: Record<string, string[]> = {};
+  // Export the server's exact total mapping contract even when this browser
+  // began before the leaf-initialization fix or received an older partial
+  // client state.  Node order is already the portable snapshot order.
+  for (const node of nodes) {
+    children_of[node.id] = [...(loomTree.children_of.get(node.id) ?? [])];
+  }
+  return {
+    tree_format: loomTree.tree_format,
+    saklas_version: loomTree.saklas_version,
+    root_id: loomTree.root_id,
+    active_node_id: loomTree.active_node_id,
+    rev: loomTree.rev,
+    nodes,
+    children_of,
+    model_id: loomTree.modelId ?? sessionState.info?.model_id ?? null,
+    session_id: loomTree.session_id,
+    name: loomTree.name,
+    cast: { ...castState.roster },
+  };
 }
 
 /** Apply a ``tree_mutated`` delta in place.  Returns ``false`` if the
  *  client missed a rev — caller full-refetches on false.
  *
  *  Phase-2 server semantics: ``updated`` carries full LoomNodeJSON
- *  objects (potentially with an extra ``children`` field that we
- *  ignore — children_of is rebuilt from the added/removed deltas).
+ *  objects (potentially with an extra ``children`` field used only to seed a
+ *  new node's own children entry; parent links still come from deltas).
  *  ``added`` nodes may also be implicit children-list extensions of
- *  existing parents. */
+ *  existing parents.  ``upsertLoomNode`` additionally establishes the
+ *  required empty ``children_of`` entry for every new leaf. */
 function applyTreeDelta(ev: {
   added?: LoomNodeJSON[];
   removed?: string[];
@@ -1245,11 +2422,11 @@ function applyTreeDelta(ev: {
 }): boolean {
   // First event after bootstrap is the rev=1 mutation; accept rev > 0
   // when our local rev is 0 (cold start) without claiming a gap.
-  if (loomTree.rev > 0 && ev.rev > loomTree.rev + 1) return false;
+  if (loomTree.loaded && ev.rev > loomTree.rev + 1) return false;
   // ``added``: inject node + extend its parent's children list.  Node
   // payloads from the server may include a ``children`` field
-  // (_node_json adds it); strip before storing so the cached node
-  // shape stays consistent with the bootstrap fetch.
+  // (the server serializer adds it); use it only to seed children_of, while
+  // stripping it from the cached node so bootstrap/delta shapes stay equal.
   for (const raw of ev.added ?? []) {
     upsertLoomNode(raw as LoomNodeJSON & { children?: string[] });
   }
@@ -1267,7 +2444,7 @@ function applyTreeDelta(ev: {
       }
     }
   }
-  // ``updated``: full node replacement.  Same children-strip as added.
+  // ``updated``: full node replacement.  Same children handling as added.
   for (const raw of ev.updated ?? []) {
     upsertLoomNode(raw as LoomNodeJSON & { children?: string[] });
   }
@@ -1298,23 +2475,18 @@ function applyTreeDelta(ev: {
   invalidateEdgeLabels();
   recomputeActivePath();
   syncChatLogFromTree();
+  hydrateProbeRackFromActiveNode();
   return true;
 }
 
-/** Bootstrap fetch of the tree.  Tolerates a 404 — older servers don't
- *  ship loom; the UI falls back to legacy linear-path rendering. */
+/** Bootstrap fetch of the required tree surface. */
 export async function refreshLoomTree(): Promise<void> {
   try {
     const snap = await apiTree.get();
     applyTreeSnapshot(snap);
   } catch (e) {
-    if (e instanceof ApiError && e.status === 404) {
-      // Server pre-loom — disable the sidebar quietly.
-      loomTree.unavailable = true;
-      loomTree.rev = 0;
-      return;
-    }
     loomTree.error = e instanceof Error ? e.message : String(e);
+    pushToast(`tree: ${loomTree.error}`, { kind: "error" });
   }
 }
 
@@ -1358,15 +2530,27 @@ export async function loomEdit(node_id: string, text: string): Promise<void> {
 export async function loomBranch(
   node_id: string,
   text: string,
+  role?: "user" | "assistant" | null,
 ): Promise<string | null> {
   try {
-    const r = await apiTree.branch(node_id, text);
+    const r = await apiTree.branch(node_id, text, undefined, role);
     await refreshLoomTree();
     return r.node_id;
   } catch (e) {
     _captureLoomError("branch", e);
     return null;
   }
+}
+
+/** Seat-swap branch: a sibling with the same text and the seat flipped
+ *  (the cast model's controlled experiment on the seat prior).  The
+ *  swapped copy re-renders under the flipped header at the next
+ *  generation; downstream nodes are NOT copied (same contract as edit). */
+export async function loomSwapSeat(node_id: string): Promise<string | null> {
+  const node = loomTree.nodes.get(node_id);
+  if (!node || (node.role !== "user" && node.role !== "assistant")) return null;
+  const flipped = node.role === "user" ? "assistant" : "user";
+  return loomBranch(node_id, node.text, flipped);
 }
 
 export async function loomDelete(node_id: string): Promise<void> {
@@ -1396,52 +2580,59 @@ export async function loomNote(node_id: string, text: string): Promise<void> {
   }
 }
 
-/** Regenerate the active assistant: send a fresh ``generate`` request
- *  anchored at the user-parent's parent, so the replayed user prompt
- *  dedups onto the existing user node and creates a sibling assistant.
+/** Regenerate one conversation node as a generated sibling in the same seat.
  *  N=1 by default.  Recipe is implicit (current rack) unless
  *  ``opts.recipe_override`` is set, in which case the engine applies
  *  the recipe-override modifier on top of the parent's recipe. */
-export async function loomRegenerateActive(
+export async function loomRegenerateNode(
+  nodeId: string,
   n: number = 1,
   opts: { recipe_override?: string | null } = {},
 ): Promise<void> {
-  if (loomTree.rev <= 0) return;
-  const activeId = loomTree.active_node_id;
-  if (!activeId) return;
-  const node = loomTree.nodes.get(activeId);
-  if (!node || node.role !== "assistant") return;
+  if (!loomTree.loaded) return;
+  const node = loomTree.nodes.get(nodeId);
+  if (!node || node.role === "system") return;
   const parentId = node.parent_id;
   if (!parentId) return;
-  // The user turn (parent) carries the prompt text we need to replay.
-  const parent = loomTree.nodes.get(parentId);
-  if (!parent || parent.role !== "user") return;
   try {
-    await sendGenerate(parent.text, {
-      parent_node_id: parent.parent_id ?? null,
+    await sendGenerate(null, {
+      parent_node_id: parentId,
       n,
       recipe_override: opts.recipe_override ?? undefined,
+      generate_seat: node.role,
     });
   } catch (e) {
     _captureLoomError("regenerate", e);
   }
 }
 
-/** Regenerate under a specific user node (the "fan out" entry point).
- *  Anchor at the user's parent so ``add_user_turn`` reuses that user
- *  node and fans out sibling assistant replies. */
-export async function loomRegenerateFromUser(
-  userNodeId: string,
+/** Active-node compatibility adapter for keyboard, loom-menu, and auto-regen
+ * callers. Chat message controls call ``loomRegenerateNode`` directly. */
+export async function loomRegenerateActive(
+  n: number = 1,
+  opts: { recipe_override?: string | null } = {},
+): Promise<void> {
+  const activeId = loomTree.active_node_id;
+  if (!activeId) return;
+  return loomRegenerateNode(activeId, n, opts);
+}
+
+/** Generate opposite-seat continuations under a committed turn.
+ *  This is the fan-out entry point for either structural seat; the selected
+ *  node supplies context only, while its role determines the reply seat. */
+export async function loomContinueFromCommitted(
+  nodeId: string,
   opts: { n?: number; recipe_override?: string | null } = {},
 ): Promise<void> {
-  if (loomTree.rev <= 0) return;
-  const user = loomTree.nodes.get(userNodeId);
-  if (!user || user.role !== "user") return;
+  if (!loomTree.loaded) return;
+  const node = loomTree.nodes.get(nodeId);
+  if (!node || node.role === "system" || node.recipe !== null) return;
   try {
-    await sendGenerate(user.text, {
-      parent_node_id: user.parent_id ?? null,
+    await sendGenerate(null, {
+      parent_node_id: node.id,
       n: opts.n ?? 1,
       recipe_override: opts.recipe_override ?? undefined,
+      generate_seat: node.role === "user" ? "assistant" : "user",
     });
   } catch (e) {
     _captureLoomError("regenerate", e);
@@ -1545,10 +2736,9 @@ export interface SamplingState {
    *  "show alts" toggle in ``SamplingStrip``; the canonical "on" value
    *  is ``8`` per Decision 1 of ``docs/plans/logit-pass.md``. */
   return_top_k: number;
-  /** Per-message role-substitution labels (roleplay scaffold).  Sticky
+  /** Active chat-template labels for the structural user/assistant roles. Sticky
    *  client state like ``seed`` — whatever's in the boxes rides the next
-   *  send and is stamped onto that turn's loom node (immutable afterward).
-   *  Empty string = standard role label (nothing sent). */
+   *  submission and is stamped onto that turn's loom node. */
   user_role: string;
   assistant_role: string;
 }
@@ -1564,8 +2754,8 @@ export const samplingState: SamplingState = $state({
   logit_bias_text: "",
   presence_penalty: 0,
   frequency_penalty: 0,
-  user_role: "",
-  assistant_role: "",
+  user_role: "user",
+  assistant_role: "assistant",
   // Initial thinking state: explicit ``false`` so an unchecked checkbox
   // on first paint actually sends ``thinking: false`` to the server.
   // The previous ``null`` (auto) state silently fell through to whatever
@@ -1693,10 +2883,16 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
     // no-op, so we omit it too: the node isn't stamped with a redundant label
     // and the bubble keeps its structural heading.  Only a genuine override
     // (a label the user changed away from the default) is sent.
-    ...roleOverride(samplingState.user_role, sessionState.info?.default_user_role, "user_role"),
+    ...roleOverride(
+      samplingState.user_role,
+      sessionState.info?.default_user_role,
+      "user",
+      "user_role",
+    ),
     ...roleOverride(
       samplingState.assistant_role,
       sessionState.info?.default_assistant_role,
+      "assistant",
       "assistant_role",
     ),
   };
@@ -1707,20 +2903,26 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
 function roleOverride(
   raw: string,
   fallback: string | null | undefined,
+  structural: ChatRole,
   key: "user_role" | "assistant_role",
 ): Partial<WSSampling> {
   const value = raw.trim();
-  if (!value || value === fallback) return {};
+  if (!value || value === structural || value === fallback) return {};
   return { [key]: value };
 }
 
 function buildSamplingPayload(): WSSampling | null {
-  // temperature / top-p / top-k / max-tokens / thinking are PATCHed to
-  // the session as the user edits them, so they ride the server's own
-  // defaults and aren't echoed here.  Seed has no PATCH path and the
-  // advanced extras (penalties, stop, logit-bias, return_top_k) aren't
-  // PATCH-able either — both always ride per-call.
+  // The strip PATCHes these numeric controls so they become defaults for
+  // future calls, but that persistence request is deliberately asynchronous.
+  // Echo the values visible in the UI on every generation as well: otherwise
+  // changing a field and immediately pressing Send can race the PATCH and run
+  // with the previous server default while the footer claims the new cap.
+  // Per-call values are the authoritative snapshot for this generation.
   const payload: WSSampling = {
+    temperature: samplingState.temperature,
+    top_p: samplingState.top_p,
+    top_k: samplingState.top_k,
+    max_tokens: samplingState.max_tokens,
     persist_per_layer_scores: true,
     // The probe-inspector live point + fading trail need per-layer whitened
     // subspace coords on each token reading.  Sent whenever a probe is attached
@@ -1927,8 +3129,61 @@ export function ensureWebSocket(): Promise<WebSocket> {
   }
   const socket = connectWs();
   wsConn.socket = socket;
+  // A socket can reconnect to a freshly restarted server whose tree has a
+  // lower revision and entirely different node ids.  Buffer wire events until
+  // we have replaced the local cache with the new authoritative snapshot;
+  // otherwise the first post-restart generation splices new nodes into the
+  // stale pre-restart sidebar.
+  let rehydrating = true;
+  const bufferedMessages: WSServerMessage[] = [];
+  const dispatch = (msg: WSServerMessage): void => {
+    handleWsMessage(msg);
+    for (const cb of wsConn.listeners) {
+      try {
+        cb(msg);
+      } catch {
+        /* ignore subscriber failures */
+      }
+    }
+  };
   wsConn.ready = new Promise<void>((resolve, reject) => {
-    socket.addEventListener("open", () => resolve(), { once: true });
+    socket.addEventListener("open", () => {
+      void (async () => {
+        try {
+          const snap = await apiTree.get();
+          applyTreeSnapshot(snap);
+          rehydrating = false;
+          // The snapshot already includes deltas at or below its revision.
+          // Replay only genuinely newer tree frames; non-tree frames retain
+          // their original arrival order.
+          for (const msg of bufferedMessages) {
+            if (msg.type === "tree_mutated" && msg.rev <= snap.rev) continue;
+            dispatch(msg);
+          }
+          bufferedMessages.length = 0;
+          // Other server-owned surfaces may also have changed across a
+          // restart.  Refresh them before callers are allowed to submit the
+          // next generation against this connection.
+          await Promise.allSettled([
+            refreshSession(),
+            refreshVectorList(),
+            refreshProbeList(),
+            refreshCorrelation(),
+            refreshManifoldList(),
+          ]);
+          resolve();
+        } catch (e) {
+          rehydrating = false;
+          loomTree.error = e instanceof Error ? e.message : String(e);
+          pushToast(`reconnect: ${loomTree.error}`, { kind: "error" });
+          // Never leave an apparently reusable OPEN socket behind after its
+          // authoritative snapshot failed.  A later send must establish a
+          // fresh connection and retry the complete rehydration barrier.
+          socket.close();
+          reject(e);
+        }
+      })();
+    }, { once: true });
     socket.addEventListener("error", (e) => reject(e), { once: true });
   });
   socket.addEventListener("message", (ev: MessageEvent) => {
@@ -1938,14 +3193,8 @@ export function ensureWebSocket(): Promise<WebSocket> {
     } catch {
       return;
     }
-    handleWsMessage(msg);
-    for (const cb of wsConn.listeners) {
-      try {
-        cb(msg);
-      } catch {
-        /* ignore subscriber failures */
-      }
-    }
+    if (rehydrating) bufferedMessages.push(msg);
+    else dispatch(msg);
   });
   socket.addEventListener("close", () => {
     if (wsConn.socket === socket) {
@@ -2000,25 +3249,15 @@ function _currentWriteTurn(): ChatTurn | null {
 
 /** Bind an in-flight token stream to a concrete loom assistant node.
  *
- * The server cannot always include the assistant node id on ``started``:
- * the node is created inside generation.  ``node_created`` and ``token``
- * events do carry it, so this reconciles the active path lazily and
- * ensures the next token has a writable ChatTurn. */
+ * The tree mutation that creates the node is ordered before its first token;
+ * this binds the stream to that already-authoritative node. */
 function adoptStreamingNode(nodeId: string | null | undefined): void {
-  if (!nodeId || abState.processingAb || loomTree.rev <= 0) return;
+  if (!nodeId || abState.processingAb || !loomTree.loaded) return;
   loomTree.pendingNodeId = nodeId;
   if (!loomTree.nodes.has(nodeId)) {
-    const active = loomTree.active_node_id;
-    const activeNode = active ? loomTree.nodes.get(active) : null;
-    const parentId =
-      activeNode?.role === "user" ? active : (activeNode?.parent_id ?? active ?? null);
-    loomTree.nodes.set(nodeId, {
-      id: nodeId,
-      parent_id: parentId,
-      role: "assistant",
-      text: "",
-    });
-    attachChild(parentId, nodeId);
+    loomTree.error = `Token arrived before authoritative node ${nodeId}`;
+    pushToast(loomTree.error, { kind: "error" });
+    return;
   }
   loomTree.active_node_id = nodeId;
   recomputeActivePath();
@@ -2040,35 +3279,23 @@ function adoptStreamingNode(nodeId: string | null | undefined): void {
 function handleWsMessage(msg: WSServerMessage): void {
   switch (msg.type) {
     case "tree_mutated": {
+      // The roster is derived from every observed turn label, so any tree
+      // mutation may change it.  The server inlines the effective snapshot.
+      if (msg.cast) {
+        castState.roster = msg.cast;
+      }
+      // Whole-tree restore can change parentage and sibling order even when
+      // node ids overlap the old tree.  Ordinary add/update/remove deltas do
+      // not carry enough information to detach an intersecting node from its
+      // former parent, so every connected client crosses an authoritative
+      // full-snapshot barrier for this operation.
+      if (msg.op === "restore") {
+        void refreshLoomTree();
+        return;
+      }
       // Apply the delta; on rev gap, full re-fetch.
       const ok = applyTreeDelta(msg);
       if (!ok) void refreshLoomTree();
-      return;
-    }
-    case "node_created": {
-      // Pre-allocate the node so n-way regen render slots exist before
-      // token events tagged with this node_id arrive.  The full node body
-      // lands via a ``tree_mutated`` (added) event — which the server's
-      // forwarder actually enqueues *before* this ``node_created``.  So
-      // merge over any node already in hand rather than replacing it: a
-      // bare ``node_created`` payload omits ``role_label`` (among other
-      // fields), and ``upsertLoomNode`` is a full replace — a blind
-      // overwrite would wipe a custom role glyph back to the structural
-      // letter (U/A) until the next full-tree refetch (e.g. on click).
-      const existing = loomTree.nodes.get(msg.node_id);
-      upsertLoomNode({
-        ...existing,
-        id: msg.node_id,
-        parent_id: msg.parent_id,
-        role: msg.role,
-        text: existing?.text ?? "",
-      });
-      if (msg.role === "assistant" && genStatus.active && !abState.processingAb) {
-        adoptStreamingNode(msg.node_id);
-      } else if (loomTree.rev > 0 && loomTree.active_node_id === msg.node_id) {
-        recomputeActivePath();
-        syncChatLogFromTree();
-      }
       return;
     }
     case "started": {
@@ -2091,14 +3318,16 @@ function handleWsMessage(msg: WSServerMessage): void {
         syncChatLogFromTree();
       }
       if (abState.processingAb && abState.pendingTurnIdx !== null) {
-        // A/B shadow run: attach a fresh assistant abPair to the steered
+        // A/B shadow run: attach a fresh same-seat abPair to the generated
         // turn that just finished.  Don't append a new top-level turn —
         // the chat panel renders the abPair in its own column.
         const steered = chatLog.turns[abState.pendingTurnIdx];
         if (steered) {
           steered.abPair = {
-            role: "assistant",
+            role: abState.pendingRole ?? steered.role,
+            roleLabel: abState.pendingRoleLabel ?? steered.roleLabel,
             text: "",
+            generated: true,
             tokens: [],
             thinkingTokens: [],
           };
@@ -2106,7 +3335,7 @@ function handleWsMessage(msg: WSServerMessage): void {
         // pendingIndex points at the steered turn so the streaming
         // pulse on Chat.svelte still highlights "this turn is live".
         chatLog.pendingIndex = abState.pendingTurnIdx;
-      } else if (loomTree.rev > 0 && msg.node_id) {
+      } else if (loomTree.loaded && msg.node_id) {
         // Loom path: the assistant node is already created server-side
         // (we got a ``tree_mutated`` add event before ``started``).  The
         // active-path sync seeds an empty turn for it; ensure the turn
@@ -2120,58 +3349,78 @@ function handleWsMessage(msg: WSServerMessage): void {
             turn.thinkingTokens = turn.thinkingTokens ?? [];
           }
         }
-      } else if (loomTree.rev > 0) {
+      } else if (loomTree.loaded) {
         // Loom path with a lazily-created assistant node: wait for
-        // ``node_created`` or the first tagged ``token`` before allocating
-        // the assistant turn.  Appending a legacy placeholder here creates
+        // the authoritative tree mutation before allocating
+        // the assistant turn. Appending a local placeholder here creates
         // a duplicate local assistant and is the source of many branch /
         // highlight misroutes.
         chatLog.pendingIndex = null;
         syncChatLogFromTree();
       } else {
-        // Normal (pre-loom) run: append a fresh assistant turn so
-        // streamed tokens have a home.
-        chatLog.turns = [
-          ...chatLog.turns,
-          { role: "assistant", text: "", tokens: [], thinkingTokens: [] },
-        ];
-        chatLog.pendingIndex = chatLog.turns.length - 1;
+        loomTree.error = "Generation started before the required tree was loaded";
+        pushToast(loomTree.error, { kind: "error" });
       }
       return;
     }
     case "token": {
       adoptStreamingNode(msg.node_id);
       genStatus.tokensSoFar += 1;
+      if (
+        typeof msg.perplexity === "number"
+        && Number.isFinite(msg.perplexity)
+        && msg.perplexity > 0
+      ) {
+        genStatus.ppl.logSum += Math.log(msg.perplexity);
+        genStatus.ppl.count += 1;
+        genStatus.ppl.mean = Math.exp(
+          genStatus.ppl.logSum / genStatus.ppl.count,
+        );
+      }
       if (genStatus.startedAt) {
         const elapsed = (performance.now() - genStatus.startedAt) / 1000;
         if (elapsed > 0) genStatus.tokPerSec = genStatus.tokensSoFar / elapsed;
       }
+      const capturedProbes = msg.captured?.probes;
+      const capturedReadings =
+        capturedProbes?.readings ?? msg.probe_readings;
+      const capturedScores = capturedProbes?.scores ?? msg.scores;
+      const capturedPerLayer =
+        capturedProbes?.per_layer_scores ?? msg.per_layer_scores;
+      const capturedLens = msg.captured?.lens;
+      const lensSnapshot = capturedLens
+        ? _lensHoverSnapshot(capturedLens)
+        : null;
+      const liveLensReadout = lensSnapshot?.readout ?? msg.lens_readout;
+      const liveLensAggregate = lensSnapshot?.aggregate ?? msg.lens_aggregate;
+      const liveSaeReadout = msg.captured?.sae?.features ?? msg.sae_readout;
       const tokenScore: TokenScore = {
         text: msg.text,
         thinking: msg.thinking,
         tokenId: msg.token_id,
-        perLayerScores: msg.per_layer_scores,
+        perLayerScores: capturedPerLayer,
         // ``msg.scores`` is the magnitude-weighted aggregate probe row —
         // the value the TUI tints live tokens with.  Using it (rather
         // than a single deepest-layer slice) makes the webui's live
         // highlight match both the TUI and the post-generation projected
         // pass.  Absent when no probes are loaded.
-        probes: msg.scores,
+        probes: capturedScores,
         // Logit-pass: pipe chosen-token logprob + top-K alternatives onto
         // the per-token row.  Both ride the WS ``token`` event directly
         // from Phase 1's engine capture; absent when ``return_top_k == 0``
-        // and no other on_token consumer is live (legacy default).
+        // and no other on-token consumer requested capture.
         logprob: msg.logprob ?? null,
         topAlts: msg.top_alts ?? null,
         // Raw decode-step index — the join key the logit fork slices
         // ``raw_token_ids`` on.  Rides the WS ``token`` event directly.
         rawIndex: msg.raw_index ?? null,
+        captured: msg.captured,
       };
       // Seed the single-probe ``score`` for the selected highlight so the
       // inline tint paints immediately as the token streams in.  The
       // canonical projected scores overwrite this on ``done``.
-      if (msg.scores && highlightState.target) {
-        const s = msg.scores[highlightState.target];
+      if (capturedScores && highlightState.target) {
+        const s = capturedScores[highlightState.target];
         if (typeof s === "number") tokenScore.score = s;
       }
       // Per-PC token highlighting: stash the full per-axis domain coords off
@@ -2179,9 +3428,9 @@ function handleWsMessage(msg: WSServerMessage): void {
       // can tint live.  Only multi-axis probes need it — axis 0 already rides
       // ``msg.scores`` — and the row keeps it through ``done`` (the per-token
       // settle pass is axis-0 only and never clobbers this field).
-      if (msg.probe_readings) {
+      if (capturedReadings) {
         const byProbe: Record<string, number[]> = {};
-        for (const [pname, r] of Object.entries(msg.probe_readings)) {
+        for (const [pname, r] of Object.entries(capturedReadings)) {
           const coords = (r as ProbeReadingJSON).coords;
           if (Array.isArray(coords) && coords.length > 1) byProbe[pname] = coords;
         }
@@ -2212,7 +3461,40 @@ function handleWsMessage(msg: WSServerMessage): void {
       // anchored to the steered branch.  ``msg.scores`` / ``per_layer_scores``
       // above still feed highlight tinting + the token-drilldown heatmap.
       if (!abState.processingAb) {
-        updateProbesFromReadings(msg.probe_readings);
+        updateProbesFromReadings(capturedReadings);
+        // J-LENS tab — the live all-layer readout. Present only while
+        // the session's live lens is enabled; shadow runs skipped like
+        // the probe rack so the matrix tracks the steered branch.
+        if (liveLensReadout) lensState.readout = liveLensReadout;
+        if (liveLensAggregate) {
+          lensState.aggregate = liveLensAggregate;
+          // Rolling strength history for the workspace-card sparklines —
+          // one compact [token, strength] frame per step, probe-sparkline
+          // cap, carries across generations like probe sparklines.
+          const frame: [string, number][] = liveLensAggregate.map(
+            ([tok, strength]) => [tok, strength],
+          );
+          const hist = lensState.aggHistory.slice();
+          hist.push(frame);
+          if (hist.length > MAX_SPARKLINE) hist.shift();
+          lensState.aggHistory = hist;
+        }
+        if (liveSaeReadout) {
+          saeState.readout = liveSaeReadout;
+          for (const feature of liveSaeReadout) {
+            const prior = saeState.history.get(feature.id) ?? [];
+            const next = [...prior, feature.activation].slice(-MAX_SPARKLINE);
+            saeState.history.set(feature.id, next);
+            // Server-cached metadata rides each row; the backfill fills
+            // the gaps between generations.
+            if (feature.max_act != null || feature.label != null) {
+              saeState.meta.set(feature.id, {
+                label: feature.label ?? null,
+                max_act: feature.max_act ?? null,
+              });
+            }
+          }
+        }
       }
       return;
     }
@@ -2226,35 +3508,7 @@ function handleWsMessage(msg: WSServerMessage): void {
       if (!abState.processingAb) {
         setProbeAggregates(msg.result?.probe_readings);
       }
-      const perToken = msg.result?.per_token_probes ?? [];
       const turn = _currentWriteTurn();
-      if (turn?.tokens && perToken.length) {
-        // Server emits per_token_probes in token order over the full
-        // generated stream; thinking + response tokens share that order.
-        // Walk the union and partition by ``thinking`` flag from the
-        // local token rows so we preserve the live separation.
-        let idx = 0;
-        for (const row of turn.thinkingTokens ?? []) {
-          if (idx < perToken.length) {
-            const probes = perToken[idx].probes;
-            row.probes = probes;
-            if (highlightState.target) {
-              row.score = probes[highlightState.target];
-            }
-          }
-          idx++;
-        }
-        for (const row of turn.tokens ?? []) {
-          if (idx < perToken.length) {
-            const probes = perToken[idx].probes;
-            row.probes = probes;
-            if (highlightState.target) {
-              row.score = probes[highlightState.target];
-            }
-          }
-          idx++;
-        }
-      }
       if (turn) {
         turn.finishReason = msg.result?.finish_reason ?? "stop";
         turn.tokensSoFar = msg.result?.tokens ?? genStatus.tokensSoFar;
@@ -2262,6 +3516,8 @@ function handleWsMessage(msg: WSServerMessage): void {
         // only).  Null when capture wasn't live; the inline surprise
         // mode + loom edge-weighting null-guard on this directly.
         turn.meanLogprob = msg.result?.mean_logprob ?? null;
+        const turnPpl = geometricMeanPpl(genStatus);
+        if (turnPpl !== null) turn.perplexity = turnPpl;
       }
       // Reconcile the live token counter against the server's
       // authoritative ``token_count``.  The streaming ``token`` events
@@ -2283,7 +3539,7 @@ function handleWsMessage(msg: WSServerMessage): void {
         loomTree.pendingNodeId = null;
         // Re-sync so the "streaming" decoration on the just-finished
         // turn switches off.
-        if (loomTree.rev > 0) syncChatLogFromTree();
+        if (loomTree.loaded) syncChatLogFromTree();
       }
 
       if (wasShadow) {
@@ -2292,6 +3548,8 @@ function handleWsMessage(msg: WSServerMessage): void {
         // already did that when it finished.
         abState.processingAb = false;
         abState.pendingTurnIdx = null;
+        abState.pendingRole = null;
+        abState.pendingRoleLabel = null;
         // Drain pending actions queued during the shadow gen — same
         // gen-active gate the steered branch uses.
         void drainNextPendingAction();
@@ -2305,6 +3563,10 @@ function handleWsMessage(msg: WSServerMessage): void {
       snapshotProbeBaseline();
       void refreshCorrelation();
       void drainNextPendingAction();
+      // SAE discovery backfill — fetch Neuronpedia metadata (label +
+      // maxActApprox) for features the live top-k surfaced this
+      // generation.  Between generations only, never per token.
+      void backfillSaeMeta();
 
       // v2.3: the legacy standalone A/B toggle is gone — auto-regen with
       // ``mode === "unsteered"`` *is* the A/B shadow.  Branch on the
@@ -2323,12 +3585,12 @@ function handleWsMessage(msg: WSServerMessage): void {
         if (
           override === "unsteered" &&
           steeredIdx !== null &&
-          chatLog.turns[steeredIdx]?.role === "assistant"
+          chatLog.turns[steeredIdx]?.generated === true
         ) {
           void _sendShadowGenerate(steeredIdx);
         } else if (
           override !== null &&
-          loomTree.rev > 0 &&
+          loomTree.loaded &&
           loomTree.active_node_id
         ) {
           // Pin the new sibling so the chat's right column shows it.
@@ -2375,10 +3637,21 @@ function handleWsMessage(msg: WSServerMessage): void {
       chatLog.pendingIndex = null;
       if (loomTree.pendingNodeId) {
         loomTree.pendingNodeId = null;
-        if (loomTree.rev > 0) syncChatLogFromTree();
+        if (loomTree.loaded) syncChatLogFromTree();
       }
+      // The system turn appended above is rebuilt away whenever
+      // ``syncChatLogFromTree`` runs (the tree knows nothing of it), so a
+      // server-owned log rendered generation errors as a silent empty
+      // node.  A sticky toast survives every tree sync — errors must
+      // never be silent.
+      pushToast(`generation: ${msg.message}`, {
+        kind: "error",
+        ttlMs: null,
+      });
       abState.processingAb = false;
       abState.pendingTurnIdx = null;
+      abState.pendingRole = null;
+      abState.pendingRoleLabel = null;
       // Drain the next pending action even on error so the UI doesn't
       // get stuck in "changes pending" forever.  The failed send
       // already surfaced as the system message above.
@@ -2391,6 +3664,11 @@ function handleWsMessage(msg: WSServerMessage): void {
 export interface SendGenerateOpts {
   stateless?: boolean;
   raw?: boolean;
+  /** Cast model: which seat the generated turn occupies.  Absent /
+   *  "assistant" = the classic flow; "user" needs scene mode server-side.
+   *  Callers pass it explicitly (the composer reads its seat toggle) —
+   *  the send primitive never defaults off ambient UI state. */
+  generate_seat?: "user" | "assistant";
   /** Override the rack-derived steering with an explicit string.  Pass
    * ``""`` for unsteered (A/B mode); ``null``/``undefined`` to use the
    * rack. */
@@ -2403,6 +3681,139 @@ export interface SendGenerateOpts {
   /** Loom phase 5: recipe-override modifier — mode string or partial
    *  recipe expression. */
   recipe_override?: string | null;
+}
+
+export interface SendSubmitOpts {
+  /** Explicit anchor.  The queue-only sentinel resolves against the live
+   * active node when this action reaches the head. */
+  parent_node_id?: string | null | "active@drain";
+  replaceSlot?: number | null;
+  raw?: boolean;
+  authored_thinking?: string | null;
+  steering?: string | null;
+  n?: number;
+  recipe_override?: string | null;
+}
+
+function submitLabel(
+  text: string | null,
+  generatedRole: ChatRole | null,
+): string {
+  if (generatedRole === null) return "append";
+  if (text === null) return "generate";
+  return "send";
+}
+
+function buildSubmitPending(
+  text: string | null,
+  authoredRole: ChatRole | null,
+  generatedRole: ChatRole | null,
+  opts: Omit<SendSubmitOpts, "replaceSlot">,
+): PendingAction {
+  return {
+    id: `pa-${_pendingCounter++}`,
+    label: submitLabel(text, generatedRole),
+    text,
+    apply: () => sendSubmitNow(text, authoredRole, generatedRole, opts),
+    awaitsGen: true,
+    rebuild: text === null
+      ? null
+      : (newText: string) =>
+          buildSubmitPending(newText, authoredRole, generatedRole, opts),
+    createdAt: Date.now(),
+    endsOnUserNode:
+      (generatedRole ?? authoredRole) === "user"
+        ? true
+        : (generatedRole ?? authoredRole) === "assistant"
+          ? false
+          : null,
+  };
+}
+
+/** Send one native role-neutral submission.
+ *
+ * Text is appended in ``authoredRole``. ``generatedRole`` optionally
+ * follows it with a decode; omit it for append-only.  With no text, the
+ * generated role continues directly from the selected leaf. No branch
+ * depends on the selected node's role.
+ */
+export async function sendSubmit(
+  text: string | null,
+  authoredRole: ChatRole | null,
+  generatedRole: ChatRole | null,
+  opts: SendSubmitOpts = {},
+): Promise<void> {
+  if (text !== null && text === "") return;
+  if (text !== null && authoredRole === null) {
+    throw new Error("A text submission requires an authored role");
+  }
+  if (text === null && generatedRole === null) return;
+  if (isPendingBusy()) {
+    const { replaceSlot, ...queuedOpts } = opts;
+    const item = buildSubmitPending(
+      text,
+      authoredRole,
+      generatedRole,
+      queuedOpts,
+    );
+    enqueuePending(
+      {
+        label: item.label,
+        text: item.text,
+        apply: item.apply,
+        awaitsGen: item.awaitsGen,
+        rebuild: item.rebuild,
+        endsOnUserNode: item.endsOnUserNode,
+      },
+      { replaceSlot: replaceSlot ?? null },
+    );
+    return;
+  }
+  return sendSubmitNow(text, authoredRole, generatedRole, opts);
+}
+
+async function sendSubmitNow(
+  text: string | null,
+  authoredRole: ChatRole | null,
+  generatedRole: ChatRole | null,
+  opts: Omit<SendSubmitOpts, "replaceSlot"> = {},
+): Promise<void> {
+  if (!loomTree.loaded) {
+    await refreshLoomTree();
+    if (!loomTree.loaded) {
+      throw new Error("Conversation tree is not ready; retry after it loads");
+    }
+  }
+  const sock = await ensureWebSocket();
+  const steering =
+    opts.steering === undefined ? currentSteeringExpression() : opts.steering;
+  const sampling = buildSamplingPayload();
+  genStatus.maxTokens = sampling?.max_tokens ?? samplingState.max_tokens;
+  const requestedParent = opts.parent_node_id;
+  const parent = requestedParent === "active@drain"
+    ? loomTree.active_node_id
+    : requestedParent;
+  const payload: WSClientMessage = {
+    type: "submit",
+    text,
+    authored_role: authoredRole,
+    generated_role: generatedRole,
+    steering: steering || null,
+    sampling,
+    thinking: samplingState.thinking ?? false,
+    raw: opts.raw ?? false,
+    ...(opts.authored_thinking
+      ? { authored_thinking: opts.authored_thinking }
+      : {}),
+    ...(parent !== undefined ? { parent_node_id: parent } : {}),
+    ...(opts.n !== undefined ? { n: opts.n } : {}),
+    ...(opts.recipe_override !== undefined
+      ? { recipe_override: opts.recipe_override }
+      : {}),
+  };
+  const send = () => sock.send(JSON.stringify(payload));
+  if (sock.readyState === WebSocket.OPEN) send();
+  else sock.addEventListener("open", send, { once: true });
 }
 
 /** Build a :class:`PendingAction` for a queued chat send.  The
@@ -2472,6 +3883,16 @@ async function sendGenerateNow(
   input: string | unknown,
   opts: SendGenerateOpts = {},
 ): Promise<void> {
+  // The first server snapshot may legitimately be revision 0.  Require the
+  // explicit readiness bit instead of guessing from the revision, and retain
+  // this defensive fetch even though App gates user interaction during boot:
+  // store-level callers and future surfaces should be safe on their own.
+  if (!loomTree.loaded) {
+    await refreshLoomTree();
+    if (!loomTree.loaded) {
+      throw new Error("Conversation tree is not ready; retry after it loads");
+    }
+  }
   const sock = await ensureWebSocket();
   const steering =
     opts.steering === undefined ? currentSteeringExpression() : opts.steering;
@@ -2490,7 +3911,7 @@ async function sendGenerateNow(
   // the tree (it will emit ``tree_mutated`` with the added user node
   // and we'll sync from there) or when ``input`` is a messages list
   // (A/B shadow path — no fresh user turn to display).
-  if (loomTree.rev <= 0 && typeof input === "string") {
+  if (!loomTree.loaded && typeof input === "string") {
     chatLog.turns = [...chatLog.turns, { role: "user", text: input }];
   }
   // Remember the input verbatim so the auto-regen shadow path can replay
@@ -2502,7 +3923,7 @@ async function sendGenerateNow(
     input,
     steering: steeringPayload,
     sampling,
-    // Coerce ``null`` (legacy "auto") to explicit ``false`` so the
+    // Coerce the current family-level automatic setting to explicit ``false`` so the
     // unchecked checkbox really means "no thinking" — the server's
     // chat-template templates treat ``null`` and ``False`` differently
     // on some families and we promised the user a binary toggle.
@@ -2518,6 +3939,9 @@ async function sendGenerateNow(
     ...(opts.recipe_override !== undefined
       ? { recipe_override: opts.recipe_override }
       : {}),
+    ...(opts.generate_seat !== undefined && opts.generate_seat !== "assistant"
+      ? { generate_seat: opts.generate_seat }
+      : {}),
   };
   const send = () => sock.send(JSON.stringify(payload));
   if (sock.readyState === WebSocket.OPEN) send();
@@ -2529,7 +3953,7 @@ async function sendGenerateNow(
  *  recipe (steering / sampling / seed / thinking) and replays its raw
  *  decode sequence up to ``rawIndex``, forcing ``altTokenId`` there
  *  before sampling the continuation.  Streams in like any regen: the
- *  new sibling lands via the WS ``node_created`` / ``token`` / ``done``
+ *  new sibling lands via the WS ``tree_mutated`` / ``token`` / ``done``
  *  events and becomes the active branch. */
 export async function sendFork(
   nodeId: string,
@@ -2578,7 +4002,7 @@ function buildPrefillPending(
 /** Answer-prefill — seed an assistant reply under a user node.  The
  *  server tokenizes ``text`` into a forced decode prefix, emits it as
  *  the opening of the assistant turn, then samples the continuation.
- *  The prefilled sibling streams in via the WS ``node_created`` /
+ *  The prefilled sibling streams in via the WS ``tree_mutated`` /
  *  ``token`` / ``done`` events and becomes the active branch.  Steering
  *  and sampling ride from the current rack exactly like a normal
  *  ``sendGenerate``; ``thinking`` is forced off server-side (the text is
@@ -2643,6 +4067,7 @@ function buildCommitPending(
   parentNodeId: string | null | "active@drain",
   text: string,
   raw: boolean = false,
+  thinking: string | null = null,
 ): PendingAction {
   return {
     id: `pa-${_pendingCounter++}`,
@@ -2656,11 +4081,11 @@ function buildCommitPending(
       const parent = parentNodeId === "active@drain"
         ? loomTree.active_node_id
         : parentNodeId;
-      return sendCommitNow(role, parent, text, raw);
+      return sendCommitNow(role, parent, text, raw, thinking);
     },
     awaitsGen: true,
     rebuild: (newText: string) =>
-      buildCommitPending(role, parentNodeId, newText, raw),
+      buildCommitPending(role, parentNodeId, newText, raw, thinking),
     createdAt: Date.now(),
     endsOnUserNode: role === "user",
   };
@@ -2672,7 +4097,7 @@ function buildCommitPending(
  *  null to fall through to the active node server-side); ``"assistant"``
  *  for ``append_assistant_turn`` (``parentNodeId`` is the user node the
  *  authored turn hangs off — required).  The server emits a single
- *  ``done`` event with the new node id; the loom's ``node_created`` /
+ *  ``done`` event with the new node id; the loom's ``tree_mutated`` /
  *  ``tree_mutated`` subscriptions land the node in the UI.  No token
  *  streaming, no steering, no sampling — just a tree mutation.
  *
@@ -2681,10 +4106,18 @@ export async function sendCommit(
   role: "user" | "assistant",
   parentNodeId: string | null | "active@drain",
   text: string,
-  opts: { replaceSlot?: number | null; raw?: boolean } = {},
+  opts: {
+    replaceSlot?: number | null;
+    raw?: boolean;
+    /** Committed thinking block riding this turn (rendered through the
+     *  family think delimiters; 400 when the family can't carry it). */
+    thinking?: string | null;
+  } = {},
 ): Promise<void> {
   if (isPendingBusy()) {
-    const item = buildCommitPending(role, parentNodeId, text, opts.raw ?? false);
+    const item = buildCommitPending(
+      role, parentNodeId, text, opts.raw ?? false, opts.thinking ?? null,
+    );
     enqueuePending(
       {
         label: item.label,
@@ -2704,7 +4137,9 @@ export async function sendCommit(
   const resolved = parentNodeId === "active@drain"
     ? loomTree.active_node_id
     : parentNodeId;
-  return sendCommitNow(role, resolved, text, opts.raw ?? false);
+  return sendCommitNow(
+    role, resolved, text, opts.raw ?? false, opts.thinking ?? null,
+  );
 }
 
 async function sendCommitNow(
@@ -2712,6 +4147,7 @@ async function sendCommitNow(
   parentNodeId: string | null,
   text: string,
   raw: boolean = false,
+  thinking: string | null = null,
 ): Promise<void> {
   const sock = await ensureWebSocket();
   // Per-message role labels ride the commit too (roleplay scaffold), so an
@@ -2724,6 +4160,7 @@ async function sendCommitNow(
     commit_role: role,
     commit_text: text,
     parent_node_id: parentNodeId,
+    ...(thinking ? { commit_thinking: thinking } : {}),
     ...(commitSampling ? { sampling: commitSampling } : {}),
     // ``raw`` lifts the user-under-user guard server-side — a flat
     // (base-model) commit's authored span may hang under any role.
@@ -2780,41 +4217,48 @@ export function sendStop(): void {
 export interface AbState {
   pendingTurnIdx: number | null;
   processingAb: boolean;
+  pendingRole: "user" | "assistant" | null;
+  pendingRoleLabel: string | null;
 }
 
 export const abState: AbState = $state({
   pendingTurnIdx: null,
   processingAb: false,
+  pendingRole: null,
+  pendingRoleLabel: null,
 });
 
 /** Build the conversation as a messages list to replay through the
  * unsteered shadow.  Walks ``chatLog.turns[0..steeredIdx-1]`` (excluding
- * ``steeredIdx`` itself, which is the steered assistant response we
+ * ``steeredIdx`` itself, which is the generated response we
  * don't want the shadow to inherit), filtering out system / error turns
  * that aren't real conversation context.
  *
- * The unsteered model sees prior steered assistant turns as if they
+ * The unsteered model sees prior steered turns as if they
  * happened naturally — that's the user's "play the conversation back"
- * contract.  Only the most recent user turn (the last entry in the
- * returned list) is what the shadow generates a fresh response for.
- *
- * Returns ``null`` when the slice doesn't end on a user turn (no
- * generation possible — the chatLog must have a trailing user turn for
- * the steered response to pair against). */
+ * contract. Scene rendering permits arbitrary seat sequences, so the target
+ * turn itself—not the final history role—selects the prompt that follows. */
 function _buildShadowMessages(
   steeredIdx: number,
-): Array<{ role: "user" | "assistant"; content: string }> | null {
-  const out: Array<{ role: "user" | "assistant"; content: string }> = [];
+): Array<{
+  role: "user" | "assistant";
+  content: string;
+  label?: string | null;
+}> {
+  const out: Array<{
+    role: "user" | "assistant";
+    content: string;
+    label?: string | null;
+  }> = [];
   for (let i = 0; i < steeredIdx; i++) {
     const t = chatLog.turns[i];
     if (!t) continue;
     if (t.role !== "user" && t.role !== "assistant") continue; // skip system / errors
-    // Use the accumulated text — assistant turns already exclude their
+    // Use the accumulated text — generated turns already exclude their
     // thinking content (only response tokens land in ``turn.text``), so
     // replaying them through ``enable_thinking=False`` is well-formed.
-    out.push({ role: t.role, content: t.text ?? "" });
+    out.push({ role: t.role, content: t.text ?? "", label: t.roleLabel });
   }
-  if (out.length === 0 || out[out.length - 1].role !== "user") return null;
   return out;
 }
 
@@ -2826,25 +4270,32 @@ function _buildShadowMessages(
  * the messages list is the *only* context the unsteered model sees.
  * That makes the comparison work for any turn, not just the first. */
 async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
+  const target = chatLog.turns[steeredIdx];
+  if (!target?.generated || target.role === "system") return;
   const messages = _buildShadowMessages(steeredIdx);
-  if (messages === null) return;
   const sock = await ensureWebSocket();
   // Shadow path mirrors ``sendGenerate``'s sampling-payload build so the
   // ``return_top_k`` opt-in rides shadow / auto-regen runs too (matches
   // the steered turn's wire-shape, keeps logit captures comparable across
   // siblings).
-  const sampling = buildSamplingPayload();
+  const sampling = buildSamplingPayload() ?? {};
+  if (target.roleLabel) {
+    if (target.role === "user") sampling.user_role = target.roleLabel;
+    else sampling.assistant_role = target.roleLabel;
+  }
   // Mark the WS reception path before the request lands so the
   // ``started`` event routes into the abPair and not a fresh turn.
   abState.pendingTurnIdx = steeredIdx;
   abState.processingAb = true;
+  abState.pendingRole = target.role;
+  abState.pendingRoleLabel = target.roleLabel ?? null;
   const payload: WSClientMessage = {
     type: "generate",
     // ``input`` accepts ``Any`` server-side; a list goes straight through
     // to ``session._prepare_input`` which dispatches on isinstance(list).
     input: messages,
     // Empty steering string == unsteered shadow per the WS protocol
-    // (saklas_api._build_steering treats "" as "no expression").
+    // (the server treats "" as "no expression").
     steering: "",
     sampling,
     thinking: samplingState.thinking ?? false,
@@ -2854,6 +4305,7 @@ async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
     // the conversation up to (but not including) the steered response.
     stateless: true,
     raw: false,
+    generate_seat: target.role,
   };
   const send = () => sock.send(JSON.stringify(payload));
   if (sock.readyState === WebSocket.OPEN) send();
@@ -2862,45 +4314,30 @@ async function _sendShadowGenerate(steeredIdx: number): Promise<void> {
 
 // =================================================== persistence ========
 //
-// v2 (loom):
-//   localStorage is a *cache* of the server's loom tree.  On bootstrap we
-//   fetch from the server and reconcile (server wins) — this retires the
-//   v1 "server-restart guard" hack that dropped the local snapshot when
-//   server-side history was empty.  The server tree is now the only
-//   authority; localStorage is for first-paint while the fetch is in
-//   flight.
+// Presentation preference cache:
+//   The server is the sole authority for the Loom tree.  In particular, do
+//   not first-paint a cached tree: after a server restart its node ids are
+//   invalid, and rendering it briefly triggers requests against nonexistent
+//   edges before the authoritative fetch arrives.  Durable conversation
+//   persistence is the explicit v4 whole-tree Save/Load flow; localStorage
+//   retains only lightweight highlight preferences.
 //
-// v1 → v2 migration:
-//   The v1 snapshot stored a flat ChatTurn[].  On load we hydrate it as
-//   a single-branch tree (root → user_1 → assistant_1 → user_2 → ...)
-//   so the sidebar renders immediately even before the server tree
-//   fetch returns.  When the server tree lands (rev > 0) it overwrites
-//   the hydrated shape — no data loss either way.
-//
-// We persist on a debounced effect rather than synchronously per
-// mutation so token-streaming gens don't write hundreds of times per
-// turn — once per ~250 ms is enough to survive an unplanned reload.
+// Preference changes persist through a short debounce so rapid highlight
+// switching does not issue redundant synchronous localStorage writes.
 
-const PERSIST_VERSION = 2;
+const PERSIST_VERSION = 4;
 const PERSIST_KEY_PREFIX = "saklas.chat.v" + PERSIST_VERSION + ".";
-/** Legacy v1 key prefix — used for the migration read on load. */
-const PERSIST_KEY_PREFIX_V1 = "saklas.chat.v1.";
+const LEGACY_TREE_PERSIST_KEY_PREFIX = "saklas.chat.v3.";
 
 function persistKey(): string | null {
   const id = sessionState.info?.model_id;
   return id ? PERSIST_KEY_PREFIX + id : null;
 }
 
-function persistKeyV1(): string | null {
-  const id = sessionState.info?.model_id;
-  return id ? PERSIST_KEY_PREFIX_V1 + id : null;
-}
-
-interface PersistedSnapshotV1 {
-  version: 1;
+interface PersistedSnapshot {
+  version: 4;
   model_id: string;
   saved_at: number;
-  turns: ChatTurn[];
   highlight: {
     target: string | null;
     compareTarget: string | null;
@@ -2908,17 +4345,17 @@ interface PersistedSnapshotV1 {
   };
 }
 
-interface PersistedSnapshotV2 {
-  version: 2;
-  model_id: string;
-  saved_at: number;
-  /** Cached loom tree.  ``null`` until the first server fetch lands. */
-  tree: LoomTreeJSON | null;
-  highlight: {
-    target: string | null;
-    compareTarget: string | null;
-    compareTwo: boolean;
-  };
+function isPersistedSnapshot(value: unknown): value is PersistedSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snap = value as Record<string, unknown>;
+  if (snap.version !== PERSIST_VERSION || typeof snap.model_id !== "string") return false;
+  if (typeof snap.saved_at !== "number") return false;
+  if (!snap.highlight || typeof snap.highlight !== "object") return false;
+  const highlight = snap.highlight as Record<string, unknown>;
+  if (!(typeof highlight.target === "string" || highlight.target === null)) return false;
+  if (!(typeof highlight.compareTarget === "string" || highlight.compareTarget === null)) return false;
+  if (typeof highlight.compareTwo !== "boolean") return false;
+  return true;
 }
 
 function safeLocalStorageGet(key: string): string | null {
@@ -2946,123 +4383,29 @@ function safeLocalStorageRemove(key: string): void {
   }
 }
 
-/** ULID-like throwaway id for synthetic migration nodes.  We don't need
- *  Crockford-base32 + monotonicity here — the server's tree fetch will
- *  overwrite this shape immediately, so unique-per-call is enough. */
-function _localId(prefix: string): string {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random()
-    .toString(36)
-    .slice(2, 10)}`;
-}
-
-/** Hydrate a v1 linear chat log as a single-branch loom tree.  No data
- *  loss — every user/assistant turn becomes a node with a synthetic id,
- *  parent-chained root-down.  Sets ``rev`` to 0 because the snapshot
- *  isn't authoritative; the server fetch will overwrite. */
-function hydrateV1ChatAsLinearTree(turns: ChatTurn[]): void {
-  loomTree.nodes.clear();
-  loomTree.children_of.clear();
-  const rootId = _localId("root");
-  loomTree.nodes.set(rootId, {
-    id: rootId,
-    parent_id: null,
-    role: "system",
-    text: "",
-  });
-  loomTree.root_id = rootId;
-  let parent = rootId;
-  for (const t of turns) {
-    if (!t || (t.role !== "user" && t.role !== "assistant" && t.role !== "system")) continue;
-    const id = _localId(t.role);
-    loomTree.nodes.set(id, {
-      id,
-      parent_id: parent,
-      role: t.role,
-      text: t.text ?? "",
-      finish_reason: t.finishReason ?? null,
-      applied_steering: t.appliedSteering ?? null,
-      aggregate_readings: t.aggregateReadings,
-    });
-    const sibs = loomTree.children_of.get(parent) ?? [];
-    loomTree.children_of.set(parent, [...sibs, id]);
-    parent = id;
-  }
-  loomTree.active_node_id = parent;
-  // Local hydration is rev 0 — server fetch will bump it.
-  loomTree.rev = 0;
-  recomputeActivePath();
-}
-
-function loadPersistedChat(): void {
-  const v2key = persistKey();
-  const v1key = persistKeyV1();
-  if (!v2key) return;
-  // Try v2 first; fall back to v1 migration.
-  let parsed: PersistedSnapshotV2 | null = null;
-  const v2raw = safeLocalStorageGet(v2key);
-  if (v2raw) {
-    try {
-      const tmp = JSON.parse(v2raw) as PersistedSnapshotV2;
-      if (tmp.version === 2 && tmp.model_id === sessionState.info?.model_id) {
-        parsed = tmp;
-      }
-    } catch {
-      /* corrupt — fall through to v1 migration */
-    }
-  }
-  if (parsed) {
-    if (parsed.tree) {
-      // First-paint cache: hydrate without overwriting future server
-      // fetches.  ``rev`` is preserved from cache, but ``refreshLoomTree``
-      // is the authoritative source — its result overwrites.
-      applyTreeSnapshot(parsed.tree);
-      // Snapshot may have been from an in-flight gen; clear pendingNodeId
-      // so a stale "streaming" indicator doesn't ghost the UI.
-      loomTree.pendingNodeId = null;
-    }
-    if (parsed.highlight) {
-      highlightState.target = parsed.highlight.target ?? null;
-      highlightState.compareTarget = parsed.highlight.compareTarget ?? null;
-      highlightState.compareTwo = !!parsed.highlight.compareTwo;
-    }
-    return;
-  }
-  if (!v1key) return;
-  const v1raw = safeLocalStorageGet(v1key);
-  if (!v1raw) return;
+function loadPersistedPreferences(): void {
+  const key = persistKey();
+  if (!key) return;
+  // v3 embedded the complete tree and could occupy most of the origin quota.
+  // It is unsafe after a backend restart and superseded by explicit v4
+  // save/load, so reclaim it during the one model-scoped bootstrap read.
+  const modelId = sessionState.info?.model_id;
+  if (modelId) safeLocalStorageRemove(LEGACY_TREE_PERSIST_KEY_PREFIX + modelId);
+  const raw = safeLocalStorageGet(key);
+  if (!raw) return;
   try {
-    const v1 = JSON.parse(v1raw) as PersistedSnapshotV1;
-    if (v1.version !== 1) return;
-    if (v1.model_id !== sessionState.info?.model_id) return;
-    // Hydrate the linear log as a single-branch tree.  Don't drop the
-    // snapshot on server-empty-history any more — the server will
-    // either accept the tree on next mutation or fetch its own and
-    // overwrite ours.
-    if (Array.isArray(v1.turns)) {
-      hydrateV1ChatAsLinearTree(
-        v1.turns.filter(
-          (t) =>
-            t && typeof t === "object" && typeof (t as ChatTurn).role === "string",
-        ),
-      );
-      // Also seed chatLog.turns directly so Chat.svelte has content on
-      // first paint even before applyTreeSnapshot rewrites — the
-      // hydrate above leaves rev at 0, so syncChatLogFromTree is a
-      // no-op.
-      chatLog.turns = v1.turns.filter(
-        (t) => t && typeof t === "object" && typeof (t as ChatTurn).role === "string",
-      );
-      chatLog.pendingIndex = null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isPersistedSnapshot(parsed)) {
+      safeLocalStorageRemove(key);
+      return;
     }
-    if (v1.highlight) {
-      highlightState.target = v1.highlight.target ?? null;
-      highlightState.compareTarget = v1.highlight.compareTarget ?? null;
-      highlightState.compareTwo = !!v1.highlight.compareTwo;
-    }
-    // Drop the v1 key once we've migrated — next persist writes v2.
-    safeLocalStorageRemove(v1key);
+    if (parsed.model_id !== sessionState.info?.model_id) return;
+    loomTree.pendingNodeId = null;
+    highlightState.target = parsed.highlight.target;
+    highlightState.compareTarget = parsed.highlight.compareTarget;
+    highlightState.compareTwo = parsed.highlight.compareTwo;
   } catch {
-    // Corrupt blob — drop it on the floor.
+    safeLocalStorageRemove(key);
   }
 }
 
@@ -3073,68 +4416,21 @@ function schedulePersist(): void {
     _persistTimer = null;
     const key = persistKey();
     if (!key) return;
-    // Serialise the loom tree from the SvelteMap-backed slice.  Use
-    // the server's ``to_dict`` list shape so a future reload (or any
-    // server that consumes this cache) is consistent with the
-    // authoritative wire format.
-    let tree: LoomTreeJSON | null = null;
-    if (loomTree.rev > 0 && loomTree.root_id && loomTree.active_node_id) {
-      const nodes: LoomNodeJSON[] = [];
-      for (const [, n] of loomTree.nodes) nodes.push(n);
-      const children_of: Record<string, string[]> = {};
-      for (const [pid, ids] of loomTree.children_of)
-        children_of[pid] = [...ids];
-      tree = {
-        root_id: loomTree.root_id,
-        active_node_id: loomTree.active_node_id,
-        rev: loomTree.rev,
-        nodes,
-        children_of,
-        model_id: loomTree.modelId ?? sessionState.info?.model_id,
-      };
-    }
-    const snapshot: PersistedSnapshotV2 = {
-      version: 2,
+    const snapshot: PersistedSnapshot = {
+      version: 4,
       model_id: sessionState.info!.model_id,
       saved_at: Date.now(),
-      tree,
       highlight: {
         target: highlightState.target,
         compareTarget: highlightState.compareTarget,
         compareTwo: highlightState.compareTwo,
       },
     };
-    const payload = JSON.stringify(snapshot);
-    // Soft ~5MB budget warning (plan §"Size management").  Each loom-
-    // tree rev bumps trigger a re-write of the whole snapshot, so a
-    // large tree can put real pressure on the localStorage quota.  The
-    // toast is advisory — we still write — and fires at most once per
-    // session so the user doesn't get spammed on every rev.
-    if (payload.length > _LOCALSTORAGE_SOFT_BUDGET && !_sizeWarned) {
-      _sizeWarned = true;
-      const mb = (payload.length / (1024 * 1024)).toFixed(1);
-      pushToast(
-        `Loom tree cache is ~${mb}MB in localStorage. Consider exporting and clearing — most browsers cap origin storage at 5–10MB.`,
-        { kind: "warning", ttlMs: 10000 },
-      );
-    }
-    safeLocalStorageSet(key, payload);
+    safeLocalStorageSet(key, JSON.stringify(snapshot));
   }, 250);
 }
 
-/** 1 GB soft budget — effectively "never toast".  The toast was the only
- *  in-app surface that flagged cache size; muting it means the user no
- *  longer sees a warning before the browser's hard quota kicks in.
- *  ``safeLocalStorageSet`` still try/catches the resulting
- *  ``QuotaExceededError`` silently when that happens (write drops, next
- *  refresh refetches the server tree). */
-const _LOCALSTORAGE_SOFT_BUDGET = 1024 * 1024 * 1024;
-
-/** Once-per-session latch so we don't toast on every rev bump after
- *  the budget threshold is crossed.  Reset implicitly on page reload. */
-let _sizeWarned = false;
-
-/** Wire a $effect.root that watches the chat log + highlight slice and
+/** Wire a $effect.root that watches the highlight slice and
  * debounces a save to localStorage.  Called from ``bootstrap`` after
  * the model id is known so the storage key resolves. */
 function attachPersistence(): void {
@@ -3142,17 +4438,6 @@ function attachPersistence(): void {
     $effect(() => {
       // Touch every reactive field we want to persist so the effect
       // re-runs whenever any of them change.
-      void chatLog.turns.length;
-      // Mutate-in-place arrays (token stream) — read .length on every
-      // turn so ``schedulePersist`` debouncer fires through gen.
-      for (const t of chatLog.turns) {
-        void t.text;
-        void t.tokens?.length;
-        void t.thinkingTokens?.length;
-      }
-      // Loom tree changes drive the v2 persisted shape; touch rev so
-      // every mutation queues a save.
-      void loomTree.rev;
       void highlightState.target;
       void highlightState.compareTarget;
       void highlightState.compareTwo;
@@ -3240,7 +4525,6 @@ function _edgeKey(parentId: string, childId: string): string {
  *  immediately when the entry is already cached.  Bumps reactivity
  *  when the label arrives so all consumers re-render. */
 export function fetchEdgeLabel(parentId: string, childId: string): void {
-  if (loomTree.unavailable) return;
   const key = _edgeKey(parentId, childId);
   if (edgeLabelCache.has(key)) return;
   if (_edgeLabelInFlight.has(key)) return;
@@ -3251,7 +4535,7 @@ export function fetchEdgeLabel(parentId: string, childId: string): void {
       edgeLabelCache.set(key, r.label);
     })
     .catch(() => {
-      // Server pre-phase-5 or transient failure — cache an empty
+      // Transient fetch failure — cache an empty
       // string so we don't retry every render.
       edgeLabelCache.set(key, "");
     })
@@ -3385,8 +4669,8 @@ export function unpinComparison(): void {
 
 // ------------------------------- node multi-select for diff ---------
 
-/** Multi-select for the cross-branch diff drawer.  Right-click on an
- *  assistant node toggles its membership; "Compare selected" opens the
+/** Multi-select for the cross-branch diff drawer.  Right-click on a
+ *  generated node toggles its membership; "Compare selected" opens the
  *  drawer with these ids.  Clears on drawer close or successful diff. */
 export const nodeSelection: { ids: string[] } = $state({ ids: [] });
 
@@ -3432,7 +4716,7 @@ export function toggleAutoRegen(): void {
   const wasOff = !autoRegenState.enabled;
   autoRegenState.enabled = !autoRegenState.enabled;
   // Off → on with the "unsteered" mode: replay the conversation through
-  // the unsteered agent for the most recent steered assistant turn that
+  // the unsteered model for the most recent generated turn that
   // doesn't already carry an ``abPair``.  Mirrors the pre-v2.3 A/B
   // toggle's retroactive-shadow behaviour, so users who flip the toggle
   // on after-the-fact see the right column populate immediately rather
@@ -3444,7 +4728,7 @@ export function toggleAutoRegen(): void {
   for (let i = chatLog.turns.length - 1; i >= 0; i--) {
     const t = chatLog.turns[i];
     if (!t) continue;
-    if (t.role !== "assistant") continue;
+    if (!t.generated || t.role === "system") continue;
     if (t.abPair) break;
     void _sendShadowGenerate(i);
     break;
@@ -3496,23 +4780,21 @@ export async function bootstrap(): Promise<void> {
   // (it's scoped by model_id), so we serialize that step.  The other
   // refreshes parallelize as before.
   await refreshSession();
-  // First-paint: load persisted (v2 cache or v1 migration) before
-  // attaching the persist effect so we don't immediately overwrite.
-  loadPersistedChat();
+  // Restore presentation preferences before attaching the persist effect so
+  // we do not immediately overwrite them.  The tree always comes from the
+  // authoritative server fetch below.
+  loadPersistedPreferences();
   // Per-model render-mode override (base vs chat) — also model-scoped.
   loadGenUiMode();
   attachPersistence();
   await Promise.allSettled([
     refreshVectorList(),
-    // Unified probe roster — every probe shape (flat subspace + curved
-    // manifold).  404 tolerated (pre-read-side server) → ``unavailable``.
+    // Unified probe roster — every probe shape.
     refreshProbeList(),
     refreshCorrelation(),
-    // Manifold catalog — 404 tolerated (server pre-dates the manifold
-    // HTTP surface); ``refreshManifoldList`` flips ``unavailable``.
+    // Current manifold catalog.
     refreshManifoldList(),
-    // Server tree wins — fetch and reconcile.  404 is a quiet no-op
-    // (server pre-loom); other failures surface via loomTree.error.
+    // Server tree wins — fetch and reconcile; failures remain visible.
     refreshLoomTree(),
   ]);
 }

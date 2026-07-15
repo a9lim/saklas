@@ -11,31 +11,81 @@ loom-mutation forwarder, and a per-generate-turn worker; see the
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections import deque
 from contextlib import suppress
-from typing import Any, Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Literal, cast
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 
 from saklas.core.errors import SaklasError
 from saklas.core.loom import LoomMutated
-from saklas.core.results import GenerationResult, RunSet
+from saklas.core.results import GenerationResult, TokenAlt
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import SaklasSession
+from saklas.core.token_callback import TokenConsumer, TokenConsumerOptions
 from saklas.core.steering import Steering
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 from saklas.server.native_common import SINGLE_SESSION_ID
 from saklas.server.request_helpers import merge_steering, parse_request_steering
 from saklas.server.streaming import probe_reading_aggregate
-from saklas.server.tree_models import node_json
+from saklas.server.tree_models import cast_json, node_json
 from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
     WSGenerateMessage,
+    WSSubmitMessage,
+    build_input,
     build_sampling,
-    per_token_probes,
     result_to_json,
 )
+
+_logger = logging.getLogger(__name__)
+
+JSONValue = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
+JSONObject = dict[str, JSONValue]
+
+
+@dataclass(frozen=True)
+class _Stop:
+    pass
+
+
+@dataclass(frozen=True)
+class _Disconnect:
+    pass
+
+
+@dataclass(frozen=True)
+class _ReaderFailure:
+    message: str
+    code: str
+
+
+@dataclass(frozen=True)
+class _InvalidInbound:
+    message: str
+
+
+_Inbound = (
+    WSGenerateMessage | WSSubmitMessage | _Stop | _Disconnect
+    | _ReaderFailure | _InvalidInbound
+)
+
+
+@dataclass(frozen=True)
+class _TokenFrame:
+    payload: JSONObject
+
+
+@dataclass(frozen=True)
+class _TokenDone:
+    pass
+
+
+_TokenQueueItem = _TokenFrame | _TokenDone
 
 
 def register_ws_stream(app: FastAPI) -> None:
@@ -44,14 +94,10 @@ def register_ws_stream(app: FastAPI) -> None:
 
     @app.websocket("/saklas/v1/sessions/{session_id}/stream")
     async def session_stream(websocket: WebSocket, session_id: str):
-        # NOTE: only ``session_id == "default"`` is actually reachable
-        # here — HF model ids contain '/' and the FastAPI path parameter
-        # is not declared ``{session_id:path}``, so the model-id branch
-        # is an HTTP-route convenience only.  Kept as a no-op guard.
         if not ws_auth_ok(websocket):
             await websocket.close(code=1008, reason="unauthorized")
             return
-        if session_id not in (SINGLE_SESSION_ID, session.model_id):
+        if session_id != SINGLE_SESSION_ID:
             await websocket.accept()
             await websocket.close(code=1008, reason="session not found")
             return
@@ -67,31 +113,43 @@ def register_ws_stream(app: FastAPI) -> None:
         # incoming frame through one queue lets both the outer dispatch
         # loop and the in-flight generation share the read side without
         # ever overlapping calls into the WS.
-        incoming: asyncio.Queue[Any] = asyncio.Queue()
-        _DISCONNECT = object()
+        incoming: asyncio.Queue[_Inbound] = asyncio.Queue()
 
         async def _reader():
             try:
                 while True:
-                    msg = await websocket.receive_json()
-                    await incoming.put(msg)
+                    raw = await websocket.receive_json()
+                    if not isinstance(raw, dict):
+                        await incoming.put(_InvalidInbound("message must be an object"))
+                    elif raw.get("type") in ("generate", "submit"):
+                        try:
+                            message = (
+                                WSSubmitMessage(**raw)
+                                if raw.get("type") == "submit"
+                                else WSGenerateMessage(**raw)
+                            )
+                            await incoming.put(message)
+                        except ValidationError as exc:
+                            await incoming.put(_InvalidInbound(str(exc)))
+                    elif raw.get("type") == "stop":
+                        await incoming.put(_Stop())
+                    else:
+                        await incoming.put(_InvalidInbound(f"unknown message type: {raw.get('type')!r}"))
             except WebSocketDisconnect:
-                await incoming.put(_DISCONNECT)
+                await incoming.put(_Disconnect())
             except Exception as e:
                 # Surface any other read-side failure into the queue so
                 # the dispatcher can close cleanly instead of leaking.
-                await incoming.put({"_reader_error": str(e), "_type": type(e).__name__})
+                await incoming.put(_ReaderFailure(str(e), type(e).__name__))
 
         reader_task = asyncio.create_task(_reader())
 
         # Loom: subscribe to ``LoomMutated`` for the connection's
-        # lifetime and forward as ``tree_mutated`` frames.  Also tag
-        # ``begin_assistant`` events into ``node_created`` so the client
-        # can pre-allocate render slots before token frames arrive.  Held
+        # lifetime and forward exact ``tree_mutated`` frames. Held
         # in a queue + forwarder task so the EventBus callback (which
         # runs on the gen thread) never touches the WS directly.
         loop = asyncio.get_running_loop()
-        tree_event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        tree_event_queue: asyncio.Queue[JSONObject] = asyncio.Queue()
         # ``websocket.send_json`` is not safe for concurrent callers —
         # starlette serializes per-call but two tasks can interleave
         # bytes on the wire and corrupt the frame sequence.  This lock
@@ -100,27 +158,19 @@ def register_ws_stream(app: FastAPI) -> None:
         # every send.
         ws_send_lock = asyncio.Lock()
 
-        async def _send_json(payload: Any) -> None:
+        async def _send_json(payload: JSONObject) -> None:
             async with ws_send_lock:
                 await websocket.send_json(payload)
 
-        def _queue_tree_event(payload: dict[str, Any]) -> None:
+        def _queue_tree_event(payload: JSONObject) -> None:
             with suppress(Exception):
                 loop.call_soon_threadsafe(tree_event_queue.put_nowait, payload)
 
         def _on_loom_event(event: object) -> None:
             if not isinstance(event, LoomMutated):
                 return
-            try:
-                tree = session.tree
-                added_nodes = [
-                    node_json(session, nid)
-                    for nid in event.added
-                    if tree.has(nid)
-                ]
-            except Exception:
-                added_nodes = []
-            mutated_payload: dict[str, Any] = {
+            added_nodes = [node_json(session, nid) for nid in event.added]
+            mutated_payload = cast(JSONObject, {
                 "type": "tree_mutated",
                 "op": event.op,
                 "rev": event.rev,
@@ -132,31 +182,17 @@ def register_ws_stream(app: FastAPI) -> None:
                     if session.tree.has(nid)
                 ],
                 "active_node_id": event.active_node_id,
-            }
+            })
+            # The roster is derived from the full tree's observed labels as
+            # well as explicit configuration.  Inline the small effective
+            # roster on every mutation so adds, deletes, and restores reconcile
+            # identity without a refetch or provenance inference client-side.
+            mutated_payload["cast"] = cast_json(session)
             _queue_tree_event(mutated_payload)
-            # ``begin_assistant`` and ``branch`` both materialize a new
-            # node — surface a separate ``node_created`` event with the
-            # parent + role so the client can allocate a render slot
-            # without waiting for the assistant text to start streaming.
-            if event.op in ("begin_assistant", "branch", "add_user"):
-                for nid in event.added:
-                    try:
-                        node = session.tree.get(nid)
-                    except Exception:
-                        continue
-                    node_payload = {
-                        "type": "node_created",
-                        "node_id": nid,
-                        "parent_id": node.parent_id,
-                        "role": node.role,
-                        "rev": event.rev,
-                    }
-                    _queue_tree_event(node_payload)
-
         loom_unsub = session.events.subscribe(_on_loom_event)
 
         async def _tree_forwarder():
-            """Forward tree-mutated / node-created events as WS frames.
+            """Forward tree-mutated events as WS frames.
 
             Runs as a dedicated task for the connection's lifetime so
             tree mutations from any source (this WS, a REST route on a
@@ -170,12 +206,55 @@ def register_ws_stream(app: FastAPI) -> None:
                         await _send_json(payload)
                     except Exception:
                         return
+                    if payload.get("op") == "finalize_assistant":
+                        updated = payload.get("updated")
+                        if isinstance(updated, list):
+                            for node in updated:
+                                if not isinstance(node, dict):
+                                    continue
+                                node_id = node.get("id")
+                                if isinstance(node_id, str):
+                                    tree_forwarded_finalized.add(node_id)
+                    tree_forwarded_event.set()
             except asyncio.CancelledError:
                 return
 
+        tree_forwarded_finalized: set[str] = set()
+        tree_forwarded_event = asyncio.Event()
         forwarder_task = asyncio.create_task(_tree_forwarder())
 
-        deferred_incoming: deque[Any] = deque()
+        async def _wait_for_tree_finalization(node_id: str) -> None:
+            """Do not let ``done`` overtake its authoritative tree delta.
+
+            The mutation forwarder and generation dispatcher are separate
+            tasks sharing a send lock.  Serialization alone does not impose
+            ordering: the dispatcher could acquire the lock first even though
+            the worker had already queued its ``finalize`` event, briefly
+            leaving clients with a completed but empty assistant node.
+            """
+            while node_id not in tree_forwarded_finalized:
+                tree_forwarded_event.clear()
+                if node_id in tree_forwarded_finalized:
+                    return
+                event_wait = asyncio.create_task(tree_forwarded_event.wait())
+                finished, pending = await asyncio.wait(
+                    {event_wait, forwarder_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    if task is not forwarder_task:
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+                if (
+                    forwarder_task in finished
+                    and node_id not in tree_forwarded_finalized
+                ):
+                    raise RuntimeError(
+                        "tree mutation stream ended before generation finalization"
+                    )
+
+        deferred_incoming: deque[_Inbound] = deque()
 
         async def _cancel_and_wait(task: asyncio.Task[Any]) -> None:
             task.cancel()
@@ -193,34 +272,23 @@ def register_ws_stream(app: FastAPI) -> None:
                     if deferred_incoming
                     else await incoming.get()
                 )
-                if msg is _DISCONNECT:
+                if isinstance(msg, _Disconnect):
                     raise WebSocketDisconnect(code=1000)
-                if isinstance(msg, dict) and "_reader_error" in msg:
-                    raise RuntimeError(msg["_reader_error"])
-
-                mtype = msg.get("type") if isinstance(msg, dict) else None
-                if mtype == "generate":
-                    try:
-                        parsed = WSGenerateMessage(**msg)
-                    except Exception as e:
-                        await _send_json({
-                            "type": "error",
-                            "message": f"invalid generate message: {e}",
-                            "code": "ValidationError",
-                        })
-                        continue
+                if isinstance(msg, _ReaderFailure):
+                    raise RuntimeError(msg.message)
+                if isinstance(msg, (WSGenerateMessage, WSSubmitMessage)):
                     await _ws_handle_generate(
-                        session, parsed, app.state.default_steering, incoming,
-                        deferred_incoming, _send_json,
+                        session, msg, app.state.default_steering, incoming,
+                        deferred_incoming, _send_json, _wait_for_tree_finalization,
                     )
-                elif mtype == "stop":
+                elif isinstance(msg, _Stop):
                     # Idle-state stop: nothing in flight.
                     continue
                 else:
                     await _send_json({
                         "type": "error",
-                        "message": f"unknown message type: {mtype!r}",
-                        "code": "UnknownMessageType",
+                        "message": msg.message,
+                        "code": "ValidationError",
                     })
         except WebSocketDisconnect:
             # Ensure any stray generation is signaled.
@@ -251,11 +319,12 @@ def register_ws_stream(app: FastAPI) -> None:
 
 async def _ws_handle_generate(
     session: SaklasSession,
-    msg: WSGenerateMessage,
+    msg: WSGenerateMessage | WSSubmitMessage,
     default_steering: "Steering | None",
-    incoming: asyncio.Queue[Any],
-    deferred_incoming: "deque[Any]",
-    send_json: Callable[[Any], Awaitable[None]],
+    incoming: asyncio.Queue[_Inbound],
+    deferred_incoming: "deque[_Inbound]",
+    send_json: Callable[[JSONObject], Awaitable[None]],
+    wait_for_tree_finalization: Callable[[str], Awaitable[None]],
 ) -> None:
     """Run one generate turn and stream token/done/error events.
 
@@ -285,12 +354,108 @@ async def _ws_handle_generate(
     (per decision 7 in the plan — N-way gen is serial in v1).  Each
     sibling produces its own ``started`` / token-stream / ``done``
     triplet, all tagged with the assistant node id.  ``tree_mutated``
-    and ``node_created`` events ride the connection-level subscription
+    events ride the connection-level subscription
     in ``session_stream``; this handler only emits the per-sibling
     ``started`` / ``token`` / ``done`` frames.
     """
     loop = asyncio.get_running_loop()
 
+    # ``submit`` is the native composer contract: an explicit authored role
+    # plus an optional generated role.  Normalize its generation half to the
+    # legacy adapter shape while retaining the authored turn for one atomic
+    # commit inside the generation worker (the async session lock below covers
+    # the whole commit + N-way fan).  ``generate`` remains accepted for protocol
+    # compatibility and the specialist fork/prefill tools.
+    submit = msg if isinstance(msg, WSSubmitMessage) else None
+    submit_text: str | None = None
+    submit_authored_role: Literal["user", "assistant"] | None = None
+    submit_authored_thinking: str | None = None
+    native_commit_role: Literal["user", "assistant"] | None = None
+    if submit is not None:
+        if submit.text is None:
+            if submit.authored_role is not None:
+                await send_json({
+                    "type": "error",
+                    "message": "authored_role requires non-empty text",
+                    "code": "ValueError",
+                    "status": 400,
+                })
+                return
+            if submit.authored_thinking is not None:
+                await send_json({
+                    "type": "error",
+                    "message": "authored_thinking requires non-empty text",
+                    "code": "ValueError",
+                    "status": 400,
+                })
+                return
+        else:
+            if submit.text == "":
+                await send_json({
+                    "type": "error",
+                    "message": "submit text must be non-empty when present",
+                    "code": "ValueError",
+                    "status": 400,
+                })
+                return
+            if submit.authored_role is None:
+                await send_json({
+                    "type": "error",
+                    "message": "text requires authored_role",
+                    "code": "ValueError",
+                    "status": 400,
+                })
+                return
+            submit_text = submit.text
+            submit_authored_role = submit.authored_role
+            submit_authored_thinking = submit.authored_thinking
+        if submit.generated_role is None and submit_text is None:
+            await send_json({
+                "type": "error",
+                "message": "submit requires text or generated_role",
+                "code": "ValueError",
+                "status": 400,
+            })
+            return
+
+        # Append-only submissions can use the established no-decode path.
+        # Append+generate keeps the authored fields above and generates from
+        # ``input=None`` after the worker lands the turn.
+        if submit.generated_role is None:
+            assert submit_authored_role is not None
+            native_commit_role = submit_authored_role
+            msg = WSGenerateMessage(
+                type="generate",
+                commit_role=submit_authored_role,
+                commit_text=submit_text,
+                commit_thinking=submit_authored_thinking,
+                parent_node_id=submit.parent_node_id,
+                sampling=submit.sampling,
+                raw=submit.raw,
+            )
+            submit_text = None
+            submit_authored_role = None
+            submit_authored_thinking = None
+        else:
+            msg = WSGenerateMessage(
+                type="generate",
+                input=None,
+                steering=submit.steering,
+                sampling=submit.sampling,
+                thinking=submit.thinking,
+                stateless=False,
+                raw=submit.raw,
+                parent_node_id=submit.parent_node_id,
+                n=submit.n,
+                recipe_override=submit.recipe_override,
+                generate_seat=submit.generated_role,
+            )
+
+    # Both submit branches above normalize to the specialist generation
+    # schema; direct generate frames already have that type.  Keep the
+    # invariant explicit for readers and static analysis across the long
+    # handler below.
+    assert isinstance(msg, WSGenerateMessage)
     sampling = build_sampling(msg.sampling)
     try:
         req_steering, explicit_clear = parse_request_steering(msg.steering)
@@ -330,6 +495,7 @@ async def _ws_handle_generate(
         return
 
     parent_node_id = msg.parent_node_id
+    submitted_parent_holder: list[str] = []
 
     # Logit fork: when ``fork_node_id`` is set the worker calls
     # ``session.fork_from_token`` instead of ``session.generate``.  All
@@ -404,7 +570,11 @@ async def _ws_handle_generate(
                 "status": 400,
             })
             return
-        if msg.commit_role == "assistant" and parent_node_id is None:
+        if (
+            native_commit_role is None
+            and msg.commit_role == "assistant"
+            and parent_node_id is None
+        ):
             await send_json({
                 "type": "error",
                 "message": (
@@ -446,7 +616,25 @@ async def _ws_handle_generate(
                 })
                 return
             try:
-                if msg.commit_role == "user":
+                commit_thinking = (
+                    None if msg.raw else (msg.commit_thinking or None)
+                )
+                if native_commit_role is not None:
+                    commit_label = (
+                        commit_user_role
+                        if native_commit_role == "user"
+                        else commit_asst_role
+                    )
+                    new_id = await asyncio.to_thread(
+                        session.append_turn,
+                        parent_node_id,
+                        commit_text,
+                        role=native_commit_role,
+                        raw=msg.raw,
+                        role_label=None if msg.raw else commit_label,
+                        thinking=commit_thinking,
+                    )
+                elif msg.commit_role == "user":
                     # ``raw`` flags a flat (base-model) commit — the
                     # authored span may hang under a node of any role,
                     # so the user-under-user guard is lifted.
@@ -456,6 +644,7 @@ async def _ws_handle_generate(
                         commit_text,
                         allow_any_parent=msg.raw,
                         role_label=None if msg.raw else commit_user_role,
+                        thinking=commit_thinking,
                     )
                 else:
                     # ``parent_node_id`` is non-None here (validated above
@@ -466,6 +655,7 @@ async def _ws_handle_generate(
                         parent_node_id,
                         commit_text,
                         role_label=None if msg.raw else commit_asst_role,
+                        thinking=commit_thinking,
                     )
             except SaklasError as e:
                 status, message = e.user_message()
@@ -481,12 +671,13 @@ async def _ws_handle_generate(
         await send_json({
             "type": "done",
             "result": {
-                "kind": "commit",
+                "kind": (
+                    "append" if native_commit_role is not None else "commit"
+                ),
                 "role": msg.commit_role,
                 "text": commit_text,
                 "node_id": new_id,
                 "finish_reason": "stop",
-                "per_token_probes": [],
                 "mean_logprob": None,
                 "mean_surprise": None,
             },
@@ -528,6 +719,7 @@ async def _ws_handle_generate(
             return
         for sibling_idx, seed_i in enumerate(seeds):
             generation_id = uuid.uuid4().hex[:12]
+            tree_rev_before_generation = int(session.tree.rev)
 
             # Per-sibling sampling override carrying the derived seed.
             if n == 1 and seed_i is None:
@@ -537,8 +729,7 @@ async def _ws_handle_generate(
                 base_sc = sampling if sampling is not None else SamplingConfig()
                 per_sibling_sampling = _dc_replace(base_sc, seed=seed_i)
 
-            token_queue: asyncio.Queue[Any] = asyncio.Queue()
-            _SENTINEL = object()
+            token_queue: asyncio.Queue[_TokenQueueItem] = asyncio.Queue()
             # The tree assigns the assistant node id at ``begin_assistant``
             # time inside ``_generate_core``; we don't know it before the
             # gen starts.  The on_token callback reads the live active
@@ -551,10 +742,10 @@ async def _ws_handle_generate(
                 is_thinking: bool,
                 tid: int | None,
                 lp: float | None,
-                top_alts: list[Any] | None,
+                top_alts: list[TokenAlt] | None,
                 perplexity: float | None = None,
                 _node_holder: list[str | None] = current_node_holder,
-                _token_queue: asyncio.Queue[Any] = token_queue,
+                _token_queue: asyncio.Queue[_TokenQueueItem] = token_queue,
             ) -> None:
                 event = build_token_event(
                     session,
@@ -564,13 +755,28 @@ async def _ws_handle_generate(
                     tid=tid,
                     lp=lp,
                     top_alts=top_alts,
+                    perplexity=perplexity,
                 )
-                loop.call_soon_threadsafe(_token_queue.put_nowait, event)
-            _on_token_flags: Any = _on_token
-            _on_token_flags._saklas_wants_live_scores = True
-            _on_token_flags._saklas_wants_per_layer_scores = True
+                loop.call_soon_threadsafe(
+                    _token_queue.put_nowait, _TokenFrame(cast(JSONObject, event))
+                )
+            consumer = TokenConsumer(
+                _on_token,
+                TokenConsumerOptions(
+                    live_scores=True,
+                    per_layer_scores=True,
+                    lens_readout=True,
+                    sae_readout=True,
+                    perplexity=True,
+                ),
+            )
+            # Live J-lens workspace readout: computed only when the session's
+            # live lens is enabled (POST .../lens/live) AND the tap consumer
+            # declares interest through ``TokenConsumerOptions`` (the same
+            # typed capability object used by ``generate_stream``), so an enabled lens
+            # streams per-step top-k on the ``token`` frame's ``lens_readout``.
 
-            result_holder: list[GenerationResult | RunSet] = []
+            result_holder: list[GenerationResult] = []
             error_holder: list[BaseException] = []
 
             # Recipe-override (phase 5): accept either a mode string or a
@@ -583,14 +789,34 @@ async def _ws_handle_generate(
 
             def _worker(
                 _sampling: SamplingConfig | None = per_sibling_sampling,
-                _on_token: Callable[..., Any] = _on_token,
-                _result_holder: list[GenerationResult | RunSet] = result_holder,
+                _on_token: TokenConsumer = consumer,
+                _result_holder: list[GenerationResult] = result_holder,
                 _error_holder: list[BaseException] = error_holder,
-                _token_queue: asyncio.Queue[Any] = token_queue,
-                _sentinel: object = _SENTINEL,
-                _recipe_override: Any = recipe_override,
+                _token_queue: asyncio.Queue[_TokenQueueItem] = token_queue,
+                _recipe_override: str | None = recipe_override,
             ) -> None:
                 try:
+                    effective_parent = parent_node_id
+                    if submit_text is not None:
+                        if not submitted_parent_holder:
+                            assert submit_authored_role is not None
+                            commit_label = None
+                            if not msg.raw and msg.sampling is not None:
+                                commit_label = (
+                                    msg.sampling.user_role
+                                    if submit_authored_role == "user"
+                                    else msg.sampling.assistant_role
+                                ) or None
+                            committed_id = session.append_turn(
+                                parent_node_id,
+                                submit_text,
+                                role=submit_authored_role,
+                                raw=msg.raw,
+                                role_label=commit_label,
+                                thinking=submit_authored_thinking,
+                            )
+                            submitted_parent_holder.append(committed_id)
+                        effective_parent = submitted_parent_holder[0]
                     if msg.fork_node_id is not None:
                         # Fork: recipe / sampling / parent all come from
                         # the source node inside ``fork_from_token``; the
@@ -622,16 +848,25 @@ async def _ws_handle_generate(
                             "raw": msg.raw,
                             "thinking": msg.thinking,
                             "on_token": _on_token,
-                            "parent_node_id": parent_node_id,
+                            "parent_node_id": effective_parent,
                         }
                         if _recipe_override is not None:
                             gen_kwargs["recipe_override"] = _recipe_override
-                        result = session.generate(msg.input, **gen_kwargs)
+                        if msg.generate_seat is not None:
+                            gen_kwargs["gen_seat"] = msg.generate_seat
+                        # Fan-out is intentionally sibling-oriented. A normal
+                        # one-shot call takes the engine's coalescing default;
+                        # only the exceptional fan case needs an override.
+                        if n > 1:
+                            gen_kwargs["append_same_role"] = False
+                        result = session.generate(
+                            build_input(msg.input), **gen_kwargs,
+                        ).first
                     _result_holder.append(result)
                 except BaseException as e:
                     _error_holder.append(e)
                 finally:
-                    loop.call_soon_threadsafe(_token_queue.put_nowait, _sentinel)
+                    loop.call_soon_threadsafe(_token_queue.put_nowait, _TokenDone())
 
             await send_json({
                 "type": "started",
@@ -655,58 +890,54 @@ async def _ws_handle_generate(
             # lifetime.
             done = False
             stop_signaled = False
+            token_get = asyncio.create_task(token_queue.get())
+            client_get = asyncio.create_task(incoming.get())
             try:
                 while not done:
-                    token_get = asyncio.create_task(token_queue.get())
-                    client_get = asyncio.create_task(incoming.get())
-                    finished, pending = await asyncio.wait(
+                    finished, _pending = await asyncio.wait(
                         {token_get, client_get}, return_when=asyncio.FIRST_COMPLETED,
                     )
                     if client_get in finished:
                         incoming_msg = client_get.result()
-                        # ``_DISCONNECT`` / reader-error sentinels:
+                        # Disconnect / reader-error lifecycle messages:
                         # signal the worker to wind down; let the outer
                         # loop propagate the disconnect on the next
                         # iteration.
-                        if isinstance(incoming_msg, dict):
-                            if incoming_msg.get("type") == "stop":
-                                _stop_session_safely()
-                                stop_signaled = True
-                            elif "_reader_error" in incoming_msg:
-                                _stop_session_safely()
-                                stop_signaled = True
-                                # Defer so the outer dispatch loop
-                                # surfaces the error after we wind down.
-                                deferred_incoming.append(incoming_msg)
-                            else:
-                                # Out-of-band frame during a generation —
-                                # defer so the outer loop sees it
-                                # after this turn finishes.  Most likely
-                                # an early ``{type: "generate"}`` from a
-                                # client that didn't wait for ``done``.
-                                #
-                                # Do not put it back on ``incoming`` here:
-                                # the next loop iteration would consume it
-                                # immediately, cancel token_queue.get(), and
-                                # spin until the worker happened to have a
-                                # token already queued.
-                                deferred_incoming.append(incoming_msg)
-                        else:
-                            # Disconnect sentinel from the reader.
+                        if isinstance(incoming_msg, _Stop):
+                            _stop_session_safely()
+                            stop_signaled = True
+                        elif isinstance(incoming_msg, (_Disconnect, _ReaderFailure)):
                             _stop_session_safely()
                             stop_signaled = True
                             deferred_incoming.append(incoming_msg)
+                        else:
+                            # Out-of-band generate/invalid frame: defer until done.
+                            deferred_incoming.append(incoming_msg)
+                        client_get = asyncio.create_task(incoming.get())
                     if token_get in finished:
                         item = token_get.result()
-                        if item is _SENTINEL:
+                        if isinstance(item, _TokenDone):
                             done = True
                         else:
-                            await send_json(item)
-                    for task in pending:
-                        task.cancel()
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
+                            await send_json(item.payload)
+                            token_get = asyncio.create_task(token_queue.get())
             finally:
+                # Keep each queue read alive until it resolves.  Cancelling and
+                # recreating ``incoming.get()`` after every token can race a
+                # just-delivered stop frame: Queue.get has already removed the
+                # item, but task cancellation wins before the dispatcher sees
+                # the result.  At turn end, preserve any frame that completed
+                # just after the final token wait for the outer dispatcher.
+                if not client_get.done():
+                    client_get.cancel()
+                with suppress(asyncio.CancelledError):
+                    await client_get
+                if not client_get.cancelled():
+                    deferred_incoming.append(client_get.result())
+                if not token_get.done():
+                    token_get.cancel()
+                with suppress(asyncio.CancelledError):
+                    await token_get
                 # Drain any residual events the worker pushed between
                 # sentinel and join — should be none because the
                 # sentinel is last, but cheap insurance.
@@ -714,10 +945,26 @@ async def _ws_handle_generate(
 
             if error_holder and not result_holder:
                 exc = error_holder[0]
+                # The model worker runs in a thread, so by the time control
+                # returns here there is no active exception for
+                # ``logger.exception`` to capture.  Preserve its original
+                # traceback explicitly: native WebSocket failures used to be
+                # surfaced only to the browser, leaving operators with no
+                # actionable server-side evidence for backend/device bugs.
+                _logger.error(
+                    "native WebSocket generation failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                if isinstance(exc, SaklasError):
+                    status, message = exc.user_message()
+                else:
+                    status = 500
+                    message = "Generation failed. Check the server log for details."
                 await send_json({
                     "type": "error",
-                    "message": str(exc),
+                    "message": message,
                     "code": type(exc).__name__,
+                    "status": status,
                     "node_id": current_node_holder[0],
                     "sibling_index": sibling_idx,
                 })
@@ -725,24 +972,27 @@ async def _ws_handle_generate(
                 # rather than continuing with stale state.
                 return
 
-            result = result_holder[0] if result_holder else None
+            if not result_holder:
+                raise RuntimeError("generation completed without a result")
+            result = result_holder[0]
             result_json = result_to_json(result)
-            if result is not None:
-                result_json["per_token_probes"] = per_token_probes(
-                    session, getattr(result, "token_count", 0) or 0,
-                )
-                # Per-attached-manifold-probe aggregate readings ride on
-                # the ``done`` event so a WS client picks up the
-                # geometric channel alongside the existing vector-probe
-                # ``per_token_probes`` block.  Empty dict when no
-                # manifold probe is attached.  Shared with the SSE / NDJSON
-                # finalization via ``probe_reading_aggregate`` (result-
-                # parameterized so each n>1 sibling scores its own result).
-                mf_readings = probe_reading_aggregate(session, result)
-                if mf_readings:
-                    result_json["probe_readings"] = mf_readings
-            else:
-                result_json["per_token_probes"] = []
+            # The engine deliberately uses the OpenAI-compatible ``stop``
+            # finish reason for EOS, stop sequences, and an external stop
+            # request.  This native WebSocket knows which case happened:
+            # surface a distinct UI-only reason so the dashboard does not
+            # present a user-cancelled 659/1024-token turn as ordinary
+            # completion.  Protocol adapters and the stored loom recipe keep
+            # the engine's canonical reason unchanged.
+            if stop_signaled and result_json.get("finish_reason") == "stop":
+                result_json["finish_reason"] = "cancelled"
+            # The settled per-probe aggregate rides the ``done`` event in
+            # the same rich shape as each token frame.  Shared with the
+            # SSE / NDJSON finalization via ``probe_reading_aggregate``
+            # (result-parameterized so each n>1 sibling scores its own
+            # result).
+            mf_readings = probe_reading_aggregate(session, result)
+            if mf_readings:
+                result_json["probe_readings"] = mf_readings
             # Phase 1 logit pass: stamp the per-turn logprob rollup on the
             # ``done`` event so subscribers (loom sidebar's sort-by-surprise,
             # webui chat-header summary) don't need to re-fetch the node.
@@ -754,18 +1004,16 @@ async def _ws_handle_generate(
             mean_surprise_out: float | None = None
             finalized_node_id = current_node_holder[0]
             if finalized_node_id is not None:
-                try:
-                    node = session.tree.nodes.get(finalized_node_id)
-                    if node is not None:
-                        mean_logprob_out = node.mean_logprob
-                        mean_surprise_out = node.mean_surprise
-                except Exception:
-                    # Defensive: tree access during shutdown / mocked
-                    # session edge cases. Default-None values keep the
-                    # wire payload well-formed.
-                    pass
+                node = session.tree.get(finalized_node_id)
+                mean_logprob_out = node.mean_logprob
+                mean_surprise_out = node.mean_surprise
             result_json["mean_logprob"] = mean_logprob_out
             result_json["mean_surprise"] = mean_surprise_out
+            if (
+                finalized_node_id is not None
+                and int(session.tree.rev) > tree_rev_before_generation
+            ):
+                await wait_for_tree_finalization(finalized_node_id)
             await send_json({
                 "type": "done",
                 "result": result_json,

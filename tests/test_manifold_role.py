@@ -51,7 +51,7 @@ def _author_role_folder(root: Path, *, with_roles: bool = True) -> Path:
         (folder / "nodes" / f"{idx:02d}_{label}.json").write_text(
             json.dumps(statements)
         )
-    nodes = [{"label": label} for label in labels]
+    nodes = [{"label": label, "role": None, "kind": None} for label in labels]
     if with_roles:
         for entry, label in zip(nodes, labels):
             entry["role"] = label
@@ -63,6 +63,9 @@ def _author_role_folder(root: Path, *, with_roles: bool = True) -> Path:
         "hyperparams": {"max_dim": 4, "var_threshold": 0.7},
         "nodes": nodes,
         "files": {},
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
     }
     (folder / "manifold.json").write_text(json.dumps(meta))
     return folder
@@ -80,13 +83,8 @@ def test_per_node_role_round_trip(tmp_path: Path):
     assert mf2.node_roles == ["pirate", "cowboy", "professor"]
 
 
-def test_legacy_folder_without_roles_loads_all_none(tmp_path: Path):
-    """Loading a manifold whose nodes carry no ``role`` field yields an
-    all-``None`` ``node_roles`` list of the right length.  This is
-    semantically "no roles" — :meth:`ManifoldFolder.nodes_sha256` and
-    :meth:`Manifold.nearest_node_role` both treat an all-``None`` list
-    as the legacy / non-role path, byte-identical to the
-    pre-Phase-A behavior."""
+def test_explicit_null_roles_load_as_all_none(tmp_path: Path):
+    """Explicit null roles produce the standard-assistant role roster."""
     from saklas.io.manifolds import ManifoldFolder
 
     folder = _author_role_folder(tmp_path, with_roles=False)
@@ -118,7 +116,7 @@ def test_invalid_role_slug_rejected(tmp_path: Path):
         )
     from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
 
-    nodes = [{"label": label} for label in labels]
+    nodes = [{"label": label, "role": None, "kind": None} for label in labels]
     # Uppercase fails the slug regex.
     nodes[0]["role"] = "Pirate"
     (folder / "manifold.json").write_text(
@@ -130,6 +128,9 @@ def test_invalid_role_slug_rejected(tmp_path: Path):
             "hyperparams": {},
             "nodes": nodes,
             "files": {},
+            "source": "local",
+            "tags": [],
+            "template_ref": None,
         })
     )
     with pytest.raises(ManifoldFormatError, match="role 'Pirate' invalid"):
@@ -404,3 +405,44 @@ def test_namespace_qualified_bare_name_still_resolves(tmp_path: Path, monkeypatc
     assert isinstance(term, ManifoldTerm)
     assert term.manifold == "local/persona"
     assert term.position == "pirate"
+
+
+def test_vector_authoring_rejects_role_cache_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import Any, cast
+    from types import SimpleNamespace
+
+    from saklas.core.session import SaklasSession
+    from saklas.io.manifolds import create_discover_manifold_folder
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "honest.deceptive", "", fit_mode="pca",
+        node_corpora={"honest": ["yes"], "deceptive": ["no"]},
+        node_roles={"honest": "pirate", "deceptive": "pirate"},
+    )
+    with pytest.raises(ValueError, match="not uniformly None"):
+        SaklasSession._author_and_fit_2node(
+            cast(Any, SimpleNamespace()), "local", "honest.deceptive", "",
+            node_corpora=None,
+            node_kinds={"honest": "abstract", "deceptive": "abstract"},
+            role=None, force=False, sae=None, sae_revision=None,
+            on_progress=None,
+        )
+
+
+def test_vector_authoring_centrally_rejects_sae_plus_role() -> None:
+    from typing import Any, cast
+    from types import SimpleNamespace
+
+    from saklas.core.session import SaklasSession
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SaklasSession._author_and_fit_2node(
+            cast(Any, SimpleNamespace()), "local", "honest.deceptive", "",
+            node_corpora=None,
+            node_kinds={"honest": "abstract", "deceptive": "abstract"},
+            role="pirate", force=False, sae="release", sae_revision=None,
+            on_progress=None,
+        )

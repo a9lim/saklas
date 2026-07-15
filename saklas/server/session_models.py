@@ -2,24 +2,21 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any
-
-from pydantic import BaseModel
 
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
-from saklas.server.native_common import resolve_session_id, session_aliases
+from saklas.server.native_common import NativeRequest
 
 
-class CreateSessionRequest(BaseModel):
+class CreateSessionRequest(NativeRequest):
     model: str | None = None
     device: str | None = None
     dtype: str | None = None
 
 
-class PatchSessionRequest(BaseModel):
+class PatchSessionRequest(NativeRequest):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -28,23 +25,25 @@ class PatchSessionRequest(BaseModel):
     thinking: bool | None = None
 
 
+class ValidateSteeringRequest(NativeRequest):
+    expression: str
+
+
 def session_config_dict(session: SaklasSession) -> dict[str, Any]:
     cfg = session.config
     return {
-        "temperature": getattr(cfg, "temperature", None),
-        "top_p": getattr(cfg, "top_p", None),
-        "top_k": getattr(cfg, "top_k", None),
-        "max_tokens": getattr(cfg, "max_new_tokens", None),
-        "system_prompt": getattr(cfg, "system_prompt", None),
-        "thinking": getattr(cfg, "thinking", None),
+        "temperature": cfg.temperature,
+        "top_p": cfg.top_p,
+        "top_k": cfg.top_k,
+        "max_tokens": cfg.max_new_tokens,
+        "system_prompt": cfg.system_prompt,
+        "thinking": cfg.thinking,
     }
 
 
 def session_model_type(session: SaklasSession) -> str | None:
     """Resolve the loaded model's ``model_type`` through multimodal wrappers."""
-    model_cfg = getattr(getattr(session, "model", None), "config", None)
-    if model_cfg is None:
-        return None
+    model_cfg = session.model.config
     text_cfg = getattr(model_cfg, "text_config", None)
     mt = getattr(text_cfg, "model_type", None) if text_cfg is not None else None
     return mt or getattr(model_cfg, "model_type", None)
@@ -81,68 +80,67 @@ def default_role_labels(
 
 
 def device_dtype(session: SaklasSession) -> tuple[str, str]:
-    info = session.model_info or {}
-    device = str(info.get("device", getattr(session, "device", "")))
-    dtype = str(info.get("dtype", getattr(session, "_dtype", "")))
-    return device, dtype
+    info = session.model_info
+    return str(info["device"]), str(info["dtype"])
+
+
+def _scene_capabilities(session: SaklasSession) -> dict[str, bool]:
+    """Serialize the current session's validated scene grammar."""
+    grammar = session.scene_grammar
+    return {
+        "scene_mode": grammar is not None,
+        "thinking_input_supported": bool(
+            grammar is not None and isinstance(grammar.think_open, str)
+        ),
+        "strips_history_thinking": bool(
+            grammar is not None and grammar.strips_history_thinking is True
+        ),
+    }
 
 
 def session_info(
-    session: SaklasSession, default_steering: Steering | None,
+    session: SaklasSession,
+    default_steering: Steering | None,
+    created_ts: int,
 ) -> dict[str, Any]:
     device, dtype = device_dtype(session)
-    try:
-        thinks = bool(supports_thinking(session.tokenizer))
-        thinks_optional = bool(thinking_is_optional(session.tokenizer))
-    except Exception:
-        thinks = False
-        thinks_optional = False
-    try:
-        is_base = bool(session.is_base_model)
-    except Exception:
-        is_base = False
-    created = getattr(session, "_created_ts", None) or int(time.time())
+    thinks = bool(supports_thinking(session.tokenizer))
+    thinks_optional = bool(thinking_is_optional(session.tokenizer))
+    is_base = bool(session.is_base_model)
     default_expr = str(default_steering) if default_steering is not None else None
-    try:
-        assistant_role_ok, user_role_ok = role_support(session)
-        default_assistant_role, default_user_role = default_role_labels(session)
-    except Exception:
-        assistant_role_ok = user_role_ok = False
-        default_assistant_role = default_user_role = None
-    try:
-        from saklas.io.lens import lens_paths
-
-        jlens_fitted = lens_paths(session.model_id)[0].exists()
-    except Exception:
-        jlens_fitted = False
+    assistant_role_ok, user_role_ok = role_support(session)
+    default_assistant_role, default_user_role = default_role_labels(session)
+    jlens_fitted = session.has_compatible_jlens()
+    sae_info = session.sae_info
     return {
         "id": "default",
-        "aliases": session_aliases(session),
         "model_id": session.model_id,
         "device": device,
         "dtype": dtype,
-        "created": created,
+        "created": created_ts,
         "config": session_config_dict(session),
         "vectors": sorted(session.vectors.keys()),
         "probes": sorted(session.probes.keys()),
-        "history_length": len(session.history) if hasattr(session, "history") else 0,
+        "history_length": len(session.tree.messages_for()),
         "supports_thinking": thinks,
         "thinking_is_optional": thinks_optional,
         "is_base_model": is_base,
         "jlens_fitted": jlens_fitted,
+        "live_lens_layers": session.live_lens_layers,
+        "sae_loaded": sae_info is not None,
+        "sae_info": sae_info,
+        "live_sae": session.live_sae,
+        # CAA live toggle state (POST .../probes/live): whether per-token
+        # monitor scoring feeds live consumers.
+        "live_probe_scores": session.live_probe_scores,
         "default_steering": default_expr,
         "role_substitution_supported": assistant_role_ok,
         "user_role_supported": user_role_ok,
         "default_assistant_role": default_assistant_role,
         "default_user_role": default_user_role,
+        # Scene-grammar capabilities (the cast model): scene_mode gates
+        # the seat toggle + free commit seating, thinking_input_supported
+        # the committed-thinking box, strips_history_thinking its
+        # "lasts one turn" pre-submit warning.
+        **_scene_capabilities(session),
     }
-
-
-# Backcompat aliases for the old ``saklas_api.py`` import surface.
-_resolve_session_id = resolve_session_id
-_session_config_dict = session_config_dict
-_session_model_type = session_model_type
-_role_support = role_support
-_default_role_labels = default_role_labels
-_device_dtype = device_dtype
-_session_info = session_info

@@ -37,7 +37,7 @@ def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
     return sub
 
 
-def _iso_monitor(m: "Manifold") -> Monitor:
+def _iso_monitor(m: "Manifold", *, n_layers: int | None = None) -> Monitor:
     """A ``Monitor`` wired with an isotropic whitener over ``m``'s
     fit layers.
 
@@ -50,7 +50,7 @@ def _iso_monitor(m: "Manifold") -> Monitor:
     from tests._whitener import isotropic_whitener
     dim = next(iter(m.layers.values())).mean.shape[0]
     whitener = isotropic_whitener(list(m.layers.keys()), dim)
-    return Monitor(whitener=whitener)
+    return Monitor(whitener=whitener, n_layers=n_layers)
 
 
 def _node_world(m: Manifold, layer_idx: int) -> torch.Tensor:
@@ -118,6 +118,8 @@ def _toy_manifold(
         sub, ev_ratio = _fit_layer_subspace_with_ev(
             centroids, domain.embed(coords),
         )
+        sub.sigma_rbf_weights = torch.zeros(coords.shape[0], 1)
+        sub.sigma_poly_coeffs = torch.zeros(domain.embed(coords).shape[1] + 1, 1)
         layers[layer_idx] = sub
         share[layer_idx] = ev_ratio
     return Manifold(
@@ -127,6 +129,7 @@ def _toy_manifold(
         node_coords=coords,
         layers=layers,
         mahalanobis_share=share,
+        origin={layer: torch.zeros(domain.intrinsic_dim) for layer in layers},
     )
 
 
@@ -458,12 +461,15 @@ def _curved_toy(dim: int = 8, seed: int = 0) -> "Manifold":
         s = 1.0 + 0.5 * layer_idx
         centroids = s * (u.unsqueeze(1) * e1 + (u ** 2).unsqueeze(1) * e2)
         sub, ev_ratio = _fit_layer_subspace_with_ev(centroids, domain.embed(coords))
+        sub.sigma_rbf_weights = torch.zeros(coords.shape[0], 1)
+        sub.sigma_poly_coeffs = torch.zeros(domain.embed(coords).shape[1] + 1, 1)
         layers[layer_idx] = sub
         share[layer_idx] = ev_ratio
     return Manifold(
         name="curve", domain=domain,
         node_labels=["a", "b", "c", "d", "e"],
         node_coords=coords, layers=layers, mahalanobis_share=share,
+        origin={layer: torch.zeros(domain.intrinsic_dim) for layer in layers},
     )
 
 
@@ -555,6 +561,40 @@ def test_gate_scalar_fraction_label_assignment_skip_curved_foot(
     assert scalars["curve~c"] == pytest.approx(full["curve~c"])
 
 
+def test_planned_gate_scalars_match_public_and_full_reading():
+    m = _curved_toy(dim=8)
+    _attach_const_sigma(m, 0.3)
+    mon = _iso_monitor(m)
+    mon.add_probe("curve", m, top_n=5)
+    hidden = {L: _node_world(m, L)[2] for L in m.layers}
+    keys = {
+        "curve",
+        "curve:fraction",
+        "curve@c",
+        "curve~c",
+        "curve:membership",
+        "curve@missing",
+        "curve~missing",
+    }
+
+    plan = mon.plan_gate_scalars(keys)
+    planned = mon.score_planned_gate_scalars(hidden, plan)
+    public = mon.score_gate_scalars(hidden, keys)
+    full = mon.flat_scalars(mon.score_single_token(hidden))
+
+    assert len(plan) == 1
+    assert plan[0].dist_index is not None
+    assert plan[0].assign_index is not None
+    assert "curve@missing" not in planned
+    assert "curve~missing" not in planned
+    assert planned == pytest.approx(public)
+    for key in keys - {"curve@missing", "curve~missing"}:
+        assert planned[key] == pytest.approx(full[key])
+    axis_plan = mon.plan_gate_scalars({"curve[0]"})
+    axis_planned = mon.score_planned_gate_scalars(hidden, axis_plan)
+    assert axis_planned["curve[0]"] == pytest.approx(full["curve[0]"])
+
+
 def test_gate_scalar_requested_labels_ignore_probe_top_n():
     m = _toy_manifold()
     mon = _iso_monitor(m)
@@ -571,6 +611,55 @@ def test_gate_scalar_requested_labels_ignore_probe_top_n():
     assert scalars["toy@a"] < 0.0
     assert "toy~a" in scalars
     assert 0.0 <= scalars["toy~a"] <= 1.0
+
+
+def test_gate_label_plan_uses_attached_candidate_metadata():
+    rc = torch.tensor([[1.0, 1.0], [2.0, -1.0], [-1.0, 2.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["a", "b", "c"])
+    mon = _iso_monitor(m)
+    mon.add_probe("tri", m)
+    probe = mon.attached_probes()["tri"]
+
+    assert probe.candidate_labels == ("a", "b", "c", NEUTRAL_LABEL)
+    assert probe.label_to_candidate_idx == {
+        "a": 0,
+        "b": 1,
+        "c": 2,
+        NEUTRAL_LABEL: 3,
+    }
+    neutral_scalars = mon.score_gate_scalars(
+        {L: sub.mean for L, sub in m.layers.items()},
+        {"tri@neutral", "tri~neutral"},
+    )
+    assert neutral_scalars["tri@neutral"] == pytest.approx(0.0, abs=1e-3)
+    assert 0.0 <= neutral_scalars["tri~neutral"] <= 1.0
+
+    real_neutral = _flat_manifold(
+        reduced_coords=rc,
+        labels=["a", NEUTRAL_LABEL, "c"],
+    )
+    mon2 = _iso_monitor(real_neutral)
+    mon2.add_probe("tri", real_neutral)
+    probe2 = mon2.attached_probes()["tri"]
+    assert probe2.inject_neutral is False
+    assert probe2.candidate_labels == ("a", NEUTRAL_LABEL, "c")
+    assert probe2.label_to_candidate_idx[NEUTRAL_LABEL] == 1
+
+
+def test_gate_label_plan_duplicate_labels_resolve_last_occurrence():
+    rc = torch.tensor([[0.0], [1.0], [2.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["dup", "other", "dup"])
+    mon = _iso_monitor(m)
+    mon.add_probe("dup_probe", m, top_n=-1)
+
+    probe = mon.attached_probes()["dup_probe"]
+    assert probe.label_to_candidate_idx["dup"] == 2
+    scalars = mon.score_gate_scalars(
+        _flat_node_hidden(m, 2),
+        {"dup_probe@dup", "dup_probe~dup"},
+    )
+    assert scalars["dup_probe@dup"] == pytest.approx(0.0, abs=1e-3)
+    assert 0.0 <= scalars["dup_probe~dup"] <= 1.0
 
 
 def test_membership_high_on_surface_low_off_tube():
@@ -592,16 +681,15 @@ def test_membership_high_on_surface_low_off_tube():
     assert mem_off < mem_on
 
 
-def test_membership_one_without_sigma_field():
-    # No σ-field → no tube → membership defaults to 1.0 even far off-surface.
+def test_curved_probe_without_sigma_field_is_rejected():
+    # Raw curved runtime geometry requires a complete tube field.
     m = _curved_toy(dim=8)
+    for sub in m.layers.values():
+        sub.sigma_rbf_weights = None
+        sub.sigma_poly_coeffs = None
     mon = _iso_monitor(m)
-    mon.add_probe("curve", m)
-    off = {
-        L: _node_world(m, L)[2] + 5.0 * sub.basis[1]
-        for L, sub in m.layers.items()
-    }
-    assert mon.score_single_token(off)["curve"].membership == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="requires a sigma field"):
+        mon.add_probe("curve", m)
 
 
 # ============================================== inverse_projection / aggregate ===
@@ -991,6 +1079,40 @@ def test_curved_warm_start_matches_cold_path():
 
 # ========================================== aggregate-only tail capture ===
 
+def test_prompt_capture_retains_only_selected_prefill_positions():
+    """Selective prompt rows survive alongside the ordinary latest slice."""
+    import torch.nn as nn
+
+    from saklas.core.hooks import HiddenCapture
+
+    class _Pass(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    layers = nn.ModuleList([_Pass(), _Pass()])
+    cap = HiddenCapture()
+    cap.attach(layers, [0, 1])
+    cap.set_aggregate_tail(2)
+    cap.set_prompt_positions([0, 2])
+
+    for layer in range(2):
+        values = torch.tensor([
+            [layer * 10.0 + 0.0],
+            [layer * 10.0 + 1.0],
+            [layer * 10.0 + 2.0],
+            [layer * 10.0 + 3.0],
+        ]).reshape(1, 4, 1)
+        layers[layer](values)
+    for layer in range(2):
+        layers[layer](torch.tensor([[[layer * 10.0 + 9.0]]]))
+
+    prompt = cap.prompt_stacked()
+    assert prompt[0].squeeze(-1).tolist() == [0.0, 2.0]
+    assert prompt[1].squeeze(-1).tolist() == [10.0, 12.0]
+    assert cap.latest_per_layer()[0].item() == 9.0
+    assert cap.latest_per_layer()[1].item() == 19.0
+    cap.detach()
+
 def test_aggregate_tail_pools_last_content_token():
     """Aggregate-only capture pools the last *content* token, not the EOS slice.
 
@@ -1083,6 +1205,43 @@ def test_aggregate_tail_clamps_when_walkback_exceeds_depth():
     # clamps to the oldest retained slice rather than indexing out of range.
     pooled = cap.tail_slice_at(0)
     assert set(pooled) == {0, 1}
+
+
+def test_tail_with_sink_can_keep_deep_tail_on_selected_layers_only():
+    import torch.nn as nn
+
+    from saklas.core.hooks import HiddenCapture
+
+    class _Pass(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    layers = nn.ModuleList([_Pass(), _Pass(), _Pass()])
+    cap = HiddenCapture()
+    rows: list[dict[int, torch.Tensor]] = []
+    cap.attach(layers, [0, 1, 2])
+    cap.set_tail_with_sink(
+        3,
+        lambda latest: rows.append({
+            layer: row.clone() for layer, row in latest.items()
+        }),
+        tail_layers={2},
+    )
+
+    for step in range(5):
+        for layer in range(3):
+            value = torch.full((1, 1, 4), float(layer * 100 + step))
+            layers[layer](value)
+        cap.fire_step_sink()
+
+    assert [len(cap._per_layer[layer]) for layer in range(3)] == [1, 1, 3]
+    assert set(cap.latest_per_layer()) == {0, 1, 2}
+    assert len(rows) == 5
+    assert all(set(row) == {0, 1, 2} for row in rows)
+
+    pooled = cap.tail_slice_at(2)
+    assert set(pooled) == {2}
+    assert pooled[2][0].item() == pytest.approx(202.0)
 
 
 # ===== probe-inspector live-point subspace coords (gated stamping) =========
@@ -1189,3 +1348,93 @@ def test_coords_only_mixed_flat_and_curved_roster():
     for L in curved.layers:
         hidden[L] = _node_world(curved, L)[1]
     _assert_lean_matches_full(mon, hidden)
+
+
+# ==================================================== depth statistics ===
+# depth_com / depth_spread: per-axis depth center of mass of the per-layer
+# coordinate trace, mass = share_weight_L · |coord_L[axis]|, depths
+# normalized layer/(n_layers−1).
+
+
+def test_depth_stats_math():
+    from saklas.core.monitor import _depth_stats
+
+    coords = {0: (1.0,), 8: (3.0,)}
+    weights = {0: 0.5, 8: 0.5}
+    com, spread = _depth_stats(coords, weights, 8.0)
+    # masses: L0 → 0.5·|1| = 0.5 at depth 0; L8 → 0.5·|3| = 1.5 at depth 1
+    assert com == pytest.approx((1.5 / 2.0,))
+    expected_var = (0.5 * (0 - 0.75) ** 2 + 1.5 * (1 - 0.75) ** 2) / 2.0
+    assert spread[0] == pytest.approx(expected_var ** 0.5)
+    # sign-independent mass: flipping a coordinate's sign moves nothing
+    com_neg, _ = _depth_stats({0: (-1.0,), 8: (-3.0,)}, weights, 8.0)
+    assert com_neg == pytest.approx(com)
+
+
+def test_depth_stats_empty_and_zero_mass():
+    from saklas.core.monitor import _depth_stats
+
+    assert _depth_stats({}, {}, 8.0) == ((), ())
+    # denominator unset (monitor constructed without n_layers)
+    assert _depth_stats({0: (1.0,)}, {0: 1.0}, 0.0) == ((), ())
+    # zero-mass axis (activation at neutral): defined-but-degenerate
+    com, spread = _depth_stats({0: (0.0,), 4: (0.0,)}, {0: 1.0, 4: 1.0}, 4.0)
+    assert com == (0.0,)
+    assert spread == (0.0,)
+
+
+def test_depth_stats_per_axis_independent():
+    from saklas.core.monitor import _depth_stats
+
+    # axis 0 reads only at L0, axis 1 only at L4 → coms split to the ends
+    coords = {0: (2.0, 0.0), 4: (0.0, 2.0)}
+    weights = {0: 1.0, 4: 1.0}
+    com, spread = _depth_stats(coords, weights, 4.0)
+    assert com == pytest.approx((0.0, 1.0))
+    assert spread == pytest.approx((0.0, 0.0))
+
+
+def test_reading_carries_depth_stats_flat_batched_path():
+    rc = torch.tensor([[1.0], [-1.0]])
+    m = _flat_manifold(reduced_coords=rc, labels=["pos", "neg"])
+    mon = _iso_monitor(m, n_layers=2)
+    mon.add_probe("ax", m)
+    r = mon.score_single_token(_flat_node_hidden(m, 0))["ax"]
+    assert len(r.depth_com) == len(r.coords) == 1
+    assert len(r.depth_spread) == 1
+    assert 0.0 <= r.depth_com[0] <= 1.0
+    assert r.depth_spread[0] >= 0.0
+    # both layers read the same node coord, so with 2 layers at depths
+    # {0, 1} the com must sit strictly inside the interval
+    assert 0.0 < r.depth_com[0] < 1.0
+
+
+def test_reading_carries_depth_stats_curved_path():
+    m = _toy_manifold()
+    mon = _iso_monitor(m, n_layers=2)
+    mon.add_probe("toy", m)
+    hidden = {L: _node_world(m, L)[2] for L in m.layers}
+    r = mon.score_single_token(hidden)["toy"]
+    assert len(r.depth_com) == len(r.coords)
+    assert all(0.0 <= c <= 1.0 for c in r.depth_com)
+    assert all(s >= 0.0 for s in r.depth_spread)
+
+
+def test_reading_depth_stats_empty_without_n_layers():
+    rc = torch.tensor([[1.0], [-1.0]])
+    m = _flat_manifold(reduced_coords=rc)
+    mon = _iso_monitor(m)   # no n_layers → no depth axis
+    mon.add_probe("ax", m)
+    r = mon.score_single_token(_flat_node_hidden(m, 0))["ax"]
+    assert r.depth_com == ()
+    assert r.depth_spread == ()
+
+
+def test_depth_stats_serialize_in_to_dict():
+    rc = torch.tensor([[1.0], [-1.0]])
+    m = _flat_manifold(reduced_coords=rc)
+    mon = _iso_monitor(m, n_layers=2)
+    mon.add_probe("ax", m)
+    d = mon.score_single_token(_flat_node_hidden(m, 0))["ax"].to_dict()
+    assert "depth_com" in d and "depth_spread" in d
+    assert isinstance(d["depth_com"], list)

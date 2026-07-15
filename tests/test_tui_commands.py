@@ -26,10 +26,9 @@ def _make_app():
     """
     app: Any = object.__new__(SaklasApp)
     session: Any = MagicMock()
-    # v2.3 loom: conversation lives in ``session.tree`` (LoomTree).
-    # We install a real LoomTree so the regen/rewind path's
-    # navigate/edit calls work; ``session.history`` is the derived
-    # view the TUI's ``_messages`` property reads.
+    # Conversation lives in ``session.tree`` (LoomTree).  We install a real
+    # tree so regen/rewind navigation works; ``session.history`` is its
+    # current active-path view.
     from saklas import LoomTree as _LoomTree
     session.tree = _LoomTree()
     session.history = []
@@ -38,10 +37,11 @@ def _make_app():
     # reach-ins).  On a ``MagicMock`` the private backing name and the public
     # property are unrelated children, so configuring the public name is what
     # production sees.  ``profiles`` is the in-memory baked-direction registry;
-    # ``model_metadata`` the structured model-info object; ``device`` / ``layers``
+    # ``model_info`` is the canonical immutable model metadata snapshot;
+    # ``device`` / ``layers``
     # / ``tokenizer`` the engine handles.
     session.profiles = {}
-    session.model_metadata = {"model_id": "mock/mock", "model_type": "mock"}
+    session.model_info = {"model_id": "mock/mock", "model_type": "mock"}
     session.device = SimpleNamespace(type="cpu")
     session.layers = [0, 1, 2]
     # One unified monitor now.  ``manifolds`` maps probe-name → the attached
@@ -67,12 +67,10 @@ def _make_app():
     session.gen_state = saklas.GenState.IDLE
 
     app._session = session
-    # ``app._messages`` is now a property derived from ``session.history``
-    # under v2.3 loom; the v2.2 shared-list assignment is no longer needed.
     app._device_str = "cpu"
-    app._alphas = {}
-    app._enabled = {}
-    app._manifold_terms = {}
+    app._get_extraction_controller()._alphas = {}
+    app._get_extraction_controller()._enabled = {}
+    app._get_extraction_controller()._manifold_terms = {}
     app._supports_thinking = False
     app._is_base_model = False
     app._render_mode = "chat"
@@ -88,8 +86,8 @@ def _make_app():
     # ``_pulled_slot`` tracks an in-progress ↑-pull-and-edit; default
     # None means "no slot pulled."  Tests that need a populated queue
     # mutate ``_pending_queue`` directly.
-    app._pending_queue = []
-    app._pulled_slot = None
+    app._get_input_history_controller()._pending_queue = []
+    app._get_input_history_controller()._pulled_slot = None
     app._ui_gen_active = False
     app._focused_panel_idx = 1
     app._highlighting = False
@@ -98,9 +96,9 @@ def _make_app():
     import queue
     app._ui_token_queue = queue.SimpleQueue()
     # Input-history ring (↑/↓ recall in the chat input).
-    app._input_history = []
-    app._history_index = None
-    app._history_stash = ""
+    app._get_input_history_controller()._input_history = []
+    app._get_input_history_controller()._history_index = None
+    app._get_input_history_controller()._history_stash = ""
     app._gen_start_time = 0.0
     app._gen_token_count = 0
     app._last_tok_per_sec = 0.0
@@ -150,7 +148,7 @@ def test_alpha_rejects_unregistered():
 
 def test_alpha_adjusts_existing():
     app = _make_app()
-    app._alphas["angry.calm"] = 0.3
+    app._get_extraction_controller()._alphas["angry.calm"] = 0.3
     app._refresh_left_panel = MagicMock()
     app._handle_command("/alpha 0.7 angry.calm")
     assert app._alphas["angry.calm"] == 0.7
@@ -159,7 +157,7 @@ def test_alpha_adjusts_existing():
 
 def test_alpha_invalid_value():
     app = _make_app()
-    app._alphas["foo"] = 0.1
+    app._get_extraction_controller()._alphas["foo"] = 0.1
     app._refresh_left_panel = MagicMock()
     app._handle_command("/alpha notanumber foo")
     assert "Invalid alpha" in _msgs(app)
@@ -173,8 +171,8 @@ def test_alpha_usage_on_missing_args():
 
 def test_unsteer_removes():
     app = _make_app()
-    app._alphas["foo"] = 0.5
-    app._enabled["foo"] = True
+    app._get_extraction_controller()._alphas["foo"] = 0.5
+    app._get_extraction_controller()._enabled["foo"] = True
     app._refresh_left_panel = MagicMock()
     app._handle_command("/unsteer foo")
     assert "foo" not in app._alphas
@@ -199,8 +197,8 @@ def test_unsteer_removes_manifold_term():
         along=0.7, onto=0.7, trigger=Trigger.BOTH, manifold="circumplex",
         position=(0.3, 0.8),
     )
-    app._manifold_terms = {"circumplex%0.3,0.8": term}
-    app._enabled = {"circumplex%0.3,0.8": True}
+    app._get_extraction_controller()._manifold_terms = {"circumplex%0.3,0.8": term}
+    app._get_extraction_controller()._enabled = {"circumplex%0.3,0.8": True}
     app._refresh_left_panel = MagicMock()
 
     app._handle_command("/unsteer circumplex%0.3,0.8")
@@ -220,19 +218,19 @@ def test_unsteer_namespace_sweeps_manifold_terms():
     from saklas.core.triggers import Trigger
 
     app = _make_app()
-    app._alphas = {"alice/foo": 0.5}
+    app._get_extraction_controller()._alphas = {"alice/foo": 0.5}
     term = ManifoldTerm(
         along=0.6, onto=0.6, trigger=Trigger.BOTH, manifold="alice/circ",
         position=(0.1,),
     )
-    app._manifold_terms = {"alice/circ%0.1": term}
-    app._enabled = {"alice/foo": True, "alice/circ%0.1": True}
+    app._get_extraction_controller()._manifold_terms = {"alice/circ%0.1": term}
+    app._get_extraction_controller()._enabled = {"alice/foo": True, "alice/circ%0.1": True}
     app._refresh_left_panel = MagicMock()
 
     app._handle_command("/unsteer alice/")
 
-    assert app._alphas == {}
-    assert app._manifold_terms == {}
+    assert app._get_extraction_controller()._alphas == {}
+    assert app._get_extraction_controller()._manifold_terms == {}
     app._session.unsteer.assert_called_once_with("alice/foo")
     # The count in the report folds in the manifold term.
     assert "Removed 2 vector(s)" in _msgs(app)
@@ -456,8 +454,8 @@ def test_start_generation_skips_highlight_when_off():
 
 def test_generate_worker_passes_steering_when_alphas_active():
     app = _make_app()
-    app._alphas["foo"] = 0.5
-    app._enabled["foo"] = True
+    app._get_extraction_controller()._alphas["foo"] = 0.5
+    app._get_extraction_controller()._enabled["foo"] = True
     captured = {}
 
     def _fake_stream(input: Any, **kwargs: Any) -> Any:
@@ -494,14 +492,13 @@ def test_probe_seeds_highlight():
 
 def test_compare_pairwise():
     import torch
-    from saklas.core.profile import Profile
     from tests._whitener import isotropic_whitener
 
     app = _make_app()
     t = {0: torch.randn(8), 1: torch.randn(8)}
     app._session.profiles = {
-        "angry.calm": Profile(t),
-        "happy.sad": Profile({k: v.clone() for k, v in t.items()}),
+        "angry.calm": t,
+        "happy.sad": {k: v.clone() for k, v in t.items()},
     }
     app._session.monitor.profiles = {}
     # /compare is Mahalanobis-only now: the session exposes a covering whitener.
@@ -513,21 +510,16 @@ def test_compare_pairwise():
 
 def test_compare_ranked():
     import torch
-    from saklas.core.profile import Profile
     from tests._whitener import isotropic_whitener
 
     app = _make_app()
     base = {0: torch.randn(8), 1: torch.randn(8)}
     app._session.profiles = {
-        "angry.calm": Profile(base),
-        "happy.sad": Profile({k: torch.randn(8) for k in base}),
-        "formal.casual": Profile({k: torch.randn(8) for k in base}),
+        "angry.calm": base,
+        "happy.sad": {k: torch.randn(8) for k in base},
+        "formal.casual": {k: torch.randn(8) for k in base},
     }
-    app._session.monitor.profiles = {
-        "angry.calm": Profile(base),
-        "happy.sad": Profile({k: torch.randn(8) for k in base}),
-        "formal.casual": Profile({k: torch.randn(8) for k in base}),
-    }
+    app._session.monitor.profiles = {}
     app._session.whitener = isotropic_whitener([0, 1], 8)
     app._handle_command("/compare angry.calm")
     msg = _msgs(app)
@@ -786,11 +778,10 @@ def test_handle_extract_explicit_sae_suffix_in_concept(monkeypatch: pytest.Monke
 
 def test_handle_extract_bare_sae_uses_autoload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Option C ``--sae <concept>``: no fresh extract — the unified profile
-    resolver (``_ensure_profile_registered``, fold a fitted manifold) picks
+    resolver (``ensure_profile_registered``, fold a fitted manifold) picks
     the unique SAE variant already on disk.
 
-    (4.0: the TUI calls ``_ensure_profile_registered`` rather than the removed
-    ``_try_autoload_vector``.)
+    The TUI calls the session's public registration API.
     """
     import torch
     from saklas.io import selectors as _sel
@@ -804,7 +795,7 @@ def test_handle_extract_bare_sae_uses_autoload(monkeypatch: pytest.MonkeyPatch, 
         raise AssertionError("session.extract must not run for bare --sae")
     app._session.extract = _fail_extract
 
-    # _ensure_profile_registered populates _profiles[<concept>:sae].
+    # ensure_profile_registered populates profiles[<concept>:sae].
     def _ensure(key: Any, **kw: Any) -> Any:
         assert key == "honest:sae"
         app._session.profiles["honest:sae"] = {0: torch.zeros(4)}
@@ -866,8 +857,8 @@ def test_handle_steer_ambiguous_pole_does_not_crash(monkeypatch: pytest.MonkeyPa
     # User-facing disambiguation hint comes from ``user_message()``.
     assert "namespace/name" in msgs
     # Slash command bailed before any state mutation.
-    assert app._alphas == {}
-    assert app._enabled == {}
+    assert app._get_extraction_controller()._alphas == {}
+    assert app._get_extraction_controller()._enabled == {}
     app._session.steer.assert_not_called()
 
 
@@ -880,7 +871,7 @@ def test_handle_steer_expression_error_still_caught(monkeypatch: pytest.MonkeyPa
     app._handle_command("/steer @@@nonsense")
     msgs = _msgs(app)
     assert "Steering expression error" in msgs
-    assert app._alphas == {}
+    assert app._get_extraction_controller()._alphas == {}
 
 
 # ---- Namespace-bulk selector + handlers ----
@@ -967,12 +958,12 @@ def test_handle_steer_namespace_bulk_loads_cached_and_warns_on_skip(monkeypatch:
     app._handle_command("/steer alice/")
     _drain_workers(app)
 
-    assert app._alphas == {
+    assert app._get_extraction_controller()._alphas == {
         "alice/honest.deceptive": pytest.approx(0.5),
         "alice/warm.clinical": pytest.approx(0.5),
     }
     # Default-off — user toggles in left panel.
-    assert app._enabled == {
+    assert app._get_extraction_controller()._enabled == {
         "alice/honest.deceptive": False,
         "alice/warm.clinical": False,
     }
@@ -996,7 +987,7 @@ def test_handle_steer_namespace_empty_namespace_short_circuits(monkeypatch: pyte
 
     assert "No concepts installed under 'alice/'" in _msgs(app)
     app.run_worker.assert_not_called()
-    assert app._alphas == {}
+    assert app._get_extraction_controller()._alphas == {}
 
 
 def test_handle_probe_namespace_bulk_loads_and_seeds_highlight(monkeypatch: pytest.MonkeyPatch):
@@ -1029,12 +1020,12 @@ def test_handle_probe_namespace_bulk_loads_and_seeds_highlight(monkeypatch: pyte
 def test_handle_unsteer_namespace_removes_only_matching_prefix():
     app = _make_app()
     # Mixed registry across two namespaces — only ``alice/`` should die.
-    app._alphas = {
+    app._get_extraction_controller()._alphas = {
         "alice/foo": 0.5,
         "alice/bar": 0.3,
         "default/baz": 0.4,
     }
-    app._enabled = {k: True for k in app._alphas}
+    app._get_extraction_controller()._enabled = {k: True for k in app._alphas}
     app._refresh_left_panel = MagicMock()
 
     app._handle_command("/unsteer alice/")
@@ -1047,14 +1038,14 @@ def test_handle_unsteer_namespace_removes_only_matching_prefix():
 
 def test_handle_unsteer_namespace_empty_match_reports_clean():
     app = _make_app()
-    app._alphas = {"default/baz": 0.4}
-    app._enabled = {"default/baz": True}
+    app._get_extraction_controller()._alphas = {"default/baz": 0.4}
+    app._get_extraction_controller()._enabled = {"default/baz": True}
 
     app._handle_command("/unsteer alice/")
 
     assert "No active vectors under 'alice/'" in _msgs(app)
     app._session.unsteer.assert_not_called()
-    assert app._alphas == {"default/baz": 0.4}
+    assert app._get_extraction_controller()._alphas == {"default/baz": 0.4}
 
 
 def test_handle_unprobe_namespace_clears_highlight_when_seed_is_in_namespace():
@@ -1176,12 +1167,12 @@ def test_push_input_history_dedupes_and_caps():
     app._push_input_history("/steer 0.5 angry")  # exact repeat collapses
     app._push_input_history("hello")  # ping-pong: re-records
 
-    assert app._input_history == ["hello", "/steer 0.5 angry", "hello"]
+    assert app._get_input_history_controller()._input_history == ["hello", "/steer 0.5 angry", "hello"]
 
     # Empty / whitespace-only input is a no-op.
     app._push_input_history("")
     app._push_input_history("   ")
-    assert app._input_history == ["hello", "/steer 0.5 angry", "hello"]
+    assert app._get_input_history_controller()._input_history == ["hello", "/steer 0.5 angry", "hello"]
 
     # Cap: overflow drops oldest, keeps newest.
     overflow = [f"line{i}" for i in range(_INPUT_HISTORY_MAX + 50)]
@@ -1194,33 +1185,33 @@ def test_push_input_history_dedupes_and_caps():
 
 def test_history_navigate_up_walks_back_and_stashes_draft():
     app = _make_app()
-    app._input_history = ["one", "two", "three"]
+    app._get_input_history_controller()._input_history = ["one", "two", "three"]
     inp = _wire_fake_input(app, value="draft-in-progress")
 
     # First ↑: stash draft, jump to newest entry.
     app._history_navigate(-1)
     assert inp.text == "three"
     assert inp.cursor_location == (0, len("three"))
-    assert app._history_index == 2
-    assert app._history_stash == "draft-in-progress"
+    assert app._get_input_history_controller()._history_index == 2
+    assert app._get_input_history_controller()._history_stash == "draft-in-progress"
 
     app._history_navigate(-1)
     assert inp.text == "two"
-    assert app._history_index == 1
+    assert app._get_input_history_controller()._history_index == 1
 
     app._history_navigate(-1)
     assert inp.text == "one"
-    assert app._history_index == 0
+    assert app._get_input_history_controller()._history_index == 0
 
     # Past the oldest pins to entry 0 — bash semantics, no wrap.
     app._history_navigate(-1)
     assert inp.text == "one"
-    assert app._history_index == 0
+    assert app._get_input_history_controller()._history_index == 0
 
 
 def test_history_navigate_down_restores_stash_at_bottom():
     app = _make_app()
-    app._input_history = ["alpha", "beta"]
+    app._get_input_history_controller()._input_history = ["alpha", "beta"]
     inp = _wire_fake_input(app, value="my draft")
 
     # Walk up twice then back down twice — should hit the stash.
@@ -1230,17 +1221,17 @@ def test_history_navigate_down_restores_stash_at_bottom():
 
     app._history_navigate(+1)  # → "beta"
     assert inp.text == "beta"
-    assert app._history_index == 1
+    assert app._get_input_history_controller()._history_index == 1
 
     app._history_navigate(+1)  # → restore stash, clear index
     assert inp.text == "my draft"
     assert app._history_index is None
-    assert app._history_stash == ""
+    assert app._get_input_history_controller()._history_stash == ""
 
 
 def test_history_navigate_down_at_live_slot_is_noop():
     app = _make_app()
-    app._input_history = ["something"]
+    app._get_input_history_controller()._input_history = ["something"]
     inp = _wire_fake_input(app, value="fresh")
 
     app._history_navigate(+1)
@@ -1276,7 +1267,7 @@ def test_user_submit_appends_to_history():
     app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted("/steer 0.5 angry"))
     app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted("/steer 0.5 angry"))  # dedupe
 
-    assert app._input_history == ["hello world", "/steer 0.5 angry"]
+    assert app._get_input_history_controller()._input_history == ["hello world", "/steer 0.5 angry"]
     # Slash commands still routed through the dispatcher; chat messages
     # still kicked off generation.  The history push doesn't replace
     # either downstream path.
@@ -1293,35 +1284,35 @@ def test_history_navigate_walks_pending_then_history():
     """``↑`` walks the queue (most-recent first) before falling into
     committed input history.  Pending positions land on
     ``_pulled_slot``; history positions land on ``_history_index``."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
-    app._input_history = ["older"]
-    app._pending_queue = [
-        PendingItem("submit", "first queued"),
-        PendingItem("submit", "second queued"),
+    app._get_input_history_controller()._input_history = ["older"]
+    app._get_input_history_controller()._pending_queue = [
+        PendingSubmit("first queued"),
+        PendingSubmit("second queued"),
     ]
     inp = _wire_fake_input(app, value="composing")
 
     # First ↑ — most-recent pending.
     app._history_navigate(-1)
     assert inp.text == "second queued"
-    assert app._pulled_slot == 1
+    assert app._get_input_history_controller()._pulled_slot == 1
     assert app._history_index is None
-    assert app._history_stash == "composing"
+    assert app._get_input_history_controller()._history_stash == "composing"
     assert inp.allow_empty_submit is True
 
     # Second ↑ — earlier pending.
     app._history_navigate(-1)
     assert inp.text == "first queued"
-    assert app._pulled_slot == 0
+    assert app._get_input_history_controller()._pulled_slot == 0
     assert inp.allow_empty_submit is True
 
     # Third ↑ — falls into history.
     app._history_navigate(-1)
     assert inp.text == "older"
     assert app._pulled_slot is None
-    assert app._history_index == 0
+    assert app._get_input_history_controller()._history_index == 0
     assert inp.allow_empty_submit is False
 
     # Fourth ↑ — clamps at the oldest history entry.
@@ -1331,22 +1322,22 @@ def test_history_navigate_walks_pending_then_history():
 
 def test_history_navigate_down_returns_through_pending_to_live():
     """``↓`` walks back through pending and restores the stash at live."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
-    app._pending_queue = [
-        PendingItem("submit", "alpha"),
-        PendingItem("submit", "beta"),
+    app._get_input_history_controller()._pending_queue = [
+        PendingSubmit("alpha"),
+        PendingSubmit("beta"),
     ]
     inp = _wire_fake_input(app, value="composing")
 
     app._history_navigate(-1)  # → "beta" (slot 1)
     app._history_navigate(-1)  # → "alpha" (slot 0)
-    assert app._pulled_slot == 0
+    assert app._get_input_history_controller()._pulled_slot == 0
 
     app._history_navigate(+1)  # → "beta" (slot 1)
     assert inp.text == "beta"
-    assert app._pulled_slot == 1
+    assert app._get_input_history_controller()._pulled_slot == 1
 
     app._history_navigate(+1)  # → restore stash
     assert inp.text == "composing"
@@ -1358,18 +1349,18 @@ def test_history_navigate_down_returns_through_pending_to_live():
 def test_pulled_pending_resubmit_replaces_slot_in_place():
     """``Enter`` after editing a pulled slot replaces *that* slot rather
     than appending to the queue tail — slot-preserving edit."""
-    from saklas.tui.chat_panel import ChatPanel, PendingItem
+    from saklas.tui.chat_panel import ChatPanel, PendingSubmit
 
     app = _make_app()
     app._session.is_generating = True  # busy so submit enqueues
-    app._pending_queue = [
-        PendingItem("submit", "a"),
-        PendingItem("submit", "b"),
-        PendingItem("submit", "c"),
+    app._get_input_history_controller()._pending_queue = [
+        PendingSubmit("a"),
+        PendingSubmit("b"),
+        PendingSubmit("c"),
     ]
     _wire_fake_input(app, value="")
     # Simulate the user having pulled slot 1 ("b") via ↑↑.
-    app._pulled_slot = 1
+    app._get_input_history_controller()._pulled_slot = 1
 
     app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted("B prime"))
 
@@ -1382,15 +1373,15 @@ def test_pulled_pending_resubmit_replaces_slot_in_place():
 def test_pulled_pending_empty_enter_removes_slot():
     """Empty ``Enter`` while a slot is pulled removes that slot —
     keyboard equivalent of the GUI's per-bubble ``×``."""
-    from saklas.tui.chat_panel import ChatPanel, PendingItem
+    from saklas.tui.chat_panel import ChatPanel, PendingSubmit
 
     app = _make_app()
-    app._pending_queue = [
-        PendingItem("submit", "keep me"),
-        PendingItem("submit", "cancel me"),
+    app._get_input_history_controller()._pending_queue = [
+        PendingSubmit("keep me"),
+        PendingSubmit("cancel me"),
     ]
     _wire_fake_input(app, value="")
-    app._pulled_slot = 1
+    app._get_input_history_controller()._pulled_slot = 1
 
     app.on_chat_panel_user_submitted(ChatPanel.UserSubmitted(""))
 
@@ -1401,58 +1392,58 @@ def test_pulled_pending_empty_enter_removes_slot():
 def test_pulled_pending_esc_cancels_pull_without_removing():
     """``Esc`` while pulled cancels the *edit* — the slot stays in the
     queue, the input restores its pre-pull stash."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
-    app._pending_queue = [PendingItem("submit", "queued")]
+    app._get_input_history_controller()._pending_queue = [PendingSubmit("queued")]
     inp = _wire_fake_input(app, value="composing")
 
     app._history_navigate(-1)  # pull slot 0
-    assert app._pulled_slot == 0
+    assert app._get_input_history_controller()._pulled_slot == 0
     assert inp.text == "queued"
 
     app.action_stop_generation()  # no gen running → cancel pull
     assert app._pulled_slot is None
     assert inp.text == "composing"
-    assert app._pending_queue == [PendingItem("submit", "queued")]
+    assert app._get_input_history_controller()._pending_queue == [PendingSubmit("queued")]
     assert inp.allow_empty_submit is False
 
 
 def test_drain_next_pending_decrements_pulled_slot():
     """When the queue head drains during a pull, the pulled-slot index
     shifts so the user keeps tracking the same item."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
-    app._pending_queue = [
-        PendingItem("submit", "head"),
-        PendingItem("submit", "middle"),
-        PendingItem("submit", "tail"),
+    app._get_input_history_controller()._pending_queue = [
+        PendingSubmit("head"),
+        PendingSubmit("middle"),
+        PendingSubmit("tail"),
     ]
     _wire_fake_input(app, value="")
-    app._pulled_slot = 2  # user is editing "tail"
+    app._get_input_history_controller()._pulled_slot = 2  # user is editing "tail"
     # Block the dispatch so we only see the slot accounting.
     app._dispatch_pending_action = MagicMock()
 
     app._drain_next_pending()
     assert [p.text for p in app._pending_queue] == ["middle", "tail"]
-    assert app._pulled_slot == 1  # still on "tail" — index slid down
+    assert app._get_input_history_controller()._pulled_slot == 1  # still on "tail" — index slid down
 
 
 def test_drain_next_pending_cancels_pull_when_head_was_pulled():
     """When the user pulled slot 0, the drain pops that very item —
     cancel the pull so the stale ``_pulled_slot`` doesn't outlive the
     queue mutation."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
-    app._pending_queue = [
-        PendingItem("submit", "about to fire"),
-        PendingItem("submit", "next up"),
+    app._get_input_history_controller()._pending_queue = [
+        PendingSubmit("about to fire"),
+        PendingSubmit("next up"),
     ]
     inp = _wire_fake_input(app, value="draft")
-    app._history_stash = "draft"
-    app._pulled_slot = 0
+    app._get_input_history_controller()._history_stash = "draft"
+    app._get_input_history_controller()._pulled_slot = 0
     app._dispatch_pending_action = MagicMock()
 
     app._drain_next_pending()
@@ -1471,7 +1462,7 @@ def test_pending_strip_markup_round_trips_through_rich():
     nothing to close`` when the strip first re-rendered."""
     from rich.console import Console
     from rich.text import Text
-    from saklas.tui.chat_panel import PendingItem, PendingStrip
+    from saklas.tui.chat_panel import PendingClear, PendingSteer, PendingSubmit, PendingStrip
     import io
 
     # Side-step Textual's mount lifecycle by calling the markup
@@ -1484,11 +1475,11 @@ def test_pending_strip_markup_round_trips_through_rich():
     strip._queue = []
 
     items = [
-        PendingItem("submit", "what do you think?"),
-        PendingItem("clear", "/clear"),
-        PendingItem("steer", "/steer 0.5 angry"),
-        PendingItem("submit", "with [brackets] and \\backslashes"),
-        PendingItem("submit", "multi\nline\nmessage"),
+        PendingSubmit("what do you think?"),
+        PendingClear("/clear"),
+        PendingSteer("/steer 0.5 angry", "0.5 angry"),
+        PendingSubmit("with [brackets] and \\backslashes"),
+        PendingSubmit("multi\nline\nmessage"),
     ]
     for slot in [None, 0, 2, len(items) - 1]:
         PendingStrip.update_queue(strip, items, pulled_slot=slot)
@@ -1503,7 +1494,7 @@ def test_slash_command_during_gen_enqueues_canonical_text():
     """Mid-gen ``/clear`` enqueues a :class:`PendingItem` carrying the
     full slash text so the user can pull and edit it via ↑.  The
     in-flight gen is not stopped — queue model preserves tokens."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingClear
 
     app = _make_app()
     app._session.is_generating = True
@@ -1511,7 +1502,7 @@ def test_slash_command_during_gen_enqueues_canonical_text():
 
     app._handle_command("/clear")
 
-    assert app._pending_queue == [PendingItem("clear", "/clear")]
+    assert app._get_input_history_controller()._pending_queue == [PendingClear("/clear")]
     app._session.stop.assert_not_called()
 
 
@@ -1526,7 +1517,7 @@ def test_shift_arrow_uses_coarse_alpha_step():
     app = _make_app()
     app._refresh_left_panel = MagicMock()
     app._left_panel.get_selected = MagicMock(return_value={"name": "honest"})
-    app._alphas = {"honest": 0.0}
+    app._get_extraction_controller()._alphas = {"honest": 0.0}
 
     # Plain right arrow path: 0.01 step.
     app.action_nav_right()
@@ -1680,7 +1671,7 @@ def test_apply_highlight_to_all_preserves_surprise_sentinel():
 
 def test_predicted_on_user_node_falls_through_to_live_when_queue_empty():
     """No queued items → predicted equals live."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSteer
 
     app = _make_app()
     # Live active is the synthetic root (system) — not a user node.
@@ -1689,24 +1680,27 @@ def test_predicted_on_user_node_falls_through_to_live_when_queue_empty():
 
     # A queued ``/steer`` doesn't shift the role, so prediction still
     # mirrors live.
-    app._pending_queue = [PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",))]
+    app._get_input_history_controller()._pending_queue = [PendingSteer("/steer 0.5 angry", "0.5 angry")]
     assert app._predicted_on_user_node() is False
 
 
 def test_predicted_on_user_node_reflects_queued_commit_user():
     """A queued ``commit_user`` predicts the next submission as prefill."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitAssistant, PendingCommitUser, PendingItem
 
     app = _make_app()
     # Live active is root — not a user node.
     assert app._predicted_on_user_node() is False
 
     # Queue a commit_user — the next item should land in prefill mode.
-    app._pending_queue = [PendingItem("commit_user", "hi")]
+    queue: list[PendingItem] = [PendingCommitUser("hi")]
+    app._get_input_history_controller()._pending_queue = queue
     assert app._predicted_on_user_node() is True
 
     # Add a commit_assistant on top — final role flips back to assistant.
-    app._pending_queue.append(PendingItem("commit_assistant", "hello", ("uid",)))
+    app._get_input_history_controller()._pending_queue.append(
+        PendingCommitAssistant("hello", "uid")
+    )
     assert app._predicted_on_user_node() is False
 
 
@@ -1714,13 +1708,13 @@ def test_predicted_walks_past_no_change_kinds():
     """Items with no role mapping (``/steer``, ``/probe``) are walked past
     so a queued ``commit_user`` followed by ``/steer`` still predicts
     user mode."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitUser, PendingProbe, PendingSteer
 
     app = _make_app()
-    app._pending_queue = [
-        PendingItem("commit_user", "hi"),
-        PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",)),
-        PendingItem("probe", "/probe calm", ("calm",)),
+    app._get_input_history_controller()._pending_queue = [
+        PendingCommitUser("hi"),
+        PendingSteer("/steer 0.5 angry", "0.5 angry"),
+        PendingProbe("/probe calm", "calm"),
     ]
     assert app._predicted_on_user_node() is True
 
@@ -1728,26 +1722,26 @@ def test_predicted_walks_past_no_change_kinds():
 def test_enqueue_pending_refreshes_input_mode():
     """Enqueueing a role-shifting item updates the placeholder
     immediately — no need to wait for the queue to drain."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitAssistant, PendingCommitUser
 
     app = _make_app()
     set_prefill_mode = MagicMock()
     app._chat_panel.set_prefill_mode = set_prefill_mode
 
-    app._enqueue_pending(PendingItem("commit_user", "hi"))
+    app._enqueue_pending(PendingCommitUser("hi"))
     # Last call reflects the queue-aware mode.
     set_prefill_mode.assert_called_with(True)
 
-    app._enqueue_pending(PendingItem("commit_assistant", "hello", ("uid",)))
+    app._enqueue_pending(PendingCommitAssistant("hello", "uid"))
     set_prefill_mode.assert_called_with(False)
 
 
 def test_remove_pending_slot_refreshes_input_mode():
     """Cancelling the queued role-shifter restores live mode."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingCommitUser
 
     app = _make_app()
-    app._pending_queue = [PendingItem("commit_user", "hi")]
+    app._get_input_history_controller()._pending_queue = [PendingCommitUser("hi")]
     set_prefill_mode = MagicMock()
     app._chat_panel.set_prefill_mode = set_prefill_mode
 
@@ -1765,13 +1759,13 @@ def test_drain_next_pending_chains_through_sync_kinds():
     """A run of sync slash kinds (/clear /steer /probe /rewind) drains
     all in one call — the old single-item drain would have left them
     stuck waiting for a ``done`` that never arrives."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingClear, PendingProbe, PendingSteer
 
     app = _make_app()
-    app._pending_queue = [
-        PendingItem("steer", "/steer 0.5 angry", ("0.5 angry",)),
-        PendingItem("probe", "/probe calm", ("calm",)),
-        PendingItem("clear", "/clear"),
+    app._get_input_history_controller()._pending_queue = [
+        PendingSteer("/steer 0.5 angry", "0.5 angry"),
+        PendingProbe("/probe calm", "calm"),
+        PendingClear("/clear"),
     ]
     _wire_fake_input(app, value="")
     dispatched: list[str] = []
@@ -1782,20 +1776,20 @@ def test_drain_next_pending_chains_through_sync_kinds():
     app._drain_next_pending()
     # All three drained in one call — chain-inline behavior.
     assert dispatched == ["steer", "probe", "clear"]
-    assert app._pending_queue == []
+    assert app._get_input_history_controller()._pending_queue == []
 
 
 def test_drain_next_pending_breaks_at_first_async_kind():
     """Drain chains through sync kinds but breaks at the first kind
     that runs a worker / kicks a gen — that one's own ``done`` will
     advance the queue, so chaining past it would race the worker."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingClear, PendingCommitUser, PendingSubmit
 
     app = _make_app()
-    app._pending_queue = [
-        PendingItem("clear", "/clear"),                # sync — chain
-        PendingItem("commit_user", "hi"),              # async — break here
-        PendingItem("submit", "next"),                 # stays queued
+    app._get_input_history_controller()._pending_queue = [
+        PendingClear("/clear"),                # sync — chain
+        PendingCommitUser("hi"),              # async — break here
+        PendingSubmit("next"),                 # stays queued
     ]
     _wire_fake_input(app, value="")
     dispatched: list[str] = []
@@ -1813,12 +1807,12 @@ def test_drain_next_pending_handles_pure_async_chain():
     """When the head is async, drain pops exactly one — matches the
     pre-existing single-item semantics every gen-bearing kind
     depends on."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingSubmit
 
     app = _make_app()
-    app._pending_queue = [
-        PendingItem("submit", "first"),
-        PendingItem("submit", "second"),
+    app._get_input_history_controller()._pending_queue = [
+        PendingSubmit("first"),
+        PendingSubmit("second"),
     ]
     _wire_fake_input(app, value="")
     app._dispatch_pending_action = MagicMock()
@@ -1877,13 +1871,13 @@ def test_manifold_fit_runs_session_fit(tmp_path: Path) -> None:
 def test_manifold_fit_mid_gen_enqueues_pending():
     """`/manifold fit` while a generation is in flight queues a
     ``manifold_fit`` PendingItem rather than running immediately."""
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingManifoldFit
 
     app = _make_app()
     app._session.is_generating = True
     app._handle_command("/manifold fit /tmp/myfold")
-    assert app._pending_queue == [
-        PendingItem("manifold_fit", "/manifold fit /tmp/myfold", ("/tmp/myfold",))
+    assert app._get_input_history_controller()._pending_queue == [
+        PendingManifoldFit("/manifold fit /tmp/myfold", "/tmp/myfold")
     ]
 
 
@@ -1905,7 +1899,9 @@ def test_steer_manifold_term_validates_and_registers(monkeypatch: pytest.MonkeyP
 
     # Stub the session manifold-load + registry so validation passes.
     domain = SimpleNamespace(intrinsic_dim=2)
-    manifold = SimpleNamespace(domain=domain)
+    manifold = SimpleNamespace(
+        domain=domain, resolve_position=lambda position: position,
+    )
 
     def _ensure(key: Any) -> None:
         app._session.manifolds[key] = manifold
@@ -1919,7 +1915,7 @@ def test_steer_manifold_term_validates_and_registers(monkeypatch: pytest.MonkeyP
     assert "circumplex%0.3,0.8" in app._manifold_terms
     term = app._manifold_terms["circumplex%0.3,0.8"]
     assert term.position == (0.3, 0.8)
-    assert app._alphas == {}  # not a scalar vector
+    assert app._get_extraction_controller()._alphas == {}  # not a scalar vector
     assert app._enabled.get("circumplex%0.3,0.8") is True
 
 
@@ -1933,7 +1929,9 @@ def test_steer_manifold_term_arity_mismatch_reports(monkeypatch: pytest.MonkeyPa
     app = _make_app()
     # Domain is 2-D but the position has 3 coords.
     domain = SimpleNamespace(intrinsic_dim=2)
-    manifold = SimpleNamespace(domain=domain)
+    manifold = SimpleNamespace(
+        domain=domain, resolve_position=lambda position: position,
+    )
 
     def _ensure(key: Any) -> None:
         app._session.manifolds[key] = manifold
@@ -1945,7 +1943,7 @@ def test_steer_manifold_term_arity_mismatch_reports(monkeypatch: pytest.MonkeyPa
     app._handle_command("/steer 0.5 circumplex%0.1,0.2,0.3")
 
     assert "2-dimensional" in _msgs(app)
-    assert app._manifold_terms == {}
+    assert app._get_extraction_controller()._manifold_terms == {}
 
 
 def test_steer_manifold_unregistered_reports(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1970,7 +1968,7 @@ def test_steer_manifold_unregistered_reports(monkeypatch: pytest.MonkeyPatch, tm
     app._handle_command("/steer 0.5 ghost%0.5")
 
     assert "no fitted tensor" in _msgs(app)
-    assert app._manifold_terms == {}
+    assert app._get_extraction_controller()._manifold_terms == {}
 
 
 def test_steer_mixed_expression_applies_vector_siblings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1990,7 +1988,9 @@ def test_steer_mixed_expression_applies_vector_siblings(monkeypatch: pytest.Monk
     app._session.extract = _fake_extract
 
     domain = SimpleNamespace(intrinsic_dim=1)
-    manifold = SimpleNamespace(domain=domain)
+    manifold = SimpleNamespace(
+        domain=domain, resolve_position=lambda position: position,
+    )
 
     def _ensure(key: Any) -> None:
         app._session.manifolds[key] = manifold
@@ -2014,13 +2014,13 @@ def test_active_alphas_merges_manifold_terms(monkeypatch: pytest.MonkeyPatch, tm
     from saklas.core.triggers import Trigger
 
     app = _make_app()
-    app._alphas = {"honest": 0.5, "warm": 0.3}
+    app._get_extraction_controller()._alphas = {"honest": 0.5, "warm": 0.3}
     term = ManifoldTerm(
         along=0.7, onto=0.7, trigger=Trigger.BOTH, manifold="circumplex",
         position=(0.3, 0.8),
     )
-    app._manifold_terms = {"circumplex%0.3,0.8": term}
-    app._enabled = {
+    app._get_extraction_controller()._manifold_terms = {"circumplex%0.3,0.8": term}
+    app._get_extraction_controller()._enabled = {
         "honest": True, "warm": False, "circumplex%0.3,0.8": True,
     }
 
@@ -2028,7 +2028,7 @@ def test_active_alphas_merges_manifold_terms(monkeypatch: pytest.MonkeyPatch, tm
     assert merged == {"honest": 0.5, "circumplex%0.3,0.8": term}
 
     # Disabling the manifold drops it from the merged dict.
-    app._enabled["circumplex%0.3,0.8"] = False
+    app._get_extraction_controller()._enabled["circumplex%0.3,0.8"] = False
     assert "circumplex%0.3,0.8" not in app._active_alphas()
 
 
@@ -2050,7 +2050,7 @@ def test_pairs_command_refused_mid_gen():
     app._session.is_generating = True
     app._handle_command("/pairs mood")
     assert "modal" in _msgs(app)
-    assert app._pending_queue == []
+    assert app._get_input_history_controller()._pending_queue == []
 
 
 def test_pairs_command_pushes_modal():
@@ -2094,24 +2094,24 @@ def test_pairs_modal_parses_pair_lines():
 
 
 # ---------------------------------------------------------------------------
-# /manifold-probe attach / remove + trait panel rendering
+# Unified /probe attach + curved-manifold trait panel rendering
 # ---------------------------------------------------------------------------
 
 
-def test_manifold_probe_requires_selector():
+def test_removed_manifold_probe_command_is_unknown():
     app = _make_app()
-    app._handle_command("/manifold-probe")
-    assert "Usage: /manifold-probe" in _msgs(app)
+    app._handle_command("/manifold-probe circumplex")
+    assert "Unknown command" in _msgs(app)
 
 
-def test_manifold_probe_remove_requires_name():
+def test_removed_manifold_probe_remove_command_is_unknown():
     app = _make_app()
-    app._handle_command("/manifold-probe-remove")
-    assert "Usage: /manifold-probe-remove" in _msgs(app)
+    app._handle_command("/manifold-probe-remove circumplex")
+    assert "Unknown command" in _msgs(app)
 
 
-def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.MonkeyPatch):
-    """``/manifold-probe <selector>`` calls the unified ``session.add_probe``
+def test_probe_curved_selector_routes_through_session(monkeypatch: pytest.MonkeyPatch):
+    """``/probe <selector>`` calls the unified ``session.add_probe``
     on a worker; on success ``_refresh_probe_panels`` splits the probe set by
     geometry and pushes the curved probe's manifold artifact to the trait
     panel's manifold section."""
@@ -2119,11 +2119,12 @@ def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.Monkey
     captured = {}
 
     # A curved manifold stub — every layer reports ``is_affine = False`` so
-    # ``_manifold_is_affine`` routes it to the manifold (curved) section.
+    # ``manifold_is_affine`` routes it to the manifold (curved) section.
     manifold = SimpleNamespace(
         domain=SimpleNamespace(intrinsic_dim=1),
         node_labels=["a"], node_coords=None,
         layers={0: SimpleNamespace(is_affine=False)},
+        validate_runtime_geometry=lambda: None,
     )
 
     def _fake_add(selector: Any, **kwargs: Any) -> Any:
@@ -2140,16 +2141,16 @@ def test_manifold_probe_attach_routes_through_session(monkeypatch: pytest.Monkey
     app.run_worker = lambda fn, thread=True: fn()
     app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)
 
-    app._handle_command("/manifold-probe circumplex")
+    app._handle_command("/probe circumplex")
 
     assert captured["selector"] == "circumplex"
     app._trait_panel.set_active_manifold_probes.assert_called()
     pushed = app._trait_panel.set_active_manifold_probes.call_args.args[0]
     assert "circumplex" in pushed
-    assert "Manifold probe 'circumplex' active" in _msgs(app)
+    assert "Probe 'circumplex' active" in _msgs(app)
 
 
-def test_manifold_probe_remove_routes_through_session():
+def test_unprobe_curved_probe_routes_through_session():
     app = _make_app()
     app._session.monitor.probe_names = ["circumplex"]
     app._session.monitor.manifolds = {
@@ -2164,39 +2165,37 @@ def test_manifold_probe_remove_routes_through_session():
     app._trait_panel.set_active_manifold_probes = MagicMock()
     app._refresh_trait_why = MagicMock()
 
-    app._handle_command("/manifold-probe-remove circumplex")
+    app._handle_command("/unprobe circumplex")
 
     assert app._session.monitor.probe_names == []
     app._trait_panel.set_active_manifold_probes.assert_called_with({})
     assert "removed" in _msgs(app).lower()
 
 
-def test_manifold_probe_remove_missing_reports():
+def test_unprobe_curved_probe_missing_reports():
     app = _make_app()
     app._session.monitor.probe_names = []
-    app._handle_command("/manifold-probe-remove ghost")
+    app._handle_command("/unprobe ghost")
     assert "not active" in _msgs(app)
 
 
-def test_manifold_probe_mid_gen_enqueues_pending():
-    from saklas.tui.chat_panel import PendingItem
+def test_probe_curved_selector_mid_gen_enqueues_canonical_pending():
+    from saklas.tui.chat_panel import PendingProbe
 
     app = _make_app()
     app._session.is_generating = True
-    app._handle_command("/manifold-probe circumplex")
-    assert app._pending_queue == [
-        PendingItem(
-            "manifold_probe", "/manifold-probe circumplex", ("circumplex",),
-        ),
+    app._handle_command("/probe circumplex")
+    assert app._get_input_history_controller()._pending_queue == [
+        PendingProbe("/probe circumplex", "circumplex"),
     ]
 
 
-def test_manifold_probe_during_ab_shadow_is_refused():
+def test_probe_curved_selector_during_ab_shadow_is_refused():
     app = _make_app()
     app._ab_shadow_active = True
-    app._handle_command("/manifold-probe circumplex")
+    app._handle_command("/probe circumplex")
     assert "A/B shadow" in _msgs(app)
-    assert app._pending_queue == []
+    assert app._get_input_history_controller()._pending_queue == []
 
 
 def test_pull_manifold_aggregates_pushes_from_last_result():
@@ -2278,6 +2277,7 @@ def test_trait_panel_renders_manifold_minimap_for_2d_box():
     """A 2-D BoxDomain manifold draws an ASCII mini-map.  The coord dot
     from the aggregate lands on a row that contains the ``●`` marker."""
     import torch
+    from saklas.core.manifold import BoxAxis, BoxDomain
     from saklas.core.results import ProbeReading
     from saklas.tui.trait_panel import TraitPanel
 
@@ -2301,8 +2301,8 @@ def test_trait_panel_renders_manifold_minimap_for_2d_box():
     panel._manifold_content = SimpleNamespace(update=content_writes.append)
 
     # Russell-style 2-D box: valence x arousal, each in [-1, 1].
-    ax = SimpleNamespace(periodic=False, period=1.0, lo=-1.0, hi=1.0)
-    domain = SimpleNamespace(intrinsic_dim=2, axes=(ax, ax))
+    ax = BoxAxis(name="axis", periodic=False, period=1.0, lo=-1.0, hi=1.0)
+    domain = BoxDomain((ax, ax))
     # Five nodes: corners + origin.  Use a real tensor so .tolist() works.
     coords = torch.tensor([
         [-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0], [0.0, 0.0],
@@ -2372,12 +2372,13 @@ def test_trait_panel_skips_minimap_for_higher_dim():
     assert "·" not in rendered
 
 
-def test_help_lists_manifold_probe_commands():
+def test_help_lists_only_canonical_probe_commands():
     app = _make_app()
     app._handle_command("/help")
     msg = _msgs(app)
-    assert "/manifold-probe" in msg
-    assert "/manifold-probe-remove" in msg
+    assert "/probe <selector>" in msg
+    assert "/unprobe" in msg
+    assert "/manifold-probe" not in msg
 
 
 def test_pairs_extract_routes_through_session_extract():

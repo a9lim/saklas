@@ -35,22 +35,14 @@
 
   let { info, trajectory, settled, size = 168 }: Props = $props();
 
-  /** Pull the two box-domain axes out of the probe row.  The caller
-   *  (``_isMiniMapCandidate``) guarantees this is a 2D box, so the
-   *  fallback ``[-1, 1]`` only fires on malformed wire data. */
+  /** Pull the exact two box-domain axes out of the probe row. The caller
+   *  (``_isMiniMapCandidate``) guarantees this is a 2D box. */
   const axes = $derived.by<[AxisSpec, AxisSpec]>(() => {
     const d = info.domain as { type?: string; axes?: AxisSpec[] };
-    if (d?.type === "box" && Array.isArray(d.axes) && d.axes.length >= 2) {
-      return [d.axes[0], d.axes[1]];
+    if (d?.type !== "box" || !Array.isArray(d.axes) || d.axes.length !== 2) {
+      throw new Error(`probe ${info.name} has invalid 2D box geometry`);
     }
-    const fallback = (name: string): AxisSpec => ({
-      name,
-      periodic: false,
-      period: 2,
-      lo: -1,
-      hi: 1,
-    });
-    return [fallback("axis_0"), fallback("axis_1")];
+    return [d.axes[0], d.axes[1]];
   });
 
   /** Normalise an authoring coord to ``[0, 1]`` along its axis.  Used for
@@ -203,8 +195,8 @@
     display: block;
     width: var(--map-size);
     height: var(--map-size);
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
+    background: var(--glass-strong);
+    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
   }
   .grid {
@@ -212,35 +204,37 @@
     stroke-width: 1;
   }
   .trajectory {
-    /* Same purple as the steering rack so the manifold-tinted family
-     * holds across panels.  Translucent + thin so the path reads as
-     * historical context, not a foreground feature. */
-    stroke: var(--accent-purple);
+    /* Green live/probe hue: the per-token path is a streaming quantity.
+     * Translucent + thin so the path reads as historical context, not a
+     * foreground feature. */
+    stroke: var(--accent-green);
     stroke-width: 1.5;
-    stroke-opacity: 0.45;
+    stroke-opacity: 0.55;
     stroke-linecap: round;
     stroke-linejoin: round;
   }
   .node circle {
-    fill: var(--fg-muted);
+    fill: var(--fg-subtle);
     stroke: var(--bg-deep);
     stroke-width: 1;
   }
   .node text {
-    fill: var(--fg-dim);
+    fill: var(--fg-muted);
     font-size: var(--text-2xs);
     font-family: var(--font-ui);
   }
   .cursor {
-    fill: var(--accent-purple);
+    /* Live head of the green trajectory — follows the path's hue so the
+     * moving cursor doesn't clash with the line it caps. */
+    fill: var(--accent-green);
     fill-opacity: 0.7;
     stroke: var(--bg-deep);
     stroke-width: 1;
   }
   .settled {
-    fill: var(--accent-purple);
-    stroke: var(--accent);
-    stroke-width: 1.5;
+    fill: var(--accent-green);
+    stroke: var(--accent-light);
+    stroke-width: 1;
   }
   .axes {
     display: flex;

@@ -20,7 +20,7 @@ import numpy as np
 from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).parent))
-from data import PROBES  # noqa: E402
+from data import PROBES  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]  # sibling script module inserted above
 
 from saklas.io.paths import safe_model_id  # noqa: E402
 

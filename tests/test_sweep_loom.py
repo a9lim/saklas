@@ -46,6 +46,7 @@ class _SweepStub:
         parent_node_id: Any = None,
         on_token: Any = None,
         recipe_override: Any = None,
+        gen_seat: str = "assistant",
     ) -> GenerationResult:
         # Echo the call args for assertions.
         self.calls.append({
@@ -66,9 +67,13 @@ class _SweepStub:
         return GenerationResult(
             text=f"r{len(self.calls)}",
             tokens=[], token_count=0, tok_per_sec=0.0, elapsed=0.001,
-            readings={}, vectors={},
+            steering_alphas={},
             applied_steering=str(steering) if steering else None,
         )
+
+    def _generate_sweep_fast(self, *_args: Any, **_kwargs: Any) -> None:
+        """This current-shape stub deliberately declines the batch fast path."""
+        return None
 
 
 def test_sweep_lands_siblings_under_user_turn():

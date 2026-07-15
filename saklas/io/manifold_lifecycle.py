@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import shutil
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 
@@ -29,7 +31,9 @@ from saklas.io.manifold_folder import (
     ManifoldFolder,
     ManifoldFormatError,
     domain_label,
+    manifold_pair_lock,
     min_nodes,
+    validate_manifold_format_version,
 )
 from saklas.io.paths import manifold_dir
 
@@ -75,8 +79,9 @@ def _manifold_tensor_files(
 ) -> list[Path]:
     """Per-model fitted tensors + their ``.json`` sidecars under ``folder``.
 
-    Globs ``*.safetensors``, filters by ``variant`` (``raw`` / ``sae`` /
-    ``from`` / ``all``), and pairs each kept tensor with its sidecar.  The
+    Scans fitted tensors and sidecars independently, filters by ``variant``
+    (``raw`` / ``sae`` / ``from`` / ``all``), and keeps orphaned halves so
+    ``clear`` can repair an interrupted or corrupted fit.  The
     node corpus and ``manifold.json`` are never touched — this is the
     fitted-artifact layer only.
 
@@ -90,9 +95,19 @@ def _manifold_tensor_files(
     from saklas.io.paths import parse_tensor_filename, safe_model_id
 
     target_safe = safe_model_id(model_scope) if model_scope is not None else None
-    out: list[Path] = []
-    for ts in sorted(folder.glob("*.safetensors")):
-        parsed = parse_tensor_filename(ts.name)
+    out: set[Path] = set()
+    candidates = list(folder.glob("*.safetensors")) + [
+        sidecar
+        for sidecar in folder.glob("*.json")
+        if sidecar.name != "manifold.json"
+    ]
+    for candidate in candidates:
+        tensor_name = (
+            candidate.with_suffix(".safetensors").name
+            if candidate.suffix == ".json"
+            else candidate.name
+        )
+        parsed = parse_tensor_filename(tensor_name)
         if parsed is None:
             continue
         model, var = parsed
@@ -101,14 +116,121 @@ def _manifold_tensor_files(
         key = "raw" if var is None else var
         if not _manifold_tensor_variant_matches(key, variant):
             continue
-        out.append(ts)
-        sc = ts.with_suffix(".json")
-        if sc.exists():
-            out.append(sc)
-    return out
+        out.add(candidate)
+    return sorted(out)
+
+
+def _pair_tensor_paths(files: list[Path]) -> list[Path]:
+    """Canonical tensor paths for a mixed tensor/sidecar file list."""
+
+    return sorted({
+        path.with_suffix(".safetensors") if path.suffix == ".json" else path
+        for path in files
+    })
+
+
+@contextmanager
+def _locked_manifold_pairs(files: list[Path]):
+    """Acquire fitted pair locks in one deterministic global order."""
+
+    with ExitStack() as stack:
+        for tensor_path in _pair_tensor_paths(files):
+            stack.enter_context(manifold_pair_lock(tensor_path))
+        yield
+
+
+def _capture_group_is_referenced(safe_model: str, capture_sha: str) -> bool:
+    """Whether any surviving fitted sidecar still owns a shared capture stem."""
+    from saklas.io.paths import manifolds_dir, parse_tensor_filename
+
+    for sidecar_path in manifolds_dir().glob("*/*/*.json"):
+        if sidecar_path.name == "manifold.json":
+            continue
+        parsed = parse_tensor_filename(
+            sidecar_path.with_suffix(".safetensors").name,
+        )
+        if parsed is None or parsed[0] != safe_model:
+            continue
+        try:
+            with open(sidecar_path) as handle:
+                sidecar = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if sidecar.get("capture_sha256") == capture_sha:
+            return True
+    return False
+
+
+def _remove_unreferenced_capture_groups(
+    capture_groups: set[tuple[str, str]],
+) -> None:
+    """Garbage-collect content-addressed captures only after the last owner."""
+    if not capture_groups:
+        return
+    from saklas.io.atomic import artifact_has_live_lease, artifact_lock
+    from saklas.io.paths import models_dir
+
+    for safe_model, capture_sha in capture_groups:
+        cache_dir = models_dir() / safe_model / "manifold_capture"
+        # The capture lock spans cache publication through fitted-sidecar
+        # publication.  Scan and delete under the same lock so lifecycle GC
+        # cannot race a different folder that is about to establish ownership.
+        with artifact_lock(cache_dir / capture_sha):
+            # A fit may have released the short cache transaction while still
+            # consuming mapped row shards.  Its process lease is the temporary
+            # owner; a later prune/clear pass reaps the group after the lease is
+            # gone (including stale PID markers after a crash).
+            if artifact_has_live_lease(cache_dir / capture_sha):
+                continue
+            if _capture_group_is_referenced(safe_model, capture_sha):
+                continue
+            for cached in cache_dir.glob(f"{capture_sha}.*"):
+                cached.unlink()
+
+
+def _capture_groups_for_models(safe_models: set[str]) -> set[tuple[str, str]]:
+    """Enumerate cache stems for models touched by a destructive operation.
+
+    This is deliberately independent of fitted sidecar readability.  Clear/rm
+    are repair surfaces, so an orphaned tensor or corrupt sidecar must not make
+    its content-addressed capture permanently undiscoverable.  Ownership is
+    still checked globally, under the existing stem lock, immediately before
+    deletion by :func:`_remove_unreferenced_capture_groups`.
+    """
+    from saklas.io.paths import models_dir
+
+    groups: set[tuple[str, str]] = set()
+    for safe_model in safe_models:
+        cache_dir = models_dir() / safe_model / "manifold_capture"
+        try:
+            cached_paths = list(cache_dir.iterdir())
+        except OSError:
+            continue
+        for cached in cached_paths:
+            stem = cached.name.split(".", 1)[0]
+            if len(stem) == 64:
+                try:
+                    int(stem, 16)
+                except ValueError:
+                    continue
+                groups.add((safe_model, stem))
+    return groups
 
 
 def clear_manifold_tensors(
+    namespace: str, name: str, model_scope: Optional[str] = None, *, variant: str = "all",
+) -> int:
+    """Atomically clear selected fitted pairs and their manifest entries."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    folder = manifold_dir(namespace, name)
+    with _locked_manifest(folder):
+        return _clear_manifold_tensors_locked(
+            namespace, name, model_scope, variant=variant,
+        )
+
+
+def _clear_manifold_tensors_locked(
     namespace: str, name: str, model_scope: Optional[str] = None, *, variant: str = "all",
 ) -> int:
     """Delete a manifold's per-model fitted tensors, keeping the corpus.
@@ -131,12 +253,18 @@ def clear_manifold_tensors(
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
         raise ManifoldNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
-    # Load *before* unlinking — once the tensors are gone the populated
-    # ``files`` manifest would fail the integrity check on a reload.  Keep
-    # the in-memory folder and re-hash from disk afterward, the same shape
-    # ``cache_ops.delete_tensors`` uses (load, mutate, re-hash).
-    mf = ManifoldFolder.load(folder)
-    if mf.fit_mode == "baked":
+    # This is a repair operation: even the non-integrity folder loader parses
+    # every fitted sidecar and rejects orphan halves. Read only the authoring
+    # manifest so the corrupt selected artifacts remain deletable.
+    manifest_path = folder / "manifold.json"
+    try:
+        with open(manifest_path) as handle:
+            manifest_data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifoldFormatError(
+            f"manifold {namespace}/{name} manifest is unreadable: {exc}"
+        ) from exc
+    if manifest_data.get("fit_mode") == "baked":
         # A baked manifold has no corpus to re-fit from — deleting its tensor
         # would destroy the only copy of its geometry.  Refuse; ``manifold rm``
         # is the way to remove it wholesale.
@@ -146,16 +274,97 @@ def clear_manifold_tensors(
             f"`manifold rm {namespace}/{name}` to delete it"
         )
     files = _manifold_tensor_files(folder, variant=variant, model_scope=model_scope)
-    for f in files:
-        f.unlink()
-    if files:
-        # ``write_metadata`` defaults to re-hashing the now-smaller
-        # on-disk tensor set via ``hash_manifold_files``.
-        mf.write_metadata()
+    capture_groups: set[tuple[str, str]] = set()
+    affected_models: set[str] = set()
+    from saklas.io.paths import parse_tensor_filename, safe_model_id
+
+    target_safe = safe_model_id(model_scope) if model_scope is not None else None
+
+    def _selected_manifest_entry(filename: str) -> bool:
+        candidate = (
+            Path(filename).with_suffix(".safetensors").name
+            if filename.endswith(".json")
+            else filename
+        )
+        parsed = parse_tensor_filename(candidate)
+        if parsed is None:
+            return False
+        safe_model, parsed_variant = parsed
+        key = "raw" if parsed_variant is None else parsed_variant
+        return (
+            (target_safe is None or safe_model == target_safe)
+            and _manifold_tensor_variant_matches(key, variant)
+        )
+
+    manifest_files = manifest_data.get("files", {})
+    if not isinstance(manifest_files, dict):
+        raise ManifoldFormatError("manifold files manifest must be an object")
+    if target_safe is not None:
+        affected_models.add(target_safe)
+    for filename in manifest_files:
+        if not _selected_manifest_entry(filename):
+            continue
+        candidate = (
+            Path(filename).with_suffix(".safetensors").name
+            if filename.endswith(".json")
+            else filename
+        )
+        parsed = parse_tensor_filename(candidate)
+        if parsed is not None:
+            affected_models.add(parsed[0])
+
+    with _locked_manifold_pairs(files):
+        for fitted_path in files:
+            parsed = parse_tensor_filename(
+                fitted_path.with_suffix(".safetensors").name,
+            )
+            if parsed is not None:
+                affected_models.add(parsed[0])
+        for sidecar_path in (path for path in files if path.suffix == ".json"):
+            try:
+                with open(sidecar_path) as handle:
+                    sidecar = json.load(handle)
+                capture_sha = sidecar.get("capture_sha256")
+                parsed = parse_tensor_filename(
+                    sidecar_path.with_suffix(".safetensors").name,
+                )
+                if isinstance(capture_sha, str) and len(capture_sha) == 64 and parsed:
+                    capture_groups.add((parsed[0], capture_sha))
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+        for f in files:
+            f.unlink(missing_ok=True)
+        # Repair only the selected manifest entries. Re-hashing every survivor
+        # here would bless an unrelated corrupt model/variant while clearing
+        # this one. Preserve untouched expected digests byte-for-byte.
+        manifest_data["files"] = {
+            name: digest
+            for name, digest in manifest_files.items()
+            if not _selected_manifest_entry(name)
+        }
+        # Invalidate only fitting targets selected by this clear.  A global
+        # epoch would throw away unrelated model/variant compute.
+        epochs_raw = manifest_data.get("fit_epochs", {})
+        epochs = dict(epochs_raw) if isinstance(epochs_raw, dict) else {}
+        selector_key = f"{target_safe or '*'}:{variant}"
+        epochs[selector_key] = int(epochs.get(selector_key, 0)) + 1
+        manifest_data["fit_epochs"] = epochs
+        write_json_atomic(manifest_path, manifest_data)
+    capture_groups.update(_capture_groups_for_models(affected_models))
+    _remove_unreferenced_capture_groups(capture_groups)
     return len(files)
 
 
 def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
+    """Remove a whole folder while excluding concurrent fits/mutations."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    folder = manifold_dir(namespace, name)
+    with _locked_manifest(folder):
+        return _remove_manifold_folder_locked(namespace, name)
+
+
+def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
     """Remove a whole manifold folder (rm), bundled-respawn semantics.
 
     The manifold analogue of ``saklas.io.cache_ops.uninstall`` for a
@@ -171,14 +380,64 @@ def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
         raise ManifoldNotFoundError(f"manifold {namespace}/{name} not found at {folder}")
-    # Read the source tier before deleting (best-effort — a corrupt
-    # manifest just reports the namespace-implied tier).
+    # Read the source tier and stale fitted-file roster before deleting.
+    # The latter is the only surviving model hint after a crash or manual
+    # deletion removes both halves of a fitted pair.
+    raw_manifest: dict[str, Any] = {}
     try:
-        source = ManifoldFolder.load(folder).source
+        with open(folder / "manifold.json") as handle:
+            candidate_manifest = json.load(handle)
+        if isinstance(candidate_manifest, dict):
+            raw_manifest = candidate_manifest
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    # Source is best-effort — a corrupt manifest reports the namespace tier.
+    try:
+        source = ManifoldFolder.load(folder, verify_manifest=False).source
     except ManifoldFormatError:
         source = "bundled" if namespace == "default" else "local"
     rematerializes = namespace == "default" or source == "bundled"
-    shutil.rmtree(folder)
+    capture_groups: set[tuple[str, str]] = set()
+    affected_models: set[str] = set()
+    from saklas.io.paths import parse_tensor_filename
+
+    manifest_files = raw_manifest.get("files", {})
+    if isinstance(manifest_files, dict):
+        for filename in manifest_files:
+            candidate = (
+                Path(filename).with_suffix(".safetensors").name
+                if filename.endswith(".json")
+                else filename
+            )
+            parsed = parse_tensor_filename(candidate)
+            if parsed is not None:
+                affected_models.add(parsed[0])
+
+    fitted_files = _manifold_tensor_files(folder)
+    with _locked_manifold_pairs(fitted_files):
+        for fitted_path in fitted_files:
+            parsed = parse_tensor_filename(
+                fitted_path.with_suffix(".safetensors").name,
+            )
+            if parsed is not None:
+                affected_models.add(parsed[0])
+        for sidecar_path in folder.glob("*.json"):
+            if sidecar_path.name == "manifold.json":
+                continue
+            try:
+                with open(sidecar_path) as handle:
+                    sidecar = json.load(handle)
+                capture_sha = sidecar.get("capture_sha256")
+                parsed = parse_tensor_filename(
+                    sidecar_path.with_suffix(".safetensors").name,
+                )
+                if isinstance(capture_sha, str) and len(capture_sha) == 64 and parsed:
+                    capture_groups.add((parsed[0], capture_sha))
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+        shutil.rmtree(folder)
+    capture_groups.update(_capture_groups_for_models(affected_models))
+    _remove_unreferenced_capture_groups(capture_groups)
     return {
         "namespace": namespace,
         "name": name,
@@ -189,6 +448,19 @@ def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
 
 
 def refresh_manifold(
+    namespace: str, name: str, *, model_scope: Optional[str] = None, force: bool = True,
+) -> str:
+    """Refresh a folder while excluding concurrent fits/mutations."""
+    from saklas.io.manifold_folder import _locked_manifest
+
+    folder = manifold_dir(namespace, name)
+    with _locked_manifest(folder):
+        return _refresh_manifold_locked(
+            namespace, name, model_scope=model_scope, force=force,
+        )
+
+
+def _refresh_manifold_locked(
     namespace: str, name: str, *, model_scope: Optional[str] = None, force: bool = True,
 ) -> str:
     """Re-pull / re-materialize a manifold from its source.
@@ -226,14 +498,15 @@ def refresh_manifold(
         clear_manifold_tensors(namespace, name, model_scope, variant="all")
         return "scoped"
 
-    source = ManifoldFolder.load(folder).source
+    source = ManifoldFolder.load(folder, verify_manifest=False).source
 
     if namespace == "default" or source == "bundled":
         # Bundled tier — re-copy from package data.  Process-scoped, so
         # this is a no-op after the first materialize within a process.
         from saklas.io.manifolds import materialize_bundled_manifolds
 
-        materialize_bundled_manifolds()
+        with _locked_manifold_pairs(_manifold_tensor_files(folder)):
+            materialize_bundled_manifolds()
         return "bundled"
 
     if source.startswith("hf://"):
@@ -241,7 +514,8 @@ def refresh_manifold(
         from saklas.io.hf_manifolds import pull_manifold
 
         coord, revision = split_revision(source[len("hf://"):])
-        pull_manifold(coord, target_folder=folder, force=force, revision=revision)
+        with _locked_manifold_pairs(_manifold_tensor_files(folder)):
+            pull_manifold(coord, target_folder=folder, force=force, revision=revision)
         return "hf"
 
     # local (or anything without an upstream): nothing to do.
@@ -258,34 +532,187 @@ def refresh_manifold(
 # the transferred tensor.  Do not rebuild the Procrustes solver here.
 
 
+@dataclass(frozen=True)
+class TransferSourceProof:
+    """Immutable source-pair generation selected before alignment work."""
+
+    tensor_name: str
+    tensor_sha256: str
+    sidecar_sha256: str
+    layers: tuple[int, ...]
+
+
+def _transfer_preflight_locked(
+    folder: Path, *, from_model: str, to_model: str, force: bool,
+) -> tuple[Path, Path, dict[str, Any], dict[str, str], bool]:
+    """Prove the source pair and classify the target with locks already held."""
+    from saklas.io.packs import verify_integrity
+    from saklas.io.paths import tensor_filename
+
+    folder = Path(folder)
+    source = folder / tensor_filename(from_model)
+    target = folder / tensor_filename(to_model, transferred_from=from_model)
+    manifest_path = folder / "manifold.json"
+    try:
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifoldFormatError(
+            f"manifold manifest is unreadable at {manifest_path}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ManifoldFormatError(
+            f"manifold manifest at {manifest_path} must be a JSON object"
+        )
+    validate_manifold_format_version(
+        manifest.get("format_version"), location=str(manifest_path),
+    )
+    files = manifest.get("files", {})
+    if not isinstance(files, dict):
+        raise ManifoldFormatError("manifold files manifest must be an object")
+
+    def trusted_pair(tensor: Path) -> bool:
+        sidecar = tensor.with_suffix(".json")
+        if tensor.name not in files or sidecar.name not in files:
+            return False
+        expected = {
+            tensor.name: files[tensor.name], sidecar.name: files[sidecar.name],
+        }
+        for name, digest in expected.items():
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise ManifoldFormatError(
+                    f"manifold manifest has invalid sha256 for selected file "
+                    f"{name!r}"
+                )
+        return bool(expected) and verify_integrity(folder, expected)[0]
+
+    if not trusted_pair(source):
+        raise ManifoldNotFoundError(
+            f"manifold {folder.name!r} has no trusted fit for source model "
+            f"{from_model!r} at {source}"
+        )
+    target_trusted = trusted_pair(target)
+    if target_trusted and not force:
+        raise ManifoldExistsError(
+            f"{target} already exists; pass force=True to overwrite"
+        )
+    return source, target, manifest, dict(files), target_trusted
+
+
+def preflight_transfer_manifold(
+    folder: Path, *, from_model: str, to_model: str, force: bool = False,
+) -> TransferSourceProof:
+    """Prove transfer viability and return the locked source-fit layer header."""
+    from safetensors import SafetensorError, safe_open
+    from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.paths import tensor_filename
+
+    folder = Path(folder)
+    source = folder / tensor_filename(from_model)
+    target = folder / tensor_filename(to_model, transferred_from=from_model)
+    with _locked_manifest(folder):
+        with _locked_manifold_pairs([source, target]):
+            source, _target, _manifest, _files, _trusted = (
+                _transfer_preflight_locked(
+                    folder, from_model=from_model, to_model=to_model,
+                    force=force,
+                )
+            )
+            try:
+                with safe_open(
+                    str(source), framework="pt", device="cpu",
+                ) as tensors:
+                    layers = sorted({
+                        int(key.split(".", 1)[0].split("_", 1)[1])
+                        for key in tensors.keys()
+                        if key.startswith("layer_") and key.endswith(".mean")
+                    })
+            except (OSError, ValueError, SafetensorError) as exc:
+                raise ManifoldFormatError(
+                    f"source fit {source} has an unreadable tensor header: {exc}"
+                ) from exc
+            if not layers:
+                raise ManifoldFormatError(
+                    f"source fit {source} carries no fitted layer means"
+                )
+            sidecar = source.with_suffix(".json")
+            return TransferSourceProof(
+                tensor_name=source.name,
+                tensor_sha256=_files[source.name],
+                sidecar_sha256=_files[sidecar.name],
+                layers=tuple(layers),
+            )
+
+
 def transfer_manifold(
     folder: Path,
     *,
     from_model: str,
     to_model: str,
-    alignment: dict[int, torch.Tensor],
+    alignment: dict[int, Any],
     transfer_quality_estimate: Optional[float] = None,
+    source_model_fingerprint: str,
+    target_model_fingerprint: str,
     whitener: "Any | None" = None,
+    target_layer_means: Mapping[int, torch.Tensor],
     force: bool = False,
+    expected_source_proof: TransferSourceProof | None = None,
+) -> Path:
+    """Publish one transferred tensor/sidecar/manifest update atomically."""
+    from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.paths import tensor_filename
+
+    source = Path(folder) / tensor_filename(from_model)
+    target = Path(folder) / tensor_filename(
+        to_model, transferred_from=from_model,
+    )
+    with _locked_manifest(Path(folder)):
+        with _locked_manifold_pairs([source, target]):
+            return _transfer_manifold_locked(
+                folder, from_model=from_model, to_model=to_model,
+                alignment=alignment,
+                transfer_quality_estimate=transfer_quality_estimate,
+                source_model_fingerprint=source_model_fingerprint,
+                target_model_fingerprint=target_model_fingerprint,
+                whitener=whitener, target_layer_means=target_layer_means,
+                force=force,
+                expected_source_proof=expected_source_proof,
+            )
+
+
+def _transfer_manifold_locked(
+    folder: Path,
+    *,
+    from_model: str,
+    to_model: str,
+    alignment: dict[int, Any],
+    transfer_quality_estimate: Optional[float] = None,
+    source_model_fingerprint: str,
+    target_model_fingerprint: str,
+    whitener: "Any | None" = None,
+    target_layer_means: Mapping[int, torch.Tensor],
+    force: bool = False,
+    expected_source_proof: TransferSourceProof | None = None,
 ) -> Path:
     """Apply a per-layer alignment map to a fitted manifold, target-side.
 
     Reads the source-model fit at ``<folder>/<safe_from>.safetensors``,
     maps each layer's affine subspace (``mean`` + ``basis`` rows, both in
-    model space) through the supplied ``alignment`` map
-    (``{layer: M_L}`` where ``v_tgt = M_L @ v_src``, the shape
-    :func:`saklas.io.alignment.fit_alignment` produces), and writes a
-    transferred per-model tensor at the ``_from-<safe_src>`` filename
-    variant (``<safe_to>_from-<safe_from>.safetensors`` —
+    model space) through the supplied compact factorized affine alignment
+    (the shape :func:`saklas.io.alignment.fit_alignment` produces), and writes a
+    transferred per-model tensor at the ``_from-<encoded_src>`` filename
+    variant (``<safe_to>_from-<encode_release_id(from_model)>.safetensors`` —
     :func:`saklas.io.paths.tensor_filename`'s transfer suffix).
 
-    The RBF interpolant fields (``node_params`` / ``rbf_weights`` /
-    ``poly_coeffs`` / ``coord_offset`` / ``coord_scale``) live in
-    subspace/authoring-coordinate space, not model space, so they ride
-    through untouched — the subspace itself relocates via the transformed
-    ``mean``/``basis`` and the in-subspace parameterization is invariant.
-    ``node_coords`` (the intrinsic authoring layout) is likewise
-    model-independent.  Layers the alignment doesn't cover are dropped,
+    Translation applies to points/means but not directions.  The mapped basis
+    is orthonormalized and the affine/RBF reduced coefficients are transformed
+    exactly into that new frame; a rank collapse is rejected.  ``node_coords``
+    (the intrinsic authoring layout) remains model-independent.  Layers the
+    alignment doesn't cover are dropped,
     mirroring :func:`saklas.io.alignment.transfer_profile`.
 
     ``alignment`` is supplied by the caller (building it needs both
@@ -326,23 +753,56 @@ def transfer_manifold(
         save_manifold,
         transfer_manifold_subspaces,
     )
-    from saklas.io.paths import safe_model_id, tensor_filename
 
     folder = Path(folder)
-    safe_from = safe_model_id(from_model)
-    src_tensor = folder / f"{safe_from}.safetensors"
-    if not src_tensor.exists():
-        raise ManifoldNotFoundError(
-            f"manifold {folder.name!r} has no fit for source model "
-            f"{from_model!r} at {src_tensor}"
+    (
+        src_tensor, out_path, manifest, files, target_trusted,
+    ) = _transfer_preflight_locked(
+        folder, from_model=from_model, to_model=to_model, force=force,
+    )
+    if expected_source_proof is not None:
+        sidecar_path = src_tensor.with_suffix(".json")
+        current_pair = (
+            src_tensor.name,
+            files.get(src_tensor.name),
+            files.get(sidecar_path.name),
         )
+        expected_pair = (
+            expected_source_proof.tensor_name,
+            expected_source_proof.tensor_sha256,
+            expected_source_proof.sidecar_sha256,
+        )
+        if current_pair != expected_pair:
+            raise ManifoldFormatError(
+                "source manifold fit changed while alignment was prepared; "
+                "retry the transfer against the current source generation"
+            )
     if not alignment:
         raise ManifoldFormatError(
             f"transfer_manifold: alignment map for {from_model!r} → "
             f"{to_model!r} is empty"
         )
 
+    # Classify the destination before loading/folding the source manifold.  A
+    # proven pair preserves ordinary exists semantics; an unproven pair is a
+    # crash-left publication that this exact producer may repair.  The public
+    # wrapper holds manifest + source/target pair locks, so this proof remains
+    # authoritative until publication completes.
+    sidecar_path = out_path.with_suffix(".json")
+
     src = load_manifold(src_tensor)
+    # ``load_manifold`` returns metadata from the same locked pair read.  Do
+    # not reopen the sidecar outside that transaction and create a TOCTOU gap.
+    source_sidecar: dict[str, Any] = dict(src.metadata)
+    if not source_model_fingerprint or not target_model_fingerprint:
+        raise ManifoldFormatError(
+            "transfer requires proven source and target model fingerprints"
+        )
+    if source_sidecar.get("model_fingerprint") != source_model_fingerprint:
+        raise ManifoldFormatError(
+            "transfer source manifold was fitted for different loaded weights; "
+            "refit the source manifold before transfer"
+        )
     # The subspace re-mapping + target-space share re-bake is pure-tensor
     # compute owned by ``core.manifold``; this io function only orchestrates the
     # folder read/write around it.  ``transfer_manifold_subspaces`` raises
@@ -355,6 +815,7 @@ def transfer_manifold(
     try:
         transferred = transfer_manifold_subspaces(
             src, alignment, whitener=whitener,
+            target_layer_means=target_layer_means,
             from_model=from_model, to_model=to_model,
         )
     except SaklasError:
@@ -362,51 +823,36 @@ def transfer_manifold(
     except ValueError as exc:
         raise ManifoldFormatError(f"transfer_manifold: {exc}") from exc
 
-    out_path = folder / tensor_filename(to_model, transferred_from=from_model)
-    if out_path.exists() and not force:
-        raise ManifoldExistsError(
-            f"{out_path} already exists; pass force=True to overwrite"
-        )
-
     # Carry the discover-mode per-model layout (``node_coords``) and the
     # source sidecar's provenance fields into the transferred tensor, then
     # stamp the transfer method + source id.  ``save_manifold`` reads
     # provenance keys off this metadata dict.
     metadata: dict[str, object] = dict(src.metadata)
-    src_sidecar_path = src_tensor.with_suffix(".json")
-    if src_sidecar_path.exists():
-        with open(src_sidecar_path) as f:
-            metadata.update(json.load(f))
+    metadata.update(source_sidecar)
     metadata["method"] = "manifold_procrustes_transfer"
     metadata["source_model_id"] = from_model
+    metadata["source_model_fingerprint"] = source_model_fingerprint
+    metadata["model_fingerprint"] = target_model_fingerprint
     # Record the *target* share metric (the source sidecar's value rode in
     # via the ``metadata.update`` above and would be misleading).
     # ``subspace_metric`` is left as the source carried it — the basis was
     # selected on the source model and only rotated here, so its selection
     # metric is unchanged by the transfer.
     metadata["share_metric"] = "mahalanobis"
-    metadata["nodes_sha256"] = ManifoldFolder.load(folder).nodes_sha256()
     if transfer_quality_estimate is not None:
         metadata["transfer_quality_estimate"] = float(transfer_quality_estimate)
-
+    if not target_trusted:
+        out_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+        files = dict(files)
+        files.pop(out_path.name, None)
+        files.pop(sidecar_path.name, None)
+        manifest["files"] = files
+        write_json_atomic(folder / "manifold.json", manifest)
+    current = ManifoldFolder.load(folder, verify_manifest=False)
+    metadata["nodes_sha256"] = current.nodes_sha256()
     save_manifold(transferred, out_path, metadata)
-    # ``save_manifold`` only persists a fixed sidecar key allow-list
-    # (``method`` / ``nodes_sha256`` / sae / fit_mode / hyperparams /
-    # diagnostics / node_roles) — the transfer-provenance fields aren't
-    # in it.  Patch them in afterward so a consumer can see where the
-    # tensor came from, mirroring ``Sidecar.source_model_id`` /
-    # ``transfer_quality_estimate`` on the vector path.
-    sidecar_path = out_path.with_suffix(".json")
-    with open(sidecar_path) as f:
-        sc_data = json.load(f)
-    sc_data["source_model_id"] = from_model
-    if transfer_quality_estimate is not None:
-        sc_data["transfer_quality_estimate"] = float(transfer_quality_estimate)
-    write_json_atomic(sidecar_path, sc_data)
-    # Refresh the folder integrity manifest so the new tensor + sidecar
-    # are covered (mirrors the fit path).  The sidecar patch above must
-    # happen *before* this re-hash so the manifest covers the final bytes.
-    ManifoldFolder.load(folder).write_metadata()
+    current.update_file_hashes(out_path, sidecar_path)
     return out_path
 
 
@@ -442,7 +888,11 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
     :class:`ManifoldFormatError` on a malformed folder.
     """
     folder = Path(folder)
-    mf = ManifoldFolder.load(folder)
+    # A summary reports authoring metadata and fitted filenames only.  Payload
+    # integrity remains mandatory when a tensor is installed, pushed, or used;
+    # hashing every historical fit here makes ordinary show/detail routing
+    # scale with artifact bytes rather than metadata size.
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
     namespace = folder.parent.name
 
     if mf.fit_mode == "authored" and mf.domain:

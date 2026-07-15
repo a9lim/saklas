@@ -3,7 +3,6 @@ import json
 import csv
 import tempfile
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 import torch
@@ -55,26 +54,24 @@ class TestGenerationResult:
     def test_to_dict_no_probes(self):
         result = GenerationResult(
             text="Hello world", tokens=[1, 2, 3], token_count=3,
-            tok_per_sec=10.0, elapsed=0.3, readings={}, vectors={"happy": 1.5},
+            tok_per_sec=10.0, elapsed=0.3,
+            steering_alphas={"happy": 1.5},
         )
         d = result.to_dict()
         assert d["text"] == "Hello world"
         assert d["tokens"] == [1, 2, 3]
-        assert d["readings"] == {}
-        assert d["vectors"] == {"happy": 1.5}
+        assert d["probe_readings"] == {}
+        assert d["steering_alphas"] == {"happy": 1.5}
 
     def test_to_dict_with_probes(self):
-        readings = ProbeReadings(
-            per_generation=[(0.5,)],
-            mean=(0.5,), std=(0.0,), min=(0.5,), max=(0.5,), delta_per_gen=(0.0,),
-        )
+        reading = ProbeReading(fraction=0.8, nearest=[], coords=(0.5,))
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
-            readings={"honest": readings}, vectors={},
+            probe_readings={"honest": reading}, steering_alphas={},
         )
         d = result.to_dict()
-        assert "honest" in d["readings"]
-        assert isinstance(d["readings"]["honest"], dict)
+        assert "honest" in d["probe_readings"]
+        assert isinstance(d["probe_readings"]["honest"], dict)
 
     def test_applied_steering_default_none(self):
         """Default value is ``None`` — no steering was active."""
@@ -119,7 +116,7 @@ class TestTokenEvent:
         assert event.logprob is None
         assert event.top_alts is None
         assert event.finish_reason is None
-        assert event.scores is None
+        assert event.probe_readings is None
         assert event.perplexity is None
 
     def test_logprobs_carried_through(self):
@@ -143,9 +140,7 @@ class TestTokenEvent:
             text="x", token_id=0, index=0,
             probe_readings={"happy": happy, "sad": sad}, perplexity=12.7,
         )
-        # ``scores`` is now a back-compat property alias for ``probe_readings``.
         assert event.probe_readings == {"happy": happy, "sad": sad}
-        assert event.scores == {"happy": happy, "sad": sad}
         assert event.perplexity == 12.7
 
     def test_finish_reason_set(self):
@@ -157,7 +152,8 @@ class TestResultCollector:
     def _make_result(self, text: str = "Hello", alpha: float = 1.0) -> GenerationResult:
         return GenerationResult(
             text=text, tokens=[1, 2], token_count=2,
-            tok_per_sec=10.0, elapsed=0.2, readings={}, vectors={"happy": alpha},
+            tok_per_sec=10.0, elapsed=0.2,
+            steering_alphas={"happy": alpha},
         )
 
     def test_add_and_to_dicts(self):
@@ -167,41 +163,19 @@ class TestResultCollector:
         assert len(dicts) == 1
         assert dicts[0]["text"] == "Hello"
         assert dicts[0]["prompt"] == "hi"
-        assert dicts[0]["vector_happy_alpha"] == 1.0
+        assert dicts[0]["steering_happy_alpha"] == 1.0
 
     def test_probe_readings_flattened(self):
-        readings = ProbeReadings(
-            per_generation=[(0.5,)],
-            mean=(0.5,), std=(0.0,), min=(0.5,), max=(0.5,), delta_per_gen=(0.0,),
-        )
+        reading = ProbeReading(fraction=0.8, nearest=[], coords=(0.5,))
         result = GenerationResult(
             text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
-            readings={"honest": readings}, vectors={},
+            probe_readings={"honest": reading}, steering_alphas={},
         )
         collector = ResultCollector()
         collector.add(result)
         d = collector.results[0]
-        assert d["probe_honest_mean"] == 0.5
-        assert d["probe_honest_std"] == 0.0
-        assert d["probe_honest_min"] == 0.5
-        assert d["probe_honest_max"] == 0.5
-
-    def test_probe_readings_flattened_accepts_legacy_scalar_stats(self):
-        readings = ProbeReadings(
-            per_generation=cast(Any, [0.5]),
-            mean=cast(Any, 0.5),
-            std=cast(Any, 0.0),
-            min=cast(Any, 0.5),
-            max=cast(Any, 0.5),
-            delta_per_gen=cast(Any, 0.0),
-        )
-        result = GenerationResult(
-            text="Hi", tokens=[1], token_count=1, tok_per_sec=5.0, elapsed=0.2,
-            readings={"honest": readings}, vectors={},
-        )
-        collector = ResultCollector()
-        collector.add(result)
-        assert collector.results[0]["probe_honest_mean"] == 0.5
+        assert d["probe_honest_coord"] == 0.5
+        assert d["probe_honest_fraction"] == 0.8
 
     def test_to_jsonl(self):
         collector = ResultCollector()
@@ -269,13 +243,12 @@ class TestRunSet:
     def _make_result(self, text: str = "Hello") -> GenerationResult:
         return GenerationResult(
             text=text, tokens=[1, 2], token_count=2,
-            tok_per_sec=10.0, elapsed=0.2, readings={}, vectors={},
+            tok_per_sec=10.0, elapsed=0.2, steering_alphas={},
         )
 
-    def test_single_run_delegates_common_attrs(self):
+    def test_single_run_uses_explicit_first(self):
         runset = RunSet([self._make_result("one")], node_ids=["n1"])
         assert runset.first.text == "one"
-        assert runset.text == "one"
         assert runset.node_id == "n1"
 
     def test_to_collector_preserves_grid_and_node_ids(self):
@@ -394,15 +367,6 @@ class TestTraitMonitorScoring:
             monitor.history["test_probe"][0][0]
             > monitor.history["test_probe"][1][0]
         )
-
-    def test_stats_accumulate(self):
-        monitor = self._make_monitor()
-        for _ in range(3):
-            h = torch.randn(16)
-            monitor.measure_from_hidden({0: h})
-        stats = monitor.get_stats("test_probe")
-        assert stats["count"] == 3
-        assert stats["min"] <= stats["max"]
 
     def test_sparkline_grows_with_history(self):
         monitor = self._make_monitor()

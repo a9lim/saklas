@@ -10,6 +10,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from saklas.core.histogram import HIST_BUCKETS, bucketize
+from saklas.core.manifold import BoxAxis, BoxDomain, Manifold
 from saklas.tui.selectable import SelectableListWidget
 from saklas.tui.utils import BAR_WIDTH, build_bar
 
@@ -51,7 +52,7 @@ class TraitPanel(SelectableListWidget):
         # from ``GenerationResult.probe_readings`` at finalize (the same
         # ``ProbeReading`` shape, pooled at the last-content token).  Either
         # may be empty; rendering degrades cleanly.
-        self._manifold_probes: dict[str, Any] = {}
+        self._manifold_probes: dict[str, Manifold] = {}
         self._manifold_readings: dict[str, "ProbeReading"] = {}
         self._manifold_aggregates: dict[str, "ProbeReading"] = {}
         self._cached_manifold_text: str = ""
@@ -60,6 +61,7 @@ class TraitPanel(SelectableListWidget):
         # the latest per-step ``{layer: [(token, score), ...]}`` payload.
         self._lens_layers: list[int] | None = None
         self._lens_readout: dict[int, list[tuple[str, float]]] = {}
+        self._lens_aggregate: list[tuple[str, float, float, float]] = []
         self._cached_lens_text: str = ""
 
     def compose(self) -> ComposeResult:
@@ -250,7 +252,7 @@ class TraitPanel(SelectableListWidget):
 
     # ------------------------------------------------- manifold probes ---
 
-    def set_active_manifold_probes(self, probes: dict[str, Any]) -> None:
+    def set_active_manifold_probes(self, probes: dict[str, Manifold]) -> None:
         """Replace the attached-manifold-probe registry.
 
         ``probes`` maps probe name (the key the session registered) to the
@@ -369,17 +371,26 @@ class TraitPanel(SelectableListWidget):
         self._lens_layers = list(layers) if layers is not None else None
         if layers is None:
             self._lens_readout = {}
+            self._lens_aggregate = []
         self._render_lens()
 
     def update_lens_readout(
-        self, readout: dict[int, list[tuple[str, float]]],
+        self,
+        readout: dict[int, list[tuple[str, float]]],
+        *,
+        aggregate: list[tuple[str, float, float, float]] | None = None,
     ) -> None:
-        """Push one decode step's lens readout (``{layer: [(token, score)]}``)."""
+        """Push one decode step's lens readout (``{layer: [(token, score)]}``)
+        plus its layer-aggregated chip list (``[(token, strength, com,
+        spread), ...]``, strength-descending)."""
         self._lens_readout = dict(readout)
+        if aggregate is not None:
+            self._lens_aggregate = list(aggregate)
         self._render_lens()
 
     def clear_lens_readout(self) -> None:
         self._lens_readout = {}
+        self._lens_aggregate = []
         self._render_lens()
 
     def _render_lens(self) -> None:
@@ -392,6 +403,15 @@ class TraitPanel(SelectableListWidget):
             return
         self._lens_header.update("[bold]WORKSPACE[/] [dim](J-lens)[/]")
         lines: list[str] = []
+        if self._lens_aggregate:
+            # Layer-aggregated chip row first: token@com, strength-descending
+            # (com = probability-mass-weighted depth center of mass, 0..1).
+            toks = "  ".join(
+                f"[ansi_cyan]{self._lens_token_markup(tok)}[/]"
+                f"[dim]@{com:.2f}[/]"
+                for tok, _strength, com, _spread in self._lens_aggregate
+            )
+            lines.append(f" [dim]Σ   [/] {toks}")
         for layer in self._lens_layers:
             row = self._lens_readout.get(layer)
             if not row:
@@ -415,7 +435,7 @@ class TraitPanel(SelectableListWidget):
 
     def _render_minimap(
         self,
-        manifold: Any,
+        manifold: Manifold,
         agg: "ProbeReading | None",
         live: "ProbeReading | None",
     ) -> str:
@@ -430,19 +450,15 @@ class TraitPanel(SelectableListWidget):
         ``CustomDomain`` / ``SphereDomain`` map skipped (no meaningful
         rectangular layout).
         """
-        domain = getattr(manifold, "domain", None)
-        if domain is None:
+        domain = manifold.domain
+        if not isinstance(domain, BoxDomain) or domain.intrinsic_dim != 2:
             return ""
-        if getattr(domain, "intrinsic_dim", 0) != 2:
-            return ""
-        axes = getattr(domain, "axes", None)
-        if axes is None or len(axes) != 2:
-            return ""
+        axes = domain.axes
         # Resolve per-axis (lo, hi).  Periodic axes use [0, period].
-        def _axis_bounds(ax: Any) -> tuple[float, float]:
-            if getattr(ax, "periodic", False):
-                return 0.0, float(getattr(ax, "period", 1.0))
-            return float(getattr(ax, "lo", 0.0)), float(getattr(ax, "hi", 1.0))
+        def _axis_bounds(ax: BoxAxis) -> tuple[float, float]:
+            if ax.periodic:
+                return 0.0, float(ax.period)
+            return float(ax.lo), float(ax.hi)
         x_lo, x_hi = _axis_bounds(axes[0])
         y_lo, y_hi = _axis_bounds(axes[1])
         if not (math.isfinite(x_lo) and math.isfinite(x_hi)
@@ -466,7 +482,7 @@ class TraitPanel(SelectableListWidget):
 
         # Build the grid with node markers.
         grid = [[" " for _ in range(MINIMAP_W)] for _ in range(MINIMAP_H)]
-        coords = getattr(manifold, "node_coords", None)
+        coords = manifold.node_coords
         if coords is not None:
             try:
                 rows = coords.tolist()
@@ -485,7 +501,7 @@ class TraitPanel(SelectableListWidget):
             coord_dot = _project(float(agg.coords[0]), float(agg.coords[1]))
         elif live is not None and live.nearest:
             label = live.nearest[0][0]
-            labels = getattr(manifold, "node_labels", None) or []
+            labels = manifold.node_labels
             try:
                 idx = labels.index(label)
             except ValueError:

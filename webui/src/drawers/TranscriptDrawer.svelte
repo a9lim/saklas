@@ -200,13 +200,10 @@
 
   <div class="body">
     {#if tab === "export"}
-      <p class="hint">
-        Export the path ending at the chosen node as a saklas transcript
-        YAML. Leave the field blank to export the active path.
-      </p>
+      <p class="hint">blank = active path</p>
 
       <label class="field">
-        <span class="label">node id (or prefix)</span>
+        <span class="label">node</span>
         <input
           type="text"
           class="input"
@@ -244,33 +241,31 @@
         </div>
       {/if}
     {:else}
-      <p class="hint">
-        Paste YAML below or upload a file. Pick a mode and run.
-      </p>
+      <p class="hint">paste or upload YAML</p>
 
       <div class="field">
         <span class="label">mode</span>
         <span class="mode-opt">
           <Radio bind:group={importMode} value="default" ariaLabel="default" />
-          <span><strong>default</strong>: attach at root (fresh branch)</span>
+          <span><strong>default</strong> · root</span>
         </span>
         <span class="mode-opt">
           <Radio bind:group={importMode} value="here" ariaLabel="here" />
-          <span><strong>here</strong>: attach at the active node</span>
+          <span><strong>here</strong> · active node</span>
         </span>
         <span class="mode-opt">
           <Radio bind:group={importMode} value="merge" ariaLabel="merge" />
-          <span><strong>merge</strong>: deepest user-turn prefix match</span>
+          <span><strong>merge</strong> · deepest match</span>
         </span>
       </div>
 
       <span class="mode-opt">
         <Checkbox bind:checked={importStrict} ariaLabel="strict mode" />
-        <span>strict (refuse on probe-hash drift)</span>
+        <span>strict probe hashes</span>
       </span>
 
       <div class="field">
-        <span class="label">file (optional)</span>
+        <span class="label">file</span>
         <input
           type="file"
           accept=".yaml,.yml,application/x-yaml,text/yaml"
@@ -302,21 +297,18 @@
 
       {#if importGuards.length > 0}
         <div class="banner">
-          <span class="banner-title">guards triggered</span>
+          <span class="banner-title">guards</span>
           <ul>
             {#each importGuards as g (g)}
               <li>{g}</li>
             {/each}
           </ul>
-          <p class="hint">
-            These have been stamped as notes on the imported branch's
-            root node so the sidebar can flag them in context.
-          </p>
+          <p class="hint">saved as root notes</p>
         </div>
       {/if}
       {#if importLeafId && !importError}
         <p class="ok">
-          imported successfully, leaf node
+          imported · leaf
           <code>{importLeafId.slice(0, 12)}</code>
         </p>
       {/if}
@@ -335,7 +327,7 @@
     height: 100%;
     min-height: 0;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
@@ -343,12 +335,13 @@
     align-items: center;
     gap: var(--space-4);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--border);
   }
   .title {
     color: var(--accent);
     text-transform: lowercase;
     letter-spacing: 0;
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
   .tabs {
     display: flex;
@@ -357,9 +350,9 @@
     justify-content: center;
   }
   .tab {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-dim);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-1) var(--space-4);
     font: inherit;
     font-family: var(--font-mono);
@@ -375,16 +368,27 @@
     background: var(--accent-subtle);
   }
   .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
-    cursor: pointer;
-    padding: var(--space-2) var(--space-2);
-    font-size: var(--text);
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
     line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--accent-red);
+    color: var(--fg);
+    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;
@@ -411,9 +415,9 @@
     text-transform: lowercase;
   }
   .input {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-2) var(--space-3);
     font: inherit;
     font-family: var(--font-mono);
@@ -423,9 +427,9 @@
     border-color: var(--accent);
   }
   .yaml {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-3) var(--space-4);
     font: inherit;
     font-family: var(--font-mono);
@@ -460,7 +464,7 @@
   }
   .banner {
     background: rgba(210, 153, 34, 0.12);
-    border: 1px solid var(--accent-yellow);
+    border: 1px solid transparent;
     padding: var(--space-4) var(--space-4);
     color: var(--accent-yellow);
     font-size: var(--text-sm);
@@ -479,21 +483,20 @@
     display: flex;
     justify-content: flex-end;
     gap: var(--space-3);
-    padding: var(--space-5) var(--space-6);
-    border-top: 1px solid var(--border);
+    padding: var(--space-3) var(--space-6);
+    color: var(--fg-muted);
   }
   .btn {
-    background: var(--bg-alt);
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-2) var(--space-5);
     font: inherit;
     font-family: var(--font-mono);
     cursor: pointer;
   }
   .btn:hover:not(:disabled) {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
   .btn:disabled {
     color: var(--fg-muted);
@@ -502,11 +505,10 @@
   .btn.primary {
     background: var(--accent);
     color: var(--text-on-accent);
-    border-color: var(--accent);
+    border-color: transparent;
   }
   .btn.primary:hover:not(:disabled) {
     background: var(--accent-light);
-    border-color: var(--accent-light);
   }
   .btn.primary:disabled {
     background: var(--bg-elev);

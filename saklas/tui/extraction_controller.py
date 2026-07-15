@@ -19,14 +19,25 @@ and those App helpers through ``self._app``.
 from __future__ import annotations
 
 import shlex
+from types import MappingProxyType
+from collections.abc import Mapping
 from typing import Any, Callable, TYPE_CHECKING
 
 from saklas.io.selectors import AmbiguousSelectorError, canonicalize_atom
 from saklas.core.errors import SaklasError
-from saklas.tui.chat_panel import PendingItem
+from saklas.core.profile import ProfileError
+from saklas.core.steering import AlphaEntry
+from saklas.core.steering_expr import ManifoldTerm
+from saklas.tui.chat_panel import (
+    PendingExtract,
+    PendingManifoldFit,
+    PendingProbe,
+    PendingSteer,
+)
 from saklas.tui.vector_panel import MAX_ALPHA
 from saklas.tui.app import (
     DEFAULT_ALPHA,
+    _UiDone,
     _detect_namespace_selector,
     _resolve_active_name,
     _unquote,
@@ -53,9 +64,38 @@ class ExtractionController:
         # generation time (``AlphaEntry`` already admits ``ManifoldTerm``,
         # so the engine needs no change).  ``_enabled`` is shared — a
         # manifold key toggles through the same left-panel control.
-        self._manifold_terms: dict[str, Any] = {}
+        self._manifold_terms: dict[str, ManifoldTerm] = {}
 
-    def _active_alphas(self) -> dict[str, Any]:
+    @property
+    def alphas(self) -> Mapping[str, float]:
+        return MappingProxyType(self._alphas)
+
+    @property
+    def enabled(self) -> Mapping[str, bool]:
+        return MappingProxyType(self._enabled)
+
+    @property
+    def manifold_terms(self) -> Mapping[str, ManifoldTerm]:
+        return MappingProxyType(self._manifold_terms)
+
+    def register_manifold_term(self, key: str, term: ManifoldTerm) -> None:
+        self._manifold_terms[key] = term
+        self._enabled[key] = True
+
+    def remove_steering_entry(self, name: str) -> None:
+        self._manifold_terms.pop(name, None)
+        self._alphas.pop(name, None)
+        self._enabled.pop(name, None)
+
+    def toggle_steering_entry(self, name: str) -> None:
+        self._enabled[name] = not self._enabled.get(name, True)
+
+    def adjust_vector_alpha(self, name: str, delta: float) -> None:
+        self._alphas[name] = max(
+            -MAX_ALPHA, min(MAX_ALPHA, self._alphas.get(name, 0.0) + delta)
+        )
+
+    def _active_alphas(self) -> dict[str, AlphaEntry]:
         """Build the alphas dict for generation from enabled entries.
 
         Merges plain scalar vectors (``_alphas``) with manifold terms
@@ -65,7 +105,7 @@ class ExtractionController:
         :class:`~saklas.core.steering_expr.ManifoldTerm` for manifolds —
         ``Steering.alphas``'s ``AlphaEntry`` union admits both.
         """
-        out: dict[str, Any] = {
+        out: dict[str, AlphaEntry] = {
             name: alpha for name, alpha in self._alphas.items()
             if self._enabled.get(name, True)
         }
@@ -153,12 +193,17 @@ class ExtractionController:
         if self._app._is_busy:
             # Reconstruct the canonical slash-command form so pulling
             # the item back via ↑ surfaces something the user can
-            # re-Enter as a slash command.  ``payload[0]`` carries the
-            # raw args the dispatcher hands to the handler.
+            # re-Enter as a slash command.  The typed action also carries
+            # the raw args the dispatcher hands to the handler.
             display_text = f"/{pending_type} {text}".rstrip()
-            self._app._enqueue_pending(
-                PendingItem(pending_type, display_text, (text,))
+            item = (
+                PendingSteer(display_text, text)
+                if pending_type == "steer"
+                else PendingProbe(display_text, text)
+                if pending_type == "probe"
+                else PendingExtract(display_text, text)
             )
+            self._app._enqueue_pending(item)
             return
         # Peel ``--role <slug>`` off the args before the bipolar parser
         # runs, so a multi-word pole (``a dog . a pair of cats``) doesn't
@@ -443,23 +488,8 @@ class ExtractionController:
         def _work() -> None:
             self._app._session.ensure_manifold_loaded(term.manifold)
             manifold = self._app._session.manifolds[term.manifold]
-            # ``resolve_position`` validates label-form (raises
-            # UnknownManifoldLabelError on miss) and passes through
-            # coord-form unchanged.  A test-double manifold without
-            # ``resolve_position`` falls back to ``term.position``
-            # directly — fine for coord form, raises here for
-            # label form (the real engine path catches it).
-            resolve = getattr(manifold, "resolve_position", None)
-            if resolve is not None:
-                resolved = resolve(term.position)
-            elif isinstance(term.position, str):
-                raise ValueError(
-                    f"manifold '{term.manifold}' cannot resolve "
-                    f"label {term.position!r} — manifold lacks "
-                    f"resolve_position()"
-                )
-            else:
-                resolved = term.position
+            # Validates label-form and passes coordinate form through.
+            resolved = manifold.resolve_position(term.position)
             want = manifold.domain.intrinsic_dim
             got = len(resolved)
             if got != want:
@@ -472,9 +502,19 @@ class ExtractionController:
         self._app._run_worker_with_queue(_work)
 
     def _handle_probe(self, text: str) -> None:
-        ns = _detect_namespace_selector(text.strip())
+        selector = (text or "").strip()
+        ns = _detect_namespace_selector(selector)
         if ns is not None:
             self._handle_probe_namespace(ns)
+            return
+
+        # A spaced period is the one authoring form on this surface: extract
+        # the bipolar concept, then attach its folded rank-1 probe.  Every
+        # other input is already a selector and belongs to the unified
+        # session resolver, which handles both flat and curved manifolds.
+        _concept, baseline = self._app._parse_args(selector)
+        if baseline is None:
+            self._start_probe_attach(_unquote(selector))
             return
 
         def _on_success(name: str, _profile: Any, _alpha: Any) -> None:
@@ -485,6 +525,25 @@ class ExtractionController:
             self._app._session.add_probe(name)
             self._app.call_from_thread(self._app._on_probe_added, name)
         self._handle_extract(text, include_alpha=False, on_success=_on_success)
+
+    def _start_probe_attach(self, selector: str) -> None:
+        """Attach any current fitted probe shape through the unified resolver."""
+        chat = self._app._chat_panel
+        if self._app._ab_shadow_active:
+            chat.add_system_message("Cannot attach a probe during A/B shadow gen.")
+            return
+        if self._app._is_busy:
+            self._app._enqueue_pending(
+                PendingProbe(f"/probe {selector}", selector)
+            )
+            return
+        chat.add_system_message(f"Attaching probe '{selector}'...")
+
+        def _work() -> None:
+            name = self._app._session.add_probe(selector)
+            self._app.call_from_thread(self._app._on_probe_added, name)
+
+        self._app._run_worker_with_queue(_work)
 
     def _handle_extract_only(self, text: str) -> None:
         def _on_success(name: str, _profile: Any, _alpha: Any) -> None:
@@ -525,10 +584,7 @@ class ExtractionController:
             return
         if self._app._is_busy:
             self._app._enqueue_pending(
-                PendingItem(
-                    "manifold_fit", f"/manifold fit {folder_arg}",
-                    (folder_arg,),
-                )
+                PendingManifoldFit(f"/manifold fit {folder_arg}", folder_arg)
             )
             return
         self._start_manifold_fit(folder_arg)
@@ -549,7 +605,7 @@ class ExtractionController:
             chat.add_system_message(
                 f"/manifold fit: no manifold.json in {folder}"
             )
-            self._app._ui_token_queue.put(("done", False))
+            self._app._ui_token_queue.put(_UiDone(False))
             return
         chat.add_system_message(f"Fitting manifold from {folder}...")
 
@@ -571,88 +627,6 @@ class ExtractionController:
             )
 
         self._app._run_worker_with_queue(_work)
-
-    def _handle_manifold_probe(self, text: str) -> None:
-        """``/manifold-probe <selector>`` — attach a curved manifold probe.
-
-        Routes through the unified ``session.add_probe`` — the selector can
-        be a bundled name (``emotions``, ``personas``), an ``ns/name`` form, or an
-        already-loaded manifold's registered name; the session's lazy-load
-        path (``_ensure_manifold_loaded``) handles resolution.  This is the
-        curved-probe front-end (the TUI mirror of the webui's "+ manifold
-        probe" launcher); ``/probe`` is the flat/concept front-end.  Both
-        land in the one monitor.  Refused
-        during A/B shadow gen for the same reason ``/probe`` is —
-        modifying the monitor set mid-shadow would interleave readings
-        across the steered/unsteered split.  Deferred behind an
-        in-flight gen via the pending queue (kind ``manifold_probe``).
-        """
-        chat = self._app._chat_panel
-        selector = (text or "").strip()
-        selector = _unquote(selector)
-        if not selector:
-            chat.add_system_message("Usage: /manifold-probe <selector>")
-            return
-        if self._app._ab_shadow_active:
-            chat.add_system_message(
-                "Cannot attach a manifold probe during A/B shadow gen."
-            )
-            return
-        if self._app._is_busy:
-            self._app._enqueue_pending(
-                PendingItem(
-                    "manifold_probe", f"/manifold-probe {selector}",
-                    (selector,),
-                )
-            )
-            return
-        self._start_manifold_probe_attach(selector)
-
-    def _start_manifold_probe_attach(self, selector: str) -> None:
-        """Run ``session.add_probe`` on a worker thread.
-
-        Mirrors ``_start_manifold_fit``'s worker structure — errors
-        surface as system messages and a ``done`` sentinel re-enters
-        the queue drain so a queued attach doesn't stall subsequent
-        items.
-        """
-        chat = self._app._chat_panel
-        chat.add_system_message(f"Attaching manifold probe '{selector}'...")
-
-        def _work() -> None:
-            name = self._app._session.add_probe(selector)
-            self._app.call_from_thread(self._app._on_manifold_probe_added, name)
-
-        self._app._run_worker_with_queue(_work)
-
-    def _handle_manifold_probe_remove(self, text: str) -> None:
-        """``/manifold-probe-remove <name>`` — detach an attached probe.
-
-        After the monitor unification there is one probe set, so this and
-        ``/unprobe`` are interchangeable; the command is kept for muscle
-        memory and detaches any probe shape via ``session.remove_probe``.
-        """
-        chat = self._app._chat_panel
-        name = (text or "").strip()
-        name = _unquote(name)
-        if not name:
-            chat.add_system_message("Usage: /manifold-probe-remove <name>")
-            return
-        monitor = self._app._session.monitor
-        if monitor is None or name not in monitor.probe_names:
-            chat.add_system_message(f"Manifold probe '{name}' not active.")
-            return
-        try:
-            self._app._session.remove_probe(name)
-        except SaklasError as e:
-            chat.add_system_message(e.user_message()[1])
-            return
-        except Exception as e:
-            chat.add_system_message(f"{type(e).__name__}: {e}")
-            return
-        self._app._refresh_probe_panels()
-        self._app._refresh_trait_why()
-        chat.add_system_message(f"Manifold probe '{name}' removed.")
 
     def _handle_pairs(self, text: str) -> None:
         """`/pairs <name>` — open the custom-statement extraction modal.
@@ -748,7 +722,7 @@ class ExtractionController:
                     self._app._steer_status, f"{type(e).__name__}: {e}",
                 )
             finally:
-                self._app._ui_token_queue.put(("done", False))
+                self._app._ui_token_queue.put(_UiDone(False))
 
         self._app.run_worker(_worker, thread=True)
 
@@ -917,7 +891,7 @@ class ExtractionController:
             return
         if self._app._is_busy:
             arg = f"{ns}/"
-            self._app._enqueue_pending(PendingItem("steer", f"/steer {arg}", (arg,)))
+            self._app._enqueue_pending(PendingSteer(f"/steer {arg}", arg))
             return
 
         from saklas.io.selectors import all_concepts
@@ -964,7 +938,7 @@ class ExtractionController:
             return
         if self._app._is_busy:
             arg = f"{ns}/"
-            self._app._enqueue_pending(PendingItem("probe", f"/probe {arg}", (arg,)))
+            self._app._enqueue_pending(PendingProbe(f"/probe {arg}", arg))
             return
 
         from saklas.io.selectors import all_concepts
@@ -1075,26 +1049,20 @@ class ExtractionController:
         # curved probe has no single direction to compare and is skipped.
         from saklas.core.profile import Profile
         all_profiles: dict[str, Profile] = {}
-        for name, prof in self._app._session.profiles.items():
-            if isinstance(prof, Profile):
-                all_profiles[name] = prof
-            elif isinstance(prof, dict) and prof:
-                all_profiles[name] = Profile(prof)
+        for name, tensors in self._app._session.profiles.items():
+            all_profiles[name] = Profile(tensors)
         monitor = self._app._session.monitor
-        if monitor:
-            from saklas.core.vectors import folded_vector_directions
-            for name in monitor.probe_names:
-                if name in all_profiles:
-                    continue
-                manifold = monitor.manifolds.get(name)
-                if manifold is None:
-                    continue
-                try:
-                    folded = folded_vector_directions(manifold)
-                except Exception:
-                    continue
-                if folded:
-                    all_profiles[name] = Profile(folded)
+        from saklas.core.vectors import folded_vector_directions
+        for name in monitor.probe_names:
+            if name in all_profiles:
+                continue
+            manifold = monitor.manifolds[name]
+            if not all(
+                sub.is_affine and sub.rank == 1
+                for sub in manifold.layers.values()
+            ):
+                continue
+            all_profiles[name] = Profile(folded_vector_directions(manifold))
 
         def _resolve(raw: str) -> str | None:
             matches = _resolve_active_name(raw, all_profiles)
@@ -1119,12 +1087,12 @@ class ExtractionController:
             # Mahalanobis-only: ``cosine_similarity`` requires the session
             # whitener (the Euclidean path is gone).  Pairs whose shared
             # layers the whitener doesn't cover raise and are skipped.
-            whitener = getattr(self._app._session, "whitener", None)
+            whitener = self._app._session.whitener
             scores = {}
             for name, prof in others.items():
                 try:
                     scores[name] = target.cosine_similarity(prof, whitener=whitener)
-                except Exception:
+                except ProfileError:
                     continue
             if not scores:
                 chat.add_system_message("No comparable profiles (no shared layers).")
@@ -1145,7 +1113,7 @@ class ExtractionController:
             if b_name is None:
                 return
             # Mahalanobis-only (see the 1-arg branch above).
-            whitener = getattr(self._app._session, "whitener", None)
+            whitener = self._app._session.whitener
             try:
                 sim = all_profiles[a_name].cosine_similarity(
                     all_profiles[b_name], whitener=whitener,

@@ -15,6 +15,7 @@ the full selector through a synthetic whitener + per-layer consensus Gram.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 import torch
@@ -563,6 +564,25 @@ def test_select_topology_deterministic() -> None:
         assert a.winner_name == b.winner_name
         assert {c.name: c.score for c in a.candidates} == \
                {c.name: c.score for c in b.candidates}
+
+
+def test_select_topology_reuses_laplacian_eigensystem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.core.manifold as manifold_mod
+
+    calls = 0
+    real = manifold_mod._laplacian_eigen
+
+    def _counted(*args: Any, **kwargs: Any):
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(manifold_mod, "_laplacian_eigen", _counted)
+    choice = _choose(_circle(40))
+    assert choice.winner_name == "torus-T1"
+    assert calls == 1
 
 
 def test_select_torus_t2_coarseness_floor() -> None:

@@ -44,7 +44,7 @@
           class="cancel"
           onclick={() => cancelPendingAction(item.id)}
           aria-label="Cancel pending {item.label}"
-          title="Cancel this queued item"
+          title="cancel"
         >×</button>
       </div>
     {/each}
@@ -53,43 +53,43 @@
 
 <style>
   /* Stacks vertically directly above the input row.  Hidden when empty
-   * — Svelte's conditional render takes care of that, no class needed. */
+   * — Svelte's conditional render takes care of that, no class needed.
+   * Borderless — the dashed border belongs to each ghost bubble (its
+   * "not yet real" identity), not to the strip's own container. */
   .pending-strip {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
     padding: var(--space-1) 0;
-    border-top: 1px dashed var(--border);
-    /* No bottom border — the input row's existing top edge picks up
-     * the visual baseline. */
   }
   .bubble {
     display: flex;
     align-items: center;
     gap: var(--space-2);
     padding: var(--space-1) var(--space-3);
-    background: rgba(242, 184, 75, 0.06);
-    border-left: 2px solid var(--accent-amber);
-    border-radius: 0 var(--radius) var(--radius) 0;
+    background: var(--glass);
+    border: 1px dashed var(--glass-line);
+    border-radius: var(--radius-pill);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     color: var(--fg-dim);
     min-width: 0;
   }
-  /* Editing state — the bubble whose text the user has pulled into
-   * the input.  Brighter background + foreground + thicker border so
-   * it stands out from the dim "just queued" rows. */
+  /* Editing state — the bubble whose text the user has pulled into the
+   * input.  White-accent (solid ring + brighter fill/foreground) so it
+   * stands out from the dim, dashed "just queued" rows. */
   .bubble.editing {
-    background: rgba(242, 184, 75, 0.16);
-    border-left-width: 3px;
-    color: var(--fg-strong);
+    background: var(--glass-strong);
+    border-style: solid;
+    border-color: var(--accent-glow);
+    color: var(--fg);
   }
   .edit-marker {
-    color: var(--accent-amber);
+    color: var(--fg);
     flex-shrink: 0;
   }
   .tag {
-    color: var(--accent-amber);
+    color: var(--fg-muted);
     text-transform: lowercase;
     flex-shrink: 0;
   }
@@ -115,6 +115,6 @@
   }
   .cancel:hover {
     color: var(--accent-red);
-    background: rgba(255, 90, 90, 0.08);
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
   }
 </style>

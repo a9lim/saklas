@@ -64,6 +64,10 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 2) -> Manifold:
         sub, ev_ratio = _fit_layer_subspace_with_ev(
             centroids, domain.embed(coords),
         )
+        assert sub.node_params is not None
+        sub.sigma_rbf_weights = torch.zeros((len(coords), 1))
+        sub.sigma_poly_coeffs = torch.zeros((sub.node_params.shape[1] + 1, 1))
+        sub.sigma_poly_coeffs[0, 0] = -20.0
         layers[layer_idx] = sub
         share[layer_idx] = ev_ratio
     return Manifold(
@@ -72,7 +76,10 @@ def _toy_manifold(*, dim: int = 8, n_layers: int = 2) -> Manifold:
         node_labels=["a", "b", "c"],
         node_coords=coords,
         layers=layers,
+        node_roles=[None, None, None],
+        node_kinds=[None, None, None],
         mahalanobis_share=share,
+        origin={layer: torch.zeros(1) for layer in layers},
     )
 
 
@@ -81,7 +88,7 @@ def _stub_session() -> SaklasSession:
 
     Only the surface the unified-probe wiring touches needs to be real:
     ``_monitor`` (one :class:`Monitor`), ``_capture._per_layer``,
-    ``_manifolds``, ``_profiles``, ``_ensure_manifold_loaded``,
+    ``_manifolds``, ``_profiles``, ``ensure_manifold_loaded``,
     ``_invalidate_prefix_cache``, ``_probe_hash_cache``, ``_layers``.
     Everything else stays as ``MagicMock`` defaults.
     """
@@ -109,8 +116,19 @@ def _stub_session() -> SaklasSession:
         set_incremental=lambda _sink: None,
     )
     session._capture_state = CaptureState()
+    session._jlens = None
+    session._jlens_identity = None
+    session._generation_jlens = None
+    session._generation_jlens_active = False
+    session._live_lens = None
+    session._lens_probes = {}
+    session._live_sae = None
+    session._sae_probes = {}
+    session._lens_step_stash = None
+    session._live_lens_active_for_generation = True
     session._incremental_readings = []
     session._incremental_gate_scores = []
+    session._compiled_clean_eligible = False
     session._layers = []
     # Minimal prefix-cache invalidator + tree spy.
     session._prefix_cache = None
@@ -121,36 +139,33 @@ def _stub_session() -> SaklasSession:
 
     # Bind the real unified-probe methods we want to exercise.  ``add_probe``
     # rides ``_resolve_probe_manifold`` (which consults ``_profiles`` then
-    # ``_ensure_manifold_loaded`` → ``_manifolds``), so bind that too; tests
-    # stub ``_ensure_manifold_loaded`` to populate ``_manifolds`` in place.
+    # ``ensure_manifold_loaded`` → ``_manifolds``), so bind that too; tests
+    # stub the public loader to populate ``_manifolds`` in place.
     session.add_probe = types.MethodType(SaklasSession.add_probe, session)
     session.remove_probe = types.MethodType(SaklasSession.remove_probe, session)
     session._resolve_probe_manifold = types.MethodType(
         SaklasSession._resolve_probe_manifold, session,
     )
     # The steering collaborator owns the gating-score-callback builder; wire a
-    # real one (the MagicMock spec would otherwise auto-mock the lazy accessor).
+    # real one explicitly.
     from saklas.core.steering_composer import SteeringComposer
     session._steering_composer = SteeringComposer(session)
-    session._get_steering_composer = types.MethodType(
-        SaklasSession._get_steering_composer, session,
-    )
     return session
 
 
 # ==================================================== add / remove probe ===
 
 def test_add_probe_registers_via_ensure_loaded():
-    """``add_probe`` rides ``_ensure_manifold_loaded`` and lands the
+    """``add_probe`` rides ``ensure_manifold_loaded`` and lands the
     artifact on the unified ``Monitor``."""
     session = _stub_session()
     m = _toy_manifold()
 
-    # ``_ensure_manifold_loaded`` is the resolution path; stub it to
+    # ``ensure_manifold_loaded`` is the resolution path; stub it to
     # populate ``_manifolds`` instead of hitting disk.
     def _fake_ensure(key: str):
         session._manifolds[key] = m
-    session._ensure_manifold_loaded = _fake_ensure
+    session.ensure_manifold_loaded = _fake_ensure
 
     name = session.add_probe("toy")
     assert name == "toy"
@@ -160,7 +175,7 @@ def test_add_probe_registers_via_ensure_loaded():
 def test_add_probe_as_name_override():
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
 
@@ -172,7 +187,7 @@ def test_add_probe_as_name_override():
 def test_remove_probe():
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
 
@@ -184,7 +199,7 @@ def test_remove_probe():
 def test_add_probe_invalidates_prefix_cache():
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
     session._prefix_cache = ("dummy",)  # pyright: ignore[reportAttributeAccessIssue]  # test stub: wrong-shaped sentinel to verify invalidation
@@ -199,7 +214,7 @@ def test_begin_capture_widens_to_manifold_layers():
     of every attached probe's fit layers."""
     session = _stub_session()
     m = _toy_manifold(n_layers=3)
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
     session.add_probe("toy")
@@ -281,6 +296,23 @@ def test_begin_capture_live_lens_uses_persistent_capture_when_available():
     assert session._capture_state.persistent is True
 
 
+def test_begin_capture_live_lens_ignored_without_consumer():
+    """A globally enabled live lens should not widen capture for a generation
+    that cannot surface ``TokenEvent.lens_readout``."""
+    session = _stub_session()
+    session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]
+    session._live_lens = {"layers": [1, 3]}
+    session._capture.attach = lambda *args, **kw: None
+    session._capture.clear = lambda: None
+    session._incremental_readings = []
+
+    ok = SaklasSession._begin_capture(
+        session, widen=False, live_lens_active=False,
+    )
+
+    assert ok is False
+
+
 # ===================================================== gating callback ===
 
 def test_gating_callback_emits_probe_scalars():
@@ -290,7 +322,7 @@ def test_gating_callback_emits_probe_scalars():
     the rank-1 case of the same readout)."""
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
     session.add_probe("toy")
@@ -327,7 +359,7 @@ def test_gating_callback_emits_probe_scalars():
 def test_gating_callback_empty_capture_returns_empty():
     session = _stub_session()
     m = _toy_manifold()
-    session._ensure_manifold_loaded = lambda key: session._manifolds.update(
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
         {key: m},
     )
     session.add_probe("toy")

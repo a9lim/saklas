@@ -1,6 +1,6 @@
 <script lang="ts">
   // Cross-branch diff drawer — phase 5.  Renders a side-by-side
-  // word-level diff between two (or more) assistant nodes, plus the
+  // word-level diff between two (or more) generated nodes, plus the
   // sorted readings-delta table and the per-token alignment for the
   // primary pair.
   //
@@ -19,6 +19,7 @@
     loomTree,
   } from "../lib/stores.svelte";
   import Select from "../lib/Select.svelte";
+  import Button from "../lib/ui/Button.svelte";
   import type {
     DiffReadingDeltaJSON,
     DiffTextSpanJSON,
@@ -201,8 +202,8 @@
   // tokenization for free, plus the hover-cross-highlight is exact
   // because each rendered span carries its own counterpart index.
   //
-  // ``per_token`` may be empty (loaded transcripts that didn't persist
-  // token sequences, or pre-v2.3 nodes); in that case we fall back to
+  // ``per_token`` may be empty for imported transcripts that do not carry
+  // token sequences; in that case we fall back to
   // the whitespace-split renderer so the diff stays visible — alignment
   // tooltips just won't fire on the fallback path.
 
@@ -227,8 +228,10 @@
   }
 
   function spanColor(state: DiffTextSpanJSON["state"]): string {
-    if (state === "insert") return "rgba(126, 231, 135, 0.18)";
-    if (state === "delete") return "rgba(248, 81, 73, 0.18)";
+    if (state === "insert")
+      return "color-mix(in srgb, var(--accent-green) 18%, transparent)";
+    if (state === "delete")
+      return "color-mix(in srgb, var(--accent-red) 18%, transparent)";
     return "transparent";
   }
 
@@ -384,42 +387,49 @@
 
 <section class="drawer-shell" aria-label="Cross-branch diff drawer">
   <header class="header">
-    <span class="title">compare branches</span>
-    <div class="header-controls">
-      <label class="header-ctl">
-        <span>layout</span>
-        <Select
-          bind:value={layout}
-          options={[
-            { value: "side-by-side", label: "side-by-side" },
-            { value: "unified", label: "unified" },
-          ]}
-          ariaLabel="Layout"
-        />
-      </label>
-      <label class="header-ctl">
-        <span>sort by</span>
-        <Select
-          bind:value={sortBy}
-          options={[
-            { value: "magnitude", label: "|Δ| desc" },
-            { value: "name", label: "name" },
-          ]}
-          ariaLabel="Sort readings by"
-        />
-      </label>
+    <div class="title">
+      <span class="eyebrow">compare branches</span>
+      <div class="name-row">
+        <span class="meta">
+          {#if ids.length >= 2}
+            {ids.length} node{ids.length > 2 ? "s" : ""} selected
+          {:else}
+            select nodes
+          {/if}
+        </span>
+      </div>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button>
+    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
   </header>
+
+  <div class="toolbar">
+    <label class="header-ctl">
+      <span>layout</span>
+      <Select
+        bind:value={layout}
+        options={[
+          { value: "side-by-side", label: "side-by-side" },
+          { value: "unified", label: "unified" },
+        ]}
+        ariaLabel="Layout"
+      />
+    </label>
+    <label class="header-ctl">
+      <span>sort by</span>
+      <Select
+        bind:value={sortBy}
+        options={[
+          { value: "magnitude", label: "|Δ| desc" },
+          { value: "name", label: "name" },
+        ]}
+        ariaLabel="Sort readings by"
+      />
+    </label>
+  </div>
 
   <div class="body">
     {#if ids.length < 2}
-      <p class="empty">
-        Pick at least two assistant nodes via the sidebar's "select for
-        compare" right-click action, or right-click a user node with
-        ≥2 assistant children and pick "compare children".
-      </p>
+      <p class="empty">select ≥2 generated nodes in Threads</p>
     {:else if loading && diffs.length === 0}
       <p class="empty">computing diff…</p>
     {:else}
@@ -428,7 +438,7 @@
         <div class="col anchor-col">
           <header class="col-header">
             <code class="col-id">{anchorId?.slice(0, 12) ?? ""}</code>
-            <span class="col-tag">anchor (A)</span>
+            <span class="col-tag">A · anchor</span>
           </header>
           <p class="col-preview">{nodePreview(anchorId ?? "")}</p>
         </div>
@@ -451,21 +461,21 @@
       {#if siblingSummary.length > 0}
         <section class="siblings-summary">
           <header class="ss-header">
-            <span class="ss-label">siblings · distributional rollup</span>
-            <span class="ss-foot">vs. {siblingSummary[0]?.label ?? "A"} (baseline)</span>
+            <span class="ss-label">siblings</span>
+            <span class="ss-foot">vs {siblingSummary[0]?.label ?? "A"}</span>
           </header>
           <table class="ss-table">
             <thead>
               <tr>
                 <th class="ss-tag">tag</th>
                 <th class="ss-preview">preview</th>
-                <th class="ss-num" title="mean chosen-token logprob over the response span">
+                <th class="ss-num" title="mean logprob">
                   mean lp
                 </th>
-                <th class="ss-num" title="fraction of aligned positions where argmax did not change">
+                <th class="ss-num" title="rank-1 agreement">
                   rk1 unchanged
                 </th>
-                <th class="ss-num" title="mean top-K-truncated KL(baseline ∥ this) across aligned positions">
+                <th class="ss-num" title="approximate KL">
                   mean ≈KL
                 </th>
               </tr>
@@ -513,7 +523,7 @@
               </span>
               {#if d.parent_applied_steering !== null || d.steering_delta}
                 <code class="recipe-delta" title="steering delta A → B">
-                  Δ steering: {d.steering_delta || "(none)"}
+                  Δ recipe: {d.steering_delta || "none"}
                 </code>
               {/if}
             </header>
@@ -593,23 +603,19 @@
                  the start of a parent block). -->
             {#if joint}
               {#if joint.kind === "loading"}
-                <p class="dim small">
-                  computing cross-branch logprobs…
-                </p>
+                <p class="dim small">computing logprobs…</p>
               {:else if joint.kind === "err"}
                 <p class="error small" role="alert">
-                  joint logprobs unavailable: {joint.message}
+                  logprobs: {joint.message}
                 </p>
               {:else}
                 {@const aligned = alignedRows(joint.data.rows)}
                 {#if aligned.length > 0}
                   <div class="joint-table">
                     <header class="joint-header">
-                      <span class="joint-label">cross-branch logprobs</span>
+                      <span class="joint-label">logprobs</span>
                       <span class="joint-summary">
-                        rank-1 changed at <strong>
-                          {joint.data.n_rank1_changed}
-                        </strong> of {aligned.length} aligned positions
+                        <strong>{joint.data.n_rank1_changed}</strong> / {aligned.length} rank-1 changes
                       </span>
                     </header>
                     <table class="lp-table">
@@ -646,18 +652,9 @@
                         {/each}
                       </tbody>
                     </table>
-                    <p class="joint-foot">
-                      lp: chosen-token logprob.  Δ lp(A): how B would have
-                      scored A's chosen token, minus what A actually gave
-                      it (negative = B disagreed).  ≈KL: top-{32}-truncated
-                      KL(A ∥ B), approximate signal, not measurement.
-                    </p>
                   </div>
                 {:else}
-                  <p class="dim small">
-                    no byte-aligned assistant tokens between these
-                    branches, so cross-evaluation has nothing to score.
-                  </p>
+                  <p class="dim small">no aligned tokens</p>
                 {/if}
               {/if}
             {/if}
@@ -665,7 +662,7 @@
             <!-- Readings delta table. -->
             {#if sortedRs.length > 0}
               <div class="readings-table">
-                <span class="readings-label">readings Δ (B − A)</span>
+                <span class="readings-label">Δ readings</span>
                 <div class="readings-grid">
                   {#each sortedRs as r (r.name)}
                     {@const top = topDeltas.has(r.name)}
@@ -690,10 +687,7 @@
                 </div>
               </div>
             {:else}
-              <p class="dim small">
-                no readings recorded; either node has empty
-                ``aggregate_readings``.
-              </p>
+              <p class="dim small">no readings</p>
             {/if}
           </section>
         {/if}
@@ -702,76 +696,113 @@
   </div>
 
   <footer class="footer">
-    <button type="button" class="btn" onclick={closeDrawer}>close</button>
+    <Button variant="ghost" size="sm" onclick={closeDrawer}>close</Button>
   </footer>
 </section>
 
 <style>
+  /* v2 sheet interior — the host paints the sheet surface, so the root
+   * stays transparent and chrome speaks sans (identifiers/values/
+   * expressions stay mono, applied locally below). */
   .drawer-shell {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
+    gap: var(--space-5);
     padding: var(--space-5) var(--space-6);
-    border-bottom: 1px solid var(--border);
   }
   .title {
-    color: var(--accent);
-    text-transform: lowercase;
-    letter-spacing: 0;
-    flex: 0 0 auto;
-  }
-  .header-controls {
     display: flex;
-    gap: var(--space-4);
-    flex: 1 1 auto;
-    justify-content: center;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .eyebrow {
     color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .name-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .meta {
+    color: var(--fg-subtle);
     font-size: var(--text-sm);
+    white-space: nowrap;
+  }
+  .close {
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .close:hover {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
+
+  /* Toolbar — the layout / sort-by controls, in their own row (same
+   * pattern as the token-drilldown toolbar). */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+    padding: var(--space-3) var(--space-6);
   }
   .header-ctl {
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
+    color: var(--fg-muted);
+    font-size: var(--text-sm);
   }
   /* Themed Select owns its own chrome. */
   .header-ctl :global(.sk-select) {
     min-width: 9em;
   }
-  .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
-    cursor: pointer;
-    padding: var(--space-2) var(--space-2);
-    font-size: var(--text);
-    line-height: 1;
-  }
-  .close:hover {
-    color: var(--accent-red);
-  }
 
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: var(--space-6);
+    padding: var(--space-5) var(--space-6);
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--space-4);
     min-height: 0;
   }
   .empty {
     color: var(--fg-muted);
     font-size: var(--text-sm);
+    line-height: 1.5;
+    max-width: 62ch;
     margin: 0;
   }
   .error {
@@ -786,8 +817,8 @@
     gap: var(--space-4);
   }
   .col {
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
+    background: var(--bg);
+    border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
   }
   .col-header {
@@ -798,7 +829,8 @@
     margin-bottom: var(--space-2);
   }
   .col-id {
-    color: var(--accent-yellow);
+    font-family: var(--font-mono);
+    color: var(--fg-dim);
   }
   .col-tag {
     color: var(--accent);
@@ -816,10 +848,13 @@
     -webkit-box-orient: vertical;
   }
 
+  /* Nested section card — aggregates the text diff + cross-eval table +
+   * readings table for one A-vs-B pair. */
   .diff-block {
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
-    padding: var(--space-4) var(--space-4);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4);
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
@@ -832,15 +867,19 @@
     flex-wrap: wrap;
   }
   .diff-title {
-    color: var(--accent);
-    font-size: var(--text-sm);
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .recipe-delta {
-    color: var(--accent-yellow);
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
     font-size: var(--text-xs);
-    background: var(--bg-elev);
-    padding: var(--space-1) var(--space-2);
-    border-radius: var(--radius);
+    background: var(--glass-strong);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-sm);
   }
 
   .text-grid {
@@ -852,19 +891,21 @@
   .columns.unified > .col {
     grid-template-columns: 1fr;
   }
+  /* Data well — the per-branch text pane. */
   .text-pane {
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    background: var(--bg);
+    border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     min-height: 5em;
     max-height: 30em;
     overflow-y: auto;
   }
   .pane-label {
-    color: var(--accent);
+    color: var(--fg-muted);
     font-size: var(--text-xs);
-    text-transform: lowercase;
-    letter-spacing: 0;
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
     display: block;
     margin-bottom: var(--space-1);
   }
@@ -879,19 +920,25 @@
     cursor: default;
     transition: background-color var(--dur-fast) var(--ease-out);
   }
+  /* Cross-pane hover alignment: no space to signal here (this is text
+   * correspondence, not a pillar), so anchor vs target read via fill
+   * weight and outline rather than hue. */
   .tok:hover {
-    background: rgba(72, 138, 203, 0.1);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
   }
   .tok.highlight-anchor {
-    background: rgba(72, 138, 203, 0.22);
+    background: color-mix(in srgb, var(--fg) 16%, transparent);
   }
   .tok.highlight-target {
-    background: rgba(210, 153, 34, 0.28);
+    background: transparent;
+    outline: 1px solid var(--fg-muted);
+    outline-offset: -1px;
   }
 
+  /* Data well — the unified diff pane. */
   .unified-body {
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    background: var(--bg);
+    border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     line-height: 1.5;
     font-size: var(--text-sm);
@@ -920,8 +967,9 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    border-radius: var(--radius-lg);
     padding: var(--space-3) var(--space-4);
     margin: 0;
   }
@@ -932,10 +980,11 @@
     gap: var(--space-4);
   }
   .ss-label {
-    color: var(--accent);
-    text-transform: lowercase;
-    letter-spacing: 0;
+    color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .ss-foot {
     color: var(--fg-muted);
@@ -945,20 +994,21 @@
     width: 100%;
     border-collapse: separate;
     border-spacing: 0;
+    font-family: var(--font-mono);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
   }
   .ss-table th,
   .ss-table td {
     padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
     text-align: left;
   }
   .ss-table thead th {
     color: var(--fg-muted);
+    font-family: var(--font-ui);
     text-transform: uppercase;
-    letter-spacing: 0;
-    font-weight: var(--weight-normal);
+    letter-spacing: 0.06em;
+    font-weight: var(--weight-medium);
   }
   .ss-table td.ss-num,
   .ss-table th.ss-num {
@@ -973,24 +1023,27 @@
   }
   .ss-table td.ss-preview {
     color: var(--fg);
+    font-family: var(--font-ui);
     max-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Anchor row inherits the blue from .tok.highlight-anchor / .msg.user
-   * so the "this is the baseline" cue reads consistently with the rest
-   * of the anchor=blue scheme — independent of --accent-subtle's chrome
-   * hue. */
+  /* Anchor row reads as a plain neutral wash — text-diff hover/cross-
+   * highlight is achromatic (no pillar owns "which node is the anchor"),
+   * so this stays consistent with .tok.highlight-anchor above rather
+   * than borrowing a hue. */
   .ss-table tr.anchor td {
-    background: rgba(72, 138, 203, 0.12);
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
   }
   .ss-table tr.anchor td.ss-tag {
-    color: var(--accent-blue);
+    color: var(--fg-strong);
     font-weight: var(--weight-medium);
   }
 
-  /* Logit-pass Phase 5: cross-evaluation table. */
+  /* Logit-pass Phase 5: cross-evaluation table.  Vocabulary-distribution
+   * quantities (logprobs, KL, rank flips) are logit-space — the lens
+   * pillar hue marks this block as that same family. */
   .joint-table {
     display: flex;
     flex-direction: column;
@@ -1004,10 +1057,11 @@
     gap: var(--space-4);
   }
   .joint-label {
-    color: var(--fg-muted);
+    color: var(--pillar-lens);
     font-size: var(--text-xs);
-    text-transform: lowercase;
-    letter-spacing: 0;
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .joint-summary {
     color: var(--fg-dim);
@@ -1020,23 +1074,24 @@
     width: 100%;
     border-collapse: separate;
     border-spacing: 0;
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
     font-size: var(--text-xs);
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
+    background: var(--bg);
+    border-radius: var(--radius);
   }
   .lp-table th,
   .lp-table td {
     padding: var(--space-1) var(--space-3);
-    border-bottom: 1px solid var(--border);
     text-align: left;
   }
   .lp-table thead th {
     color: var(--fg-muted);
-    font-weight: var(--weight-normal);
+    font-family: var(--font-ui);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
-    background: var(--bg-deep);
+    letter-spacing: 0.06em;
+    background: var(--bg);
   }
   .lp-table td.lp-num,
   .lp-table th.lp-num {
@@ -1059,21 +1114,14 @@
     background: transparent;
     word-break: break-all;
   }
-  /* Rank-1 flips read as the highest-signal rows — give them a soft
-     yellow tint, mirroring the readings table's top-delta affordance. */
+  /* Rank-1 flips are the highest-signal rows in this logit-space table —
+   * tint them in the lens family rather than the old amber. */
   .lp-table tr.rank-flip td {
-    background: rgba(240, 200, 88, 0.10);
+    background: color-mix(in srgb, var(--pillar-lens) 10%, transparent);
   }
   .lp-table tr.rank-flip .lp-flag {
-    color: var(--accent-yellow);
+    color: var(--pillar-lens);
   }
-  .joint-foot {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    line-height: 1.4;
-    margin: 0;
-  }
-
   .readings-table {
     display: flex;
     flex-direction: column;
@@ -1082,8 +1130,9 @@
   .readings-label {
     color: var(--fg-muted);
     font-size: var(--text-xs);
-    text-transform: lowercase;
-    letter-spacing: 0;
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .readings-grid {
     display: flex;
@@ -1096,9 +1145,12 @@
     align-items: center;
     gap: var(--space-2);
     font-size: var(--text-sm);
+    font-family: var(--font-mono);
   }
+  /* Top-5-by-magnitude marker: an emphasis wash, not a hue — the sign
+   * itself already reads green(+)/red(−) via .r-delta / .r-bar-fill. */
   .reading-row.top-delta .r-name {
-    color: var(--accent-yellow);
+    color: var(--fg-strong);
     font-weight: var(--weight-medium);
   }
   .r-name {
@@ -1142,20 +1194,6 @@
     display: flex;
     justify-content: flex-end;
     gap: var(--space-3);
-    padding: var(--space-5) var(--space-6);
-    border-top: 1px solid var(--border);
-  }
-  .btn {
-    background: var(--bg-alt);
-    color: var(--fg-strong);
-    border: 1px solid var(--border);
-    padding: var(--space-2) var(--space-5);
-    font: inherit;
-    font-family: var(--font-mono);
-    cursor: pointer;
-  }
-  .btn:hover {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    padding: var(--space-3) var(--space-6);
   }
 </style>

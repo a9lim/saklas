@@ -136,18 +136,19 @@
 <aside class="drawer" aria-label="Pairwise compare">
   <header class="drawer-header">
     <div class="title">
-      <span class="label">pairwise compare</span>
-      <span class="coord">
+      <span class="eyebrow">pairwise compare</span>
+      <div class="name-row">
         {#if data}
-          {layersA.length} × {layersB.length} layers · model {data.model ?? "—"}
+          <code class="name">{conceptA} × {conceptB}</code>
+          <span class="meta">{layersA.length} × {layersB.length} layers · model {data.model ?? "—"}</span>
         {:else if names.length < 2}
-          need at least two vectors or probes
+          <span class="meta">≥2 names required</span>
         {:else}
-          pick two names
+          <span class="meta">select A / B</span>
         {/if}
-      </span>
+      </div>
     </div>
-    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">×</button>
+    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">✕</button>
   </header>
 
   <div class="picker-row">
@@ -177,7 +178,7 @@
     {:else if loading && !matrix}
       <div class="empty">loading…</div>
     {:else if !matrix || layersA.length === 0 || layersB.length === 0}
-      <div class="empty">no layer data for the selected pair</div>
+      <div class="empty">no layer data</div>
     {:else}
       <div class="grid-scroll">
         <table class="grid" style="--cell: {CELL_SIZE}px;">
@@ -228,63 +229,89 @@
 </aside>
 
 <style>
+  /* v2 sheet interior — the host paints the sheet surface, so the root
+   * stays transparent and chrome speaks sans (data stays mono). */
   .drawer {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--bg);
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
-    border-left: 1px solid var(--border);
   }
 
   .drawer-header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-4) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     min-width: 0;
   }
-  .label {
+  .eyebrow {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
+    letter-spacing: 0.08em;
   }
-  .coord {
-    color: var(--fg-dim);
+  .name-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .name {
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .meta {
+    color: var(--fg-subtle);
     font-size: var(--text-sm);
+    white-space: nowrap;
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
-    padding: 0 var(--space-3);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font: inherit;
     font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    line-height: 1.4;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--fg-strong);
-    border-color: var(--fg-muted);
+    color: var(--fg);
+    background: var(--glass-strong);
   }
 
   .picker-row {
     display: flex;
     align-items: center;
-    gap: var(--space-4);
-    padding: var(--space-3) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-4) var(--space-6);
   }
   .picker {
     display: flex;
@@ -296,7 +323,6 @@
   .picker-label {
     color: var(--fg-muted);
     font-size: var(--text-sm);
-    text-transform: lowercase;
   }
   /* The themed Select owns its own chrome — the picker label provides
    * the only host styling. */
@@ -305,41 +331,43 @@
     flex: 1 1 auto;
     overflow: auto;
     min-height: 0;
-    padding: var(--space-4) var(--space-4);
+    padding: var(--space-5) var(--space-6);
   }
   .empty {
     color: var(--fg-muted);
-    font-style: italic;
-    padding: var(--space-5) 0;
-    line-height: 1.4;
+    padding: var(--space-6) 0;
+    line-height: 1.5;
+    max-width: 62ch;
   }
   .empty.err {
     color: var(--accent-error);
-    font-style: normal;
   }
 
+  /* Data well — sticky label cells stay OPAQUE (they occlude scrolled
+   * cells), so they paint --bg rather than glass. */
   .grid-scroll {
     overflow: auto;
     max-height: 100%;
-    border: 1px solid var(--border);
-    background: var(--bg-alt);
+    border-radius: var(--radius);
+    background: var(--bg);
   }
   .grid {
     border-collapse: separate;
-    border-spacing: 0;
+    border-spacing: 1px;
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
   .grid th,
   .grid td {
     padding: 0;
     margin: 0;
-    background: var(--bg-alt);
+    background: var(--bg);
   }
   .grid thead th {
     position: sticky;
     top: 0;
     z-index: 2;
-    border-bottom: 1px solid var(--border);
+    box-shadow: var(--shadow-sticky);
   }
   .grid .row-label {
     position: sticky;
@@ -349,7 +377,7 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--border);
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
   }
   .grid .corner {
@@ -361,8 +389,7 @@
     font-size: var(--text-xs);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    border-right: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
+    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
   }
   .corner .axis-a,
@@ -393,12 +420,11 @@
   }
 
   .drawer-footer {
-    border-top: 1px solid var(--border);
-    padding: var(--space-2) var(--space-4);
+    padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
   .hint {
-    line-height: 1.4;
+    line-height: 1.5;
   }
 </style>

@@ -13,8 +13,8 @@
   //     jump to first / last.
   //   * type any character → first-letter typeahead (alpha-num only),
   //     buffer flushes after 600ms idle.
-  //   * the popover flips above the trigger if the viewport would clip
-  //     it below.
+  //   * the listbox lives in the browser top layer, so scrollable racks
+  //     cannot clip it; fixed placement flips and clamps to the viewport.
   //
   // The component is generic over value type: ``T extends string |
   // number``.  Options are declarative via the ``options`` prop —
@@ -54,7 +54,8 @@
   let highlight = $state(-1);
   let trigger: HTMLButtonElement | null = $state(null);
   let listbox: HTMLUListElement | null = $state(null);
-  let flipUp = $state(false);
+  let popoverStyle = $state("");
+  const uid = $props.id();
 
   // Typeahead buffer — alphanum chars within 600 ms accumulate; idle
   // flushes the buffer.
@@ -68,13 +69,13 @@
     currentIndex >= 0 ? options[currentIndex].label : "",
   );
 
-  function commit(idx: number): void {
+  async function commit(idx: number): Promise<void> {
     const opt = options[idx];
     if (!opt || opt.disabled) return;
     value = opt.value;
     onchange?.(opt.value);
-    open = false;
-    trigger?.focus();
+    closePopover(true);
+    await tick();
   }
 
   async function openPopover(): Promise<void> {
@@ -82,15 +83,26 @@
     open = true;
     highlight = currentIndex >= 0 ? currentIndex : firstEnabled(0, 1);
     await tick();
+    try {
+      listbox?.showPopover();
+    } catch {
+      // Fixed positioning still escapes ordinary scroll containers on
+      // browsers without the Popover API; the top layer is progressive.
+    }
     placeListbox();
     listbox?.focus();
   }
 
   function closePopover(restoreFocus: boolean): void {
     if (!open) return;
+    try {
+      listbox?.hidePopover();
+    } catch {
+      /* already closed or Popover API unavailable */
+    }
     open = false;
     typeBuffer = "";
-    if (restoreFocus) trigger?.focus();
+    if (restoreFocus) queueMicrotask(() => trigger?.focus());
   }
 
   function toggle(): void {
@@ -200,12 +212,17 @@
       case "Enter":
       case " ":
         ev.preventDefault();
-        if (highlight >= 0) commit(highlight);
+        if (highlight >= 0) void commit(highlight);
         break;
       case "Escape":
-      case "Tab":
         ev.preventDefault();
         closePopover(true);
+        break;
+      case "Tab":
+        // Keep native tab order: let the browser move past the listbox,
+        // then remove the popover. Preventing Tab here trapped keyboard
+        // users on the trigger for one extra keystroke.
+        setTimeout(() => closePopover(false), 0);
         break;
       default:
         handleTypeahead(ev.key);
@@ -215,10 +232,24 @@
   function placeListbox(): void {
     if (!trigger || !listbox) return;
     const tr = trigger.getBoundingClientRect();
-    const below = window.innerHeight - tr.bottom;
-    const above = tr.top;
-    // Flip up if there's noticeably more room above and below is < 200px.
-    flipUp = below < 200 && above > below;
+    const gutter = 8;
+    const gap = 2;
+    const below = Math.max(0, window.innerHeight - tr.bottom - gutter - gap);
+    const above = Math.max(0, tr.top - gutter - gap);
+    const desired = Math.min(280, Math.max(40, listbox.scrollHeight));
+    const flipUp = below < Math.min(desired, 200) && above > below;
+    const available = flipUp ? above : below;
+    const maxHeight = Math.max(40, Math.min(280, available));
+    const renderedHeight = Math.min(desired, maxHeight);
+    const popoverWidth = Math.min(tr.width, window.innerWidth - gutter * 2);
+    const left = Math.max(
+      gutter,
+      Math.min(tr.left, window.innerWidth - popoverWidth - gutter),
+    );
+    const top = flipUp
+      ? Math.max(gutter, tr.top - renderedHeight - gap)
+      : Math.min(window.innerHeight - renderedHeight - gutter, tr.bottom + gap);
+    popoverStyle = `left:${left}px;top:${top}px;width:${popoverWidth}px;max-height:${maxHeight}px`;
   }
 
   function onDocumentMouseDown(ev: MouseEvent): void {
@@ -268,18 +299,19 @@
     <ul
       bind:this={listbox}
       class="sk-select-popover"
-      class:flip-up={flipUp}
+      popover="manual"
+      style={popoverStyle}
       role="listbox"
       tabindex="-1"
       aria-label={ariaLabel}
       aria-activedescendant={highlight >= 0
-        ? `sk-select-opt-${highlight}`
+        ? `${uid}-opt-${highlight}`
         : undefined}
       onkeydown={onListKeydown}
     >
       {#each options as opt, i (i)}
         <li
-          id="sk-select-opt-{i}"
+          id={`${uid}-opt-${i}`}
           role="option"
           class="sk-select-opt"
           class:is-highlight={i === highlight}
@@ -288,7 +320,11 @@
           aria-selected={i === currentIndex}
           aria-disabled={!!opt.disabled}
           onmouseenter={() => (opt.disabled ? null : (highlight = i))}
-          onclick={() => commit(i)}
+          onclick={(ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            void commit(i);
+          }}
           onkeydown={onListKeydown}
         >
           {opt.label}
@@ -303,6 +339,8 @@
     position: relative;
     display: inline-block;
     width: 100%;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .sk-select-trigger {
@@ -310,24 +348,30 @@
     align-items: center;
     justify-content: space-between;
     width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    background: var(--bg-elev);
+    /* Borderless input: recessed well fill is the "pick here" affordance;
+     * the ring appears on focus only. */
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     font: inherit;
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     text-align: left;
     cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-out);
+    transition: background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
   }
   .sk-select-trigger:hover:not(:disabled) {
     background: var(--surface-hi);
   }
   .sk-select-trigger:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
   }
   .sk-select.is-open .sk-select-trigger {
@@ -360,10 +404,8 @@
   }
 
   .sk-select-popover {
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: calc(100% + 2px);
+    position: fixed;
+    inset: auto;
     margin: 0;
     padding: var(--space-1) 0;
     list-style: none;
@@ -371,17 +413,15 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow-overlay);
-    max-height: 280px;
+    box-sizing: border-box;
     overflow-y: auto;
     z-index: var(--z-modal);
     outline: none;
   }
-  .sk-select-popover.flip-up {
-    top: auto;
-    bottom: calc(100% + 2px);
-  }
-
   .sk-select-opt {
+    display: flex;
+    align-items: center;
+    min-height: 24px;
     padding: var(--space-2) var(--space-3);
     color: var(--fg-strong);
     cursor: pointer;
@@ -392,11 +432,12 @@
     text-overflow: ellipsis;
   }
   .sk-select-opt.is-highlight:not(.is-disabled) {
-    background: var(--accent-subtle);
+    background: var(--bg-hover);
     color: var(--fg);
   }
   .sk-select-opt.is-active {
-    color: var(--accent);
+    background: var(--accent-subtle);
+    color: var(--fg);
   }
   .sk-select-opt.is-active.is-highlight {
     background: var(--accent-glow);

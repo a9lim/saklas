@@ -17,6 +17,8 @@ import from :mod:`saklas.core.monitor` (no circular dependency).
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -107,6 +109,10 @@ class AttachedManifoldProbe:
 
     name: str
     manifold: "Manifold"
+    # Candidate order and exact lookup are attachment invariants, built once
+    # from corpus nodes plus the optional synthetic neutral anchor.
+    candidate_labels: tuple[str, ...]
+    label_to_candidate_idx: dict[str, int]
     top_n: int = DEFAULT_NEAREST_TOP_N
     is_affine: bool = True
     # Whether the neutral anchor competes as a virtual candidate in this
@@ -114,6 +120,10 @@ class AttachedManifoldProbe:
     # ``NEUTRAL_LABEL not in manifold.node_labels`` so a real node named
     # ``neutral`` keeps sole ownership of the label.
     inject_neutral: bool = True
+    # Candidate order for exact ``@label`` / ``~label`` gate reads: corpus nodes
+    # followed by the synthetic neutral anchor when injected.  The mapping is
+    # built once at attach (duplicate corpus labels resolve to their last
+    # occurrence, matching the historic per-token dict comprehension).
     # Per-layer cache, indexed by layer index — same set of layers as
     # ``manifold.layers``.
     node_values_reduced: dict[int, torch.Tensor] = field(default_factory=dict)
@@ -232,14 +242,9 @@ def _probe_is_affine_for_manifold(manifold: "Manifold") -> bool:
     curved (``spectral`` / ``authored``), so the first fitted layer decides.
     An empty manifold is treated as affine (it scores to nothing anyway).
     """
-    for sub in manifold.layers.values():
-        return bool(sub.is_affine)
-    return True
+    from saklas.core.manifold import manifold_is_affine
 
-
-def _probe_is_affine(probe: "AttachedManifoldProbe") -> bool:
-    """Back-compat wrapper for tests / callers that ask about an attached probe."""
-    return probe.is_affine
+    return manifold_is_affine(manifold)
 
 
 def _affine_coord_map(
@@ -259,21 +264,12 @@ def _affine_coord_map(
     dev = X.device
     sub_f = sub.to(device=dev, dtype=torch.float32)
     basis = sub_f.basis                                   # (R, D)
-    mean = sub_f.mean                                     # (D,)
     R = int(basis.shape[0])
     node_coords = manifold.node_coords.to(device=dev, dtype=torch.float32)
     K_nodes = int(node_coords.shape[0])
     n_dim = int(manifold.domain.intrinsic_dim)
-    embedded = manifold.domain.embed(
-        manifold.domain.clamp_position(node_coords)
-    ).to(device=dev, dtype=torch.float32)
-    if sub_f.node_coords is not None:
-        # True per-layer node activation in-subspace: ``node_coords @ basis``
-        # (== ``eval_at`` − mean for a flat fit, but pruned-basis-consistent —
-        # the shared domain layout would mis-dimension a DLS-pruned layer).
-        v_centered = sub_f.node_coords.to(device=dev, dtype=torch.float32) @ basis
-    else:
-        v_centered = sub_f.eval_at(embedded) - mean      # (K, D) fallback
+    assert sub_f.node_coords is not None
+    v_centered = sub_f.node_coords.to(device=dev, dtype=torch.float32) @ basis
     si_vc = _woodbury_apply(v_centered, X, K, lam)       # (K, D) = Σ⁻¹ v_centered
     g_nodes = si_vc @ basis.T                             # (K, R) = B Σ⁻¹ v_centered
     c_nodes = (g_nodes @ m_r_inv.T).cpu()                # (K, R) whitened M-proj coords
@@ -337,7 +333,7 @@ def _build_whitened_factors(
         R = m_r.shape[0]
         try:
             chol = torch.linalg.cholesky(m_r)
-        except torch.linalg.LinAlgError:
+        except torch.linalg.LinAlgError:  # pyright: ignore[reportPrivateImportUsage]  # public runtime exception, absent from torch stubs
             # Defensive jitter for a near-singular subspace gram.
             eye = torch.eye(R, dtype=m_r.dtype)
             jitter = 1e-8 * float(m_r.diagonal().mean().clamp_min(1e-12))
@@ -365,26 +361,22 @@ def _build_whitened_factors(
         # Neutral anchor in the whitened metric.  Affine: the frame is
         # neutral-anchored, so neutral is reduced coord 0.  Curved: map the
         # baked per-layer ``origin`` (authoring-coord foot of the neutral mean)
-        # through the same eval_at → basis → chol pipeline as a node.  A curved
-        # fit without a stored origin falls back to the subspace mean (0).
+        # through the same eval_at → basis → chol pipeline as a node.
         if sub.is_affine:
             neutral_white = torch.zeros(R, device=dev, dtype=torch.float32)
         else:
-            o = manifold.origin.get(layer_idx)
-            if o is None:
-                neutral_white = torch.zeros(R, device=dev, dtype=torch.float32)
-            else:
-                o_dom = o.to(device=dev, dtype=torch.float32).reshape(1, -1)
-                emb = manifold.domain.embed(
-                    manifold.domain.clamp_position(o_dom)
-                ).to(device=dev, dtype=torch.float32)
-                v_centered = sub.eval_at(emb) - sub.mean.to(
-                    device=dev, dtype=torch.float32,
-                )
-                v_red = v_centered @ sub.basis.to(
-                    device=dev, dtype=torch.float32,
-                ).T                                  # (1, R)
-                neutral_white = (v_red @ chol_dev).reshape(-1)
+            o = manifold.origin[layer_idx]
+            o_dom = o.to(device=dev, dtype=torch.float32).reshape(1, -1)
+            emb = manifold.domain.embed(
+                manifold.domain.clamp_position(o_dom)
+            ).to(device=dev, dtype=torch.float32)
+            v_centered = sub.eval_at(emb) - sub.mean.to(
+                device=dev, dtype=torch.float32,
+            )
+            v_red = v_centered @ sub.basis.to(
+                device=dev, dtype=torch.float32,
+            ).T                                  # (1, R)
+            neutral_white = (v_red @ chol_dev).reshape(-1)
         mean_dev = sub.mean.to(device=dev, dtype=torch.float32)
         # Precompute ``Σ⁻¹ mean`` once (constant in mean + whitener), so the
         # per-token ``_layer_geometry`` centers via ``sih − s_mean`` against the
@@ -434,8 +426,7 @@ def _attach_manifold_probe(
     it is present for every probed layer; an absent share (CPU stub / partial
     fit) falls back to uniform weighting via the floor.
     """
-    if not manifold.layers:
-        raise ValueError(f"manifold {manifold.name!r} carries no fitted layers")
+    manifold.validate_runtime_geometry()
     if manifold.node_coords.numel() == 0 or not manifold.node_labels:
         raise ValueError(
             f"manifold {manifold.name!r} carries no node coords / labels"
@@ -465,24 +456,33 @@ def _attach_manifold_probe(
             v_centered = v_world - sub_f32.mean
             v_reduced = v_centered @ sub_f32.basis.T  # (K, R)
         node_values_reduced[layer_idx] = v_reduced.contiguous()
-        share_weights_raw[layer_idx] = float(
-            manifold.mahalanobis_share.get(layer_idx, 0.0)
-        )
+        share_weights_raw[layer_idx] = float(manifold.mahalanobis_share[layer_idx])
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in share_weights_raw.values()
+    ):
+        raise ValueError("manifold probe shares must be finite and positive")
     total = sum(max(_MIN_SHARE_WEIGHT, w) for w in share_weights_raw.values())
-    if total <= 0.0:
-        n_layers = max(1, len(share_weights_raw))
-        share_weights = dict.fromkeys(share_weights_raw, 1.0 / n_layers)
-    else:
-        share_weights = {
-            idx: max(_MIN_SHARE_WEIGHT, w) / total
-            for idx, w in share_weights_raw.items()
-        }
+    share_weights = {
+        idx: max(_MIN_SHARE_WEIGHT, w) / total
+        for idx, w in share_weights_raw.items()
+    }
+    inject_neutral = NEUTRAL_LABEL not in manifold.node_labels
+    candidate_labels = tuple(manifold.node_labels)
+    label_to_candidate_idx = {
+        label: idx for idx, label in enumerate(manifold.node_labels)
+    }
+    if inject_neutral:
+        label_to_candidate_idx[NEUTRAL_LABEL] = len(manifold.node_labels)
+        candidate_labels = (*candidate_labels, NEUTRAL_LABEL)
     probe = AttachedManifoldProbe(
         name=name,
         manifold=manifold,
         top_n=int(top_n),
         is_affine=_probe_is_affine_for_manifold(manifold),
-        inject_neutral=NEUTRAL_LABEL not in manifold.node_labels,
+        inject_neutral=inject_neutral,
+        candidate_labels=candidate_labels,
+        label_to_candidate_idx=label_to_candidate_idx,
         node_values_reduced=node_values_reduced,
         share_weights=share_weights,
     )
@@ -599,7 +599,7 @@ def _compute_assign_bandwidth(
             torch.cat([band, neutral_band.reshape(1)])
             if probe.inject_neutral else band
         )                                                    # (Kc,)
-        w = float(sw.get(layer_idx, 0.0))
+        w = float(sw[layer_idx])
         acc = cand * w if acc is None else acc + cand * w
         wsum += w
     if acc is None:

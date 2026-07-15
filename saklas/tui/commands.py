@@ -174,7 +174,7 @@ def _build_registry() -> dict[str, SlashCommand]:
             name="/probe",
             handler=SaklasApp._handle_probe,
             usage=(
-                "Usage: /probe <concept>\n"
+                "Usage: /probe <selector>\n"
                 "       /probe <pos> . <neg>\n"
                 "       /probe <ns>/         (bulk add namespace)"
             ),
@@ -213,17 +213,6 @@ def _build_registry() -> dict[str, SlashCommand]:
             max_args=None,  # folder paths may contain whitespace
         ),
         SlashCommand(
-            name="/manifold-probe",
-            handler=SaklasApp._handle_manifold_probe,
-            usage=(
-                "Usage: /manifold-probe <selector>\n"
-                "  e.g. /manifold-probe emotions\n"
-                "       /manifold-probe alice/affect"
-            ),
-            min_args=1,
-            max_args=None,  # selectors are single tokens but allow trailing
-        ),
-        SlashCommand(
             name="/lens",
             handler=SaklasApp._handle_lens,
             usage=(
@@ -232,13 +221,6 @@ def _build_registry() -> dict[str, SlashCommand]:
                 "       /lens off"
             ),
             min_args=0,
-            max_args=1,
-        ),
-        SlashCommand(
-            name="/manifold-probe-remove",
-            handler=SaklasApp._handle_manifold_probe_remove,
-            usage="Usage: /manifold-probe-remove <name>",
-            min_args=1,
             max_args=1,
         ),
         SlashCommand(
@@ -502,7 +484,7 @@ def dispatch(
     came from a pulled-and-re-edited pending row, so the new item
     replaces its slot rather than sliding to the queue tail.
     """
-    from saklas.tui.chat_panel import PendingItem
+    from saklas.tui.chat_panel import PendingClear, PendingQuit, PendingRewind
 
     text = text.strip()
     parts = text.split(maxsplit=1)
@@ -528,10 +510,16 @@ def dispatch(
         # queue head on each ``("done",)`` sentinel and calls
         # ``_dispatch_pending_action``.  Carry the full slash text
         # so the user can pull and edit the queued item via ↑.
-        app._enqueue_pending(
-            PendingItem(cmd.pending_kind or cmd.name.lstrip("/"), text),
-            replace_slot=replace_slot,
-        )
+        kind = cmd.pending_kind or cmd.name.lstrip("/")
+        if kind == "clear":
+            item = PendingClear(text)
+        elif kind == "rewind":
+            item = PendingRewind(text)
+        elif kind == "quit":
+            item = PendingQuit(text)
+        else:
+            raise AssertionError(f"interrupting command lacks typed pending action: {kind}")
+        app._enqueue_pending(item, replace_slot=replace_slot)
         return
 
     cmd.handler(app, raw_args)

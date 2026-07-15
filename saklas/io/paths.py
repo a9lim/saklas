@@ -5,6 +5,7 @@ environment variable for testing and non-default installs.
 """
 from __future__ import annotations
 
+import base64
 import os
 import re
 from pathlib import Path
@@ -13,24 +14,59 @@ from pathlib import Path
 #   raw (DiM)           -> ``<safe_model_id>.safetensors``
 #   SAE-DiM             -> ``<safe_model_id>_sae-<release>.safetensors``
 #   transferred (v1.6)  -> ``<safe_model_id>_from-<safe_src>.safetensors``
-#   role                -> ``<safe_model_id>_role-<name>.safetensors``
 #
-# The literals ``_sae-``, ``_from-``, and ``_role-`` are the *kind*
-# separators — no HF model id slug contains any of them, and the right-
-# hand-side slugs (release strings, safe-model-ids, role names) follow
-# the same ``[a-z0-9._-]`` discipline so the parse is unambiguous.
+# The literals ``_sae-`` and ``_from-`` are the *kind*
+# separators. Model ids and right-hand-side slugs can legally contain those
+# literals, so filename components escape them before concatenation and the
+# parser splits at the earliest unescaped kind separator.
 # Difference-of-means is the only extraction method (4.0), so the raw
 # tensor carries no method suffix.  Kind suffixes are mutually exclusive
-# — a tensor is at most one of {SAE, transferred, role}.
+# — a tensor is at most one of {SAE, transferred}.
 _VARIANT_SEP_SAE = "_sae-"
 _VARIANT_SEP_FROM = "_from-"
-_VARIANT_SEP_ROLE = "_role-"
 _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
     (_VARIANT_SEP_SAE, "sae"),
     (_VARIANT_SEP_FROM, "from"),
-    (_VARIANT_SEP_ROLE, "role"),
 )
 _UNSAFE_VARIANT_CHARS = re.compile(r"[^a-z0-9._-]+")
+
+
+def encode_release_id(release: str) -> str:
+    """Encode an SAE release as one reversible grammar-safe component."""
+    if not release:
+        raise ValueError("SAE release must not be empty")
+    encoded = base64.b32encode(release.encode("utf-8")).decode("ascii")
+    return "_z" + encoded.rstrip("=").lower()
+
+
+def decode_release_id(encoded: str) -> str:
+    """Reverse :func:`encode_release_id`, rejecting non-canonical input."""
+    if not encoded.startswith("_z"):
+        raise ValueError(f"invalid encoded SAE release {encoded!r}")
+    payload = encoded[2:].upper()
+    payload += "=" * (-len(payload) % 8)
+    try:
+        release = base64.b32decode(payload, casefold=False).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"invalid encoded SAE release {encoded!r}") from exc
+    if not release or encode_release_id(release) != encoded:
+        raise ValueError(f"invalid encoded SAE release {encoded!r}")
+    return release
+
+
+def _encode_tensor_component(value: str) -> str:
+    """Escape reserved filename separators inside one model/variant slug."""
+    value = value.replace("%", "%25")
+    for separator, _kind in _VARIANT_SEPARATORS:
+        value = value.replace(separator, f"%5F{separator[1:]}")
+    return value
+
+
+def _decode_tensor_component(value: str) -> str:
+    """Reverse :func:`_encode_tensor_component`."""
+    for separator, _kind in _VARIANT_SEPARATORS:
+        value = value.replace(f"%5F{separator[1:]}", separator)
+    return value.replace("%25", "%")
 
 # The trailing ``:<variant>`` scheme understood across selectors / runners.
 # One source of truth for the variant suffix grammar (this module owns the
@@ -47,10 +83,6 @@ def saklas_home() -> Path:
     return Path.home() / ".saklas"
 
 
-def vectors_dir() -> Path:
-    return saklas_home() / "vectors"
-
-
 def models_dir() -> Path:
     return saklas_home() / "models"
 
@@ -58,9 +90,7 @@ def models_dir() -> Path:
 def manifolds_dir() -> Path:
     """Root of the manifold-steering artifact tree.
 
-    Parallel to :func:`vectors_dir` — a manifold is its own artifact kind
-    (labeled nodes placed on an n-dimensional domain), not a concept
-    folder, so it lives under its own root.
+    A manifold is a labeled-node artifact placed on an n-dimensional domain.
     """
     return saklas_home() / "manifolds"
 
@@ -120,12 +150,28 @@ def baseline_prompts_path() -> Path:
 
 
 def safe_model_id(model_id: str) -> str:
-    """Flatten an HF-style model ID for filesystem use: '/' -> '__'."""
-    return model_id.replace("/", "__")
+    """Encode any HF or local model id as one reversible filename component."""
+    if not model_id:
+        raise ValueError("model id must not be empty")
+    payload = base64.urlsafe_b64encode(model_id.encode("utf-8")).decode("ascii")
+    return "_z" + payload.rstrip("=")
 
 
-def concept_dir(namespace: str, concept: str) -> Path:
-    return ensure_within(vectors_dir(), namespace, concept)
+def unsafe_model_id(safe_id: str) -> str:
+    """Reverse :func:`safe_model_id`, rejecting malformed escape sequences."""
+    if not safe_id.startswith("_z"):
+        raise ValueError(f"invalid safe model id {safe_id!r}")
+    encoded = safe_id[2:]
+    encoded += "=" * (-len(encoded) % 4)
+    try:
+        model_id = base64.b64decode(
+            encoded, altchars=b"-_", validate=True,
+        ).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"invalid encoded safe model id {safe_id!r}") from exc
+    if not model_id or safe_model_id(model_id) != safe_id:
+        raise ValueError(f"invalid encoded safe model id {safe_id!r}")
+    return model_id
 
 
 def model_dir(model_id: str) -> Path:
@@ -136,36 +182,14 @@ def safe_sae_suffix(release: str | None) -> str:
     """Filename suffix for an SAE variant.  ``None``/``""`` = raw (no suffix)."""
     if not release:
         return ""
-    slug = _UNSAFE_VARIANT_CHARS.sub("_", release.lower())
-    return f"{_VARIANT_SEP_SAE}{slug}"
+    return f"{_VARIANT_SEP_SAE}{encode_release_id(release)}"
 
 
-def safe_from_suffix(source_safe_id: str | None) -> str:
-    """Filename suffix for a transferred-profile variant.
-
-    Input is a *safe model id* (already passed through :func:`safe_model_id`)
-    so the slug is byte-stable across operating systems.  Returns the
-    empty string for ``None`` / empty (no transfer = raw).
-    """
-    if not source_safe_id:
+def safe_from_suffix(source_model_id: str | None) -> str:
+    """Reversibly encode a source model id for a transfer variant suffix."""
+    if not source_model_id:
         return ""
-    slug = _UNSAFE_VARIANT_CHARS.sub("_", source_safe_id.lower())
-    return f"{_VARIANT_SEP_FROM}{slug}"
-
-
-def safe_role_suffix(role_name: str | None) -> str:
-    """Filename suffix for a role variant.  ``None``/``""`` = raw (no suffix).
-
-    The role name is slugified with the same ``[a-z0-9._-]`` discipline
-    as :func:`safe_sae_suffix` — lowercased, unsafe characters collapsed
-    to ``_`` — so the parse is unambiguous against neighbouring kind
-    separators.  ``parse_tensor_filename`` splits on the literal ``_role-``
-    separator, so inner hyphens/dots round-trip.
-    """
-    if not role_name:
-        return ""
-    slug = _UNSAFE_VARIANT_CHARS.sub("_", role_name.lower())
-    return f"{_VARIANT_SEP_ROLE}{slug}"
+    return f"{_VARIANT_SEP_FROM}{encode_release_id(source_model_id)}"
 
 
 def tensor_filename(
@@ -173,38 +197,37 @@ def tensor_filename(
     *,
     release: str | None = None,
     transferred_from: str | None = None,
-    role: str | None = None,
+    model_id_is_safe: bool = False,
+    transferred_from_is_encoded: bool = False,
 ) -> str:
     """Construct the canonical tensor filename.
 
-    At most one of ``release``, ``transferred_from``, and ``role`` may be
-    set — composed kind variants (SAE-on-transferred, role-on-SAE, etc.)
-    are not supported.  ``transferred_from`` accepts either an HF model id
-    (``"google/gemma-3-4b-it"``) or its safe form
-    (``"google__gemma-3-4b-it"``); both flatten to the same slug.
+    At most one of ``release`` and ``transferred_from`` may be set — composed
+    kind variants are not supported. ``transferred_from`` accepts an HF/local model id by
+    default. Internal callers holding a parsed ``from-*`` filename component
+    set ``transferred_from_is_encoded=True``. The target equivalent remains
+    ``model_id_is_safe=True``.
 
     The raw tensor at the canonical path is difference-of-means (the only
     extraction method as of 4.0), so it carries no method suffix.
 
-    ``role`` (optional) names a role/persona variant; the filename gets
-    a ``_role-<safe_role>`` suffix, slugified like the SAE release slug.
     """
-    if sum(bool(x) for x in (release, transferred_from, role)) > 1:
+    if release and transferred_from:
         raise ValueError(
-            "tensor_filename: release, transferred_from, and role are "
-            "mutually exclusive"
+            "tensor_filename: release and transferred_from are mutually exclusive"
         )
+    target_safe = model_id if model_id_is_safe else safe_model_id(model_id)
+    target = _encode_tensor_component(target_safe)
     if release:
-        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}.safetensors"
+        return f"{target}{safe_sae_suffix(release)}.safetensors"
     if transferred_from:
-        # Accept either form; ``safe_model_id`` is idempotent on
-        # already-safe ids (no '/' to replace), so callers can pass
-        # whichever they have.
-        src = safe_model_id(transferred_from)
-        return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.safetensors"
-    if role:
-        return f"{safe_model_id(model_id)}{safe_role_suffix(role)}.safetensors"
-    return f"{safe_model_id(model_id)}.safetensors"
+        suffix = (
+            f"{_VARIANT_SEP_FROM}{transferred_from}"
+            if transferred_from_is_encoded
+            else safe_from_suffix(transferred_from)
+        )
+        return f"{target}{suffix}.safetensors"
+    return f"{target}.safetensors"
 
 
 def sidecar_filename(
@@ -212,22 +235,18 @@ def sidecar_filename(
     *,
     release: str | None = None,
     transferred_from: str | None = None,
-    role: str | None = None,
 ) -> str:
     """Sidecar JSON partner for a tensor filename."""
-    if sum(bool(x) for x in (release, transferred_from, role)) > 1:
+    if release and transferred_from:
         raise ValueError(
-            "sidecar_filename: release, transferred_from, and role are "
-            "mutually exclusive"
+            "sidecar_filename: release and transferred_from are mutually exclusive"
         )
+    target = _encode_tensor_component(safe_model_id(model_id))
     if release:
-        return f"{safe_model_id(model_id)}{safe_sae_suffix(release)}.json"
+        return f"{target}{safe_sae_suffix(release)}.json"
     if transferred_from:
-        src = safe_model_id(transferred_from)
-        return f"{safe_model_id(model_id)}{safe_from_suffix(src)}.json"
-    if role:
-        return f"{safe_model_id(model_id)}{safe_role_suffix(role)}.json"
-    return f"{safe_model_id(model_id)}.json"
+        return f"{target}{safe_from_suffix(transferred_from)}.json"
+    return f"{target}.json"
 
 
 def parse_tensor_filename(
@@ -239,8 +258,6 @@ def parse_tensor_filename(
       * ``None`` — raw DiM tensor (no separator).
       * ``"sae-<release>"`` — SAE-DiM variant.
       * ``"from-<safe_src>"`` — transferred-from variant.
-      * ``"role-<name>"`` — role variant.
-
     The variant string carries its kind tag so callers can dispatch
     without re-parsing.  Returns ``None`` for filenames that aren't
     ``.safetensors``.
@@ -248,8 +265,24 @@ def parse_tensor_filename(
     if not filename.endswith(".safetensors"):
         return None
     stem = filename[: -len(".safetensors")]
-    for sep, kind in _VARIANT_SEPARATORS:
-        if sep in stem:
-            model, value = stem.split(sep, 1)
-            return model, f"{kind}-{value}"
-    return stem, None
+    matches = [
+        (stem.find(separator), separator, kind)
+        for separator, kind in _VARIANT_SEPARATORS
+        if separator in stem
+    ]
+    if matches:
+        index, separator, kind = min(matches, key=lambda item: item[0])
+        model = _decode_tensor_component(stem[:index])
+        value = _decode_tensor_component(stem[index + len(separator):])
+        try:
+            unsafe_model_id(model)
+            decode_release_id(value)
+        except ValueError:
+            return None
+        return model, f"{kind}-{value}"
+    model = _decode_tensor_component(stem)
+    try:
+        unsafe_model_id(model)
+    except ValueError:
+        return None
+    return model, None

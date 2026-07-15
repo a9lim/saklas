@@ -52,7 +52,8 @@ def _mock_session():
     monitor = MagicMock()
     monitor.probe_names = []
     monitor.profiles = {}
-    session._monitor = monitor
+    monitor.manifolds = {}
+    session.monitor = monitor
     session._tokenizer = MagicMock()
     session._layers = []
     session.lock = asyncio.Lock()
@@ -121,7 +122,7 @@ class TestVectorDiagnostics:
         assert data["model"] == "test/model"
         # ``total_layers`` is the *model's* depth (so the layer-norms drawer
         # can show layers DLS dropped), not the profile's — see the endpoint
-        # comment in ``saklas/server/saklas_api.py``.
+        # native vector-route contract.
         assert data["total_layers"] == session.model_info["num_layers"]
 
         hist = data["histogram"]

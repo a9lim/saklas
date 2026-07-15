@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from rich.markup import escape
 
@@ -21,6 +21,7 @@ from saklas.core.loom import LoomNode, LoomTree
 
 if TYPE_CHECKING:
     from saklas.core.loom_diff import DiffSpan
+    from saklas.core.session import SaklasSession
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +284,9 @@ def format_node_detail(tree: LoomTree, node_id: str) -> str:
             lines.append(f"recipe.sd : {recipe.seed}")
         if recipe.sampling is not None:
             samp = recipe.sampling
-            t = getattr(samp, "temperature", None)
-            p = getattr(samp, "top_p", None)
-            m = getattr(samp, "max_tokens", None)
+            t = samp.temperature
+            p = samp.top_p
+            m = samp.max_tokens
             lines.append(f"recipe.sm : T={t} top_p={p} max={m}")
         if recipe.thinking is not None:
             lines.append(f"recipe.th : {recipe.thinking}")
@@ -379,11 +380,8 @@ def _render_text_diff(spans: list["DiffSpan"]) -> str:
     return " ".join(parts) if parts else "[dim](identical text)[/]"
 
 
-def format_compare(session: Any, node_id: str) -> str:
+def format_compare(session: "SaklasSession", node_id: str) -> str:
     """Render the loom screen's compare view for ``node_id``.
-
-    ``session`` is duck-typed — only ``.tree`` and ``.diff_nodes`` are
-    touched — so a stand-in works as well as a real ``SaklasSession``.
 
     The loom alternates user/assistant turns, so "compare" always means
     one thing: diff the assistant continuations of a single user turn.

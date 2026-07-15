@@ -40,9 +40,8 @@
   <header class="header">
     <div>
       <span class="title">session & auth</span>
-      <p>bearer key, session list, and multi-session readiness</p>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">
@@ -52,13 +51,13 @@
         <input
           type="password"
           bind:value={key}
-          placeholder="SAKLAS_API_KEY for this browser tab"
+          placeholder="SAKLAS_API_KEY"
           autocomplete="off"
         />
         <button type="button" onclick={saveKey}>{saved ? "saved" : "apply"}</button>
         <button type="button" onclick={() => { key = ""; void saveKey(); }}>clear</button>
       </div>
-      <p class="hint">Stored only in memory for this page session; no localStorage write.</p>
+      <p class="hint">memory only</p>
     </section>
 
     <section class="panel">
@@ -73,7 +72,7 @@
       {/if}
       <div class="sessions">
         {#if sessions.length === 0}
-          <div class="empty">click refresh to query the native session collection</div>
+          <div class="empty">refresh to list</div>
         {:else}
           {#each sessions as s (s.id)}
             <article class:active={sessionState.info?.id === s.id}>
@@ -86,38 +85,56 @@
       </div>
     </section>
 
-    <section class="panel">
-      <h3>remote/multi-session posture</h3>
-      <p>
-        The native API is already shaped like a multi-session service, but this
-        local dashboard still talks to the bundled same-origin server and the
-        websocket path resolves the default session. This surface makes the
-        boundary visible instead of hiding it inside fetch helpers.
-      </p>
-    </section>
   </div>
 </section>
 
 <style>
-  .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: var(--bg-alt); }
-  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-6) var(--space-6); border-bottom: 1px solid var(--border); background: var(--surface); }
-  .title { color: var(--accent); text-transform: uppercase; letter-spacing: 0; font-size: var(--text-xs); font-weight: var(--weight-bold); }
-  .header p, .hint, .panel p { margin: var(--space-1) 0 0; color: var(--fg-muted); line-height: 1.45; }
-  .close { background: transparent; border: 0; color: var(--fg-muted); font-size: var(--text-md); }
+  .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: transparent; }
+  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-6); background: var(--surface); }
+  .title { color: var(--accent); letter-spacing: 0; font-size: var(--text-md); font-weight: var(--weight-medium); }
+  .hint, .panel p { margin: var(--space-1) 0 0; color: var(--fg-muted); line-height: 1.45; }
+  .close {
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .close:hover:not(:disabled) {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
   .body { display: grid; gap: var(--space-5); padding: var(--space-6); overflow: auto; }
-  .panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-6); }
+  .panel {
+    border-radius: var(--radius);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    padding: var(--space-6);
+  }
   h3 { margin: 0 0 var(--space-4); color: var(--fg); font-size: var(--text-sm); letter-spacing: 0; }
   .key-row { display: grid; grid-template-columns: 1fr auto auto; gap: var(--space-3); }
-  input { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-deep); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); }
-  button { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); color: var(--fg); padding: var(--space-3) var(--space-5); }
-  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  input { border: 1px solid transparent; border-radius: var(--radius); background: var(--input-well); color: var(--fg); padding: var(--space-4); font-family: var(--font-mono); }
+  button { border: 1px solid transparent; border-radius: var(--radius); background: var(--glass); color: var(--fg); padding: var(--space-3) var(--space-5); }
+  button:hover:not(:disabled) { background: var(--glass-strong); color: var(--accent); }
   .section-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); }
   .sessions { display: grid; gap: var(--space-3); }
-  article { display: grid; gap: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); padding: var(--space-4); }
+  article { display: grid; gap: var(--space-2); border: 1px solid transparent; border-radius: var(--radius); background: var(--bg-elev); padding: var(--space-4); }
   article.active { border-color: var(--accent); background: var(--accent-subtle); }
   strong { color: var(--accent); }
   code { color: var(--accent-amber); font-family: var(--font-mono); }
   article span { color: var(--fg-muted); }
   .error { color: var(--accent-red); }
-  .empty { color: var(--fg-muted); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-6); text-align: center; }
+  .empty { color: var(--fg-muted); background: var(--bg); border-radius: var(--radius); padding: var(--space-6); text-align: center; }
 </style>

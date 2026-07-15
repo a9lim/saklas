@@ -21,8 +21,8 @@
   const pendingCount = $derived(pendingActions.queue.length);
   const pendingTitle = $derived(
     pendingCount === 1
-      ? "1 item queued; drains automatically on the next done event"
-      : `${pendingCount} items queued; drain automatically on each done event`,
+      ? "1 queued"
+      : `${pendingCount} queued`,
   );
 
   // Live elapsed counter — ticks while gen is active, freezes on done so
@@ -55,6 +55,12 @@
   // least started.  "Active" is the obvious signal, but a finished gen
   // with startedAt set should also keep its trailing stats visible.
   const hasRun = $derived(genStatus.startedAt !== null);
+  const finishLabel = $derived.by(() => {
+    if (!genStatus.finishReason || genStatus.finishReason === "stop") return null;
+    if (genStatus.finishReason === "length") return "token limit";
+    if (genStatus.finishReason === "cancelled") return "stopped";
+    return genStatus.finishReason;
+  });
 </script>
 
 <footer class="status-footer" aria-label="Generation status">
@@ -63,28 +69,35 @@
     <span class="text">idle</span>
   {:else}
     <span class="dot {genStatus.active ? 'live' : 'done'}" aria-hidden="true">●</span>
-    <span class="text">gen {genStatus.tokensSoFar}/{genStatus.maxTokens || "?"}</span>
-    <span class="sep" aria-hidden="true">·</span>
-    <span class="bar-wrap" aria-label="progress">
-      <Bar
-        value={genStatus.tokensSoFar}
-        max={genStatus.maxTokens || Math.max(genStatus.tokensSoFar, 1)}
-        width={120}
-        height={6}
-        color={genStatus.active ? "var(--accent-green)" : "var(--fg-muted)"}
-      />
-    </span>
+    {#if genStatus.active}
+      <span class="text">gen {genStatus.tokensSoFar}/{genStatus.maxTokens || "?"}</span>
+      <span class="sep" aria-hidden="true">·</span>
+      <span class="bar-wrap" aria-label="progress">
+        <Bar
+          value={genStatus.tokensSoFar}
+          max={genStatus.maxTokens || Math.max(genStatus.tokensSoFar, 1)}
+          width={120}
+          height={6}
+          color="var(--accent-green)"
+        />
+      </span>
+    {:else}
+      <span class="text done-label">{genStatus.tokensSoFar} tokens</span>
+    {/if}
     <span class="sep" aria-hidden="true">·</span>
     <span class="text">{tokPerSec.toFixed(1)} t/s</span>
     <span class="sep" aria-hidden="true">·</span>
     <span class="text">{elapsedSec.toFixed(1)}s</span>
     {#if ppl !== null && Number.isFinite(ppl)}
       <span class="sep" aria-hidden="true">·</span>
-      <span class="text">ppl {ppl.toFixed(2)}</span>
+      <span
+        class="text"
+        title="entropy perplexity"
+      >ppl {ppl.toFixed(2)}</span>
     {/if}
-    {#if !genStatus.active && genStatus.finishReason}
+    {#if !genStatus.active && finishLabel}
       <span class="sep" aria-hidden="true">·</span>
-      <span class="text muted">{genStatus.finishReason}</span>
+      <span class="text muted">{finishLabel}</span>
     {/if}
   {/if}
 
@@ -98,23 +111,38 @@
 <style>
   /* Embedded in the chat column, directly above the input row — a thin
    * status line.  Horizontal padding is zero so it aligns with the log
-   * and input box; the hairline above separates it from the log. */
+   * and input box; borderless — the gap above already separates it from
+   * the log. */
   .status-footer {
     display: flex;
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-2) 0;
-    border-top: 1px solid var(--border);
     color: var(--fg-dim);
     font-size: var(--text-sm);
     font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
     min-height: 22px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .dot.live {
-    color: var(--accent-green);
+    color: var(--live);
+    border-radius: 50%;
+    animation: dot-pulse 1.6s var(--ease-in-out) infinite;
+  }
+  /* Reduced-motion is handled by the global kill switch in global.css. */
+  @keyframes dot-pulse {
+    0% {
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 40%, transparent);
+    }
+    70% {
+      box-shadow: 0 0 0 6px transparent;
+    }
+    100% {
+      box-shadow: 0 0 0 0 transparent;
+    }
   }
   .dot.done {
     color: var(--fg-muted);
@@ -128,6 +156,9 @@
   .text.muted {
     color: var(--fg-muted);
   }
+  .done-label {
+    color: var(--fg-strong);
+  }
   .bar-wrap {
     display: inline-flex;
     align-items: center;
@@ -138,11 +169,11 @@
    * above the composer. */
   .pending-badge {
     margin-left: auto;
-    background: rgba(242, 184, 75, 0.12);
-    color: var(--accent-amber);
-    border: 1px solid var(--border);
+    background: var(--glass-strong);
+    color: var(--fg-dim);
+    border: 1px solid transparent;
     padding: var(--space-1) var(--space-4);
-    border-radius: var(--radius);
+    border-radius: var(--radius-pill);
     font-size: var(--text-sm);
     font-family: var(--font-ui);
   }

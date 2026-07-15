@@ -10,7 +10,7 @@ cd saklas
 pip install -e ".[dev]"
 ```
 
-Optional extras: `[cuda]` for bitsandbytes and HF `kernels`, `[cuda-experimental]` adds flash-attn on top, `[research]` for datasets and pandas, `[sae]` for SAELens-backed SAE extraction. The HTTP server and web UI bundle are part of the base install.
+Optional extras: `[cuda]` for bitsandbytes and HF `kernels`, `[cuda-experimental]` adds flash-attn on top, and `[research]` for datasets and pandas. SAELens-backed SAE extraction, the HTTP server, and the web UI bundle are part of the base install.
 
 ## Running tests
 

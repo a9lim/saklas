@@ -12,12 +12,122 @@ backends themselves (those live in ``test_manifolds_io`` /
 from __future__ import annotations
 
 import json as _json
+import queue
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from saklas import cli
+
+
+def _cross_process_alignment_worker(
+    home: str,
+    target: str,
+    load_count: Any,
+    start: Any,
+    errors: Any,
+) -> None:
+    """Exercise the neutral-cache lock in a clean spawned interpreter."""
+    import time
+
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    patch = pytest.MonkeyPatch()
+    patch.setenv("SAKLAS_HOME", home)
+    source_marker = Path(home) / "source-neutral-ready"
+    rows = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])}
+
+    def sidecar(model_id: str) -> dict[str, Any]:
+        return {
+            "method": "neutral_activations", "format_version": 4,
+            "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
+            "layers": [0],
+            "tensor_schema": {
+                "0": {"shape": [3, 2], "dtype": "torch.float32"},
+            },
+            "n_prompts": 3,
+        }
+
+    def metadata(model_id: str, **_kwargs: Any) -> dict[str, Any]:
+        if model_id == "shared/source" and not source_marker.exists():
+            raise FileNotFoundError(model_id)
+        return sidecar(model_id)
+
+    def load_rows(
+        model_id: str, *, requested_layers: object = None,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        del requested_layers
+        if model_id == "shared/source" and not source_marker.exists():
+            raise FileNotFoundError(model_id)
+        return rows, sidecar(model_id)
+
+    class Session:
+        def __init__(self, model_id: str) -> None:
+            assert model_id == "shared/source"
+            with load_count.get_lock():
+                load_count.value += 1
+            self.model = object()
+            self.tokenizer = object()
+            self.layers = [object()]
+
+        def __enter__(self) -> "Session":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def capture(
+        _model: object, _tokenizer: object, _layers: object, *,
+        model_id: str, force: bool,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        assert model_id == "shared/source" and force is False
+        time.sleep(0.15)
+        source_marker.write_text("ready")
+        return rows, sidecar(model_id)
+
+    patch.setattr(alignment_mod, "validate_neutral_cache_metadata", metadata)
+    patch.setattr(alignment_mod, "load_validated_neutral_cache", load_rows)
+    patch.setattr(
+        alignment_mod, "_load_or_compute_neutral_activations_with_metadata_locked",
+        capture,
+    )
+    patch.setattr(
+        model_mod, "model_source_fingerprint",
+        lambda model_id: f"source:{model_id}",
+    )
+    patch.setattr(
+        session_mod.SaklasSession, "from_pretrained",
+        staticmethod(lambda model_id, **_kwargs: Session(model_id)),
+    )
+    patch.setattr(
+        alignment_mod, "load_alignment_map",
+        lambda *_args, **_kwargs: (
+            {0: torch.eye(2)}, {"quality_per_layer": {"0": 1.0}},
+        ),
+    )
+
+    try:
+        start.wait(timeout=15)
+        runners._load_or_fit_transfer_alignment(
+            "shared/source", target, force=False, label="test",
+            requested_layers=[0],
+        )
+    except BaseException as exc:
+        errors.put(repr(exc))
+    finally:
+        patch.undo()
 
 
 def _materialize_bundles_for_cli_test(
@@ -584,6 +694,734 @@ def test_run_manifold_refresh_missing_errors(monkeypatch: pytest.MonkeyPatch):
     assert ex.value.code == 1
 
 
+def test_cold_alignment_reuses_loaded_target_neutrals_for_whitener(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Cold transfer neither revalidates identities nor reloads target rows."""
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    class _SessionContext:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+            self.model = object()
+            self.tokenizer = object()
+            self.layers = [object()]
+
+        def __enter__(self) -> "_SessionContext":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        session_mod.SaklasSession,
+        "from_pretrained",
+        staticmethod(lambda model_id, **_kwargs: _SessionContext(model_id)),
+    )
+    loaded: list[str] = []
+    src_acts = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [2.0, 1.0]])}
+    tgt_acts = {0: torch.tensor([[2.0, 1.0], [1.0, 3.0], [4.0, 2.0]])}
+
+    def load_with_metadata(
+        _model: object, _tokenizer: object, _layers: object, *,
+        model_id: str, force: bool,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        assert force is False
+        loaded.append(model_id)
+        acts = src_acts if model_id == "src/model" else tgt_acts
+        return acts, {
+            "method": "neutral_activations", "format_version": 4,
+            "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
+            "layers": [0],
+            "tensor_schema": {"0": {"shape": [3, 2], "dtype": "torch.float32"}},
+            "n_prompts": 3,
+        }
+
+    monkeypatch.setattr(
+        alignment_mod,
+        "_load_or_compute_neutral_activations_with_metadata_locked",
+        load_with_metadata,
+    )
+    monkeypatch.setattr(
+        alignment_mod, "validate_neutral_cache_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("cold cache")
+        ),
+    )
+    monkeypatch.setattr(model_mod, "model_source_fingerprint", lambda *_args: None)
+    monkeypatch.setattr(
+        alignment_mod, "fit_alignment",
+        lambda _src, _tgt, **_kwargs: {0: torch.eye(2)},
+    )
+    monkeypatch.setattr(
+        alignment_mod, "alignment_quality",
+        lambda _maps, _src, _tgt: {0: 1.0},
+    )
+    monkeypatch.setattr(
+        alignment_mod, "save_alignment_map",
+        lambda *_args, **_kwargs: tmp_path / "alignment.safetensors",
+    )
+    maps, quality, _path, _src_id, _tgt_id, whitener, layer_means = (
+        runners._load_or_fit_transfer_alignment(
+            "src/model", "tgt/model", force=True, label="test transfer",
+        )
+    )
+
+    assert loaded == ["src/model", "tgt/model"]
+    assert quality == {0: 1.0}
+    assert torch.equal(maps[0], torch.eye(2))
+    assert whitener.layers == {0}
+    assert set(layer_means) == {0}
+
+
+def test_cold_narrow_alignment_releases_full_seed_rosters_before_fit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import gc
+    import weakref
+
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    class _SessionContext:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+            self.model = object()
+            self.tokenizer = object()
+            self.layers = [object() for _ in range(10)]
+
+        def __enter__(self) -> "_SessionContext":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        session_mod.SaklasSession,
+        "from_pretrained",
+        staticmethod(lambda model_id, **_kwargs: _SessionContext(model_id)),
+    )
+    monkeypatch.setattr(model_mod, "model_source_fingerprint", lambda *_args: None)
+    monkeypatch.setattr(
+        alignment_mod, "validate_neutral_cache_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("cold cache")
+        ),
+    )
+
+    unrequested_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def capture(
+        _model: object, _tokenizer: object, _layers: object, *,
+        model_id: str, force: bool,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        assert force is False
+        rows = {
+            layer: torch.tensor(
+                [[1.0 + layer, 0.0], [0.0, 1.0], [2.0, 1.0]],
+            )
+            for layer in range(10)
+        }
+        unrequested_refs.append(weakref.ref(rows[9]))
+        return rows, {
+            "method": "neutral_activations", "format_version": 4,
+            "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": {str(layer): "0" * 64 for layer in range(10)},
+            "tensor_files": {
+                str(layer): f"neutral.layer-{layer}.safetensors"
+                for layer in range(10)
+            },
+            "layers": list(range(10)),
+            "tensor_schema": {
+                str(layer): {
+                    "shape": [3, 2], "dtype": "torch.float32",
+                }
+                for layer in range(10)
+            },
+            "n_prompts": 3,
+        }
+
+    monkeypatch.setattr(
+        alignment_mod,
+        "_load_or_compute_neutral_activations_with_metadata_locked",
+        capture,
+    )
+    monkeypatch.setattr(alignment_mod, "load_alignment_map", lambda *_a, **_k: None)
+
+    def fit(
+        src: dict[int, torch.Tensor], tgt: dict[int, torch.Tensor], **kwargs: Any,
+    ) -> dict[int, torch.Tensor]:
+        gc.collect()
+        assert len(unrequested_refs) == 2
+        assert all(ref() is None for ref in unrequested_refs)
+        assert set(src) == set(tgt) == {5}
+        assert kwargs["requested_layers"] == {5}
+        return {5: torch.eye(2)}
+
+    monkeypatch.setattr(alignment_mod, "fit_alignment", fit)
+    monkeypatch.setattr(
+        alignment_mod, "alignment_quality", lambda *_args, **_kwargs: {5: 1.0},
+    )
+    monkeypatch.setattr(
+        alignment_mod, "save_alignment_map",
+        lambda *_args, **_kwargs: tmp_path / "alignment.safetensors",
+    )
+
+    result = runners._load_or_fit_transfer_alignment(
+        "src/model", "tgt/model", force=True, label="test transfer",
+        requested_layers=[5],
+    )
+
+    assert set(result[0]) == {5}
+    assert result[5].layers == {5}
+
+
+def test_cached_alignment_keeps_model_free_offline_whitener_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A cached repeat loads target rows once and never loads model weights."""
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    def sidecar(model_id: str) -> dict[str, Any]:
+        return {
+            "method": "neutral_activations", "format_version": 4,
+            "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
+            "layers": [0],
+            "tensor_schema": {"0": {"shape": [3, 2], "dtype": "torch.float32"}},
+            "n_prompts": 3,
+        }
+
+    metadata_calls: list[str] = []
+    payload_calls: list[str] = []
+    target_acts = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])}
+
+    def metadata_only(model_id: str, **_kwargs: Any) -> dict[str, Any]:
+        metadata_calls.append(model_id)
+        return sidecar(model_id)
+
+    def load_validated(
+        model_id: str, **_kwargs: Any,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        payload_calls.append(model_id)
+        assert model_id == "tgt/model"
+        return target_acts, sidecar(model_id)
+
+    monkeypatch.setattr(
+        alignment_mod, "validate_neutral_cache_metadata", metadata_only,
+    )
+    monkeypatch.setattr(
+        alignment_mod, "load_validated_neutral_cache", load_validated,
+    )
+    monkeypatch.setattr(
+        model_mod, "model_source_fingerprint",
+        lambda model_id: f"source:{model_id}",
+    )
+    monkeypatch.setattr(
+        alignment_mod, "load_alignment_map",
+        lambda *_args, **_kwargs: (
+            {0: torch.eye(2)}, {"quality_per_layer": {"0": 0.75}},
+        ),
+    )
+    monkeypatch.setattr(
+        alignment_mod, "alignment_cache_path",
+        lambda *_args: (
+            tmp_path / "alignment.safetensors", tmp_path / "alignment.json",
+        ),
+    )
+    monkeypatch.setattr(
+        session_mod.SaklasSession,
+        "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact cached repeat loaded a model")
+        )),
+    )
+    result = runners._load_or_fit_transfer_alignment(
+        "src/model", "tgt/model", force=False, label="test transfer",
+    )
+
+    assert result[1] == {0: 0.75}
+    assert result[5].layers == {0}
+    assert metadata_calls == ["src/model", "tgt/model", "tgt/model"]
+    assert payload_calls == ["tgt/model"]
+
+
+def test_missing_cached_alignment_fits_offline_from_proven_neutral_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A map miss reuses both neutral caches and never loads either model."""
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    src_acts = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [2.0, 1.0]])}
+    tgt_acts = {0: torch.tensor([[2.0, 1.0], [1.0, 3.0], [4.0, 2.0]])}
+
+    def sidecar(model_id: str) -> dict[str, Any]:
+        return {
+            "method": "neutral_activations", "format_version": 4,
+            "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
+            "layers": [0],
+            "tensor_schema": {
+                "0": {"shape": [3, 2], "dtype": "torch.float32"},
+            },
+            "n_prompts": 3,
+        }
+
+    metadata_calls: list[str] = []
+    payload_calls: list[str] = []
+
+    def metadata_only(model_id: str, **_kwargs: Any) -> dict[str, Any]:
+        metadata_calls.append(model_id)
+        return sidecar(model_id)
+
+    def load_validated(
+        model_id: str, **_kwargs: Any,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        payload_calls.append(model_id)
+        return (
+            src_acts if model_id == "src/model" else tgt_acts,
+            sidecar(model_id),
+        )
+
+    monkeypatch.setattr(
+        alignment_mod, "validate_neutral_cache_metadata", metadata_only,
+    )
+    monkeypatch.setattr(
+        alignment_mod, "load_validated_neutral_cache", load_validated,
+    )
+    monkeypatch.setattr(
+        model_mod, "model_source_fingerprint",
+        lambda model_id: f"source:{model_id}",
+    )
+    monkeypatch.setattr(
+        alignment_mod, "load_alignment_map", lambda *_args, **_kwargs: None,
+    )
+    fitted: list[tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]] = []
+
+    def fit_offline(
+        src: dict[int, torch.Tensor], tgt: dict[int, torch.Tensor], **_kwargs: Any,
+    ) -> dict[int, torch.Tensor]:
+        fitted.append((src, tgt))
+        return {0: torch.eye(2)}
+
+    monkeypatch.setattr(alignment_mod, "fit_alignment", fit_offline)
+    monkeypatch.setattr(
+        alignment_mod, "alignment_quality",
+        lambda _maps, _src, _tgt: {0: 0.9},
+    )
+    saved: list[dict[str, Any]] = []
+
+    def save_offline(*_args: Any, **kwargs: Any) -> Path:
+        saved.append(kwargs)
+        return tmp_path / "alignment.safetensors"
+
+    monkeypatch.setattr(alignment_mod, "save_alignment_map", save_offline)
+    monkeypatch.setattr(
+        session_mod.SaklasSession,
+        "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("offline alignment fit loaded model weights")
+        )),
+    )
+
+    result = runners._load_or_fit_transfer_alignment(
+        "src/model", "tgt/model", force=False, label="test transfer",
+    )
+
+    assert metadata_calls == [
+        "src/model", "tgt/model", "tgt/model", "src/model",
+    ]
+    assert payload_calls == ["tgt/model", "src/model"]
+    assert len(fitted) == 1
+    assert fitted[0][0] is src_acts
+    assert set(fitted[0][1]) == {0}
+    assert fitted[0][1][0] is tgt_acts[0]
+    assert len(saved) == 1
+    assert saved[0]["source_identity"] == result[3]
+    assert saved[0]["target_identity"] == result[4]
+    assert result[1] == {0: 0.9}
+    assert result[5].layers == {0}
+
+
+def test_force_refits_only_requested_layer_without_loading_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    def sidecar(model_id: str) -> dict[str, Any]:
+        return {
+            "method": "neutral_activations", "format_version": 4, "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": {str(layer): "0" * 64 for layer in range(10)},
+            "tensor_files": {
+                str(layer): f"neutral.layer-{layer}.safetensors"
+                for layer in range(10)
+            },
+            "layers": list(range(10)),
+            "tensor_schema": {
+                str(layer): {"shape": [3, 2], "dtype": "torch.float32"}
+                for layer in range(10)
+            },
+            "n_prompts": 3,
+        }
+
+    rows = {
+        model_id: {
+            layer: torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+            for layer in range(10)
+        }
+        for model_id in ("src/model", "tgt/model")
+    }
+    payload_calls: list[tuple[str, set[int] | None]] = []
+
+    def load_rows(
+        model_id: str, *, requested_layers: object = None,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        requested = (
+            None if requested_layers is None
+            else {int(layer) for layer in requested_layers}  # type: ignore[union-attr]
+        )
+        payload_calls.append((model_id, requested))
+        selected = set(rows[model_id]) if requested is None else requested
+        return ({layer: rows[model_id][layer] for layer in selected}, sidecar(model_id))
+
+    monkeypatch.setattr(
+        alignment_mod, "validate_neutral_cache_metadata",
+        lambda model_id, **_kwargs: sidecar(model_id),
+    )
+    monkeypatch.setattr(alignment_mod, "load_validated_neutral_cache", load_rows)
+    monkeypatch.setattr(
+        model_mod, "model_source_fingerprint",
+        lambda model_id: f"source:{model_id}",
+    )
+    requested_map_layers: list[set[int]] = []
+
+    def load_map(*_args: Any, **kwargs: Any) -> tuple[dict[int, Any], dict[str, Any]]:
+        requested_map_layers.append(set(kwargs["requested_layers"]))
+        return ({}, {"quality_per_layer": {"0": 0.5}})
+
+    monkeypatch.setattr(alignment_mod, "load_alignment_map", load_map)
+    fitted: list[tuple[set[int], dict[str, Any]]] = []
+
+    def fit(src: dict[int, Any], _tgt: dict[int, Any], **kwargs: Any) -> dict[int, Any]:
+        fitted.append((set(src), kwargs))
+        return {5: torch.eye(2)}
+
+    monkeypatch.setattr(alignment_mod, "fit_alignment", fit)
+    monkeypatch.setattr(
+        alignment_mod, "alignment_quality", lambda *_args, **_kwargs: {5: 0.9},
+    )
+    saved: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        alignment_mod, "save_alignment_map",
+        lambda *_args, **kwargs: saved.append(kwargs) or tmp_path / "alignment",
+    )
+    monkeypatch.setattr(
+        session_mod.SaklasSession, "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("force refit recaptured neutral activations")
+        )),
+    )
+
+    result = runners._load_or_fit_transfer_alignment(
+        "src/model", "tgt/model", force=True, label="test transfer",
+        requested_layers=[5],
+    )
+    assert requested_map_layers == [set()]
+    assert payload_calls == [("tgt/model", {5}), ("src/model", {5})]
+    assert fitted[0][0] == {5}
+    assert fitted[0][1]["requested_layers"] == {5}
+    assert fitted[0][1]["available_shared_layers"] == set(range(10))
+    assert saved[0]["extend"] is True
+    assert set(result[0]) == {5} and result[5].layers == {5}
+
+
+def test_target_neutral_generation_race_replans_cached_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    target_generation = "old"
+
+    def sidecar(model_id: str) -> dict[str, Any]:
+        generation = target_generation if model_id == "tgt/model" else "stable"
+        return {
+            "method": "neutral_activations", "format_version": 4, "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}:{generation}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": generation,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
+            "layers": [0],
+            "tensor_schema": {"0": {"shape": [3, 2], "dtype": "torch.float32"}},
+            "n_prompts": 3,
+        }
+
+    rows = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])}
+
+    def load_rows(
+        model_id: str, *, requested_layers: object = None,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        nonlocal target_generation
+        del requested_layers
+        if model_id == "tgt/model" and target_generation == "old":
+            target_generation = "new"
+            raise ValueError("target cache changed during payload load")
+        return rows, sidecar(model_id)
+
+    monkeypatch.setattr(
+        alignment_mod, "validate_neutral_cache_metadata",
+        lambda model_id, **_kwargs: sidecar(model_id),
+    )
+    monkeypatch.setattr(alignment_mod, "load_validated_neutral_cache", load_rows)
+    monkeypatch.setattr(
+        model_mod, "model_source_fingerprint",
+        lambda model_id: f"source:{model_id}",
+    )
+    map_generations: list[str] = []
+
+    def load_map(*_args: Any, **kwargs: Any):
+        generation = kwargs["target_identity"]["capture_sha256"]
+        map_generations.append(generation)
+        factor = 1.0 if generation == "old" else 2.0
+        return (
+            {0: factor * torch.eye(2)},
+            {"quality_per_layer": {"0": 0.8, "9": -5.0}},
+        )
+
+    monkeypatch.setattr(alignment_mod, "load_alignment_map", load_map)
+    monkeypatch.setattr(
+        session_mod.SaklasSession, "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("identity replan loaded a model")
+        )),
+    )
+
+    result = runners._load_or_fit_transfer_alignment(
+        "src/model", "tgt/model", force=False, label="test",
+        requested_layers=[0],
+    )
+
+    assert map_generations == ["old", "new"]
+    assert torch.equal(result[0][0].to_dense(), 2.0 * torch.eye(2))
+    assert result[1] == {0: 0.8}
+    assert result[4]["capture_sha256"] == "new"
+
+
+def test_concurrent_distinct_alignments_single_flight_shared_model_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    cached: dict[str, tuple[dict[int, torch.Tensor], dict[str, Any]]] = {}
+    loads: dict[str, int] = {}
+
+    def sidecar(model_id: str) -> dict[str, Any]:
+        return {
+            "method": "neutral_activations", "format_version": 4, "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": {str(layer): "0" * 64 for layer in range(10)},
+            "tensor_files": {
+                str(layer): f"neutral.layer-{layer}.safetensors"
+                for layer in range(10)
+            },
+            "layers": list(range(10)), "tensor_schema": {}, "n_prompts": 3,
+        }
+
+    def metadata(model_id: str, **_kwargs: Any) -> dict[str, Any]:
+        if model_id not in cached:
+            raise FileNotFoundError(model_id)
+        return cached[model_id][1]
+
+    def load_rows(
+        model_id: str, *, requested_layers: object = None,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        rows, sc = cached[model_id]
+        if requested_layers is None:
+            return rows, sc
+        wanted = {int(layer) for layer in requested_layers}  # type: ignore[union-attr]
+        return {layer: rows[layer] for layer in wanted if layer in rows}, sc
+
+    class Session:
+        def __init__(self, model_id: str) -> None:
+            loads[model_id] = loads.get(model_id, 0) + 1
+            self.model_id = model_id
+            self.model = object()
+            self.tokenizer = object()
+            self.layers = [object()]
+
+        def __enter__(self) -> "Session":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def capture(
+        _model: object, _tokenizer: object, _layers: object, *,
+        model_id: str, force: bool,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        assert force is False
+        rows = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])}
+        cached[model_id] = (rows, sidecar(model_id))
+        return cached[model_id]
+
+    monkeypatch.setattr(alignment_mod, "validate_neutral_cache_metadata", metadata)
+    monkeypatch.setattr(alignment_mod, "load_validated_neutral_cache", load_rows)
+    monkeypatch.setattr(
+        alignment_mod, "_load_or_compute_neutral_activations_with_metadata_locked",
+        capture,
+    )
+    monkeypatch.setattr(
+        model_mod, "model_source_fingerprint",
+        lambda model_id: f"source:{model_id}",
+    )
+    monkeypatch.setattr(
+        session_mod.SaklasSession, "from_pretrained",
+        staticmethod(lambda model_id, **_kwargs: Session(model_id)),
+    )
+    monkeypatch.setattr(alignment_mod, "load_alignment_map", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        alignment_mod, "fit_alignment",
+        lambda *_args, **_kwargs: {0: torch.eye(2)},
+    )
+    monkeypatch.setattr(
+        alignment_mod, "alignment_quality", lambda *_args: {0: 1.0},
+    )
+    monkeypatch.setattr(
+        alignment_mod, "save_alignment_map",
+        lambda *_args, **_kwargs: tmp_path / "alignment",
+    )
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def run(target: str) -> None:
+        try:
+            barrier.wait()
+            runners._load_or_fit_transfer_alignment(
+                "shared/source", target, force=False, label="test",
+                requested_layers=[0],
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run, args=(target,))
+        for target in ("target/a", "target/b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert loads == {"shared/source": 1, "target/a": 1, "target/b": 1}
+
+
+def test_cross_process_distinct_alignments_single_flight_shared_model_load(
+    tmp_path: Path,
+) -> None:
+    """The filesystem neutral lock precedes model construction across commands."""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    load_count = ctx.Value("i", 0)
+    start = ctx.Barrier(2)
+    errors = ctx.Queue()
+
+    processes = [
+        ctx.Process(
+            target=_cross_process_alignment_worker,
+            args=(str(tmp_path), target, load_count, start, errors),
+        )
+        for target in ("target/a", "target/b")
+    ]
+    timed_out: list[str] = []
+    exitcodes: list[int | None] = []
+    child_errors: list[str] = []
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=20)
+        timed_out = [process.name for process in processes if process.is_alive()]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join(timeout=5)
+        exitcodes = [process.exitcode for process in processes]
+        while True:
+            try:
+                child_errors.append(errors.get_nowait())
+            except queue.Empty:
+                break
+        errors.close()
+        errors.join_thread()
+
+    assert timed_out == []
+    assert exitcodes == [0, 0]
+    assert child_errors == []
+    assert load_count.value == 1
+
+
 def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io.paths import manifold_dir, safe_model_id
@@ -592,36 +1430,63 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
     (folder / "manifold.json").write_text("{}")
     src_model = "google/gemma-3-4b-it"
     (folder / f"{safe_model_id(src_model)}.safetensors").write_bytes(b"x")
+    from saklas.io.manifolds import TransferSourceProof
 
-    # Alignment cache hit so no model load happens — mirror _run_transfer's
-    # cached branch.  ``load_alignment_map`` returns ``(M, sidecar)``.
-    import torch
-    fake_M = {14: torch.eye(4), 15: torch.eye(4)}
+    source_proof = TransferSourceProof(
+        tensor_name="source.safetensors",
+        tensor_sha256="a" * 64,
+        sidecar_sha256="b" * 64,
+        layers=(14, 15),
+    )
     monkeypatch.setattr(
-        "saklas.io.alignment.load_alignment_map",
-        lambda src, tgt: (fake_M, {"quality_per_layer": {"14": 0.9, "15": 0.8}}),
+        "saklas.io.manifolds.preflight_transfer_manifold",
+        lambda *_args, **_kwargs: source_proof,
+    )
+
+    import torch
+    from saklas.io.alignment import LayerAlignment
+
+    fake_M = {
+        layer: LayerAlignment(torch.eye(4), torch.eye(4), torch.zeros(4))
+        for layer in (14, 15)
+    }
+    target_whitener = object()
+    target_layer_means = {14: torch.zeros(4), 15: torch.zeros(4)}
+    alignment_calls: list[dict[str, Any]] = []
+
+    def fake_alignment(*_args: Any, **kwargs: Any):
+        alignment_calls.append(kwargs)
+        return (
+            fake_M, {14: 0.9, 15: 0.8}, tmp_path / "alignment.safetensors",
+            {"model_fingerprint": "src-fp"},
+            {"model_fingerprint": "tgt-fp"},
+            target_whitener,
+            target_layer_means,
+        )
+
+    monkeypatch.setattr(
+        "saklas.cli.runners._load_or_fit_transfer_alignment", fake_alignment,
     )
 
     calls: list[dict[str, Any]] = []
 
     def fake_transfer(folder_arg: Path, *, from_model: str, to_model: str,
                       alignment: Any, transfer_quality_estimate: Any = None,
-                      whitener: Any = None, layer_means: Any = None,
-                      force: bool = False) -> Path:
+                      source_model_fingerprint: Any = None,
+                      target_model_fingerprint: Any = None,
+                      whitener: Any = None, target_layer_means: Any = None,
+                      force: bool = False,
+                      expected_source_proof: Any = None) -> Path:
         calls.append({
             "folder": folder_arg, "from": from_model, "to": to_model,
             "layers": sorted(alignment.keys()), "quality": transfer_quality_estimate,
-            "force": force,
+            "force": force, "whitener": whitener,
+            "target_layer_means": target_layer_means,
+            "source_proof": expected_source_proof,
         })
         return folder_arg / "Qwen__Qwen3-4B_from-google__gemma-3-4b-it.safetensors"
 
     monkeypatch.setattr("saklas.io.manifolds.transfer_manifold", fake_transfer)
-    # Transfer is Mahalanobis-only: the runner builds a target whitener before
-    # the (mocked) backend.  No model/cache here, so stub the helper.
-    monkeypatch.setattr(
-        "saklas.cli.runners._target_whitener_from_neutral_cache",
-        lambda model_id: object(),
-    )
     cli.main([
         "manifold", "transfer", "local/circumplex",
         "--from", src_model, "--to", "Qwen/Qwen3-4B",
@@ -631,6 +1496,10 @@ def test_run_manifold_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch, tm
     assert c["from"] == src_model
     assert c["to"] == "Qwen/Qwen3-4B"
     assert c["layers"] == [14, 15]
+    assert c["whitener"] is target_whitener
+    assert c["target_layer_means"] is target_layer_means
+    assert alignment_calls[0]["requested_layers"] == [14, 15]
+    assert c["source_proof"] is source_proof
     # Median of {0.9, 0.8} = 0.85.
     assert abs(c["quality"] - 0.85) < 1e-9
     out = capsys.readouterr().out
@@ -646,19 +1515,26 @@ def test_run_manifold_transfer_json(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     (folder / "manifold.json").write_text("{}")
     src_model = "src/model"
     (folder / f"{safe_model_id(src_model)}.safetensors").write_bytes(b"x")
+    monkeypatch.setattr(
+        "saklas.io.manifolds.preflight_transfer_manifold",
+        lambda *_args, **_kwargs: None,
+    )
 
     import torch
+    target_whitener = object()
     monkeypatch.setattr(
-        "saklas.io.alignment.load_alignment_map",
-        lambda src, tgt: ({10: torch.eye(2)}, {"quality_per_layer": {"10": 0.5}}),
+        "saklas.cli.runners._load_or_fit_transfer_alignment",
+        lambda *args, **kwargs: (
+            {10: torch.eye(2)}, {10: 0.5}, tmp_path / "alignment.safetensors",
+            {"model_fingerprint": "src-fp"},
+            {"model_fingerprint": "tgt-fp"},
+            target_whitener,
+            {10: torch.zeros(2)},
+        ),
     )
     monkeypatch.setattr(
         "saklas.io.manifolds.transfer_manifold",
         lambda f, **k: f / "out.safetensors",
-    )
-    monkeypatch.setattr(
-        "saklas.cli.runners._target_whitener_from_neutral_cache",
-        lambda model_id: object(),
     )
     cli.main([
         "manifold", "transfer", "local/circumplex",
@@ -670,6 +1546,93 @@ def test_run_manifold_transfer_json(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert data["target_model"] == "tgt/model"
     assert data["transferred_layers"] == [10]
     assert abs(data["median_transfer_quality"] - 0.5) < 1e-9
+
+
+def test_run_manifold_transfer_retries_unproven_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A post-pair manifest failure must not make the CLI demand ``-f``."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.paths import manifold_dir, safe_model_id, tensor_filename
+
+    folder = manifold_dir("local", "circumplex")
+    folder.mkdir(parents=True)
+    (folder / "manifold.json").write_text("{}")
+    src_model = "src/model"
+    tgt_model = "tgt/model"
+    (folder / f"{safe_model_id(src_model)}.safetensors").write_bytes(b"source")
+    monkeypatch.setattr(
+        "saklas.io.manifolds.preflight_transfer_manifold",
+        lambda *_args, **_kwargs: None,
+    )
+
+    import torch
+
+    target_whitener = object()
+    monkeypatch.setattr(
+        "saklas.cli.runners._load_or_fit_transfer_alignment",
+        lambda *args, **kwargs: (
+            {0: torch.eye(2)}, {0: 0.5}, tmp_path / "alignment.safetensors",
+            {"model_fingerprint": "src-fp"},
+            {"model_fingerprint": "tgt-fp"},
+            target_whitener,
+            {0: torch.zeros(2)},
+        ),
+    )
+    target = folder / tensor_filename(tgt_model, transferred_from=src_model)
+    calls = 0
+
+    def fail_once(folder_arg: Path, **_kwargs: Any) -> Path:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # Model the durable pair / missing manifest-proof crash window.
+            target.write_bytes(b"unproven")
+            target.with_suffix(".json").write_text("{}")
+            raise RuntimeError("injected post-pair manifest failure")
+        return target
+
+    monkeypatch.setattr("saklas.io.manifolds.transfer_manifold", fail_once)
+    argv = [
+        "manifold", "transfer", "local/circumplex",
+        "--from", src_model, "--to", tgt_model,
+    ]
+    with pytest.raises(RuntimeError, match="post-pair manifest"):
+        cli.main(argv)
+    cli.main(argv)
+
+    assert calls == 2
+
+
+def test_run_manifold_transfer_trusted_target_skips_alignment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.paths import manifold_dir
+
+    folder = manifold_dir("local", "circumplex")
+    folder.mkdir(parents=True)
+    (folder / "manifold.json").write_text("{}")
+    monkeypatch.setattr(
+        "saklas.io.manifolds.preflight_transfer_manifold",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileExistsError("trusted transferred target exists")
+        ),
+    )
+    monkeypatch.setattr(
+        "saklas.cli.runners._load_or_fit_transfer_alignment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("trusted target performed alignment work")
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "manifold", "transfer", "local/circumplex",
+            "--from", "src/model", "--to", "tgt/model",
+        ])
+
+    assert exc.value.code == 1
 
 
 def test_run_manifold_transfer_missing_source_fit_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

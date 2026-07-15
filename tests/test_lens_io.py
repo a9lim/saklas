@@ -2,23 +2,155 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import json
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
-from saklas.core.jlens import JacobianLens
+from saklas.core.jlens import JacobianLens, JacobianLensCancelled
 from saklas.io.lens import (
     LENS_FORMAT_VERSION,
+    lens_artifact_size,
+    lens_checkpoint_paths,
+    lens_fit_lock,
     lens_paths,
     load_lens,
+    load_lens_checkpoint,
+    load_lens_sidecar,
     remove_lens,
+    remove_lens_checkpoint,
+    remove_subsumed_lens_checkpoint,
+    promote_lens_checkpoint,
     save_lens,
+    save_lens_checkpoint_accumulator,
+    stream_default_lens_corpus,
 )
+from saklas.io.paths import safe_model_id
 
 _MODEL = "test-org/tiny-model"
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def test_default_corpus_cancel_does_not_wait_for_blocked_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The web cancel button must not depend on a blocked Hub read returning."""
+    import saklas.io.lens as lens_io
+
+    provider_entered = threading.Event()
+    cancelled = threading.Event()
+
+    class BlockedProcess:
+        alive = True
+        terminated = False
+        joined = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.alive = False
+
+        def kill(self) -> None:
+            self.alive = False
+
+        def join(self, timeout: float = 0) -> None:
+            del timeout
+            self.joined = True
+
+    class EmptyReceiver:
+        closed = False
+
+        def poll(self, timeout: float) -> bool:
+            provider_entered.set()
+            time.sleep(timeout)
+            return False
+
+        def recv(self) -> object:
+            raise AssertionError("blocked provider has no result")
+
+        def close(self) -> None:
+            self.closed = True
+
+    process = BlockedProcess()
+    receiver = EmptyReceiver()
+    monkeypatch.setattr(
+        lens_io,
+        "_start_default_lens_corpus_process",
+        lambda _n: (process, receiver),
+    )
+
+    def request_cancel() -> None:
+        assert provider_entered.wait(timeout=1)
+        cancelled.set()
+
+    threading.Thread(target=request_cancel, daemon=True).start()
+    started = time.monotonic()
+    with pytest.raises(JacobianLensCancelled, match="streaming its corpus"):
+        stream_default_lens_corpus(1, cancel_event=cancelled)
+    assert time.monotonic() - started < 1.0
+    assert process.terminated and process.joined
+    assert receiver.closed
+
+
+def test_default_corpus_cancel_wins_a_simultaneously_ready_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel arriving during poll must not start the estimator afterward."""
+    import saklas.io.lens as lens_io
+
+    cancelled = threading.Event()
+
+    class FinishedProcess:
+        def is_alive(self) -> bool:
+            return False
+
+        def terminate(self) -> None:
+            raise AssertionError("completed worker must not be terminated")
+
+        def kill(self) -> None:
+            raise AssertionError("completed worker must not be killed")
+
+        def join(self, timeout: float = 0) -> None:
+            del timeout
+
+    class ReadyReceiver:
+        closed = False
+
+        def poll(self, timeout: float) -> bool:
+            del timeout
+            cancelled.set()
+            return True
+
+        def recv(self) -> object:
+            raise AssertionError("cancel must win over the queued result")
+
+        def close(self) -> None:
+            self.closed = True
+
+    receiver = ReadyReceiver()
+    monkeypatch.setattr(
+        lens_io,
+        "_start_default_lens_corpus_process",
+        lambda _n: (FinishedProcess(), receiver),
+    )
+
+    with pytest.raises(JacobianLensCancelled, match="streaming its corpus"):
+        stream_default_lens_corpus(1, cancel_event=cancelled)
+    assert receiver.closed
+
+
 _D = 8
 
 
@@ -39,15 +171,37 @@ def _lens(n_layers: int = 3, n_prompts: int = 7) -> JacobianLens:
 def _save(lens: JacobianLens) -> None:
     save_lens(
         lens, _MODEL,
-        corpus_spec="test-corpus", corpus_sha256="abc123",
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
         seq_len=128, dim_batch=8, skip_first=16,
+    )
+
+
+def _save_checkpoint(
+    partial: JacobianLens, model_id: str, *, base_n_prompts: int, **kwargs: Any,
+) -> Path:
+    """Publish a self-contained current checkpoint from estimator sums."""
+    base = (
+        JacobianLens(
+            dict(partial.jacobians), n_prompts=base_n_prompts,
+            d_model=partial.d_model,
+        )
+        if base_n_prompts else None
+    )
+    sums = {
+        layer: matrix * partial.n_prompts
+        for layer, matrix in partial.jacobians.items()
+    }
+    kwargs.setdefault("consumed_prefix_sha256", _digest("consumed-prefix"))
+    return save_lens_checkpoint_accumulator(
+        sums, partial.n_prompts, partial.d_model, model_id,
+        base=base, **kwargs,
     )
 
 
 def test_paths_layout() -> None:
     ts, sc = lens_paths(_MODEL)
     assert ts.suffix == ".safetensors" and sc.suffix == ".json"
-    assert "test-org__tiny-model" in str(ts)
+    assert safe_model_id(_MODEL) in str(ts)
 
 
 def test_save_load_round_trip() -> None:
@@ -60,26 +214,445 @@ def test_save_load_round_trip() -> None:
     assert got.n_prompts == 7
     assert got.d_model == _D
     assert got.source_layers == [0, 1, 2]
-    # fp16 storage: round-trip within half-precision tolerance, promoted fp32
+    # fp32 storage is lossless across the artifact boundary.
     for layer in got.source_layers:
         assert got.jacobians[layer].dtype == torch.float32
-        assert torch.allclose(got.jacobians[layer], lens.jacobians[layer], atol=2e-3)
+        assert torch.equal(got.jacobians[layer], lens.jacobians[layer])
     assert sidecar["format_version"] == LENS_FORMAT_VERSION
+    assert sidecar["dtype"] == "float32"
     assert sidecar["corpus_spec"] == "test-corpus"
-    assert sidecar["corpus_sha256"] == "abc123"
+    assert sidecar["corpus_sha256"] == _digest("abc123")
+    assert sidecar["corpus_hash_kind"] == "text_v1"
     assert sidecar["skip_first_positions"] == 16
+    assert set(sidecar["tensor_files"]) == {"0", "1", "2"}
+    assert set(sidecar["tensor_sha256"]) == {"0", "1", "2"}
+    assert all(
+        ".gen-" in filename and f"layer-{layer}" in filename
+        for layer, filename in sidecar["tensor_files"].items()
+    )
+    assert lens_paths(_MODEL)[0].name == sidecar["tensor_files"]["0"]
+    for layer, filename in sidecar["tensor_files"].items():
+        shard = load_file(str(lens_paths(_MODEL)[1].parent / filename))
+        assert shard[f"layer_{layer}"].dtype == torch.float32
+
+
+def test_missing_layer_topup_reuses_immutable_existing_shards() -> None:
+    initial = _lens(n_layers=2)
+    _save(initial)
+    _, sc_path = lens_paths(_MODEL)
+    before = json.loads(sc_path.read_text())
+    before_stats = {
+        layer: (sc_path.parent / filename).stat()
+        for layer, filename in before["tensor_files"].items()
+    }
+    extra = _lens(n_layers=3).jacobians[2]
+    merged = JacobianLens(
+        {**initial.jacobians, 2: extra},
+        n_prompts=initial.n_prompts, d_model=_D,
+    )
+
+    save_lens(
+        merged, _MODEL,
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
+        seq_len=128, dim_batch=8, skip_first=16,
+        reuse_layers={0, 1},
+    )
+
+    after = json.loads(sc_path.read_text())
+    assert after["tensor_files"]["0"] == before["tensor_files"]["0"]
+    assert after["tensor_files"]["1"] == before["tensor_files"]["1"]
+    assert after["tensor_files"]["2"] not in set(before["tensor_files"].values())
+    for layer in ("0", "1"):
+        stat = (sc_path.parent / after["tensor_files"][layer]).stat()
+        old = before_stats[layer]
+        assert (stat.st_ino, stat.st_mtime_ns, stat.st_size) == (
+            old.st_ino, old.st_mtime_ns, old.st_size,
+        )
+    loaded = load_lens(_MODEL)
+    assert loaded is not None and loaded[0].source_layers == [0, 1, 2]
+
+
+def test_unverified_shard_reuse_falls_back_to_payload_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.packs as packs
+
+    initial = _lens(n_layers=2)
+    _save(initial)
+    merged = JacobianLens(
+        {**initial.jacobians, 2: torch.eye(_D)},
+        n_prompts=initial.n_prompts,
+        d_model=_D,
+    )
+    real_hash = packs.hash_file
+    hashed: list[Path] = []
+
+    def _count_hash(path: Path) -> str:
+        hashed.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr(packs, "hash_file", _count_hash)
+    save_lens(
+        merged, _MODEL,
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
+        seq_len=128, dim_batch=8, skip_first=16,
+        reuse_layers={0, 1},
+    )
+
+    assert len(hashed) == 2
+    assert {path.name for path in hashed} == {
+        json.loads(lens_paths(_MODEL)[1].read_text())["tensor_files"][layer]
+        for layer in ("0", "1")
+    }
+
+
+def test_shard_reuse_is_refused_when_fit_identity_changes() -> None:
+    lens = _lens(n_layers=2)
+    _save(lens)
+    _, sc_path = lens_paths(_MODEL)
+    before = json.loads(sc_path.read_text())["tensor_files"]
+
+    save_lens(
+        lens, _MODEL,
+        corpus_spec="other-corpus", corpus_sha256=_digest("different"),
+        seq_len=128, dim_batch=8, skip_first=16,
+        reuse_layers={0, 1},
+    )
+
+    after = json.loads(sc_path.read_text())["tensor_files"]
+    assert set(after.values()).isdisjoint(before.values())
+
+
+def test_artifact_size_refreshes_a_stale_sidecar_snapshot() -> None:
+    _save(_lens(n_layers=2))
+    stale = load_lens_sidecar(_MODEL)
+    assert stale is not None
+    _save(_lens(n_layers=3, n_prompts=9))
+    current = load_lens_sidecar(_MODEL)
+    assert current is not None
+    expected = sum(
+        (lens_paths(_MODEL)[1].parent / filename).stat().st_size
+        for filename in current["tensor_files"].values()
+    )
+
+    assert lens_artifact_size(_MODEL, stale) == expected
+
+
+def test_corrupt_reusable_shard_is_rewritten_while_valid_shard_is_kept() -> None:
+    initial = _lens(n_layers=2)
+    _save(initial)
+    _, sc_path = lens_paths(_MODEL)
+    before = json.loads(sc_path.read_text())["tensor_files"]
+    corrupt = sc_path.parent / before["0"]
+    payload = bytearray(corrupt.read_bytes())
+    payload[-1] ^= 1
+    corrupt.write_bytes(payload)
+    merged = JacobianLens(
+        {**initial.jacobians, 2: torch.eye(_D)},
+        n_prompts=initial.n_prompts, d_model=_D,
+    )
+
+    save_lens(
+        merged, _MODEL,
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
+        seq_len=128, dim_batch=8, skip_first=16,
+        reuse_layers={0, 1},
+    )
+
+    after = json.loads(sc_path.read_text())["tensor_files"]
+    assert after["0"] != before["0"]
+    assert after["1"] == before["1"]
+    loaded = load_lens(_MODEL)
+    assert loaded is not None and loaded[0].source_layers == [0, 1, 2]
+
+
+def test_save_load_checkpoint_round_trip() -> None:
+    partial = _lens(n_layers=2, n_prompts=5)
+    _save_checkpoint(
+        partial, _MODEL,
+        base_n_prompts=7,
+        corpus_spec="test-corpus",
+        corpus_sha256=_digest("abc123"),
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+        consumed_prefix_sha256=_digest("consumed-prefix"),
+        raw_corpus_sha256=_digest("raw456"),
+        raw_prompt_count=13,
+        usable_prompt_count=12,
+    )
+
+    loaded = load_lens_checkpoint(_MODEL)
+    assert loaded is not None
+    got, sidecar = loaded
+    assert got.n_prompts == 12
+    assert got.source_layers == [0, 1]
+    assert sidecar["checkpoint"] is True
+    assert sidecar["base_n_prompts"] == 0
+    assert sidecar["partial_n_prompts"] == 12
+    assert sidecar["raw_corpus_sha256"] == _digest("raw456")
+    assert sidecar["raw_prompt_count"] == 13
+    assert sidecar["usable_prompt_count"] == 12
+
+
+def test_checkpoint_accumulator_is_self_contained_and_merges_prefix() -> None:
+    base = _lens(n_layers=2, n_prompts=3)
+    tail = _lens(n_layers=2, n_prompts=2)
+    sums = {layer: J * tail.n_prompts for layer, J in tail.jacobians.items()}
+
+    save_lens_checkpoint_accumulator(
+        sums, tail.n_prompts, _D, _MODEL,
+        base=base,
+        corpus_spec="test-corpus",
+        corpus_sha256=_digest("abc123"),
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+        model_layer_count=3,
+        consumed_prefix_sha256=_digest("consumed-prefix"),
+    )
+
+    loaded = load_lens_checkpoint(_MODEL)
+    assert loaded is not None
+    got, sidecar = loaded
+    expected = JacobianLens.merge([base, tail])
+    assert got.n_prompts == expected.n_prompts == 5
+    assert sidecar["base_n_prompts"] == 0
+    assert sidecar["partial_n_prompts"] == 5
+    assert sidecar["model_layer_count"] == 3
+    for layer in got.source_layers:
+        assert torch.allclose(
+            got.jacobians[layer], expected.jacobians[layer], atol=2e-3,
+        )
+
+
+def test_load_lens_sidecar_validates_tensor_header_without_materializing() -> None:
+    _save(_lens())
+    sidecar = load_lens_sidecar(_MODEL)
+    assert sidecar is not None
+    assert sidecar["source_layers"] == [0, 1, 2]
+    assert sidecar["d_model"] == _D
+
+    ts_path, _ = lens_paths(_MODEL)
+    ts_path.write_bytes(ts_path.read_bytes()[:32])
+    assert load_lens_sidecar(_MODEL) is None
+
+
+def test_save_lens_preserves_existing_tensor_on_failed_replace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _lens(n_prompts=3)
+    _save(first)
+    ts_path, _ = lens_paths(_MODEL)
+    before = ts_path.read_bytes()
+
+    def _fail_save(_fd: int) -> None:
+        raise RuntimeError("simulated save failure")
+
+    monkeypatch.setattr("saklas.io.lens.os.fsync", _fail_save)
+    with pytest.raises(RuntimeError, match="simulated"):
+        _save(_lens(n_prompts=9))
+    assert ts_path.read_bytes() == before
+    assert not ts_path.with_suffix(ts_path.suffix + ".tmp").exists()
+
+    loaded = load_lens(_MODEL)
+    assert loaded is not None
+    assert loaded[0].n_prompts == 3
+
+
+def test_checkpoint_promotion_sidecar_failure_preserves_both_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    final = _lens(n_layers=2, n_prompts=3)
+    save_lens(
+        final, _MODEL, corpus_spec="old", corpus_sha256=_digest("old-sha"),
+        seq_len=128, dim_batch=8, skip_first=16,
+        model_fingerprint="weights",
+    )
+    checkpoint = _lens(n_layers=2, n_prompts=5)
+    _save_checkpoint(
+        checkpoint, _MODEL, base_n_prompts=0,
+        corpus_spec="new", corpus_sha256=_digest("new-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    _final_tensor, final_sc = lens_paths(_MODEL)
+    real_write = lens_io.write_json_atomic
+
+    def _fail_final_pointer(path: Path, payload: object) -> None:
+        if path == final_sc:
+            raise OSError("simulated final pointer failure")
+        real_write(path, payload)
+
+    monkeypatch.setattr(lens_io, "write_json_atomic", _fail_final_pointer)
+    with pytest.raises(OSError, match="pointer failure"):
+        promote_lens_checkpoint(
+            _MODEL, n_prompts=5, source_layers=[0, 1],
+            corpus_sha256=_digest("new-sha"), corpus_hash_kind="token_ids_v1",
+            seq_len=128, d_model=_D, model_fingerprint="weights",
+        )
+
+    still_final = load_lens(_MODEL)
+    still_checkpoint = load_lens_checkpoint(_MODEL)
+    assert still_final is not None and still_final[0].n_prompts == 3
+    assert still_checkpoint is not None and still_checkpoint[0].n_prompts == 5
+
+
+def test_checkpoint_promotion_rejects_corrupt_shard_and_keeps_pointers() -> None:
+    save_lens(
+        _lens(n_layers=2, n_prompts=3), _MODEL,
+        corpus_spec="old", corpus_sha256=_digest("old-sha"),
+        seq_len=128, dim_batch=8, skip_first=16,
+        model_fingerprint="weights",
+    )
+    _save_checkpoint(
+        _lens(n_layers=2, n_prompts=5), _MODEL, base_n_prompts=0,
+        corpus_spec="new", corpus_sha256=_digest("new-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    checkpoint_ts, checkpoint_sc = lens_checkpoint_paths(_MODEL)
+    payload = bytearray(checkpoint_ts.read_bytes())
+    payload[-1] ^= 1
+    checkpoint_ts.write_bytes(payload)
+
+    assert not promote_lens_checkpoint(
+        _MODEL, n_prompts=5, source_layers=[0, 1],
+        corpus_sha256=_digest("new-sha"), corpus_hash_kind="token_ids_v1",
+        seq_len=128, d_model=_D, model_fingerprint="weights",
+    )
+    final = load_lens(_MODEL)
+    assert final is not None and final[0].n_prompts == 3
+    assert checkpoint_sc.exists() and checkpoint_ts.exists()
+
+
+def test_subsumed_checkpoint_recovery_handles_base_progress_and_subset_layers() -> None:
+    final = _lens(n_layers=3, n_prompts=7)
+    save_lens(
+        final, _MODEL, corpus_spec="same", corpus_sha256=_digest("same-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    # Legacy-compatible progress semantics: 3 durable base prompts plus a
+    # 2-prompt partial means this checkpoint reaches prompt 5, not prompt 2.
+    checkpoint = JacobianLens(
+        {1: torch.eye(_D)}, n_prompts=2, d_model=_D,
+    )
+    _save_checkpoint(
+        checkpoint, _MODEL, base_n_prompts=3,
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+
+    assert remove_subsumed_lens_checkpoint(_MODEL)
+    assert load_lens_checkpoint(_MODEL) is None
+    loaded = load_lens(_MODEL)
+    assert loaded is not None and loaded[0].source_layers == [0, 1, 2]
+
+
+def test_subsumed_checkpoint_recovery_preserves_farther_progress() -> None:
+    save_lens(
+        _lens(n_layers=2, n_prompts=3), _MODEL,
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    _save_checkpoint(
+        _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=3,
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+
+    assert not remove_subsumed_lens_checkpoint(_MODEL)
+    assert load_lens_checkpoint(_MODEL) is not None
+
+
+def test_subsumed_checkpoint_recovery_preserves_other_corpus() -> None:
+    save_lens(
+        _lens(n_layers=2, n_prompts=7), _MODEL,
+        corpus_spec="final", corpus_sha256=_digest("final-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    _save_checkpoint(
+        _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="checkpoint", corpus_sha256=_digest("other-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+
+    assert not remove_subsumed_lens_checkpoint(_MODEL)
+    assert load_lens_checkpoint(_MODEL) is not None
+
+
+def test_subsumed_checkpoint_recovery_preserves_recovery_point_if_final_corrupt() -> None:
+    save_lens(
+        _lens(n_layers=2, n_prompts=7), _MODEL,
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    _save_checkpoint(
+        _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    final_tensor, _ = lens_paths(_MODEL)
+    payload = bytearray(final_tensor.read_bytes())
+    payload[-1] ^= 1
+    final_tensor.write_bytes(payload)
+
+    assert not remove_subsumed_lens_checkpoint(_MODEL)
+    assert load_lens_checkpoint(_MODEL) is not None
+
+
+def test_remove_waits_for_fit_transaction() -> None:
+    _save(_lens())
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _remove() -> None:
+        started.set()
+        remove_lens(_MODEL)
+        finished.set()
+
+    with lens_fit_lock(_MODEL):
+        worker = threading.Thread(target=_remove)
+        worker.start()
+        assert started.wait(timeout=1.0)
+        assert not finished.wait(timeout=0.05)
+        assert load_lens(_MODEL) is not None
+    worker.join(timeout=1.0)
+    assert finished.is_set()
+    assert load_lens(_MODEL) is None
 
 
 def test_load_missing_returns_none() -> None:
     assert load_lens(_MODEL) is None
+    assert load_lens_sidecar(_MODEL) is None
 
 
-def test_load_wrong_format_version_returns_none() -> None:
+def test_load_previous_format_version_returns_none() -> None:
     _save(_lens())
     _, sc_path = lens_paths(_MODEL)
     sidecar = json.loads(sc_path.read_text())
-    sidecar["format_version"] = LENS_FORMAT_VERSION + 1
+    sidecar["format_version"] = LENS_FORMAT_VERSION - 1
     sc_path.write_text(json.dumps(sidecar))
+    assert load_lens(_MODEL) is None
+
+
+def test_load_changed_estimator_policy_returns_none() -> None:
+    _save(_lens())
+    _, sc_path = lens_paths(_MODEL)
+    sidecar = json.loads(sc_path.read_text())
+    sidecar["estimator_policy"]["skip_first_positions"] += 1
+    sc_path.write_text(json.dumps(sidecar))
+    assert load_lens_sidecar(_MODEL) is None
     assert load_lens(_MODEL) is None
 
 
@@ -87,6 +660,15 @@ def test_load_non_finite_returns_none() -> None:
     lens = _lens()
     lens.jacobians[1][0, 0] = float("inf")
     _save(lens)
+    assert load_lens(_MODEL) is None
+
+
+def test_load_rejects_same_shape_finite_payload_corruption() -> None:
+    _save(_lens())
+    ts_path, _ = lens_paths(_MODEL)
+    payload = bytearray(ts_path.read_bytes())
+    payload[-1] ^= 1
+    ts_path.write_bytes(payload)
     assert load_lens(_MODEL) is None
 
 
@@ -115,6 +697,344 @@ def test_load_corrupt_sidecar_returns_none() -> None:
 
 def test_remove_lens() -> None:
     _save(_lens())
+    _save_checkpoint(
+        _lens(n_layers=1), _MODEL,
+        base_n_prompts=0,
+        corpus_spec="test-corpus",
+        corpus_sha256=_digest("abc123"),
+        seq_len=128,
+        dim_batch=8,
+        skip_first=16,
+    )
+    ckpt_ts, ckpt_sc = lens_checkpoint_paths(_MODEL)
+    assert ckpt_ts.exists() and ckpt_sc.exists()
     assert remove_lens(_MODEL) is True
     assert load_lens(_MODEL) is None
+    assert load_lens_checkpoint(_MODEL) is None
     assert remove_lens(_MODEL) is False
+
+
+def test_remove_lens_reaps_crash_left_streaming_temp() -> None:
+    generation, _ = lens_paths(_MODEL)
+    orphan = generation.parent / "jlens.layer-1.gen-deadbeef.safetensors.tmp"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"partial shard")
+
+    assert remove_lens(_MODEL) is True
+    assert not orphan.exists()
+
+
+def test_checkpoint_pointer_unlink_is_durable_before_shard_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    _save_checkpoint(
+        _lens(n_layers=1), _MODEL, base_n_prompts=0,
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
+        seq_len=128, dim_batch=8, skip_first=16,
+    )
+    events: list[str] = []
+    real_unlink = Path.unlink
+    real_cleanup = lens_io._cleanup_unreferenced_generations
+
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        events.append("pointer" if path.suffix == ".json" else "shard")
+        real_unlink(path, *args, **kwargs)
+
+    def record_cleanup(path: Path) -> None:
+        events.append("gc")
+        real_cleanup(path)
+
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(lens_io, "fsync_directory", lambda _path: events.append("barrier"))
+    monkeypatch.setattr(lens_io, "_cleanup_unreferenced_generations", record_cleanup)
+
+    assert remove_lens_checkpoint(_MODEL)
+    assert events[0:3] == ["pointer", "barrier", "gc"]
+    assert events.index("barrier") < events.index("shard")
+
+
+def test_subsumed_checkpoint_unlink_is_durable_before_shard_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    save_lens(
+        _lens(n_layers=2, n_prompts=7), _MODEL,
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    _save_checkpoint(
+        _lens(n_layers=1, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="same", corpus_sha256=_digest("same-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    events: list[str] = []
+    real_unlink = Path.unlink
+    real_cleanup = lens_io._cleanup_unreferenced_generations
+
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        events.append("pointer" if path.suffix == ".json" else "shard")
+        real_unlink(path, *args, **kwargs)
+
+    def record_cleanup(path: Path) -> None:
+        events.append("gc")
+        real_cleanup(path)
+
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(lens_io, "fsync_directory", lambda _path: events.append("barrier"))
+    monkeypatch.setattr(lens_io, "_cleanup_unreferenced_generations", record_cleanup)
+
+    assert remove_subsumed_lens_checkpoint(_MODEL)
+    pointer = events.index("pointer")
+    barrier = events.index("barrier", pointer + 1)
+    gc_event = events.index("gc")
+    assert pointer < barrier < gc_event < events.index("shard")
+
+
+def test_full_lens_pointer_unlinks_are_durable_before_shard_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    _save(_lens())
+    _save_checkpoint(
+        _lens(n_layers=1), _MODEL, base_n_prompts=0,
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"),
+        seq_len=128, dim_batch=8, skip_first=16,
+    )
+    events: list[str] = []
+    real_unlink = Path.unlink
+
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        events.append("pointer" if path.suffix == ".json" else "shard")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(lens_io, "fsync_directory", lambda _path: events.append("barrier"))
+
+    assert remove_lens(_MODEL)
+    first_barrier = events.index("barrier")
+    assert events[:first_barrier] == ["pointer", "pointer"]
+    assert first_barrier < events.index("shard")
+
+
+def test_payload_and_pointer_directory_barriers_precede_generation_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    events: list[str] = []
+    real_write = lens_io.write_json_atomic
+    real_cleanup = lens_io._cleanup_unreferenced_generations
+
+    def record_write(path: Path, payload: object) -> None:
+        real_write(path, payload)
+        events.append("pointer")
+
+    def record_barrier(_path: Path) -> None:
+        events.append("barrier")
+
+    def record_cleanup(path: Path) -> None:
+        events.append("gc")
+        real_cleanup(path)
+
+    monkeypatch.setattr(lens_io, "write_json_atomic", record_write)
+    monkeypatch.setattr(lens_io, "fsync_directory", record_barrier)
+    monkeypatch.setattr(
+        lens_io, "_cleanup_unreferenced_generations", record_cleanup,
+    )
+
+    _save(_lens())
+
+    assert events[0:3] == ["barrier", "pointer", "barrier"]
+    assert events.index("barrier", 2) < events.index("gc")
+
+
+def test_checkpoint_payload_is_durable_before_pointer_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    events: list[str] = []
+    real_payload = lens_io._save_fp32_square_safetensors_atomic
+    real_pointer = lens_io.write_json_atomic
+
+    def record_payload(*args: object, **kwargs: object) -> str:
+        assert kwargs.get("durable") is True
+        digest = real_payload(*args, **kwargs)  # type: ignore[arg-type]
+        events.append("payload")
+        return digest
+
+    def record_pointer(path: Path, payload: object) -> None:
+        events.append("pointer")
+        real_pointer(path, payload)
+
+    monkeypatch.setattr(
+        lens_io, "_save_fp32_square_safetensors_atomic", record_payload,
+    )
+    monkeypatch.setattr(lens_io, "write_json_atomic", record_pointer)
+    _save_checkpoint(
+        _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="test-corpus", corpus_sha256=_digest("abc123"), seq_len=128,
+        dim_batch=8, skip_first=16,
+    )
+    assert events == ["payload", "payload", "pointer"]
+
+
+def test_exception_after_lens_pointer_replace_preserves_new_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    _save(_lens(n_layers=2, n_prompts=3))
+    anchor, pointer = lens_io._lens_anchor_paths(_MODEL)
+    prior_files = set(json.loads(pointer.read_text())["tensor_files"].values())
+    real_write = lens_io.write_json_atomic
+
+    def write_then_fail(path: Path, payload: object) -> None:
+        real_write(path, payload)
+        raise OSError("after lens pointer replace")
+
+    monkeypatch.setattr(lens_io, "write_json_atomic", write_then_fail)
+    with pytest.raises(OSError, match="after lens pointer"):
+        _save(_lens(n_layers=2, n_prompts=11))
+
+    monkeypatch.setattr(lens_io, "write_json_atomic", real_write)
+    loaded = load_lens(_MODEL)
+    assert loaded is not None
+    assert loaded[0].n_prompts == 11
+    assert not any((anchor.parent / name).exists() for name in prior_files)
+
+
+def test_lens_generation_gc_fails_closed_on_transient_pointer_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+    import saklas.io.lens as lens_io
+
+    _save(_lens(n_layers=2))
+    anchor, pointer = lens_io._lens_anchor_paths(_MODEL)
+    live_files = set(json.loads(pointer.read_text())["tensor_files"].values())
+    orphan = anchor.parent / f"{anchor.stem}.layer-99.gen-orphan.safetensors"
+    orphan.write_bytes(b"orphan")
+    real_open = builtins.open
+
+    def fail_pointer(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(path) == pointer:
+            raise OSError("transient pointer read")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fail_pointer)
+    lens_io._cleanup_unreferenced_generations(anchor.parent)
+
+    assert orphan.exists()
+    assert all((anchor.parent / name).exists() for name in live_files)
+
+
+def test_checkpoint_promotion_directory_barrier_precedes_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saklas.io.lens as lens_io
+
+    checkpoint = _lens(n_layers=2, n_prompts=5)
+    _save_checkpoint(
+        checkpoint, _MODEL, base_n_prompts=0,
+        corpus_spec="new", corpus_sha256=_digest("new-sha"),
+        corpus_hash_kind="token_ids_v1", seq_len=128, dim_batch=8,
+        skip_first=16, model_fingerprint="weights",
+    )
+    _final_anchor, final_pointer = lens_io._lens_anchor_paths(_MODEL)
+    _checkpoint_anchor, checkpoint_pointer = lens_io._checkpoint_anchor_paths(
+        _MODEL,
+    )
+    events: list[str] = []
+    real_fsync = lens_io.os.fsync
+    real_write = lens_io.write_json_atomic
+    real_unlink = Path.unlink
+    real_cleanup = lens_io._cleanup_unreferenced_generations
+
+    def record_fsync(fd: int) -> None:
+        events.append("file")
+        real_fsync(fd)
+
+    def record_dir(path: Path) -> None:
+        events.append("dir")
+        del path
+
+    def record_pointer(path: Path, payload: object) -> None:
+        if path == final_pointer:
+            events.append("pointer")
+        real_write(path, payload)
+
+    def record_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == checkpoint_pointer:
+            events.append("checkpoint-unlink")
+        real_unlink(path, *args, **kwargs)
+
+    def record_cleanup(path: Path) -> None:
+        events.append("gc")
+        real_cleanup(path)
+
+    monkeypatch.setattr(lens_io.os, "fsync", record_fsync)
+    monkeypatch.setattr(lens_io, "fsync_directory", record_dir)
+    monkeypatch.setattr(lens_io, "write_json_atomic", record_pointer)
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(
+        lens_io, "_cleanup_unreferenced_generations", record_cleanup,
+    )
+
+    assert promote_lens_checkpoint(
+        _MODEL, n_prompts=5, source_layers=[0, 1],
+        corpus_sha256=_digest("new-sha"), corpus_hash_kind="token_ids_v1",
+        seq_len=128, d_model=_D, model_fingerprint="weights",
+    )
+    pointer_index = events.index("pointer")
+    assert "file" in events[:pointer_index]
+    assert events[pointer_index - 1] == "dir"
+    unlink_index = events.index("checkpoint-unlink")
+    assert events[unlink_index + 1] == "dir"
+    assert unlink_index < events.index("gc")
+
+
+def test_remove_unpublishes_before_best_effort_tensor_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save(_lens())
+    real_unlink = Path.unlink
+
+    def _fail_tensor_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.suffix == ".safetensors" and ".gen-" in path.name:
+            raise OSError("simulated tensor GC failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _fail_tensor_unlink)
+
+    assert remove_lens(_MODEL)
+    assert load_lens(_MODEL) is None
+    assert load_lens_checkpoint(_MODEL) is None
+
+
+def test_lens_rejects_noncanonical_identity_digest() -> None:
+    _save(_lens())
+    _anchor, sidecar_path = lens_paths(_MODEL)
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["corpus_sha256"] = "not-a-digest"
+    sidecar_path.write_text(json.dumps(sidecar))
+    assert load_lens(_MODEL) is None
+
+
+def test_checkpoint_progress_requires_consumed_prefix_identity() -> None:
+    _save_checkpoint(
+        _lens(n_layers=2, n_prompts=2), _MODEL, base_n_prompts=0,
+        corpus_spec="test", corpus_sha256=_digest("test"),
+        seq_len=8, dim_batch=2, skip_first=0,
+    )
+    _anchor, sidecar_path = lens_checkpoint_paths(_MODEL)
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["consumed_prefix_sha256"] = None
+    sidecar_path.write_text(json.dumps(sidecar))
+    assert load_lens_checkpoint(_MODEL) is None

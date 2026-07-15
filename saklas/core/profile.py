@@ -1,7 +1,7 @@
 """Profile: the ergonomic wrapper around a baked steering-vector dict.
 
-Wire format stays identical to what :mod:`saklas.vectors` writes today —
-a safetensors file with one tensor per active layer plus a slim JSON
+The native wire format is a safetensors file with one fp32 vector per active
+layer plus an exact-version JSON
 sidecar (safetensors path) or a llama.cpp control-vector GGUF (gguf path).
 This class is purely the Python-level surface the rest of saklas uses so
 that callers stop passing bare ``dict[int, Tensor]`` around.
@@ -17,18 +17,34 @@ subspace kernel reads the baked magnitudes as per-layer weights.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import pathlib
-from contextlib import suppress
+import re
 from typing import Any, Iterable, Iterator, Literal, Mapping, overload
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load as load_safetensors, save as save_safetensors
 
 from saklas.core.errors import SaklasError
 
 log = logging.getLogger(__name__)
+
+_PROFILE_SIDECAR_FIELDS = {
+    "format_version", "method", "saklas_version", "statements_sha256",
+    "components", "bake", "sae_release", "sae_revision",
+    "sae_ids_by_layer", "source_model_id", "alignment_map_hash",
+    "transfer_quality_estimate", "diagnostics_by_layer",
+    "tensor_sha256",
+}
+_PROFILE_METADATA_FIELDS = _PROFILE_SIDECAR_FIELDS - {
+    "format_version", "saklas_version", "diagnostics_by_layer", "tensor_sha256",
+} | {"diagnostics"}
+
+_PROFILE_METHODS = frozenset({
+    "profile", "merge", "contrastive_pca", "procrustes_transfer",
+})
 
 
 class ProfileError(ValueError, SaklasError):
@@ -36,6 +52,118 @@ class ProfileError(ValueError, SaklasError):
 
     def user_message(self) -> tuple[int, str]:
         return (400, str(self) or self.__class__.__name__)
+
+
+def _validate_profile_sidecar(
+    data: Any, *, tensor_sha256: str | None = None,
+    layers: set[int] | None = None,
+) -> None:
+    if not isinstance(data, dict) or set(data) != _PROFILE_SIDECAR_FIELDS:
+        raise ProfileError("profile sidecar does not match the current exact schema")
+    method = data["method"]
+    if method not in _PROFILE_METHODS:
+        raise ProfileError(f"profile sidecar has invalid method {method!r}")
+    from saklas.io.packs import PROFILE_FORMAT_VERSION
+
+    if (
+        isinstance(data["format_version"], bool)
+        or data["format_version"] != PROFILE_FORMAT_VERSION
+        or not isinstance(data["saklas_version"], str)
+        or not data["saklas_version"]
+    ):
+        raise ProfileError("profile sidecar has invalid format identity")
+    digest = data["tensor_sha256"]
+    if (
+        not isinstance(digest, str) or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in digest)
+        or tensor_sha256 is not None and digest != tensor_sha256
+    ):
+        raise ProfileError("profile sidecar has invalid tensor sha256")
+    diag = data["diagnostics_by_layer"]
+    if diag is not None:
+        if not isinstance(diag, dict):
+            raise ProfileError("profile diagnostics_by_layer must be an object")
+        for layer, metrics in diag.items():
+            if not re.fullmatch(r"0|[1-9][0-9]*", layer) or not isinstance(metrics, dict):
+                raise ProfileError("profile diagnostics_by_layer has invalid layer schema")
+            if any(
+                not isinstance(name, str) or not name
+                or isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for name, value in metrics.items()
+            ):
+                raise ProfileError("profile diagnostics_by_layer has invalid metrics")
+        if layers is not None and {int(layer) for layer in diag} != layers:
+            raise ProfileError("profile diagnostics_by_layer does not cover tensor layers")
+    sae_ids = data["sae_ids_by_layer"]
+    if sae_ids is not None and (
+        not isinstance(sae_ids, dict) or any(
+            not isinstance(key, str) or not re.fullmatch(r"0|[1-9][0-9]*", key)
+            or not isinstance(value, str) or not value
+            for key, value in sae_ids.items()
+        )
+    ):
+        raise ProfileError("profile sae_ids_by_layer is invalid")
+    if sae_ids is not None and layers is not None and {
+        int(layer) for layer in sae_ids
+    } != layers:
+        raise ProfileError("profile sae_ids_by_layer does not cover tensor layers")
+    components = data["components"]
+    if components is not None:
+        if not isinstance(components, dict) or not components:
+            raise ProfileError("profile components must be a non-empty object")
+        for key, row in components.items():
+            if (
+                not isinstance(key, str) or not key or not isinstance(row, dict)
+                or set(row) != {"selector", "alpha", "tensor_sha256"}
+                or not isinstance(row["selector"], str) or not row["selector"]
+                or isinstance(row["alpha"], bool)
+                or not isinstance(row["alpha"], (int, float))
+                or not math.isfinite(float(row["alpha"]))
+                or not isinstance(row["tensor_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", row["tensor_sha256"])
+            ):
+                raise ProfileError("profile components has invalid provenance")
+    if method == "merge" and components is None:
+        raise ProfileError("merge profile requires component provenance")
+    if method != "merge" and components is not None:
+        raise ProfileError("non-merge profile carries component provenance")
+    nullable_strings = {
+        "statements_sha256", "bake", "sae_release", "sae_revision",
+        "source_model_id", "alignment_map_hash",
+    }
+    if any(
+        data[key] is not None and (
+            not isinstance(data[key], str) or not data[key]
+        ) for key in nullable_strings
+    ):
+        raise ProfileError("profile sidecar has invalid string provenance")
+    for key in ("statements_sha256", "alignment_map_hash"):
+        value = data[key]
+        if value is not None and not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ProfileError(f"profile sidecar field {key!r} is not a sha256")
+    transfer_fields = (
+        data["source_model_id"], data["alignment_map_hash"],
+        data["transfer_quality_estimate"],
+    )
+    if method == "procrustes_transfer":
+        if transfer_fields[0] is None or transfer_fields[1] is None:
+            raise ProfileError("transfer profile has incomplete provenance")
+    elif any(value is not None for value in transfer_fields):
+        raise ProfileError("non-transfer profile carries transfer provenance")
+    if data["transfer_quality_estimate"] is not None and (
+        isinstance(data["transfer_quality_estimate"], bool)
+        or not isinstance(data["transfer_quality_estimate"], (int, float))
+        or not math.isfinite(float(data["transfer_quality_estimate"]))
+    ):
+        raise ProfileError("profile transfer quality must be finite")
+    sae_present = any(
+        data[key] is not None for key in ("sae_release", "sae_revision", "sae_ids_by_layer")
+    )
+    if sae_present and (
+        data["sae_release"] is None or data["sae_ids_by_layer"] is None
+    ):
+        raise ProfileError("profile has incomplete SAE provenance")
 
 
 def save_profile(
@@ -46,8 +174,9 @@ def save_profile(
     """Save a baked vector profile as .safetensors with a slim .json sidecar.
 
     ``metadata`` must contain at minimum:
-        method            - str, e.g. "merge" / "procrustes_transfer" /
-                            "neutral_activations" / "gguf_import"
+        method            - one of the current safetensor profile producers:
+                            "profile" / "merge" / "contrastive_pca" /
+                            "procrustes_transfer"
 
     Optional keys honored:
         statements_sha256 - str, hash of the source neutral corpus at write time
@@ -61,6 +190,29 @@ def save_profile(
     Tensors are already baked (share pre-multiplied into magnitude) — the
     sidecar carries only method/saklas_version plus the optional fields above.
     """
+    method = metadata.get("method")
+    if not isinstance(method, str) or not method:
+        raise ProfileError("profile metadata requires a non-empty 'method' string")
+    unknown_metadata = set(metadata) - _PROFILE_METADATA_FIELDS
+    if unknown_metadata:
+        raise ProfileError(
+            f"profile metadata has unknown field(s): {sorted(unknown_metadata)}"
+        )
+    if not profile:
+        raise ProfileError("profile requires at least one layer tensor")
+    for layer, tensor in profile.items():
+        layer_value: Any = layer
+        if (
+            isinstance(layer_value, bool)
+            or not isinstance(layer_value, int)
+            or layer_value < 0
+        ):
+            raise ProfileError(f"profile layer must be a non-negative int: {layer!r}")
+        if tensor.ndim != 1 or tensor.numel() == 0:
+            raise ProfileError(f"profile layer {layer} must be a non-empty rank-1 tensor")
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ProfileError(f"profile layer {layer} must contain only finite values")
+
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -71,56 +223,48 @@ def save_profile(
         f"layer_{idx}": vec.to(dtype=torch.float32).contiguous().cpu()
         for idx, vec in profile.items()
     }
-    save_file(tensors, str(path))
+    tensor_bytes = save_safetensors(tensors)
+    tensor_digest = hashlib.sha256(tensor_bytes).hexdigest()
 
     from saklas import __version__ as _saklas_version
-    from saklas.io.packs import PACK_FORMAT_VERSION
+    from saklas.io.packs import PROFILE_FORMAT_VERSION
 
     sidecar: dict[str, Any] = {
-        "format_version": PACK_FORMAT_VERSION,
-        "method": metadata.get("method", "unknown"),
+        "format_version": PROFILE_FORMAT_VERSION,
+        "method": method,
         "saklas_version": _saklas_version,
+        "statements_sha256": metadata.get("statements_sha256"),
+        "components": metadata.get("components"),
+        "bake": metadata.get("bake"),
+        "sae_release": metadata.get("sae_release"),
+        "sae_revision": metadata.get("sae_revision"),
+        "sae_ids_by_layer": metadata.get("sae_ids_by_layer"),
+        "source_model_id": metadata.get("source_model_id"),
+        "alignment_map_hash": metadata.get("alignment_map_hash"),
+        "transfer_quality_estimate": metadata.get("transfer_quality_estimate"),
+        "diagnostics_by_layer": None,
+        "tensor_sha256": tensor_digest,
     }
-    if "statements_sha256" in metadata:
-        sidecar["statements_sha256"] = metadata["statements_sha256"]
-    if "components" in metadata:
-        sidecar["components"] = metadata["components"]
-    # v2.1: bake method records which scoring metric drove share allocation
-    # (``"euclidean"`` = legacy ``||m||_2 / r``; ``"mahalanobis"`` =
-    # ``||m||_M / r`` via per-layer activation covariance).  Loaders read
-    # this only for diagnostics; the runtime hook reads tensor magnitudes
-    # regardless of bake flavor.  Default ``"euclidean"`` is back-compat
-    # for tensors written before the bake field existed.
-    if "bake" in metadata:
-        sidecar["bake"] = metadata["bake"]
-    # SAE provenance — present only when extraction used an SAE backend.
-    for key in ("sae_release", "sae_revision", "sae_ids_by_layer"):
-        if key in metadata:
-            sidecar[key] = metadata[key]
-    # Transfer provenance — present only on transferred profiles
-    # (method="procrustes_transfer").  ``alignment_map_hash`` pins the
-    # specific Procrustes fit; ``transfer_quality_estimate`` is the
-    # median per-layer R² across shared layers.
-    for key in (
-        "source_model_id",
-        "alignment_map_hash",
-        "transfer_quality_estimate",
-    ):
-        if key in metadata:
-            sidecar[key] = metadata[key]
     # Diagnostics: stringify layer keys so the JSON round-trips through
     # standard parsers (JSON object keys must be strings).  Reader inverts.
     diagnostics = metadata.get("diagnostics")
-    if diagnostics:
+    if diagnostics is not None:
+        if not isinstance(diagnostics, dict):
+            raise ProfileError("profile metadata 'diagnostics' must be an object")
         sidecar["diagnostics_by_layer"] = {
-            str(layer): {k: float(v) for k, v in metrics.items()}
+            str(layer): dict(metrics)
             for layer, metrics in diagnostics.items()
         }
 
-    from saklas.io.atomic import write_json_atomic
+    _validate_profile_sidecar(
+        sidecar, tensor_sha256=tensor_digest, layers=set(profile),
+    )
+    from saklas.io.atomic import artifact_lock, write_bytes_atomic, write_json_atomic
 
     meta_path = path.with_suffix(".json")
-    write_json_atomic(meta_path, sidecar)
+    with artifact_lock(path):
+        write_bytes_atomic(path, tensor_bytes)
+        write_json_atomic(meta_path, sidecar)
 
     log.info("Saved profile (%d layers) to %s", len(profile), path)
 
@@ -139,35 +283,42 @@ def load_profile(path: str | pathlib.Path) -> tuple[dict[int, torch.Tensor], dic
 
         return read_gguf_profile(path)
 
-    tensors = load_file(str(path))
     meta_path = path.with_suffix(".json")
-    with open(meta_path) as f:
-        metadata = json.load(f)
+    from saklas.io.atomic import artifact_lock
 
-    from saklas.io.packs import PACK_FORMAT_VERSION
+    with artifact_lock(path):
+        tensor_bytes = path.read_bytes()
+        with open(meta_path) as f:
+            metadata = json.load(f)
+    tensor_digest = hashlib.sha256(tensor_bytes).hexdigest()
+    tensors = load_safetensors(tensor_bytes)
 
-    fmt_ver = metadata.get("format_version", 1)
-    if not isinstance(fmt_ver, int) or fmt_ver < PACK_FORMAT_VERSION:
-        raise ProfileError(
-            f"pack format is from saklas < 2.0 "
-            f"(sidecar {meta_path} format_version={fmt_ver!r}, "
-            f"need >= {PACK_FORMAT_VERSION}); "
-            f"run `python scripts/upgrade_packs.py {path.parent}` to migrate"
-        )
 
-    profile = {int(key.split("_", 1)[1]): tensor for key, tensor in tensors.items()}
+    if not tensors:
+        raise ProfileError(f"profile tensor {path} has no layers")
+    profile: dict[int, torch.Tensor] = {}
+    for key, tensor in tensors.items():
+        if not re.fullmatch(r"layer_(0|[1-9][0-9]*)", key):
+            raise ProfileError(f"profile tensor {path} has invalid key {key!r}")
+        layer = int(key.removeprefix("layer_"))
+        if tensor.dtype != torch.float32 or tensor.ndim != 1 or tensor.numel() == 0:
+            raise ProfileError(
+                f"profile tensor {path} layer {layer} must be non-empty rank-1 fp32"
+            )
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ProfileError(f"profile tensor {path} layer {layer} is non-finite")
+        profile[layer] = tensor
+    _validate_profile_sidecar(
+        metadata, tensor_sha256=tensor_digest, layers=set(profile),
+    )
 
     # Invert the layer-key stringification done at save time so diagnostics
     # are addressable by ``int`` consistently with the profile dict.
-    raw_diag = metadata.get("diagnostics_by_layer")
-    if isinstance(raw_diag, dict) and raw_diag:
-        # Malformed diagnostics leave the raw dict in place; downstream readers
-        # can decide whether to fall back. The tensors themselves are still valid.
-        with suppress(TypeError, ValueError):
-            metadata["diagnostics"] = {
-                int(layer): dict(metrics)
-                for layer, metrics in raw_diag.items()
-            }
+    raw_diag = metadata["diagnostics_by_layer"]
+    if raw_diag is not None:
+        metadata["diagnostics"] = {
+            int(layer): dict(metrics) for layer, metrics in raw_diag.items()
+        }
 
     return profile, metadata
 
@@ -304,11 +455,12 @@ class Profile:
 
         Metadata passed here overrides / augments the profile's own
         ``self.metadata``; the sidecar carries the current
-        ``PACK_FORMAT_VERSION``.
+        ``PROFILE_FORMAT_VERSION``.
         """
         merged: dict[str, Any] = dict(self._metadata)
         if metadata:
             merged.update(metadata)
+        merged.setdefault("method", "profile")
         save_profile(self._tensors, path, merged)
 
     @classmethod
@@ -316,8 +468,8 @@ class Profile:
         """Load from safetensors (+ sidecar) or gguf.
 
         Dispatches on file extension. Safetensors sidecars with a
-        ``format_version`` below ``PACK_FORMAT_VERSION`` raise
-        :class:`ProfileError` pointing at the migration script. GGUF
+        any ``format_version`` other than ``PROFILE_FORMAT_VERSION`` raise
+        :class:`ProfileError`. GGUF
         files carry metadata in-header and are exempt from the
         format_version gate.
         """
@@ -344,8 +496,9 @@ class Profile:
     ) -> "Profile":
         """Linear combination: ``sum(alpha_i * profile_i)`` per layer.
 
-        Delegates to :func:`saklas.merge.linear_sum`. Layer set is the
-        intersection of every component; ``strict=True`` raises on drop.
+        Delegates to :func:`saklas.io.merge.linear_sum`. Layer coverage is the
+        union, matching live expression composition (an absent term contributes
+        zero); ``strict=True`` requires identical coverage.
         """
         from saklas.io.merge import linear_sum
 

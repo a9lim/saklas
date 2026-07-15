@@ -4,13 +4,18 @@
   // chat/canvas, right-side inspector, and a wide drawer host for deep
   // tools.
 
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
 
-  import WorkspaceRail from "./panels/WorkspaceRail.svelte";
   import InspectorPanel from "./panels/InspectorPanel.svelte";
   import Chat from "./panels/Chat.svelte";
   import LoomSidebar from "./panels/loom/LoomSidebar.svelte";
+  import CommandPalette from "./panels/CommandPalette.svelte";
   import Toaster from "./lib/Toaster.svelte";
+  import {
+    paletteState,
+    closePalette,
+    togglePalette,
+  } from "./lib/stores/palette.svelte";
 
   import * as Drawers from "./drawers";
 
@@ -41,8 +46,49 @@
   ]);
 
   type BootStatus = "loading" | "ready" | "failed";
+  type CompactView = "threads" | "chat" | "rack";
   let bootStatus: BootStatus = $state("loading");
   let bootError: string | null = $state(null);
+  let drawerEl: HTMLElement | null = $state(null);
+  let compactView: CompactView = $state("chat");
+
+  const FOCUSABLE = [
+    "button:not([disabled])",
+    "[href]",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(",");
+
+  $effect(() => {
+    if (drawerState.open === null) return;
+    void tick().then(() => {
+      const first = drawerEl?.querySelector<HTMLElement>(FOCUSABLE);
+      (first ?? drawerEl)?.focus();
+    });
+  });
+
+  function onDrawerKeydown(ev: KeyboardEvent): void {
+    if (ev.key !== "Tab" || !drawerEl) return;
+    const focusable = [...drawerEl.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+      (el) => el.offsetParent !== null,
+    );
+    if (focusable.length === 0) {
+      ev.preventDefault();
+      drawerEl.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (ev.shiftKey && (document.activeElement === first || document.activeElement === drawerEl)) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  }
 
   async function runBootstrap(): Promise<void> {
     bootStatus = "loading";
@@ -86,6 +132,14 @@
     // for the n-way regen flow where a user might want to back out of
     // a follow-up modal without killing the stream.
     if (ev.key === "Escape") {
+      // Palette overlays everything — its own input handler closes it when
+      // focused; this catches Esc after focus wandered (backdrop click-arm,
+      // devtools, etc.).
+      if (paletteState.open) {
+        closePalette();
+        ev.preventDefault();
+        return;
+      }
       if (loomUiState.modalRequest.kind !== null) {
         return;
       }
@@ -101,8 +155,15 @@
       }
     }
 
-    if (loomTree.unavailable) return;
     const mod = ev.ctrlKey || ev.metaKey;
+    // ⌘K — the command palette; works everywhere, including pre-boot and
+    // before the tree is loaded (it's pure navigation).
+    if (mod && !ev.shiftKey && ev.key.toLowerCase() === "k") {
+      ev.preventDefault();
+      togglePalette();
+      return;
+    }
+
     if (!mod) return;
     // Shift+ctrl combos fall through to the browser; the loom shortcuts
     // use bare Cmd/Ctrl+key.
@@ -111,15 +172,16 @@
 
     if (k === "r") {
       ev.preventDefault();
-      // Ctrl+R = regenerate active assistant (N=1, current rack).
+      // Ctrl+R = regenerate the active node when it carries a generation
+      // receipt, independent of which seat it occupies.
       const active = loomTree.active_node_id;
       if (!active) return;
       const node = loomTree.nodes.get(active);
-      if (node?.role === "assistant") {
+      if (node?.recipe) {
         await loomRegenerateActive(1);
       } else {
-        // Active is a user node — open the modal to let the user pick N
-        // and confirm.
+        // A committed node has no regeneration capability; open the modal
+        // to author a fresh continuation instead.
         requestLoomModal("regenerate", { nodeId: active, n: 1 });
       }
       return;
@@ -159,29 +221,65 @@
 
 {#if bootStatus === "failed"}
   <div class="boot-failed" role="alert">
-    <h1>connection failed</h1>
+    <h1>offline</h1>
     <p class="message">{bootError}</p>
     <p class="hint">
-      saklas server unreachable.  Is <code>saklas serve</code> running?
+      start <code>saklas serve</code>
     </p>
     <button type="button" class="retry" onclick={runBootstrap}>retry</button>
   </div>
 {:else}
   <div class="shell" class:loading={bootStatus === "loading"}>
-    <main class="layout">
-      <section class="rail-zone" aria-label="Workspace navigation">
-        <WorkspaceRail />
-      </section>
+    <main
+      class="layout"
+      inert={paletteState.open || bootStatus !== "ready"}
+      aria-busy={bootStatus === "loading"}
+    >
+      <nav class="compact-nav" aria-label="Workbench views">
+        <button
+          type="button"
+          class:active={compactView === "threads"}
+          aria-pressed={compactView === "threads"}
+          onclick={() => (compactView = "threads")}
+        >threads</button>
+        <button
+          type="button"
+          class:active={compactView === "chat"}
+          aria-pressed={compactView === "chat"}
+          onclick={() => (compactView = "chat")}
+        >chat</button>
+        <button
+          type="button"
+          class:active={compactView === "rack"}
+          aria-pressed={compactView === "rack"}
+          onclick={() => (compactView = "rack")}
+        >instruments</button>
+      </nav>
 
-      <section class="loom-zone" aria-label="Threads">
+      <section
+        class="loom-zone"
+        class:compact-active={compactView === "threads"}
+        aria-label="Threads"
+        inert={drawerState.open !== null}
+      >
         <LoomSidebar />
       </section>
 
-      <section class="chat-zone" aria-label="Chat">
+      <section
+        class="chat-zone"
+        class:compact-active={compactView === "chat"}
+        aria-label="Chat"
+        inert={drawerState.open !== null}
+      >
         <Chat />
       </section>
 
-      <section class="rack-zone" aria-label="Control rack">
+      <section
+        class="rack-zone"
+        class:compact-active={compactView === "rack"}
+        aria-label="Control rack"
+        inert={drawerState.open !== null}
+      >
         <InspectorPanel />
       </section>
 
@@ -196,10 +294,15 @@
             if (ev.key === "Enter" || ev.key === " ") closeDrawer();
           }}
         ></div>
-        <aside
+        <div
+          bind:this={drawerEl}
           class="drawer"
           class:narrow={NARROW_DRAWERS.has(drawerState.open)}
+          role="dialog"
+          aria-modal="true"
           aria-label="{drawerState.open} drawer"
+          tabindex="-1"
+          onkeydown={onDrawerKeydown}
         >
           {#if drawerState.open === "subspace"}
             <Drawers.RackDrawer
@@ -259,6 +362,8 @@
             <Drawers.Transcript params={drawerState.params} />
           {:else if drawerState.open === "template_lab"}
             <Drawers.TemplateLab params={drawerState.params} />
+          {:else if drawerState.open === "cast"}
+            <Drawers.Cast params={drawerState.params} />
           {:else}
             <header class="drawer-header">
               <span class="drawer-title">{drawerState.open}</span>
@@ -273,11 +378,19 @@
               <p class="stub">unknown drawer: {drawerState.open}</p>
             </div>
           {/if}
-        </aside>
+        </div>
       {/if}
     </main>
 
+    {#if bootStatus === "loading"}
+      <div class="boot-loading" role="status" aria-live="polite">
+        <span class="boot-spinner" aria-hidden="true"></span>
+        <span>loading…</span>
+      </div>
+    {/if}
+
     <Toaster />
+    <CommandPalette />
   </div>
 {/if}
 
@@ -287,26 +400,56 @@
     grid-template-rows: 1fr;
     height: 100vh;
     width: 100vw;
-    min-width: 1280px;
-    min-height: 720px;
+    min-width: 0;
+    min-height: 0;
     background: var(--bg);
     color: var(--fg);
     overflow: hidden;
   }
   .shell.loading {
-    /* Slight desaturation so users can tell bootstrap hasn't finished
-     * without us blocking the entire frame. */
-    opacity: 0.85;
+    /* Keep the real frame visible for orientation while the explicit
+     * readiness veil below prevents controls racing their source data. */
+    color-scheme: dark;
   }
-  /* Four permanent columns: rail · threads · chat · rack.  The threads
-   * (loom) column is 376px, the rack column 432px; min-width 1280px
-   * keeps the chat column usable (1280 − 56 − 376 − 432 ≈ 416px floor).
-   * Rail is 56px (not 48px) so the longest category label ("ANALYSIS")
-   * fits without clipping at the rail's right edge; threads gave back
-   * the same 8px so the chat floor is unchanged. */
+  .shell.loading .layout {
+    filter: saturate(0.72) brightness(0.82);
+  }
+  .boot-loading {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-drawer) + 20);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-3);
+    color: var(--fg-strong);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    letter-spacing: 0.04em;
+    text-transform: lowercase;
+    background: rgba(2, 3, 8, 0.38);
+    backdrop-filter: blur(1px);
+    pointer-events: none;
+  }
+  .boot-spinner {
+    width: 12px;
+    height: 12px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: boot-spin 0.7s linear infinite;
+  }
+  @keyframes boot-spin {
+    to { transform: rotate(360deg); }
+  }
+  /* Three permanent columns: threads · chat · rack.  The threads (loom)
+   * column is 376px, the rack column 432px; min-width 1280px keeps the
+   * chat column usable (1280 − 376 − 432 ≈ 472px floor).  The former
+   * 56px workspace rail is gone — every tool it launched lives in the
+   * ⌘K command palette, hinted from the chat header. */
   .layout {
     display: grid;
-    grid-template-columns: 56px 376px minmax(0, 1fr) 432px;
+    grid-template-columns: 376px minmax(0, 1fr) 432px;
     grid-template-rows: 1fr;
     min-height: 0; /* let children scroll inside */
     position: relative; /* drawer sits over rack-zone via absolute pos */
@@ -318,10 +461,8 @@
      * and the chat/rack content visibly shifts left then snaps back. */
     overflow: hidden;
   }
-  .rail-zone {
-    background: var(--bg-deep);
-    overflow: hidden;
-    min-height: 0;
+  .compact-nav {
+    display: none;
   }
   .loom-zone {
     background: var(--bg-alt);
@@ -349,29 +490,97 @@
     overflow: hidden;
   }
 
-  /* Drawer host — slides in from the right over the rack zone.  Backdrop
-   * also covers the chat zone so the focus is unambiguous. */
+  /* Below the three-column cockpit's honest 1280px floor, turn the same
+   * three primary surfaces into explicit full-width views.  The previous
+   * fixed ``min-width: 1280px`` silently cropped the inspector (and most of
+   * chat on a phone), with no horizontal scrollbar or way to reach it.
+   * This keeps every workflow available without shrinking dense scientific
+   * controls into illegibility. */
+  @media (max-width: 1279px) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 0;
+    }
+    .compact-nav {
+      grid-column: 1;
+      grid-row: 1;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      padding: var(--space-2);
+      background: var(--bg-deep);
+      border-bottom: 1px solid var(--grid-line);
+      z-index: 1;
+    }
+    .compact-nav button {
+      min-width: 0;
+      padding: var(--space-3) var(--space-2);
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--fg-muted);
+      font: inherit;
+      font-family: var(--font-mono);
+      font-size: var(--text-sm);
+      text-transform: lowercase;
+      cursor: pointer;
+    }
+    .compact-nav button:hover {
+      color: var(--fg-strong);
+      background: var(--glass);
+    }
+    .compact-nav button.active {
+      color: var(--fg-strong);
+      background: var(--glass-strong);
+      border-color: var(--glass-line);
+    }
+    .loom-zone,
+    .chat-zone,
+    .rack-zone {
+      grid-column: 1;
+      grid-row: 2;
+      display: none;
+      min-width: 0;
+    }
+    .loom-zone.compact-active,
+    .chat-zone.compact-active,
+    .rack-zone.compact-active {
+      display: flex;
+      flex-direction: column;
+    }
+  }
+
+  /* Sheet host — analysis tools float in from the right as a rounded
+   * sheet inset from the frame edges (v2: no full-height wall).  Backdrop
+   * blurs the bench underneath so the live data reads as "behind", not
+   * "gone". */
   .drawer-backdrop {
     position: absolute;
     inset: 0;
-    background: rgba(1, 4, 9, 0.55);
+    background: rgba(2, 3, 8, 0.5);
+    backdrop-filter: blur(2px);
     z-index: var(--z-drawer);
     border: 0;
     cursor: pointer;
   }
   .drawer {
     position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
+    top: var(--space-4);
+    right: var(--space-4);
+    bottom: var(--space-4);
     width: min(980px, 78%);
     background: var(--bg-alt);
-    border-left: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
+    border-radius: var(--radius-lg);
     z-index: calc(var(--z-drawer) + 1);
     display: flex;
     flex-direction: column;
-    box-shadow: var(--shadow-overlay);
-    animation: drawer-in var(--dur) var(--ease-out);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      var(--shadow-overlay);
+    overflow: hidden;
+    animation: drawer-in var(--dur-slow) var(--ease-out);
   }
   /* Forms / pickers — sized to their content rather than the wide
    * analysis panel. */
@@ -380,10 +589,12 @@
   }
   @keyframes drawer-in {
     from {
-      transform: translateX(100%);
+      transform: translateX(28px);
+      opacity: 0;
     }
     to {
       transform: translateX(0);
+      opacity: 1;
     }
   }
   .drawer-header {
@@ -391,7 +602,6 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-3) var(--space-6);
-    border-bottom: 1px solid var(--border);
   }
   .drawer-title {
     color: var(--accent);
@@ -463,7 +673,7 @@
     margin-top: var(--space-5);
     background: var(--bg-elev);
     color: var(--accent);
-    border: 1px solid var(--border);
+    border: 0;
     padding: var(--space-3) var(--space-6);
     border-radius: var(--radius);
     font-size: var(--text-sm);
@@ -471,5 +681,20 @@
   }
   .retry:hover {
     background: var(--accent-subtle);
+  }
+
+  /* Drawer base rules are declared after the compact layout block, so keep
+   * this size override at the end of the cascade. */
+  @media (max-width: 1279px) {
+    .drawer {
+      top: var(--space-2);
+      right: var(--space-2);
+      bottom: var(--space-2);
+      width: calc(100% - 2 * var(--space-2));
+      max-width: 980px;
+    }
+    .drawer.narrow {
+      width: min(480px, calc(100% - 2 * var(--space-2)));
+    }
   }
 </style>

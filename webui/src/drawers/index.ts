@@ -47,3 +47,5 @@ export { default as NodeCompare } from "./NodeCompareDrawer.svelte";
 export { default as Transcript } from "./TranscriptDrawer.svelte";
 // Templated-completion lab — author templates + score the value distribution.
 export { default as TemplateLab } from "./TemplateLabDrawer.svelte";
+// Cast manager (phase 3) — roster of named labels + standing recipes.
+export { default as Cast } from "./CastDrawer.svelte";

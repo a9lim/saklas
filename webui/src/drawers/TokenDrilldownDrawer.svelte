@@ -9,12 +9,12 @@
   // either turn.tokens[tokenIdx] (response stream, default) or
   // turn.thinkingTokens[tokenIdx] when isThinking is true.
   //
-  // Layout: header with the token text + coordinates, body grid with
-  // sortable layer (rows ascending) × probe (cols A-Z) cells.  Each cell
-  // is a HeatmapCell tinted via tokens.scoreToRgb so highlight saturation
-  // matches the chat tokens themselves.  Sticky labels keep orientation
-  // when the grid scrolls.  A/B mode adds a steered/unsteered toggle when
-  // turn.abPair exists.
+  // Layout: header with the token text + coordinates + position scrubber,
+  // a toolbar with the view tabs (probes / logits / j-lens; only the lens
+  // carries a hue dot — it is the one pillar-owned surface here) and the
+  // steered/unsteered branch toggle, then the per-tab body.  Heatmap cells
+  // tint via tokens.scoreToRgb so highlight saturation matches the chat
+  // tokens themselves; the j-lens matrix tints in the lens family blue.
 
   import {
     drawerState,
@@ -26,15 +26,19 @@
     sessionState,
     effectiveRawMode,
     probeAxisScale,
+    lensSourceState,
+    saeSourceState,
   } from "../lib/stores.svelte";
-  import { ApiError, apiLens } from "../lib/api";
+  import { ApiError, apiLens, apiSae } from "../lib/api";
   import type {
     ChatTurn,
     LensTokenReadoutJSON,
-    TokenAltJSON,
+    SaeTokenReadoutJSON,
     TokenScore,
   } from "../lib/types";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
+  import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
+  import Button from "../lib/ui/Button.svelte";
 
   interface DrawerParams {
     turnIdx: number;
@@ -84,6 +88,11 @@
   let branch: Branch = $state<Branch>("primary");
   let branchingRank: number | null = $state(null);
   let branchError: string | null = $state(null);
+
+  const BRANCH_ITEMS: Array<{ value: Branch; label: string; title: string }> = [
+    { value: "primary", label: "steered", title: "The steered (primary) turn" },
+    { value: "shadow", label: "unsteered", title: "The unsteered A/B shadow turn" },
+  ];
 
   /** Reset the branch when the click target changes — opening the drawer
    * on a new token should always start on the primary side. */
@@ -191,8 +200,25 @@
   // routes the user to the SamplingStrip ``alts`` toggle when capture
   // wasn't on.
 
-  type Tab = "probes" | "logits" | "lens";
+  type Tab = "probes" | "logits" | "lens" | "sae";
   let tab: Tab = $state<Tab>("probes");
+
+  const TAB_ITEMS: Array<{ value: Tab; label: string; color?: string; title: string }> = [
+    { value: "probes", label: "probes", title: "Per-layer × per-probe readings" },
+    { value: "logits", label: "logits", title: "Ranked top-K alternatives at this position" },
+    {
+      value: "sae",
+      label: "sae",
+      color: "var(--pillar-sae)",
+      title: "Sparse feature activations at the resident SAE hook layer",
+    },
+    {
+      value: "lens",
+      label: "j-lens",
+      color: "var(--pillar-lens)",
+      title: "Workspace readout — what each layer was disposed to say",
+    },
+  ];
 
   /** Reset to probes tab when the CLICK target changes (scrubbing keeps
    *  the tab).  Drilldown stays on whatever tab the user had open within
@@ -219,8 +245,7 @@
 
   /** Build ranked rows from the token's ``top_alts``.  Server emits the
    *  list in descending-logprob order, so ``index + 1`` is the rank.
-   *  Chosen-row identification falls back to text equality when
-   *  ``token.tokenId`` is null (legacy / replayed shape). */
+   *  Chosen-row identification uses the token id carried by the current wire. */
   const rankRows = $derived.by<RankRow[]>(() => {
     const alts = token?.topAlts;
     if (!alts || alts.length === 0) return [];
@@ -232,10 +257,7 @@
       logprob: a.logprob,
       p: Math.exp(a.logprob),
       delta: a.logprob - lp0,
-      chosen:
-        token?.tokenId != null
-          ? a.id === token.tokenId
-          : a.text === token?.text,
+      chosen: token?.tokenId != null && a.id === token.tokenId,
     }));
   });
 
@@ -285,13 +307,13 @@
     branchError = null;
     const nodeId = loomNodeId;
     if (!nodeId) {
-      branchError = "no loom assistant node is available for this token";
+      branchError = "no generated loom node is available for this token";
       return;
     }
     if (token == null || token.rawIndex == null) {
       branchError =
         "this token has no raw-decode index; forking needs a node " +
-        "generated in this session (legacy / replayed turns can't fork)";
+        "generated with raw-decode capture in this session";
       return;
     }
     branchingRank = row.rank;
@@ -305,17 +327,16 @@
     }
   }
 
-  // ---- j-lens tab (workspace readout) -----------------------------------
+  // ---- j-lens + SAE historical channels ---------------------------------
   //
-  // On-demand recompute, not stored stream data: the server rebuilds the
-  // node's prompt render + raw decode prefix up to this token and reads
-  // the per-layer J-lens top-k at the forward that produced it — so any
-  // in-session token drills down, steered generations read their steered
-  // workspace (recipe replay), and nothing is paid per-token at gen time.
-  // Responses are cached per (node, raw_index, steered) while the drawer
-  // lives; the steered toggle refetches the unsteered counterfactual.
+  // The token's loom-owned ``captured`` record is authoritative.  Replay is
+  // reserved for old/missing channels and the explicit unsteered J-LENS
+  // counterfactual; replayed responses are kept only as the drawer's current
+  // view, never cached or written back as original data.
 
-  const LENS_TOP_K = 8;
+  // Share the logit-alternative width. Zero means the ordinary logit capture
+  // is off, so retain the canonical 8-wide J-lens view in that state.
+  const lensTopK = $derived(samplingState.return_top_k || 8);
 
   let lensData = $state<LensTokenReadoutJSON | null>(null);
   let lensLoading = $state(false);
@@ -324,44 +345,126 @@
    *  it off reads the unsteered counterfactual workspace of the same
    *  token stream.  Sticky across tokens within one drawer life. */
   let lensSteered = $state(true);
-  const lensCache = new Map<string, LensTokenReadoutJSON>();
+  type ReadoutOrigin = "captured" | "replayed" | null;
+  let lensOrigin = $state<ReadoutOrigin>(null);
+  let lensSource = $state<string | null>(null);
+  let lensRequestSeq = 0;
 
   const jlensFitted = $derived(sessionState.info?.jlens_fitted === true);
+  const saeLoaded = $derived(sessionState.info?.sae_loaded === true);
+  let saeData = $state<SaeTokenReadoutJSON | null>(null);
+  let saeLoading = $state(false);
+  let saeError = $state<string | null>(null);
+  let saeOrigin = $state<ReadoutOrigin>(null);
+  let saeSource = $state<string | null>(null);
+  let saeRequestSeq = 0;
 
-  const lensKey = $derived.by<string | null>(() => {
-    const nodeId = loomNodeId;
-    const rawIndex = token?.rawIndex;
-    if (!nodeId || rawIndex == null) return null;
-    return `${nodeId}:${rawIndex}:${lensSteered ? 1 : 0}`;
+  const capturedLensData = $derived.by<LensTokenReadoutJSON | null>(() => {
+    const captured = token?.captured?.lens;
+    if (!captured || !token) return null;
+    return {
+      node_id: loomNodeId ?? "",
+      raw_index: token.rawIndex ?? -1,
+      token_id: token.tokenId ?? -1,
+      token_text: token.text,
+      steering: captured.steering,
+      aggregate: captured.aggregate,
+      layers: captured.layers,
+    };
+  });
+
+  const capturedSaeData = $derived.by<SaeTokenReadoutJSON | null>(() => {
+    const captured = token?.captured?.sae;
+    if (!captured || !token) return null;
+    return {
+      node_id: loomNodeId ?? "",
+      raw_index: token.rawIndex ?? -1,
+      token_id: token.tokenId ?? -1,
+      token_text: token.text,
+      steering: captured.steering,
+      layer: captured.layer ?? -1,
+      features: captured.features,
+    };
   });
 
   $effect(() => {
-    if (tab !== "lens" || !jlensFitted) return;
-    const key = lensKey;
+    if (tab !== "sae") return;
+    const request = ++saeRequestSeq;
+    const captured = capturedSaeData;
+    if (captured) {
+      saeData = captured;
+      saeOrigin = "captured";
+      saeSource = token?.captured?.sae?.source ?? null;
+      saeLoading = false;
+      saeError = null;
+      return;
+    }
+    saeData = null;
+    saeOrigin = null;
+    saeSource = null;
+    saeError = null;
+    if (!saeLoaded) return;
     const nodeId = loomNodeId;
     const rawIndex = token?.rawIndex;
-    if (!key || !nodeId || rawIndex == null) return;
-    const hit = lensCache.get(key);
-    if (hit) {
-      lensData = hit;
+    if (!nodeId || rawIndex == null) return;
+    saeLoading = true; saeError = null; saeData = null;
+    apiSae.tokenReadout(nodeId, rawIndex, { raw: effectiveRawMode() })
+      .then((data) => {
+        if (request !== saeRequestSeq) return;
+        saeData = data;
+        saeOrigin = "replayed";
+        saeSource =
+          saeSourceState.sources.find((source) => source.active)?.source ??
+          sessionState.info?.sae_info?.release ?? null;
+      })
+      .catch((error) => {
+        if (request !== saeRequestSeq) return;
+        saeError = error instanceof Error ? error.message : String(error);
+      })
+      .finally(() => {
+        if (request === saeRequestSeq) saeLoading = false;
+      });
+  });
+
+  $effect(() => {
+    if (tab !== "lens") return;
+    const request = ++lensRequestSeq;
+    const captured = capturedLensData;
+    if (lensSteered && captured) {
+      lensData = captured;
+      lensOrigin = "captured";
+      lensSource = token?.captured?.lens?.source ?? null;
+      lensLoading = false;
       lensError = null;
       return;
     }
+    lensData = null;
+    lensOrigin = null;
+    lensSource = null;
+    lensError = null;
+    if (!jlensFitted) return;
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!nodeId || rawIndex == null) return;
     lensLoading = true;
     lensError = null;
     lensData = null;
     apiLens
       .tokenReadout(nodeId, rawIndex, {
-        topK: LENS_TOP_K,
+        topK: lensTopK,
         steered: lensSteered,
         raw: effectiveRawMode(),
+        layers: "all",
       })
       .then((d) => {
-        lensCache.set(key, d);
-        if (key === lensKey) lensData = d;
+        if (request !== lensRequestSeq) return;
+        lensData = d;
+        lensOrigin = "replayed";
+        lensSource =
+          lensSourceState.sources.find((source) => source.active)?.source ?? null;
       })
       .catch((e) => {
-        if (key !== lensKey) return;
+        if (request !== lensRequestSeq) return;
         const detail =
           e instanceof ApiError &&
           typeof (e.body as { detail?: unknown } | null)?.detail === "string"
@@ -370,7 +473,7 @@
         lensError = detail ?? (e instanceof Error ? e.message : String(e));
       })
       .finally(() => {
-        if (key === lensKey) lensLoading = false;
+        if (request === lensRequestSeq) lensLoading = false;
       });
   });
 
@@ -380,11 +483,14 @@
   const lensHasSteering = $derived(
     (lensData?.steering ?? null) !== null || !lensSteered,
   );
+  const lensColumnCount = $derived(
+    Math.max(0, ...(lensData?.layers.map((row) => row.tokens.length) ?? [])),
+  );
 
   function lensCellStyle(logprob: number): string {
     const p = Math.min(1, Math.exp(logprob));
     const pct = Math.round(p * 60);
-    return `background: color-mix(in srgb, var(--accent-blue) ${pct}%, transparent);`;
+    return `background: color-mix(in srgb, var(--pillar-lens) ${pct}%, transparent);`;
   }
 
   function lensCellTitle(layer: number, t: { token: string; logprob: number }): string {
@@ -456,12 +562,14 @@
 >
   <header class="drawer-header">
     <div class="title">
+      <span class="eyebrow">token drilldown</span>
       {#if token}
-        <span class="label">token</span>
-        <code class="tok-text">{JSON.stringify(token.text)}</code>
-        <span class="coord">
-          turn {turnIdx} · {isThinking ? "thinking" : "response"} token
-          <span class="scrub" title="Walk the inspected token along this turn (← / →); every tab follows">
+        <div class="name-row">
+          <code class="tok-text">{JSON.stringify(token.text)}</code>
+          <span class="coord">
+            turn {turnIdx} · {isThinking ? "thinking" : "response"}
+          </span>
+          <span class="scrub" title="← / →">
             <button
               type="button"
               class="scrub-btn"
@@ -477,85 +585,49 @@
               onclick={() => scrubTo(tokenIdx + 1)}
               aria-label="Next token"
             >▶</button>
+            {#if scrubTokenIdx !== null}
+              <button
+                type="button"
+                class="scrub-btn scrub-home"
+                onclick={() => (scrubTokenIdx = null)}
+                title="reset"
+              >↩</button>
+            {/if}
           </span>
-          {#if scrubTokenIdx !== null}
-            <button
-              type="button"
-              class="scrub-btn scrub-home"
-              onclick={() => (scrubTokenIdx = null)}
-              title="Snap back to the clicked token"
-            >↩ clicked</button>
-          {/if}
-        </span>
+        </div>
       {:else}
-        <span class="label">token</span>
-        <span class="coord">no token at ({turnIdx}, {tokenIdx})</span>
+        <div class="name-row">
+          <span class="coord">no token at ({turnIdx}, {tokenIdx})</span>
+        </div>
       {/if}
     </div>
     <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
-      ×
+      ✕
     </button>
   </header>
 
-  {#if hasAbPair}
-    <div class="branch-toggle" role="tablist" aria-label="Select branch">
-      <button
-        type="button"
-        role="tab"
-        aria-selected={branch === "primary"}
-        class:active={branch === "primary"}
-        onclick={() => (branch = "primary")}
-      >steered</button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={branch === "shadow"}
-        class:active={branch === "shadow"}
-        onclick={() => (branch = "shadow")}
-      >unsteered</button>
-    </div>
-  {/if}
-
-  <!-- View tabs: per-layer × per-probe heatmap (existing) vs. ranked
-       top-K alts (logit-pass).  Tabs always render so users see the
-       second view exists even when alts capture is off. -->
-  <div class="tab-strip" role="tablist" aria-label="Drilldown view">
-    <button
-      type="button"
-      role="tab"
-      aria-selected={tab === "probes"}
-      class:active={tab === "probes"}
-      onclick={() => (tab = "probes")}
-    >probes (per-layer)</button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={tab === "logits"}
-      class:active={tab === "logits"}
-      onclick={() => (tab = "logits")}
-    >logits</button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={tab === "lens"}
-      class:active={tab === "lens"}
-      onclick={() => (tab = "lens")}
-    >j-lens</button>
+  <!-- View tabs (probes / logits / j-lens) + the steered/unsteered branch
+       toggle when this turn has an A/B pair.  Tabs always render so users
+       see the other views exist even when their capture is off. -->
+  <div class="toolbar">
+    <SegmentedTabs items={TAB_ITEMS} bind:value={tab} ariaLabel="Token detail view" />
+    {#if hasAbPair}
+      <SegmentedTabs items={BRANCH_ITEMS} bind:value={branch} ariaLabel="Token branch" />
+    {/if}
   </div>
 
   <div class="body">
     {#if !token}
       <div class="empty">
-        Token not found.  The chat log may have been cleared or rewound
-        since the drawer was opened.
+        token unavailable
       </div>
     {:else if tab === "probes"}
       {#if isEmpty}
         <div class="empty">
-          No per-layer scores captured for this token (probes not loaded?).
+          no probe scores
         </div>
       {:else}
-        <div class="grid-scroll">
+        <div class="grid-scroll probe-grid">
           <table class="grid" style="--cell: {CELL_SIZE}px;">
             <thead>
               <tr>
@@ -594,9 +666,9 @@
       <!-- Logits tab.  Three states: ranked rows present, alts captured
            but empty (degenerate / stop token), nothing captured at all. -->
       {#if rankRows.length > 0}
-        <div class="logits-summary">
+        <div class="tab-summary">
           <div>
-            chosen: <code class="tok-text">{JSON.stringify(token.text)}</code>
+            chosen: <code class="tok-inline">{JSON.stringify(token.text)}</code>
             <span class="kv">
               logprob = <strong>{fmtLogprob(token.logprob)}</strong>
             </span>
@@ -617,7 +689,7 @@
                 <th class="tok">token</th>
                 <th class="num">logprob</th>
                 <th class="num">p</th>
-                <th class="num">Δ from rank 1</th>
+                <th class="num">Δ top</th>
                 <th class="num">branch</th>
               </tr>
             </thead>
@@ -634,15 +706,14 @@
                   <td class="num">{fmtProb(row.p)}</td>
                   <td class="num">{fmtDelta(row.delta, row.rank)}</td>
                   <td class="num">
-                    <button
-                      type="button"
-                      class="mini"
+                    <Button
+                      size="sm"
                       disabled={row.chosen || branchingRank !== null}
                       onclick={() => branchFromAlt(row)}
-                      title="Fork a sibling branch: swap in this token and resample the continuation"
+                      title="fork with token"
                     >
                       {branchingRank === row.rank ? "…" : "fork"}
-                    </button>
+                    </Button>
                   </td>
                 </tr>
               {/each}
@@ -654,120 +725,105 @@
         {/if}
       {:else if token.logprob != null}
         <div class="empty">
+          <p>logprob {fmtLogprob(token.logprob)} · no alternatives</p>
           <p>
-            Chosen-token logprob captured:
-            <strong>{fmtLogprob(token.logprob)}</strong>, but no top-K
-            alternatives were requested for this generation.
-          </p>
-          <p>
-            <button
-              type="button"
-              class="link-btn"
+            <Button
               onclick={enableAlts}
               disabled={samplingState.return_top_k > 0}
             >
               {samplingState.return_top_k > 0
-                ? "alts on (effective next gen)"
-                : "enable alts (next generation)"}
-            </button>
+                ? "alts on next run"
+                : "enable alts"}
+            </Button>
           </p>
         </div>
       {:else}
         <div class="empty">
+          <p>no logprob data</p>
           <p>
-            No logprob data captured for this token. Either it was replayed
-            from a transcript that pre-dates logit capture, or capture wasn't
-            live for the run.
-          </p>
-          <p>
-            <button
-              type="button"
-              class="link-btn"
+            <Button
               onclick={enableAlts}
               disabled={samplingState.return_top_k > 0}
             >
               {samplingState.return_top_k > 0
-                ? "alts on (effective next gen)"
-                : "enable alts (next generation)"}
-            </button>
+                ? "alts on next run"
+                : "enable alts"}
+            </Button>
           </p>
         </div>
       {/if}
-    {:else}
-      <!-- J-lens tab.  The workspace readout matrix — rows are lens
-           layers (ascending; workspace-band rows marked), cells the
+    {:else if tab === "lens"}
+      <!-- J-lens tab. The readout matrix rows are all fitted lens layers,
+           ascending; cells are the
            top-K vocabulary tokens each layer's residual was disposed to
-           say at the forward that produced this token.  Recomputed
-           on demand server-side (node prompt render + raw prefix replay),
-           so it works for any in-session token, no per-token gen cost. -->
-      {#if !jlensFitted}
+           say at the forward that produced this token. Original capture is
+           shown when present; replay is the fallback/counterfactual path. -->
+      {#if lensLoading}
         <div class="empty">
-          <p>
-            No Jacobian lens is fitted for
-            <code>{sessionState.info?.model_id ?? "this model"}</code>.
-          </p>
-          <p>
-            Fit one from a terminal —
-            <code>saklas lens fit {sessionState.info?.model_id ?? "<model>"}</code>
-            — then reopen this drawer.
-          </p>
-        </div>
-      {:else if token.rawIndex == null}
-        <div class="empty">
-          This token has no raw-decode index — the readout needs a node
-          generated in this session (legacy / replayed turns can't be
-          re-read, same constraint as forking).
-        </div>
-      {:else if !loomNodeId}
-        <div class="empty">
-          No loom assistant node is available for this token.
-        </div>
-      {:else if lensLoading}
-        <div class="empty">
-          computing workspace readout (one prefix forward)…
+          computing…
         </div>
       {:else if lensError}
         <div class="empty">
-          <p>Workspace readout failed: {lensError}</p>
+          <p>readout: {lensError}</p>
         </div>
       {:else if lensData}
-        <div class="logits-summary">
+        <div class="tab-summary">
           <div>
-            produced: <code class="tok-text">{JSON.stringify(lensData.token_text)}</code>
+            produced: <code class="tok-inline">{JSON.stringify(lensData.token_text)}</code>
+            {#if lensOrigin}
+              <span class="kv">
+                {lensOrigin}{lensSource ? ` · ${lensSource}` : ""}
+              </span>
+            {/if}
             {#if lensData.steering !== null}
-              <span class="kv steer-chip" title="The replay ran under the node's recipe steering">
+              <span class="kv steer-chip" title="recipe applied">
                 steered: <code>{lensData.steering}</code>
               </span>
             {:else if !lensSteered}
-              <span class="kv">unsteered counterfactual</span>
+              <span class="kv">unsteered</span>
             {/if}
             {#if lensHasSteering}
-              <label class="kv steer-toggle" title="Replay under the node's recipe steering vs the unsteered counterfactual of the same token stream">
+              <label class="kv steer-toggle" title="apply recipe">
                 <input type="checkbox" bind:checked={lensSteered} />
                 apply recipe steering
               </label>
             {/if}
           </div>
         </div>
+        {#if (lensData.aggregate ?? []).length > 0}
+          <!-- Layer-aggregated view of the same logits across all layers:
+               strength = mean probability, com = probability-mass-
+               weighted depth center of mass (0 = first block, 1 = last). -->
+          <div class="lens-agg" role="list" aria-label="Aggregate lens tokens">
+            <span class="lens-agg-label">aggregate</span>
+            {#each lensData.aggregate ?? [] as chip, i (i)}
+              <span
+                class="lens-agg-chip"
+                role="listitem"
+                title={`"${chip.token}" — strength ${chip.strength.toFixed(3)} · com ${chip.com.toFixed(2)} ±${chip.spread.toFixed(2)}`}
+              >
+                <span class="lens-agg-tok">{chip.token.trim() || JSON.stringify(chip.token)}</span>
+                <span class="lens-agg-com">@{chip.com.toFixed(2)}</span>
+              </span>
+            {/each}
+          </div>
+        {/if}
         <div class="grid-scroll">
           <table class="lens-table">
             <thead>
               <tr>
                 <th class="corner">L \ rank</th>
-                {#each { length: LENS_TOP_K } as _, i (i)}
+                {#each { length: lensColumnCount } as _, i (i)}
                   <th class="num">{i + 1}</th>
                 {/each}
               </tr>
             </thead>
             <tbody>
               {#each lensData.layers as row (row.layer)}
-                <tr class:off-band={!row.in_band}>
+                <tr>
                   <th
                     class="row-label"
-                    class:band={row.in_band}
-                    title={row.in_band
-                      ? `Layer ${row.layer} — workspace band (40–90% depth)`
-                      : `Layer ${row.layer} — outside the workspace band`}
+                    title={`Layer ${row.layer}`}
                   >
                     L{row.layer}
                   </th>
@@ -786,6 +842,54 @@
             </tbody>
           </table>
         </div>
+      {:else if !jlensFitted}
+        <div class="empty">
+          <p>no J-LENS fit</p>
+          <p><code>saklas lens fit {sessionState.info?.model_id ?? "<model>"}</code></p>
+        </div>
+      {:else if token.rawIndex == null}
+        <div class="empty">
+          no raw decode index
+        </div>
+      {:else if !loomNodeId}
+        <div class="empty">
+          no loom node
+        </div>
+      {/if}
+    {:else}
+      {#if saeLoading}
+        <div class="empty">computing…</div>
+      {:else if saeError}
+        <div class="empty">readout: {saeError}</div>
+      {:else if saeData}
+        <div class="tab-summary">
+          {saeOrigin ?? "readout"}{saeSource ? ` · ${saeSource}` : ""}
+          · L{saeData.layer >= 0 ? saeData.layer : "?"}
+          · produced <code>{JSON.stringify(saeData.token_text)}</code>
+        </div>
+        <div class="grid-scroll">
+          <table class="logits-table">
+            <!-- strength = activation / Neuronpedia maxActApprox — the
+                 normalized 0..1 unit the probe cards + gates read; "—"
+                 when no metadata is cached for the feature. -->
+            <thead><tr><th class="num">rank</th><th class="tok">feature</th><th class="tok">label</th><th class="num">strength</th><th class="num">activation</th></tr></thead>
+            <tbody>
+              {#each saeData.features as feature, index (feature.id)}
+                <tr>
+                  <td class="num">{index + 1}</td>
+                  <td class="tok"><code>sae/{feature.id}</code></td>
+                  <td class="tok">{feature.label ?? "—"}</td>
+                  <td class="num">{feature.max_act != null && feature.max_act > 0 ? (feature.activation / feature.max_act).toFixed(2) : "—"}</td>
+                  <td class="num">{feature.activation.toFixed(3)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {:else if !saeLoaded}
+        <div class="empty">no SAE loaded</div>
+      {:else if token.rawIndex == null || !loomNodeId}
+        <div class="empty">no raw decode record</div>
       {/if}
     {/if}
   </div>
@@ -800,56 +904,70 @@
         Logprob is the chosen-token natural-log probability under the
         post-temperature / post-top-p / post-top-k distribution the sampler
         drew from.
-      {:else}
+      {:else if tab === "lens"}
         Each row ranks softmax(W_U · norm(J_l·h)) at the forward that
         produced this token — what that layer's residual was disposed to
-        make the model say. Cell tint = probability; blue row labels mark
-        the 40–90% workspace band (early rows are noise, late rows converge
-        on the raw logits). Highlighted cells match the produced token.
+        make the model say. Cell tint = probability; highlighted cells match
+        the produced token. All fitted layers are shown because the informative
+        depth range is model-dependent.
+      {:else}
+        Post-nonlinearity sparse-feature activations from the resident SAE's
+        hook layer. Values are comparable across tokens for one feature, not
+        calibrated across different features.
       {/if}
     </span>
   </footer>
 </aside>
 
 <style>
+  /* v2 sheet interior — the host paints the sheet surface (glass hairline,
+   * radius, --bg-alt fill), so the root is transparent; chrome speaks sans
+   * and every value/token/expression sits in mono. */
   .drawer {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--bg);
+    background: transparent;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
-    border-left: 1px solid var(--border);
   }
 
   .drawer-header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-4) var(--space-4);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     min-width: 0;
   }
-  .label {
+  .eyebrow {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-transform: uppercase;
-    letter-spacing: 0;
+    letter-spacing: 0.08em;
+  }
+  .name-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    min-width: 0;
+    flex-wrap: wrap;
   }
   .tok-text {
-    color: var(--fg-strong);
+    color: var(--fg);
     font-family: var(--font-mono);
-    background: var(--bg-alt);
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--border);
+    font-size: var(--text-md);
+    background: var(--glass-strong);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-3);
     word-break: break-all;
     max-width: 28ch;
     overflow: hidden;
@@ -857,150 +975,134 @@
     white-space: nowrap;
   }
   .coord {
-    color: var(--fg-dim);
+    color: var(--fg-subtle);
     font-size: var(--text-sm);
+    white-space: nowrap;
   }
   .scrub {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-1);
-    margin-left: var(--space-1);
+    gap: var(--space-2);
   }
   .scrub-btn {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
+    border-radius: var(--radius-pill);
     font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    line-height: 1.2;
-    padding: 0 var(--space-2);
+    font-size: var(--text-2xs);
+    line-height: 1;
+    padding: var(--space-2) var(--space-4);
     cursor: pointer;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
   .scrub-btn:hover:not(:disabled) {
-    color: var(--fg-strong);
-    border-color: var(--fg-muted);
+    color: var(--fg);
+    background: var(--glass-strong);
   }
   .scrub-btn:disabled {
-    color: var(--border);
+    color: var(--fg-muted);
+    opacity: 0.35;
     cursor: default;
   }
   .scrub-pos {
     color: var(--fg-dim);
+    font-family: var(--font-mono);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
   .scrub-home {
     color: var(--accent);
-    margin-left: var(--space-2);
+    font-size: var(--text-xs);
   }
   .close {
-    background: transparent;
+    background: var(--glass);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
-    padding: 0 var(--space-3);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font: inherit;
     font-size: var(--text-md);
+    line-height: 1;
     cursor: pointer;
-    line-height: 1.4;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
   .close:hover {
-    color: var(--fg-strong);
-    border-color: var(--fg-muted);
+    color: var(--fg);
+    background: var(--glass-strong);
   }
 
-  .branch-toggle {
+  /* Toolbar — view tabs left, branch toggle right (when A/B). */
+  .toolbar {
     display: flex;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--border);
-  }
-  .branch-toggle button {
-    background: transparent;
-    color: var(--fg-dim);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-4);
-    cursor: pointer;
-    font: inherit;
-    font-family: var(--font-mono);
-    text-transform: lowercase;
-  }
-  .branch-toggle button:hover {
-    color: var(--fg-strong);
-    border-color: var(--fg-muted);
-  }
-  .branch-toggle button.active {
-    color: var(--accent);
-    border-color: var(--accent);
-    background: var(--accent-subtle);
-  }
-
-  /* View tab strip — same shape as the branch toggle but lives on its
-     own row so the two stacks read independently when both are visible
-     (steered/unsteered split + probes/logits split). */
-  .tab-strip {
-    display: flex;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--border);
-  }
-  .tab-strip button {
-    background: transparent;
-    color: var(--fg-dim);
-    border: 1px solid var(--border);
-    padding: var(--space-1) var(--space-4);
-    cursor: pointer;
-    font: inherit;
-    font-family: var(--font-mono);
-    text-transform: lowercase;
-  }
-  .tab-strip button:hover {
-    color: var(--fg-strong);
-    border-color: var(--fg-muted);
-  }
-  .tab-strip button.active {
-    color: var(--accent);
-    border-color: var(--accent);
-    background: var(--accent-subtle);
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-5);
+    padding: var(--space-3) var(--space-6);
   }
 
   .body {
     flex: 1 1 auto;
     overflow: auto;
     min-height: 0;
-    padding: var(--space-4) var(--space-4);
+    padding: var(--space-5) var(--space-6);
   }
   .empty {
     color: var(--fg-muted);
-    font-style: italic;
-    padding: var(--space-5) 0;
-    line-height: 1.4;
+    padding: var(--space-6) 0;
+    line-height: 1.5;
+    max-width: 62ch;
+  }
+  .empty code {
+    font-family: var(--font-mono);
+    color: var(--fg-dim);
   }
 
+  /* Data wells — tables recess into a deeper glass window.  Sticky
+   * label cells must stay OPAQUE (they occlude scrolled cells), so they
+   * paint the well tone rather than glass. */
   .grid-scroll {
     overflow: auto;
     max-height: 100%;
-    border: 1px solid var(--border);
-    background: var(--bg-alt);
+    border-radius: var(--radius);
+    background: var(--bg);
+  }
+  /* A narrow probe roster should not paint a full-drawer black well around
+     a five-column heatmap. Hug the matrix and center it; once the roster is
+     wider than the drawer, the same wrapper becomes the horizontal scroller. */
+  .probe-grid {
+    width: max-content;
+    max-width: 100%;
+    margin-inline: auto;
   }
   .grid {
     border-collapse: separate;
-    border-spacing: 0;
+    border-spacing: 1px;
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
   .grid th,
   .grid td {
     padding: 0;
     margin: 0;
-    background: var(--bg-alt);
+    background: var(--bg);
   }
   /* Sticky row + column labels so orientation survives long scrolls. */
   .grid thead th {
     position: sticky;
     top: 0;
     z-index: 2;
-    border-bottom: 1px solid var(--border);
+    box-shadow: var(--shadow-sticky);
   }
   .grid .row-label {
     position: sticky;
@@ -1010,7 +1112,8 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--border);
+    font-weight: var(--weight-normal);
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
   }
   .grid .corner {
@@ -1020,14 +1123,15 @@
     z-index: 3;
     color: var(--fg-muted);
     font-size: var(--text-xs);
+    font-weight: var(--weight-normal);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    border-right: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
+    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
   }
   .grid .col-label {
     color: var(--fg-dim);
     font-size: var(--text-xs);
+    font-weight: var(--weight-normal);
     padding: 0;
     /* Rotate compact column labels so they fit narrow cells.  Wrap the
      * inner span so the rotation pivots around the cell box, not the
@@ -1050,18 +1154,26 @@
   }
 
   /* Logits tab — chosen-row summary line and the ranked alts table. */
-  .logits-summary {
+  .tab-summary {
     padding: 0 0 var(--space-4) 0;
     color: var(--fg);
     font-size: var(--text-sm);
     line-height: 1.6;
   }
-  .logits-summary .kv {
+  .tab-summary .kv {
     color: var(--fg-dim);
     margin-left: var(--space-4);
   }
-  .logits-summary strong {
+  .tab-summary strong {
     color: var(--fg-strong);
+    font-family: var(--font-mono);
+  }
+  .tok-inline {
+    color: var(--fg);
+    font-family: var(--font-mono);
+    background: var(--glass-strong);
+    border-radius: var(--radius-sm);
+    padding: 0 var(--space-2);
   }
   .logits-table {
     width: 100%;
@@ -1073,20 +1185,23 @@
   .logits-table th,
   .logits-table td {
     padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--border);
     text-align: left;
-    background: var(--bg-alt);
+    background: var(--bg);
   }
   .logits-table thead th {
     position: sticky;
     top: 0;
     z-index: 1;
     color: var(--fg-muted);
-    font-weight: var(--weight-normal);
+    font-family: var(--font-ui);
+    font-weight: var(--weight-medium);
     font-size: var(--text-xs);
     text-transform: uppercase;
-    letter-spacing: 0;
-    border-bottom: 1px solid var(--border);
+    letter-spacing: 0.06em;
+    box-shadow: var(--shadow-sticky);
+  }
+  .logits-table td {
+    font-family: var(--font-mono);
   }
   .logits-table td.num,
   .logits-table th.num {
@@ -1099,16 +1214,54 @@
     background: transparent;
     word-break: break-all;
   }
-  /* Chosen row gets a soft tint + a heavier color so it reads at a
-     glance.  Reuses the same accent rationale as the branch toggle's
-     active state. */
-  .logits-table tr.chosen td {
+  .logits-table tbody tr:hover td {
+    background: color-mix(in srgb, var(--bg-hover) 60%, var(--bg));
+  }
+  /* Chosen row gets a soft accent wash + a heavier color so it reads at
+     a glance. */
+  .logits-table tr.chosen td,
+  .logits-table tbody tr.chosen:hover td {
     background: var(--accent-subtle);
     color: var(--fg-strong);
   }
-  /* J-lens tab — the workspace readout matrix.  Same table chrome as the
-     logits table; cells carry an inline probability tint, so the static
-     styles stay layout-only. */
+  /* J-lens tab — the layer-aggregated chip row above the matrix. */
+  .lens-agg {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+  }
+  .lens-agg-label {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-right: var(--space-2);
+  }
+  .lens-agg-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    background: color-mix(in srgb, var(--pillar-lens) 16%, var(--glass));
+    border: 1px solid transparent;
+    border-radius: var(--radius-pill);
+    padding: 1px var(--space-4);
+  }
+  .lens-agg-tok {
+    color: var(--pillar-lens);
+  }
+  .lens-agg-com {
+    color: var(--fg-muted);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
+  }
+  /* J-lens tab — the all-layer readout matrix. Same well chrome as the
+     logits table; cells carry an inline probability tint in the lens
+     family blue, so the static styles stay layout-only. */
   .lens-table {
     border-collapse: separate;
     border-spacing: 0;
@@ -1118,24 +1271,26 @@
   .lens-table th,
   .lens-table td {
     padding: var(--space-1) var(--space-3);
-    border-bottom: 1px solid var(--border);
     text-align: left;
-    background: var(--bg-alt);
+    background: var(--bg);
   }
   .lens-table thead th {
     position: sticky;
     top: 0;
     z-index: 2;
     color: var(--fg-muted);
-    font-weight: var(--weight-normal);
+    font-family: var(--font-ui);
+    font-weight: var(--weight-medium);
     font-size: var(--text-xs);
     text-transform: uppercase;
+    letter-spacing: 0.06em;
+    box-shadow: var(--shadow-sticky);
   }
   .lens-table .corner {
     position: sticky;
     left: 0;
     z-index: 3;
-    border-right: 1px solid var(--border);
+    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
   }
   .lens-table .row-label {
     position: sticky;
@@ -1143,15 +1298,11 @@
     z-index: 1;
     text-align: right;
     color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-weight: var(--weight-normal);
     font-size: var(--text-xs);
-    border-right: 1px solid var(--border);
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
-  }
-  .lens-table .row-label.band {
-    color: var(--accent-blue);
-  }
-  .lens-table tr.off-band td {
-    opacity: 0.55;
   }
   .lens-cell {
     font-family: var(--font-mono);
@@ -1168,6 +1319,7 @@
   .steer-chip code {
     color: var(--fg-strong);
     background: transparent;
+    font-family: var(--font-mono);
   }
   .steer-toggle {
     cursor: pointer;
@@ -1179,54 +1331,18 @@
     margin-right: var(--space-1);
   }
 
-  .mini {
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-elev);
-    color: var(--accent);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    padding: var(--space-1) var(--space-3);
-  }
-  .mini:hover:not(:disabled) {
-    border-color: var(--accent);
-    color: var(--fg);
-  }
-  .mini:disabled {
-    color: var(--fg-muted);
-    cursor: not-allowed;
-  }
   .branch-error {
     color: var(--accent-error);
     font-size: var(--text-sm);
     margin: var(--space-4) 0 0;
   }
-  .link-btn {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--accent);
-    font: inherit;
-    font-family: var(--font-mono);
-    cursor: pointer;
-    padding: var(--space-1) var(--space-4);
-  }
-  .link-btn:hover:not(:disabled) {
-    color: var(--fg-strong);
-    border-color: var(--accent);
-  }
-  .link-btn:disabled {
-    color: var(--fg-muted);
-    cursor: default;
-  }
 
   .drawer-footer {
-    border-top: 1px solid var(--border);
-    padding: var(--space-2) var(--space-4);
+    padding: var(--space-3) var(--space-6);
     color: var(--fg-muted);
     font-size: var(--text-xs);
   }
   .hint {
-    line-height: 1.4;
+    line-height: 1.5;
   }
 </style>

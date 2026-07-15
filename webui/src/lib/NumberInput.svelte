@@ -106,6 +106,29 @@
     emitChange(v);
   }
 
+  function handleKeydown(ev: KeyboardEvent): void {
+    onkeydown?.(ev);
+    if (ev.defaultPrevented || ev.key !== "Enter") return;
+    // Own Enter completely.  Letting the native number input / surrounding
+    // form continue after our explicit commit can dispatch a second change or
+    // activate a neighbouring default button; in the sampling strip that
+    // turned a just-entered max-token value into the field minimum and could
+    // start a generation with the wrong cap.
+    ev.preventDefault();
+    ev.stopPropagation();
+    // Native number inputs do not consistently emit ``change`` on Enter
+    // (Chrome waits for blur), despite Enter being the explicit commit
+    // gesture promised by this component. Commit the current draft here so
+    // keyboard-only users and form-adjacent controls apply immediately.
+    const raw = inputEl?.value ?? "";
+    if (raw === "") {
+      emitChange(allowEmpty ? null : 0);
+      return;
+    }
+    const v = Number(raw);
+    if (Number.isFinite(v)) emitChange(v);
+  }
+
   function nudge(direction: 1 | -1): void {
     if (disabled) return;
     const base = value ?? 0;
@@ -136,7 +159,7 @@
     aria-label={ariaLabel}
     oninput={onInput}
     onchange={onChange}
-    {onkeydown}
+    onkeydown={handleKeydown}
   />
   {#if !disabled}
     <span class="sk-number-steppers" aria-hidden="true">
@@ -171,15 +194,17 @@
     width: 100%;
     padding: var(--space-2) var(--space-3);
     padding-right: var(--space-6); /* room for the steppers */
-    background: var(--bg-elev);
+    /* Borderless input: recessed well fill; ring on focus only. */
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
     font: inherit;
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     -moz-appearance: textfield;
     appearance: textfield;
+    transition: border-color var(--dur-fast) var(--ease-out);
   }
   .sk-number-input::-webkit-outer-spin-button,
   .sk-number-input::-webkit-inner-spin-button {
@@ -187,8 +212,9 @@
     margin: 0;
   }
   .sk-number-input:focus-visible {
-    outline: 2px solid var(--accent-glow);
+    outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
+    border-color: var(--accent-glow);
   }
   .sk-number-input:disabled {
     opacity: 0.5;
@@ -212,7 +238,6 @@
   .sk-number:focus-within .sk-number-steppers {
     opacity: 1;
     pointer-events: auto;
-    border-left-color: var(--border);
   }
 
   .sk-number-step {
@@ -228,7 +253,7 @@
       color var(--dur-fast) var(--ease-out);
   }
   .sk-number-step:hover {
-    background: var(--accent-subtle);
+    background: var(--bg-hover);
     color: var(--accent);
   }
   .sk-number-step:active {

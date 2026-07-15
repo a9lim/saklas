@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import json
 
 import pytest
 import torch
 
 from saklas.core.errors import SaklasError
 from saklas.core.profile import Profile, ProfileError
-from saklas.io.packs import PACK_FORMAT_VERSION
+from saklas.io.packs import PROFILE_FORMAT_VERSION
 
 
 def _mk(layers: Any = (0, 5, 10), dim: int = 8, dtype: Any = torch.float32) -> dict[int, torch.Tensor]:
@@ -79,15 +80,17 @@ def test_save_load_roundtrip(tmp_path: Path):
     for idx in loaded.layers:
         assert torch.allclose(loaded[idx], p[idx])
     assert loaded.metadata["method"] == "contrastive_pca"
-    assert loaded.metadata["format_version"] == PACK_FORMAT_VERSION
+    assert loaded.metadata["format_version"] == PROFILE_FORMAT_VERSION
 
 
-def test_merged_intersection_semantics():
+def test_merged_union_semantics():
     a = Profile({0: torch.ones(4), 1: torch.ones(4), 2: torch.ones(4)})
     b = Profile({1: torch.ones(4) * 2, 2: torch.ones(4) * 2, 3: torch.ones(4) * 2})
     merged = Profile.merged([(a, 1.0), (b, 0.5)])
-    # intersection = {1, 2}
-    assert merged.layers == [1, 2]
+    # Live expression parity: missing terms contribute zero on union layers.
+    assert merged.layers == [0, 1, 2, 3]
+    assert torch.allclose(merged[0], torch.ones(4))
+    assert torch.allclose(merged[3], torch.ones(4))
     # 1*1 + 0.5*2 = 2
     assert torch.allclose(merged[1], torch.full((4,), 2.0))
     assert torch.allclose(merged[2], torch.full((4,), 2.0))
@@ -353,13 +356,48 @@ def test_save_metadata_override_merges_on_top_of_self_metadata(tmp_path: Path):
     """
     p = Profile(
         _mk(layers=(0, 1)),
-        metadata={"method": "contrastive_pca", "statements_sha256": "selfhash"},
+        metadata={"method": "contrastive_pca", "statements_sha256": "a" * 64},
     )
     path = tmp_path / "cv.safetensors"
-    p.save(path, metadata={"method": "overridden"})
+    p.save(path, metadata={"method": "profile"})
     loaded = Profile.load(path)
-    assert loaded.metadata["method"] == "overridden"
-    assert loaded.metadata["statements_sha256"] == "selfhash"
+    assert loaded.metadata["method"] == "profile"
+    assert loaded.metadata["statements_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize("metadata", [
+    {"method": "invented"},
+    {"method": "profile", "diagnostics": {0: {"score": "1.0"}}},
+    {"method": "profile", "components": {"x": {}}},
+    {"method": "profile", "sae_release": "r"},
+    {"method": "profile", "source_model_id": "src"},
+])
+def test_invalid_nested_metadata_rejects_before_publication(
+    tmp_path: Path, metadata: dict[str, Any],
+) -> None:
+    path = tmp_path / "invalid.safetensors"
+    with pytest.raises(ProfileError):
+        Profile(_mk(layers=(0, 1))).save(path, metadata=metadata)
+    assert not path.exists()
+    assert not path.with_suffix(".json").exists()
+
+
+def test_profile_digest_binds_tensor_pair(tmp_path: Path) -> None:
+    path = tmp_path / "profile.safetensors"
+    Profile(_mk(layers=(0,))).save(path, metadata={"method": "profile"})
+    sidecar = json.loads(path.with_suffix(".json").read_text())
+    sidecar["tensor_sha256"] = "0" * 64
+    path.with_suffix(".json").write_text(json.dumps(sidecar))
+    with pytest.raises(ProfileError, match="tensor sha256"):
+        Profile.load(path)
+
+
+def test_profile_per_layer_metadata_requires_exact_coverage(tmp_path: Path) -> None:
+    path = tmp_path / "profile.safetensors"
+    with pytest.raises(ProfileError, match="cover tensor layers"):
+        Profile(_mk(layers=(0, 1))).save(path, metadata={
+            "method": "profile", "diagnostics": {0: {"score": 1.0}},
+        })
 
 
 # ---------------------------------------------------------------------------

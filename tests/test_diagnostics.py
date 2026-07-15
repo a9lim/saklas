@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from saklas.core import vectors as V
+from saklas.core import profile as V
 from saklas.core.profile import Profile
 
 
@@ -60,15 +60,14 @@ class TestSidecarRoundTrip:
         assert meta["diagnostics"][0]["evr"] == pytest.approx(0.62)
         assert meta["diagnostics"][2]["inter_pair_alignment"] == pytest.approx(0.55)
 
-    def test_old_sidecar_without_diagnostics_loads_clean(self, tmp_path: Path) -> None:
-        # Simulate a v1.5-era sidecar: no diagnostics_by_layer key at all.
+    def test_current_sidecar_without_diagnostics_loads_clean(self, tmp_path: Path) -> None:
         profile_dict = {0: torch.ones(4)}
         path = tmp_path / "old.safetensors"
         V.save_profile(profile_dict, str(path), {"method": "contrastive_pca"})
 
         with open(path.with_suffix(".json")) as f:
             raw = json.load(f)
-        assert "diagnostics_by_layer" not in raw
+        assert raw["diagnostics_by_layer"] is None
 
         _, meta = V.load_profile(str(path))
         assert "diagnostics" not in meta

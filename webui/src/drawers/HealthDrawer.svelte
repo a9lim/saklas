@@ -7,6 +7,7 @@
     probeRack,
     refreshCorrelation,
     refreshLoomTree,
+    refreshManifoldList,
     refreshProbeList,
     refreshSession,
     refreshVectorList,
@@ -14,6 +15,7 @@
     steerRack,
     vectorsState,
   } from "../lib/stores.svelte";
+  import Button from "../lib/ui/Button.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
@@ -29,8 +31,8 @@
     const out: string[] = [];
     if (!sessionState.info) out.push("session info is not loaded");
     if (sessionState.error) out.push(sessionState.error);
-    if (loomTree.unavailable) out.push("loom API unavailable; branch workflows are disabled");
-    if (vectorsState.names.length === 0) out.push("no vectors registered in the session");
+    if (loomTree.error) out.push(`loom API error: ${loomTree.error}`);
+    if (steerRack.catalog.length === 0) out.push("no manifold artifacts are available");
     if (probeRack.active.length === 0) out.push("no active probes; internal-state views will be sparse");
     return out;
   });
@@ -44,6 +46,7 @@
         refreshVectorList(),
         refreshProbeList(),
         refreshLoomTree(),
+        refreshManifoldList(),
         refreshCorrelation(),
       ]);
       lastAudit = new Date().toLocaleTimeString();
@@ -56,12 +59,11 @@
 </script>
 
 <section class="drawer-shell" aria-label="Health drawer">
-  <header class="header">
-    <div>
-      <span class="title">model health</span>
-      <p>runtime readiness, tree state, vectors, probes, and UI coverage</p>
+  <header class="drawer-header">
+    <div class="title">
+      <span class="eyebrow">model health</span>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">
@@ -70,9 +72,9 @@
         <h2>{sessionState.info?.model_id ?? "no model"}</h2>
         <p>{sessionState.info ? `${sessionState.info.device}/${sessionState.info.dtype}` : "session offline"}</p>
       </div>
-      <button type="button" disabled={busy} onclick={audit}>
-        {busy ? "auditing…" : "refresh audit"}
-      </button>
+      <Button variant="solid" disabled={busy} onclick={audit}>
+        {busy ? "checking…" : "refresh"}
+      </Button>
     </section>
 
     {#if errorMsg}
@@ -86,33 +88,33 @@
         <p>{genStatus.tokensSoFar}/{genStatus.maxTokens || "—"} tokens · {genStatus.tokPerSec.toFixed(1)} tok/s</p>
       </div>
       <div class="tile">
-        <span>perplexity</span>
+        <span>ppl</span>
         <strong>{ppl === null ? "—" : ppl.toFixed(2)}</strong>
-        <p>{genStatus.ppl.count} scored steps</p>
+        <p>{genStatus.ppl.count} steps</p>
       </div>
       <div class="tile">
         <span>loom tree</span>
         <strong>{loomTree.nodes.size || "—"}</strong>
-        <p>rev {loomTree.rev || "—"} · active depth {loomTree.activePath.length || "—"}</p>
+        <p>rev {loomTree.loaded ? loomTree.rev : "—"} · depth {loomTree.activePath.length || "—"}</p>
       </div>
       <div class="tile">
-        <span>vectors</span>
-        <strong>{vectorsState.names.length}</strong>
-        <p>{steerRack.entries.size} on rack · {steerRack.profiles.size} profiles cached</p>
+        <span>artifacts</span>
+        <strong>{steerRack.catalog.length}</strong>
+        <p>{steerRack.entries.size} racked · {vectorsState.names.length} resident</p>
       </div>
       <div class="tile">
         <span>probes</span>
         <strong>{probeRack.active.length}</strong>
-        <p>{probeRack.entries.size} live rows · {steerRack.correlation ? "correlation cached" : "no matrix"}</p>
+        <p>{probeRack.entries.size} rows · {steerRack.correlation ? "matrix cached" : "no matrix"}</p>
       </div>
     </section>
 
     <section class="panel">
-      <h3>readiness checks</h3>
+      <h3>checks</h3>
       <div class="checks">
         <div class:ok={!!sessionState.info}>session metadata</div>
-        <div class:ok={!loomTree.unavailable && loomTree.rev > 0}>loom API</div>
-        <div class:ok={vectorsState.names.length > 0}>vector registry</div>
+        <div class:ok={loomTree.loaded && !loomTree.error}>loom API</div>
+        <div class:ok={steerRack.catalog.length > 0}>manifold catalog</div>
         <div class:ok={probeRack.active.length > 0}>probe monitor</div>
         <div class:ok={steerRack.correlation !== null}>correlation cache</div>
       </div>
@@ -121,7 +123,7 @@
     <section class="panel">
       <h3>warnings</h3>
       {#if warnings.length === 0}
-        <p class="good">no visible health warnings from the web client cache</p>
+        <p class="good">clear</p>
       {:else}
         <ul>
           {#each warnings as warning (warning)}
@@ -130,34 +132,160 @@
         </ul>
       {/if}
       {#if lastAudit}
-        <p class="dim">last audit: {lastAudit}</p>
+        <p class="dim">updated {lastAudit}</p>
       {/if}
     </section>
   </div>
 </section>
 
 <style>
-  .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: var(--bg-alt); }
-  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-6) var(--space-6); border-bottom: 1px solid var(--border); background: var(--surface); }
-  .title { color: var(--accent); text-transform: uppercase; letter-spacing: 0; font-size: var(--text-xs); font-weight: var(--weight-bold); }
-  .header p, .hero p, .tile p, .dim { margin: var(--space-1) 0 0; color: var(--fg-muted); }
-  .close { background: transparent; border: 0; color: var(--fg-muted); font-size: var(--text-md); }
-  .body { display: grid; gap: var(--space-5); padding: var(--space-6); overflow: auto; }
-  .hero, .tile, .panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: var(--space-6); }
-  .hero { display: flex; align-items: center; justify-content: space-between; gap: var(--space-6); }
-  h2, h3 { margin: 0; color: var(--fg); letter-spacing: 0; }
-  h2 { font-size: var(--text); }
-  h3 { font-size: var(--text-sm); margin-bottom: var(--space-5); }
-  button { border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent-subtle); color: var(--accent); padding: var(--space-5) var(--space-5); font-weight: var(--weight-bold); }
-  button:disabled { opacity: 0.55; cursor: wait; }
-  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-5); }
-  .tile span { color: var(--fg-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0; }
-  .tile strong { display: block; margin-top: var(--space-2); color: var(--accent); font-family: var(--font-mono); font-size: var(--text); }
-  .checks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-3); }
-  .checks div { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-4); color: var(--fg-muted); background: var(--bg-elev); }
-  .checks div.ok { color: var(--accent-green); border-color: var(--accent-green); background: rgba(126,231,135,0.07); }
-  ul { margin: 0; padding-left: var(--space-6); color: var(--accent-amber); }
+  /* v2 sheet interior — the host paints the sheet surface (glass hairline,
+   * radius, --bg-alt fill), so the root is transparent; chrome speaks sans
+   * and every value/identifier/number sits in mono. */
+  .drawer-shell {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: transparent;
+    color: var(--fg);
+    font-family: var(--font-ui);
+    font-size: var(--text);
+  }
+  .drawer-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+  }
+  .title {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .eyebrow {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .hero p, .tile p, .dim {
+    margin: var(--space-1) 0 0;
+    color: var(--fg-muted);
+    line-height: 1.5;
+  }
+  .close {
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .close:hover {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
+  .body {
+    display: grid;
+    gap: var(--space-5);
+    padding: var(--space-5) var(--space-6);
+    overflow: auto;
+  }
+  /* Data wells — recessed stat/summary containers. */
+  .hero, .tile, .panel {
+    border-radius: var(--radius);
+    background: var(--bg);
+    padding: var(--space-6);
+  }
+  .hero {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-6);
+  }
+  h2, h3 { margin: 0; color: var(--fg); }
+  h2 {
+    font-family: var(--font-mono);
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
+  }
+  h3 {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: var(--space-5);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-5);
+  }
+  .tile span {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .tile strong {
+    display: block;
+    margin-top: var(--space-2);
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: var(--text-md);
+    font-variant-numeric: tabular-nums;
+  }
+  .checks {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-3);
+  }
+  .checks div {
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    padding: var(--space-4);
+    color: var(--fg-muted);
+    background: var(--bg-elev);
+    font-size: var(--text-sm);
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .checks div.ok {
+    color: var(--accent-green);
+    border-color: color-mix(in srgb, var(--accent-green) 35%, var(--glass-line));
+    background: color-mix(in srgb, var(--accent-green) 8%, var(--bg-elev));
+  }
+  ul {
+    margin: 0;
+    padding-left: var(--space-6);
+    color: var(--accent-yellow);
+    line-height: 1.5;
+  }
   li + li { margin-top: var(--space-2); }
-  .good { color: var(--accent-green); margin: 0; }
-  .error { color: var(--accent-red); border: 1px solid var(--accent-red); background: rgba(255,118,117,0.08); border-radius: var(--radius); padding: var(--space-5); }
+  .good { color: var(--accent-green); margin: 0; line-height: 1.5; }
+  .error {
+    color: var(--accent-error);
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    border-radius: var(--radius);
+    padding: var(--space-5);
+    line-height: 1.5;
+  }
 </style>

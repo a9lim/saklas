@@ -19,7 +19,6 @@
   // ``s`` / ``m`` are the narrowed entry views the template renders behind
   // ``{#if s}`` / ``{#if m}`` so svelte-check enforces mode-correct access.
 
-  import type { Trigger } from "../../lib/types";
   import type { SteerEntry, SubspaceSteerEntry, ManifoldSteerEntry } from "../../lib/types";
   import {
     setSubspaceCoords,
@@ -40,6 +39,8 @@
   import Select from "../../lib/Select.svelte";
   import XYPad from "../manifold/XYPad.svelte";
   import RackCard from "./RackCard.svelte";
+  import RackMarker from "./RackMarker.svelte";
+  import { TRIGGER_LABEL, TRIGGER_WORD, nextTrigger } from "./triggers";
 
   interface Props {
     name: string;
@@ -60,9 +61,6 @@
 
   const subspace = $derived(entry.mode === "subspace");
   const accent = $derived(subspace ? "--accent" : "--accent-purple");
-  const enableGlyph = $derived(
-    subspace ? (entry.enabled ? "●" : "○") : (entry.enabled ? "◆" : "◇"),
-  );
 
   /** Display name — bare name with the namespace prefix stripped
    *  (``default/personas`` → ``personas``).  Full name stays in the tooltip. */
@@ -74,39 +72,10 @@
   const fitted = $derived(info?.fitted_for_session === true);
   const stale = $derived(info?.stale === true);
 
-  // ---------- trigger cycle (shared) ----------
-
-  const TRIGGER_ORDER: Trigger[] = [
-    "BOTH",
-    "BEFORE",
-    "AFTER",
-    "THINKING",
-    "RESPONSE",
-    "PROMPT",
-    "GENERATED",
-  ];
-  const TRIGGER_WORD: Record<Trigger, string> = {
-    BOTH: "both",
-    BEFORE: "before",
-    AFTER: "after",
-    THINKING: "thinking",
-    RESPONSE: "response",
-    PROMPT: "prompt",
-    GENERATED: "generated",
-  };
-  const TRIGGER_LABEL: Record<Trigger, string> = {
-    BOTH: "both: steer the whole turn (default)",
-    BEFORE: "before: steer thinking and response",
-    AFTER: "after: steer the after-thinking response only",
-    THINKING: "thinking: steer the chain-of-thought only",
-    RESPONSE: "response: steer the generated response only",
-    PROMPT: "prompt (alias of before)",
-    GENERATED: "generated (alias of response)",
-  };
+  // ---------- trigger cycle (shared vocabulary in ./triggers) ----------
 
   function cycleTrigger(): void {
-    const idx = TRIGGER_ORDER.indexOf(entry.trigger);
-    const next = TRIGGER_ORDER[(idx + 1) % TRIGGER_ORDER.length];
+    const next = nextTrigger(entry.trigger);
     if (entry.mode === "subspace") setSubspaceTrigger(name, next);
     else setManifoldTrigger(name, next);
   }
@@ -165,11 +134,14 @@
       class="enable"
       class:off={!entry.enabled}
       onclick={toggleEnabled}
-      title={entry.enabled ? "Enabled (click to disable)" : "Disabled (click to enable)"}
+      title={entry.enabled ? "disable" : "enable"}
       aria-pressed={entry.enabled}
       aria-label="Toggle steering for {name}"
     >
-      {enableGlyph}
+      <RackMarker
+        shape={subspace ? "circle" : "diamond"}
+        filled={entry.enabled}
+      />
     </button>
 
     <span class="name" class:struck={!entry.enabled} title={subspace ? `subspace ${name}` : `manifold ${name}`}>
@@ -177,11 +149,11 @@
     </span>
 
     {#if !fitted && info}
-      <span class="warn" title="no fitted tensor for the loaded model — fit it from the manifolds drawer">
+      <span class="warn" title="fit required">
         unfitted
       </span>
     {:else if stale}
-      <span class="warn" title="the fitted tensor is stale — node geometry changed since the fit">
+      <span class="warn" title="refit required">
         stale
       </span>
     {/if}
@@ -192,7 +164,7 @@
       type="button"
       class="trigger-pill"
       onclick={cycleTrigger}
-      title="trigger: {TRIGGER_LABEL[entry.trigger]} (click to cycle)"
+      title="trigger: {TRIGGER_LABEL[entry.trigger]}"
       aria-label="trigger for {name}: {entry.trigger}"
     >
       {TRIGGER_WORD[entry.trigger]}
@@ -213,14 +185,14 @@
     {#if info}
       {#if info.node_labels.length > 0}
         <label class="ctl-row">
-          <span class="ctl-label">snap to node</span>
+          <span class="ctl-label">node</span>
           <span class="ctl-select">
             <Select
               value={activeLabel ?? ""}
               options={snapOptions}
               onchange={onSnapToNode}
               ariaLabel="snap to node"
-              title="pick a node to lock to label-form, or '(free position)' to set coords with the sliders"
+              title="node or free position"
             />
           </span>
         </label>
@@ -243,7 +215,7 @@
             step={0.05}
             oninput={onBlendInput}
             ariaLabel="along fraction for {name}"
-            title="along — how far to slide toward the manifold position"
+            title="along"
           />
           <span class="along-val" title="along fraction">{m.blend.toFixed(2)}</span>
         </div>
@@ -256,17 +228,15 @@
             step={0.05}
             oninput={onOntoInput}
             ariaLabel="onto fraction for {name}"
-            title="onto — collapse the off-surface residual onto the manifold (curved only)"
+            title="onto"
           />
           <span class="along-val" title="onto fraction">{m.onto.toFixed(2)}</span>
         </div>
       {:else}
-        <p class="hint">magnitude: shared “subspace along” at the top of the rack</p>
+        <p class="hint">shared rack magnitude</p>
       {/if}
     {:else}
-      <p class="missing">
-        manifold metadata unavailable — coordinates are still applied.
-      </p>
+      <p class="missing">metadata unavailable</p>
     {/if}
   {/snippet}
 </RackCard>
@@ -274,13 +244,17 @@
 <style>
   /* ----- statline pieces ----- */
   .enable {
+    display: inline-grid;
+    place-items: center;
+    inline-size: 24px;
+    block-size: 24px;
+    margin: 0 -3px;
     background: transparent;
     border: 0;
-    padding: 0 var(--space-1);
+    border-radius: var(--radius-sm);
+    padding: 0;
     color: var(--card-accent);
-    font-size: var(--text);
-    line-height: 1;
-    flex: 0 0 auto;
+    flex: 0 0 24px;
     cursor: pointer;
   }
   .enable.off {
@@ -305,7 +279,8 @@
     flex: 0 0 auto;
     color: var(--accent-yellow);
     font-size: var(--text-2xs);
-    border: 1px solid var(--accent-yellow);
+    background: color-mix(in srgb, var(--accent-yellow) 15%, transparent);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: 0 var(--space-2);
   }
@@ -316,24 +291,25 @@
   }
 
   .trigger-pill {
-    background: transparent;
+    min-height: 24px;
+    background: var(--glass);
     color: var(--fg-strong);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     padding: var(--space-1) var(--space-3);
     border-radius: var(--radius);
     font-size: var(--text-xs);
     line-height: 1.2;
     flex: 0 0 auto;
     cursor: pointer;
-    transition: background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out);
+    transition: background var(--dur) var(--ease-out);
   }
   .trigger-pill:hover {
-    background: var(--bg-elev);
-    border-color: var(--fg-muted);
+    background: var(--glass-strong);
   }
 
   .icon {
+    min-width: 24px;
+    min-height: 24px;
     background: transparent;
     border: 0;
     color: var(--fg-muted);
@@ -359,6 +335,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
+    min-width: 0;
     color: var(--fg-strong);
     font-size: var(--text-xs);
   }
@@ -369,10 +346,12 @@
   .ctl-select {
     flex: 1 1 auto;
     display: inline-flex;
+    min-width: 0;
+    max-width: 100%;
   }
   .along-row {
     display: grid;
-    grid-template-columns: minmax(3em, auto) 1fr 3em;
+    grid-template-columns: minmax(3em, auto) minmax(0, 1fr) 3em;
     align-items: center;
     gap: var(--space-2);
   }

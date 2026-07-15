@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from saklas.io.manifolds import (
+    MANIFOLD_FORMAT_VERSION,
     ManifoldFolder,
     ManifoldFormatError,
     create_discover_manifold_folder,
@@ -121,7 +122,7 @@ def test_templated_sha_sensitive_to_template_context_edit(
 def test_non_templated_discover_has_no_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """An ordinary discover folder stays byte-identical: no template_ref."""
+    """An ordinary discover folder carries an explicit null template_ref."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = create_discover_manifold_folder(
         "local", "plain", "", fit_mode="pca",
@@ -130,9 +131,9 @@ def test_non_templated_discover_has_no_ref(
     )
     mf = ManifoldFolder.load(folder)
     assert mf.template_ref is None
-    # The manifest is byte-identical to the pre-template shape (no ref key).
+    # The canonical manifest carries an explicit null reference.
     payload = json.loads((folder / "manifold.json").read_text())
-    assert "template_ref" not in payload
+    assert payload["template_ref"] is None
 
 
 def test_load_rejects_template_ref_on_authored(tmp_path: Path):
@@ -140,19 +141,22 @@ def test_load_rejects_template_ref_on_authored(tmp_path: Path):
     folder = tmp_path / "bad"
     (folder / "nodes").mkdir(parents=True)
     (folder / "manifold.json").write_text(json.dumps({
-        "format_version": 5,
-        "name": "bad",
-        "fit_mode": "authored",
+        "format_version": MANIFOLD_FORMAT_VERSION,
+            "name": "bad",
+            "description": "",
+            "fit_mode": "authored",
         "domain": {"type": "box", "axes": [
-            {"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0},
+            {"name": "t", "periodic": False, "period": 1.0,
+             "lo": 0.0, "hi": 1.0},
         ]},
         "nodes": [
-            {"label": "a", "coords": [0.0]},
-            {"label": "b", "coords": [0.5]},
-            {"label": "c", "coords": [1.0]},
+            {"label": "a", "coords": [0.0], "role": None, "kind": None},
+            {"label": "b", "coords": [0.5], "role": None, "kind": None},
+            {"label": "c", "coords": [1.0], "role": None, "kind": None},
         ],
         "template_ref": "weekday",
         "files": {},
+        "source": "local", "tags": [],
     }))
     with pytest.raises(ManifoldFormatError, match="discover-mode feature"):
         ManifoldFolder.load(folder)

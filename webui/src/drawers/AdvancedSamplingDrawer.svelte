@@ -44,9 +44,8 @@
   <header class="header">
     <div>
       <span class="title">advanced sampling</span>
-      <p>per-run controls for stop strings and logit bias</p>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>×</button>
+    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
   </header>
 
   <div class="body">
@@ -62,11 +61,7 @@
           >{m.label}</button>
         {/each}
       </div>
-      <p class="hint">
-        the {genUiMode.mode} surface is active. this is a
-        {isBaseModel ? "base" : "chat"} model, so {isBaseModel ? "raw" : "chat"}
-        is its default. switching mode never changes the loom tree.
-      </p>
+      <p class="hint">default: {isBaseModel ? "raw" : "chat"} · tree unchanged</p>
     </section>
 
     <section class="panel">
@@ -104,33 +99,48 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    background: var(--bg-alt);
+    background: transparent;
   }
   .header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
     gap: var(--space-6);
-    padding: var(--space-6) var(--space-6);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-5) var(--space-6);
     background: var(--surface);
   }
   .title {
     color: var(--accent);
-    text-transform: uppercase;
     letter-spacing: 0;
-    font-size: var(--text-xs);
-    font-weight: var(--weight-bold);
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
   p {
     margin: var(--space-2) 0 0;
     color: var(--fg-muted);
   }
   .close {
-    background: transparent;
-    border: 0;
+    background: var(--glass);
     color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
     font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .close:hover {
+    color: var(--fg);
+    background: var(--glass-strong);
   }
   .body {
     display: grid;
@@ -139,9 +149,9 @@
     overflow: auto;
   }
   .panel {
-    border: 1px solid var(--border);
     border-radius: var(--radius);
-    background: var(--surface);
+    background: var(--glass);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     padding: var(--space-6);
   }
   h3 {
@@ -152,9 +162,9 @@
   }
   textarea {
     width: 100%;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
     padding: var(--space-4);
     font-family: var(--font-mono);
@@ -181,7 +191,6 @@
   .mode-row {
     display: flex;
     gap: var(--space-1);
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: var(--space-1);
     margin-bottom: var(--space-3);

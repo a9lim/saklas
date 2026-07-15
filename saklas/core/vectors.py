@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import functools
 import json
 import warnings
 from collections.abc import Sequence
 from importlib import resources as _resources
-from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+
+if TYPE_CHECKING:
+    from saklas.core.manifold import Manifold
 
 
 # Default chunk size for the batched capture path (:func:`_encode_and_capture_all_batch`
@@ -20,6 +21,107 @@ import torch
 # chunk's attention working set (``B · heads · T²``) stays comfortable on a single
 # 24 GB GPU at the A2 response cap; raise it on a roomier device for fewer forwards.
 _CAPTURE_BATCH = 16
+# Roomy accelerators should not be permanently capped at the conservative
+# starting width.  Fit-wide capture grows toward this ceiling after clean
+# batches and backs off on OOM; length bucketing keeps the larger batches from
+# turning one long response into quadratic padding work for every neighbour.
+_CAPTURE_BATCH_MAX = 64
+
+
+class _CaptureComplete(BaseException):
+    """Private non-error control flow: the last requested block has fired.
+
+    Causal-LM wrappers run final norm + the full vocabulary head after the
+    transformer stack.  Fitting consumes only residual-stream activations, so
+    the terminal capture hook aborts the wrapper before that unused projection.
+    ``BaseException`` keeps broad ``except Exception`` blocks inside model
+    wrappers from accidentally swallowing the sentinel.
+    """
+
+
+class _ReusablePooledCapture:
+    """Fit-scoped layer hooks reused across many pooled batch forwards."""
+
+    def __init__(
+        self, model: torch.nn.Module, layers: torch.nn.ModuleList,
+        layer_indices: Sequence[int],
+    ) -> None:
+        self.model = model
+        self.layers = layers
+        self.layer_indices = [int(idx) for idx in layer_indices]
+        if not self.layer_indices:
+            raise ValueError("layer_indices must select at least one layer")
+        self.terminal_layer = max(self.layer_indices)
+        self.captured: dict[int, torch.Tensor] = {}
+        self._rows: torch.Tensor | None = None
+        self._positions: torch.Tensor | None = None
+        self._promote = True
+        self._handles: list[Any] = []
+
+        def make_hook(idx: int):
+            def hook(_module: torch.nn.Module, _input: Any, output: Any) -> None:
+                h = output if isinstance(output, torch.Tensor) else output[0]
+                assert self._rows is not None and self._positions is not None
+                positions = self._positions.clamp(max=h.shape[1] - 1)
+                pooled = h[self._rows, positions, :].detach()
+                self.captured[idx] = (
+                    pooled.to(torch.float32)
+                    if self._promote and pooled.dtype != torch.float32
+                    else pooled
+                )
+                if idx == self.terminal_layer:
+                    raise _CaptureComplete()
+
+            return hook
+
+        try:
+            for idx in self.layer_indices:
+                self._handles.append(
+                    layers[idx].register_forward_hook(make_hook(idx)),
+                )
+        except BaseException:
+            self.close()
+            raise
+
+    def capture(
+        self, input_ids: torch.Tensor, *,
+        attention_mask: torch.Tensor | None,
+        pool_index: torch.Tensor,
+        promote_pooled: bool,
+    ) -> dict[int, torch.Tensor]:
+        self.captured = {}
+        self._rows = torch.arange(input_ids.shape[0], device=input_ids.device)
+        self._positions = pool_index.to(input_ids.device)
+        self._promote = promote_pooled
+        try:
+            with torch.inference_mode():
+                try:
+                    if attention_mask is not None:
+                        self.model(
+                            input_ids=input_ids, attention_mask=attention_mask,
+                            use_cache=False,
+                        )
+                    else:
+                        self.model(input_ids=input_ids, use_cache=False)
+                except _CaptureComplete:
+                    pass
+            if input_ids.device.type == "mps":
+                torch.mps.synchronize()
+            return self.captured
+        finally:
+            self._rows = None
+            self._positions = None
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+
+    def __enter__(self) -> "_ReusablePooledCapture":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
 
 
 def _capture_all_hidden_states(
@@ -30,6 +132,8 @@ def _capture_all_hidden_states(
     attention_mask: torch.Tensor | None = None,
     pool_index: "int | torch.Tensor | None" = None,
     layer_indices: Sequence[int] | None = None,
+    promote_pooled: bool = True,
+    capture_context: _ReusablePooledCapture | None = None,
 ):
     """Run one forward pass capturing hidden states at selected layers.
 
@@ -49,12 +153,31 @@ def _capture_all_hidden_states(
     ``layer_indices`` narrows hook registration to a subset; ``None`` captures
     every layer. Returns a dict mapping layer index to the retained tensor.
     """
+    if capture_context is not None:
+        if not isinstance(pool_index, torch.Tensor):
+            raise ValueError("reusable capture requires a per-row pool_index tensor")
+        requested = (
+            list(range(len(layers)))
+            if layer_indices is None else [int(idx) for idx in layer_indices]
+        )
+        if requested != capture_context.layer_indices:
+            raise ValueError(
+                "reusable capture layer selection does not match this forward"
+            )
+        return capture_context.capture(
+            input_ids, attention_mask=attention_mask, pool_index=pool_index,
+            promote_pooled=promote_pooled,
+        )
+
     captured_hidden: dict[int, torch.Tensor] = {}
     capture_layers = (
         list(range(len(layers)))
         if layer_indices is None
         else [int(idx) for idx in layer_indices]
     )
+    if not capture_layers:
+        raise ValueError("layer_indices must select at least one layer")
+    terminal_layer = max(capture_layers)
     per_row = isinstance(pool_index, torch.Tensor)
     # Precompute the gather index tensors once (not per layer/hook fire); both
     # are set iff ``per_row`` (the assert in the hook narrows them back).
@@ -81,18 +204,22 @@ def _capture_all_hidden_states(
                 pooled = h[_rows, pos, :].detach()
                 captured_hidden[idx] = (
                     pooled.to(torch.float32)
-                    if pooled.dtype != torch.float32
+                    if promote_pooled and pooled.dtype != torch.float32
                     else pooled
                 )
+                if idx == terminal_layer:
+                    raise _CaptureComplete()
                 return
             if pool_index is not None:
                 pos = min(max(int(pool_index), 0), h.shape[1] - 1)
                 pooled = h[0, pos, :].detach()
                 captured_hidden[idx] = (
                     pooled.to(torch.float32)
-                    if pooled.dtype != torch.float32
+                    if promote_pooled and pooled.dtype != torch.float32
                     else pooled.clone()
                 )
+                if idx == terminal_layer:
+                    raise _CaptureComplete()
                 return
             # No .clone() — with use_cache=False and inference_mode() the
             # residual-stream tensors are fresh allocations at each layer
@@ -100,6 +227,8 @@ def _capture_all_hidden_states(
             # the autograd graph reference so the rest of the forward pass
             # can't invalidate the data.
             captured_hidden[idx] = h.detach()
+            if idx == terminal_layer:
+                raise _CaptureComplete()
         return _hook
 
     handles = [
@@ -108,14 +237,17 @@ def _capture_all_hidden_states(
     ]
     try:
         with torch.inference_mode():
-            if attention_mask is not None:
-                model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                )
-            else:
-                model(input_ids=input_ids, use_cache=False)
+            try:
+                if attention_mask is not None:
+                    model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                    )
+                else:
+                    model(input_ids=input_ids, use_cache=False)
+            except _CaptureComplete:
+                pass
         # Single sync after the full forward pass — lazy backends (MPS)
         # may not have materialised tensor data yet.
         if input_ids.device.type == "mps":
@@ -144,7 +276,9 @@ def special_token_ids(tokenizer: Any) -> set[int]:
     return skip
 
 
-def last_content_index(token_ids: Sequence[int], tokenizer: Any) -> int:
+def last_content_index(
+    token_ids: Sequence[int], tokenizer: Any, *, skip: set[int] | None = None,
+) -> int:
     """Index of the last non-special token in ``token_ids``.
 
     Walks backward from the final position past every id in
@@ -161,7 +295,7 @@ def last_content_index(token_ids: Sequence[int], tokenizer: Any) -> int:
     idx = len(token_ids) - 1
     if idx < 0:
         return 0
-    skip = special_token_ids(tokenizer)
+    skip = special_token_ids(tokenizer) if skip is None else skip
     if skip:
         while idx > 0 and int(token_ids[idx]) in skip:
             idx -= 1
@@ -218,9 +352,10 @@ def _encode_and_capture_all(
         dict mapping layer_idx -> pooled vector (dim,) in fp32.
     """
     ids, content_end = _render_and_tokenize_for_capture(
-        tokenizer, prompt, response, device,
+        tokenizer, prompt, response,
         role=role, model_type=model_type, system_msg=system_msg,
     )
+    ids = ids.to(device)
     hidden_per_layer = _capture_all_hidden_states(
         model, layers, ids, pool_index=content_end,
         layer_indices=layer_indices,
@@ -240,9 +375,13 @@ def _encode_and_capture_all_batch(
     device: torch.device,
     *,
     role: str | None = None,
+    roles: Sequence[str | None] | None = None,
     model_type: str | None = None,
     system_msg: str = _LENGTH_DIRECTIVE,
     layer_indices: Sequence[int] | None = None,
+    rendered: "Sequence[tuple[torch.Tensor, int]] | None" = None,
+    promote_pooled: bool = True,
+    capture_context: _ReusablePooledCapture | None = None,
 ) -> dict[int, torch.Tensor]:
     """Batched conversational capture — one forward over a chunk of pairs.
 
@@ -270,34 +409,51 @@ def _encode_and_capture_all_batch(
             "batched capture needs len(prompts) == len(responses) "
             f"({len(prompts)} != {len(responses)})"
         )
-    rendered = [
-        _render_and_tokenize_for_capture(
-            tokenizer, prompt, response, device,
-            role=role, model_type=model_type, system_msg=system_msg,
+    if roles is not None and len(roles) != len(prompts):
+        raise ValueError(
+            "batched capture needs len(roles) == len(prompts) "
+            f"({len(roles)} != {len(prompts)})"
         )
-        for prompt, response in zip(prompts, responses, strict=True)
-    ]
-    seqs = [ids[0] for ids, _ in rendered]              # each (L_i,) on device
-    ends = [content_end for _, content_end in rendered]
+    if roles is not None and role is not None:
+        raise ValueError("batched capture accepts role= or roles=, not both")
+    if rendered is None:
+        rendered_rows = _prepare_capture_batch(
+            tokenizer, prompts, responses,
+            role=role, roles=roles, model_type=model_type,
+            system_msg=system_msg,
+        )
+    else:
+        if len(rendered) != len(prompts):
+            raise ValueError(
+                "rendered capture rows must align with prompts "
+                f"({len(rendered)} != {len(prompts)})"
+            )
+        rendered_rows = list(rendered)
+    # Keep the whole render/tokenize/pool-index front half on CPU.  Moving every
+    # row to the accelerator and immediately calling ``tolist()`` to find its
+    # content end forced one H2D + blocking D2H round-trip per corpus item before
+    # the actual batched forward.  Padding on CPU also avoids a Python loop of
+    # tiny device slice writes; the finished batch crosses the boundary once.
+    seqs = [ids[0] for ids, _ in rendered_rows]          # each (L_i,) on CPU
+    ends = [content_end for _, content_end in rendered_rows]
     lengths = [int(s.shape[0]) for s in seqs]
-    batch = len(seqs)
     max_len = max(lengths)
 
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = getattr(tokenizer, "eos_token_id", None) or 0
-    input_ids = torch.full(
-        (batch, max_len), int(pad_id), dtype=seqs[0].dtype, device=device,
+    input_ids_cpu = torch.nn.utils.rnn.pad_sequence(
+        seqs, batch_first=True, padding_value=int(pad_id),
     )
-    for i, seq in enumerate(seqs):
-        input_ids[i, : lengths[i]] = seq                # right-pad
+    input_ids = input_ids_cpu.to(device)
     # An attention mask is only needed when padding is actually present; a
     # ragged chunk masks the pads, a uniform/B=1 chunk runs full attention
     # (matching the single-pair path exactly).
     if min(lengths) != max_len:
-        attn = torch.zeros((batch, max_len), dtype=torch.long, device=device)
-        for i, length in enumerate(lengths):
-            attn[i, :length] = 1
+        lengths_cpu = torch.tensor(lengths, dtype=torch.long)
+        attn = (
+            torch.arange(max_len).unsqueeze(0) < lengths_cpu.unsqueeze(1)
+        ).to(dtype=torch.long, device=device)
     else:
         attn = None
     pool_index = torch.tensor(ends, dtype=torch.long, device=device)
@@ -305,6 +461,125 @@ def _encode_and_capture_all_batch(
         model, layers, input_ids,
         attention_mask=attn, pool_index=pool_index,
         layer_indices=layer_indices,
+        promote_pooled=promote_pooled,
+        capture_context=capture_context,
+    )
+
+
+def _prepare_capture_batch(
+    tokenizer: Any,
+    prompts: "Sequence[str | list[dict[str, str]]]",
+    responses: Sequence[str],
+    *,
+    role: str | None = None,
+    roles: Sequence[str | None] | None = None,
+    model_type: str | None = None,
+    system_msg: str = _LENGTH_DIRECTIVE,
+) -> list[tuple[torch.Tensor, int]]:
+    """Render/tokenize capture rows once for reuse across packing and retries."""
+    if len(prompts) != len(responses):
+        raise ValueError(
+            "capture preparation needs len(prompts) == len(responses) "
+            f"({len(prompts)} != {len(responses)})"
+        )
+    if roles is not None and len(roles) != len(prompts):
+        raise ValueError(
+            "capture preparation needs len(roles) == len(prompts) "
+            f"({len(roles)} != {len(prompts)})"
+        )
+    if roles is not None and role is not None:
+        raise ValueError("capture preparation accepts role= or roles=, not both")
+    row_roles = roles if roles is not None else [role] * len(prompts)
+    skip = special_token_ids(tokenizer)
+    texts = [
+        _render_capture_text(
+            tokenizer, prompt, response, role=row_role,
+            model_type=model_type, system_msg=system_msg,
+        )
+        for prompt, response, row_role in zip(
+            prompts, responses, row_roles, strict=True,
+        )
+    ]
+    # Fast tokenizers amortize normalization/pretokenization over the full
+    # corpus. Keep a strict fallback for minimal/test tokenizers and custom
+    # implementations that accept only scalar strings.
+    try:
+        encoded = tokenizer(texts, add_special_tokens=False)["input_ids"]
+        if isinstance(encoded, torch.Tensor):
+            encoded = encoded.tolist()
+        if len(encoded) != len(texts) or any(
+            not isinstance(row, (list, tuple)) for row in encoded
+        ):
+            raise TypeError("batch tokenizer returned an unexpected shape")
+        rows: list[tuple[torch.Tensor, int]] = []
+        for token_row in encoded:
+            values = [int(token) for token in token_row]
+            if not values:
+                bos_id = tokenizer.bos_token_id
+                if bos_id is None:
+                    bos_id = tokenizer.eos_token_id or 0
+                values = [int(bos_id)]
+            ids = torch.tensor([values], dtype=torch.long)
+            rows.append((
+                ids, last_content_index(values, tokenizer, skip=skip),
+            ))
+        return rows
+    except (TypeError, ValueError, RuntimeError, KeyError):
+        pass
+    return [
+        _render_and_tokenize_for_capture(
+            tokenizer, prompt, response,
+            role=row_role, model_type=model_type, system_msg=system_msg,
+            special_ids=skip,
+        )
+        for prompt, response, row_role in zip(
+            prompts, responses, row_roles, strict=True,
+        )
+    ]
+
+
+def _render_capture_text(
+    tokenizer: Any,
+    prompt: "str | list[dict[str, str]]",
+    response: str,
+    *,
+    role: str | None = None,
+    model_type: str | None = None,
+    system_msg: str = _LENGTH_DIRECTIVE,
+) -> str:
+    """Render one conversational capture row without tokenizing it."""
+    history: list[dict[str, str]] = (
+        [{"role": "user", "content": prompt}] if isinstance(prompt, str)
+        else [dict(t) for t in prompt]
+    )
+    if getattr(tokenizer, "chat_template", None) is not None:
+        kwargs: dict[str, Any] = {}
+        if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
+            kwargs["enable_thinking"] = False
+        messages = []
+        if system_msg:
+            messages.append({"role": "system", "content": system_msg})
+        messages.extend(history)
+        messages.append({"role": "assistant", "content": response})
+        if role is None:
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False, **kwargs,
+            )
+        if model_type is None:
+            raise ValueError(
+                "_render_and_tokenize_for_capture: role= requires model_type= "
+                "so the family's role-header registry entry can be looked up"
+            )
+        from saklas.core.role_templates import apply_with_role
+
+        return apply_with_role(
+            tokenizer, messages, role=role, model_type=model_type,
+            add_generation_prompt=False, tokenize=False, **kwargs,
+        )
+    hist_text = "\n".join(turn["content"] for turn in history)
+    return (
+        f"{system_msg}\n{hist_text}\n{response}"
+        if system_msg else f"{hist_text}\n{response}"
     )
 
 
@@ -312,11 +587,11 @@ def _render_and_tokenize_for_capture(
     tokenizer: Any,
     prompt: "str | list[dict[str, str]]",
     response: str,
-    device: torch.device,
     *,
     role: str | None = None,
     model_type: str | None = None,
     system_msg: str = _LENGTH_DIRECTIVE,
+    special_ids: set[int] | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Render a ``[system, *history, assistant]`` turn + tokenize, locating the last content token.
 
@@ -331,48 +606,13 @@ def _render_and_tokenize_for_capture(
     ``role`` (when set) substitutes a custom assistant-role label via
     :func:`saklas.core.role_templates.apply_with_role` for the persona-baselined
     fit; ``role=None`` is the swap-back default.  Returns ``(ids [1, T] on
-    device, content_end)`` where ``content_end`` is the response's last
+    CPU, content_end)`` where ``content_end`` is the response's last
     non-special token — the canonical pooling position.
     """
-    history: list[dict[str, str]] = (
-        [{"role": "user", "content": prompt}] if isinstance(prompt, str)
-        else [dict(t) for t in prompt]
+    text = _render_capture_text(
+        tokenizer, prompt, response, role=role,
+        model_type=model_type, system_msg=system_msg,
     )
-    if getattr(tokenizer, "chat_template", None) is not None:
-        # Disable thinking/reasoning mode for models that support it
-        # (Qwen 3.5, QwQ, etc.) — thinking tokens would contaminate pooling.
-        kwargs: dict[str, Any] = {}
-        if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
-            kwargs["enable_thinking"] = False
-
-        messages = []
-        if system_msg:
-            messages.append({"role": "system", "content": system_msg})
-        messages.extend(history)
-        messages.append({"role": "assistant", "content": response})
-        if role is None:
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False, **kwargs,
-            )
-        else:
-            if model_type is None:
-                raise ValueError(
-                    "_render_and_tokenize_for_capture: role= requires model_type= "
-                    "so the family's role-header registry entry can be looked up"
-                )
-            from saklas.core.role_templates import apply_with_role
-            text = apply_with_role(
-                tokenizer, messages,
-                role=role, model_type=model_type,
-                add_generation_prompt=False, tokenize=False, **kwargs,
-            )
-    else:
-        # Base model (no chat template) — there are no turn roles to render and
-        # A2 role-swap cannot apply; capture the history+response continuation as
-        # raw text, with the length directive prepended (when set) so the framing
-        # still matches generation.
-        hist_text = "\n".join(t["content"] for t in history)
-        text = f"{system_msg}\n{hist_text}\n{response}" if system_msg else f"{hist_text}\n{response}"
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc["input_ids"]
     if ids.numel() == 0:
@@ -380,18 +620,17 @@ def _render_and_tokenize_for_capture(
         if bos_id is None:
             bos_id = tokenizer.eos_token_id or 0
         ids = torch.tensor([[bos_id]])
-    ids = ids.to(device)
-
     # Last non-special token — chat templates append trailing markers (Llama's
     # <|eot_id|>, Gemma's <end_of_turn>, Qwen's <|im_end|>) whose hidden states
     # are disconnected from content.  ``last_content_index`` is the canonical
     # walkback (skips ``all_special_ids`` + ``added_tokens_encoder``), shared by
     # every single-state readout so the pooling position is defined once.
-    content_end = last_content_index(ids[0].tolist(), tokenizer)
+    content_end = last_content_index(
+        ids[0].tolist(), tokenizer, skip=special_ids,
+    )
     return ids, content_end
 
 
-@functools.cache
 def _load_neutral_prompts() -> list[str]:
     """Load neutral prompts, preferring a user override at ~/.saklas/neutral_statements.json."""
     from saklas.io.paths import neutral_statements_path
@@ -403,7 +642,6 @@ def _load_neutral_prompts() -> list[str]:
         return json.load(f)
 
 
-@functools.cache
 def _load_baseline_prompts() -> list[str]:
     """Load the shared A2 baseline user prompts.
 
@@ -449,6 +687,8 @@ def compute_neutral_activations(
     tokenizer: Any,
     layers: torch.nn.ModuleList,
     device: torch.device | None = None,
+    *,
+    rendered: Sequence[tuple[torch.Tensor, int]] | None = None,
 ) -> dict[int, torch.Tensor]:
     """Per-layer ``[N, D]`` stack across the neutral corpus.
 
@@ -481,22 +721,47 @@ def compute_neutral_activations(
     pairs = _neutral_pairs()
     prompts = [prompt for prompt, _ in pairs]
     responses = [response for _, response in pairs]
+    if rendered is not None and len(rendered) != len(pairs):
+        raise ValueError(
+            "prepared neutral rows must align with the neutral corpus "
+            f"({len(rendered)} != {len(pairs)})"
+        )
     n = len(pairs)
 
-    for start in range(0, n, _CAPTURE_BATCH):
-        end = min(start + _CAPTURE_BATCH, n)
-        per_layer = _encode_and_capture_all_batch(
-            model, tokenizer,
-            prompts[start:end], responses[start:end],
-            layers, device,
-        )
-        # Move each chunk's (B, D) to CPU before discarding the GPU-side dict —
-        # same MPS discipline as before, now per chunk instead of per pair.
-        for idx in range(n_layers):
-            chunks_by_layer[idx].append(per_layer[idx].detach().to("cpu"))
-        del per_layer
-        if _mps:
-            torch.mps.empty_cache()
+    active_batch = _CAPTURE_BATCH_MAX
+    capture_layers = list(range(n_layers))
+    with _ReusablePooledCapture(
+        model, layers, capture_layers,
+    ) as capture_context:
+        start = 0
+        while start < n:
+            end = min(start + active_batch, n)
+            try:
+                per_layer = _encode_and_capture_all_batch(
+                    model, tokenizer,
+                    prompts[start:end], responses[start:end],
+                    layers, device,
+                    rendered=None if rendered is None else rendered[start:end],
+                    capture_context=capture_context,
+                )
+            except RuntimeError as exc:
+                from saklas.core.errors import is_out_of_memory_error
+
+                if not is_out_of_memory_error(exc) or active_batch <= 1:
+                    raise
+                active_batch = max(1, active_batch // 2)
+                if _mps:
+                    torch.mps.empty_cache()
+                elif device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+            # Move each chunk's (B, D) to CPU before discarding device rows.
+            for idx in range(n_layers):
+                chunks_by_layer[idx].append(per_layer[idx].detach().to("cpu"))
+            del per_layer
+            start = end
+            if _mps:
+                torch.mps.empty_cache()
 
     return {
         idx: torch.cat(chunks, dim=0)  # (N, D), fp32 on cpu
@@ -569,26 +834,22 @@ def compute_dls_axes(
         if C.ndim == 1:
             C = C.reshape(1, -1)
         C = C.reshape(int(C.shape[0]), -1)              # (K, D)
-        layer_checkable: set[int] = set()
-        layer_keep: set[int] = set()
-        for r in range(int(B32.shape[0])):
-            row = B32[r]
-            row_norm = float(row.norm())
-            if row_norm < 1e-12:
-                continue  # degenerate axis — drop, exclude from fallback
-            layer_checkable.add(r)
-            if mu_n_cpu is None:
-                # Baseline doesn't cover this layer.  Conservative: keep —
-                # over-include rather than drop a real discriminative axis
-                # for missing baseline data.
-                layer_keep.add(r)
-                continue
-            projs = (C - mu_n_cpu) @ (row / row_norm)   # (K,) node projections
-            # Straddle zero: both a negative and a positive projection ⇒ the
-            # axis separates nodes across the baseline.  At K=2 this is the
-            # bipolar ``proj_pos · proj_neg < 0`` opposite-sign test exactly.
-            if float(projs.min()) < 0.0 and float(projs.max()) > 0.0:
-                layer_keep.add(r)
+        norms = torch.linalg.vector_norm(B32, dim=1)
+        valid = norms >= 1e-12
+        layer_checkable = set(valid.nonzero(as_tuple=False).reshape(-1).tolist())
+        layer_keep: set[int]
+        if mu_n_cpu is None:
+            # Baseline doesn't cover this layer. Conservative: keep every
+            # non-degenerate axis rather than drop genuine signal.
+            layer_keep = set(layer_checkable)
+        elif layer_checkable:
+            normalized = B32[valid] / norms[valid].unsqueeze(1)
+            projs = (C - mu_n_cpu) @ normalized.transpose(0, 1)  # (K, R_valid)
+            straddles = (projs.amin(dim=0) < 0.0) & (projs.amax(dim=0) > 0.0)
+            valid_axes = valid.nonzero(as_tuple=False).reshape(-1)
+            layer_keep = set(valid_axes[straddles].tolist())
+        else:
+            layer_keep = set()
         if layer_checkable:
             checkable[L] = layer_checkable
         if layer_keep:
@@ -613,9 +874,9 @@ def compute_dls_axes(
 def fold_directions_to_subspace(
     name: str,
     directions: dict[int, torch.Tensor],
-    neutral_means: dict[int, torch.Tensor] | None,
+    neutral_means: dict[int, torch.Tensor],
     *,
-    whitener: "Any | None" = None,
+    whitener: "Any",
     label: str = "+",
     feature_space: str = "raw",
 ) -> "Any":  # -> saklas.core.manifold.Manifold
@@ -634,25 +895,35 @@ def fold_directions_to_subspace(
 
     Per layer: ``basis = d̂_L``; ``LayerSubspace.node_coords = [[‖d_L‖]]`` —
     the real coord of the pole, a step of ``‖d_L‖`` along ``d̂`` from the
-    neutral origin (coord 0).  ``share = ‖d_L‖_M`` (whitened) / ``‖d_L‖₂``
-    (Euclidean) — the direction magnitude itself is the budget (a single
+    neutral origin (coord 0). ``share = ‖d_L‖_M``: the whitened direction
+    magnitude itself is the budget (a single
     direction has no node cloud to take a μ-centered spread over, so this is
     *not* :func:`~saklas.core.manifold.subspace_share`'s √2-scaled form; the
-    apply-time normalization handles the cross-layer scale either way).  No
+    apply-time normalization handles the cross-layer scale). No
     DLS — a derived direction has no polarity for the straddle test; the
-    caller's layer set folds verbatim.  No origin store (coord 0, §2).
-    ``neutral_means=None`` (CPU stubs) anchors at coord 0.
+    caller's layer set folds verbatim. No origin store (coord 0, §2).
+    Neutral means and a covering whitener are mandatory.
     """
     from saklas.core.manifold import (
         CustomDomain, LayerSubspace, Manifold,
     )
 
+    from saklas.core.mahalanobis import WhitenerError
+
     present = sorted(directions)
-    maha_w = (
-        whitener
-        if whitener is not None and whitener.covers_all(present)
-        else None
-    )
+    if not present:
+        raise ValueError("cannot fold an empty direction profile")
+    missing_means = sorted(set(present) - set(neutral_means))
+    if missing_means:
+        raise WhitenerError(
+            f"folding {name!r} requires neutral means for every layer; "
+            f"missing {missing_means}"
+        )
+    if whitener is None or not whitener.covers_all(present):
+        raise WhitenerError(
+            f"folding {name!r} requires a Mahalanobis whitener covering "
+            f"every layer {present}"
+        )
 
     # Every fresh tensor follows the directions' device so the folded manifold
     # is internally device-consistent.  The dispatch-time fold runs over a
@@ -670,20 +941,18 @@ def fold_directions_to_subspace(
         if norm <= 1e-12:
             continue
         basis = (d / norm).reshape(1, -1)          # (1, D) unit d̂
-        nu = (
-            neutral_means[idx].to(device=d.device, dtype=torch.float32).reshape(-1)
-            if neutral_means is not None and idx in neutral_means
-            else None
-        )
+        nu = neutral_means[idx].to(
+            device=d.device, dtype=torch.float32,
+        ).reshape(-1)
         # Neutral-anchored: mean = P_basis(ν) (off-span part of ν dropped);
         # the pole sits at the real coord ‖d‖ along d̂ from the origin.
-        mean = (nu @ basis.T) @ basis if nu is not None else torch.zeros_like(d)
+        mean = (nu @ basis.T) @ basis
         node_coords_L = torch.tensor([[norm]], dtype=torch.float32, device=d.device)
         layers[idx] = LayerSubspace.affine(mean, basis, node_coords=node_coords_L)
-        mahalanobis_share[idx] = (
-            float(maha_w.mahalanobis_norm(idx, d))
-            if maha_w is not None else norm
-        )
+        mahalanobis_share[idx] = float(whitener.mahalanobis_norm(idx, d))
+
+    if not layers:
+        raise ValueError("cannot fold a direction profile containing only zero vectors")
 
     # Shared display layout: a single ``+`` pole at coord 1 (the real per-layer
     # pole distance ‖d_L‖ lives on each ``LayerSubspace.node_coords``).
@@ -695,15 +964,16 @@ def fold_directions_to_subspace(
         node_coords=node_coords,
         layers=layers,
         feature_space=feature_space,
+        node_roles=[None],
+        node_kinds=[None],
         mahalanobis_share=mahalanobis_share,
     )
-    manifold.metadata["share_metric"] = (
-        "mahalanobis" if maha_w is not None else "euclidean"
-    )
+    manifold.metadata["share_metric"] = "mahalanobis"
+    manifold.validate_runtime_geometry()
     return manifold
 
 
-def is_foldable_vector_manifold(manifold: "Any") -> bool:
+def is_foldable_vector_manifold(manifold: "Manifold") -> bool:
     """True iff *manifold* is a folded (affine ``R = 1``) steering vector —
     the only shape :func:`folded_vector_directions` accepts.
 
@@ -713,16 +983,16 @@ def is_foldable_vector_manifold(manifold: "Any") -> bool:
     ``vectors/pairwise``).  Callers use this to skip such probes instead of
     letting the fold raise — an empty / layerless manifold is also False.
     """
-    layers = getattr(manifold, "layers", None)
+    layers = manifold.layers
     if not layers:
         return False
     return all(
-        getattr(sub, "is_affine", False) and getattr(sub, "rank", 0) == 1
+        sub.is_affine and sub.rank == 1
         for sub in layers.values()
     )
 
 
-def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
+def folded_vector_directions(manifold: "Manifold") -> dict[int, torch.Tensor]:
     """Baked-direction view of a folded (affine ``R = 1``) vector manifold.
 
     Returns ``{L: δ̂_L · share_L}`` — the steering-vector-equivalent baked
@@ -736,7 +1006,7 @@ def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
     proportional for cross-concept magnitude (``merge`` / GGUF export, which
     migrate to read the folded artifact natively).
 
-    Lets the unified folded Manifold back the legacy direction-math surface
+    Lets the unified folded Manifold back the direction-view API
     (``Profile``-returning ``extract()``, ``manifold compare``/``manifold why``) without a
     second *stored* representation — the concept's only on-disk artifact stays
     the folded Manifold; this is a downstream in-memory view.
@@ -745,34 +1015,17 @@ def folded_vector_directions(manifold: "Any") -> dict[int, torch.Tensor]:
     single-direction view is only meaningful for a folded ``R = 1`` vector.
     """
     out: dict[int, torch.Tensor] = {}
-    share_map = getattr(manifold, "mahalanobis_share", None) or {}
+    manifold.validate_runtime_geometry()
+    share_map = manifold.mahalanobis_share
     for idx, sub in manifold.layers.items():
         if not sub.is_affine or sub.rank != 1:
             raise ValueError(
                 "folded_vector_directions requires affine R=1 layers; "
                 f"layer {idx} is rank {sub.rank}, affine={sub.is_affine}"
             )
-        share = float(share_map.get(idx, 1.0))
+        share = float(share_map[idx])
         out[idx] = sub.basis.reshape(-1).to(torch.float32) * share
     return out
-
-
-def save_profile(
-    profile: dict[int, torch.Tensor],
-    path: str | Path,
-    metadata: dict[str, Any],
-) -> None:
-    """Compatibility alias for :func:`saklas.core.profile.save_profile`."""
-    from saklas.core.profile import save_profile as _save_profile
-
-    _save_profile(profile, path, metadata)
-
-
-def load_profile(path: str | Path) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
-    """Compatibility alias for :func:`saklas.core.profile.load_profile`."""
-    from saklas.core.profile import load_profile as _load_profile
-
-    return _load_profile(path)
 
 
 def project_profile(

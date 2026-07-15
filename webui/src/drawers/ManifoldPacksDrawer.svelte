@@ -139,7 +139,7 @@
 
 <div class="drawer-shell">
   <header class="header">
-    <span class="title">manifold packs</span>
+    <span class="title">packs</span>
     <button
       type="button"
       class="close"
@@ -162,22 +162,16 @@
       aria-selected={tab === "search"}
       class:active={tab === "search"}
       onclick={() => (tab = "search")}
-    >search hf</button>
+    >hf</button>
   </div>
 
   <div class="body">
     {#if tab === "installed"}
-      {#if steerRack.unavailable}
-        <p class="muted">
-          this server doesn't expose the manifold API — update saklas to
-          author and fit steering manifolds.
-        </p>
-      {:else if steerRack.loading && steerRack.catalog.length === 0}
+      {#if steerRack.loading && steerRack.catalog.length === 0}
         <p class="muted">loading manifolds…</p>
       {:else if steerRack.catalog.length === 0}
         <p class="muted">
-          no manifolds installed yet — search HF above, or use
-          <strong>+ build manifold</strong> from the manifold drawer.
+          none installed
         </p>
       {:else}
         <ul class="rows" role="list">
@@ -210,7 +204,7 @@
           <span class="vh">search query</span>
           <input
             type="search"
-            placeholder="search HF for saklas-manifold repos…"
+            placeholder="search HF…"
             aria-label="Search HF for saklas-manifold repos"
             bind:value={query}
             oninput={scheduleSearch}
@@ -218,15 +212,14 @@
         </label>
         {#if !query.trim()}
           <p class="muted">
-            type to search the HF hub for
-            <code>saklas-manifold</code>-tagged repos.
+            <code>saklas-manifold</code> repos
           </p>
         {:else if searchLoading}
-          <p class="muted">searching hf hub…</p>
+          <p class="muted">searching…</p>
         {:else if searchError}
           <p class="error" role="alert">{searchError}</p>
         {:else if searchResults.length === 0}
-          <p class="muted">no matches.</p>
+          <p class="muted">no matches</p>
         {:else}
           <ul class="rows" role="list">
             {#each searchResults as row (selectorOf(row))}
@@ -278,36 +271,48 @@
     height: 100%;
     min-height: 0;
     color: var(--fg);
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: var(--text);
   }
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-4) var(--space-5);
-    border-bottom: 1px solid var(--border);
+    padding: var(--space-5) var(--space-6);
   }
   .title {
     color: var(--accent);
     letter-spacing: 0;
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
   .close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
-    font-size: var(--text);
+    background: var(--glass);
+    color: var(--fg-muted);
+    border: 1px solid transparent;
+    border-radius: 50%;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    font-size: var(--text-md);
     line-height: 1;
-    padding: var(--space-2) var(--space-3);
     cursor: pointer;
-    transition: color var(--dur) var(--ease-out);
+    flex: none;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
   }
-  .close:hover { color: var(--accent-red); }
+  .close:hover {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
 
   .tabs {
     display: flex;
     gap: 0;
-    border-bottom: 1px solid var(--border);
     padding: 0 var(--space-5);
   }
   .tabs button {
@@ -332,7 +337,7 @@
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: var(--space-4) var(--space-5) var(--space-5);
+    padding: var(--space-5) var(--space-6);
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
@@ -359,9 +364,9 @@
     border: 0;
   }
   .search input[type="search"] {
-    background: var(--bg-deep);
+    background: var(--input-well);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -384,10 +389,6 @@
     color: var(--fg-strong);
     font-size: var(--text-sm);
   }
-  .muted strong {
-    color: var(--accent-purple);
-    font-weight: var(--weight-medium);
-  }
   .error {
     margin: 0;
     color: var(--accent-error);
@@ -409,12 +410,12 @@
     align-items: center;
     gap: var(--space-3);
     background: var(--bg-deep);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
-    transition: border-color var(--dur) var(--ease-out);
+    transition: background var(--dur) var(--ease-out);
   }
-  .row:hover { border-color: var(--accent-purple); }
+  .row:hover { background: color-mix(in srgb, var(--accent-purple) 8%, var(--bg-deep)); }
   .meta {
     display: flex;
     flex-direction: column;
@@ -423,6 +424,7 @@
   }
   .row-name {
     color: var(--fg-strong);
+    font-family: var(--font-mono);
     font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -440,7 +442,7 @@
     text-transform: uppercase;
     font-size: var(--text-2xs);
     letter-spacing: 0.04em;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     color: var(--accent-purple);
     background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
   }
@@ -470,9 +472,9 @@
     gap: var(--space-2);
   }
   .act {
-    background: transparent;
+    background: var(--glass);
     color: var(--accent-purple);
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
     font: inherit;
@@ -481,12 +483,10 @@
     cursor: pointer;
     transition:
       background var(--dur) var(--ease-out),
-      border-color var(--dur) var(--ease-out),
       color var(--dur) var(--ease-out);
   }
   .act:hover:not(:disabled) {
     background: rgba(167, 139, 250, 0.12);
-    border-color: var(--accent-purple);
   }
   .act:disabled {
     opacity: 0.45;

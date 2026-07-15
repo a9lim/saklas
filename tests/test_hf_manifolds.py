@@ -28,6 +28,7 @@ import pytest
 
 from saklas.io import hf_manifolds as hfm
 from saklas.io.hf import HFError
+from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
 
 
 # --------------------------------------------------------------------------- #
@@ -88,8 +89,10 @@ def _write_manifest(folder: Path, payload: dict[str, Any]) -> Path:
 
 def test_fetch_manifold_info_box_domain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A box-domain authored manifold reports ``box(1d)`` + node count + tensors."""
+    from saklas.io.paths import safe_model_id, tensor_filename
+
     manifest = _write_manifest(tmp_path / "repo", {
-        "format_version": 5,
+        "format_version": MANIFOLD_FORMAT_VERSION,
         "name": "months",
         "description": "month ring",
         "fit_mode": "authored",
@@ -98,7 +101,7 @@ def test_fetch_manifold_info_box_domain(tmp_path: Path, monkeypatch: pytest.Monk
         "nodes": [{"label": "january"}, {"label": "february"}],
         "tags": ["temporal"],
     })
-    api = _FakeApi(files=["manifold.json", "google__gemma-2-2b-it.safetensors",
+    api = _FakeApi(files=["manifold.json", tensor_filename("google/gemma-2-2b-it"),
                           "nodes/00_january.json"])
     monkeypatch.setattr(hfm, "_hf_hub_download", lambda coord, fn, **kw: str(manifest))
     monkeypatch.setattr(hfm, "_hf_api", lambda: api)
@@ -112,7 +115,7 @@ def test_fetch_manifold_info_box_domain(tmp_path: Path, monkeypatch: pytest.Monk
     assert info["domain_label"] == "box(1d)"
     assert info["tags"] == ["temporal"]
     # Only the .safetensors file becomes a tensor-stem entry.
-    assert info["tensor_models"] == ["google__gemma-2-2b-it"]
+    assert info["tensor_models"] == [safe_model_id("google/gemma-2-2b-it")]
 
 
 def test_fetch_manifold_info_sphere_and_custom_and_discover(
@@ -129,10 +132,9 @@ def test_fetch_manifold_info_sphere_and_custom_and_discover(
           "domain": {"type": "custom", "embed_dim": 5}}, "custom(5d)"),
         ({"fit_mode": "auto"}, "discover-auto"),
         ({"fit_mode": "pca"}, "discover-pca"),
-        ({"fit_mode": "weird"}, "?"),     # no domain, non-discover -> ?
     ]
     for i, (extra, expect) in enumerate(cases):
-        payload = {"format_version": 5, "name": f"m{i}", "nodes": []}
+        payload = {"format_version": MANIFOLD_FORMAT_VERSION, "name": f"m{i}", "nodes": []}
         payload.update(extra)
         manifest = _write_manifest(tmp_path / f"repo{i}", payload)
         monkeypatch.setattr(hfm, "_hf_hub_download", lambda c, fn, _m=manifest, **kw: str(_m))
@@ -143,18 +145,36 @@ def test_fetch_manifold_info_sphere_and_custom_and_discover(
 def test_fetch_manifold_info_rejects_newer_format(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    from saklas.io.manifolds import MANIFOLD_FORMAT_VERSION
-
     manifest = _write_manifest(tmp_path / "repo", {
         "format_version": MANIFOLD_FORMAT_VERSION + 1,
-        "name": "future", "nodes": [],
+        "name": "future", "fit_mode": "pca", "nodes": [],
     })
     api = _FakeApi(files=["manifold.json"])
     monkeypatch.setattr(hfm, "_hf_hub_download", lambda c, fn, **kw: str(manifest))
     monkeypatch.setattr(hfm, "_hf_api", lambda: api)
 
-    with pytest.raises(HFError, match="newer than"):
+    with pytest.raises(HFError, match="must be exactly"):
         hfm.fetch_manifold_info("alice/future")
+
+
+@pytest.mark.parametrize("field", ["format_version", "name", "fit_mode"])
+def test_fetch_manifold_info_requires_current_identity_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    payload = {
+        "format_version": MANIFOLD_FORMAT_VERSION,
+        "name": "current",
+        "fit_mode": "pca",
+        "nodes": [],
+    }
+    payload.pop(field)
+    manifest = _write_manifest(tmp_path / "repo", payload)
+    api = _FakeApi(files=["manifold.json"])
+    monkeypatch.setattr(hfm, "_hf_hub_download", lambda c, fn, **kw: str(manifest))
+    monkeypatch.setattr(hfm, "_hf_api", lambda: api)
+
+    with pytest.raises(HFError):
+        hfm.fetch_manifold_info("alice/current")
 
 
 def test_fetch_manifold_info_wraps_transport_failure(monkeypatch: pytest.MonkeyPatch):
@@ -171,7 +191,7 @@ def test_fetch_manifold_info_threads_revision(
 ):
     """A revision flows into both the download and the file-listing calls."""
     manifest = _write_manifest(tmp_path / "repo", {
-        "format_version": 5, "name": "m", "fit_mode": "pca", "nodes": [],
+        "format_version": MANIFOLD_FORMAT_VERSION, "name": "m", "fit_mode": "pca", "nodes": [],
     })
     api = _FakeApi(files=["manifold.json"])
     dl_kwargs: list[dict[str, Any]] = []
@@ -242,14 +262,16 @@ def test_search_manifolds_enriches_row_when_fields_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     """A row missing description/tags triggers a fetch_manifold_info enrichment."""
+    from saklas.io.paths import safe_model_id, tensor_filename
+
     api = _FakeApi(
         models=[_FakeModel("alice/months", tags=None, desc="")],
-        files=["manifold.json", "google__gemma-2-2b-it.safetensors"],
+        files=["manifold.json", tensor_filename("google/gemma-2-2b-it")],
     )
     monkeypatch.setattr(hfm, "_hf_api", lambda: api)
 
     manifest = _write_manifest(tmp_path / "repo", {
-        "format_version": 5, "name": "months", "description": "the year",
+        "format_version": MANIFOLD_FORMAT_VERSION, "name": "months", "description": "the year",
         "fit_mode": "authored",
         "domain": {"type": "box", "axes": [
             {"name": "t", "periodic": True, "lo": 0.0, "hi": 12.0}]},
@@ -264,7 +286,7 @@ def test_search_manifolds_enriches_row_when_fields_missing(
     assert row["description"] == "the year"
     assert row["domain_label"] == "box(1d)"
     assert row["node_count"] == 1
-    assert row["tensor_models"] == ["google__gemma-2-2b-it"]
+    assert row["tensor_models"] == [safe_model_id("google/gemma-2-2b-it")]
     assert row["tags"] == ["temporal"]
 
 

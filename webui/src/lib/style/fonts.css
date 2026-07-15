@@ -1,0 +1,30 @@
+/* Recursive, self-hosted — one variable file, two families.
+ *
+ * The MONO axis does the sans/mono split: axes are pinned per-family in
+ * the @font-face descriptor, so legacy components that only switch
+ * font-family (code/pre, --font-mono consumers) get the correct voice
+ * without touching font-variation-settings anywhere. Chrome speaks
+ * "Recursive Sans" (MONO 0, a touch of CASL for warmth); data speaks
+ * "Recursive Mono" (MONO 1, CASL 0, tabular rhythm).
+ *
+ * wght is deliberately NOT pinned — font-weight maps onto the 300–1000
+ * axis range normally. File lives in src/assets/fonts/ so Vite emits it
+ * into dist/assets/ where the StaticFiles mount serves it (dist
+ * top-level subdirs are NOT served — do not move it to public/).
+ */
+
+@font-face {
+  font-family: "Recursive Sans";
+  src: url("../../assets/fonts/Recursive_VF.woff2") format("woff2");
+  font-weight: 300 1000;
+  font-display: swap;
+  font-variation-settings: "MONO" 0, "CASL" 0.35, "CRSV" 0;
+}
+
+@font-face {
+  font-family: "Recursive Mono";
+  src: url("../../assets/fonts/Recursive_VF.woff2") format("woff2");
+  font-weight: 300 1000;
+  font-display: swap;
+  font-variation-settings: "MONO" 1, "CASL" 0, "CRSV" 0;
+}

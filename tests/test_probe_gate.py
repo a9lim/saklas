@@ -257,14 +257,14 @@ class _StubSession(SaklasSession):
 
     def __init__(self) -> None:
         self._profiles = {}
-        self._steering_stack = []
         self._whitener = None
         self._layer_means = {}
         self.events = EventBus()
+        self._steering_composer = SteeringComposer(self)
 
 
 def _composer(session: _StubSession) -> SteeringComposer:
-    return session._get_steering_composer()
+    return session._steering_composer
 
 
 class TestSessionProbeGateDetection:
@@ -274,7 +274,7 @@ class TestSessionProbeGateDetection:
 
     def test_no_gates_returns_false(self):
         s = _StubSession()
-        s._steering_stack.append({
+        s._steering_composer._stack.append({
             "angry.calm": (0.5, Trigger.BOTH),
         })
         assert _composer(s).steering_needs_probe_gating() is False
@@ -283,7 +283,7 @@ class TestSessionProbeGateDetection:
         # Preset triggers without a gate stay false — ``AFTER_THINKING``
         # has gate=None.
         s = _StubSession()
-        s._steering_stack.append({
+        s._steering_composer._stack.append({
             "angry.calm": (0.5, Trigger.AFTER_THINKING),
         })
         assert _composer(s).steering_needs_probe_gating() is False
@@ -291,7 +291,7 @@ class TestSessionProbeGateDetection:
     def test_gate_in_first_scope_returns_true(self):
         s = _StubSession()
         gate_trig = Trigger.when("angry.calm", ">", 0.4)
-        s._steering_stack.append({
+        s._steering_composer._stack.append({
             "calm": (0.5, gate_trig),
         })
         assert _composer(s).steering_needs_probe_gating() is True
@@ -301,10 +301,10 @@ class TestSessionProbeGateDetection:
         # Outer has gate, inner doesn't — flatten = inner-wins, but the
         # outer scope's "calm" key is still in the head if not shadowed.
         gate_trig = Trigger.when("angry.calm", ">", 0.4)
-        s._steering_stack.append({
+        s._steering_composer._stack.append({
             "calm": (0.5, gate_trig),
         })
-        s._steering_stack.append({
+        s._steering_composer._stack.append({
             "happy.sad": (0.3, Trigger.BOTH),
         })
         assert _composer(s).steering_needs_probe_gating() is True
@@ -316,10 +316,10 @@ class TestSessionProbeGateDetection:
         # one" pattern.
         s = _StubSession()
         gate_trig = Trigger.when("angry.calm", ">", 0.4)
-        s._steering_stack.append({
+        s._steering_composer._stack.append({
             "calm": (0.5, gate_trig),
         })
-        s._steering_stack.append({
+        s._steering_composer._stack.append({
             "calm": (0.5, Trigger.BOTH),
         })
         assert _composer(s).steering_needs_probe_gating() is False
