@@ -49,6 +49,8 @@ dependencies = [
     "transformers>=5.10",
     "accelerate>=0.27",
     "safetensors>=0.7.0",
+    "sae-lens>=6.0,<7.0",
+    "nltk>=3.10.0",
     "textual>=0.50",
     "pyyaml>=6.0",
     "fastapi>=0.110",
@@ -70,7 +72,6 @@ hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]
 pandas = ["pandas>=3.0.2"]
 research = ["datasets>=2.0", "pandas>=3.0.2"]
-sae = ["sae-lens>=6.0,<7.0"]
 notebook = ["plotly>=5.0", "pandas>=3.0.2", "kaleido>=0.2"]
 
 [project.scripts]

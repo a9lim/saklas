@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
+uv.lock
 dist/
 build/
 *.whl

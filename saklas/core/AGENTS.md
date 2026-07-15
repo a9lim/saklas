@@ -395,8 +395,8 @@ resolves per-layer sae_ids (`_canonical_layer_map` — Neuronpedia-hosted first,
 then narrowest width, then smallest L0: hosting supplies the label +
 `maxActApprox` metadata channel, so an unhosted pick would silently lose
 normalization), gates
-`sae_lens` imports so the module loads without `[sae]`. Registry resolution is
-eager but weights are lazy with a one-layer resident cache; a valid fitted-tensor
+`sae_lens` imports so local-only flows avoid initializing the provider package.
+Registry resolution is eager but weights are lazy with a one-layer resident cache; a valid fitted-tensor
 hit does not import SAELens at all. An explicit `revision` is passed only when
 the installed loader exposes `revision=`; otherwise loading raises instead of
 stamping a pin it did not honor. Errors:

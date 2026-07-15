@@ -46,11 +46,10 @@ when you work in that directory. Consult them only when editing that layer.
 ## Commands
 
 ```bash
-pip install -e ".[dev]"                         # editable + pytest
+pip install -e ".[dev]"                         # editable + pytest + SAELens
 pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
 pip install -e ".[cuda]"                        # bitsandbytes + kernels (Linux/CUDA)
 pip install -e ".[cuda-experimental]"            # + flash-attn (Linux/CUDA)
-pip install -e ".[sae]"                         # SAELens-backed SAE extraction
 saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]

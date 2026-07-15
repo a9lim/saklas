@@ -231,7 +231,9 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
         steering="0.2 formal",
     )
 
-    row = tree.nodes[user_id].tokens[0]
+    tokens = tree.nodes[user_id].tokens
+    assert tokens is not None
+    row = tokens[0]
     assert row["text"] == "x"
     assert row["probes"] == {
         "formal": 0.25,

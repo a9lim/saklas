@@ -240,9 +240,10 @@ def _fast_batch_session():
         assistant_role: str | None = None,
         to_device: bool = True,
         gen_seat: str = "assistant",
+        add_generation_prompt: bool = True,
     ):
         del raw, thinking, stateless, parent_node_id
-        del user_role, assistant_role, to_device, gen_seat
+        del user_role, assistant_role, to_device, gen_seat, add_generation_prompt
         mapping = {
             "alpha": [1, 2],
             "beta": [3, 4, 5],

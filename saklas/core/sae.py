@@ -3,9 +3,8 @@
 The protocol is tiny on purpose: contrastive extraction needs only per-layer
 encode/decode and the set of covered layers. The concrete ``SaeLensBackend``
 adapter (added later) lives in the same module but imports ``sae_lens`` lazily,
-inside its factory function — so installations without the ``[sae]`` extra
-can still import ``saklas.core.sae`` (e.g. for the protocol type hint or the
-mock).
+inside its factory function, so protocol, mock, and local-artifact paths avoid
+provider initialization.
 """
 from __future__ import annotations
 
@@ -387,7 +386,7 @@ def list_sae_releases(model_id: str) -> list[dict[str, Any]]:
         if rows:
             return rows
         raise SaeBackendImportError(
-            "SAE release discovery requires `sae_lens`; install saklas[sae]"
+            "SAE release discovery requires `sae_lens`; reinstall saklas"
         ) from exc
     loader = getattr(sae_lens, "get_pretrained_saes_directory", None)
     if loader is None:
@@ -551,13 +550,13 @@ def load_sae_backend(
     except ImportError as e:
         raise SaeBackendImportError(
             f"requested SAE release '{release}' but `sae_lens` is not "
-            f"installed. Install with `pip install -e \".[sae]\"`."
+            f"installed. Reinstall saklas to restore its core dependencies."
         ) from e
     if sae_lens is None:
         # Tests (and some environments) may None-shadow the module.
         raise SaeBackendImportError(
             f"requested SAE release '{release}' but `sae_lens` is not "
-            f"installed. Install with `pip install -e \".[sae]\"`."
+            f"installed. Reinstall saklas to restore its core dependencies."
         )
 
     registry_loader = getattr(sae_lens, "get_pretrained_saes_directory", None)

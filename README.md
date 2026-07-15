@@ -76,9 +76,8 @@ Extraction is difference-of-means per [Im & Li, 2025](https://arxiv.org/abs/2502
 ## Install
 
 ```bash
-pip install saklas                  # everything needed to run it
+pip install saklas                  # everything needed to run it, including SAELens
 pip install saklas[gguf]            # adds the gguf package for llama.cpp interchange
-pip install saklas[sae]             # adds SAELens for external SAE releases
 pip install saklas[research]        # adds datasets and pandas for dataset loading and DataFrames
 pip install saklas[notebook]        # adds plotly, pandas, and kaleido for Jupyter figure helpers
 pip install saklas[cuda]            # adds bitsandbytes and HF kernels for CUDA acceleration
@@ -170,7 +169,7 @@ The `%` coefficient slot is `along[,onto]`: `along` is how far to slide toward t
 
 > **Experimental.** This path is less tested than raw extraction.
 
-Pass `--sae <source>` to `manifold extract` or `manifold fit` to run extraction in feature space. `saelens:<release>` uses a published SAELens release (and requires `saklas[sae]`); `local:<name>` uses an SAE trained by Saklas. The fitted subspace is always model-space, so the generation hook never touches the SAE.
+Pass `--sae <source>` to `manifold extract` or `manifold fit` to run extraction in feature space. `saelens:<release>` uses a published SAELens release; `local:<name>` uses an SAE trained by Saklas. The fitted subspace is always model-space, so the generation hook never touches the SAE.
 
 ### Cross-model transfer
 
@@ -526,7 +525,6 @@ Use a published SAELens release, or train a local residual-post SAE when the
 model has no compatible release:
 
 ```bash
-pip install 'saklas[sae]'
 saklas sae fetch google/gemma-3-4b-it saelens:gemma-scope-2-4b-it-res
 
 # Unsupported model: train on FineWeb-Edu, or pass --corpus FILE.

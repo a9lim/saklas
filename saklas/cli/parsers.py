@@ -289,8 +289,8 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
     p.add_argument("-f", "--force", action="store_true")
     p.add_argument(
         "--sae", default=None, metavar="RELEASE",
-        help="Extract via a SAELens SAE release (requires `pip install .[sae]`). "
-             "No implicit default — you must name a release.",
+        help="Extract via a SAELens SAE release. No implicit default — you "
+             "must name a release.",
     )
     p.add_argument(
         "--role", default=None, metavar="SLUG",
@@ -383,8 +383,8 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
     )
     fit.add_argument(
         "--sae", default=None, metavar="RELEASE",
-        help="Fit in an SAELens SAE feature space (requires `.[sae]`); "
-             "centroids are reconstructed through the SAE before the fit.",
+        help="Fit in an SAELens SAE feature space; centroids are reconstructed "
+             "through the SAE before the fit.",
     )
     # Discover-mode hyperparam overrides.  Written into ``manifold.json``
     # before the fit; rejected against an authored folder.

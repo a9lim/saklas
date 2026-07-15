@@ -1544,9 +1544,7 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         1: torch.randn(6, generator=gen),
     })
 
-    step = SaklasSession._live_lens_readout_step(  # type: ignore[arg-type]
-        s, top_k=3,
-    )
+    step = s._live_lens_readout_step(top_k=3)
     assert step is not None
     out, agg, token_ids = step
     assert set(out) == {0, 1}
@@ -1632,9 +1630,7 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     # matrix. Cards, pinned readings, and aggregate must all reuse it.
     scalars = s._score_lens_gate_scalars()
     assert scalars
-    assert SaklasSession._live_lens_readout_step(  # type: ignore[arg-type]
-        s, top_k=3,
-    ) is not None
+    assert s._live_lens_readout_step(top_k=3) is not None
     assert calls == 1
     assert stat_calls == 1
     assert s._last_lens_step_readings is not None
@@ -1695,9 +1691,7 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
         "probabilities": probabilities,
     }
 
-    step = SaklasSession._live_lens_readout_step(  # type: ignore[arg-type]
-        s, top_k=3,
-    )
+    step = s._live_lens_readout_step(top_k=3)
 
     assert step is not None
     assert s._lens_step_stash["fresh"] is False
@@ -1724,9 +1718,7 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     row = s._live_lens["layer_rows"][1]
     s._live_lens["J_stack"][row].fill_(float("nan"))
 
-    step = SaklasSession._live_lens_readout_step(  # type: ignore[arg-type]
-        s, top_k=3,
-    )
+    step = s._live_lens_readout_step(top_k=3)
 
     assert step is not None
     per_layer, aggregate, token_ids = step
@@ -1738,7 +1730,7 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
 
 def test_live_lens_readout_step_none_when_off() -> None:
     s = _StubSession()
-    assert SaklasSession._live_lens_readout_step(s) is None  # type: ignore[arg-type]
+    assert s._live_lens_readout_step() is None
 
 
 # --------------------------------------------------- token readout (loom) ----

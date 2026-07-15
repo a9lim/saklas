@@ -111,8 +111,9 @@ def test_set_authored_token_scores_is_one_tree_mutation():
     ])
 
     assert t.rev == before + 1
-    assert t.nodes[uid].tokens is not None
-    assert t.nodes[uid].tokens[0]["captured"]["probes"]["scores"] == {
+    tokens = t.nodes[uid].tokens
+    assert tokens is not None
+    assert tokens[0]["captured"]["probes"]["scores"] == {
         "formal": 0.25,
     }
     assert seen[-1].op == "capture_authored"
