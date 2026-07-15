@@ -1395,7 +1395,17 @@ class TestLensFitLifecycle:
     def test_start_returns_202_and_rejects_second_fit(
         self, session_and_client: Any, monkeypatch: Any,
     ) -> None:
-        _, client = session_and_client
+        import threading
+
+        session, client = session_and_client
+        fit_started = threading.Event()
+        release_fit = threading.Event()
+
+        def blocking_fit(*_args: Any, **_kwargs: Any) -> None:
+            fit_started.set()
+            assert release_fit.wait(timeout=2.0)
+
+        session.fit_jlens.side_effect = blocking_fit
         monkeypatch.setattr(
             "saklas.io.lens.stream_default_lens_corpus",
             lambda _n, *, cancel_event=None: (
@@ -1408,12 +1418,15 @@ class TestLensFitLifecycle:
         )
         assert response.status_code == 202
 
-        client.app.state.lens_fit["running"] = True
-        response = client.post(
-            "/saklas/v1/sessions/default/lens/fit",
-            json={"prompts": 1},
-        )
-        assert response.status_code == 409
+        assert fit_started.wait(timeout=2.0)
+        try:
+            response = client.post(
+                "/saklas/v1/sessions/default/lens/fit",
+                json={"prompts": 1},
+            )
+            assert response.status_code == 409
+        finally:
+            release_fit.set()
 
     def test_cancel_sets_event_and_requires_running_fit(
         self, session_and_client: Any,

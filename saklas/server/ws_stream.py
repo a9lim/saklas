@@ -890,11 +890,11 @@ async def _ws_handle_generate(
             # lifetime.
             done = False
             stop_signaled = False
+            token_get = asyncio.create_task(token_queue.get())
+            client_get = asyncio.create_task(incoming.get())
             try:
                 while not done:
-                    token_get = asyncio.create_task(token_queue.get())
-                    client_get = asyncio.create_task(incoming.get())
-                    finished, pending = await asyncio.wait(
+                    finished, _pending = await asyncio.wait(
                         {token_get, client_get}, return_when=asyncio.FIRST_COMPLETED,
                     )
                     if client_get in finished:
@@ -913,17 +913,31 @@ async def _ws_handle_generate(
                         else:
                             # Out-of-band generate/invalid frame: defer until done.
                             deferred_incoming.append(incoming_msg)
+                        client_get = asyncio.create_task(incoming.get())
                     if token_get in finished:
                         item = token_get.result()
                         if isinstance(item, _TokenDone):
                             done = True
                         else:
                             await send_json(item.payload)
-                    for task in pending:
-                        task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await task
+                            token_get = asyncio.create_task(token_queue.get())
             finally:
+                # Keep each queue read alive until it resolves.  Cancelling and
+                # recreating ``incoming.get()`` after every token can race a
+                # just-delivered stop frame: Queue.get has already removed the
+                # item, but task cancellation wins before the dispatcher sees
+                # the result.  At turn end, preserve any frame that completed
+                # just after the final token wait for the outer dispatcher.
+                if not client_get.done():
+                    client_get.cancel()
+                with suppress(asyncio.CancelledError):
+                    await client_get
+                if not client_get.cancelled():
+                    deferred_incoming.append(client_get.result())
+                if not token_get.done():
+                    token_get.cancel()
+                with suppress(asyncio.CancelledError):
+                    await token_get
                 # Drain any residual events the worker pushed between
                 # sentinel and join — should be none because the
                 # sentinel is last, but cheap insurance.
