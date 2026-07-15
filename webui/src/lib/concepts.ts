@@ -3,8 +3,8 @@
 // Two facts about every bundled concept are already on the wire and the
 // pickers present them: which *category* it belongs to (a category-valued
 // tag) and, for bipolar axes, its two *poles* (the canonical name split on
-// ``BIPOLAR_SEP`` — a dot).  See docs/plans/webui-overhaul.md §"Category
-// data" and saklas/core/session.py ``canonical_concept_name``.
+// ``BIPOLAR_SEP`` — a dot). See saklas/core/session.py
+// ``canonical_concept_name`` for the naming contract.
 
 /** The four fixed bundled categories, in display order.  Matches the
  * category-valued tags in saklas/data/manifolds/<concept>/manifold.json

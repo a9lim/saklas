@@ -89,8 +89,9 @@ class ProbeReading:
     ``residual``):
 
     * ``assignment`` — a soft node-assignment posterior: ``(label, prob)`` over
-      the candidate nodes (+ the neutral anchor), ``softmax(−d²_M / 2τ²)`` with a
-      per-node bandwidth ``τ`` (a curved fit's within-node σ-field mapped into the
+      the candidate nodes (+ the neutral anchor),
+      ``softmax(−d²_M / 2τ² − R·log(τ))`` with a per-node bandwidth ``τ`` and
+      Gaussian log-volume correction (a curved fit's within-node σ-field mapped into the
       whitened metric, a flat fit's local layout scale).  The *distributional*
       counterpart to the argmax ``nearest`` — ships the shape instead of the
       winner.  Top-N by probability, descending; sums to ≤ 1 (the reported

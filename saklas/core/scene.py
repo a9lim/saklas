@@ -1,6 +1,6 @@
 """Scene rendering — the cast-model turn stitcher.
 
-The dynamic-roles design (``docs/plans/dynamic-roles.md``) needs renders no
+The cast model needs renders no
 chat template can produce: arbitrary seat sequences (a/a/u/a/u/u), per-turn
 cast labels, generation prompts on either seat.  Gemma and Mistral templates
 hard-raise on non-alternating roles, so ``apply_chat_template`` cannot be the

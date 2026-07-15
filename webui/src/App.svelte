@@ -1,6 +1,6 @@
 <script lang="ts">
   // saklas workbench shell.  The primary frame is a desktop research
-  // cockpit: rail navigation, the threads (loom) column, central
+  // cockpit: the threads (loom) column, central
   // chat/canvas, right-side inspector, and a wide drawer host for deep
   // tools.
 
@@ -35,7 +35,7 @@
   import type { DrawerName } from "./lib/types";
 
   // Content-driven drawer sizing — forms and pickers get a narrow panel,
-  // analysis views keep the wide one (docs/plans/webui-overhaul.md §8).
+  // while analysis views keep the wide one.
   const NARROW_DRAWERS: ReadonlySet<DrawerName> = new Set<DrawerName>([
     "subspace",
     "manifolds",
@@ -482,7 +482,7 @@
   }
   /* Two-row grid: steering rack and probe rack.  Reference views
    * (correlation N×N, per-name layer norms) live in drawer overlays
-   * launched from the workspace rail — keeping them out of the rack
+   * launched from the command palette — keeping them out of the rack
    * zone gives both racks the full vertical budget.  Each rack handles
    * its own internal scroll so its actions row stays anchored. */
   .rack-zone {

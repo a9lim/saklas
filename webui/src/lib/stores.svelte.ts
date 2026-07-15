@@ -2734,7 +2734,7 @@ export interface SamplingState {
    *  event carries ``top_alts`` and the drilldown's logits tab + the
    *  inline ``surprise`` highlight mode populate.  Flipped via the
    *  "show alts" toggle in ``SamplingStrip``; the canonical "on" value
-   *  is ``8`` per Decision 1 of ``docs/plans/logit-pass.md``. */
+   *  is ``8``. */
   return_top_k: number;
   /** Active chat-template labels for the structural user/assistant roles. Sticky
    *  client state like ``seed`` — whatever's in the boxes rides the next
@@ -2764,8 +2764,7 @@ export const samplingState: SamplingState = $state({
   thinking: false,
   // Logit-pass: top-K alternatives on by default — the drilldown logits
   // tab and the inline surprise highlight want them.  The SamplingStrip's
-  // "alts" toggle flips this between 0 and 8 (Decision 1 in
-  // docs/plans/logit-pass.md).
+  // "alts" toggle flips this between 0 and 8.
   return_top_k: 8,
 });
 

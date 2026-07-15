@@ -7,8 +7,7 @@ readings.  Serializes to YAML; round-trips through
 :meth:`Transcript.to_yaml` / :meth:`Transcript.from_yaml`.
 
 The per-node thing remains :class:`Recipe`; the file/export concept is
-:class:`Transcript` so docs and CLI stop overloading (decision 17 in
-``docs/plans/loom.md``).
+:class:`Transcript` so docs and CLI do not overload the two artifacts.
 
 Schema (v2 — the cast model)::
 

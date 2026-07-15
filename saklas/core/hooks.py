@@ -1096,23 +1096,17 @@ _SUBSPACE_GAIN = 16.0
 # extrapolation, so a curved fit doesn't detonate the way the affine path would —
 # instead, *past* ``eff_along ≈ 1`` the foot keeps translating past the node.
 #
-# Live-calibrated on a CLEAN gemma-4-12b ``months_loop%january`` α-sweep
-# (stateless=True — earlier sweeps were confounded by conversation accumulation;
-# see ``scripts/curved_gain_calibrate.py`` / ``months_low_gain.py``).  ``along=1.0``
+# Live-calibrated on a clean, stateless gemma-4-12b
+# ``months_loop%january`` α-sweep. ``along=1.0``
 # at gain ``4`` (``eff_along ≈ 4``) lands the vivid coherent winter sweet spot
 # ("skeletal trees heavy with frost", consistent across seeds); gain ``2`` is milder
 # but clearly cold; the prior ``1.5`` was too weak (only a "cool prickle").
 #
-# CAVEAT — non-monotonic above the sweet spot on PERIODIC fits (a9 will revisit).
-# ``months_loop`` is a period-12 ring; ``translate_foot`` wraps, and ``eff_along`` is
-# share-weighted (per-layer ``share ∈ [0.19, 1.47]``), so past ``~1`` each layer
-# orbits the loop at its own rate and the layers land on *different* months → the
-# seasonal signal washes out / scatters rather than intensifying (foot-ring
-# geometry: ``scripts/months_foot_ring.py``).  ``4`` rides a coincidentally-coherent
-# part of the wrap; it is NOT a "stronger = more january" magnitude.  The principled
-# fix (deferred) is to clamp the curved ``eff_along`` to ``[0,1]`` and stop
-# share-weighting it on periodic domains so ``along=1`` lands every layer exactly on
-# the node.  Prototype, like its affine sibling.
+# Periodic ``BoxDomain`` fits are a distinct case: the runtime drops
+# share-weighting and clamps ``eff_along = along * gain`` to ``[0,1]`` uniformly
+# across layers. This prevents each layer from wrapping around the domain at a
+# different rate; ``along=1`` therefore lands every layer on the target node.
+# Non-periodic curved fits retain the share-weighted, unclamped translation.
 _MANIFOLD_ALONG_GAIN = 4.0
 
 # Max |cosine| between two *curved* manifold subspaces sharing a layer before

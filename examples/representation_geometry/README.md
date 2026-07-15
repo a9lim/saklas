@@ -48,12 +48,13 @@ python examples/representation_geometry/score.py   years_now_future -m google/ge
 
 `author.py all` authors every probe; `compare.py years years_now` tables the
 framing A/B. Scripts default to `google/gemma-3-4b-it`; the numbers and figures
-below are from `google/gemma-4-12B-it`. Running on a different model shows *that*
+below are from `google/gemma-4-12b-it`. Running on a different model shows *that*
 model's geometry — a smaller or older model reports its own, earlier "now."
 
 ## Countries: entity names are lexical, not geographic
 
-![countries](figures/countries/pca_layout.png)
+`analyze.py countries` generates `figures/countries/pca_layout.png` for the
+current fit.
 
 The dominant axis (38% of the variance) is not geography — it is whether the name
 has a space in it. Every country at the far right of PC1 is a two-word name
@@ -70,7 +71,7 @@ the model has, but it is not in the country-name centroid under neutral elicitat
 
 ## Years: an ordinal vocabulary recovers its order
 
-![years decode](figures/years/decoded_vs_true.png)
+`analyze.py years` generates `figures/years/decoded_vs_true.png`.
 
 Years are the opposite case. The held-out year decodes off the activation to within
 about seven years (LOO R² = 0.92), and manifold distance tracks elapsed time
@@ -109,14 +110,16 @@ That cliff is the payoff. Extend the current-year framing past the present
 (`years_now_future`, through 2035) and ask where the recency line breaks — two
 independent ways.
 
-![belief](figures/years_now_future/belief_curve.png)
+`score.py years_now_future` generates
+`figures/years_now_future/belief_curve.png`.
 
 The **scorer** reads the model's explicit belief: the restricted-choice
 distribution over *"the current year is ___"* is a single spike at **2024–2025**
 (P = 0.78 / 0.22, everything else ≈ 0). That is the training-cutoff horizon, read
 straight off the logits.
 
-![cliff](figures/years_now_future/cliff.png)
+`analyze.py years_now_future` generates
+`figures/years_now_future/cliff.png`.
 
 The **manifold geometry** lands in the same place, from an entirely different
 computation:

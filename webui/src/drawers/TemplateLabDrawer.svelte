@@ -10,8 +10,8 @@
   //     more multi-turn contexts (history turns + the slotted final assistant
   //     turn). The slot lives only in the assistant turn.
   //
-  // Reached from the workspace rail's "manifolds → templates…" entry. Templates
-  // also feed a manifold fit (`saklas manifold from-template`).
+  // Reached from the command palette. Templates also feed a manifold fit
+  // (`saklas manifold from-template`).
 
   import { onMount } from "svelte";
   import { ApiError, apiTemplates } from "../lib/api";

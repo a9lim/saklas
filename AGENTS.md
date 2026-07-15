@@ -38,7 +38,7 @@ when you work in that directory. Consult them only when editing that layer.
   monitor, session, generation loop, loom tree
 - `saklas/io/AGENTS.md` — manifold format, HF distribution, GGUF, merge,
   alignment, paths/selectors
-- `saklas/cli/AGENTS.md` — seven-verb dispatch, config loading, flags
+- `saklas/cli/AGENTS.md` — nine-verb dispatch, config loading, flags
 - `saklas/server/AGENTS.md` — OpenAI / Ollama / native routes
 - `saklas/tui/AGENTS.md` — slash commands, panels, loom screen
 - `saklas/web/AGENTS.md` — dashboard mount, wire protocol, Svelte source layout
@@ -160,8 +160,8 @@ preset      := before | after | both | thinking | response | prompt | generated
 gate        := "when" ":" probe_atom op NUM        # op ∈ > >= < <=
 probe_atom  := [ns "/"] NAME ["." NAME] ["[" INT "]"]  # vector probe (e.g. confident.uncertain,
                                                    # jlens/fake); optional coord axis (personas[3])
-             | [ns "/"] NAME ":" "fraction"        # manifold subspace fraction
-             | [ns "/"] NAME "@" NAME              # manifold label similarity
+             | [ns "/"] NAME ":" ("fraction" | "membership")
+             | [ns "/"] NAME ("@" | "~") NAME      # distance / assignment
              | "sae" "/" INT                       # resident SAE feature strength (activation /
                                                    # Neuronpedia maxActApprox when cached; raw otherwise)
 ```
@@ -200,8 +200,10 @@ per-probe constant, so `nearest` still ranks by raw distance (literally nearest,
 distinct from the density-aware `~<label>`). Two
 **fuzzy-manifold** channels join them (additive — the `@<label>` distance gate is
 untouched): the soft-assignment probability `~<label>` (`@when:personas~hacker >
-0.5`) — a normalized, in-`[0,1]` `softmax(−d²/2τ²)` membership over the nodes,
-the distributional counterpart to argmax `nearest` — and the tube-fit density
+0.5`) — a normalized, in-`[0,1]`
+`softmax(−d²/(2τ²) − R·log(τ))` posterior over the nodes (including the
+Gaussian log-volume correction), the distributional counterpart to argmax
+`nearest` — and the tube-fit density
 `:membership` (`@when:emotions:membership > 0.6`) — `exp(−residual²/2σ²)` under the
 fitted within-node thickness `σ(z)`, high when the activation sits inside the
 manifold's learned tube (distinguishes off-surface from on-surface-but-diffuse,
@@ -581,15 +583,16 @@ across targets (a tight pole sits ~0.3 from neutral, a far persona centroid ~17)
 so one `along` gain couldn't calibrate both — `0.5 formal%formal` did nothing
 while `0.5 personas%caveman` slammed the output. `along` is now a scale-stable
 strength knob across ranks/targets; per-target *coherence* variance (~2-3×, §10)
-remains. There is **no lever / N correction** and **no `[0,1]`
-clamp / water-fill on `along`** (a high-signal layer is meant to overshoot the
-target; the de-rogued whitened coords keep it controlled and `norm_cap` bounds
-it). `onto` stays clamped `[0,1]`. (`_SUBSPACE_GAIN` is tagged a prototype —
-calibrated so `≈0.5 <concept>` lands at the coherent sweet spot; the whitened
-normalization changes the absolute scale, so this constant is **due for
-recalibration** against live output.) A steered layer always runs the slow (ctx-consulting) hook, so per-step
-triggers and probe gates work uniformly; `torch.compile`/StaticCache graph capture
-stays available only for unsteered generation.
+remains. There is **no lever / N correction** and, except for periodic domains,
+**no `[0,1]` clamp / water-fill on `along`** (a high-signal layer is meant to
+overshoot the target; the de-rogued whitened coords keep it controlled, with
+`norm_cap` guarding the non-periodic curved path while the affine path relies on
+the bounded target). `onto` stays clamped `[0,1]`. `_SUBSPACE_GAIN` is
+live-calibrated so `≈0.5 <concept>` lands at the coherent sweet spot but remains
+tagged as a prototype. The dominant always-active affine case
+uses `SteeringHook._single_affine_fast`, a fixed tensor-op sequence eligible for
+StaticCache and `torch.compile`. Curved, phased, or gated steering uses the
+ctx-consulting general path so per-step triggers and probe gates remain dynamic.
 
 ## Manifold steering
 
@@ -836,7 +839,7 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 Key contracts:
 - `generate` / `generate_stream` / `session.steering()` accept `str | Steering |
   None` only — dicts raise `TypeError`. A string is a steering expression.
-- **Cast model** (`core/scene.py`, `docs/plans/dynamic-roles.md`): rendering
+- **Cast model** (`core/scene.py`): rendering
   goes through the per-session **scene grammar** (template autopsy +
   byte-exact round-trip validation; `session.scene_grammar`, None = legacy
   fallback). `generate(..., gen_seat="user")` has the model speak the user
@@ -1100,6 +1103,6 @@ owns the throughput regression.
 
 **CPU-only**: the bulk of the suite — core dataclasses, steering-context
 semantics, manifold format integrity + staleness, selector grammar, mocked HF
-wrappers, GGUF round-trip, config loading, monitor scoring, seven-verb CLI dispatch,
+wrappers, GGUF round-trip, config loading, monitor scoring, nine-verb CLI dispatch,
 OpenAI/Ollama/native servers, TUI slash-command dispatch, loom tree/diff/filter/
 transcript.

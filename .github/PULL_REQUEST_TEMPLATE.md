@@ -9,8 +9,10 @@
 ## Test plan
 
 - [ ] `ruff check .` passes
-- [ ] Non-GPU tests pass (`pytest tests/test_paths.py tests/test_packs.py ...`)
-- [ ] GPU smoke tests pass (if touching model, vector, hooks, or monitor code)
+- [ ] `pyright` passes
+- [ ] Non-GPU tests pass (`pytest -q -m "not gpu"`)
+- [ ] GPU smoke tests pass (if touching model loading, fitting, generation, hooks, or monitors)
+- [ ] `npm run check && npm run build` passes and the committed bundle is current (if touching `webui/`)
 - [ ] Manually verified against: <!-- model id + device -->
 
 ## Notes

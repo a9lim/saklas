@@ -1,4 +1,4 @@
-"""StaticCache + CUDA-graphs detection (Phase B, v2.2).
+"""StaticCache + CUDA-graph detection and session-cache reuse.
 
 The actual graph-capture path needs CUDA hardware to exercise; these
 tests pin the *gating* behavior — what makes
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -312,9 +312,24 @@ def test_session_reuses_and_resets_generation_static_cache(
     session._generation_static_cache_len = 0
     model = _Model()
 
-    first = session._acquire_generation_static_cache(model, max_cache_len=512)
-    reused = session._acquire_generation_static_cache(model, max_cache_len=256)
-    grown = session._acquire_generation_static_cache(model, max_cache_len=768)
+    first = cast(
+        _Cache,
+        session._acquire_generation_static_cache(
+            cast(Any, model), max_cache_len=512,
+        ),
+    )
+    reused = cast(
+        _Cache,
+        session._acquire_generation_static_cache(
+            cast(Any, model), max_cache_len=256,
+        ),
+    )
+    grown = cast(
+        _Cache,
+        session._acquire_generation_static_cache(
+            cast(Any, model), max_cache_len=768,
+        ),
+    )
 
     assert reused is first
     assert first.resets == 1

@@ -8,7 +8,8 @@ unification of the former `TraitMonitor` + `ManifoldMonitor`). Every attach is
 `session.remove_probe(name)` over the one `session._monitor`; per-token readings
 ride `event.probe_readings` and the end-of-gen aggregate is
 `session.last_result.probe_readings` — both the single `ProbeReading` shape
-(`coords`/`fraction`/`nearest`/`residual` + `*_per_layer`). The trait panel
+(`coords`/`fraction`/`nearest`/`residual` + `assignment`/`membership` + depth and
+per-layer fields). The trait panel
 splits the one probe set by geometry — flat (affine) probes drive the scalar
 MONITOR PROBES section, curved probes the MANIFOLD PROBES section — the TUI
 mirror of the webui's subspace/manifold rack split (`_refresh_probe_panels` is

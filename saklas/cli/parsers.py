@@ -1381,7 +1381,10 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
     manifold = sub.add_parser(
         "manifold",
-        help="Manifold compute (extract/generate/fit/bake/merge/transfer/compare/why)",
+        help=(
+            "Manifold compute "
+            "(extract/generate/from-template/fit/bake/merge/transfer/compare/why)"
+        ),
         description="Steering-vector / manifold authoring, fitting, and analysis",
     )
     _build_manifold_parser(manifold)

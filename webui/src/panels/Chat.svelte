@@ -10,7 +10,7 @@
   // scroll bookkeeping, per-turn collapse state).  The WS lifecycle and
   // gen-status accounting belongs to the store.
   //
-  // Turn surface follows the CAST MODEL (docs/plans/dynamic-roles.md):
+  // Turn surface follows the cast model:
   // every speaker gets one neutral glass card — roles aren't a "space",
   // so they carry no hue — with identity in the role chip (glyph letter +
   // label, arbitrary strings first-class). Analysis badges appear only when

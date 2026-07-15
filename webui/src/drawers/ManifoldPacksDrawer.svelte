@@ -1,6 +1,6 @@
 <script lang="ts">
   import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
-  // ManifoldPacksDrawer — manifold-side counterpart to PackDrawer.
+  // ManifoldPacksDrawer — local manifold catalog and HF search/install.
   //
   // Two tabs at the top: "Installed" lists what saklas knows locally
   // (proxied through GET /saklas/v1/manifolds); "Search HF" hits
@@ -8,14 +8,9 @@
   // an Install button per row that POSTs the install request and
   // refreshes the local list on success.
   //
-  // Pair-drawer with ManifoldDrawer: that one is the *workspace* surface
-  // (per-row steer / probe / fit / delete on the active session); this
-  // one is the *catalog* surface (list local, browse HF, install).
-  // Mirrors how VectorsDrawer and PackDrawer split the same concerns
-  // for steering vectors.
-  //
-  // Reachable from the workspace rail's "manifolds → packs…" entry,
-  // parallel to "vectors → packs…".
+  // The rack browser is the active-session surface (steer, probe, fit,
+  // delete); this drawer is the catalog surface (list local, browse HF,
+  // install). It is reachable from the command palette.
 
   import { onMount } from "svelte";
   import { ApiError, apiManifolds } from "../lib/api";
@@ -41,8 +36,7 @@
   let searchError: string | null = $state(null);
   let installing: string | null = $state(null);
 
-  // Debounce: redo searches 300ms after the user stops typing — mirrors
-  // PackDrawer's cadence so the two feel identical.
+  // Redo searches 300ms after the user stops typing.
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   function scheduleSearch(): void {
     if (debounceTimer) clearTimeout(debounceTimer);
@@ -256,11 +250,8 @@
 </div>
 
 <style>
-  /* Two-tab layout mirrors PackDrawer pixel-for-pixel so the two
-   * pack browsers feel like one family — same tabs, same row look,
-   * same colour rhythm.  Only the install action's accent goes
-   * purple (the manifold family colour); the steering-vector side
-   * keeps its blue. */
+  /* Shared installed/search layout: compact tabs, catalog rows, and a
+   * purple install accent for the manifold family. */
   .drawer-shell {
     display: flex;
     flex-direction: column;

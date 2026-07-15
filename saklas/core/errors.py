@@ -139,14 +139,13 @@ class ManifoldArityError(SteeringExprError):
 
 
 class OverlappingManifoldError(SteeringExprError):
-    """Raised when two manifold terms target the same layer.
+    """Raised when curved manifold terms overlap at a shared layer.
 
-    Only one manifold may steer a given layer — composing two manifolds at
-    the same layer is the deferred frontier (see
-    ``docs/plans/manifold-composition.md``).  Subclasses
-    ``SteeringExprError`` so existing ``except SteeringExprError`` sites
-    still catch it; the dedicated type lets callers discriminate the
-    overlap failure from a generic parse error.
+    Multiple curved terms may share a layer when their fitted spans are
+    near-orthogonal; the affine merged subspace is orthogonalized against
+    those spans.  This error identifies the unsupported case where two curved
+    spans exceed the overlap tolerance.  It subclasses ``SteeringExprError``
+    so existing expression-error handlers still catch it.
     """
 
 

@@ -28,8 +28,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
-      # Install dev extras so pyright can resolve torch / transformers /
-      # safetensors when it analyzes the public API surface.
+      # Install dev extras so pyright can resolve runtime/test dependencies
+      # while it analyzes the package, tests, examples, and maintained scripts.
       - run: pip install -e ".[dev]"
       - run: pyright
 

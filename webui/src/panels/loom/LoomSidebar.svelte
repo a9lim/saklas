@@ -181,7 +181,7 @@
   // ----------------------------------------- ring decoration --------
 
   /** Per-node ring fill keyed off the currently-selected highlight
-   *  probe (Decision 10 in docs/plans/loom.md).  Returns the node's
+   *  probe. Returns the node's
    *  aggregate reading for ``highlightState.target`` in [-1, 1], or
    *  ``null`` when no probe is selected, the node has no aggregate
    *  readings yet, or the selected probe is missing from this node's

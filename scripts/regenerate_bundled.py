@@ -1,10 +1,8 @@
 """Regenerate every model-generated bundled manifold under
-``saklas/data/manifolds/`` — one A2 pipeline, one hardcoded spec table.
+``saklas/data/manifolds/`` through one A2 pipeline and spec table.
 
-Supersedes the two former scripts (``regenerate_bundled_manifold.py`` for
-``personas`` and ``regenerate_bundled_discover_manifold.py`` for
-``cultural``/``register``) and fills the gap they left: the concept axes (the
-2-node ``pca`` subspaces) never had an A2 regeneration path.
+The command covers both the multi-node discover manifolds and the 2-node
+``pca`` concept subspaces.
 
 Generation writes node corpora only; FIT is a separate step
 (``saklas manifold fit <ns>/<name>``), deliberately decoupled so a flaky

@@ -6872,8 +6872,8 @@ class SaklasSession:
         """Return sha256 hex of the baked tensor bytes for ``name``.
 
         Stamps :class:`saklas.core.loom.Recipe.probe_hashes` so transcript
-        replay can detect probe drift between save and load (decision
-        19 in ``docs/plans/loom.md``).  Cached on the session — adding
+        replay can detect probe drift between save and load. Cached on the
+        session — adding
         or removing a probe invalidates the relevant cache entry.
 
         Returns ``None`` when the probe isn't registered.  Hashing is
@@ -7495,11 +7495,10 @@ class SaklasSession:
     # -- History / loom tree --
 
     def _check_user_send_target(self, parent_node_id: str | None) -> None:
-        """D15 — refuse sending a new user turn from a user-role node.
+        """Refuse sending a new user turn from a user-role node.
 
-        The plan's send-semantics table (``docs/plans/loom.md`` §"Active-
-        node send semantics") rejects sending a fresh user turn when the
-        resolved parent is itself a user node: the user node is already
+        A fresh user turn is invalid when the resolved parent is itself a
+        user node: that node is already
         waiting for an assistant.  Allowing it would corrupt the tree
         shape (user-under-user) and break the v2 chat-message flatten.
 
@@ -7534,7 +7533,7 @@ class SaklasSession:
         the requested op conflicts with an in-flight generation's
         subtree reservation.
 
-        Rules (per ``docs/plans/loom.md`` phase 1):
+        Rules:
 
         - Decoration ops (``star``, ``note``) and ``branch`` never raise.
         - ``add_user_turn`` / ``begin_assistant`` / ``finalize_assistant``

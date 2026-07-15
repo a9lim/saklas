@@ -36,7 +36,7 @@ body:
     attributes:
       label: saklas version
       description: Output of `pip show saklas | grep Version`
-      placeholder: 1.1.1
+      placeholder: x.y.z
     validations:
       required: true
 
@@ -62,3 +62,9 @@ body:
     attributes:
       label: Full traceback or log output
       render: shell
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Relevant environment details
+      description: Quantization, dtype, accelerator/driver, and whether this was the CLI, TUI, Python API, or HTTP server

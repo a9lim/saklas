@@ -603,7 +603,7 @@ systematically undershoots (one dominant Fiedler mode picks k=1), and without th
 floor a curved manifold linearly embedded in a `k_flat`-plane reads flat (the flat
 affine fit reconstructs the in-plane curve, the under-dimensioned curved fit
 can't, losing reconstruction it would win at matched dim — the flat-bias the
-`scripts/experiments/concept_geometry/geometry_stress.py` harness surfaced);
+the topology regression suite surfaced);
 **(b) periodic axes** — Vietoris–Rips H1
 *persistent homology* (`_rips_h1_persistence` boundary-matrix reduction →
 `_count_persistent_loops`, essential loops at `eps_max=2ε_c`) counts the loops
@@ -633,7 +633,7 @@ fan). Both regimes also require **graded** growth (`d(sep=2)/d(sep=1) ≥ 1.08`)
 1-D-ness at the looser clustered bound (degree ≤ 4 — a tight clump reaches 4),
 returning a uniform `2π·rank/K` `S¹` coordinate in the recovered cyclic *order*
 (exact spacing dropped — topology, not metric, is what the periodic domain needs).
-Gated `7 ≤ K ≤ 128`. Validated (`geometry_stress.py periodic`) for specificity
+Gated `7 ≤ K ≤ 128`. Validated by the periodic-topology regression tests for specificity
 (~0% false-positive on random Gaussian heaps K≥9, and on grids/fans/arcs/blobs/
 lines) and clustered-ring sensitivity (100% recall for tight-to-moderate clumps);
 the bimodality guard trades two documented false-negatives — a very-loose cluster
@@ -920,7 +920,7 @@ logs the fallback reason.
 
 ## scene.py
 
-The cast-model turn stitcher (`docs/plans/dynamic-roles.md`): **template
+The cast-model turn stitcher: **template
 autopsy** renders sentinel-content probes through the live chat template and
 slices out a `TurnGrammar` — prelude, per-seat `SeatWrapper`s (open/label
 site/close), system shape (real turn vs gemma-style fold, or unsupported —
@@ -1382,7 +1382,9 @@ checks). Term markers: `ProjectedTerm(coeff, trigger, operator, base, onto)`
 default coeff 1.0, doesn't compose with `~`/`|` — lowered through
 `synthesize_subspace`'s ablation path at dispatch), `ManifoldTerm` (`along`,
 `onto`, position; `_expand_along_onto_coeffs` yields a 1- or 2-tuple). Probe gates
-(`@when:<probe><op><threshold>`) accept three identifier shapes — vector
-(`confident.uncertain`), manifold fraction (`emotions:fraction`), manifold label
-(`emotions@happy`) — all stored verbatim in `ProbeGate.probe` so the runtime gate is
+(`@when:<probe><op><threshold>`) accept coordinate axes
+(`confident.uncertain`, `personas[3]`), manifold fraction
+(`emotions:fraction`), label distance (`emotions@happy`), soft assignment
+(`personas~hacker`), tube membership (`emotions:membership`), and SAE/J-lens
+channels — all stored verbatim in `ProbeGate.probe` so the runtime gate is
 identical; the parser is the only place the discrimination lives.

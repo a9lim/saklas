@@ -23,7 +23,8 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
 ## Verb nesting
 
 - `manifold` = the unified compute surface
-  (`extract`/`generate`/`fit`/`bake`/`merge`/`transfer`/`compare`/`why`),
+  (`extract`/`generate`/`from-template`/`fit`/`bake`/`merge`/`transfer`/
+  `compare`/`why`),
   hand-dispatched by `_run_manifold` (table `_MANIFOLD_VERBS`). `fit` absorbs the
   former `discover` verb: its positional is a name-or-folder, `_run_manifold_fit`
   resolves it and reads `fit_mode`, and the discover hyperparams

@@ -834,8 +834,9 @@ export interface ProbeRequest {
  *  ``saklas.core.results.ProbeReading.to_dict()``.  ``coords`` is the
  *  domain-frame position (signed pole-normalized axis-0 at rank-1);
  *  ``residual`` is ``0`` for a flat (subspace) fit and the normalized
- *  off-surface distance for a curved (manifold) fit.  Per-layer maps are
- *  string-keyed by layer index. */
+ *  off-surface distance for a curved (manifold) fit. ``assignment`` is the
+ *  soft node posterior and ``membership`` the learned-tube density. Per-layer
+ *  maps are string-keyed by layer index. */
 export interface ProbeReadingJSON {
   fraction: number;
   nearest: [string, number][];
@@ -844,6 +845,8 @@ export interface ProbeReadingJSON {
   fraction_per_layer: Record<string, number>;
   coords_per_layer: Record<string, number[]>;
   residual_per_layer: Record<string, number>;
+  assignment?: [string, number][];
+  membership?: number;
   /** Per-axis depth center of mass (+ std) of the per-layer coordinate
    *  trace — where in the layer stack the probe reads, in normalized
    *  depth (0 = first block, 1 = last).  Mass per layer is
@@ -1791,13 +1794,10 @@ export type DrawerName =
   | "manifold_builder"
   /** Discover-mode node-union merge.  Unions the node corpora of two or
    *  more discover-mode manifolds into a fresh discover folder; restricted
-   *  to discover sources by design.  Reached from the workspace rail's
-   *  "manifolds → merge manifolds…" entry. */
+   *  to discover sources by design. Reached from the command palette. */
   | "manifold_merge"
-  /** Manifold-side counterpart to ``PackDrawer``.  Two tabs: local
-   *  catalog, plus HF search/install for ``saklas-manifold``-tagged
-   *  repos.  Reached from the workspace rail's "manifolds → packs…"
-   *  entry, parallel to "vectors → packs…". */
+  /** Local manifold catalog plus HF search/install for
+   *  ``saklas-manifold``-tagged repositories. */
   | "manifold_pack"
   | "save_conversation"
   | "load_conversation"

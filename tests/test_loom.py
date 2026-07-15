@@ -499,11 +499,11 @@ def test_add_user_turn_no_dedup_when_text_differs():
 
 
 # ---------------------------------------------------------------------------
-# D15 — active-node send role table (decision 15 in docs/plans/loom.md)
+# Active-node send role table
 #
 # These tests verify the engine-side reject when the resolved parent for
 # a new user turn is itself a user node — the "user turn already waiting
-# for an assistant" case from the plan's send-semantics table.  The
+# for an assistant" case. The
 # reject lives in ``session._generate_core``, so we exercise it through
 # the session entry rather than the bare ``tree.add_user_turn`` (which
 # is allowed to land a user-under-user for the auto-regen seed path).

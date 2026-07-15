@@ -53,7 +53,7 @@ def main() -> None:
             if reading.coords
         }
 
-    print("\n=== probe means ===")
+    print("\n=== final aggregate probe coordinates ===")
     print(json.dumps({
         "unsteered": probe_summary(unsteered.first),
         "steered": probe_summary(steered.first),

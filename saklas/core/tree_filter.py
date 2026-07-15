@@ -6,7 +6,7 @@ but deliberately distinct — the underlying scalars are different.
 probe readings during generation; this module gates on *per-node*
 aggregates that the monitor stamped on each assistant node when the gen
 finalized.  Reusing one grammar would silently change semantics across
-contexts (decision 18 in ``docs/plans/loom.md``).
+contexts.
 
 Grammar::
 

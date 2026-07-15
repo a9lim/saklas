@@ -67,11 +67,19 @@ Releases = "https://github.com/a9lim/saklas/releases"
 flash = ["flash-attn>=2.5"]
 cuda = ["bitsandbytes>=0.43", "kernels>=0.12"]
 cuda-experimental = ["bitsandbytes>=0.43", "kernels>=0.12", "flash-attn>=2.5"]
-dev = ["pytest>=8.0", "pytest-cov>=5.0", "httpx>=0.27", "ruff>=0.6.9", "pyright>=1.1.400"]
+dev = ["build>=1.2", "pytest>=8.0", "pytest-cov>=5.0", "httpx>=0.27", "ruff>=0.6.9", "pyright>=1.1.400"]
 hf = ["datasets>=2.0"]
 gguf = ["gguf>=0.10"]
 pandas = ["pandas>=3.0.2"]
-research = ["datasets>=2.0", "pandas>=3.0.2"]
+research = [
+    "datasets>=2.0",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "pandas>=3.0.2",
+    "pillow>=10",
+    "scikit-learn>=1.4",
+    "scipy>=1.11",
+]
 notebook = ["plotly>=5.0", "pandas>=3.0.2", "kaleido>=0.2"]
 
 [project.scripts]
@@ -100,7 +108,7 @@ ignore = ["E501", "E741", "E402", "E731"]
 # canonical print-to-stdout sites; T20 (flake8-print) is meant to
 # catch debug-print leakage in the engine / IO / server / TUI.
 "saklas/cli/*" = ["T20"]
-# Research/maintenance scripts are stand-alone and intentionally
+# Maintenance/benchmark scripts are stand-alone and intentionally
 # print to stdout for diagnostic output and progress reporting.
 "scripts/*" = ["T20"]
 # Examples are runnable demos that print results.
@@ -110,9 +118,7 @@ ignore = ["E501", "E741", "E402", "E731"]
 # public-API surface because the engine/CLI/server/TUI layers lean on
 # torch/transformers/fastapi/textual internals whose stubs are uneven;
 # the maintained library, tests, examples, and utility scripts are now fully
-# annotated, so the strict rules below hold across those surfaces. Exploratory
-# research experiments stay out of the strict gate; they are linted, but not
-# required to carry production-grade annotations while hypotheses are moving.
+# annotated, so the rules below hold across those surfaces.
 #
 # ``standard`` mode (rather than ``strict``) is deliberate: ``strict``
 # turns on ``reportUnknown*`` and those fire constantly on legitimate
@@ -128,7 +134,7 @@ include = [
     "scripts",
     "examples",
 ]
-exclude = ["**/__pycache__", "**/node_modules", "scripts/experiments"]
+exclude = ["**/__pycache__", "**/node_modules"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 reportMissingTypeStubs = false

@@ -1,4 +1,4 @@
-"""Cross-branch joint logprobs (Phase 5 of docs/plans/logit-pass.md).
+"""Cross-branch joint logprobs for generated loom siblings.
 
 Given two assistant LoomNodes A and B that share a parent, replay each
 branch token-by-token under the recipe stamped on that node and report,
@@ -17,11 +17,11 @@ for each aligned assistant-token position pair:
   argmax" signal.
 * ``approx_kl`` — top-K-truncated KL(P_A || P_B), summed over the union
   of each side's top-K tokens.  The tail is unobserved, so this is
-  documented as approximate signal not measurement (per Decision 5).
+  documented as an approximate signal, not a full-distribution measurement.
 
-The route is fired lazily on NodeCompareDrawer open per Decision 9;
-results cache on the session keyed by sorted ``(a_id, b_id)`` for the
-session lifetime.  Tree mutations that rename / delete the involved
+The route is called lazily when the comparison UI opens; results cache on the
+session keyed by sorted ``(a_id, b_id)`` for the session lifetime. Tree
+mutations that rename or delete the involved
 nodes invalidate the entries (see ``SaklasSession`` cache wiring).
 """
 

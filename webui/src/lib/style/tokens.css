@@ -1,8 +1,6 @@
 /* Design tokens v2 — the Observatory+ system.
  *
- * Spec: the locked direction board (2026-07-10) + docs/plans/webui-overhaul.md
- * UX principles (dark-only, density stays visible). Supersedes the a9l.im
- * mirror palette.
+ * Dark-only, high-density visual system. Supersedes the a9l.im mirror palette.
  *
  * The rules:
  *   - HUE ANSWERS "WHICH SPACE AM I LOOKING AT?" — chrome is achromatic;

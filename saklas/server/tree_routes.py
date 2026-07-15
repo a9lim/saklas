@@ -442,8 +442,7 @@ def register_tree_routes(app: FastAPI) -> None:
     async def tree_joint_logprobs(session_id: str, req: JointLogprobsRequest):
         """Cross-evaluation between two sibling generated nodes.
 
-        Logit-pass Phase 5 of ``docs/plans/logit-pass.md``.  Force-replays
-        each branch under the node's stamped recipe, steering hooks, probe
+        Force-replays each branch under the node's stamped recipe, steering hooks, probe
         gates, penalties, logit bias, and sampler transform, then returns
         per-aligned-position records carrying both branches' chosen-token
         logprobs *and* the cross-branch evaluation (what each side would

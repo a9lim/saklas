@@ -608,9 +608,8 @@ class LoomMutated:
     server WS layer (:mod:`saklas.server.ws_stream`'s
     ``WS /saklas/v1/sessions/{id}/stream``) enriches each id into full
     ``LoomNodeJSON`` payloads via :func:`saklas.server.tree_models.node_json`
-    before forwarding
-    to clients, so the wire-level ``tree_mutated`` event matches the
-    shape described in ``docs/plans/loom.md`` phase 2.  In-process
+    before forwarding to clients. The wire-level ``tree_mutated`` event
+    therefore carries full nodes while in-process
     subscribers (TUI, library callers) that already hold the tree
     look the ids up themselves; the network hop is the only place that
     needs the inlined node data.

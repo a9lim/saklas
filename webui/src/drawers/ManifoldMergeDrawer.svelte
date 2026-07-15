@@ -8,7 +8,7 @@
   // user-declared geometry that isn't mergeable without a shared coordinate
   // system.
   //
-  // Reached from the workspace rail's "manifolds → merge manifolds…" entry.
+  // Reached from the command palette's steering-manifold tools.
 
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";

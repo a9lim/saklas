@@ -3,8 +3,8 @@
 Dual-protocol HTTP on one port: OpenAI `/v1/*`, Ollama `/api/*`, native
 `/saklas/v1/*`. One model per server; generation across all three protocols
 serializes on a single `asyncio.Lock`. There is **no `/saklas/v1/packs*` surface**
-— concepts are manifolds, so distribution rides the manifold routes (install) and
-the vectors-under-session routes (extract/merge); HF upload stays CLI-only.
+— concepts are manifolds, so distribution and node-union merge ride the manifold
+routes while session vector routes own extract/bake; HF upload stays CLI-only.
 
 ## Module map
 
@@ -200,7 +200,7 @@ per-model sidecar/tensor via `_resolve_intrinsic_dim` + a `load_manifold` read.
   on an in-flight engine gen-lock). `ManifoldInstallConflict` → 409, missing → 404,
   bad input → 400, `huggingface_hub` missing → 503, HF error → 502. Returns the same
   detail JSON as `GET .../{ns}/{name}`. There is deliberately **no install/push
-  parity gap to worry about**: `push_manifold` is wired only into CLI `manifold
+  parity gap to worry about**: `push_manifold` is wired only into CLI `pack
   push` — HF upload stays CLI-only, no `POST .../push` route.
 - `POST /manifolds/generate` — LLM-authors a discover folder via
   `session.generate_responses` (A2 conversational extraction — each concept
