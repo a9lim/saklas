@@ -29,10 +29,14 @@ The dashboard speaks the native `/saklas/v1/*` API (registered by
 
 **Current composer contract (supersedes the legacy generate/seat wording
 below):** `Chat.svelte` sends `type:"submit"` with explicit native
-`authored_seat` / `generated_seat` (`human|model`). The single **swap seats**
-checkbox reverses both; selected-node role never changes composer semantics;
-empty always generates and a modifier suppresses generation only for non-empty
-text. The visible actions are `send`, `generate`, and `append` (authored-only).
+`authored_seat` / `generated_seat` (`human|model`). Two visible role controls
+select those seats independently while displaying their current role labels;
+the continuation control also accepts `none` for authored-only append, and a
+one-shot swap action exchanges the current pair. The template-channel seat stays
+an implementation detail in the composer. Selected-node role never changes
+composer semantics. Empty text generates the selected continuation role. The
+visible actions remain the compact `send`, `generate`, and `append`; there is no
+append modifier shortcut.
 Matching structural role + effective role label coalesces into one message.
 `type:"generate"` remains for specialist fork/prefill and compatibility.
 Result actions/rendering key off artifacts (`recipe`, token rows,
@@ -302,7 +306,7 @@ its resumable checkpoint.
 
 `RawBuffer` is the base-model surface.  `SessionInfo.is_base_model` (a non-chat model has no chat template) drives `genUiMode.effectiveRawMode()`; the `genUiMode.override` (`auto`/`chat`/`raw`, persisted per `model_id`, set from the AdvancedSamplingDrawer control or the cycling badge in the Chat header) wins when not `auto`.  In raw mode `Chat.svelte` renders `<RawBuffer />` instead of role bubbles — one continuous editable `pre-wrap` surface with the loom active path joined as plain text, no roles.
 
-Flat mode is non-linear: editing text anywhere in the buffer and appending past its end are the *same* operation. `resolveDivergence()` diffs the draft against the settled buffer, finds the first changed character, and the tail from there becomes one new span. **send** submits that tail as `human` and generates `model`; a clean buffer shows **generate** and omits the authored half; modifier+Enter shows **append** and submits only the `human` tail. All three use the same native `sendSubmit(..., {raw:true})` contract as chat. The divergence node and its subtree are preserved as the original branch—an edit never overwrites a model-authored span in place. The internal `committing` latch holds the buffer→draft sync across the server round trip so the typed tail does not flash out; it releases on a content check (`bufferText.startsWith(draft)`) and suppresses the tinted mirror while held. Toggling the mode never mutates the tree. Per-token tinting rides a read-only mirror layer behind the transparent-text textarea (a textarea cannot tint spans) and shows only when not actively editing.
+Flat mode is non-linear: editing text anywhere in the buffer and appending past its end are the *same* operation. `resolveDivergence()` diffs the draft against the settled buffer, finds the first changed character, and the tail from there becomes one new span. **send** submits that tail as `human` and generates `model`; a clean buffer shows **generate** and omits the authored half; the explicit **append** button submits only the `human` tail. There is no append modifier shortcut. All three use the same native `sendSubmit(..., {raw:true})` contract as chat. The divergence node and its subtree are preserved as the original branch—an edit never overwrites a model-authored span in place. The internal `committing` latch holds the buffer→draft sync across the server round trip so the typed tail does not flash out; it releases on a content check (`bufferText.startsWith(draft)`) and suppresses the tinted mirror while held. Toggling the mode never mutates the tree. Per-token tinting rides a read-only mirror layer behind the transparent-text textarea (a textarea cannot tint spans) and shows only when not actively editing.
 
 `lib/expression.ts` — every term is a `%` position. `serializeExpression(rack, subspaceAlong = 1)` emits subspace terms first (each at the shared `subspaceAlong` magnitude) then manifold terms (each at its own `along[,onto]`), picking the production from `entry.mode`. `parseExpression(expr, { isFlat? })` returns `{ rack, subspaceAlong, warnings }`: a `%` term with an `onto` coeff or a non-flat catalog `fit_mode` lands `manifold`, else `subspace` (magnitude collected into `subspaceAlong`; a later subspace term whose magnitude differs folds onto the shared value with a warning); a bare-pole term (`0.5 formal.casual`) becomes a label-form subspace term toward the signed pole. The pre-4.1 `~`/`|` projection and `!` ablation still **parse** (so pasted expressions don't throw) but the operator is dropped with a `warnings` entry. The `%` coefficient slot is `along[,onto]`: serialize emits `<along>,<onto>` when `onto > 0` and `<along>` alone otherwise; the parser reads a pre-selector comma-run of ≤ 2 (mirroring the engine's `coeff := signed_float ("," signed_float)?`), lexically unambiguous from the post-`%` coord commas. `:variant` rides the atom (`name:sae%pos`) and survives on every term shape; keep the variant list in parity with the Python grammar (`raw`, `sae`, `sae-*`, `role`, `role-*`, `from`, `from-*`) — there is no `pca` variant. The round-trip invariant is parse(serialize(rack, G)) reproducing `rack` + `G` for any serializer output.
 
@@ -311,18 +315,25 @@ The current composer is seat-neutral. Its two structural seats are always
 chat-template labels for those seats and seed once per model from
 `SessionInfo.default_user_role` / `default_assistant_role` (Gemma therefore
 shows `user` / `model`). Only genuine overrides lower to protocol `user_role` /
-`assistant_role` in `buildSamplingPayload`. The fields use the editable Saklas
-`Combobox`, whose themed list combines both model defaults with every role
-observed in the auto-derived tree cast; never reintroduce a native `datalist`.
+`assistant_role` in `buildSamplingPayload`. `CastDrawer` owns those two editable
+labels through the Saklas `Combobox`, whose themed list combines both model
+defaults with every genuinely custom role observed in the auto-derived tree cast;
+the structural `human` / `model` roster keys are presented through those model
+defaults instead of leaking into the list as extra roles. The composer
+shows the resulting labels in ordinary `Select` controls and keeps the backing
+human/model seat out of the primary surface; never reintroduce a native
+`datalist`.
 
-`Chat.svelte` has one seating control: the `swap seats` checkbox. Unchecked,
-authored text occupies `human` and generation occupies `model`; checked, those
-assignments reverse. The reducer has only three visible actions: non-empty text
-without a modifier is **send** (append authored text, then generate the other
-seat), empty text is **generate**, and non-empty modifier+Enter is **append**
-(authored text only). Selection chooses the branch anchor but never changes
-these meanings. Scene mode gates swapping because legacy templates cannot open
-a user-seat generation header.
+`Chat.svelte` exposes a visible two-part turn plan. **you write** selects the
+authored role; **model writes** independently selects a generated role or `none`
+for an authored-only append. Each visible role option carries its structural
+human/model seat internally. A one-shot `⇄` exchanges the two selected roles; it
+is not a persistent mode. Non-empty text with a generated role is **send**, empty
+text with a generated role is **generate**, and selecting `none` is **append**.
+There is no append shortcut. Selection chooses the branch anchor but never
+changes these meanings. Scene mode gates nonstandard role choices because legacy
+templates cannot open a human-seat generation header or freely commit model-seat
+text.
 
 Same effective roles coalesce throughout the engine. `append_user_turn` /
 `append_assistant_turn` append authored text in place when the selected leaf has
@@ -346,7 +357,7 @@ rerollable without consulting provenance.
 Every speaker still renders as one neutral glass card with identity in the role
 chip; system nodes are stage directions. The cast manager (`cast…`) owns the
 tree-scoped roster and standing recipes, and `+ thinking` drafts an authored
-thinking block for the next append. Composer actions use shared Saklas controls
+thinking block for the next line. Composer actions use shared Saklas controls
 (`Button`, `Checkbox`, `Combobox`), as does the raw buffer's action surface.
 
 Adding a panel: write the `.svelte`, wire state into the smallest matching `lib/stores/` slice (or `stores.svelte.ts` for cross-cutting WS/tree/chat state), mount from `App.svelte`, `npm run build`, commit the regenerated `dist/`. Adding a drawer: write it under `drawers/`, add the name to the `DrawerName` union in `lib/types.ts` (and to `NARROW_DRAWERS` in `App.svelte` for forms/pickers), add an `App.svelte` switch branch, re-export from `drawers/index.ts`, and add it to a `RAIL_CATEGORIES` group in `lib/commands.ts` so the ⌘K palette can launch it.

@@ -65,12 +65,11 @@
     roleGlyphLetter,
     samplingState,
     sessionState,
-    castState,
     highlightScale,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
   import { togglePalette } from "../lib/stores/palette.svelte";
-  import type { ChatTurn, TokenScore } from "../lib/types";
+  import type { ChatTurn, Seat, TokenScore } from "../lib/types";
   import {
     scoreToRgb,
     highlightHue,
@@ -83,43 +82,12 @@
   } from "../lib/tokens";
   import Select from "../lib/Select.svelte";
   import Checkbox from "../lib/Checkbox.svelte";
-  import Combobox from "../lib/Combobox.svelte";
   import Button from "../lib/ui/Button.svelte";
 
   // --------------------------------------------------------------- input --
 
   let input = $state("");
   let textareaRef: HTMLTextAreaElement | null = $state(null);
-
-  // ---------------------------------------------------------- cast row --
-  //
-  // The ``speaking as`` / ``reply as`` chips — the SamplingStrip role
-  // boxes promoted into the composer (the visible step toward the cast
-  // model).  Same client state (``samplingState.human_role`` /
-  // ``model_role``), lowered to protocol role labels at the wire boundary.
-  // Same support gates: base /
-  // completion models and label-free families (Mistral / talkie) can't
-  // relabel turns, raw mode has no roles.
-  const CAST_SLUG_RE = /^[a-z0-9._-]+$/;
-  const castReady = $derived(sessionState.info !== null);
-  const castUserSupported = $derived(
-    sessionState.info?.is_base_model === false &&
-      !effectiveRawMode() &&
-      sessionState.info?.user_role_supported === true,
-  );
-  const castAsstSupported = $derived(
-    sessionState.info?.is_base_model === false &&
-      !effectiveRawMode() &&
-      sessionState.info?.role_substitution_supported === true,
-  );
-  const castUserValid = $derived(
-    samplingState.human_role.trim() === "" ||
-      CAST_SLUG_RE.test(samplingState.human_role.trim()),
-  );
-  const castAsstValid = $derived(
-    samplingState.model_role.trim() === "" ||
-      CAST_SLUG_RE.test(samplingState.model_role.trim()),
-  );
 
   /** Auto-grow the textarea between 1 and 6 rows (≈ 132px at 13px line-h).
    *  With ``box-sizing: border-box`` set in CSS, ``el.scrollHeight``
@@ -150,10 +118,10 @@
   });
 
   // --- Unified submission -----------------------------------------------
-  // The composer has exactly two states: ordinary and swapped.  Selection
-  // chooses the branch anchor only; it never changes what the box means.
-  // Same-role adjacency coalesces in the engine, so prefill is no longer a
-  // separate composer state: append a model prefix, then generate model.
+  // The composer exposes the native submit contract directly: one seat for
+  // an authored line, plus an independently selected continuation seat (or
+  // none).  This keeps arbitrary scene sequences visible and makes same-seat
+  // prefill a single send: author a prefix and continue the same seat.
   const rawMode = $derived.by(() => {
     void genUiMode.mode;
     return effectiveRawMode();
@@ -163,17 +131,20 @@
     loomTree.loaded ? (loomTree.active_node_id ?? null) : null,
   );
   const sceneMode = $derived(sessionState.info?.scene_mode ?? false);
-  let swapSeats = $state(false);
+  type ContinuationSeat = Seat | "none";
+  let authoredSeat = $state<Seat>("human");
+  let continuationSeat = $state<ContinuationSeat>("model");
   $effect(() => {
-    // A non-scene renderer cannot open a generation prompt on the human
-    // seat.  Keep that compatibility boundary localized to the checkbox.
-    if ((!sceneMode || rawMode) && swapSeats) swapSeats = false;
+    // Legacy renderers only support the ordinary human → model path.  Keep
+    // append-only available, but collapse unsupported seat choices when a
+    // model does not expose the scene stitcher.
+    if (!sceneMode) {
+      if (authoredSeat !== "human") authoredSeat = "human";
+      if (continuationSeat === "human") continuationSeat = "model";
+    }
   });
-  const authoredSeat = $derived<"human" | "model">(
-    swapSeats ? "model" : "human",
-  );
-  const generatedSeat = $derived<"human" | "model">(
-    swapSeats ? "human" : "model",
+  const generatedSeat = $derived<Seat | null>(
+    continuationSeat === "none" ? null : continuationSeat,
   );
   const humanLabel = $derived(
     samplingState.human_role.trim()
@@ -186,8 +157,35 @@
       || "model",
   );
   const authoredLabel = $derived(authoredSeat === "human" ? humanLabel : modelLabel);
+  const duplicateRoleLabels = $derived(humanLabel === modelLabel);
+  const humanRoleOption = $derived(
+    duplicateRoleLabels ? `${humanLabel} · human` : humanLabel,
+  );
+  const modelRoleOption = $derived(
+    duplicateRoleLabels ? `${modelLabel} · model` : modelLabel,
+  );
 
-  // Authored-thinking input: a block the next *append* (modifier+Enter) carries,
+  const authoredSeatOptions = $derived([
+    { value: "human" as Seat, label: humanRoleOption },
+    { value: "model" as Seat, label: modelRoleOption, disabled: !sceneMode },
+  ]);
+  const continuationSeatOptions = $derived([
+    { value: "human" as ContinuationSeat, label: humanRoleOption, disabled: !sceneMode },
+    { value: "model" as ContinuationSeat, label: modelRoleOption },
+    { value: "none" as ContinuationSeat, label: "none" },
+  ]);
+  const canSwapPlan = $derived(
+    sceneMode && generatedSeat !== null && generatedSeat !== authoredSeat,
+  );
+
+  function swapPlanSeats(): void {
+    if (!canSwapPlan || generatedSeat === null) return;
+    const previousAuthored = authoredSeat;
+    authoredSeat = generatedSeat;
+    continuationSeat = previousAuthored;
+  }
+
+  // Authored-thinking input: a block the next authored line carries,
   // rendered through the family think delimiters.  Strip families keep
   // it for one turn only — the warning under the box says so before
   // submit (a9 convention 3).
@@ -200,39 +198,18 @@
   let thinkingOpen = $state(false);
   let thinkingDraft = $state("");
 
-  // --- Append modifier (Ctrl / Cmd / Option) ----------------------------
-  // Any of Ctrl, Cmd (⌘), or Option (⌥) appends a non-empty draft without
-  // generation. Empty input always generates in the generated seat; the
-  // modifier is deliberately irrelevant when there is nothing to append.
-  // Tracked at the window level so the
-  // state survives textarea blur and we can swap the send-button caption
-  // the moment the modifier comes down — without needing the user to
-  // type anything first.
-  let modHeld = $state(false);
   const hasText = $derived(input.trim() !== "");
-  const appendMode = $derived(modHeld && hasText);
-
-  /** Keep the composer prompt to the active action; shortcuts live in help. */
-  const inputPlaceholder = $derived(
-    appendMode
-      ? `append ${authoredLabel}…`
-      : `message as ${authoredLabel}…`,
+  const appendSelected = $derived(generatedSeat === null);
+  const primaryDisabled = $derived(
+    !loomTree.loaded || (!hasText && generatedSeat === null),
   );
+
+  const inputPlaceholder = $derived(`message as ${authoredLabel}…`);
   const sendLabel = $derived(
-    appendMode ? "append" : hasText ? "send" : "generate",
+    appendSelected ? "append" : hasText ? "send" : "generate",
   );
 
-  const castRoleOptions = $derived(
-    [...new Set([
-      sessionState.info?.default_user_role,
-      sessionState.info?.default_assistant_role,
-      ...Object.keys(castState.roster),
-    ].filter((value): value is string => !!value))]
-      .sort((a, b) => a.localeCompare(b))
-      .map((value) => ({ value, label: value })),
-  );
-
-  function doSend(append: boolean = false): void {
+  function doSend(): void {
     const text = hasText ? input : "";
     const replaceSlot = consumePulledSlot();
     if (!text) {
@@ -240,6 +217,7 @@
         cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
         return;
       }
+      if (generatedSeat === null) return;
     }
     const parent = isPendingBusy()
       ? ("active@drain" as const)
@@ -253,11 +231,10 @@
       pushInputHistory(text);
       input = "";
     }
-    const appendOnly = append && text !== "";
     void sendSubmit(
       text || null,
       text ? authoredSeat : null,
-      appendOnly ? null : generatedSeat,
+      generatedSeat,
       {
         parent_node_id: parent,
         replaceSlot,
@@ -303,14 +280,11 @@
 
   function onKeydown(ev: KeyboardEvent): void {
     if (ev.key === "Enter") {
-      // Shift-Enter is a newline; Ctrl/Cmd/Option-Enter is the append
-      // modifier (no generation); bare Enter sends or generates according
-      // to whether the box has text. Reading the modifier flags directly is
-      // more reliable than ``modHeld`` (which lags on focus-blur edge
-      // cases) — at the moment of Enter the event carries the truth.
+      // Shift-Enter is a newline; Enter executes the visible plan.  Append
+      // is selected explicitly by choosing no continuation.
       if (ev.shiftKey) return;
       ev.preventDefault();
-      doSend(ev.ctrlKey || ev.metaKey || ev.altKey);
+      doSend();
       return;
     }
     if (ev.key === "Escape") {
@@ -620,34 +594,6 @@
     autosize();
     scrollToBottom();
     textareaRef?.focus();
-
-    // Track any append modifier at the window level so the send-button
-    // label flips the moment the user presses it, not only when they
-    // hit Enter.  We read all three flags off the event so the modifier
-    // works across platforms and key layouts:
-    //   Ctrl → ``ctrlKey``  — Linux / Windows / Mac Ctrl
-    //   Cmd  → ``metaKey``  — Mac (⌘)
-    //   Option / Alt → ``altKey``  — Mac (⌥) / non-Mac Alt
-    // Browsers report all three correctly for both modifier-only
-    // keydown and the keydown of a non-modifier key while the modifier
-    // is held — and they go false on keyup of the modifier.
-    const setHeld = (ev: KeyboardEvent) => {
-      modHeld = ev.ctrlKey || ev.metaKey || ev.altKey;
-    };
-    const clearHeld = () => {
-      modHeld = false;
-    };
-    window.addEventListener("keydown", setHeld);
-    window.addEventListener("keyup", setHeld);
-    // ``blur`` covers tab-out / window-switch where the keyup never
-    // fires — without it the label sticks in "append" mode after the
-    // user Cmd-Tabs away mid-modifier.
-    window.addEventListener("blur", clearHeld);
-    return () => {
-      window.removeEventListener("keydown", setHeld);
-      window.removeEventListener("keyup", setHeld);
-      window.removeEventListener("blur", clearHeld);
-    };
   });
 
   // ----------------------------------------------------------- token render --
@@ -1021,54 +967,38 @@
 
   <PendingBubbles />
 
-  <div class="cast-row" aria-label="Speaking roles">
-    <label
-      class="cast"
-      title={castUserSupported
-        ? "your role"
-        : "unavailable"}
-    >
-      <span class="cast-label">human</span>
-      <Combobox
-        bind:value={samplingState.human_role}
-        options={castRoleOptions}
-        disabled={!castReady || !castUserSupported}
-        invalid={!castUserValid}
-        placeholder={sessionState.info?.default_user_role ?? "human"}
-        spellcheck={false}
-        ariaLabel="human role label"
-      />
-    </label>
-    <label
-      class="cast"
-      title={castAsstSupported
-        ? "model role"
-        : "unavailable"}
-    >
-      <span class="cast-label">model</span>
-      <Combobox
-        bind:value={samplingState.model_role}
-        options={castRoleOptions}
-        disabled={!castReady || !castAsstSupported}
-        invalid={!castAsstValid}
-        placeholder={sessionState.info?.default_assistant_role ?? "model"}
-        spellcheck={false}
-        ariaLabel="model role label"
-      />
-    </label>
-    <div
-      class="seat-toggle"
-      title={sceneMode && !rawMode
-        ? "swap who writes and who replies"
-        : "seat swapping requires scene mode"}
-    >
-      <Checkbox
-        bind:checked={swapSeats}
-        disabled={!sceneMode || rawMode}
-        label="swap seats"
-        ariaLabel="swap human and model seats"
+  <div class="turn-plan" aria-label="Next turn">
+    <div class="plan-card">
+      <span class="plan-actor">you write</span>
+      <Select
+        bind:value={authoredSeat}
+        options={authoredSeatOptions}
+        ariaLabel="You write as"
+        title={`you write as ${authoredLabel}`}
       />
     </div>
+
+    <div class="plan-swap">
+      <Button
+        variant="flat"
+        size="sm"
+        disabled={!canSwapPlan}
+        onclick={swapPlanSeats}
+        title="swap roles"
+        ariaLabel="Swap writer roles"
+      >⇄</Button>
+    </div>
+
+    <div class="plan-card">
+      <span class="plan-actor">model writes</span>
+      <Select
+        bind:value={continuationSeat}
+        options={continuationSeatOptions}
+        ariaLabel="Model writes as"
+        title={generatedSeat === null ? "model does not write" : `model writes as ${generatedSeat === "human" ? humanLabel : modelLabel}`}
+      />
+    </div>
+
     <div class="cast-manage">
       <Button
         size="sm"
@@ -1086,7 +1016,7 @@
           size="sm"
           accent={thinkingDraft.trim() !== "" ? "var(--accent-violet)" : undefined}
           onclick={() => (thinkingOpen = !thinkingOpen)}
-          title="next append"
+          title="next authored line"
         >{thinkingOpen ? "− thinking" : "+ thinking"}</Button>
       </div>
       {#if thinkingOpen}
@@ -1107,7 +1037,7 @@
     </div>
   {/if}
 
-  <form class="input-row" onsubmit={(ev) => { ev.preventDefault(); doSend(modHeld); }}>
+  <form class="input-row" onsubmit={(ev) => { ev.preventDefault(); doSend(); }}>
     <textarea
       class="input"
       bind:this={textareaRef}
@@ -1121,8 +1051,8 @@
       <Button
         type="submit"
         accent="var(--accent-green)"
-        disabled={!loomTree.loaded}
-        title={appendMode ? "modifier + ⏎ append" : "⏎ submit"}
+        disabled={primaryDisabled}
+        title={appendSelected ? "⏎ append" : "⏎ submit"}
       >{sendLabel}</Button>
       <Button
         variant="danger"
@@ -1572,57 +1502,48 @@
     outline: 1px solid var(--fg-muted);
   }
 
-  /* Cast row — compact chip-inputs above the composer.  Quiet until
-   * hovered/filled; disabled (unsupported family / raw mode) reads as
-   * plain dim text. */
-  .cast-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-5);
+  /* The visible next-turn plan names roles; each option carries its structural
+   * seat internally so the composer never makes the user manage both. */
+  .turn-plan {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+    align-items: end;
+    gap: var(--space-2);
     padding: 0 var(--space-1);
   }
-  .cast {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    width: 13em;
+  .plan-card {
+    display: grid;
+    gap: var(--space-1);
     min-width: 0;
   }
-  .cast-label {
+  .plan-actor {
     font-family: var(--font-mono);
     font-size: var(--text-2xs);
     letter-spacing: 0.12em;
     text-transform: uppercase;
     color: var(--fg-muted);
   }
-  .seat-toggle {
-    display: inline-flex;
+  .plan-swap {
+    align-self: end;
+    display: flex;
     align-items: center;
-    gap: var(--space-2);
+    min-height: 32px;
   }
   .cast-manage {
-    margin-left: auto;
+    align-self: end;
+    display: flex;
+    align-items: center;
+    min-height: 32px;
   }
 
-  @media (max-width: 600px) {
-    /* Keep both editable role labels legible on phones.  Four controls in one
-     * flex row truncated the model value (often to ``mode``) and compressed
-     * the seat toggle into an ambiguous sliver. */
-    .cast-row {
+  @media (max-width: 720px) {
+    .turn-plan {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: var(--space-2) var(--space-4);
-    }
-    .cast {
-      width: auto;
-    }
-    .seat-toggle {
-      grid-column: 1;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
     }
     .cast-manage {
-      grid-column: 2;
+      grid-column: 1 / -1;
       justify-self: end;
-      margin-left: 0;
     }
   }
 

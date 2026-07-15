@@ -15,13 +15,16 @@ block, v1 shim, seat-general import), **committed thinking**
 **per-seat stop segments** (non-assistant seats add the seat close as a
 stop string when it differs from the assistant's), **freed commit seating**
 under scene mode, and the webui. The original two-button generation-seat
-control and selected-node prefill mode were superseded by one **swap seats**
-checkbox and the native `submit` contract: explicit `authored_seat` plus
-optional `generated_seat`, named `human` / `model`. Empty always continues;
-a modifier suppresses generation only for a non-empty draft. `+ thinking`,
-the `cast…` manager, and loom `swap seat ⇄ branch` remain. The effective cast
+control, selected-node prefill mode, and later swap-toggle/modifier pairing were
+superseded by a visible two-part role plan over the native `submit` contract:
+explicit `authored_seat` plus optional `generated_seat`, named `human` / `model`
+internally but displayed through their current cast labels. The model-role picker
+accepts `none` for append-only; there is no modifier shortcut. `+ thinking`, the
+`cast…` manager, and loom `swap seat ⇄ branch` remain. The effective cast
 is auto-derived from structural and observed turn labels; the stored map
-contains configuration only. Session info carries
+contains configuration only. On visible web surfaces its two structural entries
+take their standard names from the loaded chat template (`user` / `model` for
+Gemma), leaving `human` / `model` as internal seat keys only. Session info carries
 `scene_mode`/`thinking_input_supported`/`strips_history_thinking`.
 Live-verified on gemma-3-4b end-to-end (cast fill + explicit clear +
 user-seat continue + seat-swap + thinking 400 + all UI affordances).

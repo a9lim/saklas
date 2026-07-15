@@ -7,13 +7,20 @@
   // configuration adds only a standing recipe/notes layer.  Mutations and
   // new observed labels reconcile through the inlined effective roster.
   //
-  // A steering surface, not a chat feature: labels here are the same
-  // slugs the composer's "speaking as" / "reply as" chips take, and a
-  // turn labeled with a member's slug generates under its recipe.
+  // This drawer also owns the two active structural-role labels.  The
+  // composer chooses between those labels without separately exposing their
+  // human/model template seats; a turn labeled with a member's slug generates
+  // under its recipe.
 
   import { apiTree } from "../lib/api";
-  import { castState, pushToast } from "../lib/stores.svelte";
+  import {
+    castState,
+    pushToast,
+    samplingState,
+    sessionState,
+  } from "../lib/stores.svelte";
   import { closeDrawer } from "../lib/stores/drawers.svelte";
+  import Combobox from "../lib/Combobox.svelte";
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => {
@@ -21,11 +28,13 @@
   });
 
   const SLUG_RE = /^[a-z][a-z0-9._-]*$/;
+  const ROLE_SLUG_RE = /^[a-z0-9._-]+$/;
 
   let label = $state("");
   let steering = $state("");
   let notes = $state("");
   let editing = $state<string | null>(null);
+  let editingKey = $state<string | null>(null);
   let busy = $state(false);
   let err = $state<string | null>(null);
 
@@ -36,14 +45,74 @@
     !busy && label.trim() !== "" && SLUG_RE.test(label.trim()),
   );
 
-  const roster = $derived(
-    Object.entries(castState.roster).sort(([a], [b]) => a.localeCompare(b)),
+  const defaultHumanRole = $derived(
+    sessionState.info?.default_user_role ?? "human",
+  );
+  const defaultModelRole = $derived(
+    sessionState.info?.default_assistant_role ?? "model",
+  );
+  const standardRoles = $derived(
+    [...new Set([defaultHumanRole, defaultModelRole])],
+  );
+  // The server roster is keyed by Saklas's structural seats. Present those
+  // two entries through the model's actual chat-template vocabulary, while
+  // retaining the hidden key so structural cast recipes still round-trip.
+  const roster = $derived.by(() => {
+    const byLabel = new Map<
+      string,
+      { key: string; label: string; member: (typeof castState.roster)[string] }
+    >();
+    for (const [key, member] of Object.entries(castState.roster)) {
+      const displayLabel =
+        key === "human"
+          ? defaultHumanRole
+          : key === "model"
+            ? defaultModelRole
+            : key;
+      const existing = byLabel.get(displayLabel);
+      const structural = key === "human" || key === "model";
+      if (!existing || structural) {
+        byLabel.set(displayLabel, { key, label: displayLabel, member });
+      }
+    }
+    const standard = standardRoles
+      .map((role) => byLabel.get(role))
+      .filter((row) => row !== undefined);
+    const custom = [...byLabel.values()]
+      .filter((row) => !standardRoles.includes(row.label))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    return [...standard, ...custom];
+  });
+  const roleOptions = $derived(
+    [
+      ...standardRoles,
+      ...roster
+        .map((row) => row.label)
+        .filter((role) => !standardRoles.includes(role)),
+    ].map((value) => ({ value, label: value })),
+  );
+  const humanRoleSupported = $derived(
+    sessionState.info?.is_base_model === false
+      && sessionState.info?.user_role_supported === true,
+  );
+  const modelRoleSupported = $derived(
+    sessionState.info?.is_base_model === false
+      && sessionState.info?.role_substitution_supported === true,
+  );
+  const humanRoleValid = $derived(
+    samplingState.human_role.trim() === ""
+      || ROLE_SLUG_RE.test(samplingState.human_role.trim()),
+  );
+  const modelRoleValid = $derived(
+    samplingState.model_role.trim() === ""
+      || ROLE_SLUG_RE.test(samplingState.model_role.trim()),
   );
 
-  function loadMember(slug: string): void {
-    const m = castState.roster[slug];
+  function loadMember(slug: string, key: string): void {
+    const m = castState.roster[key];
     if (!m) return;
     editing = slug;
+    editingKey = key;
     label = slug;
     steering = m.recipe?.steering ?? "";
     notes = m.notes ?? "";
@@ -52,6 +121,7 @@
 
   function clearForm(): void {
     editing = null;
+    editingKey = null;
     label = "";
     steering = "";
     notes = "";
@@ -61,15 +131,18 @@
   async function save(): Promise<void> {
     const slug = label.trim();
     if (!canSave) return;
+    const target = editing !== null && slug === editing
+      ? (editingKey ?? slug)
+      : slug;
     busy = true;
     err = null;
     try {
-      const r = await apiTree.castPut(slug, {
+      const r = await apiTree.castPut(target, {
         steering: steering.trim() === "" ? null : steering.trim(),
         notes: notes.trim(),
       });
       // Optimistic merge — the ``op="cast"`` frame confirms shortly.
-      castState.roster = { ...castState.roster, [slug]: r.member };
+      castState.roster = { ...castState.roster, [target]: r.member };
       clearForm();
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
@@ -81,7 +154,7 @@
   async function remove(slug: string): Promise<void> {
     try {
       await apiTree.castDelete(slug);
-      if (editing === slug) clearForm();
+      if (editingKey === slug) clearForm();
     } catch (e) {
       pushToast(
         `remove cast member: ${e instanceof Error ? e.message : String(e)}`,
@@ -100,38 +173,68 @@
   </header>
 
   <div class="body">
+    <div class="seat-map" aria-label="Active role labels">
+      <span class="form-title">active roles</span>
+      <div class="seat-grid">
+        <label class="field">
+          <span class="label">{defaultHumanRole} role</span>
+          <Combobox
+            bind:value={samplingState.human_role}
+            options={roleOptions}
+            disabled={!humanRoleSupported}
+            invalid={!humanRoleValid}
+            placeholder={defaultHumanRole}
+            spellcheck={false}
+            ariaLabel={`${defaultHumanRole} role label`}
+          />
+        </label>
+        <label class="field">
+          <span class="label">{defaultModelRole} role</span>
+          <Combobox
+            bind:value={samplingState.model_role}
+            options={roleOptions}
+            disabled={!modelRoleSupported}
+            invalid={!modelRoleValid}
+            placeholder={defaultModelRole}
+            spellcheck={false}
+            ariaLabel={`${defaultModelRole} role label`}
+          />
+        </label>
+      </div>
+    </div>
+
     <p class="hint">roles appear from conversation history · recipes are saved</p>
 
     {#if roster.length === 0}
       <p class="empty">none</p>
     {:else}
       <ul class="roster" aria-label="Cast roster">
-        {#each roster as [slug, member] (slug)}
-          <li class="member" class:editing={editing === slug}>
+        {#each roster as row (row.label)}
+          <li class="member" class:editing={editing === row.label}>
             <button
               type="button"
               class="member-main"
-              title="edit {slug}"
-              onclick={() => loadMember(slug)}
+              title="edit {row.label}"
+              onclick={() => loadMember(row.label, row.key)}
             >
-              <span class="glyph">{slug.slice(0, 1).toUpperCase()}</span>
+              <span class="glyph">{row.label.slice(0, 1).toUpperCase()}</span>
               <span class="member-text">
-                <span class="member-label">{slug}</span>
-                {#if member.recipe?.steering}
-                  <span class="member-recipe">{member.recipe.steering}</span>
+                <span class="member-label">{row.label}</span>
+                {#if row.member.recipe?.steering}
+                  <span class="member-recipe">{row.member.recipe.steering}</span>
                 {/if}
-                {#if member.notes}
-                  <span class="member-notes">{member.notes}</span>
+                {#if row.member.notes}
+                  <span class="member-notes">{row.member.notes}</span>
                 {/if}
               </span>
             </button>
-            {#if member.origin === "configured"}
+            {#if row.member.origin === "configured"}
               <button
                 type="button"
                 class="remove"
-                aria-label="clear configuration for {slug}"
+                aria-label="clear configuration for {row.label}"
                 title="clear recipe and notes"
-                onclick={() => void remove(slug)}
+                onclick={() => void remove(row.key)}
               >✕</button>
             {/if}
           </li>
@@ -251,6 +354,16 @@
     color: var(--fg-dim);
     font-size: var(--text-sm);
     line-height: 1.4;
+  }
+  .seat-map {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .seat-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: var(--space-3);
   }
   .empty {
     margin: 0;

@@ -182,14 +182,12 @@
   }
 
   function onKeydown(ev: KeyboardEvent): void {
-    // Bare Enter sends or generates; Ctrl/Cmd/Option-Enter appends the edit
-    // without generating; Shift-Enter is a literal newline; Escape
-    // stops an in-flight gen.
+    // Enter sends or generates; Shift-Enter is a literal newline.  Append is
+    // an explicit button beside the dirty-buffer state, never a key mode.
     if (ev.key === "Enter") {
       if (ev.shiftKey) return;
       ev.preventDefault();
-      if (ev.ctrlKey || ev.metaKey || ev.altKey) void appendEdit();
-      else submitBuffer();
+      submitBuffer();
       return;
     }
     if (ev.key === "Escape" && genStatus.active) {
@@ -434,7 +432,7 @@
       <Button
         accent="var(--accent-green)"
         onclick={() => void appendEdit()}
-        title="modifier + ⏎ append"
+        title="append without generating"
       >
         append
       </Button>
