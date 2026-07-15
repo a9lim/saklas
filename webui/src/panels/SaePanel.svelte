@@ -20,6 +20,7 @@
   // resident and turns live readout on.
 
   import Bar from "../lib/charts/Bar.svelte";
+  import Select from "../lib/Select.svelte";
   import Button from "../lib/ui/Button.svelte";
   import { onMount } from "svelte";
   import SaeProbeCard from "./rack/SaeProbeCard.svelte";
@@ -54,6 +55,8 @@
   const loaded = $derived(sessionState.info?.sae_loaded === true);
   const info = $derived(sessionState.info?.sae_info ?? null);
   let selectedSource = $state("");
+  let selectedLayer = $state("");
+  let layerSource = $state("");
   let localName = $state("my-sae");
   let trainTokens = $state(1_000_000);
   let trainLayer = $state("");
@@ -70,6 +73,34 @@
   })));
   const sourceBusy = $derived(
     saeSourceState.loading || saeState.loading || saeTrainState.running,
+  );
+  const selectedPreparedSource = $derived(
+    saeSourceState.sources.find((source) => source.source === selectedSource),
+  );
+  const selectedRelease = $derived(
+    selectedSource.startsWith("saelens:")
+      ? selectedSource.slice("saelens:".length)
+      : selectedSource,
+  );
+  const availableLayers = $derived.by(() => {
+    const registry = releases.find((row) => row.release === selectedRelease);
+    const layers = registry?.layers ?? (
+      selectedPreparedSource?.layer == null ? [] : [selectedPreparedSource.layer]
+    );
+    return [...new Set(layers)].sort((a, b) => a - b);
+  });
+  const layerOptions = $derived(availableLayers.map((layer) => ({
+    value: String(layer),
+    label: `layer ${layer}`,
+  })));
+  const sourceMatchesLoaded = $derived(
+    loaded && info !== null && selectedRelease === info.release,
+  );
+  const selectedLayerNumber = $derived(
+    selectedLayer === "" ? null : Number(selectedLayer),
+  );
+  const sourceSelectionCurrent = $derived(
+    sourceMatchesLoaded && selectedLayerNumber === info?.layer,
   );
 
   onMount(() => {
@@ -90,7 +121,30 @@
       !selectedSource ||
       !known
     ) {
-      selectedSource = active?.source ?? providerOptions[0]?.value ?? "";
+      selectedSource = active?.source ?? saeSourceState.sources[0]?.source ??
+        providerOptions[0]?.value ?? "";
+    }
+  });
+
+  $effect(() => {
+    const source = selectedSource;
+    const layers = availableLayers;
+    if (source !== layerSource) {
+      layerSource = source;
+      const resident = sourceMatchesLoaded ? info?.layer : null;
+      const cached = selectedPreparedSource?.layer ?? null;
+      const preferred = resident != null && layers.includes(resident)
+        ? resident
+        : cached != null && layers.includes(cached)
+        ? cached
+        : preferredLayer(layers);
+      selectedLayer = preferred == null ? "" : String(preferred);
+    } else if (
+      layers.length > 0 &&
+      (selectedLayer === "" || !layers.includes(Number(selectedLayer)))
+    ) {
+      const preferred = preferredLayer(layers);
+      selectedLayer = preferred == null ? "" : String(preferred);
     }
   });
 
@@ -125,6 +179,24 @@
         ? parsedLayer
         : null,
     });
+  }
+
+  function preferredLayer(layers: number[]): number | null {
+    if (layers.length === 0) return null;
+    const depth = Math.max(...layers, 1);
+    const band = layers.filter((layer) => {
+      const fraction = layer / depth;
+      return fraction >= 0.4 && fraction <= 0.9;
+    });
+    const pool = band.length > 0 ? band : layers;
+    const target = 0.65 * depth;
+    return [...pool].sort((a, b) =>
+      Math.abs(a - target) - Math.abs(b - target) || a - b
+    )[0] ?? null;
+  }
+
+  function loadSelectedSae(source: string): void {
+    void loadSae(source, selectedLayerNumber);
   }
 
   // ---------- STEER: sae-mode rack entries (by feature id) ----------
@@ -356,14 +428,24 @@
     accent="var(--pillar-sae)"
     sourceError={saeSourceState.error}
     working={saeTrainState.running}
-    onuse={(source) => void loadSae(source)}
+    selectionCurrent={sourceSelectionCurrent}
+    onuse={loadSelectedSae}
     providerOptions={providerOptions}
     providerPlaceholder="SAELens release"
-    onfetch={(source) => void loadSae(source)}
+    onfetch={loadSelectedSae}
     localActionLabel={trainConfirm ? "confirm train" : "train"}
     localActionDisabled={!localName.trim() || sourceBusy}
     onlocal={requestTrain}
   >
+    {#snippet sourceControls()}
+      <Select
+        bind:value={selectedLayer}
+        options={layerOptions}
+        placeholder="layer"
+        disabled={sourceBusy || layerOptions.length === 0}
+        ariaLabel="SAE measurement layer"
+      />
+    {/snippet}
     {#snippet localControls()}
       <label class="setup-field setup-field-wide">
         <span class="setup-field-label">name</span>
@@ -429,17 +511,8 @@
         </p>
       {/if}
     {/snippet}
-    {#snippet summary()}
-      {#if loaded}
-        <p class="source-meta">
-          <code>{info?.release}</code> · L{info?.layer} · {info?.width?.toLocaleString()} features
-        </p>
-      {:else}
-        <p class="hint">fetch or train</p>
-      {/if}
-    {/snippet}
     {#snippet messages()}
-      {#if saeState.loadMessage}
+      {#if saeState.loading && saeState.loadMessage}
         <p class="hint" role="status" aria-live="polite">{saeState.loadMessage}</p>
       {/if}
       {#if saeState.loadError}
@@ -616,8 +689,7 @@
     width: 100%;
     justify-content: space-between;
   }
-  .work-status,
-  .source-meta {
+  .work-status {
     margin: 0;
     color: var(--fg-dim);
     font-family: var(--font-mono);

@@ -527,10 +527,33 @@ def _run_tui(args: argparse.Namespace) -> None:
 
 @_saklas_error_exit
 def _enable_serve_live_lens_if_compatible(session: Any) -> bool:
-    """Apply serve's default-live policy only to a loadable lens artifact."""
-    if not session.has_compatible_jlens():
-        return False
+    """Apply serve's default-live policy to an active or cached lens."""
     try:
+        compatible = session.has_compatible_jlens()
+        model_id = getattr(session, "model_id", None)
+        if not compatible and isinstance(model_id, str) and model_id:
+            from saklas.io.lens_sources import list_lens_sources
+
+            # An older cache can predate active-source pointers. Prefer a
+            # prepared local lens, then another cached provider binding, and
+            # adopt the first one whose identity matches the loaded weights.
+            rows = sorted(
+                list_lens_sources(model_id),
+                key=lambda row: (not bool(row.get("active")), row.get("kind") != "local"),
+            )
+            for row in rows:
+                source = row.get("source")
+                if not isinstance(source, str) or not source:
+                    continue
+                try:
+                    session.select_jlens_source(source)
+                    compatible = session.has_compatible_jlens()
+                except Exception:  # noqa: BLE001 — try the next cached source
+                    continue
+                if compatible:
+                    break
+        if not compatible:
+            return False
         layers = session.enable_live_lens(top_k=8)
         print(f"Live J-lens readout: on ({len(layers)} workspace-band layers)")
         return True
@@ -573,15 +596,32 @@ def _best_serve_sae_release(rows: Sequence[dict[str, Any]]) -> str | None:
 
 @_saklas_error_exit
 def _enable_serve_live_sae_if_available(session: Any) -> bool:
-    """Attach the best SAE and start its live view for the web dashboard."""
+    """Attach a cached or best-provider SAE and start its live view."""
     try:
         info = session.sae_info
         if info is None:
+            from saklas.io.sae import list_sae_sources
+
+            # Prepared artifacts are the cheapest and most intentional
+            # default. This also repairs caches created before active.json.
+            rows = sorted(
+                list_sae_sources(session.model_id),
+                key=lambda row: (not bool(row.get("active")), row.get("kind") != "local"),
+            )
+            for row in rows:
+                source = row.get("source")
+                if not isinstance(source, str) or not source:
+                    continue
+                release = source.removeprefix("saelens:")
+                try:
+                    info = session.load_sae(release)
+                except Exception:  # noqa: BLE001 — try the next cached source
+                    continue
+                break
+        if info is None:
             from saklas.core.sae import list_sae_releases
 
-            release = _best_serve_sae_release(
-                list_sae_releases(session.model_id),
-            )
+            release = _best_serve_sae_release(list_sae_releases(session.model_id))
             if release is None:
                 return False
             info = session.load_sae(release)

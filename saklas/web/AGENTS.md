@@ -91,12 +91,15 @@ recipes/notes; effective roster rows carry `origin`.
 - **SAE source lifecycle** — `GET /sessions/{id}/sae/sources`, background
   `POST/GET /sae/load`, and polled/cancellable `POST/GET/DELETE /sae/train` back
   the symmetric SOURCE section. Load accepts `local:<name>` or
-  `saelens:<release>`; local training reports token progress and activates the
-  resulting Saklas-owned source. In both instrument tabs, local fit/train fields
+  `saelens:<release>` plus an optional hook `layer`; the SAE tab's second
+  dropdown selects that resident measurement layer, and the selection is
+  restored from cached provider metadata. Local training reports token progress
+  and activates the resulting Saklas-owned source. In both instrument tabs, local fit/train fields
   are hidden until the synthetic `local` selector option is chosen; that same
   source-row action changes from fetch/use to fit/train, while prepared
-  `local:<name>` sources remain separately selectable. Empty optional status
-  snippets are removed from flex layout so SOURCE flows directly into STEER.
+  `local:<name>` sources remain separately selectable. Prepared cached sources
+  win the default selector choice; the duplicate lower SOURCE label and passive
+  source-summary lines are omitted so SOURCE flows directly into STEER.
 
 ## Source layout
 

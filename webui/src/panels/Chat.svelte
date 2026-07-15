@@ -1156,6 +1156,7 @@
       {#if turn.nodeId}
         <Button
           size="sm"
+          variant="flat"
           onclick={() => regenMessage(turn)}
           title="reroll this message"
           ariaLabel={`Reroll ${roleDisplayLabel(turn.role, turn.roleLabel)} message`}

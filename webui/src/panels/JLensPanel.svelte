@@ -73,7 +73,7 @@
   let fitPrompts = $state(100);
   let fitLayers = $state("workspace");
   let fitConfirm = $state(false);
-  let selectedSource = $state("neuronpedia");
+  let selectedSource = $state("");
   const fitReady = $derived(
     Number.isInteger(fitPrompts) && fitPrompts >= 1 && fitPrompts <= 5000 &&
       fitLayers.trim().length > 0,
@@ -115,7 +115,8 @@
       !selectedSource ||
       !known
     ) {
-      selectedSource = active?.source ?? LENS_PROVIDER_OPTIONS[0]?.value ?? "";
+      selectedSource = active?.source ?? lensSourceState.sources[0]?.source ??
+        LENS_PROVIDER_OPTIONS[0]?.value ?? "";
     }
   });
 
@@ -482,11 +483,6 @@
         <p class="hint fit-warning" role="alert">
           Blocks generation; may take hours. Confirm again.
         </p>
-      {/if}
-    {/snippet}
-    {#snippet summary()}
-      {#if !fitted}
-        <p class="hint">fetch or fit</p>
       {/if}
     {/snippet}
     {#snippet messages()}

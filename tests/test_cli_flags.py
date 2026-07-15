@@ -354,6 +354,36 @@ def test_serve_stale_lens_gate_uses_weight_compatibility() -> None:
     assert not session.enabled
 
 
+def test_serve_selects_cached_lens_when_active_pointer_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        model_id = "org/model"
+        selected: str | None = None
+        live_top_k: int | None = None
+
+        def has_compatible_jlens(self) -> bool:
+            return self.selected == "local:default"
+
+        def select_jlens_source(self, source: str) -> None:
+            self.selected = source
+
+        def enable_live_lens(self, *, top_k: int) -> list[int]:
+            self.live_top_k = top_k
+            return [4, 5]
+
+    monkeypatch.setattr(
+        "saklas.io.lens_sources.list_lens_sources",
+        lambda _model: [{
+            "source": "local:default", "kind": "local", "active": False,
+        }],
+    )
+    session = _Session()
+    assert cli_runners._enable_serve_live_lens_if_compatible(session)
+    assert session.selected == "local:default"
+    assert session.live_top_k == 8
+
+
 def test_best_serve_sae_release_prefers_official_canonical_provider() -> None:
     rows = [
         {
@@ -392,6 +422,10 @@ def test_serve_attaches_best_sae_and_enables_live(
             return {"layer": 22, "top_k": top_k}
 
     monkeypatch.setattr(
+        "saklas.io.sae.list_sae_sources",
+        lambda _model: [],
+    )
+    monkeypatch.setattr(
         "saklas.core.sae.list_sae_releases",
         lambda _model: [{
             "release": "gemma-scope-2-4b-it-res",
@@ -404,6 +438,38 @@ def test_serve_attaches_best_sae_and_enables_live(
     assert cli_runners._enable_serve_live_sae_if_available(session)
     assert session.loaded == "gemma-scope-2-4b-it-res"
     assert session.live_top_k == 12
+
+
+def test_serve_prefers_cached_sae_over_registry_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        model_id = "google/gemma-3-4b-it"
+        sae_info = None
+        loaded: str | None = None
+
+        def load_sae(self, release: str) -> dict[str, Any]:
+            self.loaded = release
+            return {"release": release, "layer": 22, "width": 16_384}
+
+        def enable_live_sae(self, *, top_k: int) -> dict[str, int]:
+            return {"layer": 22, "top_k": top_k}
+
+    monkeypatch.setattr(
+        "saklas.io.sae.list_sae_sources",
+        lambda _model: [{
+            "source": "local:cached", "kind": "local", "active": False,
+        }],
+    )
+    monkeypatch.setattr(
+        "saklas.core.sae.list_sae_releases",
+        lambda _model: (_ for _ in ()).throw(
+            AssertionError("registry should not be consulted")
+        ),
+    )
+    session = _Session()
+    assert cli_runners._enable_serve_live_sae_if_available(session)
+    assert session.loaded == "local:cached"
 
 
 def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

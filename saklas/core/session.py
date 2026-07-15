@@ -1434,7 +1434,7 @@ class SaklasSession:
         # payloads are expected to be present in their own cache already;
         # failure is non-fatal so an offline cache eviction cannot prevent the
         # model itself from starting.
-        from saklas.io.sae import load_active_sae_source
+        from saklas.io.sae import load_active_sae_source, load_sae_metadata
 
         active_sae = load_active_sae_source(self.model_id)
         if active_sae is not None:
@@ -1443,8 +1443,17 @@ class SaklasSession:
                 if active_sae["kind"] == "local"
                 else active_sae["name"]
             )
+            # Provider bindings remember the last explicitly selected hook
+            # layer. Restore that exact measurement surface rather than
+            # silently returning to the release's automatic default.
+            metadata = (
+                load_sae_metadata(self.model_id, release)
+                if active_sae["kind"] == "saelens"
+                else None
+            )
+            layer = metadata.get("layer") if metadata is not None else None
             try:
-                self.load_sae(release)
+                self.load_sae(release, layer=layer)
             except Exception as exc:
                 _log.warning(
                     "could not restore active SAE %s for %s: %s",

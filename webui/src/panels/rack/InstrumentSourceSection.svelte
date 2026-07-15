@@ -24,6 +24,7 @@
     accent,
     sourceError = null,
     working = false,
+    selectionCurrent = true,
     onuse,
     providerOptions,
     providerPlaceholder = "provider source",
@@ -32,9 +33,9 @@
     localActionLabel,
     localActionDisabled = false,
     onlocal,
+    sourceControls,
     progress,
     warning,
-    summary,
     messages,
   }: {
     ready: boolean;
@@ -44,6 +45,8 @@
     accent: string;
     sourceError?: string | null;
     working?: boolean;
+    /** Whether secondary source settings match the resident runtime. */
+    selectionCurrent?: boolean;
     onuse: (source: string) => void;
     providerOptions: ProviderOption[];
     providerPlaceholder?: string;
@@ -52,9 +55,10 @@
     localActionLabel: string;
     localActionDisabled?: boolean;
     onlocal: () => void;
+    /** Optional controls that sit directly below the source picker. */
+    sourceControls?: Snippet;
     progress?: Snippet;
     warning?: Snippet;
-    summary: Snippet;
     messages?: Snippet;
   } = $props();
 
@@ -77,7 +81,6 @@
     providerOptions.find((option) => option.value === value),
   );
   const selectedOption = $derived(options.find((option) => option.value === value));
-  const activeSource = $derived(sources.find((source) => source.active));
 
   function applySource(): void {
     if (!value) return;
@@ -108,7 +111,6 @@
   {:else}
     <div class="setup-stack">
       <div class="setup-group">
-        <span class="setup-label">source</span>
         <div class="setup-row source-row">
           <div class="setup-controls">
             <Select
@@ -129,6 +131,7 @@
                   ? localActionDisabled
                   : selectedOption?.disabled === true ||
                     (selectedSource?.active === true &&
+                      selectionCurrent &&
                       (ready || selectedProviderOption === undefined)))}
               onclick={applySource}
             >
@@ -137,8 +140,10 @@
                 : localSelected
                   ? localActionLabel
                   : selectedSource?.active
-                  ? ready
+                  ? ready && selectionCurrent
                     ? "active"
+                    : ready
+                    ? "use"
                     : selectedProviderOption
                     ? "repair"
                       : "unavailable"
@@ -148,14 +153,11 @@
             </Button>
           </div>
         </div>
-        <p class="source-note">
-          {#if activeSource}
-            <code>{activeSource.source}</code>
-            · {activeSource.kind === "local" ? "local" : "cached"}
-          {:else}
-            none
-          {/if}
-        </p>
+        {#if sourceControls}
+          <div class="setup-row supplemental-row">
+            <div class="setup-controls">{@render sourceControls()}</div>
+          </div>
+        {/if}
       </div>
       {#if localSelected}
         <div class="setup-group local-group">
@@ -171,8 +173,6 @@
   {#if warning}
     <div class="warning">{@render warning()}</div>
   {/if}
-
-  <div class="summary">{@render summary()}</div>
 
   {#if messages}
     <div class="messages">{@render messages()}</div>
@@ -192,7 +192,6 @@
   .setup-group,
   .progress,
   .warning,
-  .summary,
   .messages {
     display: flex;
     flex-direction: column;
@@ -202,21 +201,14 @@
   .setup-group {
     gap: var(--space-1);
   }
-  .setup-label,
-  .source-note {
+  .setup-label {
     margin: 0;
     color: var(--fg-muted);
     font-size: var(--text-xs);
-  }
-  .setup-label {
     font-family: var(--font-ui);
     font-weight: var(--weight-medium);
     letter-spacing: 0.06em;
     text-transform: uppercase;
-  }
-  .source-note code {
-    color: var(--fg-dim);
-    font-family: var(--font-mono);
   }
   .setup-row {
     display: grid;
@@ -226,6 +218,9 @@
     min-width: 0;
   }
   .local-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .supplemental-row {
     grid-template-columns: minmax(0, 1fr);
   }
   .setup-controls {
@@ -283,7 +278,6 @@
   /* Optional snippets often render no DOM at all. Empty flex children still
      consumed a section gap, producing the large SOURCE→STEER void. */
   .warning:empty,
-  .summary:empty,
   .messages:empty {
     display: none;
   }

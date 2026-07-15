@@ -107,8 +107,10 @@ export async function refreshSession(): Promise<void> {
     // Feature ids (and their metadata) belong to the resident release —
     // reset the discovery/metadata state when it changes.
     const release = info.sae_info?.release ?? null;
-    if (release !== saeState.release) {
+    const layer = info.sae_info?.layer ?? null;
+    if (release !== saeState.release || layer !== saeState.layer) {
       saeState.release = release;
+      saeState.layer = layer;
       saeState.readout = [];
       saeState.history.clear();
       saeState.meta.clear();
@@ -222,6 +224,8 @@ export interface SaeState {
   meta: Map<number, { label: string | null; max_act: number | null }>;
   /** Resident release the discovery state belongs to (reset key). */
   release: string | null;
+  /** Resident hook layer; changing it invalidates feature ids/history too. */
+  layer: number | null;
   /** Presentation order shared across tab switches, mirroring the lens
    *  workspace sorter. */
   sortMode: SaeSortMode;
@@ -237,6 +241,7 @@ export const saeState: SaeState = $state({
   history: new SvelteMap<number, number[]>(),
   meta: new SvelteMap<number, { label: string | null; max_act: number | null }>(),
   release: null,
+  layer: null,
   sortMode: "strength",
   busy: false,
   loading: false,
@@ -343,10 +348,13 @@ async function pollSaeLoad(): Promise<void> {
   }
 }
 
-export async function loadSae(release: string): Promise<void> {
+export async function loadSae(
+  release: string,
+  layer: number | null = null,
+): Promise<void> {
   if (saeState.loading || !release.trim()) return;
   try {
-    const status = await apiSae.load({ release: release.trim() });
+    const status = await apiSae.load({ release: release.trim(), layer });
     saeState.loading = status.running;
     saeState.loadMessage = status.message;
     saeState.loadError = status.error;

@@ -159,6 +159,7 @@ class TestSaeRoutes:
                 break
         assert status
         assert status["error"] is None
+        session.load_sae.assert_called_once_with("scope", layer=None)
         session.enable_live_sae.assert_called_once_with(top_k=12)
 
     def test_train_cancel_requires_running_job_and_sets_event(
