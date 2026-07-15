@@ -154,11 +154,11 @@ def test_add_probe_registers_and_precaches():
     assert sum(p.share_weights.values()) == pytest.approx(1.0, abs=1e-5)
 
 
-def test_attached_layers_is_union():
+def test_probe_layers_is_union():
     m = _toy_manifold(n_layers=3)
     mon = _iso_monitor(m)
     mon.add_probe("toy", m)
-    assert mon.attached_layers() == {0, 1, 2}
+    assert mon.probe_layers() == {0, 1, 2}
 
 
 def test_remove_probe():
@@ -167,7 +167,7 @@ def test_remove_probe():
     mon.add_probe("toy", m)
     mon.remove_probe("toy")
     assert mon.probe_names == []
-    assert mon.attached_layers() == set()
+    assert mon.probe_layers() == set()
 
 
 def test_add_probe_top_n_default():
@@ -815,18 +815,6 @@ def test_empty_inputs_return_empty():
     mon.add_probe("toy", m)
     assert mon.score_single_token({}) == {}
     assert mon.score_aggregate({}) == {}
-
-
-def test_pending_per_token_flag():
-    m = _toy_manifold()
-    mon = _iso_monitor(m)
-    mon.add_probe("toy", m)
-    assert not mon.has_pending_per_token()
-    hidden = {layer_idx: sub.mean for layer_idx, sub in m.layers.items()}
-    mon.score_single_token(hidden)
-    assert mon.has_pending_per_token()
-    mon.consume_pending_per_token()
-    assert not mon.has_pending_per_token()
 
 
 # ============================================== affine (flat) batched path ===

@@ -10,10 +10,9 @@ Saklas is a library for activation steering and trait monitoring on local Huggin
 
 Every steering signal in saklas is one artifact: the **manifold**, a set of labelled nodes fit to a per-layer subspace. A plain steering vector is the two-node case. A 107-persona fan and a 20-mood affect surface are the many-node case. The same `%` operator that picks a pole picks a point anywhere on a fitted surface, so you can blend between personas or slide along an emotional gradient with the same grammar you use for a single vector.
 
-Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. There are three frontends over one engine:
+Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. There are two frontends over one engine:
 
 - **`saklas serve <model>`**: a web dashboard at `http://localhost:8000/`. The same port also speaks OpenAI `/v1/*` and Ollama `/api/*`, plus a native `/saklas/v1/*` API. Pass `--no-web` for API-only mode.
-- **`saklas tui <model>`**: a terminal UI.
 - **`SaklasSession`**: a Python API for scripted experiments.
 
 It runs on both CUDA and Apple Silicon MPS, and it runs comfortably on a MacBook. Tested on Qwen, Gemma, Ministral, gpt-oss, Llama, GLM, and Talkie, with a lot more architectures experimentally wired up.
@@ -41,13 +40,7 @@ client.chat.completions.create(
 )
 ```
 
-If you prefer a terminal:
-
-```bash
-saklas tui google/gemma-4-31b-it
-```
-
-Or directly from Python:
+Or use it directly from Python:
 
 ```python
 from saklas import SaklasSession
@@ -123,7 +116,7 @@ The two many-node manifolds are **`personas`** (107 archetype nodes from `assist
 
 ### The steering grammar
 
-Every live steering surface (Python, YAML, HTTP, the TUI) speaks the same grammar.
+Every live steering surface (Python, YAML, HTTP, and the CLI) speaks the same grammar.
 `manifold bake` accepts its namespace-qualified additive scalar subset.
 
 ```python
@@ -188,88 +181,6 @@ Open `http://localhost:8000/`.
 The chat is a branching loom tree, so any turn can fork into siblings. The composer is selection-agnostic: normally, Enter commits the draft in the **human** seat and generates the **model** seat; **swap seats** reverses both. With an empty draft, Enter simply continues the generated seat. Holding Ctrl, Cmd, or Option affects non-empty drafts only and commits without generating. Prefill remains an explicit loom action rather than an implicit composer mode. Submissions during generation get queued.
 
 You can select a probe (or `surprise (logprob)`) to color tokens by score live, and you can compare two probes at once. Every generated token is clickable, and clicking shows all probe scores at all layers for that token, plus the top alternatives the model considered. The probe inspector renders each probe's geometry in the whitened metric, and the activation atlas extends the per-token view across the whole conversation.
-
----
-
-## Terminal UI
-
-```bash
-saklas tui google/gemma-2-9b-it
-saklas tui mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
-saklas tui meta-llama/Llama-3.1-8B-Instruct -p epistemic register
-```
-
-### Flags
-
-| Flag | Description |
-|---|---|
-| `model` | HuggingFace ID or local path (optional if supplied by `-c`) |
-| `-q`, `--quantize` | `4bit` or `8bit` (CUDA only) |
-| `-d`, `--device` | `auto` (default), `cuda`, `mps`, `cpu` |
-| `-p`, `--probes` | Categories: `all`, `none`, `epistemic`, `alignment`, `register`, `cultural` |
-| `--max-tokens` | Default max generation tokens (default 1024) |
-| `--no-dls` | Disable discriminative layer selection at extraction time |
-| `-c`, `--config` | Load setup YAML (repeatable, later overrides earlier) |
-| `-s`, `--strict` | With `-c`: fail on missing concepts |
-
-### Keybindings
-
-| Key | Action |
-|---|---|
-| `Tab` / `Shift+Tab` | Cycle panel focus |
-| `Left` / `Right` | Adjust alpha finely |
-| `Shift+Left` / `Shift+Right` | Adjust alpha coarsely |
-| `Up` / `Down` | Navigate vectors or probes |
-| `Enter` | Toggle vector on or off |
-| `Backspace` / `Delete` | Remove selected vector or probe |
-| `Ctrl+T` | Toggle thinking mode |
-| `Ctrl+A` | Toggle auto-regen side-by-side comparison |
-| `Ctrl+R` | Regenerate last response |
-| `Ctrl+S` | Cycle trait sort mode |
-| `Ctrl+Y` / `Ctrl+Shift+Y` | Cycle per-token highlight: off, probe, surprise |
-| `Ctrl+O` | Toggle chat and raw render mode |
-| `Ctrl+L` | Open the loom tree screen |
-| `Ctrl+E` / `Ctrl+B` | Edit or branch the active loom node |
-| `Ctrl+N` / `Ctrl+D` | Navigate by prefix or request guarded subtree delete |
-| `Ctrl+Enter` / `Alt+Enter` | Commit without generating |
-| `[` / `]` | Adjust temperature |
-| `{` / `}` | Adjust top-p |
-| `Escape` | Stop generation |
-| `Ctrl+Q` | Quit |
-
-### Chat commands
-
-| Command | Description |
-|---|---|
-| `/steer <expression>` | Apply a steering expression (`0.5 honest + 0.3 warm@after`, `0.5 personas%pirate`, `0.5 honest:sae`, …) |
-| `/alpha <val> <name>` | Adjust an already-registered vector's alpha |
-| `/unsteer <name>` | Remove a registered vector |
-| `/probe <name>` | Extract and attach a concept probe |
-| `/probe <pos> . <neg>` | Same, bipolar form |
-| `/unprobe <name>` | Detach a probe |
-| `/manifold-probe <selector>` | Attach a many-node manifold as a probe (`emotions`, `personas`, `ns/name`) |
-| `/manifold fit <folder>` | Fit an authored manifold pack |
-| `/extract <name>` / `/extract <pos> . <neg>` | Extract to disk without attaching (`--role <slug>` for a persona-baselined fit) |
-| `/pairs <name>` | Extract from hand-written `positive \| negative` pairs |
-| `/compare <a> [b]` | Cosine similarity (1-arg: ranked vs all; 2-arg: pairwise) |
-| `/regen [N] [mode]` | Regenerate the last assistant turn, optionally as N siblings or with a recipe override |
-| `/fan <vector> <alphas>` | Generate an alpha grid as loom siblings |
-| `/auto-regen [mode]` | Configure the side-by-side comparison modifier |
-| `/tree` | Open the loom tree screen |
-| `/edit <text>` / `/branch [text]` | Mutate or branch the active loom node |
-| `/nav <prefix>` / `/del [yes]` | Navigate by node prefix or delete the active subtree after confirmation |
-| `/star` / `/note <text>` / `/path` | Mark, annotate, or print the active node's path |
-| `/prune <filter-expr>` | Dim nonmatching loom nodes by aggregate probe readings |
-| `/diff <id1> <id2> [--full]` / `/diff --siblings` | Compare branch text and reading deltas |
-| `/commit <text>` | Commit a turn without generating |
-| `/clear` / `/rewind` | Clear history or undo the last exchange |
-| `/sys <prompt>` | Set system prompt |
-| `/temp <v>` / `/top-p <v>` / `/max <n>` / `/seed [n\|clear]` | Sampling defaults |
-| `/save <name>` / `/load <name>` | Save or restore the full loom conversation tree |
-| `/export <path>` | JSONL with per-token probe readings |
-| `/model` / `/help` | Model and device state, or list commands and keybindings |
-
-To extract a concept from two poles, use `/extract a dog . a pair of cats`. The TUI parses around the space-period-space delimiter, so `dog.cat` stays a single name.
 
 ---
 
@@ -515,7 +426,7 @@ saklas lens decompose confident.uncertain -m google/gemma-3-4b-it   # how verbal
 saklas serve google/gemma-3-4b-it -S "!jlens/fake"        # ablate a lens direction
 ```
 
-`jlens/<word>` works anywhere a concept does: `0.3 jlens/orange` steers toward a token's lens direction, `!jlens/fake` ablates it, and `@when:jlens/fake > 0.4` gates another term on it. Lens directions run hotter than concept vectors — start around 0.3 rather than 0.5. In the TUI, `/lens` streams the top workspace tokens per layer live while the model generates. The fit needs a web-text corpus — pass `--corpus FILE` or `pip install 'saklas[hf]'` to stream a default sample.
+`jlens/<word>` works anywhere a concept does: `0.3 jlens/orange` steers toward a token's lens direction, `!jlens/fake` ablates it, and `@when:jlens/fake > 0.4` gates another term on it. Lens directions run hotter than concept vectors — start around 0.3 rather than 0.5. The dashboard's J-LENS tab streams the top workspace tokens per layer while the model generates. The fit needs a web-text corpus — pass `--corpus FILE` or `pip install 'saklas[hf]'` to stream a default sample.
 
 ---
 

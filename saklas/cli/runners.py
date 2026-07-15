@@ -32,7 +32,7 @@ def _saklas_error_exit(fn: Callable[..., _R]) -> Callable[..., _R]:
 
     Maps the exception's HTTP-style status (from ``user_message()``) to a
     process exit code via ``min(2, code // 100)``: 4xx/5xx land on exit 2,
-    nothing softer. The TUI is excluded — it owns its own surface.
+    nothing softer.
     """
     @functools.wraps(fn)
     def _wrapper(*args: object, **kwargs: object) -> _R:
@@ -502,30 +502,6 @@ def _warmup_session(session: SaklasSession) -> None:
 # ---------------------------------------------------------------------------
 
 @_saklas_error_exit
-def _run_tui(args: argparse.Namespace) -> None:
-    _load_effective_config(args)
-    if not args.model:
-        print(
-            "saklas tui: model required. Pass a HuggingFace repo id (e.g.\n"
-            "  saklas tui google/gemma-2-2b-it\n"
-            "or supply it via -c setup.yaml with a `model:` field.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    _print_startup(args)
-    session = _make_session(args)
-    _print_model_info(session)
-
-    _setup_steering_vectors(session, getattr(args, "config_vectors", None))
-    _warmup_session(session)
-
-    from saklas.tui.app import SaklasApp
-    app = SaklasApp(session=session)
-    app.run()
-
-
-@_saklas_error_exit
 def _enable_serve_live_lens_if_compatible(session: Any) -> bool:
     """Apply serve's default-live policy to an active or cached lens."""
     try:
@@ -695,8 +671,8 @@ def _run_serve(args: argparse.Namespace) -> None:
     # Live-lens-on by default: when the model has a fitted Jacobian lens,
     # serve starts with the full fitted readout streaming, so
     # the dashboard's J-LENS tab is hot on first load (the toggle still
-    # turns it off per session).  Serve-side policy only — the library and
-    # TUI stay opt-in. The generation's logit-alternative K also controls
+    # turns it off per session). Serve-side policy only — the library stays
+    # opt-in. The generation's logit-alternative K also controls
     # the J-lens readout width.
     _enable_serve_live_lens_if_compatible(session)
 
@@ -3500,7 +3476,7 @@ def _run_experiment_transcript(args: argparse.Namespace) -> None:
 
 
 def _parse_grid_terms(raw_terms: list[str]) -> dict[str, list[float]]:
-    from saklas.tui.loom_helpers import AlphaListError, parse_alpha_list
+    from saklas.cli.alpha_grid import AlphaListError, parse_alpha_list
 
     grid: dict[str, list[float]] = {}
     for raw in raw_terms:
@@ -3642,7 +3618,6 @@ def _run_transcript_run(args: argparse.Namespace) -> None:
 
 
 _COMMAND_RUNNERS = {
-    "tui":        _run_tui,
     "serve":      _run_serve,
     "manifold":   _run_manifold,
     "pack":       _run_pack,

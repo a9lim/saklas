@@ -835,9 +835,7 @@ to the live read at that token. `add_probe(name, manifold, *, top_n)` /
 `_build_whitened_factors` (per-layer `_LayerWhiten` build), `_attach_manifold_probe`
 (node cache + per-layer Mahalanobis-share read weights), and `_layer_geometry`. `__init__`'s `layer_means` is
 vestigial on the hot path — the readout centers on each fit's own
-`LayerSubspace.mean`. `probe_layers` is the capture-widening union
-(`attached_layers` is a back-compat alias for the surfaces that consumed the former
-`ManifoldMonitor`).
+`LayerSubspace.mean`. `probe_layers` is the capture-widening union.
 
 `flat_scalars` (one staticmethod) writes the gate channels from a readings dict:
 `"<name>"` (= coords axis 0) + `"<name>[i]"` per axis, `"<name>:fraction"`,
@@ -880,7 +878,7 @@ transfer in both `_score_probe_full` and the batched `_score_flat_batched`).
 stream)`), `score_single_token{,_per_layer}` (`_per_layer` is a view over the
 reading's `coords_per_layer` backing the loom heatmap), `measure_from_hidden`,
 `score_stack`, live-mean `begin/update/end_live`. History/stats are
-per-coordinate-axis (`axis_stats`); the TUI-facing scalar helpers report axis 0.
+per-coordinate-axis (`axis_stats`); the scalar compatibility helpers report axis 0.
 The bundled roster is the fitted 2-node `Manifold`s themselves
 (`_bootstrap_manifold_probes` — no fold). The one-shot re-render text scorer
 (`measure`) is gone — every read source is live hooks scoring captured hidden
@@ -1070,7 +1068,7 @@ any *already fitted* for the model and not already attached (`personas`,
 `emotions`) under the qualified `default/<name>` selector — attach-only (never
 fits; an unfitted one logs a skip), so a 107-node manifold can't block startup.
 This folds the former serve-only `_attach_default_manifold_probes` into the
-construction-time pass, so every frontend (TUI / serve / programmatic) gets the
+construction-time pass, so both frontends (serve / programmatic) get the
 same roster; an explicit `probes=[...]` category list skips the multi-node sweep.
 
 `SteeringComposer.compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
@@ -1223,7 +1221,7 @@ top-k width follows the generation's resolved logit-alternative
 is **every fitted layer**; pass an explicit `layers` list to trade coverage for
 device memory. `saklas serve`
 auto-enables the live lens at startup when the artifact exists (serve-side
-policy; library + TUI stay opt-in).
+policy; the library stays opt-in).
 
 ## loom.py
 
@@ -1355,7 +1353,7 @@ generation result. `to_dict()` omits `hidden_states`.
 ## histogram.py
 
 `HIST_BUCKETS = 16`; `bucketize(norms, buckets)` collapses sorted per-layer norms
-into evenly-sized groups. Used by the TUI WHY footer + CLI `manifold why`.
+into evenly-sized groups. Used by CLI `manifold why` and notebook plots.
 
 ## sampling.py / steering.py / steering_expr.py / events.py / errors.py / profile.py
 

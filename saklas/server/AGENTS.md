@@ -393,7 +393,7 @@ the **live** J-lens readout (`session.enable_live_lens` /
 `disable_live_lens` under `acquire_session_lock`, so it never races an
 in-flight stream and applies to the next generation). Enabling moves the
 selected layers' `J_l` device-resident; `layers` omitted enables every fitted
-layer (the TUI `/lens` default). Returns `{enabled,
+layer. Returns `{enabled,
 layers}` (the resolved list). While enabled, the native WS `token` frame
 carries the per-step matrix as `lens_readout` (see ws_stream below) and
 session info reports the layer list as `live_lens_layers` (`null` while off —

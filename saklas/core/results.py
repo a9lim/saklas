@@ -321,7 +321,7 @@ class TokenEvent:
     # Live J-lens readout for this step: ``{layer: [(token,
     # score), ...]}`` — the top-k lens tokens at each selected layer. The
     # loom-owned ``captured`` wire record separately carries endpoint-shaped
-    # token ids + logprobs without changing this library/TUI compatibility view.
+    # token ids + logprobs without changing this library compatibility view.
     # ``None`` when ``session.enable_live_lens`` is off.
     lens_readout: dict[int, list[tuple[str, float]]] | None = None
     # Layer-aggregated view of the same step's lens readout: ``[(token,

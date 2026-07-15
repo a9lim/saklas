@@ -1093,10 +1093,9 @@ export interface WSTokenEvent {
   text: string;
   thinking: boolean;
   token_id: number | null;
-  /** Magnitude-weighted aggregate probe score per probe, populated only
-   * when probes are loaded.  Same value the TUI tints live tokens with;
-   * the webui's inline highlight reads this so live highlighting matches
-   * the post-generation pass. */
+  /** Magnitude-weighted aggregate probe score per probe, populated only when
+   * probes are loaded. The inline highlight reads this so live highlighting
+   * matches the post-generation pass. */
   scores?: Record<string, number>;
   /** Per-layer × per-probe map populated only when probes are loaded.
    * Keys: layer-index strings → probe names → cosine-sim score.  Drives

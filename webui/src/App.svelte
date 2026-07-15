@@ -113,8 +113,8 @@
     void runBootstrap();
   });
 
-  // Global keyboard accelerators.  Esc → stop (matches TUI).  Cmd/Ctrl-
-  // Enter is left for the chat input to handle locally.
+  // Global keyboard accelerators. Esc stops generation; Cmd/Ctrl-Enter is
+  // left for the chat input to handle locally.
   //
   // Loom (phase 3): Ctrl/Cmd+R/E/B/N/D fire the corresponding tree op
   // via the sidebar's modal flow.  Browser Ctrl+B (bold) is suppressed

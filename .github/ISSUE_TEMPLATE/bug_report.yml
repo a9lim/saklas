@@ -67,4 +67,4 @@ body:
     id: environment
     attributes:
       label: Relevant environment details
-      description: Quantization, dtype, accelerator/driver, and whether this was the CLI, TUI, Python API, or HTTP server
+      description: Quantization, dtype, accelerator/driver, and whether this was the CLI, web dashboard, Python API, or HTTP server

@@ -517,7 +517,6 @@ def _replay_branch_logprobs(
     with steering_cm:
         ctx.reset()
         session._begin_capture(widen=False)
-        session._monitor.begin_live()
         try:
             needs_gating = session._steering_needs_probe_gating()
             gating_callback = (
@@ -615,7 +614,6 @@ def _replay_branch_logprobs(
                     _advance_current_input(next_token)
         finally:
             session._end_capture()
-            session._monitor.end_live()
 
     return row_logps if vocab_size is not None else {}
 

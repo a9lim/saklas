@@ -331,10 +331,6 @@ class TestTraitMonitor:
             v = hist[0][0]
             assert math.isfinite(v)
 
-        # Sparkline should be non-empty
-        sparkline = monitor.get_sparkline("happy")
-        assert len(sparkline) > 0
-
     def test_throughput_regression(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         """Steered generation should be at least 85% of vanilla throughput."""
         from saklas.core.hooks import SteeringManager

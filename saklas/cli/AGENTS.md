@@ -1,7 +1,7 @@
 # cli/
 
-Nine-verb root parser
-(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`/`sae`).
+Eight-verb root parser
+(`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`/`sae`).
 `manifold` is the
 unified compute surface (extract/generate/from-template/fit/bake/merge/transfer/
 compare/why); `pack` is the lifecycle/distribution verb (ls/show/install/search/
@@ -111,8 +111,8 @@ ones; `strict=True` raises on any unresolvable reference.
 Mahalanobis-only), no injection-mode resolution, and no `--legacy` conflict check.
 `_warmup_session`
 runs a 32-token stateless `session.generate(...)` so dynamo's shape promotion fires
-on a realistic prefill before the user's first request; called from `tui` and
-`serve` after `_setup_steering_vectors`. There is no serve-side probe-attach step:
+on a realistic prefill before the user's first request; called from `serve` after
+`_setup_steering_vectors`. There is no serve-side probe-attach step:
 the default probe roster — tagged concept axes plus every fitted bundled multi-node
 manifold (`personas`, `emotions`) — is attached at session construction
 (`_bootstrap_manifold_probes`, `core/session.py`) in every frontend, so the
@@ -127,12 +127,12 @@ and acquisition.
 
 ## Flags
 
-`tui`/`serve` share model-loading args (`model`, `-q/--quantize`, `-d/--device`,
+`serve` carries the model-loading args (`model`, `-q/--quantize`, `-d/--device`,
 `-p/--probes`), the injection block (`_add_injection_args`), the logit block
 (`_add_logit_args`), and config args (`_add_config_args`: `-c/--config` repeatable,
 `-s/--strict`).
 
-- **Injection block** (`_add_injection_args`, on `tui`/`serve`/`experiment fan`/
+- **Injection block** (`_add_injection_args`, on `serve`/`experiment fan`/
   `transcript run`/`naturalness`): `--no-dls`, `--compile`, `--cuda-graphs`. All
   argparse-default to `None`/`False`; YAML fills unset values, session defaults
   (DLS on / compile + cuda-graphs **off**) win otherwise. `~`/`|` projection is
@@ -140,8 +140,6 @@ and acquisition.
   `--theta-max`/`--legacy`.
 - **Logit block** (`_add_logit_args`): `--top-k-alts N` (→ session
   `SamplingConfig.return_top_k`). Both CLI and YAML enforce `[0,256]`.
-- `tui`: `model` optional (a `-c` config with `model:` can supply it); `--max-tokens`
-  default 1024.
 - `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (8000), `-S/--steer EXPR`,
   `-C/--cors ORIGIN` (repeatable), `-k/--api-key` (falls back to `$SAKLAS_API_KEY`),
   `--no-web`.

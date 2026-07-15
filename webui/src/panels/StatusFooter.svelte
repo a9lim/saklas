@@ -1,10 +1,9 @@
 <script lang="ts">
-  // Single-line generation footer.  Mirrors the TUI's status footer:
+  // Single-line generation footer:
   //   ● gen 47/512 [████░░░░░░] · 23 t/s · 2.1s · ppl 8.3
   //
-  // Idle state collapses to "○ idle" before the first generation lands —
-  // matches the TUI behavior of hiding stats until they have something
-  // real to report.
+  // Idle state collapses to "○ idle" before the first generation lands,
+  // hiding stats until they have something real to report.
 
   import Bar from "../lib/charts/Bar.svelte";
   import {

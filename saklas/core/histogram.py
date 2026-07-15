@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from saklas.core.stats import median_or_zero
 
-# One knob for every per-layer histogram surface (TUI WHY footer, CLI
-# ``manifold why``). Chosen so the full profile of any supported model
+# One knob for every per-layer histogram surface (CLI ``manifold why`` and
+# notebook plots). Chosen so the full profile of any supported model
 # collapses into a fixed-height block that fits without scrolling.
 HIST_BUCKETS = 16
 

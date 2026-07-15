@@ -73,8 +73,8 @@ class UnknownManifoldLabelError(KeyError, SaklasError):
     Produced by :meth:`Manifold.resolve_position` (and the nearest-node
     helpers, which short-circuit on labels) when the label is not in
     :attr:`Manifold.node_labels`.  Surfaces a 404-shaped error at the
-    HTTP layer through the shared :class:`SaklasError` MRO; CLI / TUI
-    handlers print the message and recover.
+    HTTP layer through the shared :class:`SaklasError` MRO; CLI handlers print
+    the message and recover.
     """
 
     def user_message(self) -> tuple[int, str]:

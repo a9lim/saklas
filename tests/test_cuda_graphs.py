@@ -344,9 +344,9 @@ def test_session_reuses_and_resets_generation_static_cache(
 
 def test_cuda_graphs_flag_parses():
     from saklas import cli
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it"])
+    args = cli.parse_args(["serve", "google/gemma-2-2b-it"])
     assert getattr(args, "cuda_graphs", False) is False
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it", "--cuda-graphs"])
+    args = cli.parse_args(["serve", "google/gemma-2-2b-it", "--cuda-graphs"])
     assert args.cuda_graphs is True
 
 
@@ -356,7 +356,7 @@ def test_yaml_cuda_graphs_true_folds_onto_args(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "on.yaml"
     p.write_text("model: google/gemma-2-2b-it\ncuda_graphs: true\n")
-    args = cli.parse_args(["tui", "-c", str(p)])
+    args = cli.parse_args(["serve", "-c", str(p)])
     assert getattr(args, "cuda_graphs", False) is False
     cli_runners._load_effective_config(args)
     assert args.cuda_graphs is True
@@ -381,7 +381,7 @@ def test_yaml_compile_and_cuda_graphs_compose(monkeypatch: pytest.MonkeyPatch, t
     p.write_text(
         "model: google/gemma-2-2b-it\ncompile: true\ncuda_graphs: true\n"
     )
-    args = cli.parse_args(["tui", "-c", str(p)])
+    args = cli.parse_args(["serve", "-c", str(p)])
     cli_runners._load_effective_config(args)
     assert args.compile is True
     assert args.cuda_graphs is True

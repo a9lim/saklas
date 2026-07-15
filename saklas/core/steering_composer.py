@@ -489,7 +489,7 @@ class SteeringComposer:
         whole forward+sample loop, so concurrent ``session.steering()
         .__enter__()`` from a different thread waits until the active
         generation finishes rather than mutating hook tensors mid-step.
-        Single-threaded users (TUI, CLI) pay an uncontended acquire;
+        Single-threaded users pay an uncontended acquire;
         the server's per-session asyncio lock serializes requests
         upstream so the contention path is exercised mostly by
         ad-hoc multi-threaded callers.

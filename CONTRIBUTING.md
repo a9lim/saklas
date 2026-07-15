@@ -14,8 +14,8 @@ pip install -e ".[dev]"
 
 Use `[hf]` for streamed dataset-backed J-lens/SAE fitting, `[gguf]` for GGUF
 export, `[research]` for the analysis examples, and `[notebook]` for the Plotly
-notebook helpers. SAELens, the HTTP server, the TUI, and the prebuilt dashboard
-are part of the base install. `[cuda]` adds bitsandbytes and Hugging Face
+notebook helpers. SAELens, the HTTP server, and the prebuilt dashboard are part
+of the base install. `[cuda]` adds bitsandbytes and Hugging Face
 `kernels`; `[cuda-experimental]` adds flash-attn. The CUDA extras are
 Linux/CUDA-only.
 

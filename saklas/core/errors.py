@@ -7,8 +7,8 @@ so callers (and the HTTP server) can catch the whole family with a single
 ``except ValueError`` sites catch the relevant subclasses too.
 
 Every subclass returns an HTTP-style status code through
-:meth:`SaklasError.user_message`, which the three user-facing surfaces
-(server, CLI, TUI) consume to translate exceptions consistently.  The
+:meth:`SaklasError.user_message`, which the server and CLI consume to translate
+exceptions consistently. The
 default ``(500, str(self))`` matches today's behaviour for any subclass
 that doesn't override; subclasses lift the status (and optionally rewrite
 the message) by overriding the method.
@@ -22,8 +22,7 @@ class SaklasError(Exception):
     status code (``400`` bad input, ``404`` not found, ``409`` conflict,
     ``422`` semantic-but-syntactically-valid, ``500`` server error,
     ``502`` upstream).  The CLI maps the status to an exit code via
-    ``min(2, code // 100)``; the TUI ignores the status and only uses
-    the message; the HTTP server passes it through.
+    ``min(2, code // 100)``; the HTTP server passes it through.
     """
 
     def user_message(self) -> tuple[int, str]:

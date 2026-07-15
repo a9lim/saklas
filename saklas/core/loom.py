@@ -321,9 +321,8 @@ class Recipe:
         - ``"hot"``: temperature 1.2; everything else inherits.
 
         A :class:`Recipe` instance passes through unchanged — that's the
-        ``custom`` path: callers (e.g. the TUI's ``/auto-regen custom:
-        <expr>``) parse the user's partial-recipe expression themselves
-        and hand the resulting Recipe in directly.  Unknown string modes
+        ``custom`` path: callers parse the user's partial-recipe expression
+        themselves and hand the resulting Recipe in directly. Unknown string modes
         raise ``ValueError``.
         """
         if isinstance(mode, Recipe):
@@ -610,7 +609,7 @@ class LoomMutated:
     ``LoomNodeJSON`` payloads via :func:`saklas.server.tree_models.node_json`
     before forwarding to clients. The wire-level ``tree_mutated`` event
     therefore carries full nodes while in-process
-    subscribers (TUI, library callers) that already hold the tree
+    in-process subscribers that already hold the tree
     look the ids up themselves; the network hop is the only place that
     needs the inlined node data.
 
@@ -703,8 +702,8 @@ class LoomTree:
     Owned by :class:`saklas.core.session.SaklasSession`; callers go through
     session methods so locking + event emission happen in one place.  The
     tree's own methods are thread-safe under an internal ``RLock`` so the
-    session can call them from arbitrary threads (gen worker, server
-    handler, TUI poller).
+    session can call them from arbitrary threads (generation workers and server
+    handlers).
 
     Operations that mutate bump :attr:`rev` and emit a :class:`LoomMutated`
     event through the session's :class:`EventBus`.  Surfaces track the

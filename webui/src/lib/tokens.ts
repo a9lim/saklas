@@ -1,24 +1,20 @@
 // Per-token highlighting helpers.
 //
-// Mirrors saklas/tui/chat_panel.py:_build_highlight_markup — same
-// saturation knob, same RGB mapping, same compose-with-zero behavior.
-// The TUI builds Rich markup; this module emits CSS color strings the
-// Chat panel attaches as inline ``background-color`` styles per token.
+// Shared saturation knob and RGB mapping for per-token probe highlighting.
+// This module emits CSS color strings the Chat panel attaches as inline
+// ``background-color`` styles per token.
 //
-// The two-stripe variant is a web-only affordance — the TUI's chord-key
-// model can only show one probe at a time; the dashboard can render two
-// probes simultaneously by splitting each token's background vertically.
+// The two-stripe variant renders two probes simultaneously by splitting each
+// token's background vertically.
 
 /** Saturation cutoff — score / HIGHLIGHT_SAT clamps to [-1, 1] before
- * mapping to RGB.  Matches the TUI constant exactly so highlight tints
- * align across surfaces. */
+ * mapping to RGB. */
 export const HIGHLIGHT_SAT = 0.5;
 
 /** Sentinel ``highlightState.target`` value that selects the inline
  *  surprise mode (logit-pass).  Picked to be unmistakably distinct from
  *  any real probe name (probes are slugged ``[a-z0-9._-]``); ``__``-bracketed
- *  reserves the namespace without colliding.  Imported by both
- *  ``Chat.svelte`` and any future TUI parity pass. */
+ *  reserves the namespace without colliding. */
 export const SURPRISE_TARGET = "__surprise__";
 
 /** Split a highlight target into its base probe name and coordinate axis.

@@ -370,7 +370,14 @@ Adding a panel: write the `.svelte`, wire state into the smallest matching `lib/
 
 ## Pending queue
 
-Submissions during an in-flight gen (or behind earlier queued items) defer rather than racing the WS — same semantics as the TUI. `sendGenerate` / `sendCommit` / `sendPrefill` check `isPendingBusy()` (gen active OR `pendingActions.queue.length > 0`) and, when busy, append a `PendingAction` (defined in `lib/types.ts`) carrying a `rebuild` factory the `↑`-pull-and-edit path uses to re-encode the same kind/role/target with new text. Instant mutations from the chat header (`/clear`, regen) and the rack/sampling sites also queue via `enqueuePending` with `awaitsGen: false` so the drain chains through them without waiting on a `done` that never fires.
+Submissions during an in-flight gen (or behind earlier queued items) defer rather
+than racing the WS. `sendGenerate` / `sendCommit` / `sendPrefill` check
+`isPendingBusy()` (gen active OR `pendingActions.queue.length > 0`) and, when
+busy, append a `PendingAction` (defined in `lib/types.ts`) carrying a `rebuild`
+factory the `↑`-pull-and-edit path uses to re-encode the same kind/role/target
+with new text. Instant mutations from the chat header (`/clear`, regen) and the
+rack/sampling sites also queue via `enqueuePending` with `awaitsGen: false` so
+the drain chains through them without waiting on a `done` that never fires.
 
 Queued rack mutations coalesce. `enqueueOrApply` tags each rack-mutation item with `coalesceKey: "rack"`; when the queue tail already carries that key, a fresh mutation chains its `apply` onto the tail item rather than appending a new slot, and the bubble's label updates to the latest action. A slider drag firing 30+ intermediate `setSubspaceAlong` calls mid-gen therefore leaves one queued bubble carrying the net effect. Coalescing stops at any non-rack item — rack changes before and after a queued send form distinct groups, so FIFO ordering relative to the send holds.
 
@@ -390,7 +397,39 @@ Downloaded conversations likewise use one exact schema (`version: 5`): complete 
 
 ## Per-token highlighting
 
-Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match. Authored spans gain the same token rows when their next generation prefill consumes them: the engine emits a `capture_authored` tree mutation carrying their original probe/J-LENS/SAE payloads, so user-written and model-written text share hover, highlight, and drawer behavior without an extra browser path. An authored-only append remains plain until a later generation actually forward-passes it. (v2 ramp note: `scoreToRgb` emits **constant-hue alpha ramps** — tint strength = opacity, hue = meaning — with `signed` green/red probe poles, blue surprise/J-LENS, and gold SAE families. Pinned SAE/J-LENS cards expose the same explicit `highlight` action as geometry probes; both read their native `[0,1]` strength on a unit saturation scale. The TUI still runs the old opaque ramp — a parity pass is deliberately deferred.) Hover and drawer history read the loom-owned `token.captured` channels directly, so refreshes, source switches, and explicit loom save/load preserve the original generation measurements without a browser retention cache or token-count cap. A channel disabled during that generation may still use its loom replay endpoint after the hover dwell; the drawer also replays for the explicit unsteered J-LENS counterfactual. Replayed values are never written back or mislabeled as original capture. Clicking any token opens the `token_drilldown` drawer regardless of whether a highlight probe is selected — four `SegmentedTabs` on one toolbar row (only **j-lens** and **sae** carry their pillar hue; the steered/unsteered A/B branch toggle sits right on the same row when the turn has an `abPair`): **probes** (the per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork), **sae** (captured resident-hook top features, replay fallback), and **j-lens** (the captured all-fitted-layer readout — aggregate chip row then per-layer matrix — with replay fallback and an `apply recipe steering` checkbox for the unsteered counterfactual). Captured rows show their provenance and source even if that instrument is no longer active. A **token scrubber** in the drawer header (`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the inspected position along the turn's token list while preserving the selected tab/branch; a fresh token click snaps back to its own index.
+Highlighting lives on the chat token spans, driven by a single highlight-probe
+dropdown in the chat header with an optional two-stripe compare-two mode. It
+tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds
+the same `scoreToRgb` ramp the post-generation pass uses, so streaming and
+finalized tints match. Authored spans gain the same token rows when their next
+generation prefill consumes them: the engine emits a `capture_authored` tree
+mutation carrying their original probe/J-LENS/SAE payloads, so user-written and
+model-written text share hover, highlight, and drawer behavior without an extra
+browser path. An authored-only append remains plain until a later generation
+actually forward-passes it. `scoreToRgb` emits **constant-hue alpha ramps** —
+tint strength = opacity, hue = meaning — with `signed` green/red probe poles,
+blue surprise/J-LENS, and gold SAE families. Pinned SAE/J-LENS cards expose the
+same explicit `highlight` action as geometry probes; both read their native
+`[0,1]` strength on a unit saturation scale. Hover and drawer history read the
+loom-owned `token.captured` channels directly, so refreshes, source switches,
+and explicit loom save/load preserve the original generation measurements
+without a browser retention cache or token-count cap. A channel disabled during
+that generation may still use its loom replay endpoint after the hover dwell;
+the drawer also replays for the explicit unsteered J-LENS counterfactual.
+Replayed values are never written back or mislabeled as original capture.
+Clicking any token opens the `token_drilldown` drawer regardless of whether a
+highlight probe is selected — four `SegmentedTabs` on one toolbar row (only
+**j-lens** and **sae** carry their pillar hue; the steered/unsteered A/B branch
+toggle sits right on the same row when the turn has an `abPair`): **probes** (the
+per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork),
+**sae** (captured resident-hook top features, replay fallback), and **j-lens**
+(the captured all-fitted-layer readout — aggregate chip row then per-layer matrix
+— with replay fallback and an `apply recipe steering` checkbox for the unsteered
+counterfactual). Captured rows show their provenance and source even if that
+instrument is no longer active. A **token scrubber** in the drawer header
+(`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the
+inspected position along the turn's token list while preserving the selected
+tab/branch; a fresh token click snaps back to its own index.
 
 ## Toasts
 

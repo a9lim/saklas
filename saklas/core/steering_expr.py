@@ -1,7 +1,7 @@
 """Unified steering-expression grammar and IR compiler.
 
 One parser + formatter for the steering expression language shared across
-every saklas input surface (Python, YAML, HTTP, TUI, CLI). Every surface
+every saklas input surface (Python, YAML, HTTP, CLI). Every surface
 turns a user-supplied string into the same :class:`Steering` IR.
 
 Grammar::

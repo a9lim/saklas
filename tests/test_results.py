@@ -367,11 +367,3 @@ class TestTraitMonitorScoring:
             monitor.history["test_probe"][0][0]
             > monitor.history["test_probe"][1][0]
         )
-
-    def test_sparkline_grows_with_history(self):
-        monitor = self._make_monitor()
-        for _ in range(4):
-            h = torch.randn(16)
-            monitor.measure_from_hidden({0: h})
-        sparkline = monitor.get_sparkline("test_probe")
-        assert len(sparkline) == 4

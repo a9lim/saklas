@@ -1,7 +1,7 @@
 """Tests for ``SaklasError.user_message()`` centralization (Phase 4).
 
-Each subclass returns an HTTP-style ``(status, msg)`` tuple; the three
-user-facing surfaces (server, CLI, TUI) consume the value to translate
+Each subclass returns an HTTP-style ``(status, msg)`` tuple; the server and CLI
+consume the value to translate
 exceptions consistently.  Tests pin the contract so subclasses can't
 silently lose their override.
 """

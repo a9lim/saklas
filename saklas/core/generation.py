@@ -543,7 +543,7 @@ def _advance_no_cache_input(
 
 
 class GenerationState:
-    """Shared mutable state for controlling generation from the TUI."""
+    """Shared mutable state for controlling and streaming generation."""
 
     def __init__(self):
         self.stop_requested = threading.Event()
@@ -552,9 +552,8 @@ class GenerationState:
         self.finish_reason: str = "stop"
         # For each on_token emission, the index in generated_ids of the
         # token that triggered it (last buffered ID for multi-byte emits),
-        # plus whether the emit was thinking.  Used by the TUI to map
-        # per-token probe scores (which are in generated_ids space) back
-        # to the emitted token stream.
+        # plus whether the emit was thinking. Used to map per-token probe
+        # scores (which are in generated_ids space) back to the emitted stream.
         self.emit_map: list[tuple[int, bool]] = []
         # Exact non-thinking text accepted by a stop-sequence streaming path.
         # Populated only when a stop sequence actually matches, because normal
@@ -1200,9 +1199,9 @@ def generate_steered(
                     # decode the unfinished thoughts as the response text.
                     # Without this, ``response_ids = generated_ids[0:]``
                     # would land the entire thinking dump on the loom
-                    # node's ``text`` field — the TUI's live view hides
-                    # the bug (it builds the response from ``on_token``
-                    # directly), but the webui re-renders ``node.text``
+                    # node's ``text`` field. A live stream can hide the bug by
+                    # building the response from ``on_token`` directly, but the
+                    # web UI re-renders ``node.text``
                     # after ``tree_mutated finalize_assistant`` arrives.
                     if tstate in (
                         _ThinkState.PREAMBLE,

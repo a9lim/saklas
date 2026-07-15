@@ -206,8 +206,6 @@
   --font-mono: "Recursive Mono", ui-monospace, "SF Mono", Menlo, Consolas,
     monospace;
 
-  /* ---- TUI-ported geometry knobs — 24 mirrors BAR_WIDTH ------------ */
-
   /* ---- Z-layers ---------------------------------------------------- */
   --z-drawer: 50;
   --z-modal: 100;

@@ -1,10 +1,8 @@
 <script lang="ts">
-  // Hand-rolled horizontal bar.  Positive = green, negative = red,
-  // mirroring the TUI build_bar shape but in pixel-width SVG.
+  // Hand-rolled horizontal bar. Positive = green, negative = red.
   //
   // ``value`` and ``max`` are unitless; ``width`` is the rendered max
-  // width in pixels (defaults to BAR_WIDTH * 6 ≈ the TUI's 24-glyph
-  // bar at typical web character cell width).
+  // width in pixels.
   //
   // ``bipolar`` flips the bar to a center-zero shape: fills rightward
   // from the midline for positive values, leftward for negative, with a

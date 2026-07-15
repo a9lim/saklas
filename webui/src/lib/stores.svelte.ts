@@ -1587,8 +1587,7 @@ export interface ProbeRackState {
 
 export const probeRack: ProbeRackState = $state({
   entries: new SvelteMap(),
-  // Alphabetical by default — matches the TUI's initial state.  Sort by
-  // value / change is a dropdown opt-in.
+  // Alphabetical by default; value/change sorting is a dropdown opt-in.
   sortMode: "name",
   active: [],
   loading: false,
@@ -1879,8 +1878,7 @@ export async function attachProbe(
   if (!probeRack.active.includes(info.name)) {
     probeRack.active = [...probeRack.active, info.name];
   }
-  // Seed the highlight target when a probe is attached through the rack —
-  // matches the TUI pointing highlight at a fresh probe.
+  // Seed the highlight target when a probe is attached through the rack.
   if (highlightState.target === null) {
     highlightState.target = info.name;
   }
@@ -2653,10 +2651,8 @@ export interface HighlightState {
 }
 
 export const highlightState: HighlightState = $state({
-  // Surprise mode by default — the logit-pass tint works without any
-  // probes loaded, so it's the one mode that's meaningful out of the
-  // box.  Mirrors the TUI's ``_highlight_probe = SURPRISE_PROBE`` +
-  // ``_highlighting = True`` init.  ``localStorage`` overrides per
+  // Surprise mode by default — the logit-pass tint works without any probes
+  // loaded, so it is meaningful out of the box. ``localStorage`` overrides per
   // model on hydrate, so a user who flipped to a probe + reloaded
   // still sees their last choice.
   target: SURPRISE_TARGET,
@@ -2703,7 +2699,7 @@ export const genStatus: GenStatus = $state({
 });
 
 /** Geometric-mean perplexity assembled from per-token TokenEvent.perplexity
- * values (mirrors the TUI's ``exp(sum(log(ppl)) / count)`` formula).  Pure
+ * values using ``exp(sum(log(ppl)) / count)``. Pure
  * function — caller passes the slice so it can also be used on ad-hoc
  * accumulators (e.g. an A/B side's separate perplexity buffer). */
 export function geometricMeanPpl(state: GenStatus): number | null {
@@ -3070,9 +3066,8 @@ function enqueueOrApply(label: string, apply: () => void): void {
   });
 }
 
-/** Are we busy enough that fresh submissions should queue instead of
- *  fire?  Mirrors the TUI's ``_is_busy`` — gen running OR earlier
- *  items waiting their turn.  Used by every submission helper below. */
+/** Are we busy enough that fresh submissions should queue instead of fire?
+ *  Busy means a generation is running or earlier items await their turn. */
 export function isPendingBusy(): boolean {
   return genStatus.active || pendingActions.queue.length > 0;
 }
@@ -3398,11 +3393,9 @@ function handleWsMessage(msg: WSServerMessage): void {
         thinking: msg.thinking,
         tokenId: msg.token_id,
         perLayerScores: capturedPerLayer,
-        // ``msg.scores`` is the magnitude-weighted aggregate probe row —
-        // the value the TUI tints live tokens with.  Using it (rather
-        // than a single deepest-layer slice) makes the webui's live
-        // highlight match both the TUI and the post-generation projected
-        // pass.  Absent when no probes are loaded.
+        // ``msg.scores`` is the magnitude-weighted aggregate probe row. Using
+        // it instead of a deepest-layer slice makes live highlighting match the
+        // post-generation projected pass. Absent when no probes are loaded.
         probes: capturedScores,
         // Logit-pass: pipe chosen-token logprob + top-K alternatives onto
         // the per-token row.  Both ride the WS ``token`` event directly

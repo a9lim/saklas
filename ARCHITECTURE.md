@@ -872,8 +872,7 @@ peer of the unified `subspace_inject` kernel. A 2-node concept axis, the 107-nod
 `personas` fan, and the `emotions` affect surface are all just probes on the one
 monitor. It rides the same `HiddenCapture` plumbing as generation;
 `session._begin_capture` widens capture to the union of every probe's layers
-(`Monitor.probe_layers`; `attached_layers` survives as an alias for the server/TUI
-surfaces that consumed the former `ManifoldMonitor`).
+(`Monitor.probe_layers`).
 
 The same producer-state contract now covers visible authored prompt text. During
 a stateful generation, uncaptured authored loom channels are tokenized with exact
@@ -1120,7 +1119,7 @@ features; the dashboard scales each card against its own recent maximum.
 ## 7. Grammar (`core/steering_expr.py`)
 
 `parse_expr(text) → Steering`; `format_expr` round-trips. Every live steering
-surface (Python, YAML, HTTP, TUI) speaks it. `manifold bake` parses that grammar's
+surface (Python, YAML, HTTP, CLI) speaks it. `manifold bake` parses that grammar's
 namespace-qualified additive scalar subset; it rejects dynamic terms and
 Mahalanobis `~`/`|` projections because no identity-matched whitener is loaded.
 

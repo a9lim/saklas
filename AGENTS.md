@@ -2,8 +2,8 @@
 
 ## What this is
 
-`saklas` is a Python library + Textual TUI + dual-protocol HTTP server for
-activation steering and trait monitoring on HuggingFace causal LMs. It runs
+`saklas` is a Python library + dual-protocol HTTP server for activation steering
+and trait monitoring on HuggingFace causal LMs. It runs
 OpenAI `/v1/*` and Ollama `/api/*` on one port, plus a native `/saklas/v1/*` API
 and a Svelte dashboard at `/`. Steering signal comes from representation
 engineering, unified under a single artifact family — the **manifold**: labeled
@@ -13,8 +13,8 @@ is a 20-node affect manifold over PAD. Every steering term — vectors, poles, `
 `!` ablations, and `%` manifold positions — lowers at generation time to one
 unified per-layer injection (the along/onto subspace kernel,
 `core/manifold.py::subspace_inject`). Per-call coefficients, no model mutation.
-Three frontends over one engine: `SaklasSession` (programmatic), `saklas serve`
-(HTTP), `saklas tui` (TUI).
+Two frontends over one engine: `SaklasSession` (programmatic) and `saklas serve`
+(HTTP APIs plus the web dashboard).
 
 Version lives in `saklas/__init__.py` as `__version__`.
 `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there
@@ -38,9 +38,8 @@ when you work in that directory. Consult them only when editing that layer.
   monitor, session, generation loop, loom tree
 - `saklas/io/AGENTS.md` — manifold format, HF distribution, GGUF, merge,
   alignment, paths/selectors
-- `saklas/cli/AGENTS.md` — nine-verb dispatch, config loading, flags
+- `saklas/cli/AGENTS.md` — eight-verb dispatch, config loading, flags
 - `saklas/server/AGENTS.md` — OpenAI / Ollama / native routes
-- `saklas/tui/AGENTS.md` — slash commands, panels, loom screen
 - `saklas/web/AGENTS.md` — dashboard mount, wire protocol, Svelte source layout
 
 ## Commands
@@ -50,7 +49,6 @@ pip install -e ".[dev]"                         # editable + pytest + SAELens
 pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
 pip install -e ".[cuda]"                        # bitsandbytes + kernels (Linux/CUDA)
 pip install -e ".[cuda-experimental]"            # + flash-attn (Linux/CUDA)
-saklas tui <model_id> [--no-dls]
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete|custom] [--system TEMPLATE] [--samples-per-prompt K] [--seed S]
@@ -86,8 +84,8 @@ saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
 ```
 
-The root parser has exactly nine verbs: `tui`, `serve`, `manifold`, `pack`,
-`experiment`, `config`, `template`, `lens`, `sae`. There is no `vector` alias. `manifold`
+The root parser has exactly eight verbs: `serve`, `manifold`, `pack`, `experiment`,
+`config`, `template`, `lens`, `sae`. There is no `vector` alias. `manifold`
 is the unified compute surface
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); `pack` owns
 lifecycle and distribution (ls/show/install/search/push/rm/clear/refresh/export
@@ -98,8 +96,8 @@ and a `manifold from-template` fit); `lens` owns local fitting plus source-aware
 lifecycle/readout (fit/fetch/ls/show/use/top/decompose/rm — see "Jacobian lens"
 below); `sae` owns the parallel local/external lifecycle
 (train/fetch/ls/show/use/rm). Both keep provider-owned payloads in provider
-caches and store only pinned bindings locally. No `argv[0]`
-peeking, no bare-TUI fallback —
+caches and store only pinned bindings locally. No `argv[0]` peeking or bare-model
+fallback —
 `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
 manifold` / `saklas pack` / `saklas experiment` / `saklas config` / `saklas
 template` / `saklas lens` / `saklas sae` print help and exit 0.
@@ -141,7 +139,7 @@ and `.` is used over `~` because HF repo names reject `~`.
 
 ## Steering expression grammar
 
-Every live steering surface — Python, YAML, HTTP, and TUI — speaks the grammar
+Every live steering surface — Python, YAML, HTTP, and CLI — speaks the grammar
 in `saklas.core.steering_expr`. `manifold bake` parses the same syntax but accepts
 only namespace-qualified additive/subtractive scalar terms: dynamic `!`/`%`,
 triggers, multi-coefficients, and Mahalanobis `~`/`|` projections require a live
@@ -347,14 +345,14 @@ Three read surfaces over either source, plus local fit and external fetch:
   cover every requested fitted layer. `session.enable_live_lens()` streams the
   same top-k width as the generation's logit-alternative readout per
   selected layer plus the aggregate chip list every decode step
-  (`TokenEvent.lens_readout` / `TokenEvent.lens_aggregate`, TUI `/lens` →
-  WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's
+  (`TokenEvent.lens_readout` / `TokenEvent.lens_aggregate`, displayed in the
+  dashboard WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's
   latest slices post-forward at the token tap — no new forward hooks, so steering
   fast-path/compile eligibility is untouched. The default live layer set is
   **every fitted layer**, and `saklas serve` auto-enables the
-  live lens at startup when the artifact exists (serve-side policy; library +
-  TUI stay opt-in). The dashboard's **J-LENS tab** is
-  the server sibling. Its SOURCE section lists `local:default` and fetched
+  live lens at startup when the artifact exists (serve-side policy; the library
+  stays opt-in). The dashboard's **J-LENS tab** is the server frontend. Its
+  SOURCE section lists `local:default` and fetched
   `neuronpedia` bindings, switches an existing source, fetches the official
   artifact into the Hugging Face cache, or drives the background local fit
   route `POST /saklas/v1/sessions/{id}/lens/fit` (all layers, polled,
@@ -1089,8 +1087,8 @@ independently of the per-node `--samples-per-prompt`).
 
 ## Package layout
 
-`saklas/{core,io,cli,server,tui,web}/`. `core` is the engine, `io` is persistence
-+ distribution, `cli`/`server`/`tui`/`web` are the four frontends. The Svelte
+`saklas/{core,io,cli,server,web}/`. `core` is the engine, `io` is persistence +
+distribution, and `cli`/`server`/`web` are the interface layers. The Svelte
 dashboard source lives at the repo's `webui/` directory (peer of `saklas/`); its
 build artifact is committed under `saklas/web/dist/`.
 
@@ -1103,6 +1101,5 @@ owns the throughput regression.
 
 **CPU-only**: the bulk of the suite — core dataclasses, steering-context
 semantics, manifold format integrity + staleness, selector grammar, mocked HF
-wrappers, GGUF round-trip, config loading, monitor scoring, nine-verb CLI dispatch,
-OpenAI/Ollama/native servers, TUI slash-command dispatch, loom tree/diff/filter/
-transcript.
+wrappers, GGUF round-trip, config loading, monitor scoring, eight-verb CLI
+dispatch, OpenAI/Ollama/native servers, and loom tree/diff/filter/transcript.

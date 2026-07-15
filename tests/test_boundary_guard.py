@@ -1,7 +1,7 @@
-"""Frontend ↔ engine boundary guard.
+"""Server ↔ engine boundary guard.
 
-The TUI and the HTTP server are *frontends* over :class:`SaklasSession`; they
-must talk to the engine through its public API, never reach past it into a
+The HTTP server is a frontend over :class:`SaklasSession`; it must talk to the
+engine through its public API, never reach past it into a
 ``SaklasSession`` private (``session._monitor``, ``session._profiles``, …).
 Reaching in couples a frontend to the engine's internal layout, so a private
 rename silently breaks it — exactly the migration this test guards against
@@ -14,8 +14,8 @@ should use those instead of being added to the allowlist below.
 The grep is **session-scoped**, not "any ``self._x``": a widget or route
 controller is free to keep its own privates.  Only attribute access whose
 *receiver* is a session-object expression counts — the session is bound to a
-bare ``session`` / ``sess`` local (the server routes), to ``self._session``
-(the TUI ``SaklasApp``), or reached through ``self.session`` / ``.session``.
+bare ``session`` / ``sess`` local or reached through ``self._session``,
+``self.session``, or ``.session``.
 
 Comments and string literals are stripped via :mod:`tokenize` before the
 match, so a historical note (``# v2.2 had self._messages = session._history``)
@@ -37,7 +37,7 @@ from pathlib import Path
 ALLOWLIST: list[str] = [
 ]
 
-_FRONTEND_DIRS = ("tui", "server")
+_FRONTEND_DIRS = ("server",)
 
 # Receiver expressions that denote the SaklasSession object, each matched
 # right before ``._<attr>``.  Two left-boundary regimes, so the dotted and the
@@ -51,7 +51,7 @@ _FRONTEND_DIRS = ("tui", "server")
 _SESSION_PRIVATE_RE = re.compile(
     r"(?:"
     r"(?:self|[\w\]\)])\.session"  # self.session / app.state.session / …
-    r"|self\._session"             # the TUI SaklasApp binding
+    r"|self\._session"             # an explicit private session binding
     r"|(?<![\w.])(?:session|sess)"  # a bare session/sess local
     r")"
     r"\._[A-Za-z]\w*"
@@ -118,7 +118,7 @@ def _find_reach_ins() -> dict[str, list[str]]:
 
 
 def test_no_frontend_session_private_reach_ins() -> None:
-    """No ``saklas/{tui,server}`` code reaches a SaklasSession private."""
+    """No ``saklas/server`` code reaches a SaklasSession private."""
     hits = _find_reach_ins()
     allow = set(ALLOWLIST)
     offenders = {key: lines for key, lines in hits.items() if key not in allow}
@@ -161,9 +161,9 @@ def test_allowlist_entries_are_still_present() -> None:
 # from any module is a regression against the promotion.
 _PROMOTED_OLD_NAMES = frozenset(["_export_gguf_manifold"])
 
-# All cross-module import surfaces (cli/server/tui plus core helpers) must use
+# All cross-module import surfaces (CLI/server plus core helpers) must use
 # the promoted public names.
-_ALL_FRONTEND_DIRS = ("tui", "server", "cli", "core")
+_ALL_FRONTEND_DIRS = ("server", "cli", "core")
 
 _UNDERSCORE_IMPORT_RE = re.compile(
     r"(?:^|\s)from\s+[\w.]+\s+import\s+[^#\n]*\b(_[A-Za-z]\w*)"
@@ -200,8 +200,6 @@ def test_promoted_names_not_imported_by_old_underscore_form() -> None:
       server/traits_routes.py:   _resolve_session_id  (internal server helper)
       server/probe_routes.py:    _resolve_session_id  (internal server helper)
       server/vector_routes.py:   _refuse_if_busy (internal)
-      tui/app.py:                _INPUT_HISTORY_MAX (internal TUI cap)
-      tui/extraction_controller.py: _Profile (local alias, type-annotation only)
       cli/main.py:               _build_root_parser, _COMMAND_RUNNERS (internal CLI)
     """
     offenders = _find_promoted_old_name_imports()

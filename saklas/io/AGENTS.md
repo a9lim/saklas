@@ -286,7 +286,7 @@ slug. Every bipolar pole is itself a node label, so a bare pole resolves through
 tier 1 as an affine `%` push. The retired `resolve_pole` folded into
 **`canonicalize_atom(raw) → (canonical, variant)`** (the pure slug + variant peel —
 no `match`/`sign` slots, since the bipolar sign-flip is gone); the external
-canonicalizer consumers (`SteeringComposer.resolve_pole_aliases`, `tui/app`, `cli/runners`)
+canonicalizer consumers (`SteeringComposer.resolve_pole_aliases`, `cli/runners`)
 call it directly. The underlying tier steps stay public:
 `resolve_manifold_label(label, *, namespace=)` finds a node by label across
 installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-node

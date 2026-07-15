@@ -122,10 +122,8 @@ class Monitor:
     no Euclidean readout (on real LMs the Euclidean metric is rogue-dominated,
     a wrong answer not a degraded one).
 
-    TUI-facing scalar helpers (``get_sparkline`` /
-    ``get_current_and_previous``) report coordinate **axis 0** so the
-    untouched trait panel keeps working; the full per-axis + per-layer data
-    flows through the :class:`ProbeReading` surface.
+    Full per-axis and per-layer data flows through the
+    :class:`ProbeReading` surface.
     """
 
     def __init__(self, probe_manifolds: dict[str, "Manifold"] | None = None,
@@ -191,17 +189,6 @@ class Monitor:
             n: deque(maxlen=_MAX_HISTORY) for n in self._probes
         }
 
-        # Aggregate path sets _pending_aggregate; per-token path sets _pending_per_token.
-        # has_pending_data() returns aggregate readiness — the TUI uses it to refresh
-        # trait readings after a measure() call.
-        self._pending_aggregate = False
-        self._pending_per_token = False
-
-        # Live running mean (per coordinate axis) during streaming generation.
-        self._live_values: dict[str, list[float]] = {}
-        self._live_count: int = 0
-        self._live_pending: bool = False
-
         # Curved-probe per-token foot-follow (read-side analogue of the steering
         # foot-follower).  When ``_curved_warm`` is set — only the sequential
         # incremental live-scoring path enables it, via ``enable_curved_warm`` —
@@ -242,7 +229,7 @@ class Monitor:
         """Union of fit-layer indices across attached probes.
 
         The capture-widening signal the session uses to retain every layer
-        a probe reads (peer of :meth:`Monitor.attached_layers`).  ``names``
+        a probe reads. ``names``
         narrows the union for gate-only control calls that do not need a final
         full-roster probe aggregate.
         """
@@ -1655,7 +1642,6 @@ class Monitor:
                 continue
             coords = reading.coords or (0.0,)
             self.history[name].append(tuple(coords))
-        self._pending_aggregate = True
 
     def accumulate_readings(
         self, readings: dict[str, ProbeReading],
@@ -1679,8 +1665,7 @@ class Monitor:
         with ``coords`` (domain frame) + ``fraction`` + ``nearest`` +
         ``residual`` and their per-layer traces, every probe (flat or curved).
         Does NOT touch history/stats — the in-flight gate/stream path must
-        not corrupt the session-level accumulators — but flips the
-        per-token pending flag so the TUI/webui can poll for a fresh reading.
+        not corrupt the session-level accumulators.
 
         ``only`` (a set of probe names) scores just that subset, returning
         ``{name: ProbeReading}`` for the subset alone — the gate-only per-token
@@ -1690,13 +1675,10 @@ class Monitor:
         returns the lean coords+fraction reading (no nearest / assignment /
         per-layer trace) for the axis-0-only live consumers.
         """
-        out = self._score_tokens(
+        return self._score_tokens(
             hidden_per_layer, accumulate=False, only=only,
             coords_only=coords_only,
         )
-        if out:
-            self._pending_per_token = True
-        return out
 
     def score_single_token_per_layer(
         self,
@@ -1820,8 +1802,6 @@ class Monitor:
         if aggregate_index is not None and int(aggregate_index) < 0:
             agg = empty_agg
             per_token = self._per_token_coord_stream(captured, n)
-            if accumulate:
-                self._pending_per_token = True
             return agg, per_token
         if aggregate_index is None:
             from saklas.core.vectors import last_content_index
@@ -1834,8 +1814,6 @@ class Monitor:
         }
         agg = self._score_tokens(agg_hidden, accumulate=accumulate)
         per_token = self._per_token_coord_stream(captured, n)
-        if accumulate:
-            self._pending_per_token = True
         return agg, per_token
 
     def score_stack(
@@ -1891,81 +1869,7 @@ class Monitor:
         }
         agg = self._score_tokens(agg_hidden, accumulate=accumulate)
         per_token = self._per_token_coord_stream(captured, n)
-        if accumulate:
-            self._pending_per_token = True
         return agg, per_token
-
-    def has_pending_data(self) -> bool:
-        """True iff an aggregate measurement is waiting to be consumed."""
-        return self._pending_aggregate or self._live_pending
-
-    def has_pending_per_token(self) -> bool:
-        return self._pending_per_token
-
-    def consume_pending(self) -> None:
-        """Mark aggregate pending data as consumed (called by TUI after reading)."""
-        self._pending_aggregate = False
-        self._live_pending = False
-
-    def consume_pending_per_token(self) -> None:
-        self._pending_per_token = False
-
-    def begin_live(self) -> None:
-        """Reset the live running-mean accumulator at the start of a gen."""
-        self._live_values = {}
-        self._live_count = 0
-        self._live_pending = False
-
-    def update_live(self, readings: dict[str, "ProbeReading"]) -> None:
-        """Fold one token's per-probe coordinate axis 0 into the running mean.
-
-        Accepts the per-token readings the score callback already produces;
-        the live mean tracks coordinate axis 0 (the TUI-facing scalar).
-        """
-        self._live_count += 1
-        c = self._live_count
-        for name, reading in readings.items():
-            v = reading.coords[0] if reading.coords else 0.0
-            prev = self._live_values.get(name, [0.0])
-            self._live_values[name] = [prev[0] + (v - prev[0]) / c]
-        self._live_pending = True
-
-    def end_live(self) -> None:
-        """Drop the live running mean so reads fall back to history."""
-        self._live_values = {}
-        self._live_count = 0
-        self._live_pending = False
-
-    def get_current_and_previous(self) -> tuple[dict[str, float], dict[str, float]]:
-        """Axis-0 scalar current/previous reading per probe (TUI compat)."""
-        current: dict[str, float] = {}
-        previous: dict[str, float] = {}
-        for name in self._probes:
-            hist = self.history[name]
-            live = self._live_values.get(name)
-            if live is not None:
-                current[name] = live[0]
-                previous[name] = hist[-1][0] if hist else live[0]
-            elif len(hist) >= 2:
-                current[name] = hist[-1][0]
-                previous[name] = hist[-2][0]
-            elif hist:
-                current[name] = hist[-1][0]
-                previous[name] = hist[-1][0]
-            else:
-                current[name] = 0.0
-                previous[name] = 0.0
-        return current, previous
-
-    def get_sparkline(self, name: str) -> str:
-        blocks = " ▁▂▃▄▅▆▇█"
-        # Axis-0 coordinate history (TUI compat).
-        values = [c[0] for c in self.history[name]] if name in self.history else []
-        if not values:
-            return ""
-        lo, hi = min(values), max(values)
-        span = hi - lo if hi != lo else 1.0
-        return "".join(blocks[min(8, max(0, int((v - lo) / span * 8)))] for v in values)
 
     def add_probe(self, name: str, manifold: "Manifold", *, top_n: int = DEFAULT_NEAREST_TOP_N):
         """Register a :class:`Manifold` probe — flat (any rank) or curved.
@@ -1995,28 +1899,9 @@ class Monitor:
         """Live attached-probe map (read-only view) — name → probe."""
         return dict(self._probes)
 
-    def attached_layers(self) -> set[int]:
-        """Union of fit-layer indices across every attached probe.
-
-        Alias of :meth:`probe_layers` (capture-widening signal); kept for the
-        server/TUI surfaces that consumed the former ``ManifoldMonitor``.
-        """
-        return self.probe_layers()
-
-    def reset(self) -> None:
-        """Drop every attached probe (TUI ``/unsteer``-style reset)."""
-        self._probes.clear()
-        self.history.clear()
-        self._whitener_factor_cache.clear()
-        self._invalidate_flat_cache()
-        self._pending_aggregate = False
-        self._pending_per_token = False
-
     def reset_history(self):
         for name in self._probes:
             self.history[name].clear()
-        self._pending_aggregate = False
-        self._pending_per_token = False
 
     def score_aggregate(
         self,

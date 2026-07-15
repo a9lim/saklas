@@ -19,10 +19,8 @@
   // the composer are the promoted SamplingStrip role boxes — same client
   // state, same wire block.
   //
-  // Mirrors saklas/tui/chat_panel.py for the token rhythm: leading
-  // whitespace strip after </think>, plain text fall-through when no
-  // probe is selected. (The TUI still draws role-coloured borders — its
-  // cast-model parity pass is deferred.)
+  // Token rhythm: strip leading whitespace after </think>, with plain-text
+  // fall-through when no probe is selected.
 
   import { onMount, untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
@@ -290,7 +288,7 @@
       return;
     }
     if (ev.key === "Escape") {
-      // Esc is context-sensitive (mirrors the TUI):
+      // Esc is context-sensitive:
       //   1. Gen in flight → stop the gen.  Queue keeps its items.
       //   2. No gen, pull in flight → cancel the pull (restore the
       //      stash, leave the queued slot untouched).
@@ -550,8 +548,7 @@
 
   let logRef: HTMLDivElement | null = $state(null);
   /** True iff the user has manually scrolled up — freezes auto-scroll
-   * until they hit the bottom again.  Mirrors the TUI's "scroll_end on
-   * append unless user is mid-scroll" pattern. */
+   * until they hit the bottom again. */
   let scrolledUp = $state(false);
 
   function onScroll(ev: Event): void {
@@ -742,8 +739,7 @@
     return "";
   }
 
-  /** Apply the TUI's leading-whitespace strip — drops whitespace-only
-   * tokens from the head of the response so the gap below ``</think>``
+  /** Drop whitespace-only tokens from the head of the response so the gap below ``</think>``
    * goes away in plain-text mode too.  Returns the surviving slice
    * starting at the first non-whitespace token. */
   interface VisibleToken {
@@ -774,9 +770,8 @@
     openDrawer("token_drilldown", { turnIdx, tokenIdx, isThinking });
   }
 
-  // The bare-text form for plain (no-highlight) rendering.  We still want
-  // the leading-whitespace strip so the chat surface matches the TUI
-  // even when no probe is selected.
+  // The bare-text form for plain (no-highlight) rendering still strips
+  // leading whitespace when no probe is selected.
   function plainResponseText(turn: ChatTurn): string {
     if (!turn.tokens || turn.tokens.length === 0) {
       // Fall back to the accumulated text if the per-token list is

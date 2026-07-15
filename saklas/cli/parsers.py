@@ -33,31 +33,6 @@ def _bounded_int(lo: int, hi: int):
     return parse
 
 
-def _add_common_args(p: argparse.ArgumentParser) -> None:
-    """Model-loading args shared between `tui` and `serve`."""
-    p.add_argument(
-        "model",
-        help="HuggingFace model ID or local path (e.g. google/gemma-2-9b-it)",
-    )
-    p.add_argument(
-        "-q", "--quantize",
-        choices=["4bit", "8bit"],
-        default=None,
-        help="Quantization mode (default: bf16/fp16)",
-    )
-    p.add_argument(
-        "-d", "--device",
-        default="auto",
-        help="Device: auto (detect), cuda, mps, or cpu (default: auto)",
-    )
-    p.add_argument(
-        "-p", "--probes",
-        nargs="*",
-        default=None,
-        help="Probe categories: all, none, epistemic, alignment, register, cultural (default: all)",
-    )
-
-
 def _add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-c", "--config", action="append", default=None, metavar="PATH",
                    help="Load setup YAML (repeatable; later overrides earlier)")
@@ -66,7 +41,7 @@ def _add_config_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_logit_args(p: argparse.ArgumentParser) -> None:
-    """Logit-capture options shared between ``tui`` and ``serve``.
+    """Logit-capture options for model-backed CLI surfaces.
 
     Phase 1 of the logit pass: ``--top-k-alts`` sets the session-level
     default for ``SamplingConfig.return_top_k`` — the number of top-K
@@ -172,7 +147,7 @@ _SAE_VERBS: list[tuple[str, str]] = [
 
 
 def _add_injection_args(p: argparse.ArgumentParser) -> None:
-    """Steering / extraction options shared between ``tui`` and ``serve``.
+    """Steering and extraction options for model-backed CLI surfaces.
 
     ``None`` defaults flow through to the YAML override layer (or ultimately
     to the session defaults: Mahalanobis projection + DLS on).
@@ -218,28 +193,9 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _build_tui_parser(parser: argparse.ArgumentParser) -> None:
-    # When a model supplies -c/--config pointing at a YAML with model: set,
-    # the positional can be omitted. Handled in _run_tui via composed config.
-    parser.add_argument("model", nargs="?", default=None,
-                        help="HuggingFace model ID or local path")
-    parser.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None,
-                        help="Quantization mode (default: bf16/fp16)")
-    parser.add_argument("-d", "--device", default="auto",
-                        help="Device: auto (detect), cuda, mps, or cpu")
-    parser.add_argument("-p", "--probes", nargs="*", default=None,
-                        help="Probe categories (default: all)")
-    parser.add_argument("--max-tokens", type=_positive_int, default=1024,
-                        help="Default max generation tokens")
-    _add_injection_args(parser)
-    _add_logit_args(parser)
-    _add_config_args(parser)
-
-
 def _build_serve_parser(parser: argparse.ArgumentParser) -> None:
     # When a -c/--config YAML with model: set is supplied, the positional
-    # can be omitted. Handled in _run_serve via the composed config (mirrors
-    # the same pattern in _build_tui_parser / _run_tui).
+    # can be omitted. Handled in _run_serve via the composed config.
     parser.add_argument("model", nargs="?", default=None,
                         help="HuggingFace model ID or local path")
     parser.add_argument(
@@ -1365,13 +1321,6 @@ def _build_root_parser() -> argparse.ArgumentParser:
     # the auto-generated ``positional arguments`` table on ``saklas -h``.
     # Keep it short enough to fit one line at the typical terminal
     # width; the verb's own ``-h`` carries the long-form description.
-    tui = sub.add_parser(
-        "tui",
-        help="Launch the interactive TUI (requires <model>)",
-        description="Launch the interactive TUI",
-    )
-    _build_tui_parser(tui)
-
     serve = sub.add_parser(
         "serve",
         help="Start the OpenAI + Ollama API server + analytics dashboard at /",

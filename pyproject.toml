@@ -18,8 +18,6 @@ keywords = [
     "transformers",
     "huggingface",
     "llm",
-    "textual",
-    "tui",
     "openai-api",
     "ollama",
     "sae",
@@ -51,7 +49,6 @@ dependencies = [
     "safetensors>=0.7.0",
     "sae-lens>=6.0,<7.0",
     "nltk>=3.10.0",
-    "textual>=0.50",
     "pyyaml>=6.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.44.0",
@@ -106,7 +103,7 @@ ignore = ["E501", "E741", "E402", "E731"]
 [tool.ruff.lint.per-file-ignores]
 # CLI runners and the cli/output.py presentation layer are the
 # canonical print-to-stdout sites; T20 (flake8-print) is meant to
-# catch debug-print leakage in the engine / IO / server / TUI.
+# catch debug-print leakage in the engine, IO, and server.
 "saklas/cli/*" = ["T20"]
 # Maintenance/benchmark scripts are stand-alone and intentionally
 # print to stdout for diagnostic output and progress reporting.
@@ -115,8 +112,8 @@ ignore = ["E501", "E741", "E402", "E731"]
 "examples/*" = ["T20"]
 
 # Pyright — whole-project type checking.  Historically scoped to the
-# public-API surface because the engine/CLI/server/TUI layers lean on
-# torch/transformers/fastapi/textual internals whose stubs are uneven;
+# public-API surface because the engine/CLI/server layers lean on
+# torch/transformers/fastapi internals whose stubs are uneven;
 # the maintained library, tests, examples, and utility scripts are now fully
 # annotated, so the rules below hold across those surfaces.
 #
@@ -166,7 +163,6 @@ include = ["saklas*"]
 [tool.setuptools.package-data]
 saklas = [
     "data/**/*.json",
-    "tui/*.tcss",
     "py.typed",
     "web/dist/index.html",
     "web/dist/assets/*",

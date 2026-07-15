@@ -1,4 +1,4 @@
-"""SaklasSession — unified backend for saklas's programmatic API and TUI."""
+"""SaklasSession — unified backend for saklas's programmatic and server APIs."""
 from __future__ import annotations
 import asyncio
 import json
@@ -1284,8 +1284,8 @@ class SaklasSession:
         # through ``tree.add_user_turn``
         # / ``tree.begin_assistant`` / ``tree.finalize_assistant``.  The
         # tree is in-memory only — there is no automatic cross-session
-        # persistence; the TUI's ``/save`` and ``/load`` are the explicit
-        # save/restore path (``LoomTree.save`` / ``LoomTree.load``).
+        # persistence. ``LoomTree.save`` / ``LoomTree.load`` are the explicit
+        # save/restore path.
         self.tree = LoomTree(
             events=self.events,
             model_id=self._model_info["model_id"],
@@ -1712,7 +1712,7 @@ class SaklasSession:
 
         Distinct from :attr:`gen_state`, which reports the coarse lifecycle
         *phase* (``IDLE``/``RUNNING``/…); this is the live mutable streaming
-        state the server/TUI read while a generation is in flight.
+        state the server reads while a generation is in flight.
         """
         return self._gen_state
 
@@ -1773,8 +1773,8 @@ class SaklasSession:
         """Lifecycle phase of the current generation (``IDLE`` between gens).
 
         Read-only window into the session's typed re-entry guard — see
-        :class:`GenState` for transitions.  Surfaces to the TUI and any
-        external introspector that wants to ask "is a gen running right
+        :class:`GenState` for transitions. Surfaces to any external
+        introspector that wants to ask "is a gen running right
         now?" without reaching past the public API.
         """
         return self._gen_phase
@@ -3430,9 +3430,8 @@ class SaklasSession:
     ) -> list[int]:
         """Stream the J-lens readout live during generation.
 
-        Every decode step, the lens tokens at each selected
-        layer ride ``TokenEvent.lens_readout`` (and the TUI's ``/lens``
-        panel). Their ``k`` is the generation's logit-alternative
+        Every decode step, the lens tokens at each selected layer ride
+        ``TokenEvent.lens_readout``. Their ``k`` is the generation's logit-alternative
         ``SamplingConfig.return_top_k`` (falling back to 8 when alternatives
         are disabled). ``layers`` defaults to **every fitted lens layer**.
         The per-step cost is one
@@ -4996,8 +4995,8 @@ class SaklasSession:
         """Author + fit a steering vector from two ready-made pole corpora.
 
         The corpus-in sibling of :meth:`extract` — used by persona cloning and
-        the hand-authored TUI/HTTP paths, which already hold the positive and
-        negative corpora and so skip generation.  Authors a 2-node ``pca``
+        hand-authored HTTP/library paths, which already hold the positive and
+        negative corpora and so skip generation. Authors a 2-node ``pca``
         manifold (``positive`` → pole node, ``negative`` → its opposite) and
         fits it; returns ``(canonical_name, Profile)`` like :meth:`extract`.
 
@@ -5426,8 +5425,8 @@ class SaklasSession:
         :class:`Steering` directly if you need typed construction.
 
         Pole aliases (``io.selectors.resolve_bare_atom``) resolve at parse
-        time; this is the canonical resolver site — CLI, server, and
-        TUI all route through here.  Nesting flattens: an inner
+        time; this is the canonical resolver site — CLI and server route through
+        here. Nesting flattens: an inner
         ``steering("0.5 angry.calm")`` overrides the outer
         ``steering("0.3 angry.calm")`` for the duration of the inner
         scope, and the outer entry is restored on ``__exit__``.  One hook
@@ -6358,9 +6357,8 @@ class SaklasSession:
         layers raise :class:`SaklasError`. Empty dict raises.
 
         ``accumulate`` defaults to ``False`` — ad-hoc researcher scoring
-        does not pollute the monitor's running-mean history. Pass
-        ``True`` to feed this call into the same stats pipeline the TUI
-        reads from.
+        does not pollute the monitor's history. Pass ``True`` to feed this call
+        into the same cross-generation stats pipeline as generation finalization.
         """
         if not hidden:
             raise SaklasError("score_hidden: no layers provided")
@@ -9670,7 +9668,7 @@ class SaklasSession:
             # richer per-token reading is live, and there is no probe gate.  Then
             # the per-token scoring drops the nearest / assignment / per-layer
             # work (the full aggregate is re-scored once from the tail ring at
-            # finalize), which is the common TUI/loom monitoring path.
+            # finalize), which is the common loom monitoring path.
             _full_reading_consumer = bool(
                 _wants_live_token_scores       # full ProbeReading in TokenEvent
                 or _persists_layer_scores      # per-layer heatmap row
@@ -9754,7 +9752,6 @@ class SaklasSession:
                     live_sae_active=_has_sae_consumer,
                     capture_prompt=authored_capture is not None,
                 )
-                self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
                 # ``generate_steered`` mutates it at lifecycle boundaries.
                 self._steering.ctx.reset()
@@ -9833,7 +9830,6 @@ class SaklasSession:
                 mean_logprob=_mean_logprob_out,
                 mean_surprise=_mean_surprise_out,
             )
-            self._monitor.end_live()
             self.events.emit(GenerationFinished(result=result))
             return result
         except BaseException:
@@ -9853,7 +9849,6 @@ class SaklasSession:
             # BaseException between the outer try entry and ``begin_capture``),
             # any hooks that did get attached must come off.  Idempotent.
             self._end_capture()
-            self._monitor.end_live()
             # Probe-inspector subspace-coords post-pass is per-generation; clear
             # it so it never leaks into a later gen that didn't opt in.
             self._monitor.set_subspace_coords(False)
@@ -10155,12 +10150,8 @@ class SaklasSession:
                 raw_readings = payload.get("probe_readings")
                 if isinstance(raw_readings, dict) and raw_readings:
                     probe_readings = raw_readings
-                    # ``update_live`` folds coordinate axis 0 of each reading
-                    # into the running mean; ``TokenEvent.probe_readings`` carries
-                    # the readings dict verbatim (the live-stream consumer reads
-                    # ``fraction`` / ``nearest`` / ``coords`` off each).
-                    # The event carries the rich readings directly.
-                    self._monitor.update_live(probe_readings)
+                    # The event carries the rich readings directly; the live
+                    # stream consumes ``fraction`` / ``nearest`` / ``coords``.
             event = TokenEvent(
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
