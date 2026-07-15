@@ -134,18 +134,14 @@ export interface LensReadoutTokenJSON {
   logprob: number;
 }
 
-/** One layer row of the workspace readout matrix. */
+/** One layer row of the J-lens readout matrix. */
 export interface LensReadoutLayerJSON {
   layer: number;
-  /** True iff the layer sits in the 40–90% depth workspace band (the
-   *  regime where the lens reads a verbalizable workspace rather than
-   *  early noise / late motor-copy). */
-  in_band: boolean;
   tokens: LensReadoutTokenJSON[];
 }
 
-/** One token of the layer-aggregated workspace readout: per-layer softmax
- *  → mean band probability (``strength``, 0..1) + the probability-mass-
+/** One token of the layer-aggregated J-lens readout: per-layer softmax
+ *  → mean probability (``strength``, 0..1) + the probability-mass-
  *  weighted depth center of mass (``com``, 0 = first block, 1 = last) and
  *  its std (``spread``). */
 export interface LensAggregateTokenJSON {
@@ -155,7 +151,7 @@ export interface LensAggregateTokenJSON {
   spread: number;
 }
 
-/** ``GET /sessions/{id}/lens/token-readout`` — the J-lens workspace
+/** ``GET /sessions/{id}/lens/token-readout`` — the J-lens
  *  readout at one decode step of a loom node (the forward that produced
  *  the clicked token). */
 export interface LensTokenReadoutJSON {
@@ -167,7 +163,7 @@ export interface LensTokenReadoutJSON {
   /** The steering expression the replay ran under, or ``null`` for an
    *  unsteered read (no recipe steering, or ``steered=false``). */
   steering: string | null;
-  /** Layer-aggregated view of the same logits (workspace-band subset),
+  /** Layer-aggregated view of the same logits across all requested layers,
    *  strength-descending.  Empty from a pre-aggregate server. */
   aggregate?: LensAggregateTokenJSON[];
   layers: LensReadoutLayerJSON[];
@@ -760,8 +756,8 @@ export interface ProbeInfo {
    *  on an unfitted discover manifold (no per-model layout yet). */
   node_coords?: number[][] | null;
   /** True for a pinned J-lens token probe (the READOUT channel — the one
-   *  coordinate axis is ``strength`` in [0,1], the mean band probability;
-   *  per-layer traces are ``(p_l,)`` over the workspace band; no subspace
+   *  coordinate axis is ``strength`` in [0,1], the mean fitted-layer probability;
+   *  per-layer traces are ``(p_l,)`` over all fitted layers; no subspace
    *  geometry behind it). */
   lens?: boolean;
   /** The lens probe's word (``jlens/<word>``). */
@@ -1091,15 +1087,15 @@ export interface WSTokenEvent {
    *  attached, so clients read it defensively.  Distinct from ``scores``
    *  (the magnitude-weighted axis-0 scalar the highlight tint still uses). */
   probe_readings?: Record<string, ProbeReadingJSON>;
-  /** Live J-lens workspace readout for this decode step — present only
+  /** Live J-lens readout for this decode step — present only
    *  while the session's live lens is enabled (``POST .../lens/live``).
    *  Keys are layer-index strings (same convention as
    *  ``per_layer_scores``); values the top-k ``[token, score]`` pairs,
-   *  descending by raw lens logit.  Feeds the WORKSPACE panel. */
+   *  descending by per-layer softmax probability. Feeds the WORKSPACE panel. */
   lens_readout?: Record<string, [string, number][]>;
   /** Layer-aggregated view of the same step's lens readout —
    *  ``[token, strength, com, spread]`` 4-arrays, strength-descending
-   *  (mean band probability + probability-mass-weighted depth center of
+   *  (mean fitted-layer probability + probability-mass-weighted depth center of
    *  mass).  Present under the same conditions as ``lens_readout``. */
   lens_aggregate?: [string, number, number, number][];
   /** Resident SAE top-k feature activations for this decode step.  Rows
@@ -1573,7 +1569,7 @@ export interface ManifoldSteerEntry {
 }
 
 /** J-lens token steering term — pushes along the lens direction
- *  ``W_U[v] @ J_l`` over the workspace band (``α jlens/<word>``).  The rack
+ *  ``W_U[v] @ J_l`` over all fitted layers (``α jlens/<word>``). The rack
  *  key is the full ``jlens/<word>`` atom.  Per-chip ``alpha`` (not the
  *  shared ``subspaceAlong`` master): lens atoms run hotter than concept
  *  vectors — α≈0.3 is the coherent sweet spot, α≥0.5 over-steers into

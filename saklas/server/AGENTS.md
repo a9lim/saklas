@@ -148,7 +148,7 @@ body + any typed safe-message formatter.
   `default_assistant_role` / `default_user_role`, so the webui can gate roles,
   plus `jlens_fitted` (`has_compatible_jlens`: v6 shard sidecar/payload plus loaded
   weight identity, gating the drilldown's j-lens tab without the lazy fp32 load),
-  `live_lens_layers` (the live workspace readout's resolved layer list, `null`
+  `live_lens_layers` (the live J-lens readout's resolved layer list, `null`
   while off), and `live_probe_scores` (the CAA live toggle). Session metadata is
   serialized from the exact live `SaklasSession` contract; production does not
   coerce incomplete test doubles or inspect lens sidecars as a fallback.
@@ -359,7 +359,7 @@ node_ids, rows}`.
 
 `GET /sessions/{id}/lens/sources` lists prepared `local:default` and
 `neuronpedia` sources. `POST .../lens/use` selects one under the session lock,
-evicts derived lens state, and auto-enables its workspace-band live readout.
+evicts derived lens state, and auto-enables its all-fitted-layer live readout.
 `POST/GET .../lens/fetch` starts/polls an official Neuronpedia fetch: provider
 bytes stay in the Hugging Face cache, the worker publishes only a Saklas binding,
 then activates it under the lock. Fetch and local fit are mutually exclusive.
@@ -371,14 +371,14 @@ token; multi-token words return 400. It never registers a direction or probe;
 the engine registration boundaries still revalidate the invariant.
 
 `GET /sessions/{id}/lens/token-readout?node_id=&raw_index=[&top_k=8][&steered=
-true][&raw=false][&layers=csv]` — the workspace readout at one decode step of a
+true][&raw=false][&layers=csv]` — the J-lens readout at one decode step of a
 loom node (`session.jlens_token_readout` in `asyncio.to_thread` under
 `acquire_session_lock`, 503 on timeout): the per-layer J-lens top-k matrix at
 the forward that produced the clicked token, each row
-`{layer, in_band, tokens:[{token, id, logprob}]}` sorted ascending (`in_band` =
-the 40–90% workspace band), plus the layer-aggregated `aggregate:
-[{token, strength, com, spread}]` block (per-layer softmax → mean band
-probability + probability-mass-weighted depth center of mass; band-restricted,
+`{layer, tokens:[{token, id, logprob}]}` sorted ascending, plus the
+layer-aggregated `aggregate: [{token, strength, com, spread}]` block
+(per-layer softmax → mean fitted-layer probability + probability-mass-weighted
+depth center of mass across all requested layers,
 strength-descending; `[]` from a session dict without the key). `steered` (default on) replays under the node's
 recipe steering — `steered=false` is the unsteered counterfactual; `raw` marks
 a flat-buffer node (raw-ness isn't stamped server-side, the client's render
@@ -388,29 +388,30 @@ their `user_message()` status. Discovery rides
 the session-info `jlens_fitted` field (v6 shard sidecar + live-weight compatibility,
 never the ~GB lazy artifact load).
 
-`POST /sessions/{id}/lens/live` body `{enabled, layers?, top_k?=5}` — toggle
-the **live** workspace readout (`session.enable_live_lens` /
+`POST /sessions/{id}/lens/live` body `{enabled, layers?}` — toggle
+the **live** J-lens readout (`session.enable_live_lens` /
 `disable_live_lens` under `acquire_session_lock`, so it never races an
 in-flight stream and applies to the next generation). Enabling moves the
-selected layers' `J_l` device-resident; `layers` omitted enables every
-fitted layer in the 40–90% band (the TUI `/lens` default). Returns `{enabled,
+selected layers' `J_l` device-resident; `layers` omitted enables every fitted
+layer (the TUI `/lens` default). Returns `{enabled,
 layers}` (the resolved list). While enabled, the native WS `token` frame
 carries the per-step matrix as `lens_readout` (see ws_stream below) and
 session info reports the layer list as `live_lens_layers` (`null` while off —
-the dashboard's WORKSPACE-panel rehydration read). Errors:
-`LensNotFittedError` → 404, bad `layers` → 400, `top_k` outside `[1, 50]` →
-400. `saklas serve` auto-enables the live lens at startup only when the artifact
-matches the loaded weights (`_run_serve`, `top_k=8`), so the dashboard opens hot; the toggle
+the dashboard's WORKSPACE-panel rehydration read). The generation's resolved
+logit-alternative `return_top_k` also sets the live lens width. Errors:
+`LensNotFittedError` → 404, bad `layers` → 400. `saklas serve` auto-enables
+the live lens at startup only when the artifact matches the loaded weights, so
+the dashboard opens hot; the toggle
 still disables per session.
 
 `POST /sessions/{id}/lens/fit` body `{prompts?=100, seq_len?, prompt_batch?,
-layers?="workspace", force?=false}` — kick off the **background lens fit** (the
+layers?="all", force?=false}` — kick off the **background lens fit** (the
 dashboard's "fit j-lens" button; the former CLI-only policy). 202 + the
 initial status; one fit at a time (409 while running); `layers="sample"`
 rejected (not fittable). The job resolves an immutable Hub revision, then streams the default fineweb-edu corpus
 (`io.lens.stream_default_lens_corpus` — needs the optional `datasets` dep,
 else a clean typed error), runs `session.fit_jlens` (resume-by-default,
-checkpointed) in a worker thread, and auto-enables the full-band live lens
+checkpointed) in a worker thread, and auto-enables the all-layer live lens
 when the artifact lands. Deliberately **polled, not SSE**: the fit is hours
 of wall clock and progress must survive page reloads. `GET
 /sessions/{id}/lens/fit` returns `{running, prompts_done, prompts_total,

@@ -1,15 +1,15 @@
-"""Native Jacobian-lens route group — the workspace readout surfaces.
+"""Native Jacobian-lens route group — readout surfaces.
 
 Routes under ``/saklas/v1/sessions/{id}/lens``:
 
 - ``POST .../token/validate`` — read-only single-token validation for the
   dashboard's J-lens steer/probe add forms.
 - ``GET .../token-readout`` — the dashboard's token-drilldown ``j-lens`` tab
-  asks for the per-layer workspace readout at a clicked token
+  asks for the per-layer readout at a clicked token
   (``session.jlens_token_readout`` — rebuild the node's prompt render + raw
   decode prefix, one capture forward under the node's recipe steering,
   ``softmax(W_U · norm(J_l h))`` top-k per fitted layer).
-- ``POST .../live`` — toggle the *live* workspace readout
+- ``POST .../live`` — toggle the *live* J-lens readout
   (``session.enable_live_lens`` / ``disable_live_lens``): while enabled, the
   per-decode-step top-k rides the native WS ``token`` frame's
   ``lens_readout`` channel (see ``ws_events.build_token_event``), and the
@@ -55,14 +55,13 @@ _FIT_PROGRESS_RE = re.compile(r"prompt (\d+)/(\d+)")
 class LiveLensRequest(NativeRequest):
     """Body for ``POST .../lens/live``.
 
-    ``layers`` is an explicit fitted-layer list; omitted, the session
-    enables every fitted layer in the 40–90% workspace band (the same
-    default the TUI's ``/lens`` uses).
+    ``layers`` is an explicit fitted-layer list; omitted, the session enables
+    every fitted layer. The per-generation logit-alternative count also sets
+    the live J-lens top-k width.
     """
 
     enabled: bool
     layers: list[int] | None = None
-    top_k: int = 5
 
 
 class LensTokenValidationRequest(NativeRequest):
@@ -74,18 +73,14 @@ class LensTokenValidationRequest(NativeRequest):
 class LensFitRequest(NativeRequest):
     """Body for ``POST .../fit`` — all fields optional.
 
-    Defaults mirror CLI ``lens fit`` except ``layers``, which defaults to
-    the **workspace band** rather than full depth: every dashboard surface
-    (live readout, ``jlens/`` steering atoms, the drilldown matrix, the
-    aggregate) defaults to the band, and the band-restricted fit measures
-    ~1.7× faster.  Pass ``layers="all"`` for a CLI-parity full-depth fit.
-    A matching partial fit resumes by default; ``force`` restarts.
+    Defaults mirror CLI ``lens fit``, including all source layers. A matching
+    partial fit resumes by default; ``force`` restarts.
     """
 
     prompts: int = Field(default=100, ge=1, le=5000)
     seq_len: int | None = Field(default=None, ge=32, le=4096)
     prompt_batch: int | None = Field(default=None, ge=1, le=64)
-    layers: str = "workspace"
+    layers: str = "all"
     force: bool = False
 
 
@@ -179,7 +174,7 @@ def register_lens_routes(app: FastAPI) -> None:
                 raise RuntimeError("session locked")
             session.disable_live_lens()
             await asyncio.to_thread(session.select_jlens_source, source)
-            return await asyncio.to_thread(session.enable_live_lens, top_k=8)
+            return await asyncio.to_thread(session.enable_live_lens)
 
     @app.post("/saklas/v1/sessions/{session_id}/lens/use")
     async def lens_use(session_id: str, body: LensUseRequest):
@@ -303,12 +298,12 @@ def register_lens_routes(app: FastAPI) -> None:
         token stream.  ``raw`` selects the flat (base-model / raw-buffer)
         render; the client supplies it because raw-ness isn't stamped on
         the node.  ``layers`` restricts the readout (csv or workspace/sample/all);
-        default is the fitted workspace band.
+        default is every fitted layer.
         """
         resolve_session_id(session_id)
-        req_layers = _parse_layers(layers) or "workspace"
-        if not 1 <= top_k <= 50:
-            raise HTTPException(400, "top_k must be in [1, 50]")
+        req_layers = _parse_layers(layers) or "all"
+        if not 1 <= top_k <= 256:
+            raise HTTPException(400, "top_k must be in [1, 256]")
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
@@ -333,15 +328,14 @@ def register_lens_routes(app: FastAPI) -> None:
                 # busy-model races — the family carries its own status.
                 status, text = e.user_message()
                 raise HTTPException(status, text) from e
-        band = set(out["workspace_band"])
         return {
             "node_id": out["node_id"],
             "raw_index": out["raw_index"],
             "token_id": out["token_id"],
             "token_text": out["token_text"],
             "steering": out["steering"],
-            # Layer-aggregated view of the same logits (band-restricted):
-            # mean band probability + probability-mass-weighted depth
+            # Layer-aggregated view of the same logits across all requested
+            # layers: mean probability + probability-mass-weighted depth
             # center of mass, strength-descending.
             "aggregate": [
                 {
@@ -355,7 +349,6 @@ def register_lens_routes(app: FastAPI) -> None:
             "layers": [
                 {
                     "layer": layer,
-                    "in_band": layer in band,
                     "tokens": [
                         {"token": tok, "id": tid, "logprob": round(lp, 4)}
                         for tok, lp, tid in rows
@@ -367,7 +360,7 @@ def register_lens_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/lens/live")
     async def lens_live_toggle(session_id: str, body: LiveLensRequest):
-        """Enable/disable the live workspace readout for this session.
+        """Enable/disable the live J-lens readout for this session.
 
         Enabling moves the selected layers' ``J_l`` device-resident and
         arms the per-decode-step top-k on the WS ``token`` frame
@@ -376,8 +369,6 @@ def register_lens_routes(app: FastAPI) -> None:
         session lock, so it never races an in-flight stream.
         """
         resolve_session_id(session_id)
-        if not 1 <= body.top_k <= 50:
-            raise HTTPException(400, "top_k must be in [1, 50]")
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
@@ -388,7 +379,6 @@ def register_lens_routes(app: FastAPI) -> None:
                 resolved = await asyncio.to_thread(
                     session.enable_live_lens,
                     layers=body.layers,
-                    top_k=body.top_k,
                 )
             except LensNotFittedError as e:
                 raise HTTPException(404, str(e)) from e
@@ -397,7 +387,7 @@ def register_lens_routes(app: FastAPI) -> None:
             except SaklasError as e:
                 status, text = e.user_message()
                 raise HTTPException(status, text) from e
-        return {"enabled": True, "layers": resolved, "top_k": body.top_k}
+        return {"enabled": True, "layers": resolved}
 
     def _fit_status_payload() -> dict[str, object]:
         st = app.state.lens_fit
@@ -452,13 +442,13 @@ def register_lens_routes(app: FastAPI) -> None:
                 on_progress=on_progress,
                 cancel_event=app.state.lens_fit_cancel,
             )
-            # Live-on by default: hot the full-band readout the moment the
+            # Live-on by default: hot the full fitted readout the moment the
             # artifact lands, same policy as serve startup.  Session lock so
             # the enable never races a just-unblocked generation.
             async with acquire_session_lock(session) as acquired:
                 if acquired:
                     st["live_layers"] = await asyncio.to_thread(
-                        session.enable_live_lens, top_k=8,
+                        session.enable_live_lens,
                     )
             st["message"] = "done"
             st["error"] = None

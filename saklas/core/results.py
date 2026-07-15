@@ -317,13 +317,13 @@ class TokenEvent:
     # Bounded above by sampler support size; a confident prediction
     # approaches 1. Consumers take ``log`` to recover entropy-nats.
     perplexity: float | None = None
-    # Live J-lens workspace readout for this step: ``{layer: [(token,
+    # Live J-lens readout for this step: ``{layer: [(token,
     # score), ...]}`` — the top-k lens tokens at each selected layer.
     # ``None`` when ``session.enable_live_lens`` is off.
     lens_readout: dict[int, list[tuple[str, float]]] | None = None
     # Layer-aggregated view of the same step's lens readout: ``[(token,
     # strength, com, spread), ...]`` — per-layer softmax → mean-probability
-    # strength over the workspace-band subset of the live layers, plus the
+    # strength over all live layers, plus the
     # probability-mass-weighted depth center of mass (0 = first block, 1 = last)
     # and its std (:func:`saklas.core.jlens.aggregate_readout`). ``None``
     # when the live lens is off.

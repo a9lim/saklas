@@ -360,7 +360,7 @@ def test_serve_selects_cached_lens_when_active_pointer_is_missing(
     class _Session:
         model_id = "org/model"
         selected: str | None = None
-        live_top_k: int | None = None
+        live_enabled = False
 
         def has_compatible_jlens(self) -> bool:
             return self.selected == "local:default"
@@ -368,8 +368,8 @@ def test_serve_selects_cached_lens_when_active_pointer_is_missing(
         def select_jlens_source(self, source: str) -> None:
             self.selected = source
 
-        def enable_live_lens(self, *, top_k: int) -> list[int]:
-            self.live_top_k = top_k
+        def enable_live_lens(self) -> list[int]:
+            self.live_enabled = True
             return [4, 5]
 
     monkeypatch.setattr(
@@ -381,7 +381,7 @@ def test_serve_selects_cached_lens_when_active_pointer_is_missing(
     session = _Session()
     assert cli_runners._enable_serve_live_lens_if_compatible(session)
     assert session.selected == "local:default"
-    assert session.live_top_k == 8
+    assert session.live_enabled
 
 
 def test_best_serve_sae_release_prefers_official_canonical_provider() -> None:

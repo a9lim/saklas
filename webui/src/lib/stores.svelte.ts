@@ -125,7 +125,7 @@ export async function refreshSession(): Promise<void> {
 // ======================================================== live lens ====
 
 export interface LensState {
-  /** Resolved fitted-layer list while the live workspace readout is
+  /** Resolved fitted-layer list while the live J-lens readout is
    * enabled; ``null`` while off.  Mirrors the server's
    * ``live_lens_layers`` — the panel toggle reads this, not a local
    * boolean, so reloads and multi-tab stay honest. */
@@ -136,7 +136,7 @@ export interface LensState {
    * frame; kept after ``done`` so the settled matrix stays readable. */
   readout: Record<string, [string, number][]> | null;
   /** Layer-aggregated chip list riding the same step — ``[token,
-   * strength, com, spread]`` strength-descending (mean band probability
+   * strength, com, spread]`` strength-descending (mean fitted-layer probability
    * + probability-mass-weighted depth center of mass).  Same lifecycle as
    * ``readout``. */
   aggregate: [string, number, number, number][] | null;
@@ -521,15 +521,13 @@ export function setInspectorTab(tab: InspectorTab): void {
   inspectorState.tab = tab;
 }
 
-/** Toggle the live workspace readout server-side (J-LENS tab).  ``top_k``
- * 8 (over the route's default 5) — the aggregate chip row is the primary
- * readout surface now, and 8 chips is the read the design settled on;
- * the per-layer matrix behind the disclosure widens with it. */
+/** Toggle the live J-lens readout server-side. Its token width follows the
+ * same per-generation ``return_top_k`` value as the logit alternatives. */
 export async function setLiveLens(enabled: boolean): Promise<void> {
   if (lensState.busy) return;
   lensState.busy = true;
   try {
-    const out = await apiLens.setLive({ enabled, top_k: 8 });
+    const out = await apiLens.setLive({ enabled });
     lensState.layers = out.enabled ? (out.layers ?? []) : null;
     if (!out.enabled) {
       lensState.readout = null;
@@ -703,8 +701,8 @@ export async function pollLensFit(): Promise<void> {
 }
 
 /** Kick off the background Jacobian-lens fit (the "fit j-lens" button) and
- *  start polling.  Server defaults: 100 fineweb-edu prompts, workspace-band
- *  source layers, resume-if-matching. */
+ *  start polling. Server defaults: 100 fineweb-edu prompts, all source
+ *  layers, resume-if-matching. */
 export async function startLensFit(
   body: { prompts?: number; layers?: string } = {},
 ): Promise<void> {
@@ -1385,7 +1383,7 @@ export const probeRack: ProbeRackState = $state({
 
 /** Primary scalar a probe's sparkline / sort tracks: the signed axis-0
  *  coordinate for a flat (subspace) probe, the [0,1] readout strength
- *  (axis 0 — mean band probability) for a J-lens token probe, the [0,1]
+ *  (axis 0 — mean fitted-layer probability) for a J-lens token probe, the [0,1]
  *  subspace fraction for a curved (manifold) probe. */
 function _primaryScalar(info: ProbeInfo, reading: ProbeReadingJSON): number {
   if (info.is_affine || info.lens || info.sae) {
@@ -3124,7 +3122,7 @@ function handleWsMessage(msg: WSServerMessage): void {
       // above still feed highlight tinting + the token-drilldown heatmap.
       if (!abState.processingAb) {
         updateProbesFromReadings(msg.probe_readings);
-        // J-LENS tab — the live workspace readout.  Present only while
+        // J-LENS tab — the live all-layer readout. Present only while
         // the session's live lens is enabled; shadow runs skipped like
         // the probe rack so the matrix tracks the steered branch.
         if (msg.lens_readout) lensState.readout = msg.lens_readout;

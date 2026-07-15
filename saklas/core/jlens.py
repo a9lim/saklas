@@ -487,7 +487,7 @@ def aggregate_readout(
       lets a confident layer dominate the ranking, so extra confidence
       weighting would double-count.
     - ``com``/``spread`` — the depth center of mass (+ std) weighted by
-      the same per-layer probability ``p_l(v)``.  The workspace-band
+      the same per-layer probability ``p_l(v)``. The selected-layer
       readout is sharp, not diffuse (median per-layer max ≈ 0.8 on
       gemma-3-4b) — what changes over depth is *which* token leads, so a
       token's probability profile over depth IS its depth signal.
@@ -685,7 +685,7 @@ def token_readout_stats(
     per-layer softmax calibration, read at the requested ``token_ids``
     instead of selected top-k.  For each id:
 
-    - ``strength = mean_l p_l(v)`` — mean band probability, the aggregate
+    - ``strength = mean_l p_l(v)`` — mean fitted-layer probability, the aggregate
       readout's ranking stat and the ONE probe/gate/display channel
       (objective and apples-to-apples across tokens and layers, unlike a
       within-layer max normalization).

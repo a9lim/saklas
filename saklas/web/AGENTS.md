@@ -57,11 +57,12 @@ recipes/notes; effective roster rows carry `origin`.
 - **Loom tree** under `/sessions/{id}/tree` — full-tree GET plus atomic full-tree PUT restore (model-bound, the dashboard v4 save/load inverse), `tree/active` GET; `navigate`/`edit`/`branch`/`delete`/`star`/`note`/`reset` mutations; `edge_label`, `filter`, `diff`, `joint_logprobs`; `transcript` export/import.
 - **GET `/sessions/{id}/traits/stream`** — live per-token probe SSE.
 - **GET `/sessions/{id}/lens/token-readout?node_id=&raw_index=…`** — the J-lens
-  workspace readout at one decode step: per-layer top-k matrix
-  (`layers: [{layer, in_band, tokens:[{token, id, logprob}]}]`) plus the
+  readout at one decode step: per-layer top-k matrix
+  (`layers: [{layer, tokens:[{token, id, logprob}]}]`) plus the
   layer-aggregated `aggregate: [{token, strength, com, spread}]` block
-  (per-layer softmax → mean band probability + probability-mass-weighted depth
-  center of mass, band-restricted) at the forward that produced the clicked token,
+  (per-layer softmax → mean fitted-layer probability + probability-mass-weighted
+  depth center of mass across all requested layers) at the forward that produced
+  the clicked token,
   recomputed on demand server-side (node prompt render + raw prefix replay
   under the node's recipe steering; `steered=false` for the unsteered
   counterfactual, `raw=true` for flat-buffer nodes — the client's render mode
@@ -72,10 +73,10 @@ recipes/notes; effective roster rows carry `origin`.
   `{word, token_id}` single-token check. Both J-LENS add forms call it before
   mutating the steering rack or attaching a probe; a rejected word remains in
   the input and is surfaced as an error toast.
-- **POST `/sessions/{id}/lens/live`** — toggle the *live* workspace readout
-  (`{enabled, layers?, top_k?}` → `{enabled, layers}`; layers omitted picks
-  the 40–90% band default; the dashboard passes `top_k: 8` — the aggregate
-  chip row is the primary surface). While on, each WS `token` frame carries
+- **POST `/sessions/{id}/lens/live`** — toggle the *live* J-lens readout
+  (`{enabled, layers?}` → `{enabled, layers}`; layers omitted picks every
+  fitted layer). The generation's logit-alternative `return_top_k` also sets
+  the live lens width. While on, each WS `token` frame carries
   the `lens_readout` matrix + the `lens_aggregate` chip list and session info
   reports `live_lens_layers` (`null` while off — the J-LENS tab's rehydration
   read). `apiLens.setLive`; backs the live toggle on `JLensPanel`'s merged
@@ -383,7 +384,7 @@ Downloaded conversations likewise use one exact schema (`version: 5`): complete 
 
 ## Per-token highlighting
 
-Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match. (v2 ramp note: `scoreToRgb` emits **constant-hue alpha ramps** — tint strength = opacity, hue = meaning — with `signed` green/red probe poles, blue surprise/J-LENS, and gold SAE families. Pinned SAE/J-LENS cards expose the same explicit `highlight` action as geometry probes; both read their native `[0,1]` strength on a unit saturation scale. The TUI still runs the old opaque ramp — a parity pass is deliberately deferred.) Clicking any token opens the `token_drilldown` drawer regardless of whether a highlight probe is selected — three `SegmentedTabs` on one toolbar row (only **j-lens** carries a hue dot — it is the one pillar-owned surface here; the steered/unsteered A/B branch toggle sits right on the same row when the turn has an `abPair`): **probes** (the per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork), and **j-lens** (the workspace readout — an aggregate chip row first (`token@com` chips off the response's `aggregate` block), then the per-layer matrix: rows are lens layers ascending with the 40–90% band marked in blue and off-band rows dimmed, cells the top-K tokens tinted by probability via `color-mix`, the produced token outlined where it appears; an `apply recipe steering` checkbox flips to the unsteered counterfactual, responses cached per `(node, raw_index, steered)` for the drawer's life). The j-lens tab needs `sessionState.info.jlens_fitted` and a `token.rawIndex` (same in-session constraint as forking); data comes from `apiLens.tokenReadout` on demand — nothing lens-shaped is stored per token at generation time. A **token scrubber** in the drawer header (`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the *inspected* position along the turn's token list — every tab follows (probes/logits read stream-captured data instantly, j-lens refetches per position against its cache), while the tab/branch reset effects key off the *clicked* index (`paramTokenIdx`), so scrubbing never kicks the user off their tab; a fresh token click (params identity change) snaps the scrub back, and an `↩ clicked` header button does the same explicitly.
+Highlighting lives on the chat token spans, driven by a single highlight-probe dropdown in the chat header with an optional two-stripe compare-two mode. It tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds the same `scoreToRgb` ramp the post-generation pass uses, so streaming and finalized tints match. (v2 ramp note: `scoreToRgb` emits **constant-hue alpha ramps** — tint strength = opacity, hue = meaning — with `signed` green/red probe poles, blue surprise/J-LENS, and gold SAE families. Pinned SAE/J-LENS cards expose the same explicit `highlight` action as geometry probes; both read their native `[0,1]` strength on a unit saturation scale. The TUI still runs the old opaque ramp — a parity pass is deliberately deferred.) Clicking any token opens the `token_drilldown` drawer regardless of whether a highlight probe is selected — three `SegmentedTabs` on one toolbar row (only **j-lens** carries a hue dot — it is the one pillar-owned surface here; the steered/unsteered A/B branch toggle sits right on the same row when the turn has an `abPair`): **probes** (the per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork), and **j-lens** (the all-fitted-layer readout — an aggregate chip row first (`token@com` chips off the response's `aggregate` block), then the per-layer matrix: rows are lens layers ascending, cells use the same top-K width as the logit alternatives and are tinted by probability via `color-mix`, and the produced token is outlined where it appears; an `apply recipe steering` checkbox flips to the unsteered counterfactual, responses cached per `(node, raw_index, steered, k)` for the drawer's life). The j-lens tab needs `sessionState.info.jlens_fitted` and a `token.rawIndex` (same in-session constraint as forking); data comes from `apiLens.tokenReadout` on demand — nothing lens-shaped is stored per token at generation time. A **token scrubber** in the drawer header (`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the *inspected* position along the turn's token list — every tab follows (probes/logits read stream-captured data instantly, j-lens refetches per position against its cache), while the tab/branch reset effects key off the *clicked* index (`paramTokenIdx`), so scrubbing never kicks the user off their tab; a fresh token click (params identity change) snaps the scrub back, and an `↩ clicked` header button does the same explicitly.
 
 ## Toasts
 

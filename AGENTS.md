@@ -178,7 +178,7 @@ that fires only on decode steps where the monitor reading satisfies the comparis
 Probe gates accept these identifier shapes against the merged scalars the session
 writes into `TriggerContext.probe_scores`. Every shape also takes an optional
 leading `<ns>/` segment — a J-lens token probe (`@when:jlens/fake > 0.01`, the
-readout-channel mean band **probability** — strength, the probe's one
+readout-channel mean fitted-layer **probability** — strength, the probe's one
 channel; see "Jacobian lens") or a probe attached
 under a qualified selector (`@when:default/emotions@happy > -0.5`) — stored
 verbatim. Vector probes are concept names whose
@@ -330,34 +330,33 @@ Three read surfaces over either source, plus local fit and external fetch:
   model say. Every readout surface also carries the **layer-aggregated** view
   (`core/jlens.py::aggregate_readout`, from the same logits — no extra matvec):
   per-layer softmax calibrates away the cross-layer logit scale, then per token
-  `strength = mean_l p_l(v)` (mean band probability, 0..1; uniform layer weights —
+  `strength = mean_l p_l(v)` (mean fitted-layer probability, 0..1; uniform layer weights —
   softmax already lets a confident layer dominate) and a depth center of mass
   `com` (+ `spread`) weighted by the same per-layer probability `p_l(v)` — the
-  band readout is sharp, not diffuse (median per-layer max ≈ 0.8 on gemma-3-4b),
+  readout is sharp, not diffuse (median per-layer max ≈ 0.8 on gemma-3-4b),
   and what changes over depth is *which* token leads, so a token's probability
   profile over depth is its depth signal; one channel backs every readout
   statistic (a former within-layer salience weighting handed a diffuse noise
-  layer's relative-top token a full vote; in band the two agree to ≲0.01).
+  layer's relative-top token a full vote).
   Top-k selection runs on
   the aggregated full-vocab strengths; depth CoM/spread are then computed only
   for the selected tokens. A live step calibrates the full layer-vocabulary
   logits once and shares that probability matrix across pinned probes,
-  per-layer cards, and this aggregate. The aggregate is restricted to the
-  **workspace-band subset** of the requested layers (falling back to all when
-  none are in band — same band policy as steering); the per-layer matrix always
-  covers the full request. `session.enable_live_lens()` streams the top-k per
+  per-layer cards, and this aggregate. The aggregate and per-layer matrix both
+  cover every requested fitted layer. `session.enable_live_lens()` streams the
+  same top-k width as the generation's logit-alternative readout per
   selected layer plus the aggregate chip list every decode step
   (`TokenEvent.lens_readout` / `TokenEvent.lens_aggregate`, TUI `/lens` →
   WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's
   latest slices post-forward at the token tap — no new forward hooks, so steering
   fast-path/compile eligibility is untouched. The default live layer set is
-  **every** fitted layer in the 40–90% band, and `saklas serve` auto-enables the
+  **every fitted layer**, and `saklas serve` auto-enables the
   live lens at startup when the artifact exists (serve-side policy; library +
   TUI stay opt-in). The dashboard's **J-LENS tab** is
   the server sibling. Its SOURCE section lists `local:default` and fetched
   `neuronpedia` bindings, switches an existing source, fetches the official
   artifact into the Hugging Face cache, or drives the background local fit
-  route `POST /saklas/v1/sessions/{id}/lens/fit` (workspace-band, polled,
+  route `POST /saklas/v1/sessions/{id}/lens/fit` (all layers, polled,
   cancellable); either successful preparation activates the source and turns
   the live readout on. The SAE tab has the same SOURCE/STEER/PROBE shape:
   prepared `local:<name>` / `saelens:<release>` sources, provider fetch/load,
@@ -390,18 +389,15 @@ Three read surfaces over either source, plus local fit and external fetch:
   decode prefix, one capture forward under the node's recipe steering (exact for
   always-active affine terms — the slide is position-independent; phase/gated
   terms don't reproduce on a bare forward), and read the full fitted-layer top-k
-  matrix + the band-restricted aggregate block at the position that produced the
+  matrix + the all-layer aggregate block at the position that produced the
   clicked token. On-demand recompute, zero decode-time cost; `steered=false`
   reads the unsteered counterfactual.
 - **Steering atoms** — `jlens/<word>` is an ordinary `ns/name` atom; the J-lens
   direction for vocab id v at layer l is `W_U[v] @ J_l`, a per-layer direction
   registered lazily into the profile registry (`session.register_jlens_direction`,
   reached from `ensure_profile_registered` — steering only; probes read the
-  readout channel instead, see **Probes + gates** below)
-  and **restricted to the workspace band** (40–90% depth) — in the motor regime
-  the lens direction converges on the raw unembedding row, so pushing there is
-  token-forcing (live-verified to shatter into token loops at every α), and the
-  early third is noise. `0.3 jlens/orange` pushes, `!jlens/fake` ablates (the
+  readout channel instead, see **Probes + gates** below), across every fitted
+  layer. `0.3 jlens/orange` pushes, `!jlens/fake` ablates (the
   paper's eval-awareness ablation), and it composes with every other term.
   Lens atoms run **hotter** than concept vectors: on gemma-3-4b α≈0.3 is the
   coherent sweet spot and α≥0.5 over-steers into repetition (a single sharp
@@ -412,8 +408,8 @@ Three read surfaces over either source, plus local fit and external fetch:
   not a linear probe: `add_probe("jlens/<word>")` lands in the session
   lens-probe registry (never the Monitor — no whitener involved, no direction
   fold), and the reading is the token's standing in the paper-native
-  `softmax(W_U · norm(J_l h))` over the workspace band. The reading is ONE
-  channel — `coords = (strength,)`, the **mean band probability**
+  `softmax(W_U · norm(J_l h))` over all fitted layers. The reading is ONE
+  channel — `coords = (strength,)`, the **mean fitted-layer probability**
   `mean_l p_l(v)` ∈ [0,1] (`@when:jlens/fake > 0.01`, the workspace card's
   `strength`) — objective and apples-to-apples across tokens and layers
   (a within-layer max normalization isn't; the depth-CoM mass is the same

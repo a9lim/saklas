@@ -1015,7 +1015,7 @@ def _build_lens_top(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--layers", default=None, metavar="L1,L2,...|sample|workspace|all",
-        help="Comma-separated layer indices or a layer mode (default: 9 evenly spaced fitted layers)",
+        help="Comma-separated layer indices or a layer mode (default: all fitted layers)",
     )
     p.add_argument(
         "--position", type=int, action="append", default=None, metavar="P",

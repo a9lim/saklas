@@ -325,7 +325,7 @@
     }
   }
 
-  // ---- j-lens tab (workspace readout) -----------------------------------
+  // ---- j-lens tab --------------------------------------------------------
   //
   // On-demand recompute, not stored stream data: the server rebuilds the
   // node's prompt render + raw decode prefix up to this token and reads
@@ -335,7 +335,9 @@
   // Responses are cached per (node, raw_index, steered) while the drawer
   // lives; the steered toggle refetches the unsteered counterfactual.
 
-  const LENS_TOP_K = 8;
+  // Share the logit-alternative width. Zero means the ordinary logit capture
+  // is off, so retain the canonical 8-wide J-lens view in that state.
+  const lensTopK = $derived(samplingState.return_top_k || 8);
 
   let lensData = $state<LensTokenReadoutJSON | null>(null);
   let lensLoading = $state(false);
@@ -373,7 +375,7 @@
     const rawIndex = token?.rawIndex;
     const raw = effectiveRawMode();
     if (!nodeId || rawIndex == null) return null;
-    return `${nodeId}:${rawIndex}:${lensSteered ? 1 : 0}:${raw ? 1 : 0}:workspace`;
+    return `${nodeId}:${rawIndex}:${lensSteered ? 1 : 0}:${raw ? 1 : 0}:all:${lensTopK}`;
   });
 
   $effect(() => {
@@ -393,10 +395,10 @@
     lensData = null;
     apiLens
       .tokenReadout(nodeId, rawIndex, {
-        topK: LENS_TOP_K,
+        topK: lensTopK,
         steered: lensSteered,
         raw: effectiveRawMode(),
-        layers: "workspace",
+        layers: "all",
       })
       .then((d) => {
         lensCache.set(key, d);
@@ -689,8 +691,8 @@
         </div>
       {/if}
     {:else if tab === "lens"}
-      <!-- J-lens tab.  The workspace readout matrix — rows are lens
-           layers (ascending; workspace-band rows marked), cells the
+      <!-- J-lens tab. The readout matrix rows are all fitted lens layers,
+           ascending; cells are the
            top-K vocabulary tokens each layer's residual was disposed to
            say at the forward that produced this token.  Recomputed
            on demand server-side (node prompt render + raw prefix replay),
@@ -736,8 +738,8 @@
           </div>
         </div>
         {#if (lensData.aggregate ?? []).length > 0}
-          <!-- Layer-aggregated view of the same logits (band-restricted):
-               strength = mean band probability, com = probability-mass-
+          <!-- Layer-aggregated view of the same logits across all layers:
+               strength = mean probability, com = probability-mass-
                weighted depth center of mass (0 = first block, 1 = last). -->
           <div class="lens-agg" role="list" aria-label="Aggregate lens tokens">
             <span class="lens-agg-label">aggregate</span>
@@ -758,20 +760,17 @@
             <thead>
               <tr>
                 <th class="corner">L \ rank</th>
-                {#each { length: LENS_TOP_K } as _, i (i)}
+                {#each { length: lensTopK } as _, i (i)}
                   <th class="num">{i + 1}</th>
                 {/each}
               </tr>
             </thead>
             <tbody>
               {#each lensData.layers as row (row.layer)}
-                <tr class:off-band={!row.in_band}>
+                <tr>
                   <th
                     class="row-label"
-                    class:band={row.in_band}
-                    title={row.in_band
-                      ? `Layer ${row.layer} — workspace band (40–90% depth)`
-                      : `Layer ${row.layer} — outside the workspace band`}
+                    title={`Layer ${row.layer}`}
                   >
                     L{row.layer}
                   </th>
@@ -838,9 +837,9 @@
       {:else if tab === "lens"}
         Each row ranks softmax(W_U · norm(J_l·h)) at the forward that
         produced this token — what that layer's residual was disposed to
-        make the model say. Cell tint = probability; blue row labels mark
-        the 40–90% workspace band (early rows are noise, late rows converge
-        on the raw logits). Highlighted cells match the produced token.
+        make the model say. Cell tint = probability; highlighted cells match
+        the produced token. All fitted layers are shown because the informative
+        depth range is model-dependent.
       {:else}
         Post-nonlinearity sparse-feature activations from the resident SAE's
         hook layer. Values are comparable across tokens for one feature, not
@@ -1190,7 +1189,7 @@
     font-size: var(--text-2xs);
     font-variant-numeric: tabular-nums;
   }
-  /* J-lens tab — the workspace readout matrix.  Same well chrome as the
+  /* J-lens tab — the all-layer readout matrix. Same well chrome as the
      logits table; cells carry an inline probability tint in the lens
      family blue, so the static styles stay layout-only. */
   .lens-table {
@@ -1234,12 +1233,6 @@
     font-size: var(--text-xs);
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
-  }
-  .lens-table .row-label.band {
-    color: var(--pillar-lens);
-  }
-  .lens-table tr.off-band td {
-    opacity: 0.55;
   }
   .lens-cell {
     font-family: var(--font-mono);

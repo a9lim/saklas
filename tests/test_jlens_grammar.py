@@ -81,8 +81,7 @@ def test_profile_registration_resolves_jlens_atom() -> None:
 
     dirs = composer.ensure_profile_registered("jlens/g")
     assert "jlens/g" in session._profiles
-    # workspace-band restricted: the 3-layer toy's band is layer 1
-    assert set(dirs) == {1}
+    assert set(dirs) == {0, 1}
     assert all(isinstance(v, torch.Tensor) for v in dirs.values())
 
 
@@ -108,9 +107,7 @@ def test_add_probe_routes_jlens_to_lens_registry() -> None:
     assert name == "jlens/g"
     spec = session._lens_probes["jlens/g"]
     assert spec["word"] == "g"
-    assert spec["layers"] == [
-        int(l) for l in session._jlens_workspace_band(session.jlens)
-    ]
+    assert spec["layers"] == session.jlens.source_layers
     # No direction fold, no profile registration — the readout channel is
     # computed from lens logits, not a whitened coordinate.
     assert "jlens/g" not in session._profiles
@@ -118,7 +115,7 @@ def test_add_probe_routes_jlens_to_lens_registry() -> None:
 
 def test_lens_probe_scores_strength_channel() -> None:
     """Lens-probe readings carry ONE channel — ``coords = (strength,)``,
-    the mean band probability (the gate channel + the workspace card's
+    the mean fitted-layer probability (the gate channel + the workspace card's
     number; apples-to-apples across tokens and layers) — plus the
     per-layer ``(p_l,)`` trace, matching ``token_readout_stats`` on the
     same logits."""
@@ -128,7 +125,7 @@ def test_lens_probe_scores_strength_channel() -> None:
     session = _StubSession()
     session.fit_jlens(_PROMPTS)
     SaklasSession.add_probe(session, "jlens/g")  # type: ignore[arg-type]
-    layers = [int(l) for l in session._jlens_workspace_band(session.jlens)]
+    layers = [int(l) for l in session.jlens.source_layers]
     d_model = next(iter(session.jlens.jacobians.values())).shape[0]
     hidden = {
         l: torch.randn(d_model, generator=torch.Generator().manual_seed(l))
@@ -182,7 +179,7 @@ def test_gated_lens_probe_keys_and_gate_scalars() -> None:
         def latest_per_layer(self) -> dict[int, torch.Tensor]:
             return self._latest
 
-    layers = [int(l) for l in session._jlens_workspace_band(session.jlens)]
+    layers = [int(l) for l in session.jlens.source_layers]
     d_model = next(iter(session.jlens.jacobians.values())).shape[0]
     session._capture = _FlatCapture(
         {l: torch.randn(d_model, generator=torch.Generator().manual_seed(l))
@@ -219,7 +216,7 @@ def test_lens_gate_scalar_scores_only_referenced_probe(
     session.fit_jlens(_PROMPTS)
     SaklasSession.add_probe(session, "jlens/g")  # type: ignore[arg-type]
     SaklasSession.add_probe(session, "jlens/a")  # type: ignore[arg-type]
-    session.enable_live_lens(layers=[1], top_k=3)
+    session.enable_live_lens(layers=[1])
     setattr(session, "_live_lens_active_for_generation", False)
 
     class _FlatCapture:
@@ -229,7 +226,7 @@ def test_lens_gate_scalar_scores_only_referenced_probe(
         def latest_per_layer(self) -> dict[int, torch.Tensor]:
             return self._latest
 
-    layers = [int(l) for l in session._jlens_workspace_band(session.jlens)]
+    layers = [int(l) for l in session.jlens.source_layers]
     d_model = next(iter(session.jlens.jacobians.values())).shape[0]
     session._capture = _FlatCapture(
         {l: torch.randn(d_model, generator=torch.Generator().manual_seed(l + 10))

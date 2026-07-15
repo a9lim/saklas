@@ -75,8 +75,8 @@ complete prompt microbatch); accelerator queues and pending CUDA transfers are
 drained before the active group's partial sums are abandoned, so the web cancel
 control remains responsive even when `prompt_batch > 1`. Prompt/dimension widths halve
 independently on OOM and stay below the proven failure ceiling. The fit is
-compute-bound; `source_layers` restriction is
-the one real wall-time lever (1.73× for the 40–90% band).
+compute-bound; explicit `source_layers` restriction is the one real wall-time
+lever (a previously benchmarked 40–90% subset measured 1.73× faster).
 Estimator teardown removes the fit hooks, clears their retained autograd graph
 and accelerator stripe buffers, then flushes the MPS/CUDA allocator cache. A
 long-lived server must not carry the backward-pass working set into the next
@@ -129,8 +129,8 @@ into the final basis; `token_direction(v, unembed)` is `W_U[v] @ J_l` per layer
 unembed's own dtype — a fp32 W_U copy would be GBs). `aggregate_readout(logits,
 depths, top_k)` is the **layer-aggregation** of a stacked `[L, vocab]` readout:
 per-layer softmax (calibrates away the cross-layer logit scale), then per token
-`strength = mean_l p_l(v)` (mean band probability) and a depth center of mass +
-std weighted by the same per-layer probability `p_l(v)` — the band readout is
+`strength = mean_l p_l(v)` (mean fitted-layer probability) and a depth center of mass +
+std weighted by the same per-layer probability `p_l(v)` — the selected-layer readout is
 sharp, and what changes over depth is *which* token leads, so a token's
 probability profile over depth is its depth signal (a diffuse noise layer's
 vote is discounted by its own lack of mass; the former within-layer salience
@@ -410,7 +410,7 @@ mode; decoder rows are unit-normalized so L1 cannot be evaded by rescaling.
 `sae/<id>` steering reads `W_dec[id]`; feature probes read the encoder channel
 outside the `Monitor`. The probe/gate channel is **normalized strength** —
 `activation / maxActApprox` ∈ ~[0,1], the Neuronpedia corpus-max unit, so
-features read apples-to-apples like the lens probes' mean band probability;
+features read apples-to-apples like the lens probes' mean fitted-layer probability;
 raw activation only when no metadata is cached (offline / unlisted feature).
 Metadata (`{label, max_act}` per feature, `session._sae_feature_meta`) is
 fetched lazily from Neuronpedia — at validate/pin time
@@ -1119,17 +1119,15 @@ single-token decode).
 `jlens_readout(prompt, layers=, positions=, top_k=, aggregate=)` is the offline
 readout (captures via `_capture_all_hidden_states`, default final position
 only); `aggregate=True` returns `(per_layer, per-position aggregate)` from the
-same logits, the aggregate restricted to the **workspace-band subset** of the
-requested layers (falling back to all when none are in band — the same band
-policy `jlens/` steering hard-codes; the matrix always covers the full
-request).
+same logits, with both the aggregate and matrix covering every requested fitted
+layer.
 `jlens_token_readout(node_id, raw_index, *, layers=, top_k=, apply_steering=,
 raw=)` is the loom-anchored readout behind the dashboard drilldown's j-lens
 tab: fork-style validation (assistant node, `raw_token_ids`, range), rebuild
 the node's exact prompt render via `_prepare_input` (stamped role labels +
 recipe thinking; `raw=` selects the flat render — raw-ness isn't stamped on
 the node, the caller supplies it), append `raw_token_ids[:raw_index]`, one
-capture forward, per-layer top-k + the band-restricted `aggregate` block at the
+capture forward, per-layer top-k + the all-layer `aggregate` block at the
 final position — the forward that
 *produced* the clicked token. `apply_steering` replays under the node's
 recipe steering; the steering scope opens OUTSIDE `_model_exclusive`
@@ -1143,11 +1141,11 @@ dictionary.
 
 **Lens probes (readout channel).** `add_probe("jlens/<word>")` routes to the
 session lens-probe registry (`_lens_probes: name -> {word, token_id, layers}`,
-band-restricted; `_add_lens_probe` validates the artifact + single-token word
+all fitted layers; `_add_lens_probe` validates the artifact + single-token word
 and pre-warms the device transport stack) — **never** the Monitor, never a
 direction fold, no whitener. The reading is the readout-channel synthesis of
 `ProbeReading` (`_score_lens_probes` over `jlens.token_readout_stats`):
-`coords = (strength,)` — the ONE channel, mean band probability
+`coords = (strength,)` — the ONE channel, mean fitted-layer probability
 `mean_l p_l(v)` (the gate channel `@when:jlens/<word>` and the workspace
 card's `strength`) — `coords_per_layer[l] = (p_l,)`, probability-mass-weighted
 `depth_com`, geometry fields defaulted. The live
@@ -1165,7 +1163,7 @@ reuse — the gate
 callback runs before the token tap); the finalize aggregate
 (`_score_lens_probes_aggregate`, called from `generation_finalizer`) pools
 the last content token from the capture tail ring like `_score_aggregate_only`.
-Capture accounting: lens-probe band layers join the `_begin_capture` union;
+Capture accounting: fitted lens-probe layers join the `_begin_capture` union;
 the INCREMENTAL branch swaps `set_incremental` for `set_tail_with_sink` when
 lens probes are attached (finalize needs the ring); the lens-only tail branch
 covers `_lens_probes` as well as the live lens; and a **lens-only** gate does
@@ -1173,7 +1171,7 @@ not force per-token *monitor* scoring — `need_per_token` keys on
 monitor-attached gate keys (`gated_probe_keys`), while
 `SteeringComposer.gated_lens_probe_keys` detects lens gates for the callback
 merge. `probe_hashes`/`_probe_hash` stamp lens probes with a deterministic
-identity digest (`jlens-readout-v1`, model, word, token id, band).
+identity digest (`jlens-readout-v1`, model, word, token id, layers).
 
 **CAA live toggle.** `live_probe_scores` / `set_live_probe_scores(bool)` —
 when off, `_generate_core` masks every per-token monitor consumer at the
@@ -1190,12 +1188,11 @@ attached), and `_live_lens_readout_step` runs at the token tap post-forward —
 no new forward hooks, `static_steerable` untouched — returning `(per_layer,
 aggregate)` and landing them on `TokenEvent.lens_readout` /
 `TokenEvent.lens_aggregate` and the `_last_token_probe_payload["lens"]` /
-`["lens_aggregate"]` slots. The aggregate covers the workspace-band subset of
-the live layers (precomputed at enable as `state["agg_layers"]`). Default
-layer subset: **every** fitted layer in the 40–90% depth band (the per-step
-matvec+top-k is cheap enough that the full band beats a subsample; the
-device-resident `J_l` cost is `n_band · d_model² · 4` bytes — pass an
-explicit `layers` list to trade coverage for memory). `saklas serve`
+`["lens_aggregate"]` slots. The aggregate covers every live layer, and its
+top-k width follows the generation's resolved logit-alternative
+`return_top_k` (8 only when alternatives are disabled). The default layer set
+is **every fitted layer**; pass an explicit `layers` list to trade coverage for
+device memory. `saklas serve`
 auto-enables the live lens at startup when the artifact exists (serve-side
 policy; library + TUI stay opt-in).
 

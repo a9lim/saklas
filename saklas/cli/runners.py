@@ -554,8 +554,8 @@ def _enable_serve_live_lens_if_compatible(session: Any) -> bool:
                     break
         if not compatible:
             return False
-        layers = session.enable_live_lens(top_k=8)
-        print(f"Live J-lens readout: on ({len(layers)} workspace-band layers)")
+        layers = session.enable_live_lens()
+        print(f"Live J-lens readout: on ({len(layers)} fitted layers)")
         return True
     except Exception as e:  # noqa: BLE001 — never block serve startup
         print(f"Live J-lens readout: enable failed ({e})", file=sys.stderr)
@@ -693,10 +693,11 @@ def _run_serve(args: argparse.Namespace) -> None:
     _warmup_session(session)
 
     # Live-lens-on by default: when the model has a fitted Jacobian lens,
-    # serve starts with the full-band live workspace readout streaming, so
+    # serve starts with the full fitted readout streaming, so
     # the dashboard's J-LENS tab is hot on first load (the toggle still
     # turns it off per session).  Serve-side policy only — the library and
-    # TUI stay opt-in.  ``top_k=8`` matches the dashboard's readout width.
+    # TUI stay opt-in. The generation's logit-alternative K also controls
+    # the J-lens readout width.
     _enable_serve_live_lens_if_compatible(session)
 
     # Web dashboard policy: attach the strongest compatible provider SAE (or
@@ -2884,14 +2885,6 @@ def _run_lens_show(args: argparse.Namespace) -> None:
         print(f"  artifact: {sidecar_path} ({size_mb:.0f} MB across layer shards)")
 
 
-def _lens_default_top_layers(source_layers: list[int], count: int = 9) -> list[int]:
-    """Evenly spaced fitted layers for the ``lens top`` default view."""
-    if len(source_layers) <= count:
-        return list(source_layers)
-    step = (len(source_layers) - 1) / (count - 1)
-    return sorted({source_layers[round(i * step)] for i in range(count)})
-
-
 def _run_lens_top(args: argparse.Namespace) -> None:
     import json as _json
 
@@ -2912,7 +2905,7 @@ def _run_lens_top(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
         if layers is None:
-            layers = _lens_default_top_layers(lens.source_layers)
+            layers = list(lens.source_layers)
         out, agg = session.jlens_readout(
             args.prompt, layers=layers, positions=args.position,
             top_k=args.top_k, aggregate=True,
@@ -2922,7 +2915,7 @@ def _run_lens_top(args: argparse.Namespace) -> None:
             "model": args.model,
             "prompt": args.prompt,
             "positions": args.position or [-1],
-            # Layer-aggregated view (workspace-band subset of the layers):
+            # Layer-aggregated view across every displayed layer:
             # per-layer softmax → mean-probability strength +
             # probability-mass-weighted depth center of mass, strength-descending.
             "aggregate": [
@@ -2950,7 +2943,7 @@ def _run_lens_top(args: argparse.Namespace) -> None:
     for pos_idx, pos in enumerate(positions):
         if len(positions) > 1:
             print(f"\nposition {pos}:")
-        print("  aggregate (workspace band):")
+        print("  aggregate (all displayed layers):")
         for t, s, c, sp in agg[pos_idx]:
             tok = t.strip() or repr(t)
             print(

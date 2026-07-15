@@ -1,10 +1,10 @@
 <script lang="ts">
-  // Workspace token card — one aggregate-readout token as a RackCard,
+  // J-lens token card — one aggregate-readout token as a RackCard,
   // replacing the chip cloud + separate matrix view.  Blue j-lens accent.
   //
   //   statline : □ pin glyph (the steer cards' square, click to pin) ·
   //              token · @com ±spread · strength-history sparkline
-  //   body     : the strength bar (mean band probability, absolute 0→1 —
+  //   body     : the strength bar (mean fitted-layer probability, absolute 0→1 —
   //              calibrated across tokens and steps), then the per-layer
   //              strength strip.
   //
@@ -27,9 +27,9 @@
   interface Props {
     /** Raw vocabulary token text (untrimmed). */
     token: string;
-    /** Mean band probability, 0..1 (the aggregate ``strength``). */
+    /** Mean fitted-layer probability, 0..1 (the aggregate ``strength``). */
     strength: number;
-    /** Salience-weighted depth center of mass, 0..1. */
+    /** Probability-mass-weighted depth center of mass, 0..1. */
     com: number;
     /** Depth spread around the CoM. */
     spread: number;
@@ -116,12 +116,12 @@
   {/snippet}
 
   {#snippet body()}
-    <!-- Strength: mean band probability, absolute 0→1. -->
+    <!-- Strength: mean fitted-layer probability, absolute 0→1. -->
     <ProbeReadingRow ariaLabel={`Strength ${strength.toFixed(2)}`}>
       {#snippet left()}
         <span
           class="row-label"
-          title="mean band probability"
+          title="mean fitted-layer probability"
         >strength</span>
       {/snippet}
       {#snippet bar()}

@@ -107,10 +107,10 @@ def test_jlens_steering_atom_generates(session: Any, micro_lens: Any) -> None:
 def test_live_lens_does_not_break_static_steerable(session: Any, micro_lens: Any) -> None:
     session._jlens = micro_lens
     baseline = session._steering.static_steerable()
-    layers = session.enable_live_lens(top_k=3)
+    layers = session.enable_live_lens()
     try:
         assert session._steering.static_steerable() == baseline
-        assert layers  # resolved a mid-band subset
+        assert layers  # resolved the fitted layer set
         result = session.generate(
             "Count to three.",
             sampling=SamplingConfig(max_tokens=8, seed=3),

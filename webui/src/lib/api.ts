@@ -910,21 +910,21 @@ export const apiLens = {
     return request(`${SESSION_BASE(id)}/lens/token-readout?${params}`);
   },
 
-  /** Toggle the live workspace readout.  While enabled, each WS ``token``
+  /** Toggle the live J-lens readout. While enabled, each WS ``token``
    * frame carries a ``lens_readout`` matrix (per selected layer, the top-k
-   * lens tokens for that decode step).  ``layers`` omitted enables every
-   * fitted layer in the 40–90% workspace band (the TUI's ``/lens``
-   * default).  Applies to generations started after the call. */
+   * lens tokens for that decode step). ``layers`` omitted enables every
+   * fitted layer. The generation's logit-alternative K controls the token
+   * width. Applies to generations started after the call. */
   setLive(
-    body: { enabled: boolean; layers?: number[] | null; top_k?: number },
+    body: { enabled: boolean; layers?: number[] | null },
     id: string = SESSION,
   ): Promise<{ enabled: boolean; layers: number[] | null }> {
     return request(`${SESSION_BASE(id)}/lens/live`, jsonBody(body));
   },
 
   /** Kick off a background Jacobian-lens fit (the "fit j-lens" button).
-   * 202 with the initial status; poll ``fitStatus``.  Defaults: 100
-   * corpus prompts, workspace-band source layers, resume-if-matching. */
+   * 202 with the initial status; poll ``fitStatus``. Defaults: 100
+   * corpus prompts, all source layers, resume-if-matching. */
   fit(
     body: {
       prompts?: number;

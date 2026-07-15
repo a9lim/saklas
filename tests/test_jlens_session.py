@@ -94,6 +94,7 @@ class _StubSession:
     _lens_probe_layers = SaklasSession._lens_probe_layers
     _score_lens_probes = SaklasSession._score_lens_probes
     _score_lens_gate_scalars = SaklasSession._score_lens_gate_scalars
+    _effective_return_top_k = SaklasSession._effective_return_top_k
 
     def __init__(self, *, n_layers: int = 3) -> None:
         model = frozen_toy(n_layers=n_layers)
@@ -220,7 +221,7 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
 def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS, source_layers=[0])
-    s.enable_live_lens(layers=[0], top_k=7)
+    s.enable_live_lens(layers=[0])
     old_stack = s._live_lens["J_stack"]
     s._profiles["jlens/a"] = {0: torch.ones(4)}
     s._lens_probes["jlens/a"] = {
@@ -231,7 +232,7 @@ def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
 
     assert fitted.source_layers == [1]
     assert s._live_lens["layers"] == [1]
-    assert s._live_lens["top_k"] == 7
+    assert s._live_lens["uses_all_layers"] is True
     assert s._live_lens["J_stack"] is not old_stack
     assert s._lens_probes["jlens/a"]["layers"] == [1]
     assert "jlens/a" not in s._profiles
@@ -1395,13 +1396,12 @@ def test_jlens_readout_aggregate_rides_same_logits() -> None:
         assert 0.0 <= strength <= 1.0
         assert 0.0 <= com <= 1.0
         assert spread >= 0.0
-    # 3-layer toy: the 40-90% band keeps only L1, so the aggregate is the
-    # single-layer degenerate case — com pinned at L1's normalized depth,
-    # spread 0.
-    depth_l1 = 1 / (3 - 1)
+    # Both fitted source layers contribute. Softmax assigns positive mass to
+    # every vocabulary item at each layer, so every aggregate row has a
+    # non-degenerate depth distribution over L0 and L1.
     for _, _, com, spread in rows:
-        assert com == pytest.approx(depth_l1, abs=1e-6)
-        assert spread == pytest.approx(0.0, abs=1e-6)
+        assert 0.0 < com < 1 / (3 - 1)
+        assert spread > 0.0
 
 
 def test_jlens_readout_aggregate_multi_position() -> None:
@@ -1448,11 +1448,9 @@ def test_register_jlens_direction_registers_profile() -> None:
     lens.token_direction = _spy_token_direction  # type: ignore[method-assign]
     name = s.register_jlens_direction("g")  # 'g' round-trips in the toy vocab
     assert name == "jlens/g"
-    assert seen_layers == [[1]]
+    assert seen_layers == [[0, 1]]
     dirs = s._profiles[name]
-    # restricted to the workspace band — for the 3-layer toy that's layer 1
-    # (layer 0 sits at 0% depth, outside the 40–90% band)
-    assert set(dirs) == {1}
+    assert set(dirs) == {0, 1}
     expected = lens.token_direction(
         s._tokenizer.encode("g")[0], s._model.lm_head.weight,
     )
@@ -1489,8 +1487,7 @@ def test_enable_live_lens_defaults_and_disable() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
     layers = s.enable_live_lens()
-    # 3-layer toy: fitted sources are [0, 1]; the 40-90% band keeps layer 1
-    assert layers and all(l in (0, 1) for l in layers)
+    assert layers == [0, 1]
     assert s._live_lens is not None
     assert s._live_lens["layers"] == layers
     assert "J" not in s._live_lens
@@ -1531,7 +1528,7 @@ def test_enable_live_lens_registers_no_forward_hooks() -> None:
 def test_live_lens_readout_step_reads_latest_slices() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[0, 1], top_k=3)
+    s.enable_live_lens(layers=[0, 1])
     # The per-step reader should use the pre-stacked transport cache, not the
     # per-layer dict.  Replacing the dict entries would have blown up the old
     # per-token ``state["J"][layer].to(...)`` path.
@@ -1547,7 +1544,9 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         1: torch.randn(6, generator=gen),
     })
 
-    step = SaklasSession._live_lens_readout_step(s)  # type: ignore[arg-type]
+    step = SaklasSession._live_lens_readout_step(  # type: ignore[arg-type]
+        s, top_k=3,
+    )
     assert step is not None
     out, agg = step
     assert set(out) == {0, 1}
@@ -1599,7 +1598,7 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
 
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[1], top_k=3)
+    s.enable_live_lens(layers=[1])
     s._add_lens_probe("jlens/g", as_name=None)
     s._capture = _FakeCapture({1: torch.randn(6)})
     calls = 0
@@ -1630,7 +1629,9 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     # matrix. Cards, pinned readings, and aggregate must all reuse it.
     scalars = s._score_lens_gate_scalars()
     assert scalars
-    assert SaklasSession._live_lens_readout_step(s) is not None  # type: ignore[arg-type]
+    assert SaklasSession._live_lens_readout_step(  # type: ignore[arg-type]
+        s, top_k=3,
+    ) is not None
     assert calls == 1
     assert stat_calls == 1
     assert s._last_lens_step_readings is not None
@@ -1642,7 +1643,7 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
 def test_live_lens_readout_reuses_depth_and_token_selector_tensors() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[0, 1], top_k=3)
+    s.enable_live_lens(layers=[0, 1])
     s._add_lens_probe("jlens/g", as_name=None)
     s._capture = _FakeCapture({
         0: torch.randn(6, generator=torch.Generator().manual_seed(20)),
@@ -1676,7 +1677,7 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
 
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[1], top_k=3)
+    s.enable_live_lens(layers=[1])
     s._capture = _FakeCapture({1: cast(Any, BombHidden())})
     assert s._live_lens is not None
     vocab = int(s._model.lm_head.weight.shape[0])
@@ -1691,7 +1692,9 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
         "probabilities": probabilities,
     }
 
-    step = SaklasSession._live_lens_readout_step(s)  # type: ignore[arg-type]
+    step = SaklasSession._live_lens_readout_step(  # type: ignore[arg-type]
+        s, top_k=3,
+    )
 
     assert step is not None
     assert s._lens_step_stash["fresh"] is False
@@ -1700,8 +1703,9 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
 def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[0, 1], top_k=3)
+    s.enable_live_lens(layers=[0, 1])
     s._add_lens_probe("jlens/g", as_name=None)
+    s._lens_probes["jlens/g"]["layers"] = [1]
     s._capture = _FakeCapture({
         0: torch.randn(6, generator=torch.Generator().manual_seed(0)),
         1: torch.randn(6, generator=torch.Generator().manual_seed(1)),
@@ -1717,7 +1721,9 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     row = s._live_lens["layer_rows"][1]
     s._live_lens["J_stack"][row].fill_(float("nan"))
 
-    step = SaklasSession._live_lens_readout_step(s)  # type: ignore[arg-type]
+    step = SaklasSession._live_lens_readout_step(  # type: ignore[arg-type]
+        s, top_k=3,
+    )
 
     assert step is not None
     per_layer, aggregate = step
@@ -1821,20 +1827,18 @@ def test_jlens_token_readout_shape_and_position() -> None:
     assert out["token_id"] == raw_ids[3]
     assert out["token_text"] == s._tokenizer.decode([raw_ids[3]])
     assert out["steering"] is None
-    assert out["workspace_band"] == [1]  # 3-layer toy: 40-90% band keeps L1
     assert set(out["readout"]) == {0, 1}  # fitted sources of the 3-layer toy
     for rows in out["readout"].values():
         assert len(rows) == 4
         tok, lp, tid = rows[0]
         assert isinstance(tok, str) and lp <= 0.0 and isinstance(tid, int)
-    # the aggregate block rides the same logits, band-restricted (L1 only
-    # in the 3-layer toy → single-layer degenerate com/spread)
+    # The aggregate block rides the same logits across both fitted layers.
     assert len(out["aggregate"]) == 4
     for tok, strength, com, spread in out["aggregate"]:
         assert isinstance(tok, str)
         assert 0.0 <= strength <= 1.0
-        assert com == pytest.approx(1 / (3 - 1), abs=1e-6)
-        assert spread == pytest.approx(0.0, abs=1e-6)
+        assert 0.0 < com < 1 / (3 - 1)
+        assert spread > 0.0
     # Continue-mode rebuild (cast model): no text resend — the history walk
     # to the node's parent carries the user turn; the gen header opens the
     # node's own seat.

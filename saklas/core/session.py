@@ -92,6 +92,8 @@ from saklas.core.triggers import Trigger
 
 _log = logging.getLogger(__name__)
 
+_DEFAULT_JLENS_TOP_K = 8
+
 
 class GenerationStream(Protocol):
     """Current streaming iterator contract returned by :meth:`generate_stream`."""
@@ -2031,8 +2033,9 @@ class SaklasSession:
         previous_layers = (
             list(previous_live["layers"]) if previous_live is not None else []
         )
-        previous_top_k = (
-            int(previous_live["top_k"]) if previous_live is not None else 5
+        previous_used_all_layers = bool(
+            previous_live is not None
+            and previous_live.get("uses_all_layers", False)
         )
 
         self._jlens = lens
@@ -2049,17 +2052,19 @@ class SaklasSession:
             if key.startswith("jlens/"):
                 self._profiles.pop(key, None)
 
-        band = [int(layer) for layer in self._jlens_workspace_band(lens)]
+        readout_layers = [int(layer) for layer in lens.source_layers]
         for name, spec in self._lens_probes.items():
-            spec["layers"] = list(band)
+            spec["layers"] = list(readout_layers)
             self._probe_hash_cache.pop(name, None)
-        if self._lens_probes and band:
-            self._jlens_transport_stack(lens, sorted(band), self._device)
+        if self._lens_probes and readout_layers:
+            self._jlens_transport_stack(
+                lens, sorted(readout_layers), self._device,
+            )
 
         if previous_live is not None:
             valid = [layer for layer in previous_layers if layer in lens.jacobians]
             self.enable_live_lens(
-                layers=(valid or band), top_k=previous_top_k,
+                layers=(None if previous_used_all_layers else (valid or None)),
             )
         else:
             self._live_lens = None
@@ -2343,7 +2348,11 @@ class SaklasSession:
                                 pre_evicted_live = (
                                     {
                                         "layers": list(self._live_lens["layers"]),
-                                        "top_k": int(self._live_lens["top_k"]),
+                                        "uses_all_layers": bool(
+                                            self._live_lens.get(
+                                                "uses_all_layers", False,
+                                            )
+                                        ),
                                     }
                                     if self._live_lens is not None else None
                                 )
@@ -2590,7 +2599,9 @@ class SaklasSession:
                     pre_evicted_live = (
                         {
                             "layers": list(self._live_lens["layers"]),
-                            "top_k": int(self._live_lens["top_k"]),
+                            "uses_all_layers": bool(
+                                self._live_lens.get("uses_all_layers", False)
+                            ),
                         }
                         if self._live_lens is not None else None
                     )
@@ -2746,7 +2757,9 @@ class SaklasSession:
                 if resident_evicted_early else
                 {
                     "layers": list(self._live_lens["layers"]),
-                    "top_k": int(self._live_lens["top_k"]),
+                    "uses_all_layers": bool(
+                        self._live_lens.get("uses_all_layers", False)
+                    ),
                 }
                 if self._live_lens is not None else None
             )
@@ -3104,12 +3117,9 @@ class SaklasSession:
         :func:`saklas.core.jlens.aggregate_readout`) and returns the pair
         ``(per_layer, aggregate)`` where ``aggregate`` is one
         ``[(token, strength, com, spread), ...]`` list per position, from
-        the same logits (no extra forward or matvec).  The aggregate uses
-        the **workspace-band subset** of the requested layers (past 90%
-        depth the lens converges on the sampled next-token distribution and
-        the early third is noise — the same band policy ``jlens/`` steering
-        hard-codes), falling back to every requested layer when none are in
-        band; the per-layer matrix always covers the full request.
+        the same logits (no extra forward or matvec). The aggregate uses every
+        requested fitted layer: the model-specific depth profile remains visible
+        in ``com``/``spread`` rather than being pre-filtered by a fixed band.
         """
         from saklas.core.vectors import _capture_all_hidden_states
 
@@ -3158,14 +3168,11 @@ class SaklasSession:
                 out[layer][pos_idx] = [(tok, lp) for tok, lp, _ in row]
             if not aggregate:
                 return out
-            band = set(self._jlens_workspace_band(lens))
-            agg_layers = [l for l in req if l in band] or list(req)
-            keep = set(agg_layers)
             agg: list[list[tuple[str, float, float, float]]] = []
             for pos_idx in range(len(pos)):
                 sel = [
                     i for i, (layer, p, _) in enumerate(row_refs)
-                    if p == pos_idx and layer in keep
+                    if p == pos_idx
                 ]
                 agg.append(self._jlens_aggregate_rows(
                     logits[sel],
@@ -3208,7 +3215,7 @@ class SaklasSession:
         the caller supplies it.
 
         Returns ``{node_id, raw_index, token_id, token_text, steering,
-        workspace_band, readout: {layer: [(token, logprob, id), ...]},
+        readout: {layer: [(token, logprob, id), ...]},
         aggregate: [(token, strength, com, spread), ...]}`` — ``aggregate``
         is the layer-aggregated view of the same logits (per-layer softmax
         → mean-probability strength + probability-mass-weighted depth
@@ -3314,17 +3321,9 @@ class SaklasSession:
                 readout = {
                     layer: row for layer, row in zip(req, decoded)
                 }
-                # Same band policy as jlens_readout: aggregate over the
-                # workspace-band subset (the route's default request IS the
-                # band, so this is a no-op there), matrix over the full
-                # request.
-                band = set(self._jlens_workspace_band(lens))
-                agg_idx = [i for i, l in enumerate(req) if l in band]
-                if not agg_idx:
-                    agg_idx = list(range(len(req)))
                 agg = self._jlens_aggregate_rows(
-                    logits[agg_idx],
-                    [req[i] for i in agg_idx],
+                    logits,
+                    req,
                     top_k=top_k,
                 )
         return {
@@ -3333,7 +3332,6 @@ class SaklasSession:
             "token_id": int(raw_ids[raw_index]),
             "token_text": str(self._tokenizer.decode([int(raw_ids[raw_index])])),
             "steering": steering_expr,
-            "workspace_band": self._jlens_workspace_band(lens),
             "readout": readout,
             "aggregate": agg,
         }
@@ -3349,12 +3347,9 @@ class SaklasSession:
         channel (per-layer softmax probability) via the session
         lens-probe registry instead.
 
-        Restricted to the **workspace band** (40–90% depth): in the motor
-        regime a lens direction converges on the raw unembedding row, so
-        pushing there is direct token-forcing — live-verified on gemma-3-4b
-        to shatter into token loops at every α — and the early third of the
-        lens is noise. The paper's own injection/ablation experiments act on
-        the workspace layers only.
+        Uses every fitted lens layer. Informative depth ranges vary by model;
+        callers that want a narrower intervention can fit or load a lens with
+        an explicit source-layer subset.
         """
         from saklas.core.jlens import resolve_word_token
         from saklas.core.model import get_unembedding
@@ -3364,9 +3359,9 @@ class SaklasSession:
             return name
         lens = self._require_jlens()
         token_id = resolve_word_token(self._tokenizer, word)
-        band = set(self._jlens_workspace_band(lens))
+        fitted_layers = set(int(layer) for layer in lens.source_layers)
         directions = lens.token_direction(
-            token_id, get_unembedding(self._model), layers=sorted(band),
+            token_id, get_unembedding(self._model), layers=sorted(fitted_layers),
         )
         # ``token_direction`` returns CPU tensors; land the profile on the
         # session device so the probe fold (which follows the directions'
@@ -3374,7 +3369,9 @@ class SaklasSession:
         # crash the per-probe read paths (``_subspace_coords_for``) against
         # on-device activations.
         self._profiles[name] = {
-            l: d.to(self._device) for l, d in directions.items() if l in band
+            l: d.to(self._device)
+            for l, d in directions.items()
+            if l in fitted_layers
         }
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
@@ -3384,21 +3381,20 @@ class SaklasSession:
         self,
         *,
         layers: "Sequence[int] | None" = None,
-        top_k: int = 5,
     ) -> list[int]:
         """Stream the J-lens readout live during generation.
 
-        Every decode step, the top-``top_k`` lens tokens at each selected
+        Every decode step, the lens tokens at each selected
         layer ride ``TokenEvent.lens_readout`` (and the TUI's ``/lens``
-        panel). ``layers`` defaults to **every** fitted layer in the 40–90%
-        depth band (the paper's workspace range) — the per-step cost is one
+        panel). Their ``k`` is the generation's logit-alternative
+        ``SamplingConfig.return_top_k`` (falling back to 8 when alternatives
+        are disabled). ``layers`` defaults to **every fitted lens layer**.
+        The per-step cost is one
         d×d matvec + one vocab matvec + an on-device top-k per layer, cheap
-        enough that the full band beats a 5-layer subsample (which
-        under-sampled the depth CoM). The selected layers' ``J_l`` move
-        device-resident here, once — a full-band residency is
-        ``n_band · d_model² · 4`` bytes (~450 MB on a 4B, ~1.5 GB on a
-        12B); pass an explicit ``layers`` subset to trade coverage for
-        memory.
+        enough to retain the model's full depth profile. The selected layers'
+        ``J_l`` move device-resident here, once — full-depth residency is
+        ``n_layers · d_model² · 4`` bytes. Pass an explicit ``layers``
+        subset to trade coverage for memory.
 
         Attaches **no forward hooks** (the reader consumes the capture's
         existing latest-slice buffers post-forward), so steering fast-path /
@@ -3410,8 +3406,9 @@ class SaklasSession:
         from saklas.core.model import get_final_norm, get_unembedding
 
         lens = self._require_jlens()
+        uses_all_layers = layers is None
         if layers is None:
-            layers = sorted(self._jlens_workspace_band(lens))
+            layers = sorted(int(layer) for layer in lens.source_layers)
         else:
             layers = sorted(set(int(l) for l in layers))
             missing = [l for l in layers if l not in lens.jacobians]
@@ -3429,21 +3426,13 @@ class SaklasSession:
             j_stack = torch.empty(
                 (0, *sample.shape), device=device, dtype=torch.float32,
             )
-        band = set(self._jlens_workspace_band(lens))
         self._live_lens = {
             "layers": layer_list,
-            "top_k": int(top_k),
+            "uses_all_layers": uses_all_layers,
             "J_stack": j_stack,
             "layer_rows": {l: i for i, l in enumerate(layer_list)},
             "unembed": get_unembedding(self._model),
             "norm": get_final_norm(self._model),
-            # Aggregate over the workspace-band subset of the live layers
-            # (falling back to all of them) — the same band policy every
-            # other aggregate surface applies.
-            "agg_layers": (
-                frozenset(l for l in layer_list if l in band)
-                or frozenset(layer_list)
-            ),
         }
         return list(layers)
 
@@ -3459,14 +3448,14 @@ class SaklasSession:
         return list(self._live_lens["layers"])
 
     def _jlens_workspace_band(self, lens: "Any") -> list[int]:
-        """Fitted lens layers in the 40–90% depth band — the paper's
-        workspace range. Falls back to every fitted layer for models too
-        shallow to have a band (the CPU-test toys)."""
+        """Explicit legacy ``workspace`` mode: fitted layers in the 40–90%
+        depth band, with a shallow-model fallback. J-lens defaults do not use
+        this model-agnostic heuristic."""
         n = len(self._layers)
         return workspace_layer_indices(list(lens.source_layers), n)
 
     def _live_lens_readout_step(
-        self,
+        self, *, top_k: int = 8,
     ) -> (
         tuple[
             dict[int, list[tuple[str, float]]],
@@ -3483,8 +3472,7 @@ class SaklasSession:
         **per-layer softmax probability** (the same strength unit every
         other lens surface reports — apples-to-apples across layers, unlike
         a raw logit), plus the layer-aggregated chip list ``[(token,
-        strength, com, spread), ...]`` over the workspace-band subset of
-        the live layers.
+        strength, com, spread), ...]`` over all live layers.
         """
         state = self._live_lens
         if state is None or not self._live_lens_active_for_generation:
@@ -3635,7 +3623,8 @@ class SaklasSession:
         # Display scores are per-layer softmax probabilities — the one
         # strength unit every lens surface reports (softmax is monotone, so
         # the top-k selection is unchanged from the raw-logit ranking).
-        vals, idxs = probabilities.topk(state["top_k"], dim=-1)
+        k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
+        vals, idxs = probabilities.topk(k, dim=-1)
         # one batched host transfer for the per-layer block
         all_vals = vals.detach().to("cpu").tolist()
         all_idxs = idxs.detach().to("cpu").tolist()
@@ -3645,16 +3634,11 @@ class SaklasSession:
             for v, i in zip(all_vals[row], all_idxs[row]):
                 pairs.append((self._jlens_decode_id(int(i)), float(v)))
             out[layer] = pairs
-        agg_keep: frozenset[int] = state["agg_layers"]
-        agg_sel = [
-            row for row, layer in enumerate(layers_present) if layer in agg_keep
-        ] or list(range(len(layers_present)))
-        agg_probabilities = SaklasSession._select_tensor_rows(probabilities, agg_sel)
         agg = self._jlens_aggregate_rows(
             None,
-            [layers_present[row] for row in agg_sel],
-            top_k=state["top_k"],
-            probabilities=agg_probabilities,
+            layers_present,
+            top_k=k,
+            probabilities=probabilities,
         )
         return out, agg
 
@@ -4195,7 +4179,7 @@ class SaklasSession:
             value = raw_value
             # The ONE channel is normalized strength — ``activation /
             # maxActApprox`` ∈ ~[0,1], apples-to-apples across features like
-            # the lens probes' mean band probability. Raw activation only
+            # the lens probes' mean fitted-layer probability. Raw activation only
             # when no metadata exists (offline / not on Neuronpedia).
             max_act = spec.get("max_act")
             if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
@@ -6396,10 +6380,10 @@ class SaklasSession:
 
         Validates the lens artifact + single-token word (the same
         ``resolve_word_token`` contract steering atoms use), records the
-        workspace-band layer set, and pre-warms the device transport stack so
+        full fitted layer set, and pre-warms the device transport stack so
         the first decode step doesn't hitch on the J_l transfer.  The probe
-        reads ONE channel — ``coords = (strength,)``, the mean band
-        probability ``mean_l p_l(v)`` (the workspace card's ``strength``;
+        reads ONE channel — ``coords = (strength,)``, the mean layer
+        probability ``mean_l p_l(v)`` (the J-lens card's ``strength``;
         objective and apples-to-apples across tokens and layers) — so
         ``@when:jlens/<word> > x`` gates strength.
         """
@@ -6415,13 +6399,17 @@ class SaklasSession:
         ):
             lens = self._require_jlens()
             token_id = resolve_word_token(self._tokenizer, word)
-            band = [int(l) for l in self._jlens_workspace_band(lens)]
-            self._jlens_transport_stack(lens, sorted(band), self._device)
+            readout_layers = [int(l) for l in lens.source_layers]
+            self._jlens_transport_stack(
+                lens, sorted(readout_layers), self._device,
+            )
             self._lens_probes[name] = {
-                "word": word, "token_id": int(token_id), "layers": band,
+                "word": word,
+                "token_id": int(token_id),
+                "layers": readout_layers,
             }
         # Same invalidation set as a monitor attach: the capture layer union
-        # changed (band layers join it), and the probe hash / analytics
+        # changed (lens layers join it), and the probe hash / analytics
         # caches key on the roster.
         self._invalidate_prefix_cache()
         self._probe_hash_cache.pop(name, None)
@@ -6471,7 +6459,7 @@ class SaklasSession:
         return {name: dict(spec) for name, spec in self._lens_probes.items()}
 
     def _lens_probe_layers(self, names: set[str] | None = None) -> set[int]:
-        """Union of the attached lens probes' band layers."""
+        """Union of the attached lens probes' fitted layers."""
         out: set[int] = set()
         probes = self._lens_probes
         if names is not None:
@@ -6502,7 +6490,7 @@ class SaklasSession:
         precomputed lens ``logits`` rows aligned with ``layers``).
 
         Returns ``{name: ProbeReading}`` with ``coords = (strength,)`` —
-        the ONE readout channel, mean band probability —
+        the ONE readout channel, mean layer probability —
         ``coords_per_layer[l] = (p_l,)``, and the depth CoM — the
         readout-channel synthesis of the unified reading shape (geometry
         fields defaulted: ``fraction`` / ``residual`` 0, ``nearest`` /
@@ -6523,11 +6511,11 @@ class SaklasSession:
         )
         if lens is None:
             return {}
-        band = self._lens_probe_layers()
+        readout_layers = self._lens_probe_layers()
         if logits is not None and probabilities is not None:
             raise ValueError("pass lens logits or probabilities, not both")
         if logits is None and probabilities is None:
-            layers = sorted(l for l in band if l in hidden)
+            layers = sorted(l for l in readout_layers if l in hidden)
             if not layers:
                 return {}
             logits = self._jlens_logits_rows(
@@ -6536,8 +6524,8 @@ class SaklasSession:
         else:
             assert layers is not None
             # Restrict precomputed rows (e.g. a custom live-lens layer set)
-            # to the probes' band.
-            keep = [i for i, l in enumerate(layers) if l in band]
+            # to the probes' fitted layer set.
+            keep = [i for i, l in enumerate(layers) if l in readout_layers]
             if not keep:
                 return {}
             if len(keep) != len(layers):
@@ -6598,10 +6586,10 @@ class SaklasSession:
         """Per-forward lens-probe gate scalars from the latest capture slices.
 
         Called from the gating score callback (once per decode forward, before
-        the token tap).  Computes the referenced band lens logits, stashes them
+        the token tap). Computes the referenced lens logits, stashes them
         for the display step to reuse (``_lens_step_stash``), and flattens the
         synthesized readings through :meth:`Monitor.flat_scalars` so the gate
-        key space is uniform (``jlens/<word>`` = strength, the mean band
+        key space is uniform (``jlens/<word>`` = strength, the mean layer
         probability). Gate-only calls score exact selected-token softmax
         columns; live display calls still calibrate the full matrix once for
         downstream card/aggregate reuse. Empty when nothing is capturable yet.
@@ -6636,8 +6624,8 @@ class SaklasSession:
         # callback and let the display reuse it.  Gate-only calls stay on the
         # narrower requested subset.
         probe_read_only = None if live_display_needs_full_probs else only
-        band = self._lens_probe_layers(probe_read_only)
-        layers = sorted(l for l in band if l in latest)
+        readout_layers = self._lens_probe_layers(probe_read_only)
+        layers = sorted(l for l in readout_layers if l in latest)
         if not layers:
             return {}
 
@@ -8198,6 +8186,16 @@ class SaklasSession:
             new_sampling = _replace(base, seed=overlaid.seed)
         return new_steering, new_sampling, new_thinking
 
+    def _effective_return_top_k(self, sampling: SamplingConfig | None) -> int:
+        """Resolve the generation's logit-alternative width.
+
+        Per-call ``return_top_k`` wins when positive; zero inherits the
+        session default. The same resolved width drives both the ordinary
+        logit alternatives and the live J-lens readout.
+        """
+        top_k = sampling.return_top_k if sampling is not None else 0
+        return int(top_k or self._default_return_top_k)
+
     def _prepare_generation_call(
         self,
         steering: "str | Steering | None",
@@ -8232,9 +8230,7 @@ class SaklasSession:
 
         gen_config = self._compose_gen_config(sampling)
         raw_lp = sampling.logprobs if sampling is not None else None
-        raw_top_k = sampling.return_top_k if sampling is not None else 0
-        if raw_top_k == 0:
-            raw_top_k = self._default_return_top_k
+        raw_top_k = self._effective_return_top_k(sampling)
         if raw_top_k > 0:
             lp_count: int | None = (
                 max(raw_top_k, raw_lp) if raw_lp is not None else raw_top_k
@@ -8606,6 +8602,10 @@ class SaklasSession:
                 frequency_penalty,
                 logprobs_list,
             ) = self._prepare_generation_call(steering, sampling, thinking)
+            jlens_top_k = (
+                self._effective_return_top_k(sampling)
+                or _DEFAULT_JLENS_TOP_K
+            )
             # Steering synthesis is Mahalanobis-normalized and therefore needs
             # the session whitener.  On a cold ``probes=[]`` session it may not
             # exist yet.  Prime it here while this generation already owns the
@@ -8704,11 +8704,11 @@ class SaklasSession:
                     if needs_scores
                     else None
                 )
-                # Live workspace readout (None when off): the step's top-k
+                # Live J-lens readout (None when off): the step's top-k
                 # lens tokens per selected layer + the layer-aggregated
                 # chip list.
                 lens_step = (
-                    self._live_lens_readout_step()
+                    self._live_lens_readout_step(top_k=jlens_top_k)
                     if _has_lens_consumer
                     else None
                 )

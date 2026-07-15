@@ -2,18 +2,18 @@
   // J-lens probe card — one pinned ``jlens/<word>`` token probe, wearing
   // the same RackCard chrome as the probe tab's cards.  A lens probe is a
   // READOUT-channel probe (not a linear probe): the reading is the token's
-  // standing in ``softmax(W_U · norm(J_l h))`` over the workspace band —
-  // the workspace card's quantity, so a pinned card is the *same shape* as
+  // standing in ``softmax(W_U · norm(J_l h))`` over all fitted layers —
+  // the J-lens card's quantity, so a pinned card is the *same shape* as
   // its unpinned discovery sibling (JLensTokenCard), just persistent and
   // gate-able:
   //
   //   statline : ■ pin toggle (click to unpin) · word · @com ±spread ·
   //              strength-history sparkline
-  //   body     : the strength bar (mean band probability, 0→1 absolute,
+  //   body     : the strength bar (mean fitted-layer probability, 0→1 absolute,
   //              the @when:jlens/<word> gate channel — the ONE readout
   //              channel), then the per-layer strength strip (p_l per
   //              layer, cell color normalized to the card's own max —
-  //              same convention as the workspace token cards).
+  //              same convention as the J-lens token cards).
 
   import type { ProbeRackEntry } from "../../lib/types";
   import Bar from "../../lib/charts/Bar.svelte";
@@ -38,7 +38,7 @@
 
   // ---------- latest reading: live during gen, settled (aggregate) after ----------
   const latest = $derived(entry.aggregate ?? entry.reading);
-  /** Mean band probability (axis 0 — the gate channel + workspace number). */
+  /** Mean fitted-layer probability (axis 0 — gate + displayed strength). */
   const strength = $derived(latest?.coords?.[0] ?? entry.current ?? 0);
 
   const sparkline = $derived(entry.sparkline ?? []);
@@ -130,12 +130,12 @@
   {/snippet}
 
   {#snippet body()}
-    <!-- Strength: mean band probability, absolute 0→1 (the gate channel). -->
+    <!-- Strength: mean fitted-layer probability, absolute 0→1. -->
     <ProbeReadingRow ariaLabel={`Strength ${strength.toFixed(2)}`}>
       {#snippet left()}
         <span
           class="row-label"
-          title="mean band probability"
+          title="mean fitted-layer probability"
         >strength</span>
       {/snippet}
       {#snippet bar()}

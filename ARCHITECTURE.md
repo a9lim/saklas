@@ -1001,17 +1001,14 @@ consumers with zero hot-path cost when unused:
   hooks, so steering fast-path/compile eligibility is untouched);
 - **steering atoms**: `jlens/<word>` lowers to the per-layer direction
   `W_U[v] @ J_l` registered lazily as an ordinary profile — it folds, pushes,
-  ablates, and projects like any extracted vector, but restricted to the
-  workspace band (40–90% depth): in the motor regime the direction converges
-  on the raw unembedding row, so pushing there is token-forcing, not concept
-  induction (live-verified: unrestricted, it shatters into token loops at
-  every α). Lens atoms run hotter than concept vectors — α≈0.3 is the
+  ablates, and projects like any extracted vector across every fitted layer.
+  Lens atoms run hotter than concept vectors — α≈0.3 is the
   gemma-3-4b sweet spot;
 - **probes + gates**: a `jlens/<word>` probe reads the *readout channel*, not
   a whitened coordinate — `add_probe` lands it in the session lens-probe
   registry (never the Monitor; no whitener, no direction fold), and the
-  reading is the token's standing in the band readout: ONE channel,
-  `coords = (strength,)` — the mean band **probability** `mean_l p_l(v)`
+  reading is the token's standing across all fitted layers: ONE channel,
+  `coords = (strength,)` — the mean fitted-layer **probability** `mean_l p_l(v)`
   (the `@when:jlens/<word>` gate channel — [0,1], the workspace
   `strength`, one number across every card and layer; a within-layer max
   normalization is not apples-to-apples, and the depth CoM weights by the

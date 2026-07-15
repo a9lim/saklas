@@ -1191,7 +1191,6 @@ class TestLensTokenReadout:
         "token_id": 42,
         "token_text": " magic",
         "steering": "0.3 formal.casual",
-        "workspace_band": [12, 18],
         "readout": {
             18: [(" b", -0.51234, 7), (" c", -1.2, 9)],
             12: [(" a", -0.25, 5), (" d", -2.0, 3)],
@@ -1214,9 +1213,8 @@ class TestLensTokenReadout:
         assert data["node_id"] == "n1"
         assert data["token_id"] == 42
         assert data["steering"] == "0.3 formal.casual"
-        # rows sorted ascending by layer, band flags derived from the band list
+        # rows sorted ascending by layer
         assert [row["layer"] for row in data["layers"]] == [12, 18]
-        assert all(row["in_band"] for row in data["layers"])
         assert data["layers"][1]["tokens"][0] == {
             "token": " b", "id": 7, "logprob": -0.5123,
         }
@@ -1229,7 +1227,7 @@ class TestLensTokenReadout:
         kwargs = session.jlens_token_readout.call_args.kwargs
         assert kwargs["apply_steering"] is True
         assert kwargs["raw"] is False
-        assert kwargs["layers"] == "workspace"
+        assert kwargs["layers"] == "all"
         assert kwargs["top_k"] == 2
 
     def test_aggregate_absent_from_session_is_empty_list(
@@ -1473,22 +1471,20 @@ class TestLensLiveToggle:
             json={"enabled": True},
         )
         assert resp.status_code == 200
-        assert resp.json() == {"enabled": True, "layers": [10, 14, 18], "top_k": 5}
+        assert resp.json() == {"enabled": True, "layers": [10, 14, 18]}
         kwargs = session.enable_live_lens.call_args.kwargs
-        assert kwargs["layers"] is None  # server picks the workspace band
-        assert kwargs["top_k"] == 5
+        assert kwargs["layers"] is None  # session selects every fitted layer
 
-    def test_enable_threads_layers_and_top_k(self, session_and_client: Any) -> None:
+    def test_enable_threads_layers(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.enable_live_lens.return_value = [12, 18]
         resp = client.post(
             "/saklas/v1/sessions/default/lens/live",
-            json={"enabled": True, "layers": [12, 18], "top_k": 3},
+            json={"enabled": True, "layers": [12, 18]},
         )
         assert resp.status_code == 200
         kwargs = session.enable_live_lens.call_args.kwargs
         assert kwargs["layers"] == [12, 18]
-        assert kwargs["top_k"] == 3
 
     def test_disable(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -1520,14 +1516,6 @@ class TestLensLiveToggle:
         resp = client.post(
             "/saklas/v1/sessions/default/lens/live",
             json={"enabled": True, "layers": [99]},
-        )
-        assert resp.status_code == 400
-
-    def test_top_k_bounds_400(self, session_and_client: Any) -> None:
-        _, client = session_and_client
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/live",
-            json={"enabled": True, "top_k": 0},
         )
         assert resp.status_code == 400
 

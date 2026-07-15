@@ -5,11 +5,11 @@
   //
   //   STEER — one card per ``α jlens/<word>`` token atom in the ONE
   //           steering expression (the engine folds the lens direction
-  //           over the workspace band with whitened shares, exactly
+  //           over all fitted layers with whitened shares, exactly
   //           like a concept vector).  Per-card α slider + trigger
   //           pill (lens atoms run hotter than concept vectors;
   //           default 0.3).
-  //   PROBE — the workspace readout, pinned and unpinned in ONE section
+  //   PROBE — the J-lens readout, pinned and unpinned in ONE section
   //           (pinning a token just makes its card persistent and
   //           gate-able — both card kinds are the same shape: strength
   //           bar + per-layer strength strip; the pinned card's ■ unpins,
@@ -71,7 +71,7 @@
     { value: "neuronpedia", label: "neuronpedia" },
   ];
   let fitPrompts = $state(100);
-  let fitLayers = $state("workspace");
+  let fitLayers = $state("all");
   let fitConfirm = $state(false);
   let selectedSource = $state("");
   const fitReady = $derived(

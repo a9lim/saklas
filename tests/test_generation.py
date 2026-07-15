@@ -15,6 +15,7 @@ from saklas.core.generation import (
     generate_steered,
 )
 from saklas.core.results import GenerationResult, ProbeReading
+from saklas.core.sampling import SamplingConfig
 from saklas.core.session import CaptureMode, CaptureState, GenState, SaklasSession
 from saklas.core.steering import Steering
 
@@ -68,6 +69,7 @@ class _CurrentSessionStub(SaklasSession):
         instance._live_sae_active_for_generation = True
         instance._generation_jlens = None
         instance._generation_jlens_active = False
+        instance._default_return_top_k = 0
         return instance
 
     @property
@@ -128,6 +130,19 @@ def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.Mo
     )
     assert use_thinking is True
 
+
+def test_jlens_top_k_shares_logit_alternative_width() -> None:
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
+    session._default_return_top_k = 6
+
+    assert SaklasSession._effective_return_top_k(session, None) == 6
+    assert SaklasSession._effective_return_top_k(
+        session, SamplingConfig(return_top_k=13),
+    ) == 13
+    # Per-call zero inherits the same session default as the logit pass.
+    assert SaklasSession._effective_return_top_k(
+        session, SamplingConfig(return_top_k=0),
+    ) == 6
 
 def test_prepare_input_raw_feeds_flat_active_path():
     """raw=True walks the loom tree as flat text — no chat template, no
@@ -568,7 +583,7 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
     session._incremental_gate_scores = []
     session._live_lens = {"layers": [0]}
     session._live_sae = {"layer": 0, "top_k": 3}
-    session._live_lens_readout_step = lambda: (
+    session._live_lens_readout_step = lambda **_kwargs: (
         (_ for _ in ()).throw(AssertionError("lens readout not consumed"))
     )
     session._live_sae_readout_step = lambda: (

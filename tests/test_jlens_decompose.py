@@ -98,8 +98,7 @@ def test_session_jspace_decompose_on_registered_profile(_isolated_home: None) ->
 
     out = SaklasSession.jspace_decompose(session, name, k=4)  # type: ignore[arg-type]
     del lens
-    # the registered profile is workspace-band restricted (toy band = layer 1)
-    assert set(out) == {1}
+    assert set(out) == {0, 1}
     for share, tokens in out.values():
         assert share > 0.99
         assert tokens and tokens[0][0] == "g"
