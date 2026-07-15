@@ -66,6 +66,8 @@
     samplingState,
     sessionState,
     highlightScale,
+    beginTokenHover,
+    endTokenHover,
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
   import { togglePalette } from "../lib/stores/palette.svelte";
@@ -1120,6 +1122,10 @@
                 class:tinted={highlightState.target !== null}
                 style={styleString(tokenStyle(tok))}
                 title={tooltipFor(tok)}
+                onpointerenter={() => beginTokenHover(tok, turn.nodeId)}
+                onpointerleave={endTokenHover}
+                onfocus={() => beginTokenHover(tok, turn.nodeId)}
+                onblur={endTokenHover}
                 onclick={(ev) => tokenClicked(turnIdx, tokenIdx, ev, true)}
                 onkeydown={(ev) => {
                   if (ev.key === "Enter" || ev.key === " ") {
@@ -1145,6 +1151,10 @@
             class:tinted={highlightState.target !== null}
             style={styleString(tokenStyle(tok))}
             title={tooltipFor(tok)}
+            onpointerenter={() => beginTokenHover(tok, turn.nodeId)}
+            onpointerleave={endTokenHover}
+            onfocus={() => beginTokenHover(tok, turn.nodeId)}
+            onblur={endTokenHover}
             onclick={(ev) => tokenClicked(turnIdx, originalIdx, ev, false)}
             onkeydown={(ev) => {
               if (ev.key === "Enter" || ev.key === " ") {

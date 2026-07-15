@@ -83,3 +83,48 @@ pre {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--fg-muted);
 }
+/* Delegated title surface. `lib/tooltips.ts` suppresses the native desktop
+ * bubble during hover/focus and positions this one shared floating layer. */
+.saklas-tooltip {
+  position: fixed;
+  z-index: calc(var(--z-modal) + 20);
+  max-width: min(320px, calc(100vw - 16px));
+  padding: 5px 8px 6px;
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-elev) 96%, transparent);
+  box-shadow: var(--shadow-overlay);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variation-settings: "MONO" 1, "CASL" 0;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, calc(-100% - 2px)) scale(0.98);
+  transform-origin: 50% 100%;
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+
+.saklas-tooltip.visible {
+  opacity: 1;
+  transform: translate(-50%, -100%) scale(1);
+}
+
+.saklas-tooltip.below {
+  transform: translate(-50%, 2px) scale(0.98);
+  transform-origin: 50% 0;
+}
+
+.saklas-tooltip.below.visible {
+  transform: translate(-50%, 0) scale(1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .saklas-tooltip { transition: none; }
+}

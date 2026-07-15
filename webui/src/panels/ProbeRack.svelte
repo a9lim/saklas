@@ -17,6 +17,7 @@
     activeProbeNames,
     openDrawer,
     probeRack,
+    probeEntryForDisplay,
     probesLiveState,
     setLiveProbes,
     setProbeSortMode,
@@ -91,7 +92,7 @@
 
   <div class="strips" class:is-empty={count === 0} role="list">
     {#each probes as name (name)}
-        {@const entry = probeRack.entries.get(name)}
+        {@const entry = probeEntryForDisplay(name)}
         {#if entry}
           <div role="listitem">
             <ProbeCard {name} {entry} />

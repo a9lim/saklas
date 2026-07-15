@@ -249,6 +249,284 @@ export const saeState: SaeState = $state({
   loadError: null,
 });
 
+// ================================================= token hover readout ====
+
+/** A non-destructive, token-anchored view of the three read channels shown in
+ * the inspector.  Panels read this overlay while a transcript token is under
+ * the pointer, then fall back to their ordinary live/settled state on leave. */
+export interface TokenHoverState {
+  active: boolean;
+  key: string | null;
+  tokenText: string;
+  probeReadings: Record<string, ProbeReadingJSON> | null;
+  probes: Record<string, number> | null;
+  coordsByProbe: Record<string, number[]> | null;
+  perLayerScores: Record<string, Record<string, number>> | null;
+  lensReadout: Record<string, [string, number][]> | null;
+  lensAggregate: [string, number, number, number][] | null;
+  saeReadout: SaeFeatureJSON[] | null;
+  lensLoading: boolean;
+  saeLoading: boolean;
+}
+
+export const tokenHoverState: TokenHoverState = $state({
+  active: false,
+  key: null,
+  tokenText: "",
+  probeReadings: null,
+  probes: null,
+  coordsByProbe: null,
+  perLayerScores: null,
+  lensReadout: null,
+  lensAggregate: null,
+  saeReadout: null,
+  lensLoading: false,
+  saeLoading: false,
+});
+
+interface LensHoverSnapshot {
+  readout: Record<string, [string, number][]>;
+  aggregate: [string, number, number, number][];
+}
+
+const TOKEN_HOVER_DELAY_MS = 140;
+const TOKEN_HOVER_CACHE_SIZE = 128;
+const _probeHoverCache = new Map<string, Record<string, ProbeReadingJSON>>();
+const _lensHoverCache = new Map<string, LensHoverSnapshot>();
+const _saeHoverCache = new Map<string, SaeFeatureJSON[]>();
+const _tokenLiveHoverKeys = new WeakMap<TokenScore, {
+  probeKey: string;
+  lensKey: string;
+  saeKey: string;
+}>();
+const _lensHoverInFlight = new Map<string, Promise<LensHoverSnapshot>>();
+const _saeHoverInFlight = new Map<string, Promise<SaeFeatureJSON[]>>();
+let _liveHoverSeq = 0;
+let _hoverFetchTimer: ReturnType<typeof setTimeout> | null = null;
+let _hoverClearTimer: ReturnType<typeof setTimeout> | null = null;
+
+function _cacheHoverValue<K, V>(cache: Map<K, V>, key: K, value: V): void {
+  cache.delete(key);
+  cache.set(key, value);
+  if (cache.size > TOKEN_HOVER_CACHE_SIZE) {
+    const oldest = cache.keys().next().value as K | undefined;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+}
+
+function _readHoverValue<K, V>(cache: Map<K, V>, key: K): V | undefined {
+  const value = cache.get(key);
+  if (value !== undefined) {
+    cache.delete(key);
+    cache.set(key, value);
+  }
+  return value;
+}
+
+function _hoverCacheKeys(nodeId: string, rawIndex: number, raw: boolean): {
+  key: string;
+  probeKey: string;
+  lensKey: string;
+  saeKey: string;
+} {
+  const modelKey = sessionState.info?.model_id ?? "unknown-model";
+  const key = `${modelKey}:${nodeId}:${rawIndex}:${raw ? 1 : 0}`;
+  const lensSource = lensSourceState.sources.find((source) => source.active)?.source ??
+    "default";
+  const saeSource = sessionState.info?.sae_info?.fingerprint ??
+    sessionState.info?.sae_info?.sae_id ??
+    sessionState.info?.sae_info?.release ??
+    "default";
+  return {
+    key,
+    probeKey: `${key}:probes`,
+    lensKey: `${key}:lens:${lensSource}`,
+    saeKey: `${key}:sae:${saeSource}`,
+  };
+}
+
+function _fetchLensHover(
+  key: string,
+  nodeId: string,
+  rawIndex: number,
+  raw: boolean,
+): Promise<LensHoverSnapshot> {
+  const cached = _readHoverValue(_lensHoverCache, key);
+  if (cached) return Promise.resolve(cached);
+  const pending = _lensHoverInFlight.get(key);
+  if (pending) return pending;
+  const request = apiLens.tokenReadout(nodeId, rawIndex, {
+    topK: Math.max(samplingState.return_top_k, 12),
+    steered: true,
+    raw,
+    layers: "all",
+  }).then((data) => {
+    const snapshot: LensHoverSnapshot = {
+      readout: Object.fromEntries(data.layers.map((row) => [
+        String(row.layer),
+        row.tokens.map((token) => [token.token, Math.exp(token.logprob)]),
+      ])),
+      aggregate: (data.aggregate ?? []).map((token) => [
+        token.token,
+        token.strength,
+        token.com,
+        token.spread,
+      ]),
+    };
+    _cacheHoverValue(_lensHoverCache, key, snapshot);
+    return snapshot;
+  }).finally(() => _lensHoverInFlight.delete(key));
+  _lensHoverInFlight.set(key, request);
+  return request;
+}
+
+function _fetchSaeHover(
+  key: string,
+  nodeId: string,
+  rawIndex: number,
+  raw: boolean,
+): Promise<SaeFeatureJSON[]> {
+  const cached = _readHoverValue(_saeHoverCache, key);
+  if (cached) return Promise.resolve(cached);
+  const pending = _saeHoverInFlight.get(key);
+  if (pending) return pending;
+  const request = apiSae.tokenReadout(nodeId, rawIndex, {
+    topK: 12,
+    steered: true,
+    raw,
+  }).then((data) => {
+    _cacheHoverValue(_saeHoverCache, key, data.features);
+    return data.features;
+  }).finally(() => _saeHoverInFlight.delete(key));
+  _saeHoverInFlight.set(key, request);
+  return request;
+}
+
+/** Begin showing one transcript token in the inspector.  Live snapshots land
+ * synchronously; absent historical J-LENS/SAE snapshots are recomputed only
+ * after a short hover dwell and cached by node/raw-index/mode. */
+export function beginTokenHover(
+  token: TokenScore,
+  nodeId: string | null | undefined,
+): void {
+  if (_hoverClearTimer !== null) clearTimeout(_hoverClearTimer);
+  if (_hoverFetchTimer !== null) clearTimeout(_hoverFetchTimer);
+  _hoverClearTimer = null;
+  _hoverFetchTimer = null;
+
+  const raw = effectiveRawMode();
+  const rawIndex = token.rawIndex ?? null;
+  const modelKey = sessionState.info?.model_id ?? "unknown-model";
+  const cacheKeys = nodeId && rawIndex !== null
+    ? _hoverCacheKeys(nodeId, rawIndex, raw)
+    : null;
+  const key = cacheKeys?.key ??
+    `live:${modelKey}:${nodeId ?? "none"}:${rawIndex ?? "none"}:${token.tokenId ?? "none"}`;
+  tokenHoverState.active = true;
+  tokenHoverState.key = key;
+  tokenHoverState.tokenText = token.text;
+  tokenHoverState.probeReadings = null;
+  tokenHoverState.probes = token.probes ?? null;
+  tokenHoverState.coordsByProbe = token.coordsByProbe ?? null;
+  tokenHoverState.perLayerScores = token.perLayerScores ?? null;
+  tokenHoverState.lensReadout = null;
+  tokenHoverState.lensAggregate = null;
+  tokenHoverState.saeReadout = null;
+  tokenHoverState.lensLoading = false;
+  tokenHoverState.saeLoading = false;
+
+  const liveKeys = _tokenLiveHoverKeys.get(token);
+  const cachedProbes = (liveKeys
+    ? _readHoverValue(_probeHoverCache, liveKeys.probeKey)
+    : undefined) ?? (cacheKeys
+    ? _readHoverValue(_probeHoverCache, cacheKeys.probeKey)
+    : undefined);
+  const cachedLens = (liveKeys
+    ? _readHoverValue(_lensHoverCache, liveKeys.lensKey)
+    : undefined) ?? (cacheKeys
+    ? _readHoverValue(_lensHoverCache, cacheKeys.lensKey)
+    : undefined);
+  const cachedSae = (liveKeys
+    ? _readHoverValue(_saeHoverCache, liveKeys.saeKey)
+    : undefined) ?? (cacheKeys
+    ? _readHoverValue(_saeHoverCache, cacheKeys.saeKey)
+    : undefined);
+  if (cachedProbes) tokenHoverState.probeReadings = cachedProbes;
+  if (cachedLens) {
+    tokenHoverState.lensReadout = cachedLens.readout;
+    tokenHoverState.lensAggregate = cachedLens.aggregate;
+  }
+  if (cachedSae) tokenHoverState.saeReadout = cachedSae;
+
+  if (!nodeId || rawIndex === null || cacheKeys === null) return;
+  const needsLens = (!tokenHoverState.lensReadout || !tokenHoverState.lensAggregate) &&
+    sessionState.info?.jlens_fitted === true;
+  const needsSae = !tokenHoverState.saeReadout &&
+    sessionState.info?.sae_loaded === true;
+  tokenHoverState.lensLoading = needsLens;
+  tokenHoverState.saeLoading = needsSae;
+  if (!needsLens && !needsSae) return;
+
+  _hoverFetchTimer = setTimeout(() => {
+    _hoverFetchTimer = null;
+    if (needsLens) {
+      void _fetchLensHover(cacheKeys.lensKey, nodeId, rawIndex, raw)
+        .then((snapshot) => {
+          if (!tokenHoverState.active || tokenHoverState.key !== key) return;
+          tokenHoverState.lensReadout = snapshot.readout;
+          tokenHoverState.lensAggregate = snapshot.aggregate;
+        })
+        .catch(() => { /* Opportunistic hover read: fall through to the empty hint. */ })
+        .finally(() => {
+          if (tokenHoverState.active && tokenHoverState.key === key) {
+            tokenHoverState.lensLoading = false;
+          }
+        });
+    }
+    if (needsSae) {
+      void _fetchSaeHover(cacheKeys.saeKey, nodeId, rawIndex, raw)
+        .then((features) => {
+          if (!tokenHoverState.active || tokenHoverState.key !== key) return;
+          tokenHoverState.saeReadout = features;
+        })
+        .catch(() => { /* Opportunistic hover read: fall through to the empty hint. */ })
+        .finally(() => {
+          if (tokenHoverState.active && tokenHoverState.key === key) {
+            tokenHoverState.saeLoading = false;
+          }
+        });
+    }
+  }, TOKEN_HOVER_DELAY_MS);
+}
+
+/** Delay the clear just enough to cross the whitespace between adjacent token
+ * spans without flashing the inspector back to the settled generation. */
+export function endTokenHover(): void {
+  if (_hoverFetchTimer !== null) clearTimeout(_hoverFetchTimer);
+  if (_hoverClearTimer !== null) clearTimeout(_hoverClearTimer);
+  _hoverFetchTimer = null;
+  _hoverClearTimer = setTimeout(() => {
+    tokenHoverState.active = false;
+    tokenHoverState.key = null;
+    tokenHoverState.tokenText = "";
+    tokenHoverState.lensLoading = false;
+    tokenHoverState.saeLoading = false;
+    _hoverClearTimer = null;
+  }, 45);
+}
+
+export function lensReadoutForDisplay(): Record<string, [string, number][]> | null {
+  return tokenHoverState.active ? tokenHoverState.lensReadout : lensState.readout;
+}
+
+export function lensAggregateForDisplay(): [string, number, number, number][] | null {
+  return tokenHoverState.active ? tokenHoverState.lensAggregate : lensState.aggregate;
+}
+
+export function saeReadoutForDisplay(): SaeFeatureJSON[] {
+  return tokenHoverState.active ? (tokenHoverState.saeReadout ?? []) : saeState.readout;
+}
+
 export const saeSourceState: {
   sources: InstrumentSourceJSON[];
   loading: boolean;
@@ -1408,6 +1686,103 @@ function _primaryPerLayer(
   return out;
 }
 
+/** Read one probe card through the token-hover overlay. Token rows retain the
+ * primary scalar, multi-axis coordinates, and layer strip; lens/SAE cards can
+ * additionally fill from the bounded live/on-demand hover caches. */
+export function probeEntryForDisplay(name: string): ProbeRackEntry | undefined {
+  const base = probeRack.entries.get(name);
+  if (!base || !tokenHoverState.active) return base;
+
+  let reading: ProbeReadingJSON | null = tokenHoverState.probeReadings?.[name] ?? null;
+  if (!reading) {
+    let scalar = tokenHoverState.probes?.[name];
+    const tokenCoords = tokenHoverState.coordsByProbe?.[name];
+    if (scalar === undefined && tokenCoords?.[0] !== undefined) {
+      scalar = tokenCoords[0];
+    }
+    const perLayer: Record<string, number> = {};
+    for (const [layer, scores] of Object.entries(tokenHoverState.perLayerScores ?? {})) {
+      const value = scores[name];
+      if (typeof value === "number" && Number.isFinite(value)) perLayer[layer] = value;
+    }
+
+    if (scalar === undefined && name.startsWith("jlens/")) {
+      const word = name.slice("jlens/".length);
+      const aggregate = tokenHoverState.lensAggregate?.find(
+        ([token]) => token === word || token.trim() === word,
+      );
+      if (aggregate) {
+        scalar = aggregate[1];
+        for (const [layer, tokens] of Object.entries(tokenHoverState.lensReadout ?? {})) {
+          const hit = tokens.find(([token]) => token === word || token.trim() === word);
+          if (hit) perLayer[layer] = hit[1];
+        }
+      }
+    }
+    if (scalar === undefined && name.startsWith("sae/")) {
+      const id = Number(name.slice("sae/".length));
+      const feature = tokenHoverState.saeReadout?.find((row) => row.id === id);
+      if (feature) {
+        scalar = base.info.max_act != null && base.info.max_act > 0
+          ? feature.activation / base.info.max_act
+          : feature.activation;
+        const layer = base.info.layers[0];
+        if (layer !== undefined) perLayer[String(layer)] = scalar;
+      }
+    }
+
+    if (scalar !== undefined || Object.keys(perLayer).length > 0) {
+      const value = scalar ?? 0;
+      const usesCoords = base.info.is_affine || base.info.lens || base.info.sae;
+      const coords = usesCoords
+        ? (tokenCoords ?? [value])
+        : [];
+      const coordsPerLayer = Object.fromEntries(
+        Object.entries(perLayer).map(([layer, v]) => [layer, [v]]),
+      );
+      reading = {
+        fraction: usesCoords ? 0 : value,
+        nearest: [],
+        coords,
+        residual: 0,
+        fraction_per_layer: usesCoords ? {} : perLayer,
+        coords_per_layer: usesCoords ? coordsPerLayer : {},
+        residual_per_layer: {},
+      };
+    }
+  }
+
+  if (!reading) {
+    return {
+      ...base,
+      current: 0,
+      previous: 0,
+      sparkline: [],
+      perLayer: {},
+      reading: null,
+      aggregate: null,
+      savedAggregate: null,
+      nearest: [],
+      trajectory: [],
+    };
+  }
+  const current = _primaryScalar(base.info, reading);
+  return {
+    ...base,
+    current,
+    previous: current,
+    sparkline: [current],
+    perLayer: _primaryPerLayer(base.info, reading),
+    reading,
+    // ProbeCard's settled-only fields (residual and mini-map dot) should also
+    // describe the hovered token, so the ephemeral view fills both slots.
+    aggregate: reading,
+    savedAggregate: null,
+    nearest: reading.nearest,
+    trajectory: [],
+  };
+}
+
 /** A probe targets a 2-D-authored ``BoxDomain`` — the regime the mini-map
  *  renders.  Higher-dim and sphere/custom probes attach but skip it. */
 function _probeIsMiniMapCandidate(info: ProbeInfo): boolean {
@@ -1467,7 +1842,7 @@ export function saeRawFallbackScale(): number {
     const reading = entry.aggregate ?? entry.reading;
     max = Math.max(max, reading?.coords?.[0] ?? entry.current ?? 0);
   }
-  for (const feature of saeState.readout) {
+  for (const feature of saeReadoutForDisplay()) {
     const meta = saeState.meta.get(feature.id);
     if ((feature.max_act ?? meta?.max_act) != null) continue;
     max = Math.max(max, feature.activation);
@@ -3095,6 +3470,35 @@ function handleWsMessage(msg: WSServerMessage): void {
           if (Array.isArray(coords) && coords.length > 1) byProbe[pname] = coords;
         }
         if (Object.keys(byProbe).length > 0) tokenScore.coordsByProbe = byProbe;
+      }
+      // Keep the expensive per-layer instrument snapshots out of the loom's
+      // durable token rows. The newest 128 remain available at zero cost for
+      // hover; older tokens fall back to the on-demand readout endpoints.
+      const hoverNodeId = msg.node_id ?? _currentWriteTurn()?.nodeId;
+      const hoverKeys = hoverNodeId && msg.raw_index != null
+        ? _hoverCacheKeys(hoverNodeId, msg.raw_index, effectiveRawMode())
+        : {
+            key: `stream:${++_liveHoverSeq}`,
+            probeKey: `stream:${_liveHoverSeq}:probes`,
+            lensKey: `stream:${_liveHoverSeq}:lens`,
+            saeKey: `stream:${_liveHoverSeq}:sae`,
+          };
+      _tokenLiveHoverKeys.set(tokenScore, {
+        probeKey: hoverKeys.probeKey,
+        lensKey: hoverKeys.lensKey,
+        saeKey: hoverKeys.saeKey,
+      });
+      if (msg.probe_readings) {
+        _cacheHoverValue(_probeHoverCache, hoverKeys.probeKey, msg.probe_readings);
+      }
+      if (msg.lens_readout && msg.lens_aggregate) {
+        _cacheHoverValue(_lensHoverCache, hoverKeys.lensKey, {
+          readout: msg.lens_readout,
+          aggregate: msg.lens_aggregate,
+        });
+      }
+      if (msg.sae_readout) {
+        _cacheHoverValue(_saeHoverCache, hoverKeys.saeKey, msg.sae_readout);
       }
       const turn = _currentWriteTurn();
       if (turn) {

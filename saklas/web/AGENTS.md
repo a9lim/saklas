@@ -115,6 +115,8 @@ webui/src/
   lib/
     api.ts                    # typed REST + WS + SSE clients
     stores.svelte.ts          # runes-based shared state + cross-cutting WS/tree state
+    tooltips.ts               # delegated Saklas tooltip layer; `title` remains
+                              # the authoring API, native bubbles are suppressed
     stores/                   # split slices: drawers, inputHistory, toasts (.svelte.ts)
     types.ts                  # shared interfaces; DrawerName union
     expression.ts             # parse/serialize the steering grammar
@@ -186,7 +188,10 @@ webui/src/
                               # two-group split is gone), sae = SaePanel,
                               # lens = JLensPanel. InspectorTab union is the four
                               # pillar names (the pre-4.2 "probes"/"jlens" values
-                              # are gone)
+                              # are gone). Hovering a transcript/raw-buffer token
+                              # overlays that token's probe/J-LENS/SAE readings;
+                              # live frames are immediate, historical lens/SAE
+                              # reads use the existing token endpoints + LRU cache
     JLensPanel.svelte         # J-LENS pillar — SOURCE picker + official fetch
                               # and cancellable local fit; then STEER + merged
                               # PROBE cards with live workspace discovery

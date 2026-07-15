@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 import { mount } from "svelte";
 import App from "./App.svelte";
+import { installTooltipLayer } from "./lib/tooltips";
 // Side-effect CSS imports — Vite extracts these into the bundled CSS.
 // Imported here (not from App.svelte) so svelte-check, which runs sans
 // Vite's CSS plugin, doesn't trip on missing module declarations.
@@ -24,5 +25,9 @@ if (!target) throw new Error("saklas web: #app element missing in index.html");
 
 const isStyleGuide =
   window.location.pathname.replace(/\/+$/, "") === "/styleguide";
+// Installed once outside either page root so every current/future `title`
+// authoring surface uses Saklas tooltip chrome, including drawers, portals,
+// the command palette, and the standalone styleguide.
+installTooltipLayer();
 const app = mount(isStyleGuide ? StyleGuide : App, { target });
 export default app;

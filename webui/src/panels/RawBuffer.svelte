@@ -23,6 +23,8 @@
     highlightState,
     openDrawer,
     highlightScale,
+    beginTokenHover,
+    endTokenHover,
   } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
   import Button from "../lib/ui/Button.svelte";
@@ -347,6 +349,11 @@
     });
   }
 
+  function hoverToken(v: RawToken): void {
+    if (!v.tok || v.turnIdx === null) return;
+    beginTokenHover(v.tok, chatLog.turns[v.turnIdx]?.nodeId);
+  }
+
   let logRef: HTMLDivElement | null = $state(null);
   let scrolledUp = $state(false);
   function onScroll(ev: Event): void {
@@ -388,6 +395,10 @@
               title={inspectTooltip(v)}
               role="button"
               tabindex="-1"
+              onpointerenter={() => hoverToken(v)}
+              onpointerleave={endTokenHover}
+              onfocus={() => hoverToken(v)}
+              onblur={endTokenHover}
               onclick={() => openToken(v)}
               onkeydown={(ev) => {
                 if (ev.key === "Enter" || ev.key === " ") {

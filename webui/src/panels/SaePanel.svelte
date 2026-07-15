@@ -36,16 +36,19 @@
     checkSaeTrain,
     loadSae,
     probeRack,
+    probeEntryForDisplay,
     saeState,
     saeSourceState,
     saeTrainState,
     saeRawFallbackScale,
+    saeReadoutForDisplay,
     seedProbeDisplay,
     sessionState,
     setLiveSae,
     setSaeSortMode,
     startSaeTrain,
     steerRack,
+    tokenHoverState,
     refreshSaeSources,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
@@ -53,6 +56,7 @@
   import type { SaeSortMode } from "../lib/stores.svelte";
 
   const loaded = $derived(sessionState.info?.sae_loaded === true);
+  const displayReadout = $derived(saeReadoutForDisplay());
   const info = $derived(sessionState.info?.sae_info ?? null);
   let selectedSource = $state("");
   let selectedLayer = $state("");
@@ -211,10 +215,10 @@
   // ---------- PROBE: pinned probe cards + unpinned discovery cards ----------
   const pinnedBase = $derived.by(() => activeProbeNames()
     .filter((name) => name.startsWith("sae/"))
-    .map((name) => ({ name, entry: probeRack.entries.get(name) }))
+    .map((name) => ({ name, entry: probeEntryForDisplay(name) }))
     .filter((row) => row.entry !== undefined));
 
-  const discoveryBase = $derived.by(() => saeState.readout
+  const discoveryBase = $derived.by(() => displayReadout
     .filter((row) => !probeRack.active.includes(`sae/${row.id}`))
     .map((row) => {
       // Metadata merges from the row's server-cached values and the
@@ -320,7 +324,7 @@
         strength: entry.info.max_act != null ? value : value / fallbackScale,
       };
     });
-    if (saeState.live) {
+    if (saeState.live || tokenHoverState.active) {
       rows.push(...discovery.map((feature) => ({
         kind: "discovery" as const,
         key: `sae/${feature.id}`,
@@ -622,7 +626,13 @@
           </div>
         {/if}
 
-        {#if saeState.live}
+        {#if tokenHoverState.active}
+          {#if tokenHoverState.saeLoading}
+            <p class="hint">reading hovered token…</p>
+          {:else if probeCards.length === 0}
+            <p class="hint">no SAE score for this token</p>
+          {/if}
+        {:else if saeState.live}
           {#if discovery.length === 0}
             <p class="hint">run to discover</p>
           {/if}

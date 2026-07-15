@@ -232,6 +232,7 @@
           <Button>browse manifolds</Button>
           <Button variant="danger">delete</Button>
           <Button size="sm">re-fit</Button>
+          <Button size="sm" title="Saklas tooltip">tooltip</Button>
           <Button size="sm" accent="var(--pillar-sae)">+ pin feature</Button>
           <Button size="sm" accent="var(--pillar-lens)">+ steer token</Button>
           <Button disabled>unavailable</Button>

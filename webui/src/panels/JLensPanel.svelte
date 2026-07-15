@@ -46,7 +46,10 @@
     lensFetchState,
     lensSourceState,
     lensState,
+    lensAggregateForDisplay,
+    lensReadoutForDisplay,
     probeRack,
+    probeEntryForDisplay,
     refreshLensSources,
     seedProbeDisplay,
     sessionState,
@@ -55,6 +58,7 @@
     startLensFetch,
     startLensFit,
     steerRack,
+    tokenHoverState,
     useLensSource,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
@@ -63,6 +67,12 @@
 
   const fitted = $derived(sessionState.info?.jlens_fitted === true);
   const liveOn = $derived(lensState.layers !== null);
+  const displayReadout = $derived(lensReadoutForDisplay());
+  const displayAggregate = $derived(lensAggregateForDisplay());
+  const displayLayers = $derived.by(() => {
+    if (!tokenHoverState.active) return lensState.layers ?? [];
+    return Object.keys(displayReadout ?? {}).map(Number).sort((a, b) => a - b);
+  });
   const sourceBusy = $derived(
     lensSourceState.loading || lensSourceState.busy ||
       lensFetchState.running || lensFitState.running,
@@ -204,7 +214,7 @@
     const names = activeProbeNames().filter((n) => n.startsWith("jlens/"));
     const rows: PinnedRow[] = [];
     for (const name of names) {
-      const entry = probeRack.entries.get(name);
+      const entry = probeEntryForDisplay(name);
       if (!entry) continue;
       const latest = entry.aggregate ?? entry.reading;
       rows.push({
@@ -225,9 +235,9 @@
   });
 
   const aggRows = $derived.by((): AggRow[] => {
-    const rows = lensState.aggregate;
+    const rows = displayAggregate;
     if (!rows || rows.length === 0) return [];
-    const hist = lensState.aggHistory;
+    const hist = tokenHoverState.active ? [] : lensState.aggHistory;
     // Pinned tokens already have a persistent card above — the aggregate
     // group carries only the unpinned remainder of the top-k.
     const out = rows
@@ -237,9 +247,9 @@
         strength,
         com,
         spread,
-        series: hist.map(
-          (frame) => frame.find(([t]) => t === token)?.[1] ?? 0,
-        ),
+        series: tokenHoverState.active
+          ? [strength]
+          : hist.map((frame) => frame.find(([t]) => t === token)?.[1] ?? 0),
       }));
     if (lensState.workspaceSortMode === "name") {
       out.sort((a, b) =>
@@ -282,7 +292,7 @@
       strength: row.value,
       com: row.com,
     }));
-    if (liveOn) {
+    if (liveOn || tokenHoverState.active) {
       rows.push(...aggRows.map((row) => ({
         kind: "aggregate" as const,
         key: `aggregate:${row.token}`,
@@ -568,8 +578,8 @@
                     com={card.row.com}
                     spread={card.row.spread}
                     series={card.row.series}
-                    layers={lensState.layers ?? []}
-                    readout={lensState.readout}
+                    layers={displayLayers}
+                    readout={displayReadout}
                     pinned={false}
                     busy={probeBusy}
                     onpin={pinWord}
@@ -580,7 +590,13 @@
           </div>
         {/if}
 
-        {#if liveOn}
+        {#if tokenHoverState.active}
+          {#if tokenHoverState.lensLoading}
+            <p class="hint">reading hovered token…</p>
+          {:else if aggRows.length === 0}
+            <p class="hint">no J-lens score for this token</p>
+          {/if}
+        {:else if liveOn}
           {#if aggRows.length > 0}
             <p class="hint drill-hint">click a token for layers</p>
           {:else}
