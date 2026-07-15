@@ -705,7 +705,8 @@ persona breaks by `α ≈ 1.0`). Tagged a prototype.)
 `HiddenCapture` — public API: `attach`/`attach_persistent`/`detach`/`clear`,
 `stacked`/`latest_per_layer`/`per_layer_buckets`/`tail_slice_at`, the mode setters
 `set_incremental`/`set_aggregate_tail`/`set_tail_with_sink`, the post-forward
-`fire_step_sink`/`ingest_persistent`, and `is_transient()` (true iff transient
+`fire_step_sink`/`ingest_persistent`, selective-prefill
+`set_prompt_positions`/`prompt_stacked`, and `is_transient()` (true iff transient
 per-gen forward hooks are registered — the compiled-clean routing gate). No
 caller reaches into `_per_layer`/`_handles`/`_step_sink`: `per_layer_buckets()`
 returns the raw bucket dict (a plain attribute return — **zero per-token cost** on
@@ -754,6 +755,22 @@ representable). The `_score_*` dispatch keys off `mode`:
 Every read is a full per-probe `ProbeReading` either way; the modes trade only
 *when/how often* scoring runs (per token vs once) and memory (length-1 vs tail
 ring vs full stack).
+
+Loom-attached generation also scores visible **authored** spans on the prefill
+that already consumes them. `_pending_authored_prompt_targets` selects authored
+node channels with no prior token capture; `_match_authored_prompt_targets`
+locates their exact content-token sequences in the full rendered prompt and maps
+token `j` to its producer state at `j-1` (the same semantics generated rows use).
+`HiddenCapture` clones only those selected prompt rows at each active
+probe/J-LENS/SAE layer, not the full prompt stack. A KV-prefix hit translates
+full positions into suffix-local rows and leaves cached producers untouched;
+selective prompt capture forces transient hooks because persistent buffers carry
+only the latest slice. The first post-forward callback scores the rows in prompt
+order, writes one `capture_authored` loom mutation per populated channel, then
+runs the ordinary final-prompt sink. There is no second transformer forward, but
+the requested monitor/SAE/J-LENS readout work still runs per authored token.
+Captured authored rows are immutable: rerolls reuse their original data, while a
+standalone append remains plain until a later generation actually prefills it.
 
 ## monitor.py
 
@@ -1202,12 +1219,16 @@ policy; library + TUI stay opt-in).
 
 ## loom.py
 
-Generated token rows own the canonical `captured` measurement record. The
-decode tap creates it once from the original probe/J-LENS/SAE readouts, stamps
-instrument source plus recipe steering, appends it beside the token identity,
-and exposes the same object to the native WS. Because token rows already ride
-the compressed token sidecar, explicit loom save/load preserves these rich
-historical channels without a separate cache or schema path.
+Visible token rows own the canonical `captured` measurement record. The decode
+tap creates it for generated tokens; selective prefill capture creates the same
+shape for authored tokens from the producer rows that were already forward
+passed. Both stamp instrument source plus recipe steering and live directly on
+the loom node. Because token rows already ride the compressed token sidecar,
+explicit loom save/load preserves these rich historical channels without a
+separate cache or schema path. `set_authored_token_scores` installs one authored
+channel atomically and emits `LoomMutated(op="capture_authored")`; unlike the
+hot-loop `append_token`, it advances the tree revision so clients receive the
+updated authored node.
 
 `LoomTree` — the engine-side conversation tree. Nodes are turns, children are
 alternative continuations, the active path is the model's context.

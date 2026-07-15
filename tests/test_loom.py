@@ -89,6 +89,36 @@ def test_begin_and_finalize_assistant():
     assert t.nodes[aid].finish_reason == "stop"
 
 
+def test_set_authored_token_scores_is_one_tree_mutation():
+    bus = EventBus()
+    seen: list[LoomMutated] = []
+    bus.subscribe(lambda e: seen.append(e) if isinstance(e, LoomMutated) else None)
+    t = LoomTree(events=bus)
+    uid = t.add_user_turn("hello")
+    before = t.rev
+
+    t.set_authored_token_scores(uid, [
+        {
+            "token_id": 7,
+            "text": "hello",
+            "captured": {
+                "probes": {
+                    "provenance": "captured",
+                    "scores": {"formal": 0.25},
+                },
+            },
+        },
+    ])
+
+    assert t.rev == before + 1
+    assert t.nodes[uid].tokens is not None
+    assert t.nodes[uid].tokens[0]["captured"]["probes"]["scores"] == {
+        "formal": 0.25,
+    }
+    assert seen[-1].op == "capture_authored"
+    assert seen[-1].updated == (uid,)
+
+
 def test_messages_for_active_path():
     t = _seed_tree()
     msgs = t.messages_for()

@@ -104,6 +104,13 @@ class HiddenCapture:
         # forward.  The normal single-row paths keep using ``_per_layer``.
         self._batch_per_layer: dict[int, list[torch.Tensor]] = {}
         self._batch_forward_count: int = 0
+        # Selective prompt capture.  Decode-time measurements retain only the
+        # last position, but a loom-attached generation may also ask for the
+        # producer positions of visible authored tokens from the first prefill
+        # forward.  Keeping only those rows avoids cloning the full [T, D]
+        # prompt at every measured layer.
+        self._prompt_positions: tuple[int, ...] = ()
+        self._prompt_per_layer: dict[int, torch.Tensor] = {}
 
     def attach(
         self, layers: "torch.nn.ModuleList", layer_indices: list[int]
@@ -121,12 +128,27 @@ class HiddenCapture:
         self._tail_layers = None
         self._forward_count = 0
         self._persistent_buffers = {}
+        self._prompt_positions = ()
+        self._prompt_per_layer = {}
         for idx in layer_indices:
             bucket = self._per_layer[idx]
 
             def _make(bucket_ref: list[torch.Tensor], layer_idx: int) -> Any:
                 def _hook(module: Any, input: Any, output: Any) -> None:
                     h = output if isinstance(output, torch.Tensor) else output[0]
+                    if (
+                        self._prompt_positions
+                        and layer_idx not in self._prompt_per_layer
+                        and int(h.shape[1]) > self._prompt_positions[-1]
+                    ):
+                        positions = torch.tensor(
+                            self._prompt_positions,
+                            device=h.device,
+                            dtype=torch.long,
+                        )
+                        self._prompt_per_layer[layer_idx] = (
+                            h[0].index_select(0, positions).detach().clone()
+                        )
                     src = h[0, -1, :].detach()
                     if self._incremental:
                         keep_deep_tail = (
@@ -368,6 +390,8 @@ class HiddenCapture:
         # Drop the persistent-buffer source so a later transient capture (or a
         # no-probe gen) can't read stale slices through ``ingest_persistent``.
         self._persistent_buffers = {}
+        self._prompt_positions = ()
+        self._prompt_per_layer = {}
 
     def clear(self) -> None:
         self._per_layer = {}
@@ -381,6 +405,24 @@ class HiddenCapture:
         self._forward_count = 0
         self._batch_forward_count = 0
         self._persistent_buffers = {}
+        self._prompt_positions = ()
+        self._prompt_per_layer = {}
+
+    def set_prompt_positions(self, positions: list[int]) -> None:
+        """Retain selected rows from the first multi-token prefill forward.
+
+        Positions are local to the ``input_ids`` passed into that forward.  A
+        caller using a KV prefix therefore subtracts the cached prefix length
+        before arming the capture.  Persistent latest-slice buffers cannot
+        provide prompt rows; the session forces this mode onto transient hooks.
+        """
+        normalized = tuple(sorted({int(pos) for pos in positions if pos >= 0}))
+        self._prompt_positions = normalized
+        self._prompt_per_layer = {}
+
+    def prompt_stacked(self) -> dict[int, torch.Tensor]:
+        """Return selected prefill rows as ``{layer: [positions, D]}``."""
+        return dict(self._prompt_per_layer)
 
     def tail_slice_at(self, forward_index: int) -> dict[int, torch.Tensor]:
         """Per-layer ``[D]`` slice for decode ``forward_index`` from the tail ring.

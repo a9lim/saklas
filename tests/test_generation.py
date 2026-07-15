@@ -107,6 +107,142 @@ def _decode_echo(ids: torch.Tensor) -> str:
     return "".join(chr(int(t)) for t in ids[0])
 
 
+class _OffsetEchoTokenizer:
+    """Character tokenizer with exact fast-tokenizer-style offsets."""
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [ord(char) for char in text]
+
+    def __call__(self, text: str, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "input_ids": self.encode(text),
+            "offset_mapping": [(i, i + 1) for i in range(len(text))],
+        }
+
+    def decode(self, ids: Any, **_kwargs: Any) -> str:
+        return "".join(chr(int(tid)) for tid in ids)
+
+
+def test_authored_prompt_targets_map_to_producer_rows_after_prefix_cache() -> None:
+    from saklas.core.loom import LoomTree, Recipe
+
+    tree = LoomTree()
+    user_id = tree.add_user_turn(" ab ")
+    assistant_id = tree.begin_assistant(user_id, recipe=Recipe())
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
+    session._tokenizer = _OffsetEchoTokenizer()
+    session.tree = tree
+
+    targets = SaklasSession._pending_authored_prompt_targets(
+        session, assistant_id, raw=False,
+    )
+    assert len(targets) == 1
+    assert "".join(targets[0].token_texts) == " ab "
+
+    prompt = torch.tensor(
+        [[1, *targets[0].token_ids, 2]], dtype=torch.long,
+    )
+    matches, producer_positions = SaklasSession._match_authored_prompt_targets(
+        session, targets, prompt, cache_position_offset=2,
+    )
+
+    assert producer_positions == [0, 1]
+    # The first authored token and its producer are already in the cached
+    # prefix. Later tokens map to suffix-local producer rows.
+    assert matches[0].capture_columns == (None, None, 0, 1)
+
+
+def test_authored_prompt_match_excludes_generation_role_and_preserves_trim() -> None:
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
+    session._tokenizer = _OffsetEchoTokenizer()
+    target = SaklasSession._tokenize_authored_prompt_text(
+        session, "node", " assistant ", thinking=False,
+    )
+    assert target is not None
+    content_ids = session._tokenizer.encode("assistant")
+    # The same word appears again in the synthetic generation header. The
+    # no-generation render length bounds matching to visible message content.
+    prompt = torch.tensor(
+        [[1, *content_ids, 2, *content_ids, 3]], dtype=torch.long,
+    )
+    matches, _positions = SaklasSession._match_authored_prompt_targets(
+        session,
+        [target],
+        prompt,
+        cache_position_offset=0,
+        search_end=2 + len(content_ids),
+    )
+
+    assert matches[0].token_positions[0] == 1
+    assert "".join(matches[0].target.token_texts) == " assistant "
+
+
+def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> None:
+    from saklas.core.loom import LoomTree, Recipe
+    from saklas.core.session import _AuthoredPromptMatch, _AuthoredPromptTarget
+
+    tree = LoomTree()
+    user_id = tree.add_user_turn("x")
+    tree.begin_assistant(user_id, recipe=Recipe(steering="0.2 formal"))
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
+    session.tree = tree
+    session._capture = SimpleNamespace(
+        prompt_stacked=lambda: {0: torch.tensor([[3.0, 4.0]])},
+    )
+
+    def _reading(value: float) -> ProbeReading:
+        return ProbeReading(
+            fraction=0.0,
+            nearest=[],
+            coords=(value,),
+            coords_per_layer={0: (value,)},
+        )
+
+    session._monitor = SimpleNamespace(
+        score_single_token=lambda _hidden: {"formal": _reading(0.25)},
+    )
+    session._live_lens = {"source": "local:default"}
+    session._live_sae = {"source": "saelens:test", "layer": 0}
+    session._authored_lens_capture = lambda _hidden, *, top_k: (
+        {0: [("yes", 0.8)]},
+        [("yes", 0.8, 0.5, 0.1)],
+        {0: [9]},
+        {"jlens/yes": _reading(0.8)},
+    )
+    session._authored_sae_capture = lambda _hidden: (
+        [(12, 1.5, "feature", 3.0)],
+        {"sae/12": _reading(0.5)},
+    )
+    match = _AuthoredPromptMatch(
+        _AuthoredPromptTarget(user_id, False, (120,), ("x",)),
+        (1,),
+        (0,),
+    )
+
+    SaklasSession._persist_authored_prompt_captures(
+        session,
+        [match],
+        monitor_active=True,
+        lens_active=True,
+        sae_active=True,
+        lens_top_k=8,
+        persist_per_layer_scores=True,
+        steering="0.2 formal",
+    )
+
+    row = tree.nodes[user_id].tokens[0]
+    assert row["text"] == "x"
+    assert row["probes"] == {
+        "formal": 0.25,
+        "jlens/yes": 0.8,
+        "sae/12": 0.5,
+    }
+    assert set(row["captured"]) == {"probes", "lens", "sae"}
+    assert row["captured"]["lens"]["layers"][0]["tokens"][0]["id"] == 9
+    assert row["captured"]["sae"]["features"][0]["id"] == 12
+
+
 def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.MonkeyPatch) -> None:
     session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._profiles = {}

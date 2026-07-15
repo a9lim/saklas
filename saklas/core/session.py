@@ -235,6 +235,39 @@ class _PrefixCacheEntry:
 
 
 @dataclass(slots=True)
+class _AuthoredPromptTarget:
+    """One visible authored node channel awaiting its first prompt capture."""
+
+    node_id: str
+    thinking: bool
+    token_ids: tuple[int, ...]
+    token_texts: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _AuthoredPromptMatch:
+    """A target located in the full rendered prompt token sequence."""
+
+    target: _AuthoredPromptTarget
+    token_positions: tuple[int, ...]
+    capture_columns: tuple[int | None, ...] = ()
+
+
+@dataclass(slots=True)
+class _AuthoredPromptCapture:
+    """Per-generation policy for loom-authored prefill measurements."""
+
+    targets: list[_AuthoredPromptTarget]
+    monitor_active: bool
+    lens_active: bool
+    sae_active: bool
+    lens_top_k: int
+    persist_per_layer_scores: bool
+    steering: str | None
+    search_end: int | None = None
+
+
+@dataclass(slots=True)
 class _SerialGenerationJob:
     input: Any
     steering: Any = None
@@ -5718,6 +5751,7 @@ class SaklasSession:
         final_probe_aggregate: bool = True,
         live_lens_active: bool = True,
         live_sae_active: bool = True,
+        capture_prompt: bool = False,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
@@ -5854,6 +5888,7 @@ class SaklasSession:
         # ``return_hidden``) falls back to transient capture hooks.
         use_persistent = bool(
             not widen
+            and not capture_prompt
             # Persistent capture buffers are installed for every layer before
             # compile; layer_idxs selects the subset this generation consumes.
             # Live lens layers can therefore ride the same compile-clean path
@@ -7886,6 +7921,7 @@ class SaklasSession:
         assistant_role: str | None = None,
         to_device: bool = True,
         gen_seat: str = "assistant",
+        add_generation_prompt: bool = True,
     ) -> torch.Tensor:
         if raw and (isinstance(input, str) or input is None):
             # Flat (base-model / completion) path: no chat template, no
@@ -7938,7 +7974,8 @@ class SaklasSession:
         if gen_seat == "assistant":
             gen_role = steer_role if steer_role is not None else assistant_role
             if (
-                steer_role is not None
+                add_generation_prompt
+                and steer_role is not None
                 and assistant_role is not None
                 and steer_role != assistant_role
             ):
@@ -7966,6 +8003,7 @@ class SaklasSession:
         ids = build_chat_input(
             self._tokenizer, messages, self.config.system_prompt,
             thinking=thinking,
+            add_generation_prompt=add_generation_prompt,
             gen_role=gen_role,
             model_type=model_type_for_role,
             scene=self.scene_grammar,
@@ -8054,6 +8092,439 @@ class SaklasSession:
         )
         self._gen_state.reset()
         return input_ids, use_thinking, int(input_ids.shape[1])
+
+    def _tokenize_authored_prompt_text(
+        self,
+        node_id: str,
+        text: str,
+        *,
+        thinking: bool,
+    ) -> _AuthoredPromptTarget | None:
+        """Tokenize visible authored text without changing its rendered bytes.
+
+        Fast-tokenizer offsets let the loom keep the user's exact whitespace
+        while assigning each span to the model token that consumed it.  A slow
+        tokenizer falls back to one-token decodes only when they concatenate
+        byte-for-byte to the original text; otherwise the channel is left plain
+        instead of replacing authored copy with a normalized reconstruction.
+        """
+        token_ids = tuple(int(tid) for tid in self._tokenizer.encode(
+            text, add_special_tokens=False,
+        ))
+        if not token_ids:
+            return None
+
+        pieces: tuple[str, ...] | None = None
+        try:
+            encoded = self._tokenizer(
+                text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            encoded_ids = encoded["input_ids"]
+            offsets = encoded["offset_mapping"]
+            if isinstance(encoded_ids, torch.Tensor):
+                encoded_ids = encoded_ids.detach().to("cpu").tolist()
+            if encoded_ids and isinstance(encoded_ids[0], list):
+                encoded_ids = encoded_ids[0]
+            if isinstance(offsets, torch.Tensor):
+                offsets = offsets.detach().to("cpu").tolist()
+            if offsets and isinstance(offsets[0], list) and len(offsets) == 1:
+                offsets = offsets[0]
+            if tuple(int(tid) for tid in encoded_ids) == token_ids:
+                cursor = 0
+                spans: list[str] = []
+                valid = len(offsets) == len(token_ids)
+                for raw_start, raw_end in offsets:
+                    start, end = int(raw_start), int(raw_end)
+                    if start < 0 or end < start or end > len(text) or end < cursor:
+                        valid = False
+                        break
+                    # Attach gaps (usually leading spaces omitted by a word
+                    # token's formal offset) to the following visible token.
+                    spans.append(text[cursor:end])
+                    cursor = end
+                if valid and spans:
+                    spans[-1] += text[cursor:]
+                    if "".join(spans) == text:
+                        pieces = tuple(spans)
+        except (KeyError, TypeError, ValueError, NotImplementedError):
+            pass
+
+        if pieces is None:
+            decoded: list[str] = []
+            try:
+                for tid in token_ids:
+                    try:
+                        piece = self._tokenizer.decode(
+                            [tid],
+                            skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False,
+                        )
+                    except TypeError:
+                        piece = self._tokenizer.decode(
+                            [tid], skip_special_tokens=False,
+                        )
+                    decoded.append(str(piece))
+            except (AttributeError, TypeError, ValueError):
+                return None
+            if "".join(decoded) != text:
+                return None
+            pieces = tuple(decoded)
+
+        return _AuthoredPromptTarget(
+            node_id=node_id,
+            thinking=thinking,
+            token_ids=token_ids,
+            token_texts=pieces,
+        )
+
+    def _pending_authored_prompt_targets(
+        self,
+        assistant_node_id: str | None,
+        *,
+        raw: bool,
+    ) -> list[_AuthoredPromptTarget]:
+        """Uncaptured authored channels on the prompt path, in render order."""
+        if assistant_node_id is None:
+            return []
+        generated = self.tree.nodes.get(assistant_node_id)
+        if generated is None or generated.parent_id is None:
+            return []
+        targets: list[_AuthoredPromptTarget] = []
+        for node in self.tree.path_to(generated.parent_id):
+            if node.id == self.tree.root_id or node.recipe is not None:
+                continue
+            # Raw/flat rendering ignores thinking_text; chat rendering places
+            # authored thinking before the visible response content.
+            if not raw and node.thinking_text and node.thinking_tokens is None:
+                target = self._tokenize_authored_prompt_text(
+                    node.id, node.thinking_text, thinking=True,
+                )
+                if target is not None:
+                    targets.append(target)
+            if node.text and node.tokens is None:
+                target = self._tokenize_authored_prompt_text(
+                    node.id, node.text, thinking=False,
+                )
+                if target is not None:
+                    targets.append(target)
+        return targets
+
+    @staticmethod
+    def _rfind_token_subsequence(
+        haystack: list[int],
+        needle: tuple[int, ...],
+        end: int,
+    ) -> int:
+        """Rightmost exact token subsequence ending at or before ``end``."""
+        width = len(needle)
+        for start in range(min(end, len(haystack)) - width, -1, -1):
+            if tuple(haystack[start:start + width]) == needle:
+                return start
+        return -1
+
+    def _match_authored_prompt_targets(
+        self,
+        targets: list[_AuthoredPromptTarget],
+        input_ids: torch.Tensor,
+        *,
+        cache_position_offset: int,
+        search_end: int | None = None,
+    ) -> tuple[list[_AuthoredPromptMatch], list[int]]:
+        """Locate visible text in the full prompt and map producer rows.
+
+        Matching walks backward because the generation prompt follows the last
+        visible message and duplicate authored lines are common during rerolls.
+        Positions are first resolved in the full prompt, then translated into
+        the suffix-local coordinates of a KV-prefix hit.  The first suffix token
+        has no producer row in the new forward and is therefore left unscored.
+        """
+        full_ids = [
+            int(tid) for tid in input_ids[0].detach().to("cpu").tolist()
+        ]
+        limit = min(
+            len(full_ids),
+            int(search_end) if search_end is not None else len(full_ids),
+        )
+        reversed_matches: list[_AuthoredPromptMatch] = []
+        for target in reversed(targets):
+            start = self._rfind_token_subsequence(
+                full_ids, target.token_ids, limit,
+            )
+            # Gemma-family templates trim message content before tokenizing.
+            # Preserve the loom's verbatim authored whitespace, but if the
+            # exact standalone token sequence is absent, retry the stripped
+            # content and attach the trimmed edge bytes to its first/last
+            # visible token span. Whitespace the template removed has no model
+            # position of its own, so this is the only faithful display mapping.
+            if start < 0:
+                original_text = "".join(target.token_texts)
+                stripped_text = original_text.strip()
+                if stripped_text and stripped_text != original_text:
+                    stripped_target = self._tokenize_authored_prompt_text(
+                        target.node_id,
+                        stripped_text,
+                        thinking=target.thinking,
+                    )
+                    if stripped_target is not None:
+                        pieces = list(stripped_target.token_texts)
+                        left = original_text[:len(original_text) - len(
+                            original_text.lstrip()
+                        )]
+                        right = original_text[len(original_text.rstrip()):]
+                        pieces[0] = left + pieces[0]
+                        pieces[-1] += right
+                        stripped_target.token_texts = tuple(pieces)
+                        stripped_start = self._rfind_token_subsequence(
+                            full_ids, stripped_target.token_ids, limit,
+                        )
+                        if stripped_start >= 0:
+                            target = stripped_target
+                            start = stripped_start
+            if start < 0:
+                _log.debug(
+                    "authored prompt capture skipped node %s: content tokens "
+                    "not found verbatim in rendered prompt",
+                    target.node_id,
+                )
+                continue
+            positions = tuple(range(start, start + len(target.token_ids)))
+            reversed_matches.append(_AuthoredPromptMatch(target, positions))
+            limit = start
+        matches = list(reversed(reversed_matches))
+
+        effective_producers = sorted({
+            token_position - 1 - cache_position_offset
+            for match in matches
+            for token_position in match.token_positions
+            if token_position - 1 >= cache_position_offset
+        })
+        producer_to_column = {
+            producer: column
+            for column, producer in enumerate(effective_producers)
+        }
+        for match in matches:
+            match.capture_columns = tuple(
+                producer_to_column.get(
+                    token_position - 1 - cache_position_offset
+                )
+                if token_position - 1 >= cache_position_offset
+                else None
+                for token_position in match.token_positions
+            )
+        return matches, effective_producers
+
+    def _authored_lens_capture(
+        self,
+        hidden: dict[int, torch.Tensor],
+        *,
+        top_k: int,
+    ) -> tuple[
+        dict[int, list[tuple[str, float]]],
+        list[tuple[str, float, float, float]],
+        dict[int, list[int]],
+        dict[str, ProbeReading],
+    ] | None:
+        """Live J-LENS payload for one retained authored producer row."""
+        state = self._live_lens
+        if state is None or not self._live_lens_active_for_generation:
+            return None
+        layers = [int(layer) for layer in state["layers"] if int(layer) in hidden]
+        if not layers:
+            return None
+        lens = (
+            self._generation_jlens
+            if self._generation_jlens_active
+            else self.jlens
+        )
+        if lens is None:
+            return None
+        logits = self._jlens_logits_rows(
+            lens, [(layer, hidden[layer]) for layer in layers],
+        )
+        from saklas.core.jlens import readout_probabilities
+
+        probabilities = readout_probabilities(logits)
+        readings = self._score_lens_probes(
+            {}, probabilities=probabilities, layers=layers,
+        ) if self._lens_probes else {}
+        k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
+        values, indices = probabilities.topk(k, dim=-1)
+        value_rows = values.detach().to("cpu").tolist()
+        id_rows = indices.detach().to("cpu").tolist()
+        per_layer: dict[int, list[tuple[str, float]]] = {}
+        token_ids: dict[int, list[int]] = {}
+        for row, layer in enumerate(layers):
+            per_layer[layer] = [
+                (self._jlens_decode_id(int(tid)), float(value))
+                for value, tid in zip(value_rows[row], id_rows[row], strict=True)
+            ]
+            token_ids[layer] = [int(tid) for tid in id_rows[row]]
+        aggregate = self._jlens_aggregate_rows(
+            None, layers, top_k=k, probabilities=probabilities,
+        )
+        return per_layer, aggregate, token_ids, readings
+
+    def _authored_sae_capture(
+        self,
+        hidden: dict[int, torch.Tensor],
+    ) -> tuple[
+        list[tuple[int, float, str | None, float | None]],
+        dict[str, ProbeReading],
+    ] | None:
+        """Live SAE payload for one retained authored producer row."""
+        state = self._live_sae
+        if state is None or not self._live_sae_active_for_generation:
+            return None
+        layer = int(state["layer"])
+        if layer not in hidden:
+            return None
+        activations = self._encode_sae_hidden(hidden[layer])
+        k = min(int(state["top_k"]), int(activations.numel()))
+        values, indices = torch.topk(activations, k=k)
+        value_list = values.detach().to("cpu").tolist()
+        id_list = indices.detach().to("cpu").tolist()
+        raw_by_fid = {
+            int(fid): float(value)
+            for fid, value in zip(id_list, value_list, strict=True)
+        }
+        readings = self._score_sae_probes(
+            activations=activations, raw_by_fid=raw_by_fid,
+        ) if self._sae_probes else {}
+        rows = [
+            (
+                int(fid),
+                float(value),
+                self._sae_label(int(fid)),
+                self._sae_max_act(int(fid)),
+            )
+            for value, fid in zip(value_list, id_list, strict=True)
+        ]
+        return rows, readings
+
+    def _persist_authored_prompt_captures(
+        self,
+        matches: list[_AuthoredPromptMatch],
+        *,
+        monitor_active: bool,
+        lens_active: bool,
+        sae_active: bool,
+        lens_top_k: int,
+        persist_per_layer_scores: bool,
+        steering: str | None,
+    ) -> None:
+        """Score selected prefill rows and attach them to authored loom nodes."""
+        prompt_rows = self._capture.prompt_stacked()
+        if not matches or not prompt_rows:
+            return
+        from saklas.core.token_payloads import TokenProbePayload
+
+        output_rows: list[list[dict[str, Any]]] = [
+            [
+                {
+                    "token_id": int(tid),
+                    "text": text,
+                    "logprob": None,
+                    "perplexity": None,
+                }
+                for tid, text in zip(
+                    match.target.token_ids,
+                    match.target.token_texts,
+                    strict=True,
+                )
+            ]
+            for match in matches
+        ]
+        ordered: list[tuple[int, int, int, int]] = []
+        for match_index, match in enumerate(matches):
+            for token_index, (token_position, column) in enumerate(zip(
+                match.token_positions, match.capture_columns, strict=True,
+            )):
+                if column is not None:
+                    ordered.append((token_position, match_index, token_index, column))
+
+        populated_matches: set[int] = set()
+        for _position, match_index, token_index, column in sorted(ordered):
+            hidden = {
+                layer: rows[column]
+                for layer, rows in prompt_rows.items()
+                if column < int(rows.shape[0])
+            }
+            if not hidden:
+                continue
+            payload = TokenProbePayload()
+            if monitor_active:
+                payload.merge_readings(
+                    self._monitor.score_single_token(hidden),
+                    per_layer=persist_per_layer_scores,
+                )
+
+            lens_payload = lens_aggregate = lens_token_ids = None
+            if lens_active:
+                lens_capture = self._authored_lens_capture(
+                    hidden, top_k=lens_top_k,
+                )
+                if lens_capture is not None:
+                    (
+                        lens_payload,
+                        lens_aggregate,
+                        lens_token_ids,
+                        lens_readings,
+                    ) = lens_capture
+                    payload.merge_readings(
+                        lens_readings, per_layer=persist_per_layer_scores,
+                    )
+
+            sae_payload = None
+            if sae_active:
+                sae_capture = self._authored_sae_capture(hidden)
+                if sae_capture is not None:
+                    sae_payload, sae_readings = sae_capture
+                    payload.merge_readings(
+                        sae_readings, per_layer=persist_per_layer_scores,
+                    )
+
+            shaped = payload.to_token_payload(
+                lens=lens_payload,
+                lens_aggregate=lens_aggregate,
+                lens_token_ids=lens_token_ids,
+                lens_source=(
+                    self._live_lens.get("source")
+                    if self._live_lens is not None else None
+                ),
+                sae=sae_payload,
+                sae_source=(
+                    self._live_sae.get("source")
+                    if self._live_sae is not None else None
+                ),
+                sae_layer=(
+                    int(self._live_sae["layer"])
+                    if self._live_sae is not None else None
+                ),
+                steering=steering,
+            )
+            captured = shaped.get("captured")
+            if not captured:
+                continue
+            row = output_rows[match_index][token_index]
+            if payload.scores:
+                row["probes"] = {
+                    name: round(float(value), 6)
+                    for name, value in payload.scores.items()
+                }
+            if payload.per_layer_scores:
+                row["per_layer_scores"] = payload.per_layer_scores
+            row["captured"] = captured
+            populated_matches.add(match_index)
+
+        for match_index in sorted(populated_matches):
+            match = matches[match_index]
+            self.tree.set_authored_token_scores(
+                match.target.node_id,
+                output_rows[match_index],
+                thinking=match.target.thinking,
+            )
 
     def _compose_gen_config(
         self, sampling: SamplingConfig | None,
@@ -8386,6 +8857,7 @@ class SaklasSession:
         forced_prefix: list[int] | None = None,
         want_perplexity: bool = True,
         cache_token_text: bool = True,
+        authored_capture: _AuthoredPromptCapture | None = None,
     ) -> tuple[list[int], float]:
         """Run the decode loop once capture and steering are installed."""
         cached_pkv = None
@@ -8419,6 +8891,44 @@ class SaklasSession:
             if hit is not None:
                 suffix_ids, cached_pkv, cache_position_offset, cached_static = hit
                 effective_input_ids = suffix_ids
+
+        authored_matches: list[_AuthoredPromptMatch] = []
+        if authored_capture is not None:
+            authored_matches, prompt_positions = self._match_authored_prompt_targets(
+                authored_capture.targets,
+                input_ids,
+                cache_position_offset=cache_position_offset,
+                search_end=authored_capture.search_end,
+            )
+            self._capture.set_prompt_positions(prompt_positions)
+
+        base_step_callback = (
+            self._capture.ingest_persistent
+            if self._capture_state.persistent
+            else self._capture.fire_step_sink
+        )
+        prompt_capture_pending = bool(authored_matches)
+
+        def _step_callback() -> None:
+            nonlocal prompt_capture_pending
+            # The first callback follows the full/suffix prefill.  Score the
+            # visible authored positions in prompt order before the ordinary
+            # final-prompt sink advances curved monitor feet to the state that
+            # produces generated token 0.
+            if prompt_capture_pending and authored_capture is not None:
+                prompt_capture_pending = False
+                self._persist_authored_prompt_captures(
+                    authored_matches,
+                    monitor_active=authored_capture.monitor_active,
+                    lens_active=authored_capture.lens_active,
+                    sae_active=authored_capture.sae_active,
+                    lens_top_k=authored_capture.lens_top_k,
+                    persist_per_layer_scores=(
+                        authored_capture.persist_per_layer_scores
+                    ),
+                    steering=authored_capture.steering,
+                )
+            base_step_callback()
 
         start = time.monotonic()
         composer = self._steering_composer
@@ -8489,11 +8999,7 @@ class SaklasSession:
             # fire the step sink); otherwise ``fire_step_sink`` (the transient
             # hooks already accumulated in-forward).  Both no-op when no per-token
             # sink is installed (aggregate-only / full-retention / no-probe).
-            step_callback=(
-                self._capture.ingest_persistent
-                if self._capture_state.persistent
-                else self._capture.fire_step_sink
-            ),
+            step_callback=_step_callback,
             use_static_cache=use_static_cache,
             forced_prefix=forced_prefix,
             steering_active=bool(
@@ -9062,6 +9568,57 @@ class SaklasSession:
             )
             self._live_lens_active_for_generation = _has_lens_consumer
             self._live_sae_active_for_generation = _has_sae_consumer
+            authored_targets = self._pending_authored_prompt_targets(
+                assistant_node_id, raw=raw,
+            )
+            authored_channels_active = bool(
+                (_live_scores_on and _has_monitor_probes)
+                or _has_lens_consumer
+                or _has_sae_consumer
+            )
+            authored_search_end: int | None = None
+            if authored_targets and authored_channels_active and not raw:
+                content_only_ids = self._prepare_input(
+                    input,
+                    raw=False,
+                    thinking=use_thinking,
+                    stateless=stateless,
+                    parent_node_id=chat_history_anchor,
+                    user_role=(
+                        sampling.user_role if sampling is not None else None
+                    ),
+                    assistant_role=(
+                        sampling.assistant_role if sampling is not None else None
+                    ),
+                    to_device=False,
+                    gen_seat=gen_seat,
+                    add_generation_prompt=False,
+                )
+                authored_search_end = int(content_only_ids.shape[1])
+            authored_recipe_steering = None
+            if assistant_node_id is not None:
+                authored_recipe_node = self.tree.nodes.get(assistant_node_id)
+                if (
+                    authored_recipe_node is not None
+                    and authored_recipe_node.recipe is not None
+                ):
+                    authored_recipe_steering = (
+                        authored_recipe_node.recipe.steering
+                    )
+            authored_capture = (
+                _AuthoredPromptCapture(
+                    targets=authored_targets,
+                    monitor_active=bool(_live_scores_on and _has_monitor_probes),
+                    lens_active=_has_lens_consumer,
+                    sae_active=_has_sae_consumer,
+                    lens_top_k=jlens_top_k,
+                    persist_per_layer_scores=_persists_layer_scores,
+                    steering=authored_recipe_steering,
+                    search_end=authored_search_end,
+                )
+                if authored_targets and authored_channels_active
+                else None
+            )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
@@ -9078,6 +9635,7 @@ class SaklasSession:
                     final_probe_aggregate=return_probe_readings,
                     live_lens_active=_has_lens_consumer,
                     live_sae_active=_has_sae_consumer,
+                    capture_prompt=authored_capture is not None,
                 )
                 self._monitor.begin_live()
                 # Reset the steering manager's TriggerContext for this gen;
@@ -9121,6 +9679,7 @@ class SaklasSession:
                         )
                     ),
                     cache_token_text=_tap_has_text_consumer,
+                    authored_capture=authored_capture,
                 )
             finally:
                 self._gen_state.stop_requested.set()

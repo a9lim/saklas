@@ -1079,6 +1079,40 @@ def test_curved_warm_start_matches_cold_path():
 
 # ========================================== aggregate-only tail capture ===
 
+def test_prompt_capture_retains_only_selected_prefill_positions():
+    """Selective prompt rows survive alongside the ordinary latest slice."""
+    import torch.nn as nn
+
+    from saklas.core.hooks import HiddenCapture
+
+    class _Pass(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    layers = nn.ModuleList([_Pass(), _Pass()])
+    cap = HiddenCapture()
+    cap.attach(layers, [0, 1])
+    cap.set_aggregate_tail(2)
+    cap.set_prompt_positions([0, 2])
+
+    for layer in range(2):
+        values = torch.tensor([
+            [layer * 10.0 + 0.0],
+            [layer * 10.0 + 1.0],
+            [layer * 10.0 + 2.0],
+            [layer * 10.0 + 3.0],
+        ]).reshape(1, 4, 1)
+        layers[layer](values)
+    for layer in range(2):
+        layers[layer](torch.tensor([[[layer * 10.0 + 9.0]]]))
+
+    prompt = cap.prompt_stacked()
+    assert prompt[0].squeeze(-1).tolist() == [0.0, 2.0]
+    assert prompt[1].squeeze(-1).tolist() == [10.0, 12.0]
+    assert cap.latest_per_layer()[0].item() == 9.0
+    assert cap.latest_per_layer()[1].item() == 19.0
+    cap.detach()
+
 def test_aggregate_tail_pools_last_content_token():
     """Aggregate-only capture pools the last *content* token, not the EOS slice.
 

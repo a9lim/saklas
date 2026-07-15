@@ -855,6 +855,19 @@ monitor. It rides the same `HiddenCapture` plumbing as generation;
 (`Monitor.probe_layers`; `attached_layers` survives as an alias for the server/TUI
 surfaces that consumed the former `ManifoldMonitor`).
 
+The same producer-state contract now covers visible authored prompt text. During
+a stateful generation, uncaptured authored loom channels are tokenized with exact
+offsets, located inside the full rendered prompt, and token `j` is paired with
+hidden position `j-1`—exactly as a generated token is paired with the state that
+selected it. `HiddenCapture.set_prompt_positions` retains only those rows during
+the existing prefill; probe, SAE, and J-LENS payloads are then written into the
+authored node as loom-owned historical data before decode proceeds. Prefix-cache
+reuse scores only producer rows present in the new suffix, and an authored-only
+append is scored lazily when a later generation forward-passes it. This adds no
+transformer forward, though the enabled readout heads still do their ordinary
+per-token scoring work. Already-captured authored rows are never overwritten by
+a reroll or source switch.
+
 ### 6.1 One read shape (every field, every token), two execution paths
 
 `_score_full` produces one full `ProbeReading` per probe — **no flat/curved field

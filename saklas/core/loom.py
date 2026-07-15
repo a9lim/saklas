@@ -599,7 +599,8 @@ class LoomMutated:
 
     ``op`` is one of ``"edit"``, ``"branch"``, ``"navigate"``, ``"delete"``,
     ``"star"``, ``"note"``, ``"reset"``, ``"add_user"``, ``"begin_assistant"``,
-    ``"finalize_assistant"``, ``"restore"`` (whole-tree replacement),
+    ``"finalize_assistant"``, ``"capture_authored"``,
+    ``"restore"`` (whole-tree replacement),
     ``"cast"`` (roster change — no node ids;
     clients refetch the roster).
 
@@ -1086,6 +1087,42 @@ class LoomTree:
                 if node.tokens is None:
                     node.tokens = []
                 node.tokens.append(score)
+
+    def set_authored_token_scores(
+        self,
+        node_id: str,
+        scores: list[TokenScoreDict],
+        *,
+        thinking: bool = False,
+    ) -> None:
+        """Attach captured prompt-token measurements to an authored node.
+
+        Unlike :meth:`append_token`, this is a one-shot tree mutation: prompt
+        rows arrive together after prefill, so the revision advances once and
+        clients receive the updated node through the ordinary loom delta.
+        Existing rows are never merged here; the session calls this only for a
+        previously uncaptured authored channel so its original capture remains
+        immutable across later generations.
+        """
+        with self._lock:
+            node = self.nodes.get(node_id)
+            if node is None:
+                raise UnknownNodeError(node_id)
+            if node.recipe is not None:
+                raise InvalidNodeOperationError(
+                    "set_authored_token_scores requires an authored node"
+                )
+            if thinking:
+                node.thinking_tokens = list(scores)
+            else:
+                node.tokens = list(scores)
+            self.rev += 1
+            self._emit(LoomMutated(
+                op="capture_authored",
+                rev=self.rev,
+                updated=(node_id,),
+                active_node_id=self.active_node_id,
+            ))
 
     def finalize_assistant(
         self,
