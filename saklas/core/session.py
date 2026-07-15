@@ -80,7 +80,6 @@ from saklas.core.results import (
     TokenEvent,
 )
 from saklas.core.sampling import SamplingConfig
-from saklas.core.seats import Seat, coerce_seat
 from saklas.core.steering import Steering
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm, ProjectedTerm
 from saklas.core.manifold import Manifold
@@ -7229,25 +7228,28 @@ class SaklasSession:
         parent_node_id: str | None,
         text: str,
         *,
-        seat: Seat,
+        role: Literal["user", "assistant"],
         raw: bool = False,
         role_label: str | None = None,
         thinking: str | None = None,
     ) -> str:
-        """Append one authored span in the native ``human``/``model`` seat.
+        """Append one authored span in a structural chat-template role.
 
-        This is the seat-neutral append primitive. The older
-        :meth:`append_user_turn` and :meth:`append_assistant_turn` methods stay
-        as compatibility adapters for callers that speak chat-protocol roles.
+        This is the role-neutral append primitive. The specialized
+        :meth:`append_user_turn` and :meth:`append_assistant_turn` methods
+        retain their role-specific validation and concatenation behavior.
         """
-        seat = coerce_seat(seat)
-        if seat == "human":
+        if role == "user":
             return self.append_user_turn(
                 parent_node_id,
                 text,
                 allow_any_parent=raw,
                 role_label=role_label,
                 thinking=thinking,
+            )
+        if role != "assistant":
+            raise ValueError(
+                f"role must be 'user' or 'assistant', got {role!r}"
             )
         parent = parent_node_id or self.tree.active_node_id
         return self.append_assistant_turn(
@@ -7265,7 +7267,7 @@ class SaklasSession:
         role_label: str | None = None,
         thinking: str | None = None,
     ) -> str:
-        """Append a model-seat span without generating.
+        """Append an assistant-role span without generating.
 
         If ``user_node_id`` is already an assistant structural role under the
         same effective ``role_label``, ``text`` is concatenated exactly onto
@@ -8128,9 +8130,7 @@ class SaklasSession:
                     sampling.user_role if gen_seat == "user"
                     else sampling.assistant_role
                 )
-            cast_label = explicit_label or (
-                "human" if gen_seat == "user" else "model"
-            )
+            cast_label = explicit_label or gen_seat
         member = self.tree.cast.get(cast_label) if cast_label else None
         if member is None or member.recipe is None:
             return steering, sampling, thinking

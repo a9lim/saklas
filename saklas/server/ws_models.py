@@ -66,17 +66,17 @@ class WSGenerateMessage(NativeRequest):
 
 
 class WSSubmitMessage(NativeRequest):
-    """Native seat-neutral chat submission.
+    """Native role-neutral chat submission.
 
-    ``text`` plus ``authored_seat`` appends a span.  ``generated_seat`` then
+    ``text`` plus ``authored_role`` appends a span.  ``generated_role`` then
     optionally asks the model to continue from it; omit it for append-only.
-    With no text, ``generated_seat`` is a bare continue from the selected leaf.
+    With no text, ``generated_role`` is a bare continue from the selected leaf.
     """
 
     type: Literal["submit"]
     text: str | None = None
-    authored_seat: Literal["human", "model"] | None = None
-    generated_seat: Literal["human", "model"] | None = None
+    authored_role: Literal["user", "assistant"] | None = None
+    generated_role: Literal["user", "assistant"] | None = None
     steering: str | None = None
     sampling: WSSamplingParams | None = None
     thinking: bool | None = None

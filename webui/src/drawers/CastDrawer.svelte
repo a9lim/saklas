@@ -9,8 +9,8 @@
   //
   // This drawer also owns the two active structural-role labels.  The
   // composer chooses between those labels without separately exposing their
-  // human/model template seats; a turn labeled with a member's slug generates
-  // under its recipe.
+  // canonical user/assistant roles; a turn labeled with a member's slug
+  // generates under its recipe.
 
   import { apiTree } from "../lib/api";
   import {
@@ -45,16 +45,16 @@
     !busy && label.trim() !== "" && SLUG_RE.test(label.trim()),
   );
 
-  const defaultHumanRole = $derived(
-    sessionState.info?.default_user_role ?? "human",
+  const defaultUserRole = $derived(
+    sessionState.info?.default_user_role ?? "user",
   );
-  const defaultModelRole = $derived(
-    sessionState.info?.default_assistant_role ?? "model",
+  const defaultAssistantRole = $derived(
+    sessionState.info?.default_assistant_role ?? "assistant",
   );
   const standardRoles = $derived(
-    [...new Set([defaultHumanRole, defaultModelRole])],
+    [...new Set([defaultUserRole, defaultAssistantRole])],
   );
-  // The server roster is keyed by Saklas's structural seats. Present those
+  // The server roster is keyed by Saklas's structural roles. Present those
   // two entries through the model's actual chat-template vocabulary, while
   // retaining the hidden key so structural cast recipes still round-trip.
   const roster = $derived.by(() => {
@@ -64,13 +64,13 @@
     >();
     for (const [key, member] of Object.entries(castState.roster)) {
       const displayLabel =
-        key === "human"
-          ? defaultHumanRole
-          : key === "model"
-            ? defaultModelRole
+        key === "user"
+          ? defaultUserRole
+          : key === "assistant"
+            ? defaultAssistantRole
             : key;
       const existing = byLabel.get(displayLabel);
-      const structural = key === "human" || key === "model";
+      const structural = key === "user" || key === "assistant";
       if (!existing || structural) {
         byLabel.set(displayLabel, { key, label: displayLabel, member });
       }
@@ -91,21 +91,21 @@
         .filter((role) => !standardRoles.includes(role)),
     ].map((value) => ({ value, label: value })),
   );
-  const humanRoleSupported = $derived(
+  const userRoleSupported = $derived(
     sessionState.info?.is_base_model === false
       && sessionState.info?.user_role_supported === true,
   );
-  const modelRoleSupported = $derived(
+  const assistantRoleSupported = $derived(
     sessionState.info?.is_base_model === false
       && sessionState.info?.role_substitution_supported === true,
   );
-  const humanRoleValid = $derived(
-    samplingState.human_role.trim() === ""
-      || ROLE_SLUG_RE.test(samplingState.human_role.trim()),
+  const userRoleValid = $derived(
+    samplingState.user_role.trim() === ""
+      || ROLE_SLUG_RE.test(samplingState.user_role.trim()),
   );
-  const modelRoleValid = $derived(
-    samplingState.model_role.trim() === ""
-      || ROLE_SLUG_RE.test(samplingState.model_role.trim()),
+  const assistantRoleValid = $derived(
+    samplingState.assistant_role.trim() === ""
+      || ROLE_SLUG_RE.test(samplingState.assistant_role.trim()),
   );
 
   function loadMember(slug: string, key: string): void {
@@ -173,31 +173,31 @@
   </header>
 
   <div class="body">
-    <div class="seat-map" aria-label="Active role labels">
+    <div class="role-map" aria-label="Active role labels">
       <span class="form-title">active roles</span>
-      <div class="seat-grid">
+      <div class="role-grid">
         <label class="field">
-          <span class="label">{defaultHumanRole} role</span>
+          <span class="label">{defaultUserRole} role</span>
           <Combobox
-            bind:value={samplingState.human_role}
+            bind:value={samplingState.user_role}
             options={roleOptions}
-            disabled={!humanRoleSupported}
-            invalid={!humanRoleValid}
-            placeholder={defaultHumanRole}
+            disabled={!userRoleSupported}
+            invalid={!userRoleValid}
+            placeholder={defaultUserRole}
             spellcheck={false}
-            ariaLabel={`${defaultHumanRole} role label`}
+            ariaLabel={`${defaultUserRole} role label`}
           />
         </label>
         <label class="field">
-          <span class="label">{defaultModelRole} role</span>
+          <span class="label">{defaultAssistantRole} role</span>
           <Combobox
-            bind:value={samplingState.model_role}
+            bind:value={samplingState.assistant_role}
             options={roleOptions}
-            disabled={!modelRoleSupported}
-            invalid={!modelRoleValid}
-            placeholder={defaultModelRole}
+            disabled={!assistantRoleSupported}
+            invalid={!assistantRoleValid}
+            placeholder={defaultAssistantRole}
             spellcheck={false}
-            ariaLabel={`${defaultModelRole} role label`}
+            ariaLabel={`${defaultAssistantRole} role label`}
           />
         </label>
       </div>
@@ -355,12 +355,12 @@
     font-size: var(--text-sm);
     line-height: 1.4;
   }
-  .seat-map {
+  .role-map {
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
   }
-  .seat-grid {
+  .role-grid {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: var(--space-3);

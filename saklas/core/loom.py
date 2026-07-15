@@ -42,7 +42,6 @@ from typing import Any, Callable, Iterator, Literal, cast
 
 from saklas.core.errors import SaklasError
 from saklas.core.sampling import SamplingConfig
-from saklas.core.seats import chat_role_to_seat
 
 # ---------------------------------------------------------------------------
 # ulid — tiny inline implementation
@@ -441,7 +440,7 @@ class LoomNode:
     # ``_active_role`` (transient, never persisted here).
     role_label: str | None = None
     # Verbatim thinking text for the turn — a committed thinking block
-    # the human typed (any seat), or the decoded thinking channel of a
+    # the author typed (any role), or the decoded thinking channel of a
     # generated node (stamped at finalize).  Rendered through the family
     # think delimiters by the scene stitcher, which applies the family's
     # history policy (strip families render it only while the turn is
@@ -481,13 +480,6 @@ class LoomNode:
     # turns, and is persisted explicitly rather than inferred from absence.
     raw_token_ids: list[int] | None = None
 
-    @property
-    def seat(self) -> str | None:
-        """Native structural seat, independent of who authored the turn."""
-        if self.role == "system":
-            return None
-        return chat_role_to_seat(self.role)
-
     def to_dict(self, *, include_tokens: bool = False) -> dict[str, Any]:
         out: dict[str, Any] = {
             "id": self.id,
@@ -517,10 +509,7 @@ class LoomNode:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LoomNode":
         required = _NODE_FIELDS_WITH_TOKENS if "tokens" in data else _NODE_FIELDS
-        # Native tree responses add the derived human/model ``seat`` beside
-        # the persisted chat-protocol ``role``.  Accept it on restore, but
-        # never persist it as a second source of truth.
-        _require_fields(data, required, "loom node", optional=frozenset({"seat"}))
+        _require_fields(data, required, "loom node")
         recipe = None
         if data["recipe"] is not None:
             if not isinstance(data["recipe"], dict):
@@ -528,16 +517,6 @@ class LoomNode:
             recipe = Recipe.from_dict(data["recipe"])
         if data["role"] not in ("user", "assistant", "system"):
             raise LoomTreeError(f"invalid loom node role {data['role']!r}")
-        expected_seat = (
-            "human" if data["role"] == "user"
-            else "model" if data["role"] == "assistant"
-            else None
-        )
-        if "seat" in data and data["seat"] != expected_seat:
-            raise LoomTreeError(
-                f"loom node seat {data['seat']!r} disagrees with role "
-                f"{data['role']!r}"
-            )
         if not isinstance(data["id"], str) or not data["id"]:
             raise LoomTreeError("loom node field 'id' must be a non-empty string")
         if data["parent_id"] is not None and not isinstance(data["parent_id"], str):
@@ -837,7 +816,7 @@ class LoomTree:
     def cast_roster(self) -> dict[str, CastMember]:
         """Return the configured cast plus every role observed in the tree.
 
-        ``human`` and ``model`` are structural defaults and therefore always
+        ``user`` and ``assistant`` are structural defaults and therefore always
         exist.  Per-turn labels join the roster automatically across the whole
         loom (not merely the active path), so navigation cannot make speakers
         flicker in and out.  Explicit members win because they may carry a
@@ -845,13 +824,13 @@ class LoomTree:
         """
         with self._lock:
             roster: dict[str, CastMember] = {
-                "human": CastMember(),
-                "model": CastMember(),
+                "user": CastMember(),
+                "assistant": CastMember(),
             }
             for node in self.nodes.values():
                 if node.role == "system":
                     continue
-                label = node.role_label or node.seat
+                label = node.role_label or node.role
                 if label:
                     roster.setdefault(label, CastMember())
             roster.update(self.cast)
@@ -1197,7 +1176,7 @@ class LoomTree:
         """Append authored text to an existing same-role message.
 
         A node-level generation receipt cannot faithfully describe a message
-        after a human-authored tail is added, so generated payloads are
+        after an authored tail is added, so generated payloads are
         cleared and the node becomes an authored message.  The tree shape is
         unchanged and the existing node stays active.
         """
@@ -1454,9 +1433,9 @@ class LoomTree:
             if len(path) < 2:
                 return  # nothing meaningful to rewind from
             # Walk back one whole submission when the active node carries a
-            # generation receipt, otherwise one committed turn.  Seat is
-            # identity, not provenance: swapped model→human submissions rewind
-            # exactly like human→model ones.
+            # generation receipt, otherwise one committed turn. Structural
+            # role is independent of provenance: swapped assistant→user
+            # submissions rewind exactly like user→assistant ones.
             anchor = path[-1]
             steps = 2 if anchor.recipe is not None else 1
             target_idx = max(0, len(path) - 1 - steps)

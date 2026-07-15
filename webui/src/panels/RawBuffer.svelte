@@ -140,15 +140,15 @@
   function submitBuffer(): void {
     if (genStatus.active) return;
     const d = resolveDivergence();
-    // The divergence tail is the authored human span; generation occupies
-    // the model seat. A clean buffer omits the authored half entirely.
+    // The divergence tail is an authored user span; generation occupies the
+    // assistant role. A clean buffer omits the authored half entirely.
     const text = d.tail === "" ? null : d.tail;
     committing = true;
     dirty = false;
     void sendSubmit(
       text,
-      text === null ? null : "human",
-      "model",
+      text === null ? null : "user",
+      "assistant",
       { raw: true, parent_node_id: d.parentNodeId },
     );
   }
@@ -169,7 +169,7 @@
     committing = true;
     await sendSubmit(
       d.tail,
-      "human",
+      "user",
       null,
       { raw: true, parent_node_id: d.parentNodeId ?? null },
     );

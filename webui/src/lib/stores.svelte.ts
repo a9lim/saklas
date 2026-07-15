@@ -55,7 +55,7 @@ import type {
   TokenScore,
   Trigger,
   Variant,
-  Seat,
+  ChatRole,
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
@@ -761,13 +761,13 @@ let _roleDefaultsModelId: string | null = null;
 
 function _hydrateSamplingFromInfo(): void {
   const info = sessionState.info;
-  // Structural seats stay human/model; the editable values are the actual
-  // role labels used by this model family's chat template. Seed once per
+  // The editable values are the actual labels used by this model family's
+  // chat template. Seed once per
   // loaded model so ordinary refreshes never erase a custom cast label.
   if (info && _roleDefaultsModelId !== info.model_id) {
     _roleDefaultsModelId = info.model_id;
-    samplingState.human_role = info.default_user_role ?? "human";
-    samplingState.model_role = info.default_assistant_role ?? "model";
+    samplingState.user_role = info.default_user_role ?? "user";
+    samplingState.assistant_role = info.default_assistant_role ?? "assistant";
   }
   const cfg = info?.config;
   if (!cfg) return;
@@ -817,10 +817,10 @@ export function roleDisplayLabel(
 ): string {
   if (roleLabel) return roleLabel;
   if (role === "user") {
-    return sessionState.info?.default_user_role ?? "human";
+    return sessionState.info?.default_user_role ?? "user";
   }
   if (role === "assistant") {
-    return sessionState.info?.default_assistant_role ?? "model";
+    return sessionState.info?.default_assistant_role ?? "assistant";
   }
   return role;
 }
@@ -1889,7 +1889,7 @@ function nodeToTurn(n: LoomNodeJSON): ChatTurn {
     });
     turn.thinking = true;
   } else if (n.thinking_text) {
-    // Committed thinking block (no token rows — the human typed it):
+    // Committed thinking block (no token rows — the author typed it):
     // one synthesized row renders it through the same collapsible the
     // streamed thinking channel uses.
     turn.thinkingTokens = [{ text: n.thinking_text, thinking: true }];
@@ -2412,12 +2412,11 @@ export interface SamplingState {
    *  "show alts" toggle in ``SamplingStrip``; the canonical "on" value
    *  is ``8`` per Decision 1 of ``docs/plans/logit-pass.md``. */
   return_top_k: number;
-  /** Native cast labels for the structural human/model seats.  Sticky
+  /** Active chat-template labels for the structural user/assistant roles. Sticky
    *  client state like ``seed`` — whatever's in the boxes rides the next
-   *  submission and is stamped onto that turn's loom node.  The wire adapter
-   *  lowers custom values to ``user_role`` / ``assistant_role``. */
-  human_role: string;
-  model_role: string;
+   *  submission and is stamped onto that turn's loom node. */
+  user_role: string;
+  assistant_role: string;
 }
 
 export const samplingState: SamplingState = $state({
@@ -2431,8 +2430,8 @@ export const samplingState: SamplingState = $state({
   logit_bias_text: "",
   presence_penalty: 0,
   frequency_penalty: 0,
-  human_role: "human",
-  model_role: "model",
+  user_role: "user",
+  assistant_role: "assistant",
   // Initial thinking state: explicit ``false`` so an unchecked checkbox
   // on first paint actually sends ``thinking: false`` to the server.
   // The previous ``null`` (auto) state silently fell through to whatever
@@ -2561,15 +2560,15 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
     // and the bubble keeps its structural heading.  Only a genuine override
     // (a label the user changed away from the default) is sent.
     ...roleOverride(
-      samplingState.human_role,
+      samplingState.user_role,
       sessionState.info?.default_user_role,
-      "human",
+      "user",
       "user_role",
     ),
     ...roleOverride(
-      samplingState.model_role,
+      samplingState.assistant_role,
       sessionState.info?.default_assistant_role,
-      "model",
+      "assistant",
       "assistant_role",
     ),
   };
@@ -2580,7 +2579,7 @@ function nonDefaultSamplingOverrides(): Partial<WSSampling> {
 function roleOverride(
   raw: string,
   fallback: string | null | undefined,
-  structural: "human" | "model",
+  structural: ChatRole,
   key: "user_role" | "assistant_role",
 ): Partial<WSSampling> {
   const value = raw.trim();
@@ -3360,63 +3359,63 @@ export interface SendSubmitOpts {
 
 function submitLabel(
   text: string | null,
-  generatedSeat: Seat | null,
+  generatedRole: ChatRole | null,
 ): string {
-  if (generatedSeat === null) return "append";
+  if (generatedRole === null) return "append";
   if (text === null) return "generate";
   return "send";
 }
 
 function buildSubmitPending(
   text: string | null,
-  authoredSeat: Seat | null,
-  generatedSeat: Seat | null,
+  authoredRole: ChatRole | null,
+  generatedRole: ChatRole | null,
   opts: Omit<SendSubmitOpts, "replaceSlot">,
 ): PendingAction {
   return {
     id: `pa-${_pendingCounter++}`,
-    label: submitLabel(text, generatedSeat),
+    label: submitLabel(text, generatedRole),
     text,
-    apply: () => sendSubmitNow(text, authoredSeat, generatedSeat, opts),
+    apply: () => sendSubmitNow(text, authoredRole, generatedRole, opts),
     awaitsGen: true,
     rebuild: text === null
       ? null
       : (newText: string) =>
-          buildSubmitPending(newText, authoredSeat, generatedSeat, opts),
+          buildSubmitPending(newText, authoredRole, generatedRole, opts),
     createdAt: Date.now(),
     endsOnUserNode:
-      (generatedSeat ?? authoredSeat) === "human"
+      (generatedRole ?? authoredRole) === "user"
         ? true
-        : (generatedSeat ?? authoredSeat) === "model"
+        : (generatedRole ?? authoredRole) === "assistant"
           ? false
           : null,
   };
 }
 
-/** Send one native human/model submission.
+/** Send one native role-neutral submission.
  *
- * Text is appended in ``authoredSeat``.  ``generatedSeat`` optionally
+ * Text is appended in ``authoredRole``. ``generatedRole`` optionally
  * follows it with a decode; omit it for append-only.  With no text, the
- * generated seat continues directly from the selected leaf.  No branch
+ * generated role continues directly from the selected leaf. No branch
  * depends on the selected node's role.
  */
 export async function sendSubmit(
   text: string | null,
-  authoredSeat: Seat | null,
-  generatedSeat: Seat | null,
+  authoredRole: ChatRole | null,
+  generatedRole: ChatRole | null,
   opts: SendSubmitOpts = {},
 ): Promise<void> {
   if (text !== null && text === "") return;
-  if (text !== null && authoredSeat === null) {
-    throw new Error("A text submission requires an authored seat");
+  if (text !== null && authoredRole === null) {
+    throw new Error("A text submission requires an authored role");
   }
-  if (text === null && generatedSeat === null) return;
+  if (text === null && generatedRole === null) return;
   if (isPendingBusy()) {
     const { replaceSlot, ...queuedOpts } = opts;
     const item = buildSubmitPending(
       text,
-      authoredSeat,
-      generatedSeat,
+      authoredRole,
+      generatedRole,
       queuedOpts,
     );
     enqueuePending(
@@ -3432,13 +3431,13 @@ export async function sendSubmit(
     );
     return;
   }
-  return sendSubmitNow(text, authoredSeat, generatedSeat, opts);
+  return sendSubmitNow(text, authoredRole, generatedRole, opts);
 }
 
 async function sendSubmitNow(
   text: string | null,
-  authoredSeat: Seat | null,
-  generatedSeat: Seat | null,
+  authoredRole: ChatRole | null,
+  generatedRole: ChatRole | null,
   opts: Omit<SendSubmitOpts, "replaceSlot"> = {},
 ): Promise<void> {
   if (!loomTree.loaded) {
@@ -3459,8 +3458,8 @@ async function sendSubmitNow(
   const payload: WSClientMessage = {
     type: "submit",
     text,
-    authored_seat: authoredSeat,
-    generated_seat: generatedSeat,
+    authored_role: authoredRole,
+    generated_role: generatedRole,
     steering: steering || null,
     sampling,
     thinking: samplingState.thinking ?? false,

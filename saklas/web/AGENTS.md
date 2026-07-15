@@ -29,8 +29,8 @@ The dashboard speaks the native `/saklas/v1/*` API (registered by
 
 **Current composer contract (supersedes the legacy generate/seat wording
 below):** `Chat.svelte` sends `type:"submit"` with explicit native
-`authored_seat` / `generated_seat` (`human|model`). Two visible role controls
-select those seats independently while displaying their current role labels;
+`authored_role` / `generated_role` (`user|assistant`). Two visible role controls
+select those roles independently while displaying their chat-template labels;
 the continuation control also accepts `none` for authored-only append, and a
 one-shot swap action exchanges the current pair. The template-channel seat stays
 an implementation detail in the composer. Selected-node role never changes
@@ -41,7 +41,7 @@ Matching structural role + effective role label coalesces into one message.
 `type:"generate"` remains for specialist fork/prefill and compatibility.
 Result actions/rendering key off artifacts (`recipe`, token rows,
 `raw_token_ids`, logprobs), not assistant role. The cast is structural
-human/model plus labels observed anywhere in the tree, overlaid by configured
+user/assistant plus labels observed anywhere in the tree, overlaid by configured
 recipes/notes; effective roster rows carry `origin`.
 
 - **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. With probes loaded, the `token` event carries `scores` (`dict[str, float]`, the magnitude-weighted axis-0 aggregate — drives the highlight tinting), `per_layer_scores` (`dict[str, dict[str, float]]`, string-keyed, feeds the token-drilldown heatmap), `probe_readings` (`Record<name, ProbeReading>` — the unified per-probe reading for *every* probe shape, flat or curved, populated whenever any probe is attached), `raw_index` (decode-step index into the backing node's `raw_token_ids`), and — while the live lens is on — `lens_readout` (`Record<layerStr, [token, score][]>`, the per-step J-lens top-k matrix) plus `lens_aggregate` (`[token, strength, com, spread][]` 4-arrays, strength-descending — the layer-aggregated chip list feeding the J-LENS tab's WORKSPACE section). The `done` event's `result` carries `probe_readings` of the **same** `ProbeReading` shape (aggregated at the last-content token, so per-token and aggregate are one shape). The composer uses `type:"submit"`; authored-only submissions return `result.kind="append"`. A `generate` message with `fork_node_id`/`fork_raw_index`/`fork_alt_token_id` is the **logit fork** — replays the node's raw decode prefix with one token swapped, resampling the continuation as a sibling. A `generate` with `prefill_node_id`/`prefill_text` is the compatibility **answer-prefill** path. Legacy `commit_role`/`commit_text` fields remain accepted for older clients and keep their legacy `result.kind="commit"`; new UI code must not use them for the composer.
@@ -306,34 +306,33 @@ its resumable checkpoint.
 
 `RawBuffer` is the base-model surface.  `SessionInfo.is_base_model` (a non-chat model has no chat template) drives `genUiMode.effectiveRawMode()`; the `genUiMode.override` (`auto`/`chat`/`raw`, persisted per `model_id`, set from the AdvancedSamplingDrawer control or the cycling badge in the Chat header) wins when not `auto`.  In raw mode `Chat.svelte` renders `<RawBuffer />` instead of role bubbles — one continuous editable `pre-wrap` surface with the loom active path joined as plain text, no roles.
 
-Flat mode is non-linear: editing text anywhere in the buffer and appending past its end are the *same* operation. `resolveDivergence()` diffs the draft against the settled buffer, finds the first changed character, and the tail from there becomes one new span. **send** submits that tail as `human` and generates `model`; a clean buffer shows **generate** and omits the authored half; the explicit **append** button submits only the `human` tail. There is no append modifier shortcut. All three use the same native `sendSubmit(..., {raw:true})` contract as chat. The divergence node and its subtree are preserved as the original branch—an edit never overwrites a model-authored span in place. The internal `committing` latch holds the buffer→draft sync across the server round trip so the typed tail does not flash out; it releases on a content check (`bufferText.startsWith(draft)`) and suppresses the tinted mirror while held. Toggling the mode never mutates the tree. Per-token tinting rides a read-only mirror layer behind the transparent-text textarea (a textarea cannot tint spans) and shows only when not actively editing.
+Flat mode is non-linear: editing text anywhere in the buffer and appending past its end are the *same* operation. `resolveDivergence()` diffs the draft against the settled buffer, finds the first changed character, and the tail from there becomes one new span. **send** submits that tail as `user` and generates `assistant`; a clean buffer shows **generate** and omits the authored half; the explicit **append** button submits only the `user` tail. There is no append modifier shortcut. All three use the same native `sendSubmit(..., {raw:true})` contract as chat. The divergence node and its subtree are preserved as the original branch—an edit never overwrites a generated span in place. The internal `committing` latch holds the buffer→draft sync across the server round trip so the typed tail does not flash out; it releases on a content check (`bufferText.startsWith(draft)`) and suppresses the tinted mirror while held. Toggling the mode never mutates the tree. Per-token tinting rides a read-only mirror layer behind the transparent-text textarea (a textarea cannot tint spans) and shows only when not actively editing.
 
 `lib/expression.ts` — every term is a `%` position. `serializeExpression(rack, subspaceAlong = 1)` emits subspace terms first (each at the shared `subspaceAlong` magnitude) then manifold terms (each at its own `along[,onto]`), picking the production from `entry.mode`. `parseExpression(expr, { isFlat? })` returns `{ rack, subspaceAlong, warnings }`: a `%` term with an `onto` coeff or a non-flat catalog `fit_mode` lands `manifold`, else `subspace` (magnitude collected into `subspaceAlong`; a later subspace term whose magnitude differs folds onto the shared value with a warning); a bare-pole term (`0.5 formal.casual`) becomes a label-form subspace term toward the signed pole. The pre-4.1 `~`/`|` projection and `!` ablation still **parse** (so pasted expressions don't throw) but the operator is dropped with a `warnings` entry. The `%` coefficient slot is `along[,onto]`: serialize emits `<along>,<onto>` when `onto > 0` and `<along>` alone otherwise; the parser reads a pre-selector comma-run of ≤ 2 (mirroring the engine's `coeff := signed_float ("," signed_float)?`), lexically unambiguous from the post-`%` coord commas. `:variant` rides the atom (`name:sae%pos`) and survives on every term shape; keep the variant list in parity with the Python grammar (`raw`, `sae`, `sae-*`, `role`, `role-*`, `from`, `from-*`) — there is no `pca` variant. The round-trip invariant is parse(serialize(rack, G)) reproducing `rack` + `G` for any serializer output.
 
-The current composer is seat-neutral. Its two structural seats are always
-`human` and `model`; `samplingState.human_role` / `model_role` are the editable
-chat-template labels for those seats and seed once per model from
+The current composer is role-neutral. Its two structural roles are always
+`user` and `assistant`; `samplingState.user_role` / `assistant_role` are the editable
+chat-template labels for those roles and seed once per model from
 `SessionInfo.default_user_role` / `default_assistant_role` (Gemma therefore
 shows `user` / `model`). Only genuine overrides lower to protocol `user_role` /
 `assistant_role` in `buildSamplingPayload`. `CastDrawer` owns those two editable
 labels through the Saklas `Combobox`, whose themed list combines both model
 defaults with every genuinely custom role observed in the auto-derived tree cast;
-the structural `human` / `model` roster keys are presented through those model
+the structural `user` / `assistant` roster keys are presented through those model
 defaults instead of leaking into the list as extra roles. The composer
-shows the resulting labels in ordinary `Select` controls and keeps the backing
-human/model seat out of the primary surface; never reintroduce a native
+shows the resulting labels in ordinary `Select` controls; never reintroduce a native
 `datalist`.
 
 `Chat.svelte` exposes a visible two-part turn plan. **you write** selects the
 authored role; **model writes** independently selects a generated role or `none`
-for an authored-only append. Each visible role option carries its structural
-human/model seat internally. A one-shot `⇄` exchanges the two selected roles; it
+for an authored-only append. Each visible role option carries its canonical
+user/assistant role internally. A one-shot `⇄` exchanges the two selected roles; it
 is not a persistent mode. Non-empty text with a generated role is **send**, empty
 text with a generated role is **generate**, and selecting `none` is **append**.
 There is no append shortcut. Selection chooses the branch anchor but never
 changes these meanings. Scene mode gates nonstandard role choices because legacy
-templates cannot open a human-seat generation header or freely commit model-seat
-text.
+templates cannot open a user-role generation header or freely commit
+assistant-role text.
 
 Same effective roles coalesce throughout the engine. `append_user_turn` /
 `append_assistant_turn` append authored text in place when the selected leaf has
@@ -351,8 +350,8 @@ use the same tinted-glass `Button` treatment; the action label changes among
 `send` / `generate` / `append`. Regeneration is message-local: every non-system
 bubble renders a small flat `↻` button immediately after its role chip and calls
 `loomRegenerateNode(node_id)`. The replacement is a generated sibling in the
-same structural seat, so authored and generated human/model messages are all
-rerollable without consulting provenance.
+same structural role, so every non-system message is rerollable without
+consulting provenance.
 
 Every speaker still renders as one neutral glass card with identity in the role
 chip; system nodes are stage directions. The cast manager (`cast…`) owns the

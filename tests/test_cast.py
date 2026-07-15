@@ -51,10 +51,10 @@ def test_no_label_no_change():
     assert _apply(stub, sampling=s) == (None, s, None)
 
 
-def test_structural_model_member_applies_without_custom_label():
+def test_structural_assistant_member_applies_without_custom_label():
     stub = _Stub()
     stub.tree.set_cast_member(
-        "model", CastMember(recipe=Recipe(steering="0.2 concise")),
+        "assistant", CastMember(recipe=Recipe(steering="0.2 concise")),
     )
     steering, _, _ = _apply(stub)
     assert steering == "0.2 concise"

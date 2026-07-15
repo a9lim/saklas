@@ -10,7 +10,12 @@
   // Empty result (no generated turn yet, or last turn had no readings)
   // → renders a notice and disables the download button.
 
-  import { chatLog, samplingState, closeDrawer } from "../lib/stores.svelte";
+  import {
+    chatLog,
+    samplingState,
+    closeDrawer,
+    roleDisplayLabel,
+  } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
   import Radio from "../lib/Radio.svelte";
 
@@ -60,8 +65,8 @@
       seed: samplingState.seed,
     };
     return {
-      seat: turn.role === "user" ? "human" : "model",
-      role: turn.roleLabel ?? (turn.role === "user" ? "human" : "model"),
+      structural_role: turn.role,
+      role: roleDisplayLabel(turn.role, turn.roleLabel),
       text: turn.text ?? "",
       thinking: turn.thinking ?? false,
       applied_steering: turn.appliedSteering ?? null,
@@ -100,7 +105,7 @@
     const readings = (rec.readings ?? {}) as Record<string, number>;
     const sampling = (rec.sampling ?? {}) as Record<string, unknown>;
     const cols: { key: string; value: unknown }[] = [
-      { key: "seat", value: rec.seat },
+      { key: "structural_role", value: rec.structural_role },
       { key: "role", value: rec.role },
       { key: "text", value: rec.text },
       { key: "thinking", value: rec.thinking },

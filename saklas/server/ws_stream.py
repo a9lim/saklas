@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, cast
+from typing import Any, Awaitable, Callable, Literal, cast
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
@@ -25,7 +25,6 @@ from saklas.core.errors import SaklasError
 from saklas.core.loom import LoomMutated
 from saklas.core.results import GenerationResult, TokenAlt
 from saklas.core.sampling import SamplingConfig
-from saklas.core.seats import Seat, chat_role_to_seat, seat_to_chat_role
 from saklas.core.session import SaklasSession
 from saklas.core.token_callback import TokenConsumer, TokenConsumerOptions
 from saklas.core.steering import Steering
@@ -361,23 +360,23 @@ async def _ws_handle_generate(
     """
     loop = asyncio.get_running_loop()
 
-    # ``submit`` is the native composer contract: an explicit authored seat
-    # plus an optional generated seat.  Normalize its generation half to the
+    # ``submit`` is the native composer contract: an explicit authored role
+    # plus an optional generated role.  Normalize its generation half to the
     # legacy adapter shape while retaining the authored turn for one atomic
     # commit inside the generation worker (the async session lock below covers
     # the whole commit + N-way fan).  ``generate`` remains accepted for protocol
     # compatibility and the specialist fork/prefill tools.
     submit = msg if isinstance(msg, WSSubmitMessage) else None
     submit_text: str | None = None
-    submit_authored_seat: Seat | None = None
+    submit_authored_role: Literal["user", "assistant"] | None = None
     submit_authored_thinking: str | None = None
-    native_commit_seat: Seat | None = None
+    native_commit_role: Literal["user", "assistant"] | None = None
     if submit is not None:
         if submit.text is None:
-            if submit.authored_seat is not None:
+            if submit.authored_role is not None:
                 await send_json({
                     "type": "error",
-                    "message": "authored_seat requires non-empty text",
+                    "message": "authored_role requires non-empty text",
                     "code": "ValueError",
                     "status": 400,
                 })
@@ -399,21 +398,21 @@ async def _ws_handle_generate(
                     "status": 400,
                 })
                 return
-            if submit.authored_seat is None:
+            if submit.authored_role is None:
                 await send_json({
                     "type": "error",
-                    "message": "text requires authored_seat",
+                    "message": "text requires authored_role",
                     "code": "ValueError",
                     "status": 400,
                 })
                 return
             submit_text = submit.text
-            submit_authored_seat = submit.authored_seat
+            submit_authored_role = submit.authored_role
             submit_authored_thinking = submit.authored_thinking
-        if submit.generated_seat is None and submit_text is None:
+        if submit.generated_role is None and submit_text is None:
             await send_json({
                 "type": "error",
-                "message": "submit requires text or generated_seat",
+                "message": "submit requires text or generated_role",
                 "code": "ValueError",
                 "status": 400,
             })
@@ -422,12 +421,12 @@ async def _ws_handle_generate(
         # Append-only submissions can use the established no-decode path.
         # Append+generate keeps the authored fields above and generates from
         # ``input=None`` after the worker lands the turn.
-        if submit.generated_seat is None:
-            assert submit_authored_seat is not None
-            native_commit_seat = submit_authored_seat
+        if submit.generated_role is None:
+            assert submit_authored_role is not None
+            native_commit_role = submit_authored_role
             msg = WSGenerateMessage(
                 type="generate",
-                commit_role=seat_to_chat_role(submit_authored_seat),
+                commit_role=submit_authored_role,
                 commit_text=submit_text,
                 commit_thinking=submit_authored_thinking,
                 parent_node_id=submit.parent_node_id,
@@ -435,7 +434,7 @@ async def _ws_handle_generate(
                 raw=submit.raw,
             )
             submit_text = None
-            submit_authored_seat = None
+            submit_authored_role = None
             submit_authored_thinking = None
         else:
             msg = WSGenerateMessage(
@@ -449,7 +448,7 @@ async def _ws_handle_generate(
                 parent_node_id=submit.parent_node_id,
                 n=submit.n,
                 recipe_override=submit.recipe_override,
-                generate_seat=seat_to_chat_role(submit.generated_seat),
+                generate_seat=submit.generated_role,
             )
 
     # Both submit branches above normalize to the specialist generation
@@ -572,7 +571,7 @@ async def _ws_handle_generate(
             })
             return
         if (
-            native_commit_seat is None
+            native_commit_role is None
             and msg.commit_role == "assistant"
             and parent_node_id is None
         ):
@@ -620,17 +619,17 @@ async def _ws_handle_generate(
                 commit_thinking = (
                     None if msg.raw else (msg.commit_thinking or None)
                 )
-                if native_commit_seat is not None:
+                if native_commit_role is not None:
                     commit_label = (
                         commit_user_role
-                        if native_commit_seat == "human"
+                        if native_commit_role == "user"
                         else commit_asst_role
                     )
                     new_id = await asyncio.to_thread(
                         session.append_turn,
                         parent_node_id,
                         commit_text,
-                        seat=native_commit_seat,
+                        role=native_commit_role,
                         raw=msg.raw,
                         role_label=None if msg.raw else commit_label,
                         thinking=commit_thinking,
@@ -673,10 +672,9 @@ async def _ws_handle_generate(
             "type": "done",
             "result": {
                 "kind": (
-                    "append" if native_commit_seat is not None else "commit"
+                    "append" if native_commit_role is not None else "commit"
                 ),
                 "role": msg.commit_role,
-                "seat": chat_role_to_seat(msg.commit_role),
                 "text": commit_text,
                 "node_id": new_id,
                 "finish_reason": "stop",
@@ -801,18 +799,18 @@ async def _ws_handle_generate(
                     effective_parent = parent_node_id
                     if submit_text is not None:
                         if not submitted_parent_holder:
-                            assert submit_authored_seat is not None
+                            assert submit_authored_role is not None
                             commit_label = None
                             if not msg.raw and msg.sampling is not None:
                                 commit_label = (
                                     msg.sampling.user_role
-                                    if submit_authored_seat == "human"
+                                    if submit_authored_role == "user"
                                     else msg.sampling.assistant_role
                                 ) or None
                             committed_id = session.append_turn(
                                 parent_node_id,
                                 submit_text,
-                                seat=submit_authored_seat,
+                                role=submit_authored_role,
                                 raw=msg.raw,
                                 role_label=commit_label,
                                 thinking=submit_authored_thinking,

@@ -1006,15 +1006,15 @@ export interface WSGenerateRequest {
   generate_seat?: "user" | "assistant" | null;
 }
 
-export type Seat = "human" | "model";
+export type ChatRole = "user" | "assistant";
 
-/** Native composer submission.  Authorship and generation are explicit,
- * independent seats; omit ``generated_seat`` for an append-only action. */
+/** Native composer submission. The authored and generated structural roles
+ * are independent; omit ``generated_role`` for an append-only action. */
 export interface WSSubmitRequest {
   type: "submit";
   text?: string | null;
-  authored_seat?: Seat | null;
-  generated_seat?: Seat | null;
+  authored_role?: ChatRole | null;
+  generated_role?: ChatRole | null;
   steering?: string | null;
   sampling?: WSSampling | null;
   thinking?: boolean | null;
@@ -1179,20 +1179,17 @@ export interface LoomNodeJSON {
   id: string;
   parent_id: string | null;
   role: "user" | "assistant" | "system";
-  /** Native structural seat.  ``role`` remains as a compatibility adapter
-   *  for persisted trees and chat-template boundaries. */
-  seat?: Seat | null;
   text: string;
   /** Per-turn role-substitution label (roleplay scaffold) — the custom
    *  role this turn was *sent* with (e.g. "captain" / "pirate"), or null
    *  for the standard role.  Drives the bubble heading + loom glyph.
    *  Null means the standard role. */
   role_label: string | null;
-  /** The turn's verbatim thinking block — committed by the human, or the
+  /** The turn's verbatim thinking block — committed by the author, or the
    *  decoded thinking channel of a generated node (stamped at finalize).
    *  Strip families re-render it for one turn only. Null means no block. */
   thinking_text: string | null;
-  /** Generated nodes only, irrespective of seat. Mirrors Recipe. */
+  /** Generated nodes only, irrespective of structural role. Mirrors Recipe. */
   recipe: {
     steering: string | null;
     sampling: WSSampling | null;

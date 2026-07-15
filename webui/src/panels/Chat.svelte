@@ -69,7 +69,7 @@
   } from "../lib/stores.svelte";
   import type { AutoRegenMode } from "../lib/stores.svelte";
   import { togglePalette } from "../lib/stores/palette.svelte";
-  import type { ChatTurn, Seat, TokenScore } from "../lib/types";
+  import type { ChatRole, ChatTurn, TokenScore } from "../lib/types";
   import {
     scoreToRgb,
     highlightHue,
@@ -118,10 +118,10 @@
   });
 
   // --- Unified submission -----------------------------------------------
-  // The composer exposes the native submit contract directly: one seat for
-  // an authored line, plus an independently selected continuation seat (or
-  // none).  This keeps arbitrary scene sequences visible and makes same-seat
-  // prefill a single send: author a prefix and continue the same seat.
+  // The composer exposes the native submit contract directly: one role for
+  // an authored line, plus an independently selected continuation role (or
+  // none). This keeps arbitrary scene sequences visible and makes same-role
+  // prefill a single send: author a prefix and continue the same role.
   const rawMode = $derived.by(() => {
     void genUiMode.mode;
     return effectiveRawMode();
@@ -131,58 +131,58 @@
     loomTree.loaded ? (loomTree.active_node_id ?? null) : null,
   );
   const sceneMode = $derived(sessionState.info?.scene_mode ?? false);
-  type ContinuationSeat = Seat | "none";
-  let authoredSeat = $state<Seat>("human");
-  let continuationSeat = $state<ContinuationSeat>("model");
+  type ContinuationRole = ChatRole | "none";
+  let authoredRole = $state<ChatRole>("user");
+  let continuationRole = $state<ContinuationRole>("assistant");
   $effect(() => {
-    // Legacy renderers only support the ordinary human → model path.  Keep
-    // append-only available, but collapse unsupported seat choices when a
+    // Legacy renderers only support the ordinary user → assistant path. Keep
+    // append-only available, but collapse unsupported role choices when a
     // model does not expose the scene stitcher.
     if (!sceneMode) {
-      if (authoredSeat !== "human") authoredSeat = "human";
-      if (continuationSeat === "human") continuationSeat = "model";
+      if (authoredRole !== "user") authoredRole = "user";
+      if (continuationRole === "user") continuationRole = "assistant";
     }
   });
-  const generatedSeat = $derived<Seat | null>(
-    continuationSeat === "none" ? null : continuationSeat,
+  const generatedRole = $derived<ChatRole | null>(
+    continuationRole === "none" ? null : continuationRole,
   );
-  const humanLabel = $derived(
-    samplingState.human_role.trim()
+  const userLabel = $derived(
+    samplingState.user_role.trim()
       || sessionState.info?.default_user_role
-      || "human",
+      || "user",
   );
-  const modelLabel = $derived(
-    samplingState.model_role.trim()
+  const assistantLabel = $derived(
+    samplingState.assistant_role.trim()
       || sessionState.info?.default_assistant_role
-      || "model",
+      || "assistant",
   );
-  const authoredLabel = $derived(authoredSeat === "human" ? humanLabel : modelLabel);
-  const duplicateRoleLabels = $derived(humanLabel === modelLabel);
-  const humanRoleOption = $derived(
-    duplicateRoleLabels ? `${humanLabel} · human` : humanLabel,
+  const authoredLabel = $derived(authoredRole === "user" ? userLabel : assistantLabel);
+  const duplicateRoleLabels = $derived(userLabel === assistantLabel);
+  const userRoleOption = $derived(
+    duplicateRoleLabels ? `${userLabel} · user` : userLabel,
   );
-  const modelRoleOption = $derived(
-    duplicateRoleLabels ? `${modelLabel} · model` : modelLabel,
+  const assistantRoleOption = $derived(
+    duplicateRoleLabels ? `${assistantLabel} · assistant` : assistantLabel,
   );
 
-  const authoredSeatOptions = $derived([
-    { value: "human" as Seat, label: humanRoleOption },
-    { value: "model" as Seat, label: modelRoleOption, disabled: !sceneMode },
+  const authoredRoleOptions = $derived([
+    { value: "user" as ChatRole, label: userRoleOption },
+    { value: "assistant" as ChatRole, label: assistantRoleOption, disabled: !sceneMode },
   ]);
-  const continuationSeatOptions = $derived([
-    { value: "human" as ContinuationSeat, label: humanRoleOption, disabled: !sceneMode },
-    { value: "model" as ContinuationSeat, label: modelRoleOption },
-    { value: "none" as ContinuationSeat, label: "none" },
+  const continuationRoleOptions = $derived([
+    { value: "user" as ContinuationRole, label: userRoleOption, disabled: !sceneMode },
+    { value: "assistant" as ContinuationRole, label: assistantRoleOption },
+    { value: "none" as ContinuationRole, label: "none" },
   ]);
   const canSwapPlan = $derived(
-    sceneMode && generatedSeat !== null && generatedSeat !== authoredSeat,
+    sceneMode && generatedRole !== null && generatedRole !== authoredRole,
   );
 
-  function swapPlanSeats(): void {
-    if (!canSwapPlan || generatedSeat === null) return;
-    const previousAuthored = authoredSeat;
-    authoredSeat = generatedSeat;
-    continuationSeat = previousAuthored;
+  function swapPlanRoles(): void {
+    if (!canSwapPlan || generatedRole === null) return;
+    const previousAuthored = authoredRole;
+    authoredRole = generatedRole;
+    continuationRole = previousAuthored;
   }
 
   // Authored-thinking input: a block the next authored line carries,
@@ -199,9 +199,9 @@
   let thinkingDraft = $state("");
 
   const hasText = $derived(input.trim() !== "");
-  const appendSelected = $derived(generatedSeat === null);
+  const appendSelected = $derived(generatedRole === null);
   const primaryDisabled = $derived(
-    !loomTree.loaded || (!hasText && generatedSeat === null),
+    !loomTree.loaded || (!hasText && generatedRole === null),
   );
 
   const inputPlaceholder = $derived(`message as ${authoredLabel}…`);
@@ -217,7 +217,7 @@
         cancelPendingAction(pendingActions.queue[replaceSlot]?.id ?? "");
         return;
       }
-      if (generatedSeat === null) return;
+      if (generatedRole === null) return;
     }
     const parent = isPendingBusy()
       ? ("active@drain" as const)
@@ -233,8 +233,8 @@
     }
     void sendSubmit(
       text || null,
-      text ? authoredSeat : null,
-      generatedSeat,
+      text ? authoredRole : null,
+      generatedRole,
       {
         parent_node_id: parent,
         replaceSlot,
@@ -971,8 +971,8 @@
     <div class="plan-card">
       <span class="plan-actor">you write</span>
       <Select
-        bind:value={authoredSeat}
-        options={authoredSeatOptions}
+        bind:value={authoredRole}
+        options={authoredRoleOptions}
         ariaLabel="You write as"
         title={`you write as ${authoredLabel}`}
       />
@@ -983,7 +983,7 @@
         variant="flat"
         size="sm"
         disabled={!canSwapPlan}
-        onclick={swapPlanSeats}
+        onclick={swapPlanRoles}
         title="swap roles"
         ariaLabel="Swap writer roles"
       >⇄</Button>
@@ -992,10 +992,10 @@
     <div class="plan-card">
       <span class="plan-actor">model writes</span>
       <Select
-        bind:value={continuationSeat}
-        options={continuationSeatOptions}
+        bind:value={continuationRole}
+        options={continuationRoleOptions}
         ariaLabel="Model writes as"
-        title={generatedSeat === null ? "model does not write" : `model writes as ${generatedSeat === "human" ? humanLabel : modelLabel}`}
+        title={generatedRole === null ? "model does not write" : `model writes as ${generatedRole === "user" ? userLabel : assistantLabel}`}
       />
     </div>
 

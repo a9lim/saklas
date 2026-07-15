@@ -397,13 +397,13 @@ class _StubSession:
         return new_id
 
     def append_turn(
-        self, parent_node_id: Any, text: Any, *, seat: Any,
+        self, parent_node_id: Any, text: Any, *, role: Any,
         raw: bool = False, role_label: Any = None, thinking: Any = None,
     ):
         from saklas.core.session import SaklasSession
         return SaklasSession.append_turn(
             self,  # pyright: ignore[reportArgumentType]
-            parent_node_id, text, seat=seat, raw=raw,
+            parent_node_id, text, role=role, raw=raw,
             role_label=role_label, thinking=thinking,
         )
 
@@ -1158,43 +1158,43 @@ class TestCommit:
 
 
 class TestSubmit:
-    def test_text_requires_authored_seat(self, session_and_client: Any):
+    def test_text_requires_authored_role(self, session_and_client: Any):
         _session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
                 "type": "submit",
                 "text": "hello",
-                "generated_seat": "model",
+                "generated_role": "assistant",
             })
             msg = ws.receive_json()
         assert msg["type"] == "error"
         assert msg["status"] == 400
 
-    def test_swapped_commit_only_can_start_with_model(
+    def test_swapped_commit_only_can_start_with_assistant(
         self, session_and_client: Any,
     ):
         session, client = session_and_client
-        # Seat swapping is exposed only for scene-capable renderers, where a
-        # model-authored first turn is a legal structural shape.
+        # Role swapping is exposed only for scene-capable renderers, where an
+        # assistant-authored first turn is a legal structural shape.
         session.scene_grammar = MagicMock()
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
                 "type": "submit",
-                "text": "opening as the model",
-                "authored_seat": "model",
+                "text": "opening as the assistant",
+                "authored_role": "assistant",
             })
             while True:
                 msg = ws.receive_json()
                 if msg["type"] == "done":
                     break
                 assert msg["type"] != "error", msg
-        assert msg["result"]["seat"] == "model"
+        assert msg["result"]["role"] == "assistant"
         assert msg["result"]["kind"] == "append"
         path = session.tree.active_path()[1:]
         assert [node.role for node in path] == ["assistant"]
         assert path[0].recipe is None
 
-    def test_unswapped_commits_human_then_generates_model(
+    def test_unswapped_commits_user_then_generates_assistant(
         self, session_and_client: Any,
     ):
         session, client = session_and_client
@@ -1202,8 +1202,8 @@ class TestSubmit:
             ws.send_json({
                 "type": "submit",
                 "text": "hello",
-                "authored_seat": "human",
-                "generated_seat": "model",
+                "authored_role": "user",
+                "generated_role": "assistant",
             })
             while True:
                 msg = ws.receive_json()
@@ -1214,18 +1214,18 @@ class TestSubmit:
         assert [node.role for node in path] == ["user", "assistant"]
         assert path[0].text == "hello"
 
-    def test_swapped_commits_model_then_generates_human(
+    def test_swapped_commits_assistant_then_generates_user(
         self, session_and_client: Any,
     ):
         session, client = session_and_client
-        human_id = session.tree.add_user_turn("question")
+        user_id = session.tree.add_user_turn("question")
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
                 "type": "submit",
                 "text": "authored answer",
-                "authored_seat": "model",
-                "generated_seat": "human",
-                "parent_node_id": human_id,
+                "authored_role": "assistant",
+                "generated_role": "user",
+                "parent_node_id": user_id,
             })
             while True:
                 msg = ws.receive_json()
@@ -1236,12 +1236,12 @@ class TestSubmit:
         assert [node.role for node in path] == ["user", "assistant", "user"]
         assert path[-2].text == "authored answer"
 
-    def test_empty_with_no_modifier_semantics_continues_generated_seat(
+    def test_empty_with_no_modifier_semantics_continues_generated_role(
         self, session_and_client: Any,
     ):
         session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
-            ws.send_json({"type": "submit", "generated_seat": "model"})
+            ws.send_json({"type": "submit", "generated_role": "assistant"})
             while True:
                 msg = ws.receive_json()
                 if msg["type"] == "done":
@@ -1257,13 +1257,13 @@ class TestSubmit:
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
                 "type": "submit", "text": "one",
-                "authored_seat": "human",
+                "authored_role": "user",
             })
             while (first := ws.receive_json())["type"] != "done":
                 assert first["type"] != "error", first
             ws.send_json({
                 "type": "submit", "text": " two",
-                "authored_seat": "human",
+                "authored_role": "user",
             })
             while (second := ws.receive_json())["type"] != "done":
                 assert second["type"] != "error", second
@@ -1280,11 +1280,11 @@ class TestSubmit:
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
                 "type": "submit", "text": "Once",
-                "authored_seat": "model",
+                "authored_role": "assistant",
             })
             while (appended := ws.receive_json())["type"] != "done":
                 assert appended["type"] != "error", appended
-            ws.send_json({"type": "submit", "generated_seat": "model"})
+            ws.send_json({"type": "submit", "generated_role": "assistant"})
             while (generated := ws.receive_json())["type"] != "done":
                 assert generated["type"] != "error", generated
         assert generated["node_id"] == appended["node_id"]

@@ -17,14 +17,15 @@ stop string when it differs from the assistant's), **freed commit seating**
 under scene mode, and the webui. The original two-button generation-seat
 control, selected-node prefill mode, and later swap-toggle/modifier pairing were
 superseded by a visible two-part role plan over the native `submit` contract:
-explicit `authored_seat` plus optional `generated_seat`, named `human` / `model`
-internally but displayed through their current cast labels. The model-role picker
+explicit `authored_role` plus optional `generated_role`, both canonical
+`user` / `assistant` roles displayed through their current chat-template labels.
+The model-role picker
 accepts `none` for append-only; there is no modifier shortcut. `+ thinking`, the
 `cast…` manager, and loom `swap seat ⇄ branch` remain. The effective cast
 is auto-derived from structural and observed turn labels; the stored map
 contains configuration only. On visible web surfaces its two structural entries
 take their standard names from the loaded chat template (`user` / `model` for
-Gemma), leaving `human` / `model` as internal seat keys only. Session info carries
+Gemma). Session info carries
 `scene_mode`/`thinking_input_supported`/`strips_history_thinking`.
 Live-verified on gemma-3-4b end-to-end (cast fill + explicit clear +
 user-seat continue + seat-swap + thinking 400 + all UI affordances).
@@ -36,11 +37,12 @@ Companion to `docs/plans/sae-pillar.md` in spirit.*
 
 ## Vision (a9)
 
-Roles become fully dynamic: "deer", "pirate", "human", "model" are all
-swappable labels, and **both the human and the model can write for any role**.
-The chat-app framing (blue human, green machine, two fixed seats) dissolves
+Roles become fully dynamic: "deer", "pirate", "user", "model" are all
+swappable labels, and **both the author and the model can write for any role**.
+The chat-app framing (blue author, green machine, two fixed roles) dissolves
 into a loom-native one: a transcript is a *script*, turns are lines spoken by
-cast members, and who typed a line is provenance, not identity.
+cast members. A node's recipe records model generation; it never determines
+the role's identity or presentation.
 
 Two ambition-setting requirements (2026-07-10):
 
@@ -53,19 +55,18 @@ Two ambition-setting requirements (2026-07-10):
 
 ## The cast model
 
-A turn is `(seat, label)` plus optional generation artifacts:
+A turn is `(role, label)` plus optional generation artifacts:
 
-- **seat** — the *structural* Saklas role, named **human** / **model** (plus
-  system as stage direction). At renderer and compatibility-protocol
-  boundaries these lower to `user` / `assistant`, because those are what
-  model templates know how to emit.
+- **role** — the structural chat-template channel, `user` / `assistant` (plus
+  `system` as stage direction). The renderer gives those channels the loaded
+  template's actual labels, such as Gemma's `user` / `model`.
 - **label** — arbitrary slug, what the reader (and the model) sees ("deer",
   "pirate", "user").
 - **generation artifacts** — recipe, raw token ids, scored token rows, and
   logprobs. These expose only the operations they support; no separate
   provenance field participates in identity or presentation.
 
-`LoomNode` already carries `(role=seat, role_label=label)`; the engine change
+`LoomNode` carries `(role, role_label=label)`; the engine change
 is in *rendering* and in decoupling "generated" from `role == "assistant"`.
 
 ## The scene renderer (template autopsy + stitcher)
@@ -115,7 +116,7 @@ free per turn.
    them (gpt-oss ends user turns `<|end|>` vs assistant `<|return|>`;
    gemma/qwen/llama share terminators). Generating into a seat stops on that
    seat's terminator. Asymmetric but correct.
-3. **Thinking is a per-turn optional input on any seat.** The human can
+3. **Thinking is a per-turn optional input on any seat.** The author can
    commit their own thinking block; rendered via the family think delimiters
    when they exist, error otherwise. History policy: **follow the family
    template's convention uniformly** — if the template strips thinking from

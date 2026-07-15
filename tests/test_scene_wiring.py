@@ -221,17 +221,17 @@ def test_ws_generate_message_rejects_bad_seat():
         WSGenerateMessage(type="generate", generate_seat="narrator")  # type: ignore[arg-type]
 
 
-def test_ws_submit_message_uses_native_seats():
+def test_ws_submit_message_uses_structural_roles():
     from saklas.server.ws_models import WSSubmitMessage
 
     msg = WSSubmitMessage(
         type="submit",
         text="answer",
-        authored_seat="model",
-        generated_seat="human",
+        authored_role="assistant",
+        generated_role="user",
     )
-    assert msg.authored_seat == "model"
-    assert msg.generated_seat == "human"
+    assert msg.authored_role == "assistant"
+    assert msg.generated_role == "user"
 
 
 # ---------------------------------------------------------------------------
