@@ -12,6 +12,7 @@ backends themselves (those live in ``test_manifolds_io`` /
 from __future__ import annotations
 
 import json as _json
+import queue
 import threading
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,114 @@ from typing import Any
 import pytest
 
 from saklas import cli
+
+
+def _cross_process_alignment_worker(
+    home: str,
+    target: str,
+    load_count: Any,
+    start: Any,
+    errors: Any,
+) -> None:
+    """Exercise the neutral-cache lock in a clean spawned interpreter."""
+    import time
+
+    import torch
+
+    import saklas.core.model as model_mod
+    import saklas.core.session as session_mod
+    import saklas.io.alignment as alignment_mod
+    from saklas.cli import runners
+
+    patch = pytest.MonkeyPatch()
+    patch.setenv("SAKLAS_HOME", home)
+    source_marker = Path(home) / "source-neutral-ready"
+    rows = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])}
+
+    def sidecar(model_id: str) -> dict[str, Any]:
+        return {
+            "method": "neutral_activations", "format_version": 4,
+            "capture_version": 1,
+            "model_fingerprint": f"fp:{model_id}",
+            "model_source_fingerprint": f"source:{model_id}",
+            "capture_sha256": model_id,
+            "tensor_sha256": {"0": "0" * 64},
+            "tensor_files": {"0": "neutral.layer-0.safetensors"},
+            "layers": [0],
+            "tensor_schema": {
+                "0": {"shape": [3, 2], "dtype": "torch.float32"},
+            },
+            "n_prompts": 3,
+        }
+
+    def metadata(model_id: str, **_kwargs: Any) -> dict[str, Any]:
+        if model_id == "shared/source" and not source_marker.exists():
+            raise FileNotFoundError(model_id)
+        return sidecar(model_id)
+
+    def load_rows(
+        model_id: str, *, requested_layers: object = None,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        del requested_layers
+        if model_id == "shared/source" and not source_marker.exists():
+            raise FileNotFoundError(model_id)
+        return rows, sidecar(model_id)
+
+    class Session:
+        def __init__(self, model_id: str) -> None:
+            assert model_id == "shared/source"
+            with load_count.get_lock():
+                load_count.value += 1
+            self.model = object()
+            self.tokenizer = object()
+            self.layers = [object()]
+
+        def __enter__(self) -> "Session":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def capture(
+        _model: object, _tokenizer: object, _layers: object, *,
+        model_id: str, force: bool,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        assert model_id == "shared/source" and force is False
+        time.sleep(0.15)
+        source_marker.write_text("ready")
+        return rows, sidecar(model_id)
+
+    patch.setattr(alignment_mod, "validate_neutral_cache_metadata", metadata)
+    patch.setattr(alignment_mod, "load_validated_neutral_cache", load_rows)
+    patch.setattr(
+        alignment_mod, "_load_or_compute_neutral_activations_with_metadata_locked",
+        capture,
+    )
+    patch.setattr(
+        model_mod, "model_source_fingerprint",
+        lambda model_id: f"source:{model_id}",
+    )
+    patch.setattr(
+        session_mod.SaklasSession, "from_pretrained",
+        staticmethod(lambda model_id, **_kwargs: Session(model_id)),
+    )
+    patch.setattr(
+        alignment_mod, "load_alignment_map",
+        lambda *_args, **_kwargs: (
+            {0: torch.eye(2)}, {"quality_per_layer": {"0": 1.0}},
+        ),
+    )
+
+    try:
+        start.wait(timeout=15)
+        runners._load_or_fit_transfer_alignment(
+            "shared/source", target, force=False, label="test",
+            requested_layers=[0],
+        )
+    except BaseException as exc:
+        errors.put(repr(exc))
+    finally:
+        patch.undo()
 
 
 def _materialize_bundles_for_cli_test(
@@ -1266,122 +1375,50 @@ def test_concurrent_distinct_alignments_single_flight_shared_model_load(
 
 
 def test_cross_process_distinct_alignments_single_flight_shared_model_load(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    tmp_path: Path,
 ) -> None:
     """The filesystem neutral lock precedes model construction across commands."""
     import multiprocessing
-    import time
-    import torch
 
-    if "fork" not in multiprocessing.get_all_start_methods():
-        pytest.skip("cross-process monkeypatch inheritance requires fork")
-    ctx = multiprocessing.get_context("fork")
-
-    import saklas.core.model as model_mod
-    import saklas.core.session as session_mod
-    import saklas.io.alignment as alignment_mod
-    from saklas.cli import runners
-
-    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    source_marker = tmp_path / "source-neutral-ready"
+    ctx = multiprocessing.get_context("spawn")
     load_count = ctx.Value("i", 0)
     start = ctx.Barrier(2)
     errors = ctx.Queue()
-    rows = {0: torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])}
-
-    def sidecar(model_id: str) -> dict[str, Any]:
-        return {
-            "method": "neutral_activations", "format_version": 4, "capture_version": 1,
-            "model_fingerprint": f"fp:{model_id}",
-            "model_source_fingerprint": f"source:{model_id}",
-            "capture_sha256": model_id,
-            "tensor_sha256": {"0": "0" * 64},
-            "tensor_files": {"0": "neutral.layer-0.safetensors"},
-            "layers": [0],
-            "tensor_schema": {"0": {"shape": [3, 2], "dtype": "torch.float32"}},
-            "n_prompts": 3,
-        }
-
-    def metadata(model_id: str, **_kwargs: Any) -> dict[str, Any]:
-        if model_id == "shared/source" and not source_marker.exists():
-            raise FileNotFoundError(model_id)
-        return sidecar(model_id)
-
-    def load_rows(
-        model_id: str, *, requested_layers: object = None,
-    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
-        del requested_layers
-        if model_id == "shared/source" and not source_marker.exists():
-            raise FileNotFoundError(model_id)
-        return rows, sidecar(model_id)
-
-    class Session:
-        def __init__(self, model_id: str) -> None:
-            assert model_id == "shared/source"
-            with load_count.get_lock():
-                load_count.value += 1
-            self.model = object()
-            self.tokenizer = object()
-            self.layers = [object()]
-
-        def __enter__(self) -> "Session":
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-    def capture(
-        _model: object, _tokenizer: object, _layers: object, *,
-        model_id: str, force: bool,
-    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
-        assert model_id == "shared/source" and force is False
-        time.sleep(0.15)
-        source_marker.write_text("ready")
-        return rows, sidecar(model_id)
-
-    monkeypatch.setattr(alignment_mod, "validate_neutral_cache_metadata", metadata)
-    monkeypatch.setattr(alignment_mod, "load_validated_neutral_cache", load_rows)
-    monkeypatch.setattr(
-        alignment_mod, "_load_or_compute_neutral_activations_with_metadata_locked",
-        capture,
-    )
-    monkeypatch.setattr(
-        model_mod, "model_source_fingerprint",
-        lambda model_id: f"source:{model_id}",
-    )
-    monkeypatch.setattr(
-        session_mod.SaklasSession, "from_pretrained",
-        staticmethod(lambda model_id, **_kwargs: Session(model_id)),
-    )
-    monkeypatch.setattr(
-        alignment_mod, "load_alignment_map",
-        lambda *_args, **_kwargs: (
-            {0: torch.eye(2)}, {"quality_per_layer": {"0": 1.0}},
-        ),
-    )
-
-    def worker(target: str) -> None:
-        try:
-            start.wait()
-            runners._load_or_fit_transfer_alignment(
-                "shared/source", target, force=False, label="test",
-                requested_layers=[0],
-            )
-        except BaseException as exc:
-            errors.put(repr(exc))
 
     processes = [
-        ctx.Process(target=worker, args=(target,))
+        ctx.Process(
+            target=_cross_process_alignment_worker,
+            args=(str(tmp_path), target, load_count, start, errors),
+        )
         for target in ("target/a", "target/b")
     ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=10)
+    timed_out: list[str] = []
+    exitcodes: list[int | None] = []
+    child_errors: list[str] = []
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=20)
+        timed_out = [process.name for process in processes if process.is_alive()]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join(timeout=5)
+        exitcodes = [process.exitcode for process in processes]
+        while True:
+            try:
+                child_errors.append(errors.get_nowait())
+            except queue.Empty:
+                break
+        errors.close()
+        errors.join_thread()
 
-    assert all(not process.is_alive() for process in processes)
-    assert [process.exitcode for process in processes] == [0, 0]
-    assert errors.empty()
+    assert timed_out == []
+    assert exitcodes == [0, 0]
+    assert child_errors == []
     assert load_count.value == 1
 
 
