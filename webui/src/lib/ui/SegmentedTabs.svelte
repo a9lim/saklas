@@ -101,7 +101,7 @@
   .tab.on {
     color: var(--fg);
     background: color-mix(in srgb, var(--tab-c) 9%, var(--glass));
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    box-shadow: inset 0 1px 0 var(--top-light-strong);
   }
 
   .dot {

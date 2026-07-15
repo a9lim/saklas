@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   import { apiExperiments } from "../lib/api";
   import type { ExperimentFanResponse, WSSampling } from "../lib/types";
   import {
@@ -195,7 +196,7 @@
     <div class="title">
       <span class="eyebrow">experiment lab</span>
     </div>
-    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -338,29 +339,6 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
 
   .body {
     display: grid;
@@ -373,7 +351,7 @@
   .results {
     border-radius: var(--radius-lg);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow: var(--shadow-well);
     padding: var(--space-5);
     min-width: 0;
   }

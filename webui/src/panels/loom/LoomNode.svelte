@@ -172,7 +172,7 @@
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.09);
+    background: var(--glass-bright);
     color: var(--fg);
     display: inline-flex;
     align-items: center;
@@ -210,7 +210,7 @@
     white-space: nowrap;
   }
   .note-mark {
-    color: var(--accent-purple);
+    color: var(--pillar-manifold);
     font-size: var(--text-2xs);
     line-height: 1;
   }

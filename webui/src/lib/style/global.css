@@ -8,10 +8,7 @@ body {
   /* The Observatory ambient: a faint blue-violet field high off-canvas
    * plus a violet breath at the lower corner. Material, not data —
    * everything readable sits on panels above it. */
-  background:
-    radial-gradient(1200px 560px at 72% -12%, rgba(103, 116, 190, 0.09), transparent 60%),
-    radial-gradient(900px 480px at 6% 108%, rgba(167, 139, 250, 0.05), transparent 65%),
-    var(--bg);
+  background: var(--ambient-canvas);
   color: var(--fg);
   font-family: var(--font-ui);
   font-size: var(--text);
@@ -47,7 +44,7 @@ pre {
 }
 
 ::selection {
-  background: rgba(237, 239, 247, 0.22);
+  background: var(--selection-bg);
 }
 
 :focus-visible {
@@ -77,7 +74,7 @@ pre {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--border);
+  background: var(--glass-line);
   border-radius: var(--radius-pill);
 }
 ::-webkit-scrollbar-thumb:hover {

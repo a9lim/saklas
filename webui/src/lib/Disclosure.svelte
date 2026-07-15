@@ -51,9 +51,10 @@
 
 <style>
   .sk-disclosure {
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
     border-radius: var(--radius);
-    background: var(--surface);
+    background: var(--glass);
+    box-shadow: var(--shadow-well);
     overflow: hidden;
   }
   .sk-disclosure.is-flush {
@@ -89,7 +90,7 @@
     outline-offset: -2px;
   }
   .sk-disclosure.is-open .sk-disclosure-trigger {
-    border-bottom-color: var(--border);
+    background: var(--bg-hover);
   }
   .sk-disclosure.is-flush.is-open .sk-disclosure-trigger {
     border-bottom-color: transparent;
@@ -112,7 +113,7 @@
 
   .sk-disclosure-body {
     padding: var(--space-4) var(--space-4);
-    background: transparent;
+    background: color-mix(in srgb, var(--input-well) 72%, transparent);
   }
   .sk-disclosure.is-flush .sk-disclosure-body {
     padding: var(--space-3) 0;

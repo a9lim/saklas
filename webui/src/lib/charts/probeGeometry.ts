@@ -73,22 +73,22 @@ interface Palette {
 
 function readPalette(el: HTMLElement): Palette {
   const cs = getComputedStyle(el);
-  const v = (name: string, fallback: string): string => {
+  const v = (name: string, fallback = "transparent"): string => {
     const got = cs.getPropertyValue(name).trim();
     return got || fallback;
   };
   return {
-    fg: v("--fg-strong", "#d3d7e4"),
-    fgDim: v("--fg-dim", "#a3a8bd"),
-    muted: v("--fg-muted", "#6b7088"),
-    border: v("--border", "rgba(233, 236, 248, 0.09)"),
-    accent: v("--accent", "#edeff7"),
-    purple: v("--pillar-manifold", "#a78bfa"),
-    bg: v("--bg-deep", "#05060b"),
-    node: v("--geom-node", v("--pillar-manifold", "#a78bfa")),
-    neutral: v("--geom-neutral", v("--fg-subtle", "#8a90a6")),
-    live: v("--live", "#34d399"),
-    light: v("--accent-light", "#ffffff"),
+    fg: v("--fg-strong"),
+    fgDim: v("--fg-dim"),
+    muted: v("--fg-muted"),
+    border: v("--glass-line"),
+    accent: v("--accent"),
+    purple: v("--pillar-manifold"),
+    bg: v("--bg-deep"),
+    node: v("--geom-node", v("--pillar-manifold")),
+    neutral: v("--geom-neutral", v("--fg-subtle")),
+    live: v("--live"),
+    light: v("--accent-light"),
   };
 }
 

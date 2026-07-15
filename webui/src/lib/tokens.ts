@@ -82,18 +82,18 @@ export function surpriseScore(
 export type TintHue = "signed" | "surprise" | "sae";
 
 /* Ramp poles (tokens.css: --highlight-pos / --highlight-neg /
- * --highlight-surprise) as rgb triplets, and the alpha ceiling.  v2
+ * CSS variables as the single palette source, and the alpha ceiling.  v2
  * tints are constant-hue ALPHA ramps: tint strength = opacity, hue =
  * meaning, so text contrast stays put and the poles are OKLCH-matched
  * in perceived lightness (the old ramp swept luminance through opaque
- * rgb(0,255·t,0), which wobbled legibility with the score). */
-const TINT_POS = "52, 211, 153"; /* #34d399 */
-const TINT_NEG = "229, 84, 79"; /* #e5544f */
-const TINT_SURPRISE = "107, 166, 248"; /* #6ba6f8 */
-const TINT_SAE = "242, 201, 76"; /* #f2c94c */
+ * green, which wobbled legibility with the score). */
+const TINT_POS = "var(--accent-green)";
+const TINT_NEG = "var(--accent-red)";
+const TINT_SURPRISE = "var(--pillar-lens)";
+const TINT_SAE = "var(--pillar-sae)";
 const TINT_MAX_ALPHA = 0.62;
 
-/** Map a probe score to a CSS rgba() background (stronger score =
+/** Map a probe score to a CSS color background (stronger score =
  * more opaque tint of a constant hue).  Returns ``"transparent"`` when
  * score is effectively zero or null/undefined.
  *
@@ -120,10 +120,16 @@ export function scoreToRgb(
   const s = Number.isFinite(scale) && scale > 1e-6 ? scale : HIGHLIGHT_SAT;
   const t = Math.max(-1, Math.min(1, score / s));
   if (t === 0) return "transparent";
-  const a = (Math.abs(t) * TINT_MAX_ALPHA).toFixed(3);
-  if (hue === "surprise") return `rgba(${TINT_SURPRISE}, ${a})`;
-  if (hue === "sae") return `rgba(${TINT_SAE}, ${a})`;
-  return t > 0 ? `rgba(${TINT_POS}, ${a})` : `rgba(${TINT_NEG}, ${a})`;
+  const amount = (Math.abs(t) * TINT_MAX_ALPHA * 100).toFixed(1);
+  const color =
+    hue === "surprise"
+      ? TINT_SURPRISE
+      : hue === "sae"
+        ? TINT_SAE
+        : t > 0
+          ? TINT_POS
+          : TINT_NEG;
+  return `color-mix(in srgb, ${color} ${amount}%, transparent)`;
 }
 
 /** Color family for a selected transcript-highlight channel. */

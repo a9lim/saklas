@@ -14,7 +14,7 @@
   //                curved-only residual meta, the per-layer heatmap strip,
   //                and a 2-D box-domain mini-map.
   //
-  // Family is signalled by accent (--accent flat / --accent-purple curved)
+  // Family is signalled by accent (--accent flat / --pillar-manifold curved)
   // and glyph.  A dedicated action toggles the transcript highlight for
   // *every* family — the per-token score map is keyed by probe name
   // regardless of geometry, so curved probes are valid highlight targets
@@ -49,7 +49,7 @@
   /** Flat (affine) ⇒ subspace family; curved ⇒ manifold family. */
   const affine = $derived(info.is_affine);
 
-  const accent = $derived(affine ? "--accent" : "--accent-purple");
+  const accent = $derived(affine ? "--accent" : "--pillar-manifold");
 
   /** Saturation scale for the per-layer heatmap strip + token tint — the
    *  axis-0 node extent for a flat probe ("full = as far along as the most
@@ -369,8 +369,8 @@
     min-width: 0;
   }
   .icon {
-    min-width: 24px;
-    min-height: 24px;
+    min-width: var(--control-target);
+    min-height: var(--control-target);
     background: transparent;
     border: 0;
     color: var(--fg-muted);
@@ -388,10 +388,10 @@
     background: var(--bg-elev);
   }
   .inspect:hover:not(:disabled) {
-    color: var(--accent-purple);
+    color: var(--pillar-manifold);
   }
   .highlight-action {
-    min-height: 24px;
+    min-height: var(--control-target);
     padding: var(--space-1) var(--space-3);
     color: var(--fg-muted);
     background: var(--glass);

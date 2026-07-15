@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // ManifoldMergeDrawer — discover-mode node-union merge.
   //
   // Unions the *node corpora* of two or more discover-mode manifolds and
@@ -127,8 +128,7 @@
 <section class="drawer-shell" aria-label="Merge manifolds">
   <header class="header">
     <span class="title">merge manifolds</span>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -246,29 +246,6 @@
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -370,8 +347,8 @@
   }
   input[type="text"]:focus,
   select:focus {
-    outline: 1px solid var(--accent-purple);
-    border-color: var(--accent-purple);
+    outline: 1px solid var(--pillar-manifold);
+    border-color: var(--pillar-manifold);
   }
   .warn {
     margin: 0;
@@ -389,7 +366,7 @@
     gap: var(--space-3);
   }
   .primary {
-    background: var(--accent-purple);
+    background: var(--pillar-manifold);
     color: var(--text-on-accent);
     border: 1px solid transparent;
     padding: var(--space-2) var(--space-5);
@@ -428,7 +405,7 @@
     border-radius: 50%;
     border: 1px solid var(--bg-deep);
     border-right-color: transparent;
-    animation: spin 0.7s linear infinite;
+    animation: spin var(--dur-spin) linear infinite;
     display: inline-block;
   }
   @keyframes spin {

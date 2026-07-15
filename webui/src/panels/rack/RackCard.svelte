@@ -16,7 +16,7 @@
 
   interface Props {
     /** CSS custom-property *name* for the family accent — e.g. ``"--accent"``
-     *  for a subspace (flat) card, ``"--accent-purple"`` for a manifold
+     *  for a subspace (flat) card, ``"--pillar-manifold"`` for a manifold
      *  (curved) card.  Exposed to the slotted content as ``--card-accent``. */
     accent?: string;
     /** Dim + de-emphasise the card (a disabled steer term).  Probe cards
@@ -72,7 +72,7 @@
     border: 1px solid transparent;
     border-radius: var(--radius-lg);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    box-shadow: var(--shadow-rack);
     font-size: var(--text-sm);
     transition:
       border-color var(--dur) var(--ease-out),
@@ -85,10 +85,7 @@
   }
   .card.active {
     border-color: color-mix(in srgb, var(--card-accent) 40%, transparent);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.04),
-      0 0 0 1px color-mix(in srgb, var(--card-accent) 18%, transparent),
-      0 0 18px color-mix(in srgb, var(--card-accent) 7%, transparent);
+    box-shadow: var(--shadow-rack-active);
   }
   .card.disabled {
     /* Off is a reversible state, not unavailable content. Keep labels and
@@ -104,7 +101,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-3);
-    min-height: 24px;
+    min-height: var(--control-target);
     min-width: 0;
   }
 

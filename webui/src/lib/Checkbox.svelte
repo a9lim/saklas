@@ -80,8 +80,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
+    width: var(--control-target);
+    height: var(--control-target);
     padding: 0;
     background: transparent;
     border: 0;
@@ -98,7 +98,7 @@
     height: 14px;
     box-sizing: border-box;
     background: var(--bg-elev);
-    border: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
     border-radius: var(--radius-sm);
     transition: background var(--dur-fast) var(--ease-out),
       border-color var(--dur-fast) var(--ease-out);
@@ -111,13 +111,11 @@
     outline-offset: 2px;
   }
   .sk-checkbox.is-checked .sk-checkbox-box {
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 55%),
-      var(--accent);
+    background: var(--material-glint), var(--accent);
     border-color: var(--accent);
   }
   .sk-checkbox.is-checked:hover:not(.is-disabled) .sk-checkbox-box {
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 55%),
-      var(--accent-light);
+    background: var(--material-glint), var(--accent-light);
     border-color: var(--accent-light);
   }
   .sk-checkbox.is-disabled {

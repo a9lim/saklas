@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Per-token drilldown drawer — opens when a chat token is clicked.
   //
   // Replaces the v1.6 always-on inspector (which forced every user to look
@@ -601,9 +602,7 @@
         </div>
       {/if}
     </div>
-    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
-      ✕
-    </button>
+    <DrawerCloseButton onclick={onClose} />
   </header>
 
   <!-- View tabs (probes / logits / j-lens) + the steered/unsteered branch
@@ -1018,29 +1017,6 @@
     color: var(--accent);
     font-size: var(--text-xs);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
 
   /* Toolbar — view tabs left, branch toggle right (when A/B). */
   .toolbar {
@@ -1113,7 +1089,7 @@
     color: var(--fg-dim);
     font-size: var(--text-xs);
     font-weight: var(--weight-normal);
-    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-sticky-inline);
     white-space: nowrap;
   }
   .grid .corner {
@@ -1126,7 +1102,7 @@
     font-weight: var(--weight-normal);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-sticky), var(--shadow-sticky-inline);
   }
   .grid .col-label {
     color: var(--fg-dim);
@@ -1290,7 +1266,7 @@
     position: sticky;
     left: 0;
     z-index: 3;
-    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-sticky), var(--shadow-sticky-inline);
   }
   .lens-table .row-label {
     position: sticky;
@@ -1301,7 +1277,7 @@
     font-family: var(--font-mono);
     font-weight: var(--weight-normal);
     font-size: var(--text-xs);
-    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-sticky-inline);
     white-space: nowrap;
   }
   .lens-cell {
@@ -1332,7 +1308,7 @@
   }
 
   .branch-error {
-    color: var(--accent-error);
+    color: var(--accent-red);
     font-size: var(--text-sm);
     margin: var(--space-4) 0 0;
   }

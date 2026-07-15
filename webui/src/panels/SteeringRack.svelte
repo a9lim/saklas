@@ -171,7 +171,7 @@
    * read as the two card families. */
   .add-subspace,
   .add-manifold {
-    min-height: 24px;
+    min-height: var(--control-target);
     flex: 1 1 0;
     border: 1px solid transparent;
     padding: 2px var(--space-5);
@@ -193,10 +193,10 @@
   /* Manifold launcher — purple-tinted to echo the manifold card's accent
    * so the two surfaces read as one feature. */
   .add-manifold {
-    background: color-mix(in srgb, var(--accent-purple) 10%, transparent);
-    color: var(--accent-purple);
+    background: color-mix(in srgb, var(--pillar-manifold) 10%, transparent);
+    color: var(--pillar-manifold);
   }
   .add-manifold:hover {
-    background: color-mix(in srgb, var(--accent-purple) 18%, transparent);
+    background: color-mix(in srgb, var(--pillar-manifold) 18%, transparent);
   }
 </style>

@@ -46,9 +46,10 @@
     display: flex;
     gap: var(--space-2);
     padding: var(--space-1);
-    background: var(--bg-elev);
-    border: 1px solid var(--border);
+    background: var(--glass);
+    border: 1px solid transparent;
     border-radius: var(--radius);
+    box-shadow: var(--shadow-well);
   }
 
   .sk-mode-tab {
@@ -71,8 +72,9 @@
     background: var(--bg-hover);
   }
   .sk-mode-tab.active {
-    background: var(--accent-subtle);
+    background: color-mix(in srgb, var(--accent) 9%, var(--glass-strong));
     color: var(--accent);
+    box-shadow: inset 0 1px 0 var(--top-light-strong);
   }
   .sk-mode-tab:focus-visible {
     outline: 2px solid var(--focus-ring);

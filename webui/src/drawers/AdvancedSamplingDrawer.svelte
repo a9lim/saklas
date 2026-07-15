@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   import {
     closeDrawer,
     samplingState,
@@ -45,7 +46,7 @@
     <div>
       <span class="title">advanced sampling</span>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -107,7 +108,7 @@
     justify-content: space-between;
     gap: var(--space-6);
     padding: var(--space-5) var(--space-6);
-    background: var(--surface);
+    background: transparent;
   }
   .title {
     color: var(--accent);
@@ -119,29 +120,6 @@
     margin: var(--space-2) 0 0;
     color: var(--fg-muted);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     display: grid;
     gap: var(--space-5);
@@ -151,7 +129,7 @@
   .panel {
     border-radius: var(--radius);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow: var(--shadow-well);
     padding: var(--space-6);
   }
   h3 {

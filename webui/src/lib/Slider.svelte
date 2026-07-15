@@ -57,7 +57,7 @@
     -webkit-appearance: none;
     appearance: none;
     width: 100%;
-    height: 24px;
+    height: var(--control-target);
     margin: 0;
     /* Borderless: the track is a recessed groove — fill only.  The thumb
      * keeps its --bg-deep cutout ring (a glyph stroke, not chrome). */

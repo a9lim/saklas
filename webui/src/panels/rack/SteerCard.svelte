@@ -9,7 +9,7 @@
   //                        the magnitude is the rack-level "subspace along"
   //                        master shared by every subspace term)
   //   manifold → a curved fit (e.g. emotions).  Manifold accent (◆/◇,
-  //              --accent-purple).
+  //              --pillar-manifold).
   //              statline: glyph · name · unfitted/stale warn · trigger · ✕
   //              body:     snap-to-node Select · XYPad · along · onto
   //
@@ -60,7 +60,7 @@
   // ---------- family chrome (accent + enable glyph) ----------
 
   const subspace = $derived(entry.mode === "subspace");
-  const accent = $derived(subspace ? "--accent" : "--accent-purple");
+  const accent = $derived(subspace ? "--accent" : "--pillar-manifold");
 
   /** Display name — bare name with the namespace prefix stripped
    *  (``default/personas`` → ``personas``).  Full name stays in the tooltip. */
@@ -291,7 +291,7 @@
   }
 
   .trigger-pill {
-    min-height: 24px;
+    min-height: var(--control-target);
     background: var(--glass);
     color: var(--fg-strong);
     border: 1px solid transparent;
@@ -308,8 +308,8 @@
   }
 
   .icon {
-    min-width: 24px;
-    min-height: 24px;
+    min-width: var(--control-target);
+    min-height: var(--control-target);
     background: transparent;
     border: 0;
     color: var(--fg-muted);

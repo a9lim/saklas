@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   import {
     closeDrawer,
     genStatus,
@@ -63,7 +64,7 @@
     <div class="title">
       <span class="eyebrow">model health</span>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -176,29 +177,6 @@
     color: var(--fg-muted);
     line-height: 1.5;
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     display: grid;
     gap: var(--space-5);
@@ -282,7 +260,7 @@
   li + li { margin-top: var(--space-2); }
   .good { color: var(--accent-green); margin: 0; line-height: 1.5; }
   .error {
-    color: var(--accent-error);
+    color: var(--accent-red);
     background: color-mix(in srgb, var(--accent-red) 8%, transparent);
     border-radius: var(--radius);
     padding: var(--space-5);

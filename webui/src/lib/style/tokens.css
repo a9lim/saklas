@@ -35,6 +35,14 @@
   --radius-lg: 12px;        /* cards, sheets, panels */
   --radius-pill: 999px;
 
+  /* Shared control/data geometry. Component-specific optical sizes stay
+   * local; repeated interaction targets and data marks do not. */
+  --control-target: 24px;
+  --control-compact: 26px;
+  --control-field: 32px;
+  --data-mark-radius: 2px;
+  --data-bar-height: 8px;
+
   /* ---- Surfaces -----------------------------------------------------
    * Ground carries a faint blue-violet ambient (set in global.css).
    * Glass tier = the card material (translucent + blur + top-light). */
@@ -43,16 +51,20 @@
   --bg-deep: #04050a;       /* rail — the floor; also the well tone */
   --bg: #07080e;            /* app canvas */
   --bg-alt: #10121c;        /* panel tier (opaque composite of glass-on-bg) */
-  --surface: #10121c;       /* alias of --bg-alt */
   --bg-elev: #1a1d2b;       /* elevated */
   --surface-hi: #222639;    /* highest: modals, popovers, menus */
 
   --glass: rgba(255, 255, 255, 0.045);        /* v2 card fill */
   --glass-strong: rgba(255, 255, 255, 0.075); /* v2 raised fill / wells */
+  --glass-bright: rgba(255, 255, 255, 0.09);  /* selected compact chrome */
   --glass-line: rgba(233, 236, 248, 0.085);   /* hairline — floating edges + state rings ONLY */
   --blur-glass: 6px;
   /* Recessed input fill — "type here" reads as a well, not an outline. */
   --input-well: rgba(2, 3, 8, 0.45);
+  /* Overlays are one material family, not per-surface black guesses. */
+  --scrim-soft: rgba(2, 3, 8, 0.38);
+  --scrim: rgba(2, 3, 8, 0.5);
+  --scrim-strong: rgba(2, 3, 8, 0.55);
 
   /* Translucent wash laid over any surface tier on hover. */
   --bg-hover: rgba(237, 239, 247, 0.05);
@@ -66,9 +78,6 @@
   --fg-subtle: #8a90a6;     /* tertiary */
   --fg-muted: #858ba3;      /* labels/hints: >=4.9:1 on elevated cards */
   --text-on-accent: #07080e;/* dark canvas — sits on white --accent */
-
-  /* ---- The one border --------------------------------------------- */
-  --border: rgba(233, 236, 248, 0.09);
 
   /* ---- Pillar hues --------------------------------------------------
    * The four instruments. Subspace shares
@@ -89,11 +98,8 @@
    * their consumers get rebuilt treatments in later phases. */
   --accent: #edeff7;
   --accent-light: #ffffff;
-  --accent-blue: var(--pillar-lens);
-  --accent-purple: var(--pillar-manifold);
   --accent-green: #34d399;
   --accent-red: #e5544f;
-  --accent-error: #e5544f;
   --accent-amber: #b08b52;   /* demoted: pending/edit chrome, anchor rings */
   --accent-yellow: #c2a44f;  /* demoted: warn chips */
   --accent-subtle: rgba(237, 239, 247, 0.08);  /* accent fill wash */
@@ -109,10 +115,6 @@
    * Probe ramp poles are OKLCH-matched (green ↔ red); surprise reads
    * in logit-space blue (it is a vocabulary-distribution quantity —
    * same family as the lens). */
-  --highlight-pos: #34d399;
-  --highlight-neg: #e5544f;
-  --highlight-surprise: #6ba6f8;
-
   /* Layer heatmaps are solid data marks, not translucent token washes.
    * A visible neutral zero keeps weak readings legible; empty is distinct
    * without falling all the way to black. Cells themselves stay borderless. */
@@ -121,8 +123,8 @@
    * black grid the shared LayerStrip removed. */
   --data-track: #616a82;
   --data-track-fill: #343a50;
-  --layer-cell-neutral: #616a82;
-  --layer-cell-empty: #343a50;
+  --layer-cell-neutral: var(--data-track);
+  --layer-cell-empty: var(--data-track-fill);
   --layer-cell-positive: #6ee7b7;
   --layer-cell-negative: #ffb1ad;
   --layer-cell-lens: #aed3ff;
@@ -132,10 +134,34 @@
    * shadow is for sheets/modals/popovers/toasts. --shadow-sticky is the
    * borderless replacement for a sticky table header's bottom rule —
    * elevation that only reads once content scrolls underneath. */
-  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.05),
+  --top-light-faint: rgba(255, 255, 255, 0.02);
+  --top-light-subtle: rgba(255, 255, 255, 0.03);
+  --top-light: rgba(255, 255, 255, 0.04);
+  --top-light-card: rgba(255, 255, 255, 0.05);
+  --top-light-strong: rgba(255, 255, 255, 0.06);
+  --material-glint: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.18),
+    transparent 55%
+  );
+  --shadow-well: inset 0 1px 0 var(--top-light-subtle);
+  --shadow-rack: inset 0 1px 0 var(--top-light);
+  --shadow-card: inset 0 1px 0 var(--top-light-card),
     0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-rack-active:
+    inset 0 1px 0 var(--top-light),
+    0 0 0 1px color-mix(in srgb, var(--card-accent) 18%, transparent),
+    0 0 18px color-mix(in srgb, var(--card-accent) 7%, transparent);
+  --shadow-card-active:
+    inset 0 1px 0 var(--top-light-card),
+    0 0 0 1px color-mix(in srgb, var(--card-accent) 20%, transparent),
+    0 0 24px color-mix(in srgb, var(--card-accent) 7%, transparent),
+    0 8px 28px rgba(0, 0, 0, 0.4);
   --shadow-overlay: 0 12px 40px rgba(0, 0, 0, 0.5);
+  --shadow-sheet: inset 0 1px 0 var(--top-light), var(--shadow-overlay);
   --shadow-sticky: 0 2px 8px rgba(0, 0, 0, 0.45);
+  --shadow-sticky-inline: 2px 0 8px rgba(0, 0, 0, 0.45);
+  --shadow-data-label: 0 0 2px rgba(0, 0, 0, 0.6);
 
   /* ---- Type scale — px, base 13.5px --------------------------------- */
   --text-2xs: 10px;         /* layer ticks, micro-labels */
@@ -169,6 +195,9 @@
   --dur-fast: 0.12s;
   --dur: 0.2s;
   --dur-slow: 0.3s;
+  --dur-spin: 0.7s;
+  --dur-draw: 0.9s;
+  --dur-pulse: 1.6s;
 
   /* ---- Fonts ---------------------------------------------------------
    * One variable file, two families (axes pinned in fonts.css):
@@ -187,4 +216,21 @@
 
   /* Loom conflict/error surface. */
   --err-bg: rgba(229, 84, 79, 0.08);
+  --warn-bg: rgba(194, 164, 79, 0.06);
+
+  /* Page-wide material effects live here so components never invent
+   * almost-matching scrims, selection fills, or ambient fields. */
+  --selection-bg: rgba(237, 239, 247, 0.22);
+  --ambient-canvas:
+    radial-gradient(
+      1200px 560px at 72% -12%,
+      rgba(103, 116, 190, 0.09),
+      transparent 60%
+    ),
+    radial-gradient(
+      900px 480px at 6% 108%,
+      rgba(167, 139, 250, 0.05),
+      transparent 65%
+    ),
+    var(--bg);
 }

@@ -92,7 +92,7 @@
       x2={width / 2}
       y1="0"
       y2={height}
-      stroke="var(--border)"
+      stroke="var(--glass-line)"
       stroke-width="1"
     />
   {/if}
@@ -102,7 +102,7 @@
       x2={width}
       y1={height}
       y2={height}
-      stroke="var(--border)"
+      stroke="var(--glass-line)"
       stroke-width="0.5"
     />
   {/if}
@@ -123,7 +123,7 @@
     vertical-align: middle;
     /* Rounded ends via CSS clip on the element box — an SVG rect ``rx``
      * would distort under preserveAspectRatio="none", this doesn't. */
-    border-radius: 2px;
+    border-radius: var(--data-mark-radius);
     overflow: hidden;
   }
   .track {

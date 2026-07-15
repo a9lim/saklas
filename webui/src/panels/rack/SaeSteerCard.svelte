@@ -129,7 +129,7 @@
   }
 
   .trigger-pill {
-    min-height: 24px;
+    min-height: var(--control-target);
     background: var(--glass);
     color: var(--fg-strong);
     border: 1px solid transparent;
@@ -146,8 +146,8 @@
   }
 
   .icon {
-    min-width: 24px;
-    min-height: 24px;
+    min-width: var(--control-target);
+    min-height: var(--control-target);
     background: transparent;
     border: 0;
     color: var(--fg-muted);

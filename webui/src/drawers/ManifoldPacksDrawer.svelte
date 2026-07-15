@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // ManifoldPacksDrawer — manifold-side counterpart to PackDrawer.
   //
   // Two tabs at the top: "Installed" lists what saklas knows locally
@@ -140,12 +141,7 @@
 <div class="drawer-shell">
   <header class="header">
     <span class="title">packs</span>
-    <button
-      type="button"
-      class="close"
-      aria-label="Close"
-      onclick={closeDrawer}
-    >✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="tabs" role="tablist">
@@ -286,29 +282,6 @@
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
 
   .tabs {
     display: flex;
@@ -374,7 +347,7 @@
     font-size: var(--text-sm);
   }
   .search input[type="search"]:focus-visible {
-    outline: 1px solid var(--accent-purple);
+    outline: 1px solid var(--pillar-manifold);
     outline-offset: -1px;
   }
 
@@ -391,7 +364,7 @@
   }
   .error {
     margin: 0;
-    color: var(--accent-error);
+    color: var(--accent-red);
     font-size: var(--text-sm);
     word-break: break-word;
   }
@@ -415,7 +388,7 @@
     padding: var(--space-3) var(--space-4);
     transition: background var(--dur) var(--ease-out);
   }
-  .row:hover { background: color-mix(in srgb, var(--accent-purple) 8%, var(--bg-deep)); }
+  .row:hover { background: color-mix(in srgb, var(--pillar-manifold) 8%, var(--bg-deep)); }
   .meta {
     display: flex;
     flex-direction: column;
@@ -443,8 +416,8 @@
     font-size: var(--text-2xs);
     letter-spacing: 0.04em;
     border: 1px solid transparent;
-    color: var(--accent-purple);
-    background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
+    color: var(--pillar-manifold);
+    background: color-mix(in srgb, var(--pillar-manifold) 12%, transparent);
   }
   .fit-spectral {
     color: var(--accent);
@@ -473,7 +446,7 @@
   }
   .act {
     background: var(--glass);
-    color: var(--accent-purple);
+    color: var(--pillar-manifold);
     border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
@@ -486,7 +459,7 @@
       color var(--dur) var(--ease-out);
   }
   .act:hover:not(:disabled) {
-    background: rgba(167, 139, 250, 0.12);
+    background: color-mix(in srgb, var(--pillar-manifold) 12%, transparent);
   }
   .act:disabled {
     opacity: 0.45;

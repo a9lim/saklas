@@ -115,7 +115,7 @@
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    min-height: 24px;
+    min-height: var(--control-target);
   }
   .body-button {
     background: none;
@@ -135,8 +135,8 @@
 
   .x {
     flex: none;
-    min-width: 24px;
-    min-height: 24px;
+    min-width: var(--control-target);
+    min-height: var(--control-target);
     background: none;
     border: none;
     padding: 0 0 0 2px;

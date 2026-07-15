@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Cross-branch diff drawer — phase 5.  Renders a side-by-side
   // word-level diff between two (or more) generated nodes, plus the
   // sorted readings-delta table and the per-token alignment for the
@@ -399,7 +400,7 @@
         </span>
       </div>
     </div>
-    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="toolbar">
@@ -745,29 +746,6 @@
     font-size: var(--text-sm);
     white-space: nowrap;
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
 
   /* Toolbar — the layout / sort-by controls, in their own row (same
    * pattern as the token-drilldown toolbar). */
@@ -852,7 +830,7 @@
    * readings table for one A-vs-B pair. */
   .diff-block {
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow: var(--shadow-well);
     border-radius: var(--radius-lg);
     padding: var(--space-4);
     display: flex;
@@ -968,7 +946,7 @@
     flex-direction: column;
     gap: var(--space-2);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow: var(--shadow-well);
     border-radius: var(--radius-lg);
     padding: var(--space-3) var(--space-4);
     margin: 0;

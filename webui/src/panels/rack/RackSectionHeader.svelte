@@ -77,7 +77,7 @@
     align-items: center;
     justify-content: space-between;
     gap: var(--space-4);
-    min-height: 26px;
+    min-height: var(--control-compact);
     padding-bottom: var(--space-3);
   }
   .header-text {
@@ -99,7 +99,7 @@
     flex: 0 0 auto;
   }
   .toggle {
-    min-height: 24px;
+    min-height: var(--control-target);
     padding: 1px var(--space-3);
     color: var(--fg-muted);
     background: var(--glass);

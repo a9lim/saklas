@@ -1016,7 +1016,7 @@
         <Button
           variant="flat"
           size="sm"
-          accent={thinkingDraft.trim() !== "" ? "var(--accent-violet)" : undefined}
+          accent={thinkingDraft.trim() !== "" ? "var(--pillar-manifold)" : undefined}
           onclick={() => (thinkingOpen = !thinkingOpen)}
           title="next authored line"
         >{thinkingOpen ? "− thinking" : "+ thinking"}</Button>
@@ -1235,8 +1235,8 @@
     background: var(--accent-glow);
   }
   .mode-badge.raw {
-    background: rgba(167, 139, 250, 0.12);
-    color: var(--accent-purple);
+    background: color-mix(in srgb, var(--pillar-manifold) 12%, transparent);
+    color: var(--pillar-manifold);
   }
 
   /* Conversation-actions strip — inline, pushed to the right edge of
@@ -1326,9 +1326,9 @@
     align-items: center;
     gap: var(--space-2);
     padding: var(--space-2) var(--space-3);
-    background: rgba(167, 139, 250, 0.10);
+    background: color-mix(in srgb, var(--pillar-manifold) 10%, transparent);
     border-radius: var(--radius);
-    color: var(--accent-purple);
+    color: var(--pillar-manifold);
     font-size: var(--text-xs);
     margin-bottom: var(--space-2);
   }
@@ -1365,7 +1365,7 @@
     border: 1px solid transparent;
     border-radius: var(--radius-lg);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow: var(--shadow-well);
     padding: var(--space-3) var(--space-5);
     display: flex;
     flex-direction: column;
@@ -1374,7 +1374,7 @@
     word-break: break-word;
   }
   .msg.shadow {
-    border-color: color-mix(in srgb, var(--accent-purple) 26%, transparent);
+    border-color: color-mix(in srgb, var(--pillar-manifold) 26%, transparent);
   }
 
   .who {
@@ -1405,7 +1405,7 @@
     width: 15px;
     height: 15px;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.09);
+    background: var(--glass-bright);
     color: var(--fg);
     display: inline-flex;
     align-items: center;

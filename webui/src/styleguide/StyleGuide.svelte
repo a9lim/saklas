@@ -534,7 +534,7 @@
   }
   .sw {
     width: 40px;
-    height: 24px;
+    height: var(--control-target);
     border-radius: var(--radius-sm);
     border: 1px solid transparent;
   }
@@ -607,7 +607,7 @@
     flex: 1;
     height: 64px;
     border-radius: var(--radius);
-    border: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
     display: flex;
     align-items: flex-end;
     padding: 8px;

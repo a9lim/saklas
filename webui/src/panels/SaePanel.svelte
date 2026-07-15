@@ -792,7 +792,7 @@
     border-color: var(--accent-glow);
   }
   .add-btn {
-    min-height: 24px;
+    min-height: var(--control-target);
     /* Family-tinted fill — the gold sibling of the racks' launchers. */
     background: color-mix(in srgb, var(--pillar-sae) 10%, transparent);
     color: var(--pillar-sae);

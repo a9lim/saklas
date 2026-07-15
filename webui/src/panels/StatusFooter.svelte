@@ -130,7 +130,7 @@
   .dot.live {
     color: var(--live);
     border-radius: 50%;
-    animation: dot-pulse 1.6s var(--ease-in-out) infinite;
+    animation: dot-pulse var(--dur-pulse) var(--ease-in-out) infinite;
   }
   /* Reduced-motion is handled by the global kill switch in global.css. */
   @keyframes dot-pulse {

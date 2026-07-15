@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Manifold authoring form — reached from "+ build manifold" in the
   // ManifoldDrawer.  Two steps in one scroll:
   //
@@ -779,8 +780,7 @@
 <section class="drawer-shell" aria-label="Build manifold">
   <header class="header">
     <span class="title">build manifold</span>
-    <button type="button" class="close" aria-label="Close" onclick={cancel}
-      >✕</button>
+    <DrawerCloseButton onclick={cancel} />
   </header>
 
   <div class="body">
@@ -1448,29 +1448,6 @@
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -1572,7 +1549,7 @@
     gap: var(--space-2);
     border-radius: var(--radius);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow: var(--shadow-well);
     padding: var(--space-3);
   }
   .axis-field {

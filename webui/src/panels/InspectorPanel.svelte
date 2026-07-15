@@ -145,7 +145,7 @@
     grid-template-columns: auto auto minmax(0, 1fr) auto;
     align-items: center;
     gap: var(--space-2);
-    min-height: 24px;
+    min-height: var(--control-target);
     margin: 0 var(--space-4) var(--space-1);
     padding: 3px var(--space-3);
     border-radius: var(--radius);

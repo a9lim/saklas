@@ -123,7 +123,7 @@
     stroke-dashoffset: 0;
   }
   .sparkline-line.draw {
-    animation: sparkline-draw 0.9s var(--ease-out);
+    animation: sparkline-draw var(--dur-draw) var(--ease-out);
   }
   @keyframes sparkline-draw {
     from {

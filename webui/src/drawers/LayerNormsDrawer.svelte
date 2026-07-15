@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Layer-norms overlay — per-layer ``||baked||`` bar chart for any
   // registered steering vector OR active probe.  Replaces the v1.7
   // inline ReferenceCollapsibles' layer-norms section.  Picker spans
@@ -145,7 +146,7 @@
         {/if}
       </div>
     </div>
-    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">✕</button>
+    <DrawerCloseButton onclick={onClose} />
   </header>
 
   <div class="toolbar">
@@ -249,29 +250,6 @@
     font-size: var(--text-sm);
     white-space: nowrap;
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
 
   .toolbar {
     display: flex;
@@ -332,7 +310,7 @@
     max-width: 62ch;
   }
   .empty.err {
-    color: var(--accent-error);
+    color: var(--accent-red);
   }
 
   .bars {

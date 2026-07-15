@@ -427,7 +427,7 @@
     font-size: var(--text-sm);
     letter-spacing: 0.04em;
     text-transform: lowercase;
-    background: rgba(2, 3, 8, 0.38);
+    background: var(--scrim-soft);
     backdrop-filter: blur(1px);
     pointer-events: none;
   }
@@ -437,7 +437,7 @@
     border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     border-top-color: var(--accent);
     border-radius: 50%;
-    animation: boot-spin 0.7s linear infinite;
+    animation: boot-spin var(--dur-spin) linear infinite;
   }
   @keyframes boot-spin {
     to { transform: rotate(360deg); }
@@ -558,7 +558,7 @@
   .drawer-backdrop {
     position: absolute;
     inset: 0;
-    background: rgba(2, 3, 8, 0.5);
+    background: var(--scrim);
     backdrop-filter: blur(2px);
     z-index: var(--z-drawer);
     border: 0;
@@ -576,9 +576,7 @@
     z-index: calc(var(--z-drawer) + 1);
     display: flex;
     flex-direction: column;
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.04),
-      var(--shadow-overlay);
+    box-shadow: var(--shadow-sheet);
     overflow: hidden;
     animation: drawer-in var(--dur-slow) var(--ease-out);
   }

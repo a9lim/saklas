@@ -1782,7 +1782,7 @@ export type DrawerName =
   | "subspace"
   /** Shared rack browser, manifold (curved) family — curved fits only
    *  (``fit_mode`` spectral / authored), e.g. ``emotions``.  Purple
-   *  ``--accent-purple``.  Same layout as the subspace half, with a
+   *  ``--pillar-manifold``.  Same layout as the subspace half, with a
    *  "+ build manifold" launcher.  ``RackDrawer`` with
    *  ``family: "manifold"``. */
   | "manifolds"

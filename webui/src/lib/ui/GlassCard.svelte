@@ -46,11 +46,7 @@
 
   .sk-card.active {
     border-color: color-mix(in srgb, var(--card-accent) 40%, transparent);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.05),
-      0 0 0 1px color-mix(in srgb, var(--card-accent) 20%, transparent),
-      0 0 24px color-mix(in srgb, var(--card-accent) 7%, transparent),
-      0 8px 28px rgba(0, 0, 0, 0.4);
+    box-shadow: var(--shadow-card-active);
   }
 
   .sk-card.disabled {

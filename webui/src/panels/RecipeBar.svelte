@@ -173,7 +173,7 @@
     background: linear-gradient(
       100deg,
       var(--glass),
-      rgba(255, 255, 255, 0.02) 55%,
+      var(--top-light-faint) 55%,
       color-mix(in srgb, var(--pillar-lens) 5%, transparent)
     );
   }

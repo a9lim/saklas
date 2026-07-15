@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Export drawer — JSONL or CSV download of the last generated turn.
   // Mirrors the TUI's ``/export <path>``: the TUI dumps
   // ``session.last_result`` through ``ResultCollector``.  The web side
@@ -170,9 +171,7 @@
 <section class="drawer-shell" aria-label="Export drawer">
   <header class="header">
     <span class="title">export</span>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button
-    >
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -263,29 +262,6 @@
     letter-spacing: 0;
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
-  }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
   }
   .body {
     flex: 1 1 auto;

@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-check --tsconfig ./tsconfig.json && node ./scripts/check-theme.mjs",
+    "check:theme": "node ./scripts/check-theme.mjs"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
