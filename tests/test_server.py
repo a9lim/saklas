@@ -144,6 +144,8 @@ class TestSaeRoutes:
     def test_load_accepts_harmonized_saelens_source(
         self, session_and_client: Any,
     ) -> None:
+        import time
+
         session, client = session_and_client
         session.load_sae.return_value = {"layer": 14, "width": 4096}
         resp = client.post(
@@ -153,11 +155,14 @@ class TestSaeRoutes:
         assert resp.status_code == 202
         assert resp.json()["release"] == "saelens:scope"
         status: dict[str, Any] = {}
-        for _ in range(20):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
             status = client.get("/saklas/v1/sessions/default/sae/load").json()
             if not status["running"]:
                 break
+            time.sleep(0.01)
         assert status
+        assert status["running"] is False
         assert status["error"] is None
         session.load_sae.assert_called_once_with("scope", layer=None)
         session.enable_live_sae.assert_called_once_with(top_k=12)
