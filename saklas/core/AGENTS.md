@@ -1186,9 +1186,13 @@ capture-widen union in `_begin_capture` (which also forces transient — not
 persistent — capture routing, and arms a bounded tail ring when no probes are
 attached), and `_live_lens_readout_step` runs at the token tap post-forward —
 no new forward hooks, `static_steerable` untouched — returning `(per_layer,
-aggregate)` and landing them on `TokenEvent.lens_readout` /
+aggregate, token_ids)` and landing the compatibility pair view on
+`TokenEvent.lens_readout` /
 `TokenEvent.lens_aggregate` and the `_last_token_probe_payload["lens"]` /
-`["lens_aggregate"]` slots. The aggregate covers every live layer, and its
+`["lens_aggregate"]` slots. `token_ids` are the ids already selected by the
+same top-k; `TokenProbePayload.to_token_payload` combines them with those
+probabilities into the endpoint-shaped, JSON-safe `captured.lens` record
+without another softmax. The aggregate covers every live layer, and its
 top-k width follows the generation's resolved logit-alternative
 `return_top_k` (8 only when alternatives are disabled). The default layer set
 is **every fitted layer**; pass an explicit `layers` list to trade coverage for
@@ -1197,6 +1201,13 @@ auto-enables the live lens at startup when the artifact exists (serve-side
 policy; library + TUI stay opt-in).
 
 ## loom.py
+
+Generated token rows own the canonical `captured` measurement record. The
+decode tap creates it once from the original probe/J-LENS/SAE readouts, stamps
+instrument source plus recipe steering, appends it beside the token identity,
+and exposes the same object to the native WS. Because token rows already ride
+the compressed token sidecar, explicit loom save/load preserves these rich
+historical channels without a separate cache or schema path.
 
 `LoomTree` — the engine-side conversation tree. Nodes are turns, children are
 alternative continuations, the active path is the model's context.

@@ -38,6 +38,7 @@ import type {
 } from "./api";
 import type {
   CastMemberJSON,
+  CapturedLensReadoutJSON,
   ChatTurn,
   GenStatus,
   InstrumentSourceJSON,
@@ -290,78 +291,41 @@ interface LensHoverSnapshot {
 }
 
 const TOKEN_HOVER_DELAY_MS = 140;
-const TOKEN_HOVER_CACHE_SIZE = 128;
-const _probeHoverCache = new Map<string, Record<string, ProbeReadingJSON>>();
-const _lensHoverCache = new Map<string, LensHoverSnapshot>();
-const _saeHoverCache = new Map<string, SaeFeatureJSON[]>();
-const _tokenLiveHoverKeys = new WeakMap<TokenScore, {
-  probeKey: string;
-  lensKey: string;
-  saeKey: string;
-}>();
-const _lensHoverInFlight = new Map<string, Promise<LensHoverSnapshot>>();
-const _saeHoverInFlight = new Map<string, Promise<SaeFeatureJSON[]>>();
-let _liveHoverSeq = 0;
 let _hoverFetchTimer: ReturnType<typeof setTimeout> | null = null;
 let _hoverClearTimer: ReturnType<typeof setTimeout> | null = null;
 
-function _cacheHoverValue<K, V>(cache: Map<K, V>, key: K, value: V): void {
-  cache.delete(key);
-  cache.set(key, value);
-  if (cache.size > TOKEN_HOVER_CACHE_SIZE) {
-    const oldest = cache.keys().next().value as K | undefined;
-    if (oldest !== undefined) cache.delete(oldest);
-  }
-}
-
-function _readHoverValue<K, V>(cache: Map<K, V>, key: K): V | undefined {
-  const value = cache.get(key);
-  if (value !== undefined) {
-    cache.delete(key);
-    cache.set(key, value);
-  }
-  return value;
-}
-
-function _hoverCacheKeys(nodeId: string, rawIndex: number, raw: boolean): {
-  key: string;
-  probeKey: string;
-  lensKey: string;
-  saeKey: string;
-} {
+function _hoverTokenKey(nodeId: string, rawIndex: number, raw: boolean): string {
   const modelKey = sessionState.info?.model_id ?? "unknown-model";
-  const key = `${modelKey}:${nodeId}:${rawIndex}:${raw ? 1 : 0}`;
-  const lensSource = lensSourceState.sources.find((source) => source.active)?.source ??
-    "default";
-  const saeSource = sessionState.info?.sae_info?.fingerprint ??
-    sessionState.info?.sae_info?.sae_id ??
-    sessionState.info?.sae_info?.release ??
-    "default";
+  return `${modelKey}:${nodeId}:${rawIndex}:${raw ? 1 : 0}`;
+}
+
+function _lensHoverSnapshot(captured: CapturedLensReadoutJSON): LensHoverSnapshot {
   return {
-    key,
-    probeKey: `${key}:probes`,
-    lensKey: `${key}:lens:${lensSource}`,
-    saeKey: `${key}:sae:${saeSource}`,
+    readout: Object.fromEntries(captured.layers.map((row) => [
+      String(row.layer),
+      row.tokens.map((token) => [token.token, Math.exp(token.logprob)]),
+    ])),
+    aggregate: captured.aggregate.map((token) => [
+      token.token,
+      token.strength,
+      token.com,
+      token.spread,
+    ]),
   };
 }
 
 function _fetchLensHover(
-  key: string,
   nodeId: string,
   rawIndex: number,
   raw: boolean,
 ): Promise<LensHoverSnapshot> {
-  const cached = _readHoverValue(_lensHoverCache, key);
-  if (cached) return Promise.resolve(cached);
-  const pending = _lensHoverInFlight.get(key);
-  if (pending) return pending;
-  const request = apiLens.tokenReadout(nodeId, rawIndex, {
+  return apiLens.tokenReadout(nodeId, rawIndex, {
     topK: Math.max(samplingState.return_top_k, 12),
     steered: true,
     raw,
     layers: "all",
   }).then((data) => {
-    const snapshot: LensHoverSnapshot = {
+    return {
       readout: Object.fromEntries(data.layers.map((row) => [
         String(row.layer),
         row.tokens.map((token) => [token.token, Math.exp(token.logprob)]),
@@ -373,38 +337,25 @@ function _fetchLensHover(
         token.spread,
       ]),
     };
-    _cacheHoverValue(_lensHoverCache, key, snapshot);
-    return snapshot;
-  }).finally(() => _lensHoverInFlight.delete(key));
-  _lensHoverInFlight.set(key, request);
-  return request;
+  });
 }
 
 function _fetchSaeHover(
-  key: string,
   nodeId: string,
   rawIndex: number,
   raw: boolean,
 ): Promise<SaeFeatureJSON[]> {
-  const cached = _readHoverValue(_saeHoverCache, key);
-  if (cached) return Promise.resolve(cached);
-  const pending = _saeHoverInFlight.get(key);
-  if (pending) return pending;
-  const request = apiSae.tokenReadout(nodeId, rawIndex, {
+  return apiSae.tokenReadout(nodeId, rawIndex, {
     topK: 12,
     steered: true,
     raw,
-  }).then((data) => {
-    _cacheHoverValue(_saeHoverCache, key, data.features);
-    return data.features;
-  }).finally(() => _saeHoverInFlight.delete(key));
-  _saeHoverInFlight.set(key, request);
-  return request;
+  }).then((data) => data.features);
 }
 
-/** Begin showing one transcript token in the inspector.  Live snapshots land
- * synchronously; absent historical J-LENS/SAE snapshots are recomputed only
- * after a short hover dwell and cached by node/raw-index/mode. */
+/** Begin showing one transcript token in the inspector. Loom-owned captures
+ * land synchronously; a channel absent from the original generation may be
+ * replayed after a short dwell, but replay results are not substituted for or
+ * retained as original capture data. */
 export function beginTokenHover(
   token: TokenScore,
   nodeId: string | null | undefined,
@@ -417,51 +368,36 @@ export function beginTokenHover(
   const raw = effectiveRawMode();
   const rawIndex = token.rawIndex ?? null;
   const modelKey = sessionState.info?.model_id ?? "unknown-model";
-  const cacheKeys = nodeId && rawIndex !== null
-    ? _hoverCacheKeys(nodeId, rawIndex, raw)
-    : null;
-  const key = cacheKeys?.key ??
-    `live:${modelKey}:${nodeId ?? "none"}:${rawIndex ?? "none"}:${token.tokenId ?? "none"}`;
+  const key = nodeId && rawIndex !== null
+    ? _hoverTokenKey(nodeId, rawIndex, raw)
+    : `live:${modelKey}:${nodeId ?? "none"}:${rawIndex ?? "none"}:${token.tokenId ?? "none"}`;
+  const capturedProbes = token.captured?.probes;
+  const capturedLens = token.captured?.lens;
+  const capturedSae = token.captured?.sae;
   tokenHoverState.active = true;
   tokenHoverState.key = key;
   tokenHoverState.tokenText = token.text;
-  tokenHoverState.probeReadings = null;
-  tokenHoverState.probes = token.probes ?? null;
+  tokenHoverState.probeReadings = capturedProbes?.readings ?? null;
+  tokenHoverState.probes = capturedProbes?.scores ?? token.probes ?? null;
   tokenHoverState.coordsByProbe = token.coordsByProbe ?? null;
-  tokenHoverState.perLayerScores = token.perLayerScores ?? null;
+  tokenHoverState.perLayerScores =
+    capturedProbes?.per_layer_scores ?? token.perLayerScores ?? null;
   tokenHoverState.lensReadout = null;
   tokenHoverState.lensAggregate = null;
-  tokenHoverState.saeReadout = null;
+  tokenHoverState.saeReadout = capturedSae?.features ?? null;
   tokenHoverState.lensLoading = false;
   tokenHoverState.saeLoading = false;
 
-  const liveKeys = _tokenLiveHoverKeys.get(token);
-  const cachedProbes = (liveKeys
-    ? _readHoverValue(_probeHoverCache, liveKeys.probeKey)
-    : undefined) ?? (cacheKeys
-    ? _readHoverValue(_probeHoverCache, cacheKeys.probeKey)
-    : undefined);
-  const cachedLens = (liveKeys
-    ? _readHoverValue(_lensHoverCache, liveKeys.lensKey)
-    : undefined) ?? (cacheKeys
-    ? _readHoverValue(_lensHoverCache, cacheKeys.lensKey)
-    : undefined);
-  const cachedSae = (liveKeys
-    ? _readHoverValue(_saeHoverCache, liveKeys.saeKey)
-    : undefined) ?? (cacheKeys
-    ? _readHoverValue(_saeHoverCache, cacheKeys.saeKey)
-    : undefined);
-  if (cachedProbes) tokenHoverState.probeReadings = cachedProbes;
-  if (cachedLens) {
-    tokenHoverState.lensReadout = cachedLens.readout;
-    tokenHoverState.lensAggregate = cachedLens.aggregate;
+  if (capturedLens) {
+    const snapshot = _lensHoverSnapshot(capturedLens);
+    tokenHoverState.lensReadout = snapshot.readout;
+    tokenHoverState.lensAggregate = snapshot.aggregate;
   }
-  if (cachedSae) tokenHoverState.saeReadout = cachedSae;
 
-  if (!nodeId || rawIndex === null || cacheKeys === null) return;
-  const needsLens = (!tokenHoverState.lensReadout || !tokenHoverState.lensAggregate) &&
+  if (!nodeId || rawIndex === null) return;
+  const needsLens = capturedLens === undefined &&
     sessionState.info?.jlens_fitted === true;
-  const needsSae = !tokenHoverState.saeReadout &&
+  const needsSae = capturedSae === undefined &&
     sessionState.info?.sae_loaded === true;
   tokenHoverState.lensLoading = needsLens;
   tokenHoverState.saeLoading = needsSae;
@@ -470,7 +406,7 @@ export function beginTokenHover(
   _hoverFetchTimer = setTimeout(() => {
     _hoverFetchTimer = null;
     if (needsLens) {
-      void _fetchLensHover(cacheKeys.lensKey, nodeId, rawIndex, raw)
+      void _fetchLensHover(nodeId, rawIndex, raw)
         .then((snapshot) => {
           if (!tokenHoverState.active || tokenHoverState.key !== key) return;
           tokenHoverState.lensReadout = snapshot.readout;
@@ -484,7 +420,7 @@ export function beginTokenHover(
         });
     }
     if (needsSae) {
-      void _fetchSaeHover(cacheKeys.saeKey, nodeId, rawIndex, raw)
+      void _fetchSaeHover(nodeId, rawIndex, raw)
         .then((features) => {
           if (!tokenHoverState.active || tokenHoverState.key !== key) return;
           tokenHoverState.saeReadout = features;
@@ -1688,7 +1624,7 @@ function _primaryPerLayer(
 
 /** Read one probe card through the token-hover overlay. Token rows retain the
  * primary scalar, multi-axis coordinates, and layer strip; lens/SAE cards can
- * additionally fill from the bounded live/on-demand hover caches. */
+ * additionally fill from retained live/on-demand hover snapshots. */
 export function probeEntryForDisplay(name: string): ProbeRackEntry | undefined {
   const base = probeRack.entries.get(name);
   if (!base || !tokenHoverState.active) return base;
@@ -2206,6 +2142,7 @@ function recomputeActivePath(): void {
  *  are bit-identical to the live-streamed shape so the highlight / click
  *  / fork affordances behave the same way. */
 function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): TokenScore {
+  const capturedProbes = row.captured?.probes;
   const out: TokenScore = {
     text: row.text,
     thinking: false,
@@ -2214,8 +2151,22 @@ function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): Toke
   if (row.logprob !== undefined) out.logprob = row.logprob;
   if (row.top_alts) out.topAlts = row.top_alts;
   if (row.raw_index !== undefined) out.rawIndex = row.raw_index;
-  if (row.probes) out.probes = row.probes;
-  if (row.per_layer_scores) out.perLayerScores = row.per_layer_scores;
+  if (capturedProbes?.scores ?? row.probes) {
+    out.probes = capturedProbes?.scores ?? row.probes;
+  }
+  if (capturedProbes?.per_layer_scores ?? row.per_layer_scores) {
+    out.perLayerScores =
+      capturedProbes?.per_layer_scores ?? row.per_layer_scores;
+  }
+  if (row.captured) out.captured = row.captured;
+  const readings = capturedProbes?.readings;
+  if (readings) {
+    const byProbe: Record<string, number[]> = {};
+    for (const [name, reading] of Object.entries(readings)) {
+      if (reading.coords.length > 1) byProbe[name] = reading.coords;
+    }
+    if (Object.keys(byProbe).length > 0) out.coordsByProbe = byProbe;
+  }
   return out;
 }
 
@@ -3430,17 +3381,30 @@ function handleWsMessage(msg: WSServerMessage): void {
         const elapsed = (performance.now() - genStatus.startedAt) / 1000;
         if (elapsed > 0) genStatus.tokPerSec = genStatus.tokensSoFar / elapsed;
       }
+      const capturedProbes = msg.captured?.probes;
+      const capturedReadings =
+        capturedProbes?.readings ?? msg.probe_readings;
+      const capturedScores = capturedProbes?.scores ?? msg.scores;
+      const capturedPerLayer =
+        capturedProbes?.per_layer_scores ?? msg.per_layer_scores;
+      const capturedLens = msg.captured?.lens;
+      const lensSnapshot = capturedLens
+        ? _lensHoverSnapshot(capturedLens)
+        : null;
+      const liveLensReadout = lensSnapshot?.readout ?? msg.lens_readout;
+      const liveLensAggregate = lensSnapshot?.aggregate ?? msg.lens_aggregate;
+      const liveSaeReadout = msg.captured?.sae?.features ?? msg.sae_readout;
       const tokenScore: TokenScore = {
         text: msg.text,
         thinking: msg.thinking,
         tokenId: msg.token_id,
-        perLayerScores: msg.per_layer_scores,
+        perLayerScores: capturedPerLayer,
         // ``msg.scores`` is the magnitude-weighted aggregate probe row —
         // the value the TUI tints live tokens with.  Using it (rather
         // than a single deepest-layer slice) makes the webui's live
         // highlight match both the TUI and the post-generation projected
         // pass.  Absent when no probes are loaded.
-        probes: msg.scores,
+        probes: capturedScores,
         // Logit-pass: pipe chosen-token logprob + top-K alternatives onto
         // the per-token row.  Both ride the WS ``token`` event directly
         // from Phase 1's engine capture; absent when ``return_top_k == 0``
@@ -3450,12 +3414,13 @@ function handleWsMessage(msg: WSServerMessage): void {
         // Raw decode-step index — the join key the logit fork slices
         // ``raw_token_ids`` on.  Rides the WS ``token`` event directly.
         rawIndex: msg.raw_index ?? null,
+        captured: msg.captured,
       };
       // Seed the single-probe ``score`` for the selected highlight so the
       // inline tint paints immediately as the token streams in.  The
       // canonical projected scores overwrite this on ``done``.
-      if (msg.scores && highlightState.target) {
-        const s = msg.scores[highlightState.target];
+      if (capturedScores && highlightState.target) {
+        const s = capturedScores[highlightState.target];
         if (typeof s === "number") tokenScore.score = s;
       }
       // Per-PC token highlighting: stash the full per-axis domain coords off
@@ -3463,42 +3428,13 @@ function handleWsMessage(msg: WSServerMessage): void {
       // can tint live.  Only multi-axis probes need it — axis 0 already rides
       // ``msg.scores`` — and the row keeps it through ``done`` (the per-token
       // settle pass is axis-0 only and never clobbers this field).
-      if (msg.probe_readings) {
+      if (capturedReadings) {
         const byProbe: Record<string, number[]> = {};
-        for (const [pname, r] of Object.entries(msg.probe_readings)) {
+        for (const [pname, r] of Object.entries(capturedReadings)) {
           const coords = (r as ProbeReadingJSON).coords;
           if (Array.isArray(coords) && coords.length > 1) byProbe[pname] = coords;
         }
         if (Object.keys(byProbe).length > 0) tokenScore.coordsByProbe = byProbe;
-      }
-      // Keep the expensive per-layer instrument snapshots out of the loom's
-      // durable token rows. The newest 128 remain available at zero cost for
-      // hover; older tokens fall back to the on-demand readout endpoints.
-      const hoverNodeId = msg.node_id ?? _currentWriteTurn()?.nodeId;
-      const hoverKeys = hoverNodeId && msg.raw_index != null
-        ? _hoverCacheKeys(hoverNodeId, msg.raw_index, effectiveRawMode())
-        : {
-            key: `stream:${++_liveHoverSeq}`,
-            probeKey: `stream:${_liveHoverSeq}:probes`,
-            lensKey: `stream:${_liveHoverSeq}:lens`,
-            saeKey: `stream:${_liveHoverSeq}:sae`,
-          };
-      _tokenLiveHoverKeys.set(tokenScore, {
-        probeKey: hoverKeys.probeKey,
-        lensKey: hoverKeys.lensKey,
-        saeKey: hoverKeys.saeKey,
-      });
-      if (msg.probe_readings) {
-        _cacheHoverValue(_probeHoverCache, hoverKeys.probeKey, msg.probe_readings);
-      }
-      if (msg.lens_readout && msg.lens_aggregate) {
-        _cacheHoverValue(_lensHoverCache, hoverKeys.lensKey, {
-          readout: msg.lens_readout,
-          aggregate: msg.lens_aggregate,
-        });
-      }
-      if (msg.sae_readout) {
-        _cacheHoverValue(_saeHoverCache, hoverKeys.saeKey, msg.sae_readout);
       }
       const turn = _currentWriteTurn();
       if (turn) {
@@ -3525,17 +3461,17 @@ function handleWsMessage(msg: WSServerMessage): void {
       // anchored to the steered branch.  ``msg.scores`` / ``per_layer_scores``
       // above still feed highlight tinting + the token-drilldown heatmap.
       if (!abState.processingAb) {
-        updateProbesFromReadings(msg.probe_readings);
+        updateProbesFromReadings(capturedReadings);
         // J-LENS tab — the live all-layer readout. Present only while
         // the session's live lens is enabled; shadow runs skipped like
         // the probe rack so the matrix tracks the steered branch.
-        if (msg.lens_readout) lensState.readout = msg.lens_readout;
-        if (msg.lens_aggregate) {
-          lensState.aggregate = msg.lens_aggregate;
+        if (liveLensReadout) lensState.readout = liveLensReadout;
+        if (liveLensAggregate) {
+          lensState.aggregate = liveLensAggregate;
           // Rolling strength history for the workspace-card sparklines —
           // one compact [token, strength] frame per step, probe-sparkline
           // cap, carries across generations like probe sparklines.
-          const frame: [string, number][] = msg.lens_aggregate.map(
+          const frame: [string, number][] = liveLensAggregate.map(
             ([tok, strength]) => [tok, strength],
           );
           const hist = lensState.aggHistory.slice();
@@ -3543,9 +3479,9 @@ function handleWsMessage(msg: WSServerMessage): void {
           if (hist.length > MAX_SPARKLINE) hist.shift();
           lensState.aggHistory = hist;
         }
-        if (msg.sae_readout) {
-          saeState.readout = msg.sae_readout;
-          for (const feature of msg.sae_readout) {
+        if (liveSaeReadout) {
+          saeState.readout = liveSaeReadout;
+          for (const feature of liveSaeReadout) {
             const prior = saeState.history.get(feature.id) ?? [];
             const next = [...prior, feature.activation].slice(-MAX_SPARKLINE);
             saeState.history.set(feature.id, next);

@@ -263,6 +263,45 @@ export interface SaeTokenReadoutJSON {
   features: SaeFeatureJSON[];
 }
 
+// --------------------------------------- loom-owned token captures --
+
+export type TokenReadoutProvenance = "captured" | "replayed";
+
+/** Probe measurements recorded by the generation that authored the token. */
+export interface CapturedProbeReadoutJSON {
+  provenance: TokenReadoutProvenance;
+  scores?: Record<string, number>;
+  per_layer_scores?: Record<string, Record<string, number>>;
+  readings?: Record<string, ProbeReadingJSON>;
+}
+
+/** J-LENS measurements recorded at the original decode step.  ``layers``
+ * deliberately matches the token-readout endpoint shape, so historical UI
+ * surfaces do not need a second cache-only representation. */
+export interface CapturedLensReadoutJSON {
+  provenance: TokenReadoutProvenance;
+  source: string | null;
+  steering: string | null;
+  layers: LensReadoutLayerJSON[];
+  aggregate: LensAggregateTokenJSON[];
+}
+
+/** SAE measurements recorded at the original decode step. */
+export interface CapturedSaeReadoutJSON {
+  provenance: TokenReadoutProvenance;
+  source: string | null;
+  steering: string | null;
+  layer: number | null;
+  features: SaeFeatureJSON[];
+}
+
+/** Canonical rich measurement record owned by a loom token row. */
+export interface TokenCapturedJSON {
+  probes?: CapturedProbeReadoutJSON;
+  lens?: CapturedLensReadoutJSON;
+  sae?: CapturedSaeReadoutJSON;
+}
+
 // ----------------------------------------------------- manifolds --
 
 /** One axis of a Box manifold domain.  ``periodic`` axes wrap (the
@@ -1081,6 +1120,10 @@ export interface WSTokenEvent {
   /** Loom: node id this token belongs to.  Routes the token to the right
    * sibling render during n-way regen.  Optional. */
   node_id: string | null;
+  /** Canonical rich measurement record. The identical object is persisted on
+   * the loom token row; legacy scalar/readout fields below remain temporary
+   * compatibility aliases. */
+  captured?: TokenCapturedJSON;
   /** Per-attached-probe reading for this token — every probe shape (a
    *  2-node concept axis is the rank-1 case).  Keys are probe names; values
    *  are the full ``ProbeReadingJSON``.  Omitted entirely when no probe is
@@ -1169,6 +1212,9 @@ export interface LoomTokenRowJSON {
    *  keyed by stringified layer index.  Drives the token-drilldown
    *  drawer's heatmap on rehydrated turns. */
   per_layer_scores?: Record<string, Record<string, number>>;
+  /** Rich channels captured by the original generation. This survives tree
+   * rehydration and explicit loom save/load without replaying the model. */
+  captured?: TokenCapturedJSON;
 }
 
 export interface LoomNodeJSON {
@@ -1459,6 +1505,8 @@ export interface TokenScore {
    *  transcript-imported nodes (engine pre-dates raw-id capture),
    *  in which case the token can't be forked. */
   rawIndex?: number | null;
+  /** Loom-owned rich measurements from the original decode step. */
+  captured?: TokenCapturedJSON;
 }
 
 export interface ChatTurn {

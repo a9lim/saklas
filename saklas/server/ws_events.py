@@ -73,6 +73,13 @@ def build_token_event(
             name: r.to_dict() for name, r in readings.items()
         }
 
+    # Canonical historical record. The token tap builds this once and stores
+    # this exact JSON-safe object on the loom row; the WebSocket forwards it
+    # verbatim so live and rehydrated tokens have one rich-channel authority.
+    captured = payload.get("captured")
+    if captured:
+        event["captured"] = captured
+
     # Live J-lens workspace readout: the step's top-k lens tokens per selected
     # layer (``enable_live_lens``), stashed by the token tap alongside the
     # probe readings.  String layer keys to match ``per_layer_scores``' wire

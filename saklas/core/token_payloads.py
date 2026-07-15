@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,9 +20,18 @@ class TokenProbePayload:
     probe_readings: dict[str, ProbeReading] | None = None
 
     def to_token_payload(
-        self, *, lens: Any = None, lens_aggregate: Any = None, sae: Any = None,
+        self,
+        *,
+        lens: Any = None,
+        lens_aggregate: Any = None,
+        lens_token_ids: Any = None,
+        lens_source: str | None = None,
+        sae: Any = None,
+        sae_source: str | None = None,
+        sae_layer: int | None = None,
+        steering: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "scores": self.scores,
             "per_layer_scores": self.per_layer_scores,
             "probe_readings": self.probe_readings,
@@ -29,6 +39,17 @@ class TokenProbePayload:
             "lens_aggregate": lens_aggregate,
             "sae": sae,
         }
+        captured = serialize_captured_token_channels(
+            payload,
+            lens_token_ids=lens_token_ids,
+            lens_source=lens_source,
+            sae_source=sae_source,
+            sae_layer=sae_layer,
+            steering=steering,
+        )
+        if captured:
+            payload["captured"] = captured
+        return payload
 
     def merge_readings(
         self,
@@ -69,6 +90,105 @@ def _per_layer_axis0(
                 float(coord[0] if coord else 0.0), 6,
             )
     return by_layer or None
+
+
+def serialize_captured_token_channels(
+    payload: dict[str, Any],
+    *,
+    lens_token_ids: dict[int, list[int]] | None = None,
+    lens_source: str | None = None,
+    sae_source: str | None = None,
+    sae_layer: int | None = None,
+    steering: str | None = None,
+) -> dict[str, Any]:
+    """Return the JSON-safe, loom-owned measurement record for one token.
+
+    The decode tap calls this once, then places the same ``captured`` object
+    on both the loom token row and the native WebSocket frame.  Legacy scalar
+    aliases remain outside this record for existing consumers, but this is the
+    authoritative rich shape used by historical hover and drilldown surfaces.
+    """
+    captured: dict[str, Any] = {}
+
+    scores = payload.get("scores")
+    per_layer_scores = payload.get("per_layer_scores")
+    readings = payload.get("probe_readings")
+    if scores or per_layer_scores or readings:
+        probes: dict[str, Any] = {"provenance": "captured"}
+        if scores:
+            probes["scores"] = {
+                str(name): round(float(value), 6)
+                for name, value in scores.items()
+            }
+        if per_layer_scores:
+            probes["per_layer_scores"] = per_layer_scores
+        if readings:
+            probes["readings"] = {
+                str(name): reading.to_dict()
+                for name, reading in readings.items()
+            }
+        captured["probes"] = probes
+
+    lens = payload.get("lens")
+    aggregate = payload.get("lens_aggregate")
+    if lens or aggregate:
+        id_rows = lens_token_ids or {}
+        layers: list[dict[str, Any]] = []
+        for layer, row in sorted(lens.items() if lens else ()):
+            token_ids = id_rows.get(int(layer), [])
+            tokens: list[dict[str, Any]] = []
+            for index, pair in enumerate(row):
+                token, probability = pair
+                token_id = token_ids[index] if index < len(token_ids) else -1
+                # The live display already calibrated this row once.  Convert
+                # that probability into the endpoint's logprob unit without a
+                # second softmax; the floor keeps strict JSON finite.
+                logprob = math.log(max(float(probability), 1e-45))
+                tokens.append({
+                    "token": str(token),
+                    "id": int(token_id),
+                    "logprob": float(logprob),
+                })
+            layers.append({"layer": int(layer), "tokens": tokens})
+        captured["lens"] = {
+            "provenance": "captured",
+            "source": lens_source,
+            "steering": steering,
+            "layers": layers,
+            "aggregate": [
+                {
+                    "token": str(token),
+                    "strength": float(strength),
+                    "com": float(com),
+                    "spread": float(spread),
+                }
+                for token, strength, com, spread in (aggregate or ())
+            ],
+        }
+
+    sae = payload.get("sae")
+    if sae:
+        captured["sae"] = {
+            "provenance": "captured",
+            "source": sae_source,
+            "steering": steering,
+            "layer": int(sae_layer) if sae_layer is not None else None,
+            "features": [
+                {
+                    "id": int(row[0]),
+                    "activation": float(row[1]),
+                    "label": row[2],
+                    "max_act": (
+                        float(row[3])
+                        if len(row) > 3 and row[3] is not None
+                        else None
+                    ),
+                }
+                for row in sae
+            ],
+        }
+
+    return captured
 
 
 def build_token_probe_payload(

@@ -498,18 +498,14 @@ Fork / prefill / commit are mutually exclusive (400 on mix). `n>1` fans out N si
 assistant nodes on one shared user parent, generated serially with deterministic
 derived seeds. Server → client: `started` (node_id filled lazily by the first
 token), `tree_mutated`, `token` (per token — `logprob`/`top_alts`/`perplexity`
-when captured, `scores`/`per_layer_scores` when probes are loaded, `probe_readings`
-`Record<name, {fraction, nearest}>` when any probe is attached, computed
-inline off `session._capture._per_layer`, and `lens_readout`
-`Record<layerStr, [token, score][]>` + `lens_aggregate`
-`[token, strength, com, spread][]` while the live lens is on — the WS
-The stream wraps `_on_token` in a typed `TokenConsumer` whose options request lens readout so the engine computes the
-step readout, and `build_token_event` copies the token tap's `lens` /
-`lens_aggregate` slots onto
-the frame; likewise `sae_readout`
-`[{id, activation, label, max_act}]` while the live SAE readout is on —
-`max_act` is the cached Neuronpedia maxActApprox strength unit, `null`
-until the metadata backfill lands), `done` (`result` with `text`, `tokens`,
+when captured, plus the token tap's canonical `captured` object — the same
+JSON-safe rich record appended to the loom row — with optional probe, J-LENS,
+and SAE channels and their original source/steering provenance). Compatibility
+aliases remain: `scores`/`per_layer_scores`/`probe_readings`, `lens_readout` +
+`lens_aggregate`, and `sae_readout`. The stream wraps `_on_token` in a typed
+`TokenConsumer` whose options request the live readouts; `build_token_event`
+forwards `captured` verbatim rather than rebuilding it from loom rows), `done`
+(`result` with `text`, `tokens`,
 `finish_reason`, `usage`, `mean_logprob`, `mean_surprise`,
 `probe_readings` aggregate), `error` (validation errors keep the connection open;
 other failures close 1011).

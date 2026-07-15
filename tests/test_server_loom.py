@@ -540,6 +540,20 @@ class TestTreeGet:
             "logprob": -1.5,
             "probes": {"calm": 0.42},
             "per_layer_scores": {"5": {"calm": 0.38}, "10": {"calm": 0.45}},
+            "captured": {
+                "lens": {
+                    "provenance": "captured",
+                    "source": "local:default",
+                    "steering": None,
+                    "layers": [{
+                        "layer": 5,
+                        "tokens": [{
+                            "token": "hello", "id": 100, "logprob": -0.1,
+                        }],
+                    }],
+                    "aggregate": [],
+                },
+            },
         })
         session.tree.append_token(a1, {
             "token_id": 101,
@@ -564,6 +578,9 @@ class TestTreeGet:
         assert first["probes"] == {"calm": 0.42}
         assert first["per_layer_scores"] == {
             "5": {"calm": 0.38}, "10": {"calm": 0.45},
+        }
+        assert first["captured"]["lens"]["layers"][0]["tokens"][0] == {
+            "token": "hello", "id": 100, "logprob": -0.1,
         }
 
     def test_active_path_shape(self, session_and_client: Any):

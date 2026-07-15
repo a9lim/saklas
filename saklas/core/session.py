@@ -3433,8 +3433,20 @@ class SaklasSession:
             "layer_rows": {l: i for i, l in enumerate(layer_list)},
             "unembed": get_unembedding(self._model),
             "norm": get_final_norm(self._model),
+            "source": SaklasSession._active_jlens_source_label(self),
         }
         return list(layers)
+
+    def _active_jlens_source_label(self) -> str | None:
+        """Return the active J-lens source in the public source syntax."""
+        from saklas.io.lens_sources import load_active_lens_source
+
+        active = load_active_lens_source(self.model_id)
+        if active is None:
+            return None
+        if active["kind"] == "local":
+            return f"local:{active['name']}"
+        return str(active["name"])
 
     def disable_live_lens(self) -> None:
         """Stop streaming the live lens readout and free the device J_l copies."""
@@ -3460,6 +3472,7 @@ class SaklasSession:
         tuple[
             dict[int, list[tuple[str, float]]],
             list[tuple[str, float, float, float]],
+            dict[int, list[int]],
         ]
         | None
     ):
@@ -3472,7 +3485,10 @@ class SaklasSession:
         **per-layer softmax probability** (the same strength unit every
         other lens surface reports — apples-to-apples across layers, unlike
         a raw logit), plus the layer-aggregated chip list ``[(token,
-        strength, com, spread), ...]`` over all live layers.
+        strength, com, spread), ...]`` over all live layers.  The third
+        return value carries the vocabulary ids already selected by ``topk``;
+        the loom serializer uses them to normalize the historical wire shape
+        without re-tokenizing the decoded strings.
         """
         state = self._live_lens
         if state is None or not self._live_lens_active_for_generation:
@@ -3629,18 +3645,20 @@ class SaklasSession:
         all_vals = vals.detach().to("cpu").tolist()
         all_idxs = idxs.detach().to("cpu").tolist()
         out: dict[int, list[tuple[str, float]]] = {}
+        token_ids: dict[int, list[int]] = {}
         for row, layer in enumerate(layers_present):
             pairs: list[tuple[str, float]] = []
             for v, i in zip(all_vals[row], all_idxs[row]):
                 pairs.append((self._jlens_decode_id(int(i)), float(v)))
             out[layer] = pairs
+            token_ids[layer] = [int(i) for i in all_idxs[row]]
         agg = self._jlens_aggregate_rows(
             None,
             layers_present,
             top_k=k,
             probabilities=probabilities,
         )
-        return out, agg
+        return out, agg, token_ids
 
     # -- Sparse-autoencoder runtime -------------------------------------
 
@@ -4073,8 +4091,18 @@ class SaklasSession:
         """Enable the one-matvec live feature readout at the resident layer."""
         if not 1 <= int(top_k) <= 100:
             raise ValueError("top_k must be in [1, 100]")
-        _backend, layer, _width = self._require_sae()
-        self._live_sae = {"layer": layer, "top_k": int(top_k)}
+        backend, layer, _width = self._require_sae()
+        release = str(backend.release)
+        source = (
+            release
+            if release.startswith(("local:", "saelens:"))
+            else f"saelens:{release}"
+        )
+        self._live_sae = {
+            "layer": layer,
+            "top_k": int(top_k),
+            "source": source,
+        }
         return {"layer": layer, "top_k": int(top_k)}
 
     def disable_live_sae(self) -> None:
@@ -8749,6 +8777,11 @@ class SaklasSession:
                 lens_aggregate_payload = (
                     lens_step[1] if lens_step is not None else None
                 )
+                lens_token_ids = (
+                    lens_step[2]
+                    if lens_step is not None and len(lens_step) > 2
+                    else None
+                )
                 if (
                     lens_payload
                     or lens_aggregate_payload
@@ -8764,10 +8797,32 @@ class SaklasSession:
                 ):
                     if payload is None:
                         payload = TokenProbePayload()
+                    recipe_steering = None
+                    if assistant_node_id is not None:
+                        node = self.tree.nodes.get(assistant_node_id)
+                        if node is not None and node.recipe is not None:
+                            recipe_steering = node.recipe.steering
                     self._last_token_probe_payload = payload.to_token_payload(
                         lens=lens_payload,
                         lens_aggregate=lens_aggregate_payload,
+                        lens_token_ids=lens_token_ids,
+                        lens_source=(
+                            self._live_lens.get("source")
+                            if self._live_lens is not None
+                            else None
+                        ),
                         sae=sae_step,
+                        sae_source=(
+                            self._live_sae.get("source")
+                            if self._live_sae is not None
+                            else None
+                        ),
+                        sae_layer=(
+                            int(self._live_sae["layer"])
+                            if self._live_sae is not None
+                            else None
+                        ),
+                        steering=recipe_steering,
                     )
                 if assistant_node_id is not None and tid is not None:
                     token_row: dict[str, Any] = {
@@ -8793,6 +8848,13 @@ class SaklasSession:
                         }
                     if per_layer_payload:
                         token_row["per_layer_scores"] = per_layer_payload
+                    captured = (
+                        self._last_token_probe_payload.get("captured")
+                        if self._last_token_probe_payload is not None
+                        else None
+                    )
+                    if captured:
+                        token_row["captured"] = captured
                     self.tree.append_token(
                         assistant_node_id,
                         token_row,

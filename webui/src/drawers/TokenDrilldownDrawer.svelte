@@ -26,6 +26,8 @@
     sessionState,
     effectiveRawMode,
     probeAxisScale,
+    lensSourceState,
+    saeSourceState,
   } from "../lib/stores.svelte";
   import { ApiError, apiLens, apiSae } from "../lib/api";
   import type {
@@ -325,15 +327,12 @@
     }
   }
 
-  // ---- j-lens tab --------------------------------------------------------
+  // ---- j-lens + SAE historical channels ---------------------------------
   //
-  // On-demand recompute, not stored stream data: the server rebuilds the
-  // node's prompt render + raw decode prefix up to this token and reads
-  // the per-layer J-lens top-k at the forward that produced it — so any
-  // in-session token drills down, steered generations read their steered
-  // workspace (recipe replay), and nothing is paid per-token at gen time.
-  // Responses are cached per (node, raw_index, steered) while the drawer
-  // lives; the steered toggle refetches the unsteered counterfactual.
+  // The token's loom-owned ``captured`` record is authoritative.  Replay is
+  // reserved for old/missing channels and the explicit unsteered J-LENS
+  // counterfactual; replayed responses are kept only as the drawer's current
+  // view, never cached or written back as original data.
 
   // Share the logit-alternative width. Zero means the ordinary logit capture
   // is off, so retain the canonical 8-wide J-lens view in that state.
@@ -346,50 +345,107 @@
    *  it off reads the unsteered counterfactual workspace of the same
    *  token stream.  Sticky across tokens within one drawer life. */
   let lensSteered = $state(true);
-  const lensCache = new Map<string, LensTokenReadoutJSON>();
+  type ReadoutOrigin = "captured" | "replayed" | null;
+  let lensOrigin = $state<ReadoutOrigin>(null);
+  let lensSource = $state<string | null>(null);
+  let lensRequestSeq = 0;
 
   const jlensFitted = $derived(sessionState.info?.jlens_fitted === true);
   const saeLoaded = $derived(sessionState.info?.sae_loaded === true);
   let saeData = $state<SaeTokenReadoutJSON | null>(null);
   let saeLoading = $state(false);
   let saeError = $state<string | null>(null);
-  const saeCache = new Map<string, SaeTokenReadoutJSON>();
+  let saeOrigin = $state<ReadoutOrigin>(null);
+  let saeSource = $state<string | null>(null);
+  let saeRequestSeq = 0;
+
+  const capturedLensData = $derived.by<LensTokenReadoutJSON | null>(() => {
+    const captured = token?.captured?.lens;
+    if (!captured || !token) return null;
+    return {
+      node_id: loomNodeId ?? "",
+      raw_index: token.rawIndex ?? -1,
+      token_id: token.tokenId ?? -1,
+      token_text: token.text,
+      steering: captured.steering,
+      aggregate: captured.aggregate,
+      layers: captured.layers,
+    };
+  });
+
+  const capturedSaeData = $derived.by<SaeTokenReadoutJSON | null>(() => {
+    const captured = token?.captured?.sae;
+    if (!captured || !token) return null;
+    return {
+      node_id: loomNodeId ?? "",
+      raw_index: token.rawIndex ?? -1,
+      token_id: token.tokenId ?? -1,
+      token_text: token.text,
+      steering: captured.steering,
+      layer: captured.layer ?? -1,
+      features: captured.features,
+    };
+  });
 
   $effect(() => {
-    if (tab !== "sae" || !saeLoaded) return;
+    if (tab !== "sae") return;
+    const request = ++saeRequestSeq;
+    const captured = capturedSaeData;
+    if (captured) {
+      saeData = captured;
+      saeOrigin = "captured";
+      saeSource = token?.captured?.sae?.source ?? null;
+      saeLoading = false;
+      saeError = null;
+      return;
+    }
+    saeData = null;
+    saeOrigin = null;
+    saeSource = null;
+    saeError = null;
+    if (!saeLoaded) return;
     const nodeId = loomNodeId;
     const rawIndex = token?.rawIndex;
     if (!nodeId || rawIndex == null) return;
-    const key = `${nodeId}:${rawIndex}:${effectiveRawMode() ? 1 : 0}`;
-    const hit = saeCache.get(key);
-    if (hit) { saeData = hit; saeError = null; return; }
     saeLoading = true; saeError = null; saeData = null;
     apiSae.tokenReadout(nodeId, rawIndex, { raw: effectiveRawMode() })
-      .then((data) => { saeCache.set(key, data); saeData = data; })
-      .catch((error) => { saeError = error instanceof Error ? error.message : String(error); })
-      .finally(() => { saeLoading = false; });
-  });
-
-  const lensKey = $derived.by<string | null>(() => {
-    const nodeId = loomNodeId;
-    const rawIndex = token?.rawIndex;
-    const raw = effectiveRawMode();
-    if (!nodeId || rawIndex == null) return null;
-    return `${nodeId}:${rawIndex}:${lensSteered ? 1 : 0}:${raw ? 1 : 0}:all:${lensTopK}`;
+      .then((data) => {
+        if (request !== saeRequestSeq) return;
+        saeData = data;
+        saeOrigin = "replayed";
+        saeSource =
+          saeSourceState.sources.find((source) => source.active)?.source ??
+          sessionState.info?.sae_info?.release ?? null;
+      })
+      .catch((error) => {
+        if (request !== saeRequestSeq) return;
+        saeError = error instanceof Error ? error.message : String(error);
+      })
+      .finally(() => {
+        if (request === saeRequestSeq) saeLoading = false;
+      });
   });
 
   $effect(() => {
-    if (tab !== "lens" || !jlensFitted) return;
-    const key = lensKey;
-    const nodeId = loomNodeId;
-    const rawIndex = token?.rawIndex;
-    if (!key || !nodeId || rawIndex == null) return;
-    const hit = lensCache.get(key);
-    if (hit) {
-      lensData = hit;
+    if (tab !== "lens") return;
+    const request = ++lensRequestSeq;
+    const captured = capturedLensData;
+    if (lensSteered && captured) {
+      lensData = captured;
+      lensOrigin = "captured";
+      lensSource = token?.captured?.lens?.source ?? null;
+      lensLoading = false;
       lensError = null;
       return;
     }
+    lensData = null;
+    lensOrigin = null;
+    lensSource = null;
+    lensError = null;
+    if (!jlensFitted) return;
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!nodeId || rawIndex == null) return;
     lensLoading = true;
     lensError = null;
     lensData = null;
@@ -401,11 +457,14 @@
         layers: "all",
       })
       .then((d) => {
-        lensCache.set(key, d);
-        if (key === lensKey) lensData = d;
+        if (request !== lensRequestSeq) return;
+        lensData = d;
+        lensOrigin = "replayed";
+        lensSource =
+          lensSourceState.sources.find((source) => source.active)?.source ?? null;
       })
       .catch((e) => {
-        if (key !== lensKey) return;
+        if (request !== lensRequestSeq) return;
         const detail =
           e instanceof ApiError &&
           typeof (e.body as { detail?: unknown } | null)?.detail === "string"
@@ -414,7 +473,7 @@
         lensError = detail ?? (e instanceof Error ? e.message : String(e));
       })
       .finally(() => {
-        if (key === lensKey) lensLoading = false;
+        if (request === lensRequestSeq) lensLoading = false;
       });
   });
 
@@ -423,6 +482,9 @@
    *  user already flipped to unsteered and needs the way back. */
   const lensHasSteering = $derived(
     (lensData?.steering ?? null) !== null || !lensSteered,
+  );
+  const lensColumnCount = $derived(
+    Math.max(0, ...(lensData?.layers.map((row) => row.tokens.length) ?? [])),
   );
 
   function lensCellStyle(logprob: number): string {
@@ -694,23 +756,9 @@
       <!-- J-lens tab. The readout matrix rows are all fitted lens layers,
            ascending; cells are the
            top-K vocabulary tokens each layer's residual was disposed to
-           say at the forward that produced this token.  Recomputed
-           on demand server-side (node prompt render + raw prefix replay),
-           so it works for any in-session token, no per-token gen cost. -->
-      {#if !jlensFitted}
-        <div class="empty">
-          <p>no J-LENS fit</p>
-          <p><code>saklas lens fit {sessionState.info?.model_id ?? "<model>"}</code></p>
-        </div>
-      {:else if token.rawIndex == null}
-        <div class="empty">
-          no raw decode index
-        </div>
-      {:else if !loomNodeId}
-        <div class="empty">
-          no loom node
-        </div>
-      {:else if lensLoading}
+           say at the forward that produced this token. Original capture is
+           shown when present; replay is the fallback/counterfactual path. -->
+      {#if lensLoading}
         <div class="empty">
           computing…
         </div>
@@ -722,6 +770,11 @@
         <div class="tab-summary">
           <div>
             produced: <code class="tok-inline">{JSON.stringify(lensData.token_text)}</code>
+            {#if lensOrigin}
+              <span class="kv">
+                {lensOrigin}{lensSource ? ` · ${lensSource}` : ""}
+              </span>
+            {/if}
             {#if lensData.steering !== null}
               <span class="kv steer-chip" title="recipe applied">
                 steered: <code>{lensData.steering}</code>
@@ -760,7 +813,7 @@
             <thead>
               <tr>
                 <th class="corner">L \ rank</th>
-                {#each { length: lensTopK } as _, i (i)}
+                {#each { length: lensColumnCount } as _, i (i)}
                   <th class="num">{i + 1}</th>
                 {/each}
               </tr>
@@ -789,18 +842,31 @@
             </tbody>
           </table>
         </div>
+      {:else if !jlensFitted}
+        <div class="empty">
+          <p>no J-LENS fit</p>
+          <p><code>saklas lens fit {sessionState.info?.model_id ?? "<model>"}</code></p>
+        </div>
+      {:else if token.rawIndex == null}
+        <div class="empty">
+          no raw decode index
+        </div>
+      {:else if !loomNodeId}
+        <div class="empty">
+          no loom node
+        </div>
       {/if}
     {:else}
-      {#if !saeLoaded}
-        <div class="empty">no SAE loaded</div>
-      {:else if token.rawIndex == null || !loomNodeId}
-        <div class="empty">no raw decode record</div>
-      {:else if saeLoading}
+      {#if saeLoading}
         <div class="empty">computing…</div>
       {:else if saeError}
         <div class="empty">readout: {saeError}</div>
       {:else if saeData}
-        <div class="tab-summary">resident SAE · L{saeData.layer} · produced <code>{JSON.stringify(saeData.token_text)}</code></div>
+        <div class="tab-summary">
+          {saeOrigin ?? "readout"}{saeSource ? ` · ${saeSource}` : ""}
+          · L{saeData.layer >= 0 ? saeData.layer : "?"}
+          · produced <code>{JSON.stringify(saeData.token_text)}</code>
+        </div>
         <div class="grid-scroll">
           <table class="logits-table">
             <!-- strength = activation / Neuronpedia maxActApprox — the
@@ -820,6 +886,10 @@
             </tbody>
           </table>
         </div>
+      {:else if !saeLoaded}
+        <div class="empty">no SAE loaded</div>
+      {:else if token.rawIndex == null || !loomNodeId}
+        <div class="empty">no raw decode record</div>
       {/if}
     {/if}
   </div>

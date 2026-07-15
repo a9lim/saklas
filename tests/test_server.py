@@ -1661,6 +1661,23 @@ class TestWSTokenEventLens:
             "18": [[" c", 2.0]],
         }
 
+    def test_canonical_capture_rides_token_frame_verbatim(self) -> None:
+        captured = {
+            "lens": {
+                "provenance": "captured",
+                "source": "local:default",
+                "steering": None,
+                "layers": [{
+                    "layer": 12,
+                    "tokens": [{"token": " a", "id": 7, "logprob": -0.25}],
+                }],
+                "aggregate": [],
+            },
+        }
+        event = self._event({"captured": captured})
+
+        assert event["captured"] is captured
+
     def test_absent_when_lens_off(self) -> None:
         event = self._event({"readings": None, "lens": None})
         assert "lens_readout" not in event

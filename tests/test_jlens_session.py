@@ -1548,11 +1548,14 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         s, top_k=3,
     )
     assert step is not None
-    out, agg = step
+    out, agg, token_ids = step
     assert set(out) == {0, 1}
+    assert set(token_ids) == {0, 1}
     for row in out.values():
         assert len(row) == 3
         assert all(isinstance(tok, str) for tok, _ in row)
+    assert all(len(row) == 3 for row in token_ids.values())
+    assert all(isinstance(token_id, int) for row in token_ids.values() for token_id in row)
     # display scores are per-layer softmax probabilities, descending — the
     # one strength unit every lens surface reports
     scores = [sc for _, sc in out[0]]
@@ -1726,8 +1729,9 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     )
 
     assert step is not None
-    per_layer, aggregate = step
+    per_layer, aggregate, token_ids = step
     assert set(per_layer) == {0, 1}
+    assert set(token_ids) == {0, 1}
     assert all(torch.isfinite(torch.tensor(score)) for _tok, score in per_layer[1])
     assert all(torch.isfinite(torch.tensor(row[1])) for row in aggregate)
 
