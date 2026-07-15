@@ -435,8 +435,57 @@ def aggregate_readout_from_probabilities(
             "aggregate_readout_from_probabilities: "
             f"{probabilities.shape[0]} probability rows but {len(depths)} depths"
         )
+    idxs, stats = aggregate_readout_tensors_from_probabilities(
+        probabilities,
+        depths,
+        top_k=top_k,
+        depth_tensor=depth_tensor,
+    )
+    # Public list surface: one packed host transfer. Token ids are promoted to
+    # float64 only in this tiny K-wide payload, which represents every practical
+    # vocabulary id exactly and avoids a second CUDA synchronization.
+    host = torch.cat(
+        [stats.to(torch.float64), idxs.reshape(1, -1).to(torch.float64)],
+        dim=0,
+    ).cpu()
+    return [
+        (
+            int(host[3, j]),
+            float(host[0, j]),
+            float(host[1, j]),
+            float(host[2, j]),
+        )
+        for j in range(int(idxs.numel()))
+    ]
+
+
+def aggregate_readout_tensors_from_probabilities(
+    probabilities: torch.Tensor,
+    depths: "Sequence[float]",
+    *,
+    top_k: int = 8,
+    depth_tensor: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device-resident aggregate selection and statistics.
+
+    Returns ``(token_ids[K], stats[3,K])`` where the statistic rows are
+    strength, depth center-of-mass, and depth spread. Keeping this tensor form
+    separate from the public list conversion lets the live readout combine its
+    per-layer and aggregate payloads into one GPU-to-host synchronization per
+    token.
+    """
+    if probabilities.ndim != 2 or probabilities.shape[0] == 0:
+        raise ValueError(
+            "aggregate_readout_tensors_from_probabilities expects "
+            f"[layers, vocab] probabilities, got shape {tuple(probabilities.shape)}"
+        )
+    if len(depths) != probabilities.shape[0]:
+        raise ValueError(
+            "aggregate_readout_tensors_from_probabilities: "
+            f"{probabilities.shape[0]} probability rows but {len(depths)} depths"
+        )
     strength = probabilities.mean(dim=0)                       # [V]
-    k = min(int(top_k), int(strength.shape[-1]))
+    k = min(max(int(top_k), 0), int(strength.shape[-1]))
     vals, idxs = strength.topk(k)
     p = probabilities.index_select(-1, idxs)                   # [L, K]
     d = _depth_column(
@@ -449,18 +498,7 @@ def aggregate_readout_from_probabilities(
     com = (p * d).sum(dim=0) / mass                             # [K]
     var = (p * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
     spread = var.clamp_min(0.0).sqrt()
-    # one batched host transfer for the whole readout
-    stats = torch.stack([vals, com, spread]).cpu()
-    idx_cpu = idxs.cpu()
-    return [
-        (
-            int(idx_cpu[j]),
-            float(stats[0, j]),
-            float(stats[1, j]),
-            float(stats[2, j]),
-        )
-        for j in range(k)
-    ]
+    return idxs, torch.stack([vals, com, spread])
 
 
 def aggregate_readout(

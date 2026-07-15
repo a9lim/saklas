@@ -1130,6 +1130,11 @@ class SaklasSession:
         # signal.  Either one (or a future StaticCache-only opt-in) enables the
         # preallocated K/V path for fast-path-eligible steering.
         self._compiled: bool = hasattr(self._model, "_orig_mod")
+        # CUDA graph trees are thread-local in PyTorch. ``from_pretrained``
+        # warms them on this construction thread; synchronous ``generate`` can
+        # replay them here, while ``generate_stream`` must route its worker to
+        # eager execution. Non-graph compiled modes are cross-thread safe.
+        self._compile_owner_thread: int = threading.get_ident()
         self._static_cache_active: bool = False
         if self._compiled or self._cuda_graphs_active:
             from saklas.core.cuda_graphs import (
@@ -1147,7 +1152,7 @@ class SaklasSession:
 
         # Set by ``SteeringComposer.install_composed_steering`` when the current
         # steering lowers to the persistent compile-clean offset buffers
-        # (static-affine push, compiled MPS session) instead of transient hooks —
+        # (static-affine push, compiled CUDA/MPS session) instead of transient hooks —
         # routes the decode loop to the compiled module + StaticCache.
         self._steering_uses_compiled_offsets: bool = False
 
@@ -1157,17 +1162,25 @@ class SaklasSession:
         # every forward (fused into the compiled graph); a probed gen on the
         # compiled path reads them post-forward via ``HiddenCapture.ingest_persistent``
         # instead of registering transient capture hooks that would graph-break.
-        # Empty unless a compiled MPS session adopted them.
+        # Empty unless a compiled CUDA/MPS session adopted them.
         self._capture_buffers: dict[int, torch.Tensor] = {}
         self._capture_handles: list[Any] = []
         # Per-gen flags: ``_compiled_clean_eligible`` (set early in
         # ``_generate_core``) means this gen *can* take the compiled clean path —
-        # compiled MPS, static cache, capture buffers present, not return_hidden —
+        # compiled CUDA/MPS, static cache, capture buffers present, not return_hidden —
         # provided steering also lowers to offsets.  ``_capture_state.persistent``
         # (set in ``_begin_capture``) means the active capture rides the persistent
         # buffers, so the decode loop wires ``ingest_persistent`` as its step
         # callback and the routing keeps the compiled module.
         self._compiled_clean_eligible: bool = False
+
+        # One session-resident StaticCache for ordinary (non-prefix-cache)
+        # generations.  CUDA graphs guard on the K/V tensors' identities, so a
+        # fresh cache per request forces a full Dynamo recompile even when every
+        # shape is unchanged.  Grow this cache only when needed, then reset and
+        # reuse it in place across serialized session generations.
+        self._generation_static_cache: object | None = None
+        self._generation_static_cache_len: int = 0
 
         # Active assistant-role label for the current ``session.steering()``
         # scope — populated when every role-tagged term in the resolved
@@ -3431,12 +3444,16 @@ class SaklasSession:
 
         Attaches **no forward hooks** (the reader consumes the capture's
         existing latest-slice buffers post-forward), so steering fast-path /
-        compile eligibility is untouched; the one concession is that capture
-        itself routes through transient hooks while the live lens is on
-        (the persistent compiled-clean capture buffers only cover probe
-        layers). Returns the resolved layer list.
+        compile eligibility is untouched. A compiled session constructed with
+        its default/non-empty probe roster already has persistent capture
+        buffers for every layer, so an all-layer lens stays compile-clean;
+        an explicit ``probes=[]`` session uses transient capture and the eager
+        fallback instead. Returns the resolved layer list.
         """
         from saklas.core.model import get_final_norm, get_unembedding
+
+        if self._device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
 
         lens = self._require_jlens()
         uses_all_layers = layers is None
@@ -3672,11 +3689,38 @@ class SaklasSession:
         # Display scores are per-layer softmax probabilities — the one
         # strength unit every lens surface reports (softmax is monotone, so
         # the top-k selection is unchanged from the raw-logit ranking).
+        from saklas.core.jlens import (
+            aggregate_readout_tensors_from_probabilities,
+        )
+
         k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
         vals, idxs = probabilities.topk(k, dim=-1)
-        # one batched host transfer for the per-layer block
-        all_vals = vals.detach().to("cpu").tolist()
-        all_idxs = idxs.detach().to("cpu").tolist()
+        depth_tensor = self._jlens_depth_tensor(
+            layers_present, probabilities.device,
+        )
+        agg_idxs, agg_stats = aggregate_readout_tensors_from_probabilities(
+            probabilities,
+            self._jlens_depths(layers_present),
+            top_k=k,
+            depth_tensor=depth_tensor,
+        )
+        # The per-layer cards and aggregate chips used to cross the CUDA
+        # boundary in four blocking transfers, with aggregate kernels not even
+        # submitted until the first pair had synchronized. Pack the tiny
+        # K-wide result (float64 keeps token ids exact) and synchronize once.
+        n_layers = len(layers_present)
+        host_rows = torch.cat(
+            [
+                vals.to(torch.float64),
+                idxs.to(torch.float64),
+                agg_stats.to(torch.float64),
+                agg_idxs.reshape(1, -1).to(torch.float64),
+            ],
+            dim=0,
+        ).detach().cpu().tolist()
+        all_vals = host_rows[:n_layers]
+        all_idxs = host_rows[n_layers:2 * n_layers]
+        agg_host = host_rows[2 * n_layers:]
         out: dict[int, list[tuple[str, float]]] = {}
         token_ids: dict[int, list[int]] = {}
         for row, layer in enumerate(layers_present):
@@ -3685,12 +3729,15 @@ class SaklasSession:
                 pairs.append((self._jlens_decode_id(int(i)), float(v)))
             out[layer] = pairs
             token_ids[layer] = [int(i) for i in all_idxs[row]]
-        agg = self._jlens_aggregate_rows(
-            None,
-            layers_present,
-            top_k=k,
-            probabilities=probabilities,
-        )
+        agg = [
+            (
+                self._jlens_decode_id(int(agg_host[3][j])),
+                float(agg_host[0][j]),
+                float(agg_host[1][j]),
+                float(agg_host[2][j]),
+            )
+            for j in range(k)
+        ]
         return out, agg, token_ids
 
     # -- Sparse-autoencoder runtime -------------------------------------
@@ -8840,6 +8887,44 @@ class SaklasSession:
         return self.tree.begin_assistant(
             user_node_id, recipe=recipe, role_label=gen_label, seat=gen_seat)
 
+    def _compiled_graph_thread_safe(self) -> bool:
+        """Whether this thread owns PyTorch's warmed CUDA graph tree."""
+        if not getattr(self, "_cuda_graphs_active", False):
+            return True
+        return (
+            threading.get_ident()
+            == getattr(self, "_compile_owner_thread", threading.get_ident())
+        )
+
+    def _acquire_generation_static_cache(
+        self,
+        model: PreTrainedModel,
+        *,
+        max_cache_len: int,
+    ) -> object:
+        """Return a reset, identity-stable StaticCache with enough capacity."""
+        cached = self._generation_static_cache
+        if cached is not None and self._generation_static_cache_len >= max_cache_len:
+            reset = getattr(cached, "reset", None)
+            if callable(reset):
+                reset()
+                return cached
+            self._generation_static_cache = None
+            self._generation_static_cache_len = 0
+
+        from saklas.core.cuda_graphs import make_static_cache
+
+        model_dtype = next(model.parameters()).dtype
+        cache = make_static_cache(
+            model,
+            max_cache_len=max_cache_len,
+            device=self._device,
+            dtype=model_dtype,
+        )
+        self._generation_static_cache = cache
+        self._generation_static_cache_len = max_cache_len
+        return cache
+
     def _run_generation_loop(
         self,
         input_ids: torch.Tensor,
@@ -8866,6 +8951,7 @@ class SaklasSession:
         effective_input_ids = input_ids
         static_cache_eligible = (
             self._static_cache_active
+            and self._compiled_graph_thread_safe()
             and (
                 self._steering.all_fast_path()
                 or self._steering.static_steerable()
@@ -8950,7 +9036,7 @@ class SaklasSession:
         use_static_cache = static_cache_eligible and (
             cached_pkv is None or cached_static
         )
-        # Compiled-model routing (MPS).  The graph was traced with ONLY the
+        # Compiled-model routing (CUDA/MPS). The graph was traced with ONLY the
         # persistent branchless offset + capture hooks present (attached
         # pre-compile), so the compiled module is correct exactly when the live
         # hook topology matches that: no *transient* per-token capture hooks
@@ -8964,22 +9050,54 @@ class SaklasSession:
         # / recompiles, so route it to the eager original (``_orig_mod``) +
         # DynamicCache — where the same persistent hooks still apply any offsets
         # and capture, so correctness holds and ``compile=True`` never regresses
-        # the hooked path.  CUDA keeps its existing graph-capture path untouched.
+        # the hooked path. On CUDA this boundary also avoids Dynamo retracing on
+        # every per-generation hook topology.
         gen_model = self._model
         steering_uses_compiled_offsets = bool(
             self._steering_uses_compiled_offsets
         )
-        if self._compiled and self._device.type == "mps":
+        if self._compiled and self._device.type in {"cuda", "mps"}:
             compiled_clean = not self._capture.is_transient() and (
                 steering_uses_compiled_offsets
                 or self._steering.all_fast_path()
             )
-            if compiled_clean:
+            if compiled_clean and self._compiled_graph_thread_safe():
                 use_static_cache = self._static_cache_active and (
                     cached_pkv is None or cached_static
                 )
             else:
                 gen_model = getattr(self._model, "_orig_mod", self._model)
+                use_static_cache = False
+        generation_pkv = cached_pkv
+        if use_static_cache and generation_pkv is None:
+            # Reserve at least the session default decode window and bucket the
+            # total length.  Most interactive requests then keep one cache
+            # allocation and one set of Dynamo guards even when their per-call
+            # max_tokens differ.  The session lock serializes access, so reset +
+            # reuse cannot race another generation.
+            reserve_tokens = max(
+                int(gen_config.max_new_tokens),
+                int(self.config.max_new_tokens),
+                1,
+            )
+            required_len = (
+                cache_position_offset
+                + int(effective_input_ids.shape[1])
+                + reserve_tokens
+            )
+            cache_len = ((required_len + 255) // 256) * 256
+            try:
+                generation_pkv = self._acquire_generation_static_cache(
+                    gen_model,
+                    max_cache_len=cache_len,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "Reusable StaticCache allocation failed (%s: %s); "
+                    "falling back to DynamicCache",
+                    type(exc).__name__,
+                    exc,
+                )
                 use_static_cache = False
         generated_ids = generate_steered(
             gen_model, self._tokenizer, effective_input_ids,
@@ -8990,7 +9108,7 @@ class SaklasSession:
             frequency_penalty=frequency_penalty,
             logprobs=lp_count,
             trigger_ctx=self._steering.ctx,
-            past_key_values=cached_pkv,
+            past_key_values=generation_pkv,
             cache_position_offset=cache_position_offset,
             score_callback=gating_callback,
             # Per-token probe scoring fires post-forward (FIX F1), not inside the
@@ -9433,14 +9551,14 @@ class SaklasSession:
             # ``SteeringComposer.install_composed_steering``, which consults this
             # to decide whether a probed gen may still lower steering to the
             # persistent offset buffers — slice 2). Eligible when the compiled
-            # MPS graph + static cache are live, the persistent capture
+            # CUDA/MPS graph + static cache are live, the persistent capture
             # buffers were adopted, and the caller didn't ask for the full per-step
             # hidden stack (``return_hidden`` keeps the transient full-retention
             # capture).  Capture then rides the persistent buffers; steering rides the
             # offsets — both compile-clean.
             self._compiled_clean_eligible = bool(
                 self._compiled
-                and self._device.type == "mps"
+                and self._device.type in {"cuda", "mps"}
                 and self._static_cache_active
                 and self._capture_buffers
                 and not (sampling and sampling.return_hidden)

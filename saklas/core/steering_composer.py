@@ -1046,7 +1046,7 @@ class SteeringComposer:
     def install_composed_steering(self) -> None:
         """Attach the currently-composed steering entries to model layers.
 
-        Compiled fast path (MPS): a static-affine pure-push steering lowers to
+        Compiled accelerator fast path: a static-affine pure-push steering lowers to
         the persistent branchless offset buffers (traced into the compiled
         graph) instead of transient ctx-consulting hooks — the latter would
         force a per-gen ``torch.compile`` recompile and graph-break at every
@@ -1063,7 +1063,7 @@ class SteeringComposer:
         session._steering_uses_compiled_offsets = False
         if (
             session._compiled
-            and session._device.type == "mps"
+            and session._device.type in {"cuda", "mps"}
             and steering.has_compiled_offsets()
             and (
                 not session._monitor.probe_names

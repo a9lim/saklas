@@ -20,7 +20,15 @@ HF causal LM loading. `_LAYER_ACCESSORS` maps `model_type` → layer-list access
 eager), dtype, device. `_compile_with_probe` wraps `torch.compile` with a 2-token
 prefill+decode warmup so inductor/Triton failures surface at load as a caught
 warning + eager fallback (`use_static_cuda_launcher` forced off — Gemma-4 + torch
-2.12 kernel-arg-mismatch bug). `_load_text_from_multimodal` extracts text-only
+2.12 kernel-arg-mismatch bug). StaticCache is early-initialized before a
+compiled prefill so Transformers marks its K/V addresses outside Dynamo;
+leaving its lazy init inside the graph disables CUDA graphs and recompiles once
+per fresh cache. Ordinary generations reuse one reset-in-place StaticCache per
+session so its K/V identities stay graph-stable. Persistent offset and capture
+hooks are shared by CUDA and MPS compiled sessions; dynamic/curved/gated hook
+topologies route to the eager original. CUDA graph trees are thread-local, so a
+stream worker routes to eager while same-thread generation may replay the graph.
+`_load_text_from_multimodal` extracts text-only
 sub-models (Ministral-as-Mistral3), strips `language_model.` prefixes,
 dequantizes FP8. `patch_torch_for_mps()` installs two lazy MPS-only workarounds
 (`torch.histc` integer→float for MoE routing; `torch.ldexp` MXFP4 round-trip
