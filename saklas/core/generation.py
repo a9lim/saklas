@@ -914,10 +914,10 @@ def generate_steered(
     change as the cache grows.  Caller must guarantee CUDA + a
     StaticCache-compatible architecture (see
     :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported`); we
-    don't re-probe here.  When ``past_key_values`` is non-None
-    (prefix-cache hit), it's expected to *already* be a StaticCache
-    sized to fit the upcoming decode; we don't re-allocate.  When
-    ``past_key_values is None``, we build a fresh StaticCache sized
+    don't re-probe here.  When ``past_key_values`` is non-None (a prefix-cache
+    hit or a reset session-resident cache), it's expected to *already* be a
+    StaticCache sized to fit the upcoming decode; we don't re-allocate.  When
+    ``past_key_values is None``, we build a fresh fallback StaticCache sized
     to ``input_ids.shape[1] + cache_position_offset +
     config.max_new_tokens``.
 
@@ -986,12 +986,11 @@ def generate_steered(
     # ---- StaticCache ---------------------------------------------------
     # Caller flips ``use_static_cache`` after probing
     # :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported` at session
-    # construction time.  We allocate the static buffer here, sized to
-    # cover the entire upcoming generation, so the decode loop sees no
-    # allocator activity per step.  When the caller hands us a
-    # pre-prefilled ``past_key_values`` (prefix-cache hit), it's expected
-    # to already be a StaticCache with enough headroom — we only build a
-    # fresh one when ``past_key_values is None``.
+    # construction time.  When the caller supplies ``past_key_values`` (a
+    # prefix-cache hit or reset session-resident cache), it's expected to have
+    # enough headroom.  Otherwise we allocate a fresh fallback covering the
+    # upcoming generation, so the decode loop sees no allocator activity per
+    # step.
     cache_position: torch.Tensor | None = None
     # Tracked as a Python int so the per-step advance never crosses
     # CPU↔GPU — we ``fill_`` the GPU buffer rather than read its value

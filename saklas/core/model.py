@@ -759,6 +759,13 @@ def _compile_with_probe(
 
     import torch._inductor.config as _ic
     _ic.use_static_cuda_launcher = False
+    previous_matmul_precision: str | None = None
+    if torch.device(device).type == "cuda":
+        # Ada tensor cores accelerate the FP32 matmuls surrounding BF16 model
+        # inference (notably live J-LENS transport/readout) with TF32 while
+        # retaining FP32 range.  ``high`` is PyTorch's explicit opt-in.
+        previous_matmul_precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("high")
 
     log.info("Compiling model with torch.compile(mode=%r)", mode)
     compiled = torch.compile(model, mode=mode, dynamic=None)
@@ -773,6 +780,8 @@ def _compile_with_probe(
         with torch.inference_mode():
             _run_compile_probes(compiled, model, device, bos, mode=mode)
     except Exception as exc:
+        if previous_matmul_precision is not None:
+            torch.set_float32_matmul_precision(previous_matmul_precision)
         warnings.warn(
             f"torch.compile probe failed during warmup "
             f"({type(exc).__name__}: {str(exc)[:200]}); falling back to "

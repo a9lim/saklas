@@ -5,6 +5,7 @@ AutoModelForCausalLM calls and inspect the load_kwargs `load_model` passes.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -199,7 +200,7 @@ def test_mistral_regex_fix_skipped_for_non_mistral():
 
 def _run_load_with_compile(
     *, device: str, compile: bool = True, compile_mode: str = "default",
-    model_type: str = "qwen3",
+    model_type: str = "qwen3", patch_precision: bool = True,
 ):
     """Run load_model with mocked transformers + ``torch.compile``.
 
@@ -226,6 +227,11 @@ def _run_load_with_compile(
         compile_invocations.append({"model": model, **kwargs})
         return _FakeCompiled(model)
 
+    precision_context = (
+        patch.object(torch, "set_float32_matmul_precision")
+        if patch_precision
+        else nullcontext()
+    )
     with (
         patch.object(model_mod, "AutoTokenizer") as mock_tok,
         patch.object(model_mod, "AutoConfig") as mock_cfg,
@@ -236,6 +242,7 @@ def _run_load_with_compile(
         # is ever called.  We're not exercising the probe here — only that
         # ``torch.compile`` fired with the right args — so stub it out.
         patch.object(model_mod, "_run_compile_probes", return_value=None),
+        precision_context,
     ):
         mock_tok.from_pretrained.return_value = SimpleNamespace()
         mock_cfg.from_pretrained.return_value = cfg
@@ -328,6 +335,7 @@ def test_compile_probe_failure_falls_back_to_eager():
         def __call__(self, **fwd: Any) -> None:
             raise RuntimeError("inductor codegen produced an invalid kernel")
 
+    precision_before = torch.get_float32_matmul_precision()
     with (
         patch.object(model_mod, "AutoTokenizer") as mock_tok,
         patch.object(model_mod, "AutoConfig") as mock_cfg,
@@ -349,6 +357,7 @@ def test_compile_probe_failure_falls_back_to_eager():
     assert any(
         "torch.compile probe failed" in str(w.message) for w in caught
     ), f"expected a fallback UserWarning, got: {[str(w.message) for w in caught]}"
+    assert torch.get_float32_matmul_precision() == precision_before
 
 
 def test_compile_mode_propagates():
@@ -359,6 +368,21 @@ def test_compile_mode_propagates():
         device="cuda", compile_mode="reduce-overhead",
     )
     assert invocations[0]["mode"] == "reduce-overhead"
+
+
+def test_cuda_compile_enables_high_float32_matmul_precision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    precision: list[str] = []
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", precision.append)
+
+    _run_load_with_compile(
+        device="cuda",
+        compile_mode="reduce-overhead",
+        patch_precision=False,
+    )
+
+    assert precision == ["high"]
 
 
 def test_get_memory_gb_returns_zero_when_mps_backend_unavailable(monkeypatch: pytest.MonkeyPatch):

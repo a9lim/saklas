@@ -1228,7 +1228,7 @@ class SteeringManager:
         # manifolds.
         self.subspaces: dict[str, dict[str, Any]] = {}
         self.ctx: TriggerContext = TriggerContext()
-        # Persistent compile-clean steering path (MPS torch.compile).  A single
+        # Persistent compile-clean steering path (CUDA/MPS torch.compile). A single
         # branchless ``hidden.add_(offset)`` hook per layer, attached ONCE before
         # compile (so it is traced into the captured graph) and never
         # re-registered — the per-gen steering is pushed by updating the
@@ -1589,7 +1589,7 @@ class SteeringManager:
         self.manifolds.clear()
         self.subspaces.clear()
 
-    # -- Persistent compile-clean offset path (MPS torch.compile) --------------
+    # -- Persistent compile-clean offset path (CUDA/MPS torch.compile) ---------
 
     def adopt_compiled_offsets(
         self, buffers: dict[int, torch.Tensor], handles: list[Any],

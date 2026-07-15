@@ -20,6 +20,7 @@ from saklas.core.jlens import (
     MultiTokenWordError,
     aggregate_readout,
     aggregate_readout_from_probabilities,
+    aggregate_readout_tensors_from_probabilities,
     fit_jacobian_lens,
     lens_logits,
     readout_probabilities,
@@ -839,6 +840,30 @@ def test_aggregate_readout_reuses_calibrated_probabilities_exactly() -> None:
     got = aggregate_readout_from_probabilities(
         readout_probabilities(logits), depths, top_k=4,
     )
+    assert got == expected
+
+
+def test_aggregate_readout_tensor_surface_matches_list_surface() -> None:
+    logits = torch.randn(5, _VOCAB)
+    probabilities = readout_probabilities(logits)
+    depths = [0.41, 0.52, 0.63, 0.74, 0.85]
+    expected = aggregate_readout_from_probabilities(
+        probabilities, depths, top_k=4,
+    )
+
+    ids, stats = aggregate_readout_tensors_from_probabilities(
+        probabilities, depths, top_k=4,
+    )
+    got = [
+        (
+            int(ids[j]),
+            float(stats[0, j]),
+            float(stats[1, j]),
+            float(stats[2, j]),
+        )
+        for j in range(int(ids.numel()))
+    ]
+
     assert got == expected
 
 
