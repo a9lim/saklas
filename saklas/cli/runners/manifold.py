@@ -24,8 +24,8 @@ if TYPE_CHECKING:
 
 
 def _run_manifold_bake(args: argparse.Namespace) -> None:
-    from saklas.io import merge as merge_mod
-    dst = merge_mod.merge_into_manifold(
+    from saklas.io import bake as bake_mod
+    dst = bake_mod.merge_into_manifold(
         args.name, args.expression, model=args.model,
         force=args.force, strict=args.strict,
     )

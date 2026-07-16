@@ -458,7 +458,7 @@ def save_manifold(
         "node_kinds",
         # Merge provenance ({coord: {alpha, tensor_sha256}}),
         # carried on a ``fit_mode="baked"`` manifold produced by
-        # :func:`saklas.io.merge.merge_into_manifold`.  Informational only — a
+        # :func:`saklas.io.bake.merge_into_manifold`.  Informational only — a
         # baked manifold never re-fits, so nothing branches on it; surfaced
         # by the inspector the way the legacy pack sidecar's ``components``
         # was.  Absent on every non-merge fit.

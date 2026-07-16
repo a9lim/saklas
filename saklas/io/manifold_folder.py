@@ -798,7 +798,7 @@ class ManifoldSidecar:
     node_spread_per_layer: dict[str, Any] = field(default_factory=dict)
     # Merge provenance on a ``fit_mode="baked"`` manifold — the
     # ``{coord: {alpha, tensor_sha256}}`` map written by
-    # :func:`saklas.io.merge.merge_into_manifold`.  ``None`` on every fit that
+    # :func:`saklas.io.bake.merge_into_manifold`.  ``None`` on every fit that
     # isn't a merge (the common case).  Informational only — a baked
     # manifold never re-fits, so nothing branches on it.
     components: Optional[dict[str, Any]] = None

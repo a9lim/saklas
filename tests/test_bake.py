@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import torch
 
-from saklas.io import merge
+from saklas.io import bake
 from saklas.io.manifolds import (
     ManifoldFolder, ManifoldSidecar,
     create_baked_manifold_folder, save_baked_manifold_tensor,
@@ -28,20 +28,20 @@ def test_parse_expr_two_components(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     profile = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": profile})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"gemma": profile})
-    shared = merge.shared_models("0.3 default/happy + 0.4 a9lim/archaic")
+    shared = bake.shared_models("0.3 default/happy + 0.4 a9lim/archaic")
     assert shared == [safe_model_id("gemma")]
 
 
 def test_bare_component_rejected():
     """Components without a namespace prefix are rejected."""
-    with pytest.raises(merge.MergeError, match="namespace"):
-        merge.merge_into_manifold("x", "0.5 a", model=None)
+    with pytest.raises(bake.MergeError, match="namespace"):
+        bake.merge_into_manifold("x", "0.5 a", model=None)
 
 
 def test_trigger_rejected():
     """Merge expressions don't accept trigger annotations."""
-    with pytest.raises(merge.MergeError, match="trigger"):
-        merge.merge_into_manifold(
+    with pytest.raises(bake.MergeError, match="trigger"):
+        bake.merge_into_manifold(
             "x", "0.5 default/happy@after", model=None,
         )
 
@@ -49,8 +49,8 @@ def test_trigger_rejected():
 @pytest.mark.parametrize("operator", ["~", "|"])
 def test_projection_operator_rejected(operator: str):
     """Offline bake cannot replace live Mahalanobis projection with Euclidean."""
-    with pytest.raises(merge.MergeError, match="Mahalanobis"):
-        merge.merge_into_manifold(
+    with pytest.raises(bake.MergeError, match="Mahalanobis"):
+        bake.merge_into_manifold(
             "x", f"0.5 default/happy{operator}default/sad", model=None,
         )
 
@@ -64,18 +64,18 @@ def test_projection_operator_rejected(operator: str):
     ],
 )
 def test_dynamic_or_multicoeff_term_rejected(expression: str, message: str):
-    with pytest.raises(merge.MergeError, match=message):
-        merge.merge_into_manifold("x", expression, model=None)
+    with pytest.raises(bake.MergeError, match=message):
+        bake.merge_into_manifold("x", expression, model=None)
 
 
 def test_empty_expression_rejected():
-    with pytest.raises(merge.MergeError):
-        merge.merge_into_manifold("x", "", model=None)
+    with pytest.raises(bake.MergeError):
+        bake.merge_into_manifold("x", "", model=None)
 
 
 def test_invalid_syntax_rejected():
-    with pytest.raises(merge.MergeError):
-        merge.merge_into_manifold("x", "0.5 default/happy +", model=None)
+    with pytest.raises(bake.MergeError):
+        bake.merge_into_manifold("x", "0.5 default/happy +", model=None)
 
 
 # ------------------------------------------------------- linear_sum ---
@@ -83,7 +83,7 @@ def test_invalid_syntax_rejected():
 def test_linear_sum_equal_layers():
     a = {0: torch.tensor([1.0, 0.0]), 1: torch.tensor([0.0, 1.0])}
     b = {0: torch.tensor([2.0, 0.0]), 1: torch.tensor([0.0, 2.0])}
-    out = merge.linear_sum([(a, 0.5), (b, 0.25)])
+    out = bake.linear_sum([(a, 0.5), (b, 0.25)])
     assert torch.allclose(out[0], torch.tensor([1.0, 0.0]))
     assert torch.allclose(out[1], torch.tensor([0.0, 1.0]))
 
@@ -94,7 +94,7 @@ def test_linear_sum_layer_union_matches_live_composition():
          2: torch.tensor([1.0, 1.0])}
     b = {1: torch.tensor([0.0, 2.0]),
          2: torch.tensor([2.0, 2.0])}
-    out = merge.linear_sum([(a, 1.0), (b, 1.0)])
+    out = bake.linear_sum([(a, 1.0), (b, 1.0)])
     assert sorted(out.keys()) == [0, 1, 2]
     assert torch.allclose(out[0], a[0])
 
@@ -102,7 +102,7 @@ def test_linear_sum_layer_union_matches_live_composition():
 def test_linear_sum_disjoint_layers_uses_union():
     a = {0: torch.tensor([1.0])}
     b = {1: torch.tensor([2.0])}
-    out = merge.linear_sum([(a, 1.0), (b, 1.0)])
+    out = bake.linear_sum([(a, 1.0), (b, 1.0)])
     assert sorted(out) == [0, 1]
     assert torch.equal(out[0], a[0])
     assert torch.equal(out[1], b[1])
@@ -111,13 +111,13 @@ def test_linear_sum_disjoint_layers_uses_union():
 def test_linear_sum_strict_rejects_different_layer_coverage():
     a = {0: torch.tensor([1.0]), 1: torch.tensor([2.0])}
     b = {1: torch.tensor([3.0])}
-    with pytest.raises(merge.MergeError, match="coverage differs"):
-        merge.linear_sum([(a, 1.0), (b, 1.0)], strict=True)
+    with pytest.raises(bake.MergeError, match="coverage differs"):
+        bake.linear_sum([(a, 1.0), (b, 1.0)], strict=True)
 
 
 def test_linear_sum_single_component():
     a = {0: torch.tensor([2.0, 3.0])}
-    out = merge.linear_sum([(a, 0.5)])
+    out = bake.linear_sum([(a, 0.5)])
     assert torch.allclose(out[0], torch.tensor([1.0, 1.5]))
 
 
@@ -136,7 +136,7 @@ def _make_concept_with_tensors(
     profile is a corpus-less ``baked`` manifold built straight from the
     direction via :func:`fold_directions_to_subspace`.  One ``manifold.json``
     is shared across every model's per-model tensor, mirroring how
-    :func:`merge.merge_into_manifold` writes multi-model output.
+    :func:`bake.merge_into_manifold` writes multi-model output.
     """
     folder: Path | None = None
     for model_id, profile in model_tensors.items():
@@ -202,7 +202,7 @@ def test_shared_models_intersection(monkeypatch: pytest.MonkeyPatch, tmp_path: P
                                 {"gemma": profile, "qwen": profile})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic",
                                 {"gemma": profile})
-    shared = merge.shared_models("0.5 default/happy + 0.5 a9lim/archaic")
+    shared = bake.shared_models("0.5 default/happy + 0.5 a9lim/archaic")
     assert shared == [safe_model_id("gemma")]
 
 
@@ -211,8 +211,8 @@ def test_shared_models_empty_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     profile = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": profile})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"qwen": profile})
-    with pytest.raises(merge.MergeError, match="no shared models"):
-        merge.shared_models("0.5 default/happy + 0.5 a9lim/archaic")
+    with pytest.raises(bake.MergeError, match="no shared models"):
+        bake.shared_models("0.5 default/happy + 0.5 a9lim/archaic")
 
 
 def test_merge_resolves_each_component_model_once(
@@ -226,15 +226,15 @@ def test_merge_resolves_each_component_model_once(
     _make_concept_with_tensors(
         tmp_path, "a9lim", "archaic", {"gemma": profile},
     )
-    real_resolve = merge._resolve_component
+    real_resolve = bake._resolve_component
     calls: list[tuple[str, str, str]] = []
 
     def counted(ns: str, name: str, sid: str, variant: Any, coord: str):
         calls.append((ns, name, sid))
         return real_resolve(ns, name, sid, variant, coord)
 
-    monkeypatch.setattr(merge, "_resolve_component", counted)
-    merge.merge_into_manifold(
+    monkeypatch.setattr(bake, "_resolve_component", counted)
+    bake.merge_into_manifold(
         "bard", "default/happy + a9lim/archaic", model=None,
     )
 
@@ -260,10 +260,10 @@ def test_role_variant_uses_and_validates_canonical_tensor(
         tensor_path, sidecar_path,
     )
 
-    assert merge.shared_models("default/happy:role-pirate") == [safe_model_id("gemma")]
-    with pytest.raises(merge.MergeError, match="no shared models"):
-        merge.shared_models("default/happy:raw")
-    dst = merge.merge_into_manifold(
+    assert bake.shared_models("default/happy:role-pirate") == [safe_model_id("gemma")]
+    with pytest.raises(bake.MergeError, match="no shared models"):
+        bake.shared_models("default/happy:raw")
+    dst = bake.merge_into_manifold(
         "pirate_happy", "default/happy:role-pirate", model=None,
     )
     assert (dst / tensor_filename("gemma")).is_file()
@@ -292,8 +292,8 @@ def test_transfer_variant_routes_concrete_tensor(
     _seed_neutral_cache("target", {0: torch.tensor([1.0])})
 
     variant = f"from-{encode_release_id('src')}"
-    assert merge.shared_models(f"default/happy:{variant}") == [safe_model_id("target")]
-    dst = merge.merge_into_manifold(
+    assert bake.shared_models(f"default/happy:{variant}") == [safe_model_id("target")]
+    dst = bake.merge_into_manifold(
         "transferred_happy", f"default/happy:{variant}", model=None,
     )
     assert (dst / tensor_filename("target")).is_file()
@@ -305,7 +305,7 @@ def test_merge_into_manifold_single_model(monkeypatch: pytest.MonkeyPatch, tmp_p
     p2 = {0: torch.tensor([0.0, 2.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": p1})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"gemma": p2})
-    dst = merge.merge_into_manifold(
+    dst = bake.merge_into_manifold(
         "bard",
         "0.5 default/happy + 0.25 a9lim/archaic",
         model=None,
@@ -339,12 +339,12 @@ def test_merge_into_manifold_conflict(monkeypatch: pytest.MonkeyPatch, tmp_path:
     p = {0: torch.tensor([1.0])}
     _make_concept_with_tensors(tmp_path, "default", "happy", {"gemma": p})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic", {"gemma": p})
-    merge.merge_into_manifold(
+    bake.merge_into_manifold(
         "bard", "0.5 default/happy + 0.5 a9lim/archaic",
         model=None, force=False,
     )
-    with pytest.raises(merge.MergeError, match="exists"):
-        merge.merge_into_manifold(
+    with pytest.raises(bake.MergeError, match="exists"):
+        bake.merge_into_manifold(
             "bard", "0.5 default/happy + 0.5 a9lim/archaic",
             model=None, force=False,
         )
@@ -373,10 +373,10 @@ def test_merge_retry_repairs_later_unproven_baked_pair(
     monkeypatch.setattr(ManifoldFolder, "update_file_hashes", fail_second)
     expression = "default/happy + a9lim/archaic"
     with pytest.raises(OSError, match="injected"):
-        merge.merge_into_manifold("bard", expression, model=None)
+        bake.merge_into_manifold("bard", expression, model=None)
     monkeypatch.setattr(ManifoldFolder, "update_file_hashes", real_update)
 
-    dst = merge.merge_into_manifold("bard", expression, model=None)
+    dst = bake.merge_into_manifold("bard", expression, model=None)
     loaded = ManifoldFolder.load(dst)
     assert sorted(loaded.tensor_models()) == sorted(map(safe_model_id, ("gemma", "qwen")))
 
@@ -388,7 +388,7 @@ def test_merge_into_manifold_explicit_model(monkeypatch: pytest.MonkeyPatch, tmp
                                 {"google/gemma-2-2b-it": p, "qwen": p})
     _make_concept_with_tensors(tmp_path, "a9lim", "archaic",
                                 {"google/gemma-2-2b-it": p, "qwen": p})
-    dst = merge.merge_into_manifold(
+    dst = bake.merge_into_manifold(
         "bard",
         "0.5 default/happy + 0.5 a9lim/archaic",
         model="google/gemma-2-2b-it",

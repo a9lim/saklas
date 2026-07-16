@@ -128,7 +128,7 @@ class TestMergeVector:
         expected = folded_directions(load_manifold(tensor_path))
 
         with patch(
-            "saklas.io.merge.merge_into_manifold",
+            "saklas.io.bake.merge_into_manifold",
             return_value=merged_folder,
         ) as m:
             resp = client.post(
@@ -159,10 +159,10 @@ class TestMergeVector:
         assert torch.allclose(call_profile[5].float(), expected[5].float(), atol=1e-5)
 
     def test_invalid_expression_400(self, session_and_client: tuple[SaklasSession, TestClient]):
-        from saklas.io.merge import MergeError
+        from saklas.io.bake import MergeError
         _, client = session_and_client
         with patch(
-            "saklas.io.merge.merge_into_manifold",
+            "saklas.io.bake.merge_into_manifold",
             side_effect=MergeError("merge requires at least one component"),
         ):
             resp = client.post(
@@ -173,10 +173,10 @@ class TestMergeVector:
         assert resp.status_code == 400
 
     def test_missing_component_400(self, session_and_client: tuple[SaklasSession, TestClient]):
-        from saklas.io.merge import MergeError
+        from saklas.io.bake import MergeError
         _, client = session_and_client
         with patch(
-            "saklas.io.merge.merge_into_manifold",
+            "saklas.io.bake.merge_into_manifold",
             side_effect=MergeError("component default/missing not installed"),
         ):
             resp = client.post(
@@ -207,7 +207,7 @@ class TestMergeVector:
         empty_folder.mkdir(parents=True)
 
         with patch(
-            "saklas.io.merge.merge_into_manifold",
+            "saklas.io.bake.merge_into_manifold",
             return_value=empty_folder,
         ):
             resp = client.post(

@@ -386,13 +386,13 @@ def register_vector_routes(app: FastAPI) -> None:
     async def bake_vector(session_id: str, req: BakeVectorRequest):
         """Merge an expression of installed directions into a baked manifold.
 
-        Wraps :func:`saklas.io.merge.merge_into_manifold` (model-scoped to
+        Wraps :func:`saklas.io.bake.merge_into_manifold` (model-scoped to
         the session's loaded model) — the merge lands a corpus-less
         ``fit_mode="baked"`` manifold — then folds the fitted tensor back to a
         steering Profile and registers it so it's immediately steerable.
         Returns the same profile-JSON shape ``GET /vectors/{name}`` produces.
         """
-        from saklas.io.merge import merge_into_manifold, MergeError
+        from saklas.io.bake import merge_into_manifold, MergeError
         from saklas.io.paths import tensor_filename
         from saklas.io.manifold_tensors import load_manifold
         from saklas.core.capture import folded_directions

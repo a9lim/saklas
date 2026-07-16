@@ -99,7 +99,7 @@ def test_merged_union_semantics():
 def test_merged_strict_refuses_drop():
     a = Profile({0: torch.ones(4), 1: torch.ones(4)})
     b = Profile({1: torch.ones(4), 2: torch.ones(4)})
-    from saklas.io.merge import MergeError
+    from saklas.io.bake import MergeError
     with pytest.raises(MergeError):
         Profile.merged([(a, 1.0), (b, 1.0)], strict=True)
 

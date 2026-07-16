@@ -30,7 +30,7 @@ from saklas.core.steering_expr import SteeringExprError
 from saklas.io.hf_manifolds import ManifoldInstallConflict
 from saklas.io.gguf_io import GGUFNotInstalled
 from saklas.io.hf import HFError
-from saklas.io.merge import MergeError
+from saklas.io.bake import MergeError
 
 
 def test_base_default_status_and_message():
@@ -72,7 +72,7 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (ManifoldInstallConflict, 409),
     # io/gguf_io.py
     (GGUFNotInstalled, 400),
-    # io/merge.py
+    # io/bake.py
     (MergeError, 400),
 ]
 

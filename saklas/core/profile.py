@@ -496,11 +496,11 @@ class Profile:
     ) -> "Profile":
         """Linear combination: ``sum(alpha_i * profile_i)`` per layer.
 
-        Delegates to :func:`saklas.io.merge.linear_sum`. Layer coverage is the
+        Delegates to :func:`saklas.io.bake.linear_sum`. Layer coverage is the
         union, matching live expression composition (an absent term contributes
         zero); ``strict=True`` requires identical coverage.
         """
-        from saklas.io.merge import linear_sum
+        from saklas.io.bake import linear_sum
 
         pairs = [(p.as_dict(), float(a)) for p, a in components]
         if len(pairs) < 2:

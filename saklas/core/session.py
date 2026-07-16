@@ -5323,7 +5323,7 @@ class SaklasSession:
         """Bake additive steering terms into a corpus-less manifold.
 
         The Python mirror of CLI ``manifold bake``.  Wraps
-        :func:`saklas.io.merge.merge_into_manifold`, model-scoped to this
+        :func:`saklas.io.bake.merge_into_manifold`, model-scoped to this
         session's loaded model — the merge lands a corpus-less
         ``fit_mode="baked"`` manifold under ``local/<name>/`` — then folds the
         fitted tensor back to a steering :class:`Profile` and registers it
@@ -5333,7 +5333,7 @@ class SaklasSession:
         Dynamic terms and Mahalanobis projection operators are rejected because
         the offline merge path does not carry an identity-matched whitener.
         """
-        from saklas.io.merge import MergeError, merge_into_manifold
+        from saklas.io.bake import MergeError, merge_into_manifold
         from saklas.io.paths import tensor_filename
         from saklas.io.manifold_tensors import load_manifold
         from saklas.core.model import loaded_model_fingerprint

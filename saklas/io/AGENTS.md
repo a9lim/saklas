@@ -390,7 +390,7 @@ pays one neutral-corpus forward loop, not two). The old `bootstrap_probes` is go
 sources bundled probe directions by folding fitted 2-node manifolds
 (`session._bootstrap_manifold_probes`).
 
-## merge.py
+## bake.py
 
 Offline direction merging into a corpus-less `fit_mode="baked"` manifold.
 `merge_into_manifold(name, expression, model, *, force, strict)` resolves each
