@@ -26,6 +26,7 @@ from saklas.core.instruments.types import (
     Distance,
     Fraction,
     GateRef,
+    InstrumentBinding,
     InstrumentPlan,
     Membership,
     ReadRequest,
@@ -35,6 +36,76 @@ from saklas.core.instruments.types import (
 
 if TYPE_CHECKING:
     from saklas.core.session import SaklasSession
+
+
+class GeometryRun:
+    """Per-generation measurement executor for the geometry family.
+
+    Deliberately thin: the Monitor engine owns the whitened reads and its
+    own generation-scoped warm state (curved feet, warm-start flags reset
+    by the capture planner), and the four capture modes' per-token scoring
+    stays session/HiddenCapture wiring.  The run contributes what its
+    siblings do — the immutable per-generation :class:`InstrumentBinding`
+    spec snapshot, the ``observe`` step memo, and the uniform protocol
+    face over the Monitor's scoring entry points.
+    """
+
+    def __init__(
+        self,
+        instrument: "GeometryInstrument",
+        binding: InstrumentBinding,
+        *,
+        bound: bool = False,
+    ) -> None:
+        self._instrument = instrument
+        self.binding = binding
+        self.bound = bound
+        self._memo_step: int | None = None
+        self._memo_readings: dict[str, Any] | None = None
+
+    # ------------------------------------------------------------ protocol
+
+    def observe(
+        self, step_id: int, hidden: dict[int, torch.Tensor],
+    ) -> dict[str, Any]:
+        """Full whitened readings for the roster at this step, memoized by
+        ``step_id``."""
+        if self._memo_step == step_id and self._memo_readings is not None:
+            return self._memo_readings
+        readings = self._instrument._session._monitor.score_single_token(hidden)
+        self._memo_step = step_id
+        self._memo_readings = readings
+        return readings
+
+    def gate_scalars(
+        self,
+        step_id: int,
+        hidden: dict[int, torch.Tensor],
+        gate_keys: frozenset[str] | set[str],
+    ) -> dict[str, float]:
+        """The gated subset's scalar channels at this step."""
+        del step_id
+        monitor = self._instrument._session._monitor
+        plan = monitor.plan_gate_scalars(set(gate_keys))
+        if not plan:
+            return {}
+        return monitor.score_planned_gate_scalars(hidden, plan)
+
+    def observe_aggregate(
+        self, pooled: dict[int, torch.Tensor],
+    ) -> dict[str, Any]:
+        """One full-roster read at the pooled last-content slice —
+        bit-identical to a live read at that token."""
+        return self._instrument._session._monitor.score_single_token(pooled)
+
+    def observe_many(
+        self, pooled_rows: "list[dict[int, torch.Tensor]]",
+    ) -> list[dict[str, Any]]:
+        return [self.observe_aggregate(rows) for rows in pooled_rows]
+
+    def close(self) -> None:
+        self._memo_step = None
+        self._memo_readings = None
 
 
 class GeometryInstrument:
@@ -50,6 +121,44 @@ class GeometryInstrument:
 
     def __init__(self, session: "SaklasSession") -> None:
         self._session = session
+        # The current per-generation run (idle passthrough until bind()).
+        self.current_run = GeometryRun(
+            self, InstrumentBinding(family=self.family),
+        )
+
+    # ------------------------------------------------------------ run lifecycle
+
+    def bind(self, plan: InstrumentPlan) -> GeometryRun:
+        """Bind an immutable per-generation run.
+
+        The binding carries the probe-name roster only: geometry specs
+        cannot be mutated by any un-locked path (attach/detach hold
+        ``_model_exclusive``), so unlike the SAE family there is no
+        mid-generation mutation to freeze against, and the full spec walk
+        (which touches Monitor internals) stays off the per-generation
+        path.
+        """
+        del plan  # demand already consumed by the capture planner
+        run = GeometryRun(
+            self,
+            InstrumentBinding(
+                family=self.family,
+                specs={
+                    str(name): {}
+                    for name in self._session._monitor.probe_names
+                },
+            ),
+            bound=True,
+        )
+        self.current_run = run
+        return run
+
+    def close_run(self) -> None:
+        """Close the current run and restore the idle passthrough run."""
+        self.current_run.close()
+        self.current_run = GeometryRun(
+            self, InstrumentBinding(family=self.family),
+        )
 
     # -------------------------------------------------------------- registry
 

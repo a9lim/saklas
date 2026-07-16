@@ -56,6 +56,11 @@ class Instrument(Protocol):
     """Session-lifetime handle for one read family."""
 
     family: str
+    #: The per-generation run currently in effect.  An **idle** run
+    #: (``bound=False``, live-registry passthrough) backs out-of-generation
+    #: reads; ``bind`` replaces it with a generation-bound run and
+    #: ``close_run``-style teardown restores an idle one.
+    current_run: "InstrumentRun"
 
     def specs(self) -> Mapping[str, Mapping[str, Any]]:
         """Attached probe specs keyed by registered name."""
@@ -85,6 +90,10 @@ class InstrumentRun(Protocol):
     """Immutable-per-generation measurement executor for one family."""
 
     binding: InstrumentBinding
+    #: True for a generation-bound run (its binding froze the specs);
+    #: False for the idle passthrough run that backs out-of-generation
+    #: reads against the live registry.
+    bound: bool
 
     def observe(
         self,

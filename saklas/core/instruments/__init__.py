@@ -8,6 +8,7 @@ Instrument / InstrumentRun contract and the division of labor.
 
 from saklas.core.instruments.protocol import Instrument, InstrumentRun, Reading
 from saklas.core.instruments.types import (
+    AGG_TAIL_DEPTH,
     Assignment,
     Axis,
     DepthBasis,
@@ -31,6 +32,7 @@ from saklas.core.instruments.types import (
 )
 
 __all__ = [
+    "AGG_TAIL_DEPTH",
     "Assignment",
     "Axis",
     "DepthBasis",

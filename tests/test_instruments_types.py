@@ -207,5 +207,21 @@ def test_session_facades_are_the_instruments() -> None:
     assert isinstance(inst["sae"], SaeInstrument)
     assert session.lens is inst["lens"]
     assert session.sae is inst["sae"]
+
+
+def test_instruments_and_runs_satisfy_the_protocol() -> None:
+    """Every concrete family satisfies the runtime-checkable ``Instrument``
+    protocol, and each carries a current run satisfying ``InstrumentRun``
+    (idle passthrough before ``bind``, generation-bound after)."""
+    from saklas.core.instruments import Instrument, InstrumentRun
+    from saklas.core.session import SaklasSession
+
+    session = SaklasSession.__new__(SaklasSession)
+    for family, instrument in session.instruments.items():
+        assert isinstance(instrument, Instrument), family
+        run = instrument.current_run
+        assert isinstance(run, InstrumentRun), family
+        assert run.bound is False
+        assert run.binding.family == family
     assert session.lens.family == "lens"
     assert session.sae.family == "sae"

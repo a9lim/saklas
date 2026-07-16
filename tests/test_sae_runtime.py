@@ -522,6 +522,68 @@ def test_fetch_sae_feature_meta_batch_caches_and_updates_probes(
     assert on_disk["1"]["max_act"] == 4.0
 
 
+def test_bound_run_freezes_sae_unit_against_metadata_backfill() -> None:
+    """The InstrumentBinding snapshot: a Neuronpedia backfill landing
+    mid-generation (it mutates attached specs + the meta cache WITHOUT the
+    generation lock) must not change a running generation's strength unit.
+    Between generations (idle run) the refresh applies immediately, as
+    before."""
+    from saklas.core.instruments.types import InstrumentPlan
+
+    session = _session()
+    inst = session._sae_instrument
+    # Attached before any metadata exists: the unit is raw at bind time.
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    acts = session._encode_sae_hidden(
+        session._capture.latest_per_layer()[1]
+    )
+    inst.bind(InstrumentPlan(family="sae"))
+    before = {n: v for n, _f, _r, v in inst.probe_values(acts)}
+    assert before["sae/1"] == pytest.approx(3.0)  # raw
+
+    # The backfill lands mid-generation.
+    session._sae_feature_meta["1"] = {
+        "label": "one", "max_act": 4.0, "checked": True,
+    }
+    session._refresh_sae_probe_meta({"1": {"label": "one", "max_act": 4.0}})
+    during = {n: v for n, _f, _r, v in inst.probe_values(acts)}
+    assert during["sae/1"] == pytest.approx(3.0)  # unit frozen at bind
+
+    inst.close_run()  # generation boundary
+    after = {n: v for n, _f, _r, v in inst.probe_values(acts)}
+    assert after["sae/1"] == pytest.approx(3.0 / 4.0)  # refresh now applies
+
+
+def test_sae_bind_resolves_unit_from_meta_cache() -> None:
+    """Bind-time resolution: a spec whose ``max_act`` is unset but whose
+    unit exists in the metadata cache freezes the RESOLVED unit — the
+    live-cache fallback never runs under a bound run, so a mid-generation
+    cache mutation cannot flip the unit either."""
+    from saklas.core.instruments.types import InstrumentPlan
+
+    session = _session()
+    inst = session._sae_instrument
+    # Feature 2's unit (10.0) is already in the fixture's meta cache; the
+    # spec itself carries no max_act (validate-time fetch never ran).
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": None, "max_act": None,
+    }
+    acts = session._encode_sae_hidden(
+        session._capture.latest_per_layer()[1]
+    )
+    inst.bind(InstrumentPlan(family="sae"))
+    assert inst.current_run.binding.specs["sae/2"]["max_act"] == 10.0
+    values = {n: v for n, _f, _r, v in inst.probe_values(acts)}
+    assert values["sae/2"] == pytest.approx(5.0 / 10.0)
+
+    # A mid-generation cache mutation is invisible to the bound run.
+    session._sae_feature_meta["2"]["max_act"] = 2.0
+    values = {n: v for n, _f, _r, v in inst.probe_values(acts)}
+    assert values["sae/2"] == pytest.approx(5.0 / 10.0)
+
+
 @pytest.mark.parametrize("max_act", [float("nan"), float("inf")])
 def test_sae_feature_meta_rejects_nonfinite_scale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, max_act: float,

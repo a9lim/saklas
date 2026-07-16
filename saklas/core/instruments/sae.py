@@ -36,6 +36,7 @@ from saklas.core.instruments.types import (
     AGG_TAIL_DEPTH,
     Axis,
     GateRef,
+    InstrumentBinding,
     InstrumentPlan,
     ReadRequest,
     parse_gate_ref,
@@ -45,6 +46,84 @@ from saklas.core.instruments.types import (
 if TYPE_CHECKING:
     from saklas.core.results import ProbeReading
     from saklas.core.session import SaklasSession
+
+
+class SaeRun:
+    """Per-generation measurement executor for the SAE family.
+
+    Owns the generation-scoped state (``protocol.py``): the immutable
+    :class:`InstrumentBinding` — probe specs frozen at bind with the
+    normalization unit (``max_act``) **resolved** into the snapshot — the
+    live-active flag, the per-forward encode stash, and the ``observe``
+    memo.  The frozen specs are the fix for the metadata-backfill race:
+    ``fetch_sae_feature_meta`` mutates attached specs and the meta cache
+    without the generation lock, so a running generation must measure
+    against its bind-time snapshot, never the live registry.  An idle run
+    (``bound=False``) reads the live registry — between generations a
+    Neuronpedia refresh still changes the unit immediately.
+    """
+
+    def __init__(
+        self,
+        instrument: "SaeInstrument",
+        binding: InstrumentBinding,
+        *,
+        active: bool = True,
+        bound: bool = False,
+    ) -> None:
+        self._instrument = instrument
+        self.binding = binding
+        self.active = active
+        self.bound = bound
+        self.step_stash: dict[str, Any] | None = None
+        self.last_step_readings: dict[str, "ProbeReading"] | None = None
+        self._memo_step: int | None = None
+        self._memo_readings: dict[str, "ProbeReading"] | None = None
+
+    # ------------------------------------------------------------ protocol
+
+    def observe(
+        self, step_id: int, hidden: dict[int, torch.Tensor],
+    ) -> dict[str, "ProbeReading"]:
+        """Readings for every attached probe at this step, memoized by
+        ``step_id`` — gate and display callers share one computation."""
+        if self._memo_step == step_id and self._memo_readings is not None:
+            return self._memo_readings
+        readings = self._instrument.score_probes(hidden)
+        self._memo_step = step_id
+        self._memo_readings = readings
+        return readings
+
+    def gate_scalars(
+        self,
+        step_id: int,
+        hidden: dict[int, Any] | None,
+        gate_keys: frozenset[str] | set[str],
+    ) -> dict[str, float]:
+        """The gate channels' scalars for this step (the encode stash the
+        display step reuses lives on this run)."""
+        del step_id, hidden  # worker reads the capture's latest slices
+        return self._instrument.gate_scalars(set(gate_keys))
+
+    def observe_aggregate(
+        self, pooled: dict[int, Any],
+    ) -> dict[str, "ProbeReading"]:
+        """End-of-generation aggregate at the pooled last-content slice."""
+        return self._instrument.score_probes(pooled)
+
+    def observe_many(
+        self, pooled_rows: "list[dict[int, Any]]",
+    ) -> list[dict[str, "ProbeReading"]]:
+        """Batch-generation aggregates: one reading set per row."""
+        return [self.observe_aggregate(rows) for rows in pooled_rows]
+
+    def close(self) -> None:
+        """Release generation-scoped state (stash, memo)."""
+        self.step_stash = None
+        self.last_step_readings = None
+        self._memo_step = None
+        self._memo_readings = None
+        self.active = True
 
 
 class SaeInstrument:
@@ -62,12 +141,86 @@ class SaeInstrument:
         self.probes: dict[str, dict[str, Any]] = {}
         # Live feature discovery: {layer, top_k, source}, or None when off.
         self.live: dict[str, Any] | None = None
-        # Per-forward stash: the gate callback encodes first (score_callback
-        # runs before the token tap), the display step reuses the encoded
-        # activations + already-transferred raw values.  Reset per generation.
-        self.step_stash: dict[str, Any] | None = None
-        self.active_for_generation: bool = True
-        self.last_step_readings: dict[str, "ProbeReading"] | None = None
+        # The current per-generation run (idle passthrough until bind()).
+        self.current_run = SaeRun(
+            self, InstrumentBinding(family=self.family),
+        )
+
+    # ------------------------------------------------------------- run state
+
+    @property
+    def step_stash(self) -> dict[str, Any] | None:
+        return self.current_run.step_stash
+
+    @step_stash.setter
+    def step_stash(self, value: "dict[str, Any] | None") -> None:
+        self.current_run.step_stash = value
+
+    @property
+    def last_step_readings(self) -> "dict[str, ProbeReading] | None":
+        return self.current_run.last_step_readings
+
+    @last_step_readings.setter
+    def last_step_readings(
+        self, value: "dict[str, ProbeReading] | None",
+    ) -> None:
+        self.current_run.last_step_readings = value
+
+    @property
+    def active_for_generation(self) -> bool:
+        return self.current_run.active
+
+    @active_for_generation.setter
+    def active_for_generation(self, value: bool) -> None:
+        self.current_run.active = bool(value)
+
+    # ------------------------------------------------------------ run lifecycle
+
+    def bind(self, plan: InstrumentPlan, *, live_active: bool = True) -> SaeRun:
+        """Bind an immutable per-generation run from a declared plan.
+
+        The binding freezes each attached probe's spec **with its
+        normalization unit resolved**: ``max_act`` falls back to the
+        session metadata cache at bind time, so a mid-generation
+        Neuronpedia backfill (which mutates specs and cache without the
+        generation lock) cannot change what a running generation measures.
+        """
+        del plan  # demand already consumed by the capture planner
+        session = self._session
+        # Duck-typed narrow stubs may lack the metadata cache; a real
+        # session always carries it (set in ``__init__``).
+        has_meta_cache = getattr(session, "_sae_feature_meta", None) is not None
+        specs: dict[str, dict[str, Any]] = {}
+        for name, spec in self.probes.items():
+            frozen = dict(spec)
+            max_act = frozen.get("max_act")
+            if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
+                frozen["max_act"] = (
+                    session._sae_max_act(int(frozen["feature_id"]))
+                    if has_meta_cache else None
+                )
+            specs[name] = frozen
+        run = SaeRun(
+            self,
+            InstrumentBinding(family=self.family, specs=specs),
+            active=live_active,
+            bound=True,
+        )
+        self.current_run = run
+        return run
+
+    def close_run(self) -> None:
+        """Close the current run and restore the idle passthrough run."""
+        self.current_run.close()
+        self.current_run = SaeRun(
+            self, InstrumentBinding(family=self.family),
+        )
+
+    def _measurement_specs(self) -> "Mapping[str, Mapping[str, Any]]":
+        """The spec source for measurement: a bound run's frozen binding
+        (race-immune), else the live registry (idle passthrough)."""
+        run = self.current_run
+        return run.binding.specs if run.bound else self.probes
 
     # -------------------------------------------------------------- registry
 
@@ -178,7 +331,7 @@ class SaeInstrument:
         from saklas.core.results import ProbeReading
 
         session = self._session
-        if not self.probes:
+        if not self._measurement_specs():
             return {}
         _backend, layer, _width = session._require_sae()
         if activations is None:
@@ -209,17 +362,22 @@ class SaeInstrument:
 
         ``raw_by_fid`` is a per-forward cache from a caller that has already
         transferred selected feature activations (currently the live top-k
-        readout). Normalization always reads the current probe metadata, so a
-        Neuronpedia maxActApprox refresh changes the unit immediately.
+        readout). Normalization reads the **measurement specs**: a bound
+        run's bind-time snapshot (a mid-generation Neuronpedia backfill
+        cannot change the unit under a running generation), else the live
+        registry (between generations a refresh changes the unit
+        immediately, as before).
         """
         session = self._session
+        specs = self._measurement_specs()
+        live_fallback = not self.current_run.bound
         names = [
-            name for name in self.probes
+            name for name in specs
             if only is None or name in only
         ]
         if not names:
             return []
-        fids = [int(self.probes[name]["feature_id"]) for name in names]
+        fids = [int(specs[name]["feature_id"]) for name in names]
         raw_values_by_fid: dict[int, float] = {
             int(fid): float(value)
             for fid, value in (raw_by_fid or {}).items()
@@ -246,16 +404,18 @@ class SaeInstrument:
                 raw_values_by_fid[int(fid)] = float(raw_value)
         out: list[tuple[str, int, float, float]] = []
         for name, fid in zip(names, fids, strict=True):
-            spec = self.probes[name]
+            spec = specs[name]
             raw_value = float(raw_values_by_fid[fid])
             value = raw_value
             # The ONE channel is normalized strength — ``activation /
             # maxActApprox`` ∈ ~[0,1], apples-to-apples across features like
             # the lens probes' mean fitted-layer probability. Raw activation
             # only when no metadata exists (offline / not on Neuronpedia).
+            # A bound run's unit was resolved into the snapshot at bind; the
+            # live cache fallback applies only between generations.
             max_act = spec.get("max_act")
             if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
-                max_act = session._sae_max_act(fid)
+                max_act = session._sae_max_act(fid) if live_fallback else None
             if max_act is not None:
                 value = value / float(max_act)
             out.append((name, fid, raw_value, value))
@@ -274,7 +434,8 @@ class SaeInstrument:
         silently-constant comparison.
         """
         session = self._session
-        if not self.probes:
+        specs = self._measurement_specs()
+        if not specs:
             return {}
         _backend, layer, _width = session._require_sae()
         only = None
@@ -282,7 +443,7 @@ class SaeInstrument:
             only = {
                 key.split("[", 1)[0]
                 for key in gate_keys
-                if key.split("[", 1)[0] in self.probes
+                if key.split("[", 1)[0] in specs
             }
             if not only:
                 return {}
@@ -327,7 +488,7 @@ class SaeInstrument:
                     for layer, rows in stacked.items()
                     if rows.shape[0] > agg_fwd
                 }
-        return self.score_probes(pooled) if pooled else {}
+        return self.current_run.observe_aggregate(pooled) if pooled else {}
 
     # ----------------------------------------------------------- live readout
 

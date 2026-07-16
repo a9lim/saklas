@@ -32,6 +32,7 @@ from saklas.core.instruments.types import (
     AGG_TAIL_DEPTH,
     Axis,
     GateRef,
+    InstrumentBinding,
     InstrumentPlan,
     ReadRequest,
     parse_gate_ref,
@@ -41,6 +42,94 @@ from saklas.core.instruments.types import (
 if TYPE_CHECKING:
     from saklas.core.results import ProbeReading
     from saklas.core.session import SaklasSession
+
+
+class LensRun:
+    """Per-generation measurement executor for the lens family.
+
+    Owns everything generation-scoped (``protocol.py``): the immutable
+    :class:`InstrumentBinding` (probe specs frozen at bind), the resident-
+    lens disk-identity pin, the live-active flag, the per-forward stash the
+    gate callback and the display step share, and the ``observe`` memo.
+    An **idle** run (``bound=False``) backs out-of-generation reads —
+    defensive captures, offline readouts — with live-registry passthrough
+    semantics, so every read path has a run to consult.
+    """
+
+    def __init__(
+        self,
+        instrument: "LensInstrument",
+        binding: InstrumentBinding,
+        *,
+        lens: Any = None,
+        pinned: bool = False,
+        active: bool = True,
+        bound: bool = False,
+    ) -> None:
+        self._instrument = instrument
+        self.binding = binding
+        #: The pinned resident lens (or None — unbound / validated-missing).
+        self.lens = lens
+        #: True when this generation snapshot-pinned the lens identity.
+        self.pinned = pinned
+        #: Live-readout activity for this generation.
+        self.active = active
+        #: True for a generation-bound run (idle runs pass through).
+        self.bound = bound
+        self.step_stash: dict[str, Any] | None = None
+        self.last_step_readings: dict[str, "ProbeReading"] | None = None
+        self._memo_step: int | None = None
+        self._memo_readings: dict[str, "ProbeReading"] | None = None
+
+    # ------------------------------------------------------------ protocol
+
+    def observe(
+        self, step_id: int, hidden: dict[int, torch.Tensor],
+    ) -> dict[str, "ProbeReading"]:
+        """Readings for every attached probe at this step, memoized by
+        ``step_id`` so the gate callback (pre-token-tap) and the display
+        step share one computation."""
+        if self._memo_step == step_id and self._memo_readings is not None:
+            return self._memo_readings
+        readings = self._instrument.score_probes(hidden)
+        self._memo_step = step_id
+        self._memo_readings = readings
+        return readings
+
+    def gate_scalars(
+        self,
+        step_id: int,
+        hidden: dict[int, Any] | None,
+        gate_keys: frozenset[str] | set[str],
+    ) -> dict[str, float]:
+        """The gate channels' scalars for this step.  The per-forward
+        matrix-level reuse (band logits stashed for the display step)
+        stays inside the instrument's worker — the stash lives on this
+        run, so the reuse is generation-scoped by construction."""
+        del step_id, hidden  # worker reads the capture's latest slices
+        return self._instrument.gate_scalars(set(gate_keys))
+
+    def observe_aggregate(
+        self, pooled: dict[int, Any],
+    ) -> dict[str, "ProbeReading"]:
+        """End-of-generation aggregate at the pooled last-content slice."""
+        return self._instrument.score_probes(pooled)
+
+    def observe_many(
+        self, pooled_rows: "list[dict[int, Any]]",
+    ) -> list[dict[str, "ProbeReading"]]:
+        """Batch-generation aggregates: one reading set per row."""
+        return [self.observe_aggregate(rows) for rows in pooled_rows]
+
+    def close(self) -> None:
+        """Release generation-scoped state (stash, memo, pin)."""
+        self.step_stash = None
+        self.last_step_readings = None
+        self._memo_step = None
+        self._memo_readings = None
+        self.lens = None
+        self.pinned = False
+        self.active = True
 
 
 class LensInstrument:
@@ -62,17 +151,108 @@ class LensInstrument:
         # disabling drops this dict but transported stacks stay in the
         # session's device cache.
         self.live: dict[str, Any] | None = None
-        # Per-forward stash: the gate callback computes band logits first
-        # (score_callback runs before the token tap), the display step
-        # reuses them when the layer sets match.  Reset per generation.
-        self.step_stash: dict[str, Any] | None = None
-        self.active_for_generation: bool = True
-        self.last_step_readings: dict[str, "ProbeReading"] | None = None
-        # Per-generation disk-identity pin: `_begin_capture` snapshots the
-        # resident lens once per generation so an external `jlens.json`
-        # switch mid-decode can't change what this generation reads.
-        self.generation_lens: Any = None
-        self.generation_lens_active: bool = False
+        # The current per-generation run (idle passthrough until bind()).
+        # All generation-scoped state — stash, display readings, active
+        # flag, disk-identity pin — lives on it.
+        self.current_run = LensRun(
+            self, InstrumentBinding(family=self.family),
+        )
+
+    # ------------------------------------------------------------- run state
+    # Historical state names, delegating to the current run so the session's
+    # own delegating properties (and every internal read path) are unchanged.
+
+    @property
+    def step_stash(self) -> dict[str, Any] | None:
+        return self.current_run.step_stash
+
+    @step_stash.setter
+    def step_stash(self, value: "dict[str, Any] | None") -> None:
+        self.current_run.step_stash = value
+
+    @property
+    def last_step_readings(self) -> "dict[str, ProbeReading] | None":
+        return self.current_run.last_step_readings
+
+    @last_step_readings.setter
+    def last_step_readings(
+        self, value: "dict[str, ProbeReading] | None",
+    ) -> None:
+        self.current_run.last_step_readings = value
+
+    @property
+    def active_for_generation(self) -> bool:
+        return self.current_run.active
+
+    @active_for_generation.setter
+    def active_for_generation(self, value: bool) -> None:
+        self.current_run.active = bool(value)
+
+    @property
+    def generation_lens(self) -> Any:
+        return self.current_run.lens
+
+    @generation_lens.setter
+    def generation_lens(self, value: Any) -> None:
+        self.current_run.lens = value
+
+    @property
+    def generation_lens_active(self) -> bool:
+        return self.current_run.pinned
+
+    @generation_lens_active.setter
+    def generation_lens_active(self, value: bool) -> None:
+        self.current_run.pinned = bool(value)
+
+    # ------------------------------------------------------------ run lifecycle
+
+    def bind(self, plan: InstrumentPlan, *, live_active: bool = True) -> LensRun:
+        """Bind an immutable per-generation run from a declared plan.
+
+        Freezes the attached probe specs into the run's binding and — when
+        the plan declares any capture demand — snapshot-pins the resident
+        lens once, so an external ``jlens.json`` switch mid-decode cannot
+        change what this generation reads (the former ``_begin_capture``
+        pin, now owned by the run).
+        """
+        session = self._session
+        pin_demand = bool(plan.latest_layers or plan.tail_layers)
+        run = LensRun(
+            self,
+            InstrumentBinding(
+                family=self.family,
+                specs={name: dict(spec) for name, spec in self.probes.items()},
+            ),
+            lens=None,
+            pinned=False,
+            active=live_active,
+            bound=True,
+        )
+        # Install the (pin-free) run BEFORE consulting ``session.jlens``:
+        # its getter short-circuits to the pin while the pin flag is set, so
+        # a stale prior run's snapshot must never suppress this boundary's
+        # disk refresh — the same reset-then-read ordering the inline
+        # ``_begin_capture`` pin used.
+        self.current_run = run
+        if pin_demand:
+            run.lens = session.jlens
+            run.pinned = True
+        return run
+
+    def close_run(self) -> None:
+        """Close the current run and restore the idle passthrough run."""
+        self.current_run.close()
+        self.current_run = LensRun(
+            self, InstrumentBinding(family=self.family),
+        )
+
+    def _measurement_specs(self) -> "dict[str, Any] | Any":
+        """The spec source for measurement: a bound run's frozen binding
+        (immune to concurrent spec mutation — e.g. the ``jlens`` getter's
+        eviction path zeroing probe layers from another thread), else the
+        live registry."""
+        run = self.current_run
+        return run.binding.specs if run.bound else self.probes
 
     # -------------------------------------------------------------- registry
 
@@ -243,12 +423,15 @@ class LensInstrument:
         from saklas.core.results import ProbeReading
 
         session = self._session
-        if not self.probes:
+        probes = self._measurement_specs()
+        if not probes:
             return {}
         lens = self._resident_lens()
         if lens is None:
             return {}
-        readout_layers = self.probe_layers()
+        readout_layers: set[int] = set()
+        for spec in probes.values():
+            readout_layers.update(spec["layers"])
         if logits is not None and probabilities is not None:
             raise ValueError("pass lens logits or probabilities, not both")
         if logits is None and probabilities is None:
@@ -272,12 +455,12 @@ class LensInstrument:
                     probabilities = probabilities[keep]
             layers = [layers[i] for i in keep]
         names = [
-            name for name in self.probes
+            name for name in probes
             if only is None or name in only
         ]
         if not names:
             return {}
-        token_ids = [self.probes[n]["token_id"] for n in names]
+        token_ids = [probes[n]["token_id"] for n in names]
         prob_device = (
             probabilities.device
             if probabilities is not None
@@ -334,7 +517,8 @@ class LensInstrument:
         from saklas.core.monitor import Monitor
 
         session = self._session
-        if not self.probes:
+        probes = self._measurement_specs()
+        if not probes:
             return {}
         lens = self._resident_lens()
         if lens is None:
@@ -347,7 +531,7 @@ class LensInstrument:
             only = {
                 key.split("[", 1)[0]
                 for key in gate_keys
-                if key.split("[", 1)[0] in self.probes
+                if key.split("[", 1)[0] in probes
             }
             if not only:
                 return {}
@@ -359,7 +543,10 @@ class LensInstrument:
         # callback and let the display reuse it.  Gate-only calls stay on the
         # narrower requested subset.
         probe_read_only = None if live_display_needs_full_probs else only
-        readout_layers = self.probe_layers(probe_read_only)
+        readout_layers: set[int] = set()
+        for name, spec in probes.items():
+            if probe_read_only is None or name in probe_read_only:
+                readout_layers.update(spec["layers"])
         layers = sorted(l for l in readout_layers if l in latest)
         if not layers:
             return {}
@@ -436,7 +623,7 @@ class LensInstrument:
                 }
         if not pooled:
             return {}
-        return self.score_probes(pooled)
+        return self.current_run.observe_aggregate(pooled)
 
     # ----------------------------------------------------------- live readout
 

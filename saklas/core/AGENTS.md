@@ -1013,13 +1013,27 @@ lens/SAE-attached gate references at generation preflight
 (`UnsupportedProbeChannelError`, 400) and fixes the old
 `re.split("[\\[:@~]")` truncation of variant-suffixed probe names.
 
-Deferred to a follow-up slice (deliberately, not silently): plan-driven
-`_begin_capture` layer-union (`InstrumentPlan` production/consumption —
-the per-family union branches in `_begin_capture` remain explicit
-session logic), and the formal `InstrumentRun` objectification (the
-step-stash gate→display compute-reuse contract its `observe` memoization
-would formalize is implemented by the per-family stashes and pinned by
-tests).
+Both formerly deferred slices are landed. **Plan-driven capture:** every
+family implements `plan(ReadRequest) -> InstrumentPlan` and
+`_begin_capture` (plus the batch preamble) unions the declared
+`latest_layers`/`tail_layers` instead of hand-rolled per-family branches;
+retention-mode selection stays session-side (the
+`INCREMENTAL → set_tail_with_sink` upgrade is cross-instrument resource
+sharing). **Formal runs:** `bind(plan)` freezes an `InstrumentBinding`
+(spec snapshot; the SAE binding resolves `max_act` at bind, so the
+un-locked Neuronpedia backfill can no longer change a running
+generation's strength unit — sol's race) and returns the family's
+run (`LensRun`/`SaeRun`/`GeometryRun`), which owns all generation-scoped
+state: step stashes, display readings, active flags, the lens
+disk-identity pin (taken inside `bind` with the reset-then-read ordering
+the `jlens` getter's pin short-circuit requires), and the `observe`
+step-memo. Instruments keep the historical state names as delegating
+properties over `current_run` (an idle passthrough run backs
+out-of-generation reads — measurement specs come from
+`_measurement_specs()`: the frozen binding when bound, the live registry
+when idle). The generation finallys call `close_run()`; per-step
+gate→display matrix reuse remains the stash mechanism inside the workers,
+run-scoped by construction.
 
 ## triggers.py
 

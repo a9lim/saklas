@@ -1138,8 +1138,15 @@ is the `{"geometry", "lens", "sae"}` registry, and `session.lens` / `session.sae
 are the typed public facades; the historical `session._score_*` / `_live_*`
 methods survive as delegating forwarders. Artifact/source lifecycle
 (`fit_jlens`, `train_sae`/`load_sae`, token replay) stays session-side — source
-management is not measurement. Deferred, not silent: the plan-driven
-`_begin_capture` layer-union and the formal `InstrumentRun` objectification.
+management is not measurement. Capture is plan-driven: each family declares
+demand via `plan(ReadRequest) -> InstrumentPlan` and the session planner unions
+the declared layers, keeping retention-mode selection to itself. `bind(plan)`
+opens the formal per-generation `InstrumentRun` — an immutable
+`InstrumentBinding` (probe specs frozen at bind; the SAE binding resolves the
+normalization unit there, immunizing a running generation against the un-locked
+metadata backfill) plus the generation-scoped stashes, flags, and the lens
+disk-identity pin — closed by the generation finallys (`close_run`), with an
+idle passthrough run backing out-of-generation reads.
 
 ---
 

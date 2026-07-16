@@ -5603,28 +5603,17 @@ class SaklasSession:
         has_lens_gate = bool(lens_plan.gate_keys)
         has_sae_gate = bool(sae_plan.gate_keys)
 
-        # Refresh an externally replaced/removed J-lens exactly once before
-        # fixing this generation's capture layers.  Every token, gate, and
-        # final aggregate below consumes the same resident generation even if
-        # another process switches ``jlens.json`` mid-decode.  The pin is
-        # needed exactly when the lens family declared any capture demand
-        # (live readout, gated probes, or finalize aggregates).
-        needs_lens_snapshot = bool(
-            lens_plan.latest_layers or lens_plan.tail_layers
-        )
-        # A prior defensive/standalone capture may not have run the ordinary
-        # generation-finally cleanup. Never let its snapshot suppress this
-        # boundary's disk refresh.
-        self._generation_jlens = None
-        self._generation_jlens_active = False
-        self._generation_jlens = self.jlens if needs_lens_snapshot else None
-        self._generation_jlens_active = needs_lens_snapshot
-
-        # Per-generation reset of the per-forward lens stash + display row.
-        self._lens_step_stash = None
-        self._last_lens_step_readings = None
-        self._sae_step_stash = None
-        self._last_sae_step_readings = None
+        # Bind each family's per-generation run (``Instrument.bind``): probe
+        # specs freeze into the immutable ``InstrumentBinding`` (a concurrent
+        # SAE metadata backfill can no longer change what this generation
+        # measures), stashes and step memos start fresh, and the lens run
+        # snapshot-pins the resident lens exactly when its plan declared
+        # capture demand — one disk refresh per generation; every token,
+        # gate, and final aggregate below consumes the same resident lens
+        # even if another process switches ``jlens.json`` mid-decode.
+        self._geometry_instrument.bind(geometry_plan)
+        self._lens_instrument.bind(lens_plan, live_active=live_lens_active)
+        self._sae_instrument.bind(sae_plan, live_active=live_sae_active)
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
@@ -9229,10 +9218,12 @@ class SaklasSession:
             self._active_gen_reservation = None
             self._last_token_probe_payload = None
             self._last_token_probe_readings = None
-            self._live_lens_active_for_generation = True
-            self._live_sae_active_for_generation = True
-            self._generation_jlens = None
-            self._generation_jlens_active = False
+            # Close each family's per-generation run (releases stashes, step
+            # memos, and the lens pin; restores the idle passthrough run with
+            # default-active flags — finalize consumed the aggregates above).
+            self._geometry_instrument.close_run()
+            self._lens_instrument.close_run()
+            self._sae_instrument.close_run()
             # Reset capture state to the default (FULL, non-persistent) so the
             # next gen starts clean (finalize has already consumed the rows by
             # now). Belt-and-suspenders: ``_begin_capture`` resets it at gen start
@@ -9752,7 +9743,11 @@ class SaklasSession:
         self,
         pooled: dict[int, torch.Tensor],
     ) -> dict[str, ProbeReading]:
-        """Pinned J-lens/SAE readout probe aggregates from a batched tail slice."""
+        """Pinned J-lens/SAE readout probe aggregates from a batched tail slice.
+
+        The forwarders resolve through each family's bound run state
+        (frozen spec snapshot + pinned lens), so every row of the batch
+        measures against the same bind-time binding."""
         if not pooled:
             return {}
         out: dict[str, ProbeReading] = {}
@@ -9936,33 +9931,29 @@ class SaklasSession:
                 if return_probe_readings else []
             )
             has_lens_probes = bool(return_probe_readings and self._lens_probes)
-            if has_lens_probes:
-                # Batched generation bypasses ``_begin_capture`` but still
-                # owns one generation transaction. Pin one disk-refreshed lens
-                # across every row aggregate rather than reopening all shards
-                # once per batch item.
-                self._generation_jlens = None
-                self._generation_jlens_active = False
-                self._generation_jlens = self.jlens
-                self._generation_jlens_active = True
             has_sae_probes = bool(return_probe_readings and self._sae_probes)
+            # Batched generation bypasses ``_begin_capture`` but still owns
+            # one generation transaction: plan + bind each family's run.
+            # The lens bind pins one disk-refreshed lens across every row
+            # aggregate (rather than reopening all shards per batch item),
+            # and the bindings freeze probe specs against concurrent
+            # metadata backfills for the whole batch.
+            batch_request = ReadRequest(
+                final_aggregate=return_probe_readings,
+                batch=True,
+            )
+            geometry_plan = self._geometry_instrument.plan(batch_request)
+            lens_plan = self._lens_instrument.plan(batch_request)
+            sae_plan = self._sae_instrument.plan(batch_request)
+            self._geometry_instrument.bind(geometry_plan)
+            self._lens_instrument.bind(lens_plan)
+            self._sae_instrument.bind(sae_plan)
             capture_probe_aggregates = bool(
                 probe_names or has_lens_probes or has_sae_probes
             )
             if capture_probe_aggregates:
-                # Batch rows read only end-of-row aggregates: each family
-                # declares its layers under a batch ReadRequest (no live
-                # readouts, no per-token consumers, no gates).
-                batch_request = ReadRequest(
-                    final_aggregate=return_probe_readings,
-                    batch=True,
-                )
                 layer_set: set[int] = set()
-                for batch_plan in (
-                    self._geometry_instrument.plan(batch_request),
-                    self._lens_instrument.plan(batch_request),
-                    self._sae_instrument.plan(batch_request),
-                ):
+                for batch_plan in (geometry_plan, lens_plan, sae_plan):
                     layer_set |= batch_plan.latest_layers
                     layer_set |= batch_plan.tail_layers
                 layer_idxs = sorted(layer_set)
@@ -10109,8 +10100,9 @@ class SaklasSession:
                 self._active_gen_reservation = None
                 self._last_token_probe_payload = None
                 self._last_token_probe_readings = None
-                self._generation_jlens = None
-                self._generation_jlens_active = False
+                self._geometry_instrument.close_run()
+                self._lens_instrument.close_run()
+                self._sae_instrument.close_run()
                 self._capture_state = CaptureState()
                 self._compiled_clean_eligible = False
                 self._incremental_readings = []
