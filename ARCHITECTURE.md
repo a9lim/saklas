@@ -1145,8 +1145,13 @@ opens the formal per-generation `InstrumentRun` — an immutable
 `InstrumentBinding` (probe specs frozen at bind; the SAE binding resolves the
 normalization unit there, immunizing a running generation against the un-locked
 metadata backfill) plus the generation-scoped stashes, flags, and the lens
-disk-identity pin — closed by the generation finallys (`close_run`), with an
-idle passthrough run backing out-of-generation reads.
+disk-identity pin. Ordering contract: the lens disk refresh + pin happens
+BEFORE planning/freezing (the adoption path rewrites live probe layer lists),
+and every capture transaction — generation, batch, joint-logprob replay —
+closes its runs in its finally (`close_run` is protocol surface). Lens/SAE
+measurement guards consult the frozen binding, so mid-generation roster
+mutations apply at the next generation boundary; an idle passthrough run backs
+out-of-generation reads against the live registry.
 
 ---
 

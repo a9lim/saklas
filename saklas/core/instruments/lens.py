@@ -88,7 +88,11 @@ class LensRun:
     ) -> dict[str, "ProbeReading"]:
         """Readings for every attached probe at this step, memoized by
         ``step_id`` so the gate callback (pre-token-tap) and the display
-        step share one computation."""
+        step share one computation.  An idle run never memoizes — it
+        persists indefinitely, so a repeated ``step_id`` with different
+        hidden states would return stale readings."""
+        if not self.bound:
+            return self._instrument.score_probes(hidden)
         if self._memo_step == step_id and self._memo_readings is not None:
             return self._memo_readings
         readings = self._instrument.score_probes(hidden)
@@ -206,37 +210,48 @@ class LensInstrument:
 
     # ------------------------------------------------------------ run lifecycle
 
-    def bind(self, plan: InstrumentPlan, *, live_active: bool = True) -> LensRun:
+    def bind(
+        self,
+        plan: InstrumentPlan,
+        *,
+        live_active: bool = True,
+        lens: Any = None,
+        pinned: bool = False,
+    ) -> LensRun:
         """Bind an immutable per-generation run from a declared plan.
 
-        Freezes the attached probe specs into the run's binding and — when
-        the plan declares any capture demand — snapshot-pins the resident
-        lens once, so an external ``jlens.json`` switch mid-decode cannot
-        change what this generation reads (the former ``_begin_capture``
-        pin, now owned by the run).
+        The **session planner supplies the pin**: the disk-refreshing
+        ``session.jlens`` read must happen BEFORE ``plan()`` — its adoption
+        path rewrites the live probe layer lists when an external
+        replacement lens is adopted, so a plan (and a spec freeze) taken
+        earlier would pair the new lens with stale layers (sol's slice-B
+        review, finding 2).  ``bind`` therefore only freezes the (already
+        refreshed) registry and installs the pin it is handed.  The frozen
+        spec copies own their ``layers`` list — the live registry's lists
+        are replaced in place by the adoption/eviction paths.
         """
+        del plan  # demand consumed by the planner; the pin decision is its
         session = self._session
-        pin_demand = bool(plan.latest_layers or plan.tail_layers)
         run = LensRun(
             self,
             InstrumentBinding(
                 family=self.family,
-                specs={name: dict(spec) for name, spec in self.probes.items()},
+                fingerprint=(
+                    str(identity)
+                    if (identity := getattr(session, "_jlens_identity", None))
+                    is not None else None
+                ),
+                specs={
+                    name: {**spec, "layers": list(spec["layers"])}
+                    for name, spec in self.probes.items()
+                },
             ),
-            lens=None,
-            pinned=False,
+            lens=lens,
+            pinned=pinned,
             active=live_active,
             bound=True,
         )
-        # Install the (pin-free) run BEFORE consulting ``session.jlens``:
-        # its getter short-circuits to the pin while the pin flag is set, so
-        # a stale prior run's snapshot must never suppress this boundary's
-        # disk refresh — the same reset-then-read ordering the inline
-        # ``_begin_capture`` pin used.
         self.current_run = run
-        if pin_demand:
-            run.lens = session.jlens
-            run.pinned = True
         return run
 
     def close_run(self) -> None:
@@ -607,7 +622,10 @@ class LensInstrument:
         the aggregate semantics match the monitor probes' exactly.
         """
         session = self._session
-        if not self.probes or not generated_ids:
+        # Binding-authoritative guard: a probe detached mid-generation
+        # stays in this generation's aggregate roster (mutations apply
+        # next generation).
+        if not self._measurement_specs() or not generated_ids:
             return {}
         if pooled is None:
             agg_fwd = session._aggregate_forward_index(generated_ids)
@@ -835,7 +853,7 @@ class LensInstrument:
         # may already have computed the same readings from these exact rows;
         # reuse them to avoid a second selected-token host sync on the
         # pinned+gated+live path.
-        if self.probes:
+        if self._measurement_specs():
             readings_reused = False
             if stash is not None and stash.get("readings_fresh"):
                 reading_layers = tuple(
@@ -943,7 +961,7 @@ class LensInstrument:
         probabilities = readout_probabilities(logits)
         readings = self.score_probes(
             {}, probabilities=probabilities, layers=layers,
-        ) if self.probes else {}
+        ) if self._measurement_specs() else {}
         k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
         values, indices = probabilities.topk(k, dim=-1)
         value_rows = values.detach().to("cpu").tolist()

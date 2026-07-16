@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 import torch
 
 from saklas.core.joint_logprobs import (
@@ -347,9 +348,23 @@ class _MockTree:
 
 
 class _MockSession:
-    """Just enough surface for ``compute_joint_logprobs`` to run."""
+    """Just enough surface for ``compute_joint_logprobs`` to run.
+
+    Carries REAL instruments and the real ``_close_instrument_runs`` so the
+    replay's run lifecycle is exercised: ``_begin_capture`` here binds all
+    three families exactly like the real planner does, which lets the
+    lifecycle regression assert the replay's ``finally`` closes them (the
+    former no-op stubs made the bind leak invisible to this suite)."""
 
     def __init__(self):
+        from types import MethodType
+
+        from saklas.core.instruments.geometry import GeometryInstrument
+        from saklas.core.instruments.lens import LensInstrument
+        from saklas.core.instruments.sae import SaeInstrument
+        from saklas.core.instruments.types import InstrumentPlan
+        from saklas.core.session import SaklasSession
+
         self.tokenizer = _MockTokenizer()
         # Build a vocabulary that covers the strings we'll feed.  The
         # decode path needs every id to round-trip.
@@ -363,13 +378,38 @@ class _MockSession:
         self._steering = type("SteeringState", (), {"ctx": TriggerContext()})()
         self._monitor = type(
             "MonitorState", (),
-            {"begin_live": lambda _self: None, "end_live": lambda _self: None},
+            {
+                "begin_live": lambda _self: None,
+                "end_live": lambda _self: None,
+                "probe_names": [],
+            },
         )()
         self._compose_gen_config = lambda _sampling: self.config
-        self._begin_capture = lambda **_kwargs: None
+        self._geometry_instrument = GeometryInstrument(self)  # type: ignore[arg-type]
+        self._lens_instrument = LensInstrument(self)  # type: ignore[arg-type]
+        self._sae_instrument = SaeInstrument(self)  # type: ignore[arg-type]
+
+        def _bind_all(**_kwargs: Any) -> bool:
+            self._geometry_instrument.bind(InstrumentPlan(family="geometry"))
+            self._lens_instrument.bind(InstrumentPlan(family="lens"))
+            self._sae_instrument.bind(InstrumentPlan(family="sae"))
+            return False
+
+        self._begin_capture = _bind_all
         self._end_capture = lambda: None
+        self._close_instrument_runs = MethodType(
+            SaklasSession._close_instrument_runs, self,
+        )
         self._steering_needs_probe_gating = lambda: False
         self._build_gating_score_callback = lambda: None
+
+    def assert_runs_closed(self) -> None:
+        for instrument in (
+            self._geometry_instrument,
+            self._lens_instrument,
+            self._sae_instrument,
+        ):
+            assert instrument.current_run.bound is False, instrument.family
 
 
 def test_compute_joint_logprobs_runs_end_to_end_on_mock():
@@ -400,6 +440,28 @@ def test_compute_joint_logprobs_runs_end_to_end_on_mock():
         assert r.rank_changed is False
     # n_rank1_changed mirrors the aligned-row count where rank flipped.
     assert result.n_rank1_changed == 0
+    # The replay is a full capture transaction: every family's run must be
+    # closed on the way out (a leaked bound run pins a stale lens between
+    # generations and freezes SAE units past their generation).
+    session.assert_runs_closed()
+
+
+def test_joint_logprobs_closes_runs_on_replay_failure():
+    """A mid-replay model failure must still close every bound run — the
+    bind happens inside the replay ``try`` so even a partial-bind failure
+    reaches the teardown."""
+    from saklas.core.joint_logprobs import compute_joint_logprobs
+
+    session: Any = _MockSession()
+
+    def _boom(_input_ids: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("mid-replay model failure")
+
+    session._model = FakeLogitsModel(_boom)
+    session.model = session._model
+    with pytest.raises(RuntimeError, match="mid-replay"):
+        compute_joint_logprobs(session, "a1", "a2")
+    session.assert_runs_closed()
 
 
 def test_compute_joint_logprobs_to_dict_round_trip():

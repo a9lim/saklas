@@ -70,7 +70,11 @@ from saklas.core.model import (
     loaded_model_fingerprint,
     workspace_layer_indices,
 )
-from saklas.core.instruments.types import AGG_TAIL_DEPTH, ReadRequest
+from saklas.core.instruments.types import (
+    AGG_TAIL_DEPTH,
+    ReadRequest,
+    parse_gate_ref,
+)
 from saklas.core.monitor import Monitor
 from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile, load_profile as _load_profile
@@ -3540,6 +3544,18 @@ class SaklasSession:
             "sae": self._sae_instrument,
         }
 
+    def _close_instrument_runs(self) -> None:
+        """Close every family's per-generation run (idempotent teardown).
+
+        Every capture transaction that binds runs must reach this in its
+        ``finally`` — the ordinary generation, the batch fast path, and
+        the joint-logprob replay.  A bound run leaking past its
+        transaction pins a stale lens (suppressing disk refresh between
+        generations) and freezes SAE units past their generation."""
+        self._geometry_instrument.close_run()
+        self._lens_instrument.close_run()
+        self._sae_instrument.close_run()
+
     @property
     def lens(self) -> "LensInstrument":
         """The J-lens instrument — the typed public face of the lens read
@@ -5580,6 +5596,33 @@ class SaklasSession:
         per_token_full_consumer = bool(
             need_per_token and gating_only_probes is None
         )
+        # Close any run a standalone capture path may have left bound
+        # (defensive — the generation finallys are the ordinary teardown):
+        # a stale pin would short-circuit the lens disk refresh below, and
+        # a stale binding would keep serving frozen specs to idle reads.
+        self._close_instrument_runs()
+        # Lens disk refresh + pin BEFORE planning: the ``jlens`` getter's
+        # adoption path rewrites the live probe layer lists when an
+        # external replacement lens landed, so the capture plan AND the
+        # frozen binding must both see the refreshed registry (a plan taken
+        # earlier pairs the new lens with stale layers and KeyErrors in the
+        # transport stack).  Pin demand is the registry boolean, not plan
+        # emptiness — probes whose lens vanished still pin the validated-
+        # missing state so per-token paths never reopen the sidecar.
+        lens_probes_live = self._lens_probes
+        lens_gate_hit = any(
+            parse_gate_ref(key).probe in lens_probes_live
+            for key in (lens_gating_probe_keys or ())
+        )
+        lens_pin_demand = bool(
+            (live_lens_active and self._live_lens is not None)
+            or (
+                lens_probes_live
+                and (final_probe_aggregate or lens_gate_hit)
+            )
+        )
+        pinned_lens = self.jlens if lens_pin_demand else None
+
         geometry_plan = self._geometry_instrument.plan(ReadRequest(
             gate_keys=frozenset(gating_probe_keys or ()),
             per_token_consumers=per_token_full_consumer,
@@ -5607,12 +5650,16 @@ class SaklasSession:
         # specs freeze into the immutable ``InstrumentBinding`` (a concurrent
         # SAE metadata backfill can no longer change what this generation
         # measures), stashes and step memos start fresh, and the lens run
-        # snapshot-pins the resident lens exactly when its plan declared
-        # capture demand — one disk refresh per generation; every token,
-        # gate, and final aggregate below consumes the same resident lens
-        # even if another process switches ``jlens.json`` mid-decode.
+        # carries the pin taken above — every token, gate, and final
+        # aggregate below consumes the same resident lens even if another
+        # process switches ``jlens.json`` mid-decode.
         self._geometry_instrument.bind(geometry_plan)
-        self._lens_instrument.bind(lens_plan, live_active=live_lens_active)
+        self._lens_instrument.bind(
+            lens_plan,
+            live_active=live_lens_active,
+            lens=pinned_lens,
+            pinned=lens_pin_demand,
+        )
         self._sae_instrument.bind(sae_plan, live_active=live_sae_active)
         if widen:
             layer_idxs = list(range(len(self._layers)))
@@ -9221,9 +9268,7 @@ class SaklasSession:
             # Close each family's per-generation run (releases stashes, step
             # memos, and the lens pin; restores the idle passthrough run with
             # default-active flags — finalize consumed the aggregates above).
-            self._geometry_instrument.close_run()
-            self._lens_instrument.close_run()
-            self._sae_instrument.close_run()
+            self._close_instrument_runs()
             # Reset capture state to the default (FULL, non-persistent) so the
             # next gen starts clean (finalize has already consumed the rows by
             # now). Belt-and-suspenders: ``_begin_capture`` resets it at gen start
@@ -9747,13 +9792,15 @@ class SaklasSession:
 
         The forwarders resolve through each family's bound run state
         (frozen spec snapshot + pinned lens), so every row of the batch
-        measures against the same bind-time binding."""
+        measures against the same bind-time binding — the guards consult
+        the binding too, so an ``on_result`` callback detaching a probe
+        cannot change later rows' roster."""
         if not pooled:
             return {}
         out: dict[str, ProbeReading] = {}
-        if self._lens_probes:
+        if self._lens_instrument._measurement_specs():
             out.update(self._score_lens_probes(pooled))
-        if self._sae_probes:
+        if self._sae_instrument._measurement_specs():
             out.update(self._score_sae_probes(pooled))
         return out
 
@@ -9933,11 +9980,15 @@ class SaklasSession:
             has_lens_probes = bool(return_probe_readings and self._lens_probes)
             has_sae_probes = bool(return_probe_readings and self._sae_probes)
             # Batched generation bypasses ``_begin_capture`` but still owns
-            # one generation transaction: plan + bind each family's run.
-            # The lens bind pins one disk-refreshed lens across every row
-            # aggregate (rather than reopening all shards per batch item),
-            # and the bindings freeze probe specs against concurrent
+            # one generation transaction: defensive close, then the lens
+            # disk refresh + pin BEFORE the plans freeze specs (the same
+            # refresh-then-plan ordering ``_begin_capture`` uses), then
+            # plan + bind each family's run.  One pinned lens serves every
+            # row aggregate rather than reopening all shards per batch
+            # item, and the bindings freeze probe specs against concurrent
             # metadata backfills for the whole batch.
+            self._close_instrument_runs()
+            pinned_lens = self.jlens if has_lens_probes else None
             batch_request = ReadRequest(
                 final_aggregate=return_probe_readings,
                 batch=True,
@@ -9946,7 +9997,9 @@ class SaklasSession:
             lens_plan = self._lens_instrument.plan(batch_request)
             sae_plan = self._sae_instrument.plan(batch_request)
             self._geometry_instrument.bind(geometry_plan)
-            self._lens_instrument.bind(lens_plan)
+            self._lens_instrument.bind(
+                lens_plan, lens=pinned_lens, pinned=has_lens_probes,
+            )
             self._sae_instrument.bind(sae_plan)
             capture_probe_aggregates = bool(
                 probe_names or has_lens_probes or has_sae_probes
@@ -10100,9 +10153,7 @@ class SaklasSession:
                 self._active_gen_reservation = None
                 self._last_token_probe_payload = None
                 self._last_token_probe_readings = None
-                self._geometry_instrument.close_run()
-                self._lens_instrument.close_run()
-                self._sae_instrument.close_run()
+                self._close_instrument_runs()
                 self._capture_state = CaptureState()
                 self._compiled_clean_eligible = False
                 self._incremental_readings = []

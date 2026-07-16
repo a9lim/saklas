@@ -584,6 +584,48 @@ def test_sae_bind_resolves_unit_from_meta_cache() -> None:
     assert values["sae/2"] == pytest.approx(5.0 / 10.0)
 
 
+def test_detach_during_bound_generation_keeps_aggregate_roster() -> None:
+    """Mutations apply next generation: a probe detached mid-generation
+    (e.g. the synchronous DELETE route, which takes no generation lock)
+    stays in the bound generation's aggregate roster; the next bind sees
+    the removal."""
+    from saklas.core.instruments.types import InstrumentPlan
+
+    session = _session()
+    inst = session._sae_instrument
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    inst.bind(InstrumentPlan(family="sae"))
+    pooled = session._capture.latest_per_layer()
+
+    del inst.probes["sae/1"]  # the un-locked detach lands mid-generation
+
+    readings = inst.score_aggregate([1], pooled=pooled)
+    assert "sae/1" in readings  # frozen roster still measures it
+
+    inst.close_run()
+    readings = inst.score_aggregate([1], pooled=pooled)
+    assert readings == {}  # the removal applies at the next boundary
+
+
+def test_idle_observe_never_memoizes_stale_readings() -> None:
+    """The idle passthrough run persists indefinitely, so ``observe`` must
+    not key a memo on ``step_id`` alone — a repeated step with different
+    hidden states returns fresh readings."""
+    session = _session()
+    inst = session._sae_instrument
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    run = inst.current_run
+    assert run.bound is False
+    first = run.observe(0, {1: torch.tensor([0.2, 3.0, 5.0, 1.0])})
+    second = run.observe(0, {1: torch.tensor([0.2, 8.0, 5.0, 1.0])})
+    assert first["sae/1"].coords == (3.0,)
+    assert second["sae/1"].coords == (8.0,)
+
+
 @pytest.mark.parametrize("max_act", [float("nan"), float("inf")])
 def test_sae_feature_meta_rejects_nonfinite_scale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, max_act: float,

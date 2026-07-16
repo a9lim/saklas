@@ -110,6 +110,7 @@ class _StubSession:
     )
     _generation_jlens = SaklasSession._generation_jlens
     _generation_jlens_active = SaklasSession._generation_jlens_active
+    _close_instrument_runs = SaklasSession._close_instrument_runs
 
     def __init__(self, *, n_layers: int = 3) -> None:
         from saklas.core.instruments.geometry import GeometryInstrument
@@ -582,6 +583,70 @@ def test_generation_boundary_refreshes_external_lens_once() -> None:
     assert session_a._generation_jlens is None
     assert session_a._jlens is None
     assert session_a._lens_probes["jlens/example"]["layers"] == []
+
+
+def test_external_lens_replacement_plans_and_freezes_refreshed_layers() -> None:
+    """The refresh-then-plan boundary (sol's slice-B finding 2): an external
+    replacement lens on a DISJOINT layer set must be adopted before the
+    capture plan and the frozen binding are taken — pairing the new lens
+    with stale layers KeyErrors in the transport stack."""
+    session_a = _StubSession()
+    session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+
+    # Another process replaces the artifact with a disjoint-layer fit.
+    corpus_b = [
+        f"replacement disjoint prompt {i} with enough content" for i in range(4)
+    ]
+    disk_b = _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
+    assert list(disk_b.source_layers) == [1]
+
+    attached_layers: list[int] = []
+
+    class _Capture:
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, indices: list[int]) -> None:
+            attached_layers.extend(indices)
+
+        def set_aggregate_tail(self, _depth: int) -> None:
+            pass
+
+    session_a._capture = _Capture()
+    session_a._capture_buffers = {}
+    session_a._compiled_clean_eligible = False
+    session_a._steering_uses_compiled_offsets = False
+    session_a._steering = SimpleNamespace(all_fast_path=lambda: True)
+    session_a._monitor = SimpleNamespace(
+        probe_names=[],
+        enable_curved_warm=lambda _enabled: None,
+    )
+    session_a._live_sae = None
+    session_a._sae_probes = {}
+
+    ok = SaklasSession._begin_capture(
+        cast(Any, session_a), final_probe_aggregate=True,
+    )
+
+    assert ok is True
+    # The adoption rewrote the live registry BEFORE planning/freezing:
+    # the capture plan, the frozen binding, and the pinned lens all agree
+    # on the replacement's layer set.
+    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+    assert attached_layers == [1]
+    run = session_a._lens_instrument.current_run
+    assert run.pinned is True
+    assert list(run.binding.specs["jlens/example"]["layers"]) == [1]
+    assert list(run.lens.source_layers) == [1]
+    # And the pinned lens can actually score the frozen band — the stale
+    # pairing raised KeyError(0) out of the transport stack.
+    hidden_dim = int(session_a._model.lm_head.weight.shape[1])
+    hidden = {1: torch.randn(hidden_dim)}
+    readings = session_a._lens_instrument.score_probes(hidden)
+    assert "jlens/example" in readings
 
 
 def test_generation_lens_snapshot_avoids_per_token_disk_validation(

@@ -86,7 +86,11 @@ class SaeRun:
         self, step_id: int, hidden: dict[int, torch.Tensor],
     ) -> dict[str, "ProbeReading"]:
         """Readings for every attached probe at this step, memoized by
-        ``step_id`` — gate and display callers share one computation."""
+        ``step_id`` — gate and display callers share one computation.  An
+        idle run never memoizes (it persists indefinitely; a repeated
+        ``step_id`` with different hidden states must not read stale)."""
+        if not self.bound:
+            return self._instrument.score_probes(hidden)
         if self._memo_step == step_id and self._memo_readings is not None:
             return self._memo_readings
         readings = self._instrument.score_probes(hidden)
@@ -200,9 +204,15 @@ class SaeInstrument:
                     if has_meta_cache else None
                 )
             specs[name] = frozen
+        backend = getattr(session, "_sae_backend", None)
         run = SaeRun(
             self,
-            InstrumentBinding(family=self.family, specs=specs),
+            InstrumentBinding(
+                family=self.family,
+                source=getattr(backend, "release", None),
+                fingerprint=getattr(backend, "revision", None),
+                specs=specs,
+            ),
             active=live_active,
             bound=True,
         )
@@ -474,7 +484,10 @@ class SaeInstrument:
     ) -> dict[str, "ProbeReading"]:
         """End-of-gen aggregate pooled at the last content token."""
         session = self._session
-        if not self.probes or not generated_ids:
+        # Binding-authoritative guard: a probe detached mid-generation
+        # stays in this generation's aggregate roster (mutations apply
+        # next generation).
+        if not self._measurement_specs() or not generated_ids:
             return {}
         if pooled is None:
             agg_fwd = session._aggregate_forward_index(generated_ids)
@@ -555,7 +568,7 @@ class SaeInstrument:
         }
         if stashed_raw_by_fid:
             raw_by_fid = {**stashed_raw_by_fid, **raw_by_fid}
-        if self.probes:
+        if self._measurement_specs():
             self.last_step_readings = self.score_probes(
                 activations=acts,
                 raw_by_fid=raw_by_fid,
@@ -607,7 +620,7 @@ class SaeInstrument:
         }
         readings = self.score_probes(
             activations=activations, raw_by_fid=raw_by_fid,
-        ) if self.probes else {}
+        ) if self._measurement_specs() else {}
         rows = [
             (
                 int(fid),

@@ -516,8 +516,11 @@ def _replay_branch_logprobs(
 
     with steering_cm:
         ctx.reset()
-        session._begin_capture(widen=False)
         try:
+            # Inside the try: ``_begin_capture`` binds every family's
+            # per-generation run, so a partial-bind failure must still
+            # reach the teardown below.
+            session._begin_capture(widen=False)
             needs_gating = session._steering_needs_probe_gating()
             gating_callback = (
                 session._build_gating_score_callback() if needs_gating else None
@@ -614,6 +617,11 @@ def _replay_branch_logprobs(
                     _advance_current_input(next_token)
         finally:
             session._end_capture()
+            # The replay is a full capture transaction: without this, the
+            # bound runs leak past the request — the stale lens pin
+            # suppresses disk refresh between generations and the SAE
+            # binding keeps serving frozen units to idle reads.
+            session._close_instrument_runs()
 
     return row_logps if vocab_size is not None else {}
 

@@ -69,7 +69,11 @@ class GeometryRun:
         self, step_id: int, hidden: dict[int, torch.Tensor],
     ) -> dict[str, Any]:
         """Full whitened readings for the roster at this step, memoized by
-        ``step_id``."""
+        ``step_id``.  An idle run never memoizes (it persists
+        indefinitely; a repeated ``step_id`` with different hidden states
+        must not read stale)."""
+        if not self.bound:
+            return self._instrument._session._monitor.score_single_token(hidden)
         if self._memo_step == step_id and self._memo_readings is not None:
             return self._memo_readings
         readings = self._instrument._session._monitor.score_single_token(hidden)

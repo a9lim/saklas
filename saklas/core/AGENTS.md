@@ -1023,17 +1023,43 @@ sharing). **Formal runs:** `bind(plan)` freezes an `InstrumentBinding`
 (spec snapshot; the SAE binding resolves `max_act` at bind, so the
 un-locked Neuronpedia backfill can no longer change a running
 generation's strength unit — sol's race) and returns the family's
-run (`LensRun`/`SaeRun`/`GeometryRun`), which owns all generation-scoped
-state: step stashes, display readings, active flags, the lens
-disk-identity pin (taken inside `bind` with the reset-then-read ordering
-the `jlens` getter's pin short-circuit requires), and the `observe`
-step-memo. Instruments keep the historical state names as delegating
-properties over `current_run` (an idle passthrough run backs
-out-of-generation reads — measurement specs come from
-`_measurement_specs()`: the frozen binding when bound, the live registry
-when idle). The generation finallys call `close_run()`; per-step
-gate→display matrix reuse remains the stash mechanism inside the workers,
-run-scoped by construction.
+run (`LensRun`/`SaeRun`/`GeometryRun`), which owns the instrument-side
+generation-scoped state: step stashes, display readings, active flags,
+the lens disk-identity pin, and the `observe` step-memo (memoized only
+while bound — the idle run persists indefinitely, so it never memoizes).
+Geometry's curved warm feet stay in the Monitor engine and the four
+capture modes stay session/HiddenCapture wiring. Instruments keep the
+historical state names as delegating properties over `current_run` (an
+idle passthrough run backs out-of-generation reads — measurement specs
+come from `_measurement_specs()`: the frozen binding when bound, the
+live registry when idle).
+
+Post-review hardening (sol, gaslamp thread `instrument-protocol`):
+
+- **Ordering contract** — `_begin_capture` (and the batch preamble)
+  defensively `_close_instrument_runs()`, then takes the lens disk
+  refresh + pin (`session.jlens`, whose adoption path REWRITES live
+  probe layer lists), and only then plans/binds — a plan or freeze taken
+  before the refresh pairs the new lens with stale layers and KeyErrors
+  in the transport stack. Pin demand is the registry boolean, not plan
+  emptiness (probes whose lens vanished still pin the validated-missing
+  state).
+- **Every capture transaction closes its runs** — the generation finallys,
+  the batch finally, and the joint-logprob replay all reach
+  `_close_instrument_runs()`; `close_run` is protocol surface (the
+  bind/close asymmetry is what let the replay leak bound runs, pinning a
+  stale lens between generations).
+- **Mutations apply next generation** — lens/SAE measurement guards
+  (score/aggregate/live/authored/batch-row) consult
+  `_measurement_specs()`, so an un-locked mid-generation detach (the
+  synchronous DELETE route) cannot change a bound generation's roster.
+  Geometry's roster remains live-Monitor-backed (attach/detach are
+  `_model_exclusive`-guarded; a served detach mid-generation is a known,
+  pre-existing narrower exposure).
+
+Per-step gate→display matrix reuse remains the stash mechanism inside
+the workers, run-scoped by construction; `observe(step_id)` is
+protocol-complete but the hot paths are not yet routed through it.
 
 ## triggers.py
 

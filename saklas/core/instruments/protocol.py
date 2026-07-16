@@ -84,6 +84,15 @@ class Instrument(Protocol):
 
     def bind(self, plan: InstrumentPlan) -> "InstrumentRun": ...
 
+    def close_run(self) -> None:
+        """Close the current run and restore an idle passthrough run.
+
+        Part of the protocol because every ``bind`` needs a matching
+        teardown the session can invoke uniformly — the bind/close
+        asymmetry is what let a standalone capture path leak a bound
+        run past its generation."""
+        ...
+
 
 @runtime_checkable
 class InstrumentRun(Protocol):

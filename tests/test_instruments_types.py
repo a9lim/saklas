@@ -223,5 +223,10 @@ def test_instruments_and_runs_satisfy_the_protocol() -> None:
         assert isinstance(run, InstrumentRun), family
         assert run.bound is False
         assert run.binding.family == family
+        # close_run is protocol surface (the bind/close asymmetry is what
+        # let a standalone capture path leak a bound run), and it must
+        # restore an idle passthrough run.
+        instrument.close_run()
+        assert instrument.current_run.bound is False
     assert session.lens.family == "lens"
     assert session.sae.family == "sae"
