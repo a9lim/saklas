@@ -34,8 +34,23 @@ those registrars import):
   `max_act` strength unit)
 - `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
-`server/sse.py`, `server/streaming.py`, and `server/ws_events.py` are the shared
-SSE / WS plumbing. `server/streaming.py` owns the end-of-stream derivation shared by
+`server/sse.py`, `server/streaming.py`, `server/ws_events.py`, and
+`server/background_job.py` are the shared SSE / WS / polled-job plumbing.
+`server/background_job.py::BackgroundJob` is the polled-job counterpart to
+`sse.progress_sse_response`: it centralizes the scaffolding the four background
+routes share (J-lens `fit` + `fetch`, SAE `train` + `load`) — the mutable
+`app.state.<name>` status dict, the `app.state.<name>_task` handle, the optional
+`app.state.<name>_cancel` `threading.Event`, the group mutual-exclusion 409
+(`share_group` / `refuse_if_busy` — lens fetch XOR fit, sae load XOR train), the
+start/status/cancel triad, `launch` (guaranteed `running`/`finished_at`
+finalization), and shutdown `stop`. Those `app.state` attributes remain the live
+source of truth (the job reads/writes through `app.state`, never a cached copy),
+so shutdown hooks and callers that reassign them are honored. `make_progress_hook`
+builds the regex progress callback (each job keeps its own vocabulary — prompts
+for the fit, tokens for the train) and `scrub_job_error` carries the same
+error-scrubbing discipline as the SSE worker onto the polled surface (typed
+`SaklasError.user_message()`, else the exception type only; a cooperative-cancel
+settles to `cancelled`). `server/streaming.py` owns the end-of-stream derivation shared by
 all three streaming protocols — `stream_finalizer(session, result)` yields
 `(finish_reason, usage, probe_agg)`, and `probe_reading_aggregate(session, result)` /
 `_usage_dict(result)` are its result-parameterized parts (the SSE, NDJSON, and WS
@@ -135,7 +150,10 @@ the full traceback server-side and sends the generic `{"message": "<op> failed",
 `server/sse.py::progress_sse_response` is the shared queue-driven SSE worker — it
 owns the progress/done/error frame loop, the `call_soon_threadsafe` bridge,
 cancellation cleanup, and the generic catch-all; route modules supply only the job
-body + any typed safe-message formatter.
+body + any typed safe-message formatter. The **polled** background jobs (J-lens
+`fit` / `fetch`, SAE `train` / `load`) share the identical discipline via
+`server/background_job.py::scrub_job_error`, which writes the scrubbed
+message/error into the job's status dict instead of an SSE frame.
 
 ### session_routes.py
 
@@ -351,6 +369,9 @@ evicts derived lens state, and auto-enables its all-fitted-layer live readout.
 `POST/GET .../lens/fetch` starts/polls an official Neuronpedia fetch: provider
 bytes stay in the Hugging Face cache, the worker publishes only a Saklas binding,
 then activates it under the lock. Fetch and local fit are mutually exclusive.
+Both are `background_job.BackgroundJob`s (`app.state.lens_fit` /
+`app.state.lens_fetch`, shared 409 group); only the fit is cooperatively
+cancellable, and `_stop_lens_fit` drains both at shutdown.
 
 `POST /sessions/{id}/lens/token/validate` body `{word}` — a read-only tokenizer
 check for the dashboard's J-lens STEER and PROBE add forms. Returns
@@ -423,7 +444,10 @@ readout. `POST/GET/DELETE .../sae/train` starts, polls, and
 cooperatively cancels native local training over the default FineWeb-Edu stream;
 status carries token progress. A successful train makes the local source
 resident and enables live SAE discovery. Provider load and local train are
-mutually exclusive.
+mutually exclusive — both are `background_job.BackgroundJob`s
+(`app.state.sae_load` / `app.state.sae_train`, shared 409 group); only the train
+is cooperatively cancellable (`_stop_sae_train` drains it at shutdown), the load's
+DELETE being the unload.
 
 ### traits_routes.py — live traits SSE
 

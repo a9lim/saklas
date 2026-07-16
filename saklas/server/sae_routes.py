@@ -5,9 +5,6 @@ import asyncio
 import logging
 import math
 import re
-import threading
-import time
-from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import Field
@@ -15,6 +12,11 @@ from pydantic import Field
 from saklas.core.errors import SaklasError
 from saklas.core.loom import InvalidNodeOperationError, UnknownNodeError
 from saklas.server.app import acquire_session_lock
+from saklas.server.background_job import (
+    BackgroundJob,
+    make_progress_hook,
+    scrub_job_error,
+)
 from saklas.server.native_common import NativeRequest, resolve_session_id
 
 log = logging.getLogger(__name__)
@@ -56,42 +58,50 @@ class SaeTrainRequest(NativeRequest):
 
 def register_sae_routes(app: FastAPI) -> None:
     session = app.state.session
-    app.state.sae_load = {
-        "running": False,
-        "release": None,
-        "message": None,
-        "error": None,
-        "started_at": None,
-        "finished_at": None,
-        "info": None,
-    }
-    app.state.sae_load_task = None
-    app.state.sae_train = {
-        "running": False,
-        "name": None,
-        "tokens_done": 0,
-        "tokens_total": 0,
-        "message": None,
-        "error": None,
-        "started_at": None,
-        "finished_at": None,
-        "info": None,
-    }
-    app.state.sae_train_task = None
-    app.state.sae_train_cancel = None
+
+    # An SAE artifact operation — a provider load or a local train — runs one at
+    # a time; the two jobs guard each other (load XOR train).  Only the train is
+    # cooperatively cancellable (a running estimator loop); the provider load has
+    # no cancel event and no DELETE-cancel (its DELETE is the unload).
+    _SAE_BUSY = "an SAE artifact operation is already running"
+    sae_load_job = BackgroundJob(
+        app,
+        "sae_load",
+        {
+            "running": False,
+            "release": None,
+            "message": None,
+            "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "info": None,
+        },
+        busy_message=_SAE_BUSY,
+    )
+    sae_train_job = BackgroundJob(
+        app,
+        "sae_train",
+        {
+            "running": False,
+            "name": None,
+            "tokens_done": 0,
+            "tokens_total": 0,
+            "message": None,
+            "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "info": None,
+        },
+        busy_message=_SAE_BUSY,
+        cancellable=True,
+        not_running_message="no SAE training is running",
+    )
+    sae_load_job.share_group(sae_train_job)
 
     async def _stop_sae_train() -> None:
-        event = app.state.sae_train_cancel
-        task = app.state.sae_train_task
-        if event is not None:
-            event.set()
-        if task is not None and not task.done():
-            await task
+        await sae_train_job.stop()
 
     app.router.on_shutdown.append(_stop_sae_train)
-
-    def _status() -> dict[str, Any]:
-        return dict(app.state.sae_load)
 
     @app.get("/saklas/v1/sessions/{session_id}/sae/releases")
     async def sae_releases(session_id: str):
@@ -122,8 +132,7 @@ def register_sae_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/sae/load", status_code=202)
     async def sae_load(session_id: str, body: SaeLoadRequest):
         resolve_session_id(session_id)
-        if app.state.sae_load["running"] or app.state.sae_train["running"]:
-            raise HTTPException(409, "an SAE artifact operation is already running")
+        sae_load_job.refuse_if_busy()
         source = body.release.strip()
         release = (
             source[len("saelens:"):]
@@ -132,116 +141,87 @@ def register_sae_routes(app: FastAPI) -> None:
         )
         if not release:
             raise HTTPException(400, "SAE source must not be empty")
-        state = app.state.sae_load
-        state.update({
-            "running": True,
-            "release": source,
-            "message": f"loading {source}",
-            "error": None,
-            "started_at": time.time(),
-            "finished_at": None,
-            "info": None,
-        })
+        state = sae_load_job.state
+        sae_load_job.start(
+            message=f"loading {source}", release=source, info=None,
+        )
 
-        async def worker() -> None:
-            try:
-                async with acquire_session_lock(session) as acquired:
-                    if not acquired:
-                        raise RuntimeError("session locked")
-                    info = await asyncio.to_thread(
-                        session.load_sae, release, layer=body.layer,
-                    )
-                    await asyncio.to_thread(session.enable_live_sae, top_k=12)
-                state["info"] = info
-                state["message"] = (
-                    f"loaded {source} · live at L{info.get('layer')} "
-                    f"({info.get('width')} features)"
+        async def _load_job() -> None:
+            async with acquire_session_lock(session) as acquired:
+                if not acquired:
+                    raise RuntimeError("session locked")
+                info = await asyncio.to_thread(
+                    session.load_sae, release, layer=body.layer,
                 )
-            except Exception as exc:  # background status owns translation
-                if isinstance(exc, SaklasError):
-                    _code, message = exc.user_message()
-                else:
-                    message = str(exc)
-                state["error"] = message
-                state["message"] = "load failed"
-            finally:
-                state["running"] = False
-                state["finished_at"] = time.time()
+                await asyncio.to_thread(session.enable_live_sae, top_k=12)
+            state["info"] = info
+            state["message"] = (
+                f"loaded {source} · live at L{info.get('layer')} "
+                f"({info.get('width')} features)"
+            )
 
-        app.state.sae_load_task = asyncio.create_task(worker())
-        return _status()
+        def _load_on_error(exc: BaseException) -> None:
+            # Background status owns translation: a typed error surfaces its
+            # safe message, anything else its ``str`` (no server logging here).
+            if isinstance(exc, SaklasError):
+                _code, message = exc.user_message()
+            else:
+                message = str(exc)
+            state["error"] = message
+            state["message"] = "load failed"
 
-    def _train_status() -> dict[str, Any]:
-        return dict(app.state.sae_train)
+        sae_load_job.launch(_load_job, _load_on_error)
+        return sae_load_job.status()
 
     async def _sae_train_job(body: SaeTrainRequest, layer: int) -> None:
-        from saklas.core.sae_training import SaeTrainingCancelled
         from saklas.io.lens import stream_default_lens_corpus
 
-        state = app.state.sae_train
+        state = sae_train_job.state
+        n_docs = max(1, math.ceil(body.tokens / body.seq_len))
+        state["message"] = f"streaming {n_docs:,} corpus documents…"
+        docs, spec = await asyncio.to_thread(
+            stream_default_lens_corpus, n_docs,
+        )
+        on_progress = make_progress_hook(
+            state, _TRAIN_PROGRESS_RE,
+            done_field="tokens_done", total_field="tokens_total",
+        )
+        result = await asyncio.to_thread(
+            session.train_sae,
+            body.name,
+            docs,
+            layer=layer,
+            corpus_spec=spec,
+            tokens=body.tokens,
+            seq_len=body.seq_len,
+            batch_size=body.batch_size,
+            d_sae=body.width,
+            expansion=body.expansion,
+            learning_rate=body.learning_rate,
+            l1_coefficient=body.l1,
+            dead_feature_threshold=body.dead_threshold,
+            seed=body.seed,
+            force=body.force,
+            on_progress=on_progress,
+            cancel_event=sae_train_job.cancel_event,
+        )
+        state["info"] = result["runtime"]
+        state["tokens_done"] = int(result["metrics"]["tokens_trained"])
+        state["message"] = f"active: {result['source']}"
+        state["error"] = None
         try:
-            n_docs = max(1, math.ceil(body.tokens / body.seq_len))
-            state["message"] = f"streaming {n_docs:,} corpus documents…"
-            docs, spec = await asyncio.to_thread(
-                stream_default_lens_corpus, n_docs,
-            )
-
-            def on_progress(message: str) -> None:
-                match = _TRAIN_PROGRESS_RE.search(message)
-                if match is not None:
-                    state["tokens_done"] = int(match.group(1).replace(",", ""))
-                    state["tokens_total"] = int(match.group(2).replace(",", ""))
-                state["message"] = message
-
-            result = await asyncio.to_thread(
-                session.train_sae,
-                body.name,
-                docs,
-                layer=layer,
-                corpus_spec=spec,
-                tokens=body.tokens,
-                seq_len=body.seq_len,
-                batch_size=body.batch_size,
-                d_sae=body.width,
-                expansion=body.expansion,
-                learning_rate=body.learning_rate,
-                l1_coefficient=body.l1,
-                dead_feature_threshold=body.dead_threshold,
-                seed=body.seed,
-                force=body.force,
-                on_progress=on_progress,
-                cancel_event=app.state.sae_train_cancel,
-            )
-            state["info"] = result["runtime"]
-            state["tokens_done"] = int(result["metrics"]["tokens_trained"])
-            state["message"] = f"active: {result['source']}"
-            state["error"] = None
-            try:
-                async with acquire_session_lock(session) as acquired:
-                    if acquired:
-                        await asyncio.to_thread(session.enable_live_sae, top_k=12)
-            except Exception:
-                log.exception("could not auto-enable live SAE after training")
-        except SaeTrainingCancelled:
-            state["message"] = "cancelled"
-            state["error"] = None
-        except SaklasError as exc:
-            _code, text = exc.user_message()
-            state["message"] = "training failed"
-            state["error"] = text
-        except Exception as exc:  # noqa: BLE001 - scrubbed, logged server-side
-            log.exception("SAE training failed")
-            state["message"] = "training failed"
-            state["error"] = f"SAE training failed ({type(exc).__name__})"
-        finally:
-            state["running"] = False
-            state["finished_at"] = time.time()
+            async with acquire_session_lock(session) as acquired:
+                if acquired:
+                    await asyncio.to_thread(session.enable_live_sae, top_k=12)
+        except Exception:
+            log.exception("could not auto-enable live SAE after training")
 
     @app.post("/saklas/v1/sessions/{session_id}/sae/train", status_code=202)
     async def sae_train_start(session_id: str, body: SaeTrainRequest):
+        from saklas.core.sae_training import SaeTrainingCancelled
+
         resolve_session_id(session_id)
-        if app.state.sae_train["running"] or app.state.sae_load["running"]:
-            raise HTTPException(409, "an SAE artifact operation is already running")
+        sae_train_job.refuse_if_busy()
         layer = body.layer
         if layer is None:
             layer = round(0.65 * max(len(session.layers) - 1, 0))
@@ -249,41 +229,40 @@ def register_sae_routes(app: FastAPI) -> None:
             raise HTTPException(
                 400, f"SAE layer {layer} is outside model layers 0..{len(session.layers) - 1}",
             )
-        app.state.sae_train.update({
-            "running": True,
-            "name": body.name,
-            "tokens_done": 0,
-            "tokens_total": body.tokens,
-            "message": "starting…",
-            "error": None,
-            "started_at": time.time(),
-            "finished_at": None,
-            "info": None,
-        })
-        app.state.sae_train_cancel = threading.Event()
-        app.state.sae_train_task = asyncio.create_task(
-            _sae_train_job(body, layer),
+        sae_train_job.start(
+            message="starting…",
+            name=body.name,
+            tokens_done=0,
+            tokens_total=body.tokens,
+            info=None,
         )
-        return _train_status()
+
+        def _on_error(exc: BaseException) -> None:
+            scrub_job_error(
+                sae_train_job.state, exc,
+                cancel_exc=SaeTrainingCancelled,
+                op_label="SAE training",
+                logger=log,
+                failure_message="training failed",
+            )
+
+        sae_train_job.launch(lambda: _sae_train_job(body, layer), _on_error)
+        return sae_train_job.status()
 
     @app.get("/saklas/v1/sessions/{session_id}/sae/train")
     async def sae_train_status(session_id: str):
         resolve_session_id(session_id)
-        return _train_status()
+        return sae_train_job.status()
 
     @app.delete("/saklas/v1/sessions/{session_id}/sae/train", status_code=202)
     async def sae_train_cancel(session_id: str):
         resolve_session_id(session_id)
-        if not app.state.sae_train["running"] or app.state.sae_train_cancel is None:
-            raise HTTPException(409, "no SAE training is running")
-        app.state.sae_train_cancel.set()
-        app.state.sae_train["message"] = "cancelling…"
-        return _train_status()
+        return sae_train_job.request_cancel()
 
     @app.get("/saklas/v1/sessions/{session_id}/sae/load")
     def sae_load_status(session_id: str):
         resolve_session_id(session_id)
-        return _status()
+        return sae_load_job.status()
 
     @app.delete("/saklas/v1/sessions/{session_id}/sae/load")
     async def sae_unload(session_id: str):

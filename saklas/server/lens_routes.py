@@ -31,11 +31,8 @@ sidecar/payload and live-weight compatibility check, never the ~GB fp32 lens loa
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 import logging
 import re
-import threading
-import time
 
 from fastapi import FastAPI, HTTPException
 from pydantic import Field
@@ -44,6 +41,11 @@ from saklas.core.errors import SaklasError
 from saklas.core.jlens import LensNotFittedError, resolve_word_token
 from saklas.core.loom import InvalidNodeOperationError, UnknownNodeError
 from saklas.server.app import acquire_session_lock
+from saklas.server.background_job import (
+    BackgroundJob,
+    make_progress_hook,
+    scrub_job_error,
+)
 from saklas.server.native_common import NativeRequest, resolve_session_id
 
 log = logging.getLogger(__name__)
@@ -114,44 +116,47 @@ def register_lens_routes(app: FastAPI) -> None:
     """Mount the Jacobian-lens read + fit routes."""
     session = app.state.session
 
-    # One background fit at a time; the status dict is the polled surface.
-    # Plain-dict mutation from the worker thread's ``on_progress`` is safe
-    # under the GIL (single-writer, readers only format it).
-    app.state.lens_fit = {
-        "running": False,
-        "prompts_done": 0,
-        "prompts_total": 0,
-        "message": None,
-        "error": None,
-        "started_at": None,
-        "finished_at": None,
-        "live_layers": None,
-    }
-    app.state.lens_fit_task = None
-    app.state.lens_fit_cancel = None
-    app.state.lens_fetch = {
-        "running": False,
-        "source": None,
-        "message": None,
-        "error": None,
-        "started_at": None,
-        "finished_at": None,
-        "live_layers": None,
-    }
-    app.state.lens_fetch_task = None
+    # A J-lens artifact operation — a background fit or an official fetch — runs
+    # one at a time; the two jobs guard each other (fetch XOR fit).  The status
+    # dicts are the polled surfaces; plain-dict mutation from the worker thread's
+    # ``on_progress`` is safe under the GIL (single-writer, readers only format).
+    _LENS_BUSY = "a J-lens artifact operation is already running"
+    lens_fit_job = BackgroundJob(
+        app,
+        "lens_fit",
+        {
+            "running": False,
+            "prompts_done": 0,
+            "prompts_total": 0,
+            "message": None,
+            "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "live_layers": None,
+        },
+        busy_message=_LENS_BUSY,
+        cancellable=True,
+        not_running_message="no lens fit is running",
+    )
+    lens_fetch_job = BackgroundJob(
+        app,
+        "lens_fetch",
+        {
+            "running": False,
+            "source": None,
+            "message": None,
+            "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "live_layers": None,
+        },
+        busy_message=_LENS_BUSY,
+    )
+    lens_fit_job.share_group(lens_fetch_job)
 
     async def _stop_lens_fit() -> None:
-        event = app.state.lens_fit_cancel
-        task = app.state.lens_fit_task
-        if event is not None:
-            event.set()
-        if task is not None and not task.done():
-            await task
-        fetch_task = app.state.lens_fetch_task
-        if fetch_task is not None and not fetch_task.done():
-            fetch_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await fetch_task
+        await lens_fit_job.stop()
+        await lens_fetch_job.stop()
 
     app.router.on_shutdown.append(_stop_lens_fit)
 
@@ -180,8 +185,7 @@ def register_lens_routes(app: FastAPI) -> None:
     async def lens_use(session_id: str, body: LensUseRequest):
         """Select an already fitted/fetched source and turn its readout on."""
         resolve_session_id(session_id)
-        if app.state.lens_fit["running"] or app.state.lens_fetch["running"]:
-            raise HTTPException(409, "a J-lens artifact operation is already running")
+        lens_fit_job.refuse_if_busy()
         try:
             layers = await _activate_lens_source(body.source)
         except FileNotFoundError as exc:
@@ -197,42 +201,38 @@ def register_lens_routes(app: FastAPI) -> None:
             raise HTTPException(503, str(exc)) from exc
         return {"source": body.source, "live_layers": layers}
 
-    def _fetch_status_payload() -> dict[str, object]:
-        return dict(app.state.lens_fetch)
-
     async def _lens_fetch_job(body: LensFetchRequest) -> None:
         from saklas.io.lens_sources import fetch_neuronpedia_lens
 
-        st = app.state.lens_fetch
-        try:
-            if body.source != "neuronpedia":
-                raise ValueError("J-lens source must be neuronpedia")
-            st["message"] = "fetching official lens into the Hugging Face cache…"
-            binding = await asyncio.to_thread(
-                fetch_neuronpedia_lens,
-                session.model_id,
-                force=body.force,
-                activate=False,
-            )
-            st["message"] = "activating…"
-            st["live_layers"] = await _activate_lens_source(binding.name)
-            st["message"] = (
-                f"active: {binding.name} ({len(binding.source_layers)} layers)"
-            )
-            st["error"] = None
-        except FileNotFoundError as exc:
+        st = lens_fetch_job.state
+        if body.source != "neuronpedia":
+            raise ValueError("J-lens source must be neuronpedia")
+        st["message"] = "fetching official lens into the Hugging Face cache…"
+        binding = await asyncio.to_thread(
+            fetch_neuronpedia_lens,
+            session.model_id,
+            force=body.force,
+            activate=False,
+        )
+        st["message"] = "activating…"
+        st["live_layers"] = await _activate_lens_source(binding.name)
+        st["message"] = (
+            f"active: {binding.name} ({len(binding.source_layers)} layers)"
+        )
+        st["error"] = None
+
+    def _fetch_on_error(exc: BaseException) -> None:
+        st = lens_fetch_job.state
+        if isinstance(exc, FileNotFoundError):
             st["error"] = str(exc)
             st["message"] = "official lens unavailable"
-        except (ValueError, RuntimeError) as exc:
+        elif isinstance(exc, (ValueError, RuntimeError)):
             st["error"] = str(exc)
             st["message"] = "fetch failed"
-        except Exception as exc:  # noqa: BLE001 - scrubbed, logged server-side
+        else:
             log.exception("J-lens fetch failed")
             st["error"] = f"J-lens fetch failed ({type(exc).__name__})"
             st["message"] = "fetch failed"
-        finally:
-            st["running"] = False
-            st["finished_at"] = time.time()
 
     @app.post("/saklas/v1/sessions/{session_id}/lens/fetch", status_code=202)
     async def lens_fetch_start(
@@ -240,24 +240,17 @@ def register_lens_routes(app: FastAPI) -> None:
     ):
         resolve_session_id(session_id)
         body = body or LensFetchRequest()
-        if app.state.lens_fit["running"] or app.state.lens_fetch["running"]:
-            raise HTTPException(409, "a J-lens artifact operation is already running")
-        app.state.lens_fetch.update({
-            "running": True,
-            "source": body.source,
-            "message": "starting…",
-            "error": None,
-            "started_at": time.time(),
-            "finished_at": None,
-            "live_layers": None,
-        })
-        app.state.lens_fetch_task = asyncio.create_task(_lens_fetch_job(body))
-        return _fetch_status_payload()
+        lens_fetch_job.refuse_if_busy()
+        lens_fetch_job.start(
+            message="starting…", source=body.source, live_layers=None,
+        )
+        lens_fetch_job.launch(lambda: _lens_fetch_job(body), _fetch_on_error)
+        return lens_fetch_job.status()
 
     @app.get("/saklas/v1/sessions/{session_id}/lens/fetch")
     async def lens_fetch_status(session_id: str):
         resolve_session_id(session_id)
-        return _fetch_status_payload()
+        return lens_fetch_job.status()
 
     @app.post("/saklas/v1/sessions/{session_id}/lens/token/validate")
     def validate_lens_token(
@@ -389,81 +382,50 @@ def register_lens_routes(app: FastAPI) -> None:
                 raise HTTPException(status, text) from e
         return {"enabled": True, "layers": resolved}
 
-    def _fit_status_payload() -> dict[str, object]:
-        st = app.state.lens_fit
-        return {
-            "running": st["running"],
-            "prompts_done": st["prompts_done"],
-            "prompts_total": st["prompts_total"],
-            "message": st["message"],
-            "error": st["error"],
-            "started_at": st["started_at"],
-            "finished_at": st["finished_at"],
-            "live_layers": st["live_layers"],
-        }
-
     async def _lens_fit_job(
         body: LensFitRequest, source_layers: "list[int] | str",
     ) -> None:
         """The one background fit: stream corpus → fit → live-on.
 
-        Error frames follow the SSE scrubbing discipline — typed saklas
-        errors surface their ``user_message()``, anything else logs the
-        traceback server-side and reports only the exception type.
+        Error frames follow the scrubbing discipline in ``scrub_job_error`` —
+        typed saklas errors surface their ``user_message()``, anything else logs
+        the traceback server-side and reports only the exception type.
         """
-        from saklas.core.jlens import JacobianLensCancelled
         from saklas.io.lens import stream_default_lens_corpus
 
-        st = app.state.lens_fit
-        try:
-            st["message"] = f"streaming {body.prompts} corpus documents…"
-            docs, spec = await asyncio.to_thread(
-                stream_default_lens_corpus,
-                body.prompts,
-                cancel_event=app.state.lens_fit_cancel,
-            )
-
-            def on_progress(msg: str) -> None:
-                m = _FIT_PROGRESS_RE.search(msg)
-                if m is not None:
-                    st["prompts_done"] = int(m.group(1))
-                    st["prompts_total"] = int(m.group(2))
-                st["message"] = msg
-
-            st["message"] = "fitting…"
-            await asyncio.to_thread(
-                session.fit_jlens,
-                docs,
-                corpus_spec=spec,
-                source_layers=source_layers,
-                seq_len=body.seq_len,
-                prompt_batch=body.prompt_batch,
-                force=body.force,
-                on_progress=on_progress,
-                cancel_event=app.state.lens_fit_cancel,
-            )
-            # Live-on by default: hot the full fitted readout the moment the
-            # artifact lands, same policy as serve startup.  Session lock so
-            # the enable never races a just-unblocked generation.
-            async with acquire_session_lock(session) as acquired:
-                if acquired:
-                    st["live_layers"] = await asyncio.to_thread(
-                        session.enable_live_lens,
-                    )
-            st["message"] = "done"
-            st["error"] = None
-        except JacobianLensCancelled:
-            st["message"] = "cancelled"
-            st["error"] = None
-        except SaklasError as e:
-            _, text = e.user_message()
-            st["error"] = text
-        except Exception as e:  # noqa: BLE001 — scrubbed, logged server-side
-            log.exception("lens fit failed")
-            st["error"] = f"lens fit failed ({type(e).__name__})"
-        finally:
-            st["running"] = False
-            st["finished_at"] = time.time()
+        st = lens_fit_job.state
+        st["message"] = f"streaming {body.prompts} corpus documents…"
+        docs, spec = await asyncio.to_thread(
+            stream_default_lens_corpus,
+            body.prompts,
+            cancel_event=lens_fit_job.cancel_event,
+        )
+        on_progress = make_progress_hook(
+            st, _FIT_PROGRESS_RE,
+            done_field="prompts_done", total_field="prompts_total",
+        )
+        st["message"] = "fitting…"
+        await asyncio.to_thread(
+            session.fit_jlens,
+            docs,
+            corpus_spec=spec,
+            source_layers=source_layers,
+            seq_len=body.seq_len,
+            prompt_batch=body.prompt_batch,
+            force=body.force,
+            on_progress=on_progress,
+            cancel_event=lens_fit_job.cancel_event,
+        )
+        # Live-on by default: hot the full fitted readout the moment the
+        # artifact lands, same policy as serve startup.  Session lock so
+        # the enable never races a just-unblocked generation.
+        async with acquire_session_lock(session) as acquired:
+            if acquired:
+                st["live_layers"] = await asyncio.to_thread(
+                    session.enable_live_lens,
+                )
+        st["message"] = "done"
+        st["error"] = None
 
     @app.post("/saklas/v1/sessions/{session_id}/lens/fit", status_code=202)
     async def lens_fit_start(session_id: str, body: LensFitRequest | None = None):
@@ -474,6 +436,8 @@ def register_lens_routes(app: FastAPI) -> None:
         attempted while it runs fail with the ordinary busy error.  A
         matching interrupted fit resumes from its last checkpoint.
         """
+        from saklas.core.jlens import JacobianLensCancelled
+
         resolve_session_id(session_id)
         body = body or LensFitRequest()
         source_layers = _parse_layers(body.layers) or "workspace"
@@ -483,39 +447,32 @@ def register_lens_routes(app: FastAPI) -> None:
                 "layers='sample' is not fittable (debug readout only) — "
                 "use 'workspace', 'all', or an explicit csv list",
             )
-        st = app.state.lens_fit
-        if st["running"] or app.state.lens_fetch["running"]:
-            raise HTTPException(409, "a J-lens artifact operation is already running")
-        st.update(
-            running=True,
-            prompts_done=0,
-            prompts_total=body.prompts,
-            message="starting…",
-            error=None,
-            started_at=time.time(),
-            finished_at=None,
+        lens_fit_job.refuse_if_busy()
+        lens_fit_job.start(
+            message="starting…", prompts_done=0, prompts_total=body.prompts,
         )
-        # Keep a handle so the task isn't GC'd mid-fit.
-        app.state.lens_fit_cancel = threading.Event()
-        app.state.lens_fit_task = asyncio.create_task(
-            _lens_fit_job(body, source_layers),
+
+        def _on_error(exc: BaseException) -> None:
+            scrub_job_error(
+                lens_fit_job.state, exc,
+                cancel_exc=JacobianLensCancelled,
+                op_label="lens fit",
+                logger=log,
+            )
+
+        lens_fit_job.launch(
+            lambda: _lens_fit_job(body, source_layers), _on_error,
         )
-        return _fit_status_payload()
+        return lens_fit_job.status()
 
     @app.get("/saklas/v1/sessions/{session_id}/lens/fit")
     async def lens_fit_status(session_id: str):
         """Poll the background lens fit (progress / error / completion)."""
         resolve_session_id(session_id)
-        return _fit_status_payload()
+        return lens_fit_job.status()
 
     @app.delete("/saklas/v1/sessions/{session_id}/lens/fit", status_code=202)
     async def lens_fit_cancel(session_id: str):
         """Cancel corpus acquisition or stop after the current fit pass."""
         resolve_session_id(session_id)
-        st = app.state.lens_fit
-        event = app.state.lens_fit_cancel
-        if not st["running"] or event is None:
-            raise HTTPException(409, "no lens fit is running")
-        event.set()
-        st["message"] = "cancelling…"
-        return _fit_status_payload()
+        return lens_fit_job.request_cancel()
