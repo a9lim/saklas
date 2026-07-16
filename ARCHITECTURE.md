@@ -1172,7 +1172,10 @@ getter's refresh/adopt/evict, registry attach/detach — including the session's
 `remove_probe` lens branch via the atomic `try_detach` — the live toggles,
 `fit_jlens`'s restore→adopt transitions, and the coherent read surfaces),
 so it cannot tear mid-`prepare`; per-preparation tokens draw from one
-process-wide sequence.
+process-wide sequence. Idle-passthrough reads are coherent too: the lens pairs
+lens + specs in one locked `_measurement_state()` hold, and the SAE family has
+a sibling registry lock behind per-call idle spec snapshots (its metadata
+backfill replaces whole spec dicts atomically).
 A bound run symmetrically reads the prep's live-state snapshot
 (`_measurement_live`), and every family's `prepare`
 raises on a still-bound run (a stale pin would suppress that refresh). Every

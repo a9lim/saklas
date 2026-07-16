@@ -522,6 +522,51 @@ def test_fetch_sae_feature_meta_batch_caches_and_updates_probes(
     assert on_disk["1"]["max_act"] == 4.0
 
 
+def test_sae_registry_lock_snapshots_idle_reads() -> None:
+    """round-6 P2: the idle-passthrough spec source is a per-call
+    coherent snapshot under the SAE registry lock — handing out the live
+    dict let one idle read RuntimeError mid-iteration under the
+    un-locked detach, and the metadata backfill could rewrite a unit
+    mid-read.  The session's ``remove_probe`` SAE branch routes through
+    the atomic ``try_detach`` and blocks while the lock is held."""
+    import threading
+
+    session = _session()
+    inst = session._sae_instrument
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    session._probe_hash_cache = {}
+
+    # Idle _measurement_specs is a per-call copy, not the live dict.
+    snapshot = inst._measurement_specs()
+    assert snapshot is not inst.probes
+    assert inst.try_detach("sae/1") is True
+    assert "sae/1" in snapshot  # the copy is immune to the detach
+    assert inst.try_detach("sae/1") is False
+
+    # And the removal path serializes on the registry lock.
+    session._sae_probes["sae/1"] = {
+        "feature_id": 1, "layer": 1, "label": None, "max_act": None,
+    }
+    entered = threading.Event()
+
+    def _detach() -> None:
+        entered.set()
+        SaklasSession.remove_probe(cast(Any, session), "sae/1")
+
+    with inst.state_lock:
+        detacher = threading.Thread(target=_detach)
+        detacher.start()
+        assert entered.wait(timeout=5.0)
+        detacher.join(timeout=0.2)
+        assert detacher.is_alive()  # blocked on the registry lock
+        assert "sae/1" in inst.probes
+    detacher.join(timeout=5.0)
+    assert not detacher.is_alive()
+    assert "sae/1" not in inst.probes
+
+
 def test_bound_run_freezes_sae_unit_against_metadata_backfill() -> None:
     """The InstrumentBinding snapshot: a Neuronpedia backfill landing
     mid-generation (it mutates attached specs + the meta cache WITHOUT the

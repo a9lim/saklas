@@ -1084,11 +1084,22 @@ Geometry's curved warm feet stay in the Monitor engine and the four
 capture modes stay session/HiddenCapture wiring. Instruments keep the
 historical state names as delegating properties over `current_run` (an
 idle passthrough run backs out-of-generation reads — measurement specs
-come from `_measurement_specs()`: the frozen binding when bound, the
-live registry when idle; the live-readout state symmetrically from
+come from `_measurement_specs()`: the frozen binding when bound; when
+idle, the lens pairs lens + specs in ONE `_measurement_state()`
+state-lock hold (refresh the getter, copy the registry — separately
+resolved, an idle read could pair lens A with a concurrently adopted
+B's rewritten layers; round-6 P1) and the SAE returns a per-call
+coherent snapshot under its own registry lock (the live dict tore
+mid-iteration under the un-locked detach; round-6 P2). The
+live-readout state symmetrically from
 `_measurement_live()`: the run's prepare-time snapshot when bound, so a
 bound run keeps reading the live stack that matches its pin even after
-an adoption rebuilds the instrument-level `live`).
+an adoption rebuilds the instrument-level `live`. The SAE family
+carries its own `state_lock` mirroring the lens boundary — registry
+mutation (attach/detach/`try_detach` — the session's `remove_probe`
+SAE branch routes through it — the metadata backfill's whole-dict spec
+replacement, load/unload probe eviction) and the coherent snapshots all
+hold it; never on per-token paths.)
 
 Post-review hardening (sol, gaslamp thread `instrument-protocol`):
 

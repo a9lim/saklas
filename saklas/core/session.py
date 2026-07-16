@@ -3850,9 +3850,10 @@ class SaklasSession:
             # stale directions and pinned probes rather than silently reusing ids.
             for name in [key for key in self._profiles if key.startswith("sae/")]:
                 del self._profiles[name]
-            for name in list(self._sae_probes):
-                self._probe_hash_cache.pop(name, None)
-            self._sae_probes.clear()
+            with self._sae_instrument.state_lock:
+                for name in list(self._sae_probes):
+                    self._probe_hash_cache.pop(name, None)
+                self._sae_probes.clear()
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
         return self.sae_info or {}
@@ -3871,9 +3872,10 @@ class SaklasSession:
             self._last_sae_step_readings = None
             for name in [key for key in self._profiles if key.startswith("sae/")]:
                 del self._profiles[name]
-            for name in list(self._sae_probes):
-                self._probe_hash_cache.pop(name, None)
-            self._sae_probes.clear()
+            with self._sae_instrument.state_lock:
+                for name in list(self._sae_probes):
+                    self._probe_hash_cache.pop(name, None)
+                self._sae_probes.clear()
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
 
@@ -4077,13 +4079,21 @@ class SaklasSession:
         ``max_act`` is part of the readout-channel identity (it sets the
         strength unit), so the probe-hash cache entry is invalidated too.
         """
-        for name, spec in self._sae_probes.items():
-            entry = fetched.get(str(spec.get("feature_id")))
-            if entry is None:
-                continue
-            spec["label"] = entry.get("label")
-            spec["max_act"] = entry.get("max_act")
-            self._probe_hash_cache.pop(name, None)
+        with self._sae_instrument.state_lock:
+            for name, spec in list(self._sae_probes.items()):
+                entry = fetched.get(str(spec.get("feature_id")))
+                if entry is None:
+                    continue
+                # Whole-dict replacement (one atomic store): idle readers
+                # hold per-call spec snapshots or shared references — a
+                # field-level mutation could hand them a half-updated
+                # unit (round-6).
+                self._sae_probes[name] = {
+                    **spec,
+                    "label": entry.get("label"),
+                    "max_act": entry.get("max_act"),
+                }
+                self._probe_hash_cache.pop(name, None)
 
     def register_sae_direction(self, feature_id: int | str) -> str:
         """Register ``W_dec[id]`` at the resident hook layer as a profile."""
@@ -6425,8 +6435,8 @@ class SaklasSession:
         """
         if self._lens_instrument.try_detach(name):
             pass
-        elif name in self._sae_probes:
-            del self._sae_probes[name]
+        elif self._sae_instrument.try_detach(name):
+            pass
         else:
             self._geometry_instrument.detach(name)
         self._invalidate_prefix_cache()

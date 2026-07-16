@@ -816,6 +816,63 @@ def test_lens_state_lock_serializes_detach_and_reads() -> None:
     assert read_out and isinstance(read_out[0], dict)
 
 
+def test_idle_measurement_state_is_coherent() -> None:
+    """round-6 P1: the idle-passthrough read pairs the lens and the spec
+    snapshot in ONE state-lock hold — ``_measurement_specs`` handing out
+    the live registry while the lens resolved separately let an idle
+    read pair lens A with a concurrently adopted B's rewritten layers.
+    The helper's getter read also refreshes, so the pair reflects the
+    replacement consistently."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session_a = _StubSession()
+    session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    corpus_b = [
+        f"replacement idle prompt {i} with enough content" for i in range(4)
+    ]
+    _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
+
+    inst = session_a._lens_instrument
+    lens, specs = inst._measurement_state()
+    # One hold: the refreshed lens and the copied specs agree on B.
+    assert lens is not None and list(lens.source_layers) == [1]
+    assert list(specs["jlens/example"]["layers"]) == [1]
+    # The copy is per-call: a later registry mutation can't reach it.
+    del inst.probes["jlens/example"]
+    assert "jlens/example" in specs
+
+    # And the idle read blocks while the lens-state lock is held.
+    entered = threading.Event()
+    out: list[Any] = []
+
+    def _idle_read() -> None:
+        entered.set()
+        out.append(inst._measurement_state())
+
+    with inst.state_lock:
+        reader = threading.Thread(target=_idle_read)
+        reader.start()
+        assert entered.wait(timeout=5.0)
+        reader.join(timeout=0.2)
+        assert reader.is_alive()
+    reader.join(timeout=5.0)
+    assert not reader.is_alive() and out
+
+    # A bound run stays lock-free frozen state (prep pin + binding).
+    inst.probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [1],
+    }
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    inst.bind(inst.plan(prep), prep)
+    lens_bound, specs_bound = inst._measurement_state()
+    assert prep.pinned and lens_bound is prep.lens
+    assert specs_bound is inst.current_run.binding.specs
+    session_a._close_instrument_runs()
+
+
 def test_prepare_pin_demand_formula() -> None:
     """Pin demand = a live readout, or attached probes with a final
     aggregate or a lens gate — the one formula both generation

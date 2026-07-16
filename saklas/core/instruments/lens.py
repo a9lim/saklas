@@ -405,6 +405,32 @@ class LensInstrument:
         run = self.current_run
         return run.live_state if run.bound else self.live
 
+    def _measurement_state(self) -> "tuple[Any, dict[str, Any] | Any]":
+        """The coherent ``(lens, specs)`` pair for measurement.
+
+        Bound: the run's pin + frozen binding — lock-free, immutable by
+        construction (an unpinned bound run falls back to the getter,
+        which locks internally; nothing measures on such a run anyway).
+        Idle: ONE state-lock hold refreshes the resident lens and copies
+        the registry, so an idle-passthrough read (``observe`` on the
+        idle run, offline scoring) cannot pair lens A with a
+        concurrently adopted replacement's rewritten layers (round-6
+        P1: ``_measurement_specs`` handed out the live registry while
+        ``_resident_lens`` locked separately — scoring resumed with A's
+        lens and B's layers and KeyErrored).
+        """
+        run = self.current_run
+        if run.bound:
+            lens = run.lens if run.pinned else self._session.jlens
+            return lens, run.binding.specs
+        with self.state_lock:
+            lens = self._session.jlens
+            specs = {
+                name: {**spec, "layers": list(spec["layers"])}
+                for name, spec in self.probes.items()
+            }
+            return lens, specs
+
     # -------------------------------------------------------------- registry
 
     def attach(self, selector: str, *, as_name: str | None = None) -> str:
@@ -584,18 +610,6 @@ class LensInstrument:
                 ).encode("utf-8")
             ).hexdigest()
 
-    # ------------------------------------------------------------- resolution
-
-    def _resident_lens(self) -> Any:
-        """The generation-pinned lens when a generation is active, else the
-        session's disk-validated resident lens."""
-        session = self._session
-        return (
-            self.generation_lens
-            if self.generation_lens_active
-            else session.jlens
-        )
-
     # ---------------------------------------------------------------- scoring
 
     def score_probes(
@@ -624,11 +638,8 @@ class LensInstrument:
         from saklas.core.results import ProbeReading
 
         session = self._session
-        probes = self._measurement_specs()
-        if not probes:
-            return {}
-        lens = self._resident_lens()
-        if lens is None:
+        lens, probes = self._measurement_state()
+        if not probes or lens is None:
             return {}
         readout_layers: set[int] = set()
         for spec in probes.values():
@@ -718,11 +729,8 @@ class LensInstrument:
         from saklas.core.monitor import Monitor
 
         session = self._session
-        probes = self._measurement_specs()
-        if not probes:
-            return {}
-        lens = self._resident_lens()
-        if lens is None:
+        lens, probes = self._measurement_state()
+        if not probes or lens is None:
             return {}
         latest = session._capture.latest_per_layer()
         if not latest:
@@ -1146,7 +1154,7 @@ class LensInstrument:
         layers = [int(layer) for layer in state["layers"] if int(layer) in hidden]
         if not layers:
             return None
-        lens = self._resident_lens()
+        lens, specs = self._measurement_state()
         if lens is None:
             return None
         logits = session._jlens_logits_rows(
@@ -1157,7 +1165,7 @@ class LensInstrument:
         probabilities = readout_probabilities(logits)
         readings = self.score_probes(
             {}, probabilities=probabilities, layers=layers,
-        ) if self._measurement_specs() else {}
+        ) if specs else {}
         k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
         values, indices = probabilities.topk(k, dim=-1)
         value_rows = values.detach().to("cpu").tolist()

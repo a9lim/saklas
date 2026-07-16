@@ -28,6 +28,7 @@ composition-preflight error (``validate_gate``), not a silent constant.
 from __future__ import annotations
 
 import hashlib
+import threading
 from typing import Any, Mapping, TYPE_CHECKING
 
 import torch
@@ -148,6 +149,13 @@ class SaeInstrument:
         self.probes: dict[str, dict[str, Any]] = {}
         # Live feature discovery: {layer, top_k, source}, or None when off.
         self.live: dict[str, Any] | None = None
+        # The SAE registry boundary (round-6 P2, the lens state_lock's
+        # sibling): one reentrant leaf lock covering registry mutation
+        # (attach/detach, the session's metadata backfill and load/unload
+        # probe eviction) and the coherent snapshots (specs/names/
+        # probe_hash, the idle _measurement_specs copy).  Never held on
+        # per-token paths — bound runs read their frozen binding.
+        self.state_lock = threading.RLock()
         # The current per-generation run (idle passthrough until bind()).
         self.current_run = SaeRun(
             self, InstrumentBinding(family=self.family),
@@ -233,7 +241,9 @@ class SaeInstrument:
         # session always carries it (set in ``__init__``).
         has_meta_cache = getattr(session, "_sae_feature_meta", None) is not None
         specs: dict[str, dict[str, Any]] = {}
-        for name, spec in self.probes.items():
+        with self.state_lock:
+            probe_items = list(self.probes.items())
+        for name, spec in probe_items:
             frozen = dict(spec)
             max_act = frozen.get("max_act")
             if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
@@ -266,9 +276,17 @@ class SaeInstrument:
 
     def _measurement_specs(self) -> "Mapping[str, Mapping[str, Any]]":
         """The spec source for measurement: a bound run's frozen binding
-        (race-immune), else the live registry (idle passthrough)."""
+        (race-immune), else a per-call coherent snapshot of the live
+        registry (idle passthrough) — handing out the live dict let one
+        idle read tear mid-iteration under the un-locked detach, and a
+        metadata backfill could rewrite a unit mid-read (round-6 P2)."""
         run = self.current_run
-        return run.binding.specs if run.bound else self.probes
+        if run.bound:
+            return run.binding.specs
+        with self.state_lock:
+            return {
+                name: dict(spec) for name, spec in self.probes.items()
+            }
 
     # -------------------------------------------------------------- registry
 
@@ -286,24 +304,39 @@ class SaeInstrument:
         with session._model_exclusive(
             "add_probe called while another model operation is in flight; retry shortly"
         ):
-            self.probes[name] = {
-                "feature_id": idx,
-                "layer": int(validated["layer"]),
-                "label": validated.get("label"),
-                "max_act": validated.get("max_act"),
-            }
+            with self.state_lock:
+                self.probes[name] = {
+                    "feature_id": idx,
+                    "layer": int(validated["layer"]),
+                    "label": validated.get("label"),
+                    "max_act": validated.get("max_act"),
+                }
         return name
 
     def detach(self, name: str) -> None:
-        del self.probes[name]
+        with self.state_lock:
+            del self.probes[name]
+
+    def try_detach(self, name: str) -> bool:
+        """Atomic membership-check + detach under the registry lock (the
+        session's ``remove_probe`` dispatch — a bare check + direct
+        delete is two un-serialized registry touches)."""
+        with self.state_lock:
+            if name not in self.probes:
+                return False
+            del self.probes[name]
+            return True
 
     def specs(self) -> dict[str, dict[str, Any]]:
-        """Snapshot of attached probe specifications."""
-        return {name: dict(spec) for name, spec in self.probes.items()}
+        """Snapshot of attached probe specifications (coherent — a
+        concurrent detach or backfill cannot tear the iteration)."""
+        with self.state_lock:
+            return {name: dict(spec) for name, spec in self.probes.items()}
 
     @property
     def names(self) -> list[str]:
-        return list(self.probes)
+        with self.state_lock:
+            return list(self.probes)
 
     def validate_gate(self, ref: GateRef) -> None:
         validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
@@ -367,9 +400,11 @@ class SaeInstrument:
         part of the channel identity (it sets the unit), so drift
         detection catches a unit change.
         """
-        spec = self.probes.get(name)
-        if spec is None:
-            return None
+        with self.state_lock:
+            spec = self.probes.get(name)
+            if spec is None:
+                return None
+            spec = dict(spec)
         session = self._session
         info = session.sae_info or {}
         return hashlib.sha256(repr((
