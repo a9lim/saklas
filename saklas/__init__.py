@@ -262,6 +262,8 @@ if TYPE_CHECKING:
         JacobianLens as JacobianLens,
         JacobianLensError as JacobianLensError,
         JSpaceDecomposition as JSpaceDecomposition,
+        LensNotFittedError as LensNotFittedError,
+        MultiTokenWordError as MultiTokenWordError,
     )
     from saklas.core.errors import (
         UnsupportedProbeChannelError as UnsupportedProbeChannelError,
@@ -274,6 +276,4 @@ if TYPE_CHECKING:
     )
     from saklas.core.instruments.sae import (
         SaeInstrument as SaeInstrument,
-        LensNotFittedError as LensNotFittedError,
-        MultiTokenWordError as MultiTokenWordError,
     )

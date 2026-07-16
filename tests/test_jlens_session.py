@@ -247,7 +247,9 @@ def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS, source_layers=[0])
     s.enable_live_lens(layers=[0])
-    old_stack = s._live_lens["J_stack"]
+    live = s._live_lens
+    assert live is not None
+    old_stack = live["J_stack"]
     s._profiles["jlens/a"] = {0: torch.ones(4)}
     s._lens_probes["jlens/a"] = {
         "word": "a", "token_id": 1, "layers": [0],
@@ -256,9 +258,11 @@ def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
     fitted = s.fit_jlens(_PROMPTS, source_layers=[1], force=True)
 
     assert fitted.source_layers == [1]
-    assert s._live_lens["layers"] == [1]
-    assert s._live_lens["uses_all_layers"] is True
-    assert s._live_lens["J_stack"] is not old_stack
+    live = s._live_lens
+    assert live is not None
+    assert live["layers"] == [1]
+    assert live["uses_all_layers"] is True
+    assert live["J_stack"] is not old_stack
     assert s._lens_probes["jlens/a"]["layers"] == [1]
     assert "jlens/a" not in s._profiles
 
@@ -639,6 +643,7 @@ def test_external_lens_replacement_plans_and_freezes_refreshed_layers() -> None:
     assert attached_layers == [1]
     run = session_a._lens_instrument.current_run
     assert run.pinned is True
+    assert run.lens is not None
     assert list(run.binding.specs["jlens/example"]["layers"]) == [1]
     assert list(run.lens.source_layers) == [1]
     # And the pinned lens can actually score the frozen band — the stale
@@ -1069,9 +1074,9 @@ def test_generation_lens_snapshot_avoids_per_token_disk_validation(
     session._lens_probes["jlens/a"] = {
         "word": "a", "token_id": 1, "layers": layers,
     }
-    session._generation_jlens = lens
-    session._generation_jlens_active = True
-    session._live_lens_active_for_generation = False
+    session._lens_instrument.generation_lens = lens
+    session._lens_instrument.generation_lens_active = True
+    session._lens_instrument.active_for_generation = False
 
     monkeypatch.setattr(
         lens_io,
@@ -1722,7 +1727,7 @@ def test_subset_resume_releases_unrequested_resident_matrices(
     assert session._jlens_device_cache
     old_live_stack = torch.zeros(64)
     live_stack_ref = weakref.ref(old_live_stack)
-    session._live_lens = {
+    session._lens_instrument.live = {
         "layers": [0], "top_k": 3, "J_stack": old_live_stack,
     }
     del old_live_stack
@@ -2207,7 +2212,7 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
     import saklas.core.jlens as jlens_module
 
     probabilities = jlens_module.readout_probabilities(logits)
-    s._lens_step_stash = {
+    s._lens_instrument.step_stash = {
         "step": 5,
         "layers": (1,),
         "logits": logits,
@@ -2221,7 +2226,9 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
     # rides the stash (the old ``fresh`` flag was consume-once); a
     # different step never matches, so staleness is structural.
     assert s._live_lens_readout_step(top_k=3, step_id=5) is not None
-    assert s._lens_step_stash["step"] == 5
+    stash = s._lens_step_stash
+    assert stash is not None
+    assert stash["step"] == 5
 
 
 def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:

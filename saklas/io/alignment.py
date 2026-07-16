@@ -1402,7 +1402,9 @@ def _load_or_fit_transfer_alignment_locked(
     )
     wanted = available if wanted_arg is None else (available & wanted_arg)
     if not wanted:
-        print(f"{label}: source and target have no requested shared layers", file=sys.stderr)
+        sys.stderr.write(
+            f"{label}: source and target have no requested shared layers\n"
+        )
         sys.exit(1)
 
     # A cold cache fill necessarily captures the model's full neutral roster,
@@ -1486,7 +1488,7 @@ def _load_or_fit_transfer_alignment_locked(
             available_shared_layers=available,
         )
     except AlignmentError as e:
-        print(f"{label}: {e}", file=sys.stderr)
+        sys.stderr.write(f"{label}: {e}\n")
         sys.exit(1)
     fitted_quality = alignment_quality(fitted, src_acts, tgt_missing)
     quality_per_layer.update(fitted_quality)

@@ -630,7 +630,7 @@ class SteeringComposer:
                 return True
         return False
 
-    def _gated_refs(self) -> "list[GateRef]":
+    def _gated_refs(self) -> "list[tuple[str, GateRef]]":
         """Every active probe-gate reference, parsed once into its
         structured form (:func:`parse_gate_ref` — the ONE place the
         scalar-key discrimination lives).  Walks the flattened steering

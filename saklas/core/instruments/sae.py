@@ -243,11 +243,10 @@ class SaeInstrument:
         Neuronpedia backfill (which mutates specs and cache without the
         generation lock) cannot change what a running generation measures.
         """
-        if not isinstance(prep, InstrumentPrep) or prep.family != self.family:
+        if prep.family != self.family:
             raise TypeError(
                 "SaeInstrument.bind takes the InstrumentPrep its own "
-                f"prepare() returned, got {type(prep).__name__} "
-                f"(family={getattr(prep, 'family', None)!r})"
+                f"prepare() returned, got family={prep.family!r}"
             )
         if plan.family != self.family:
             raise ValueError(

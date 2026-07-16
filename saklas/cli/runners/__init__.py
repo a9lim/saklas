@@ -15,6 +15,10 @@ through this package object (``import saklas.cli.runners as _pkg``), so a
 ``monkeypatch.setattr("saklas.cli.runners.<name>", ...)`` still takes effect.
 """
 
+# This module is intentionally a compatibility barrel: every imported private
+# name is re-exported for historical callers and monkeypatch seams.
+# ruff: noqa: F401
+
 from __future__ import annotations
 
 from saklas.cli.runners.shared import (

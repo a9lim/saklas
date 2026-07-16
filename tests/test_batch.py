@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 import pytest
 
-from saklas.core.results import GenerationResult, ProbeReading, RunSet
+from saklas.core.results import GenerationResult, ProbeReading
 from saklas.core.steering_composer import SteeringComposer
 
 if TYPE_CHECKING:
