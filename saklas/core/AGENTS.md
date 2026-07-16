@@ -940,6 +940,30 @@ Family implementations land incrementally: lens + SAE instruments extract
 their session.py regions; geometry stays a thin adapter over `Monitor` (the
 four capture modes are session/HiddenCapture state, not Monitor internals).
 
+`lens.py` — **`LensInstrument`**, the extracted J-lens family (the former
+~675-line session region): owns the probe registry (`probes`), the
+live-readout runtime dict (`live` — device-resident `J_stack` + unembed/norm
+modules), the per-forward stash (`step_stash` + `last_step_readings`), the
+per-generation flags (`active_for_generation`) and disk-identity pin
+(`generation_lens`/`generation_lens_active`), and the read surfaces:
+`attach`/`detach`/`specs`/`probe_layers`, `score_probes` (readout-channel
+`ProbeReading` synthesis), `gate_scalars` (once-per-forward band logits +
+stash for display reuse), `score_aggregate` (tail-ring pooled last content
+token), `live_readout_step` (token-tap display; gate-stash row reuse),
+`authored_capture` (per-row computation only — token matching and loom
+persistence stay session-side), `enable_live`/`disable_live`/`live_layers`,
+`probe_hash` (the `jlens-readout-v2` identity digest), and `validate_gate`
+(strength axis only). Shared J-lens *primitives* (`_jlens_logits_rows`,
+depth/decode caches, the transport stack, the `jlens` disk-identity
+property) stay on the session — the instrument reaches them through the
+session back-ref exactly like `SteeringComposer`. The session re-exposes the
+instrument's state under the historical private names
+(`_lens_probes`/`_live_lens`/`_lens_step_stash`/`_last_lens_step_readings`/
+`_live_lens_active_for_generation`/`_generation_jlens{,_active}`) via
+delegating properties, and `_lens_instrument` itself is a lazy property
+(first touch constructs it — ctor only stores the session ref) so narrow
+test stubs that skip `__init__` self-heal.
+
 ## triggers.py
 
 `Trigger` (frozen): phase flags + optional `ProbeGate`. `Trigger.active(ctx)`

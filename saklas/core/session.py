@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import queue
-import re
 import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
@@ -1337,14 +1336,6 @@ class SaklasSession:
         self._whitener: Any = None
         self._jlens: Any = None  # lazy per-model Jacobian lens (io/lens.py)
         self._jlens_identity: tuple[Any, ...] | None = None
-        # One immutable resident-lens snapshot per generation.  Disk pointer
-        # refresh belongs at the generation boundary, never in a per-token
-        # probe/gate scorer (where reopening every fitted shard is O(T*L)
-        # filesystem work).  ``_generation_jlens_active`` distinguishes a
-        # validated missing lens from the idle state, whose public read methods
-        # should still consult ``session.jlens`` normally.
-        self._generation_jlens: Any = None
-        self._generation_jlens_active = False
         self._jlens_device_cache: dict[tuple[int, str, tuple[int, ...]], torch.Tensor] = {}
         self._jlens_readout_module_cache: (
             tuple[torch.Tensor, torch.nn.Module] | None
@@ -1357,20 +1348,15 @@ class SaklasSession:
             tuple[str, tuple[int, ...]], torch.Tensor
         ] = {}
         self._jlens_decode_cache: dict[int, str] = {}
-        # Live workspace readout (enable_live_lens): device-resident J_l
-        # subset + settings, or None when off.
-        self._live_lens: dict[str, Any] | None = None
-        # Pinned J-lens token probes: name -> {word, token_id, layers}.  NOT
-        # monitor probes — they read the lens readout channel (per-layer
-        # softmax probability), not a whitened subspace coordinate,
-        # and are scored on the post-forward lens path (`_score_lens_probes`).
-        self._lens_probes: dict[str, dict[str, Any]] = {}
-        # Per-forward stash: the gate callback computes band logits first
-        # (score_callback runs before the token tap), the display step reuses
-        # them when the layer sets match.  Reset per generation.
-        self._lens_step_stash: dict[str, Any] | None = None
-        self._live_lens_active_for_generation: bool = True
-        self._last_lens_step_readings: dict[str, "ProbeReading"] | None = None
+        # The J-lens read family lives on its instrument (probe registry,
+        # live-readout runtime, per-forward stash, per-generation
+        # disk-identity pin); the session re-exposes the state fields under
+        # their historical private names via delegating properties, and the
+        # instrument itself is created lazily on first touch (the
+        # ``_lens_instrument`` property) so narrow test stubs that skip
+        # ``__init__`` self-heal.  Touch it here so the real construction
+        # path is eager and deterministic.
+        _ = self._lens_instrument
         # Live sparse-autoencoder runtime. One source + one hook layer is
         # resident in v1; provider weights stay in SAELens/HF caches while
         # Saklas-trained weights live under SAKLAS_HOME. Readout probes are
@@ -3393,6 +3379,88 @@ class SaklasSession:
         self._invalidate_analytics_cache()
         return name
 
+    # -- J-lens instrument state (delegating views) --
+    # The lens read family lives on ``self._lens_instrument``; these
+    # properties re-expose its state under the historical private names so
+    # capture planning, the steering composer, the token tap, the wire
+    # layers, and tests keep one source of truth during the instrument
+    # migration (the plan/run split retargets the call sites later).
+
+    @property
+    def _lens_instrument(self) -> "LensInstrument":
+        """The J-lens instrument, created lazily on first touch.
+
+        Lazy so a narrow test stub that subclasses the session but skips
+        ``__init__`` (or assigns lens state in ``__new__``) self-heals: the
+        first state read/write constructs the instrument, whose ``__init__``
+        only stores the session reference.
+        """
+        inst = self.__dict__.get("_lens_instrument")
+        if inst is None:
+            from saklas.core.instruments.lens import LensInstrument
+
+            inst = LensInstrument(self)
+            self.__dict__["_lens_instrument"] = inst
+        return inst
+
+    @property
+    def _lens_probes(self) -> dict[str, dict[str, Any]]:
+        return self._lens_instrument.probes
+
+    @_lens_probes.setter
+    def _lens_probes(self, value: dict[str, dict[str, Any]]) -> None:
+        self._lens_instrument.probes = value
+
+    @property
+    def _live_lens(self) -> dict[str, Any] | None:
+        return self._lens_instrument.live
+
+    @_live_lens.setter
+    def _live_lens(self, value: "dict[str, Any] | None") -> None:
+        self._lens_instrument.live = value
+
+    @property
+    def _lens_step_stash(self) -> dict[str, Any] | None:
+        return self._lens_instrument.step_stash
+
+    @_lens_step_stash.setter
+    def _lens_step_stash(self, value: "dict[str, Any] | None") -> None:
+        self._lens_instrument.step_stash = value
+
+    @property
+    def _last_lens_step_readings(self) -> "dict[str, ProbeReading] | None":
+        return self._lens_instrument.last_step_readings
+
+    @_last_lens_step_readings.setter
+    def _last_lens_step_readings(
+        self, value: "dict[str, ProbeReading] | None",
+    ) -> None:
+        self._lens_instrument.last_step_readings = value
+
+    @property
+    def _live_lens_active_for_generation(self) -> bool:
+        return self._lens_instrument.active_for_generation
+
+    @_live_lens_active_for_generation.setter
+    def _live_lens_active_for_generation(self, value: bool) -> None:
+        self._lens_instrument.active_for_generation = bool(value)
+
+    @property
+    def _generation_jlens(self) -> Any:
+        return self._lens_instrument.generation_lens
+
+    @_generation_jlens.setter
+    def _generation_jlens(self, value: Any) -> None:
+        self._lens_instrument.generation_lens = value
+
+    @property
+    def _generation_jlens_active(self) -> bool:
+        return self._lens_instrument.generation_lens_active
+
+    @_generation_jlens_active.setter
+    def _generation_jlens_active(self, value: bool) -> None:
+        self._lens_instrument.generation_lens_active = bool(value)
+
     def enable_live_lens(
         self,
         *,
@@ -3400,61 +3468,12 @@ class SaklasSession:
     ) -> list[int]:
         """Stream the J-lens readout live during generation.
 
-        Every decode step, the lens tokens at each selected layer ride
-        ``TokenEvent.lens_readout``. Their ``k`` is the generation's logit-alternative
-        ``SamplingConfig.return_top_k`` (falling back to 8 when alternatives
-        are disabled). ``layers`` defaults to **every fitted lens layer**.
-        The per-step cost is one
-        d×d matvec + one vocab matvec + an on-device top-k per layer, cheap
-        enough to retain the model's full depth profile. The selected layers'
-        ``J_l`` move device-resident here, once — full-depth residency is
-        ``n_layers · d_model² · 4`` bytes. Pass an explicit ``layers``
-        subset to trade coverage for memory.
-
-        Attaches **no forward hooks** (the reader consumes the capture's
-        existing latest-slice buffers post-forward), so steering fast-path /
-        compile eligibility is untouched. A compiled session constructed with
-        its default/non-empty probe roster already has persistent capture
-        buffers for every layer, so an all-layer lens stays compile-clean;
-        an explicit ``probes=[]`` session uses transient capture and the eager
-        fallback instead. Returns the resolved layer list.
+        Delegates to :meth:`LensInstrument.enable_live` — see
+        ``core/instruments/lens.py`` for the contract (device residency,
+        layer defaulting, no forward hooks / compile eligibility untouched).
+        Returns the resolved layer list.
         """
-        from saklas.core.model import get_final_norm, get_unembedding
-
-        if self._device.type == "cuda":
-            torch.set_float32_matmul_precision("high")
-
-        lens = self._require_jlens()
-        uses_all_layers = layers is None
-        if layers is None:
-            layers = sorted(int(layer) for layer in lens.source_layers)
-        else:
-            layers = sorted(set(int(l) for l in layers))
-            missing = [l for l in layers if l not in lens.jacobians]
-            if missing:
-                raise ValueError(
-                    f"layers {missing} not in the fitted lens "
-                    f"(fitted: {lens.source_layers[0]}..{lens.source_layers[-1]})"
-                )
-        device = self._device
-        layer_list = list(layers)
-        if layer_list:
-            j_stack = self._jlens_transport_stack(lens, layer_list, device)
-        else:
-            sample = next(iter(lens.jacobians.values()))
-            j_stack = torch.empty(
-                (0, *sample.shape), device=device, dtype=torch.float32,
-            )
-        self._live_lens = {
-            "layers": layer_list,
-            "uses_all_layers": uses_all_layers,
-            "J_stack": j_stack,
-            "layer_rows": {l: i for i, l in enumerate(layer_list)},
-            "unembed": get_unembedding(self._model),
-            "norm": get_final_norm(self._model),
-            "source": SaklasSession._active_jlens_source_label(self),
-        }
-        return list(layers)
+        return self._lens_instrument.enable_live(layers=layers)
 
     def _active_jlens_source_label(self) -> str | None:
         """Return the active J-lens source in the public source syntax."""
@@ -3469,14 +3488,12 @@ class SaklasSession:
 
     def disable_live_lens(self) -> None:
         """Stop streaming the live lens readout and free the device J_l copies."""
-        self._live_lens = None
+        self._lens_instrument.disable_live()
 
     @property
     def live_lens_layers(self) -> list[int] | None:
         """The live lens readout's layer list, or ``None`` when it's off."""
-        if self._live_lens is None:
-            return None
-        return list(self._live_lens["layers"])
+        return self._lens_instrument.live_layers
 
     def _jlens_workspace_band(self, lens: "Any") -> list[int]:
         """Explicit legacy ``workspace`` mode: fitted layers in the 40–90%
@@ -3495,217 +3512,13 @@ class SaklasSession:
         ]
         | None
     ):
-        """One decode step's lens readout from the capture's latest slices.
+        """One decode step's live lens readout (token-tap, post-forward).
 
-        Runs post-forward at the token tap (never inside a hook). On-device
-        matvecs + top-k; a handful of small host transfers per step; token
-        decoding memoized across steps. Returns ``(per_layer, aggregate)``
-        — the top-k tokens per selected layer, each scored by its
-        **per-layer softmax probability** (the same strength unit every
-        other lens surface reports — apples-to-apples across layers, unlike
-        a raw logit), plus the layer-aggregated chip list ``[(token,
-        strength, com, spread), ...]`` over all live layers.  The third
-        return value carries the vocabulary ids already selected by ``topk``;
-        the loom serializer uses them to normalize the historical wire shape
-        without re-tokenizing the decoded strings.
+        Delegates to :meth:`LensInstrument.live_readout_step` — stash reuse
+        with the gate callback, per-layer softmax probabilities, aggregate
+        chips, one packed host transfer.
         """
-        state = self._live_lens
-        if state is None or not self._live_lens_active_for_generation:
-            return None
-        buckets = self._capture.per_layer_buckets()
-        unembed = state["unembed"]
-        layers_present: list[int] = []
-        hidden_rows: list[torch.Tensor] = []
-        transport_rows: list[int] = []
-        layer_rows: dict[int, int] = state["layer_rows"]
-        for layer in state["layers"]:
-            bucket = buckets.get(layer)
-            if not bucket:
-                continue
-            layers_present.append(layer)
-            # Keep the raw bucket reference until after stash reuse is resolved:
-            # an exact gate+live cache hit never needs these hidden rows, so it
-            # should not pay a dtype/device conversion just to discard them.
-            hidden_rows.append(bucket[-1])
-            transport_rows.append(layer_rows[layer])
-        if not layers_present:
-            return None
-        stash = self._lens_step_stash
-        logits: torch.Tensor | None = None
-        probabilities: torch.Tensor | None = None
-        cached_logits: dict[int, torch.Tensor] = {}
-        cached_probs: dict[int, torch.Tensor] = {}
-        if stash is not None and stash.get("fresh"):
-            stash_layers = tuple(int(layer) for layer in (stash.get("layers") or ()))
-            if stash_layers == tuple(layers_present):
-                # The common gate+live path: exact row-set match.  Keep the
-                # existing zero-copy reuse of the full matrix rather than
-                # restacking full-vocab rows.
-                stash["fresh"] = False
-                logits = stash["logits"]
-                probabilities = stash.get("probabilities")
-            else:
-                # The gate callback may already have computed this forward's
-                # band logits before the token tap.  Reuse any overlapping rows
-                # rather than requiring the live display layer set to match
-                # exactly: an explicit live-lens display can cover a superset of
-                # the gated probe band without recomputing those rows.  Softmax
-                # calibration is per-layer, so cached probability rows compose
-                # exactly with newly computed rows.
-                for row, layer in enumerate(stash_layers):
-                    if layer in layers_present:
-                        cached_logits[int(layer)] = stash["logits"][row]
-                        probs = stash.get("probabilities")
-                        if probs is not None:
-                            cached_probs[int(layer)] = probs[row]
-                if cached_logits:
-                    stash["fresh"] = False
-        computed_logits: dict[int, torch.Tensor] = {}
-        if logits is None:
-            missing = [
-                (layer, hidden, transport_row)
-                for layer, hidden, transport_row in zip(
-                    layers_present, hidden_rows, transport_rows, strict=True,
-                )
-                if layer not in cached_logits
-            ]
-            if missing:
-                J_stack: torch.Tensor = state["J_stack"]
-                J = SaklasSession._select_tensor_rows(
-                    J_stack,
-                    [row for _layer, _hidden, row in missing],
-                )
-                H = torch.stack(
-                    [
-                        hidden.to(torch.float32)
-                        for _layer, hidden, _row in missing
-                    ],
-                    dim=0,
-                ).to(J.device)
-                transported = torch.bmm(J, H.unsqueeze(-1)).squeeze(-1)
-                normed = state["norm"](transported)
-                computed = normed.to(unembed.dtype) @ unembed.T
-                if not cached_logits and len(missing) == len(layers_present):
-                    logits = computed
-                else:
-                    computed_logits = {
-                        layer: computed[row]
-                        for row, (layer, _hidden, _transport) in enumerate(missing)
-                    }
-            if logits is None:
-                logits = torch.stack(
-                    [
-                        cached_logits[layer]
-                        if layer in cached_logits else computed_logits[layer]
-                        for layer in layers_present
-                    ],
-                    dim=0,
-                )
-        from saklas.core.jlens import readout_probabilities
-
-        if probabilities is None:
-            if not cached_probs and not computed_logits:
-                probabilities = readout_probabilities(logits)
-            else:
-                probability_rows: dict[int, torch.Tensor] = dict(cached_probs)
-                uncached_prob_layers = [
-                    layer for layer in layers_present
-                    if layer not in probability_rows
-                ]
-                if uncached_prob_layers:
-                    uncached_logits = torch.stack(
-                        [
-                            computed_logits[layer]
-                            if layer in computed_logits else cached_logits[layer]
-                            for layer in uncached_prob_layers
-                        ],
-                        dim=0,
-                    )
-                    uncached_probs = readout_probabilities(uncached_logits)
-                    probability_rows.update({
-                        layer: uncached_probs[row]
-                        for row, layer in enumerate(uncached_prob_layers)
-                    })
-                probabilities = torch.stack(
-                    [probability_rows[layer] for layer in layers_present], dim=0,
-                )
-        # Pinned lens probes ride the same calibrated matrix — per-step
-        # readout-channel readings for the payload merge.  A gate callback
-        # may already have computed the same readings from these exact rows;
-        # reuse them to avoid a second selected-token host sync on the
-        # pinned+gated+live path.
-        if self._lens_probes:
-            readings_reused = False
-            if stash is not None and stash.get("readings_fresh"):
-                reading_layers = tuple(
-                    int(layer) for layer in (stash.get("readings_layers") or ())
-                )
-                if reading_layers == tuple(layers_present):
-                    self._last_lens_step_readings = cast(
-                        "dict[str, ProbeReading]",
-                        stash.get("readings") or {},
-                    )
-                    stash["readings_fresh"] = False
-                    readings_reused = True
-                elif reading_layers:
-                    stash["readings_fresh"] = False
-            if not readings_reused:
-                self._last_lens_step_readings = self._score_lens_probes(
-                    {}, probabilities=probabilities, layers=list(layers_present),
-                )
-        else:
-            self._last_lens_step_readings = None
-        # Display scores are per-layer softmax probabilities — the one
-        # strength unit every lens surface reports (softmax is monotone, so
-        # the top-k selection is unchanged from the raw-logit ranking).
-        from saklas.core.jlens import (
-            aggregate_readout_tensors_from_probabilities,
-            pack_readout_rows_to_host,
-        )
-
-        k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
-        vals, idxs = probabilities.topk(k, dim=-1)
-        depth_tensor = self._jlens_depth_tensor(
-            layers_present, probabilities.device,
-        )
-        agg_idxs, agg_stats = aggregate_readout_tensors_from_probabilities(
-            probabilities,
-            self._jlens_depths(layers_present),
-            top_k=k,
-            depth_tensor=depth_tensor,
-        )
-        # The per-layer cards and aggregate chips used to cross the accelerator
-        # boundary in four blocking transfers, with aggregate kernels not even
-        # submitted until the first pair had synchronized. Pack the tiny
-        # K-wide result through the shared MPS-safe helper and synchronize once.
-        n_layers = len(layers_present)
-        host_rows = pack_readout_rows_to_host(
-            vals,
-            idxs,
-            agg_stats,
-            agg_idxs.reshape(1, -1),
-        ).tolist()
-        all_vals = host_rows[:n_layers]
-        all_idxs = host_rows[n_layers:2 * n_layers]
-        agg_host = host_rows[2 * n_layers:]
-        out: dict[int, list[tuple[str, float]]] = {}
-        token_ids: dict[int, list[int]] = {}
-        for row, layer in enumerate(layers_present):
-            pairs: list[tuple[str, float]] = []
-            for v, i in zip(all_vals[row], all_idxs[row]):
-                pairs.append((self._jlens_decode_id(int(i)), float(v)))
-            out[layer] = pairs
-            token_ids[layer] = [int(i) for i in all_idxs[row]]
-        agg = [
-            (
-                self._jlens_decode_id(int(agg_host[3][j])),
-                float(agg_host[0][j]),
-                float(agg_host[1][j]),
-                float(agg_host[2][j]),
-            )
-            for j in range(k)
-        ]
-        return out, agg, token_ids
+        return self._lens_instrument.live_readout_step(top_k=top_k)
 
     # -- Sparse-autoencoder runtime -------------------------------------
 
@@ -6459,41 +6272,14 @@ class SaklasSession:
         return name
 
     def _add_lens_probe(self, selector: str, *, as_name: str | None) -> str:
-        """Attach a ``jlens/<word>`` token probe to the lens-probe registry.
+        """Attach a ``jlens/<word>`` token probe (readout channel).
 
-        Validates the lens artifact + single-token word (the same
-        ``resolve_word_token`` contract steering atoms use), records the
-        full fitted layer set, and pre-warms the device transport stack so
-        the first decode step doesn't hitch on the J_l transfer.  The probe
-        reads ONE channel — ``coords = (strength,)``, the mean layer
-        probability ``mean_l p_l(v)`` (the J-lens card's ``strength``;
-        objective and apples-to-apples across tokens and layers) — so
-        ``@when:jlens/<word> > x`` gates strength.
+        Delegates the validation + registry write to
+        :meth:`LensInstrument.attach`; the session owns the cache
+        invalidation at this boundary (the capture layer union changed, and
+        the probe hash / analytics caches key on the roster).
         """
-        from saklas.core.jlens import resolve_word_token
-
-        word = selector.split("/", 1)[1]
-        if not word:
-            raise ValueError("empty jlens probe word")
-        name = as_name if as_name is not None else selector
-        with self._model_exclusive(
-            "add_probe called while another model operation is in "
-            "flight; retry shortly"
-        ):
-            lens = self._require_jlens()
-            token_id = resolve_word_token(self._tokenizer, word)
-            readout_layers = [int(l) for l in lens.source_layers]
-            self._jlens_transport_stack(
-                lens, sorted(readout_layers), self._device,
-            )
-            self._lens_probes[name] = {
-                "word": word,
-                "token_id": int(token_id),
-                "layers": readout_layers,
-            }
-        # Same invalidation set as a monitor attach: the capture layer union
-        # changed (lens layers join it), and the probe hash / analytics
-        # caches key on the roster.
+        name = self._lens_instrument.attach(selector, as_name=as_name)
         self._invalidate_prefix_cache()
         self._probe_hash_cache.pop(name, None)
         self._invalidate_analytics_cache()
@@ -6534,22 +6320,16 @@ class SaklasSession:
     @property
     def lens_probe_names(self) -> list[str]:
         """Names of the attached J-lens token probes (readout channel)."""
-        return list(self._lens_probes)
+        return self._lens_instrument.names
 
     @property
     def lens_probe_specs(self) -> dict[str, dict[str, Any]]:
         """Snapshot of attached J-lens probe specifications."""
-        return {name: dict(spec) for name, spec in self._lens_probes.items()}
+        return self._lens_instrument.specs()
 
     def _lens_probe_layers(self, names: set[str] | None = None) -> set[int]:
         """Union of the attached lens probes' fitted layers."""
-        out: set[int] = set()
-        probes = self._lens_probes
-        if names is not None:
-            probes = {name: probes[name] for name in names if name in probes}
-        for spec in probes.values():
-            out.update(spec["layers"])
-        return out
+        return self._lens_instrument.probe_layers(names)
 
     @property
     def sae_probe_names(self) -> list[str]:
@@ -6569,191 +6349,22 @@ class SaklasSession:
         layers: "Sequence[int] | None" = None,
         only: "set[str] | None" = None,
     ) -> dict[str, "ProbeReading"]:
-        """Score every attached lens probe from hidden slices (or reuse
-        precomputed lens ``logits`` rows aligned with ``layers``).
-
-        Returns ``{name: ProbeReading}`` with ``coords = (strength,)`` —
-        the ONE readout channel, mean layer probability —
-        ``coords_per_layer[l] = (p_l,)``, and the depth CoM — the
-        readout-channel synthesis of the unified reading shape (geometry
-        fields defaulted: ``fraction`` / ``residual`` 0, ``nearest`` /
-        ``assignment`` empty, ``membership`` 1.0).  Empty when no probe
-        layer is available.
-        """
-        from saklas.core.jlens import (
-            token_readout_stats,
-            token_readout_stats_from_probabilities,
+        """Score attached lens probes (delegates to
+        :meth:`LensInstrument.score_probes`)."""
+        return self._lens_instrument.score_probes(
+            hidden,
+            logits=logits,
+            probabilities=probabilities,
+            layers=layers,
+            only=only,
         )
-
-        if not self._lens_probes:
-            return {}
-        lens = (
-            self._generation_jlens
-            if self._generation_jlens_active
-            else self.jlens
-        )
-        if lens is None:
-            return {}
-        readout_layers = self._lens_probe_layers()
-        if logits is not None and probabilities is not None:
-            raise ValueError("pass lens logits or probabilities, not both")
-        if logits is None and probabilities is None:
-            layers = sorted(l for l in readout_layers if l in hidden)
-            if not layers:
-                return {}
-            logits = self._jlens_logits_rows(
-                lens, [(l, hidden[l]) for l in layers],
-            )
-        else:
-            assert layers is not None
-            # Restrict precomputed rows (e.g. a custom live-lens layer set)
-            # to the probes' fitted layer set.
-            keep = [i for i, l in enumerate(layers) if l in readout_layers]
-            if not keep:
-                return {}
-            if len(keep) != len(layers):
-                if logits is not None:
-                    logits = logits[keep]
-                if probabilities is not None:
-                    probabilities = probabilities[keep]
-            layers = [layers[i] for i in keep]
-        names = [
-            name for name in self._lens_probes
-            if only is None or name in only
-        ]
-        if not names:
-            return {}
-        token_ids = [self._lens_probes[n]["token_id"] for n in names]
-        prob_device = (
-            probabilities.device
-            if probabilities is not None
-            else cast(torch.Tensor, logits).device
-        )
-        token_ids_tensor = self._readout_long_tensor(token_ids, prob_device)
-        depth_tensor = self._jlens_depth_tensor(layers, prob_device)
-        if probabilities is None:
-            assert logits is not None
-            stats = token_readout_stats(
-                logits,
-                self._jlens_depths(layers),
-                token_ids,
-                token_ids_tensor=token_ids_tensor,
-                depth_tensor=depth_tensor,
-            )
-        else:
-            stats = token_readout_stats_from_probabilities(
-                probabilities,
-                self._jlens_depths(layers),
-                token_ids,
-                token_ids_tensor=token_ids_tensor,
-                depth_tensor=depth_tensor,
-            )
-        out: dict[str, ProbeReading] = {}
-        for name, (strength, com, spread, per_layer) in zip(names, stats):
-            out[name] = ProbeReading(
-                fraction=0.0,
-                nearest=[],
-                coords=(strength,),
-                residual=0.0,
-                coords_per_layer={
-                    l: (p_l,) for l, p_l in zip(layers, per_layer)
-                },
-                depth_com=(com,),
-                depth_spread=(spread,),
-            )
-        return out
 
     def _score_lens_gate_scalars(
         self, gate_keys: "set[str] | None" = None,
     ) -> dict[str, float]:
-        """Per-forward lens-probe gate scalars from the latest capture slices.
-
-        Called from the gating score callback (once per decode forward, before
-        the token tap). Computes the referenced lens logits, stashes them
-        for the display step to reuse (``_lens_step_stash``), and flattens the
-        synthesized readings through :meth:`Monitor.flat_scalars` so the gate
-        key space is uniform (``jlens/<word>`` = strength, the mean layer
-        probability). Gate-only calls score exact selected-token softmax
-        columns; live display calls still calibrate the full matrix once for
-        downstream card/aggregate reuse. Empty when nothing is capturable yet.
-        """
-        if not self._lens_probes:
-            return {}
-        lens = (
-            self._generation_jlens
-            if self._generation_jlens_active
-            else self.jlens
-        )
-        if lens is None:
-            return {}
-        latest = self._capture.latest_per_layer()
-        if not latest:
-            return {}
-        only = None
-        if gate_keys:
-            only = {
-                key.split("[", 1)[0]
-                for key in gate_keys
-                if key.split("[", 1)[0] in self._lens_probes
-            }
-            if not only:
-                return {}
-        live_display_needs_full_probs = bool(
-            self._live_lens is not None
-            and self._live_lens_active_for_generation
-        )
-        # When the token tap will immediately need every pinned probe reading
-        # for the live payload, compute that superset once in the gate
-        # callback and let the display reuse it.  Gate-only calls stay on the
-        # narrower requested subset.
-        probe_read_only = None if live_display_needs_full_probs else only
-        readout_layers = self._lens_probe_layers(probe_read_only)
-        layers = sorted(l for l in readout_layers if l in latest)
-        if not layers:
-            return {}
-
-        logits = self._jlens_logits_rows(
-            lens, [(l, latest[l]) for l in layers],
-        )
-        probabilities = None
-        if live_display_needs_full_probs:
-            from saklas.core.jlens import readout_probabilities
-
-            probabilities = readout_probabilities(logits)
-            live_stash: dict[str, Any] = {
-                "layers": tuple(layers),
-                "logits": logits,
-                "probabilities": probabilities,
-                "fresh": True,
-            }
-            self._lens_step_stash = live_stash
-        else:
-            self._lens_step_stash = {
-                "layers": tuple(layers),
-                "logits": logits,
-                "fresh": True,
-            }
-        if probabilities is not None:
-            readings = self._score_lens_probes(
-                {},
-                probabilities=probabilities,
-                layers=layers,
-                only=probe_read_only,
-            )
-            live_stash = cast("dict[str, Any]", self._lens_step_stash)
-            live_stash["readings"] = readings
-            live_stash["readings_layers"] = tuple(layers)
-            live_stash["readings_fresh"] = True
-            self._last_lens_step_readings = readings
-        else:
-            readings = self._score_lens_probes(
-                {}, logits=logits, layers=layers, only=probe_read_only,
-            )
-        if only is None:
-            return Monitor.flat_scalars(readings)
-        return Monitor.flat_scalars({
-            name: reading for name, reading in readings.items() if name in only
-        })
+        """Per-forward lens gate scalars (delegates to
+        :meth:`LensInstrument.gate_scalars`)."""
+        return self._lens_instrument.gate_scalars(gate_keys)
 
     def _score_lens_probes_aggregate(
         self,
@@ -6761,29 +6372,11 @@ class SaklasSession:
         *,
         pooled: dict[int, torch.Tensor] | None = None,
     ) -> dict[str, "ProbeReading"]:
-        """End-of-gen lens-probe aggregate pooled at the last content token.
-
-        Mirrors :meth:`_score_aggregate_only`: one readout at the pooled
-        slice from the capture tail ring (or the FULL-mode stack), so the
-        aggregate semantics match the monitor probes' exactly.
-        """
-        if not self._lens_probes or not generated_ids:
-            return {}
-        if pooled is None:
-            agg_fwd = self._aggregate_forward_index(generated_ids)
-            if agg_fwd is None:
-                return {}
-            pooled = self._capture.tail_slice_at(agg_fwd)
-            if not pooled:
-                stacked = self._capture.stacked()
-                pooled = {
-                    l: t[agg_fwd]
-                    for l, t in stacked.items()
-                    if t.shape[0] > agg_fwd
-                }
-        if not pooled:
-            return {}
-        return self._score_lens_probes(pooled)
+        """End-of-gen lens-probe aggregate (delegates to
+        :meth:`LensInstrument.score_aggregate`)."""
+        return self._lens_instrument.score_aggregate(
+            generated_ids, pooled=pooled,
+        )
 
     @property
     def live_probe_scores(self) -> bool:
@@ -6856,25 +6449,13 @@ class SaklasSession:
         """
         if name in self._probe_hash_cache:
             return self._probe_hash_cache[name]
-        lens_spec = self._lens_probes.get(name)
-        if lens_spec is not None:
-            # A lens probe has no baked tensor — hash the readout-channel
-            # identity (model, token, band, channel version) so transcript
-            # drift detection still works across a semantics change (v2:
-            # single strength axis; v1 carried a salience axis; the depth-CoM
-            # mass moved salience→probability within v2 — display-only, the
-            # coords channel is bit-identical, so no bump).
-            import hashlib
-            digest = hashlib.sha256(
-                repr(
-                    (
-                        "jlens-readout-v2", self.model_id, lens_spec["word"],
-                        lens_spec["token_id"], tuple(lens_spec["layers"]),
-                    )
-                ).encode("utf-8")
-            ).hexdigest()
-            self._probe_hash_cache[name] = digest
-            return digest
+        lens_digest = self._lens_instrument.probe_hash(name)
+        if lens_digest is not None:
+            # A lens probe has no baked tensor — the instrument hashes the
+            # readout-channel identity (model, token, band, channel version)
+            # so transcript drift detection works across a semantics change.
+            self._probe_hash_cache[name] = lens_digest
+            return lens_digest
         sae_spec = self._sae_probes.get(name)
         if sae_spec is not None:
             # v2: the channel is normalized strength (activation /
@@ -8345,45 +7926,10 @@ class SaklasSession:
         dict[int, list[int]],
         dict[str, ProbeReading],
     ] | None:
-        """Live J-LENS payload for one retained authored producer row."""
-        state = self._live_lens
-        if state is None or not self._live_lens_active_for_generation:
-            return None
-        layers = [int(layer) for layer in state["layers"] if int(layer) in hidden]
-        if not layers:
-            return None
-        lens = (
-            self._generation_jlens
-            if self._generation_jlens_active
-            else self.jlens
-        )
-        if lens is None:
-            return None
-        logits = self._jlens_logits_rows(
-            lens, [(layer, hidden[layer]) for layer in layers],
-        )
-        from saklas.core.jlens import readout_probabilities
-
-        probabilities = readout_probabilities(logits)
-        readings = self._score_lens_probes(
-            {}, probabilities=probabilities, layers=layers,
-        ) if self._lens_probes else {}
-        k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
-        values, indices = probabilities.topk(k, dim=-1)
-        value_rows = values.detach().to("cpu").tolist()
-        id_rows = indices.detach().to("cpu").tolist()
-        per_layer: dict[int, list[tuple[str, float]]] = {}
-        token_ids: dict[int, list[int]] = {}
-        for row, layer in enumerate(layers):
-            per_layer[layer] = [
-                (self._jlens_decode_id(int(tid)), float(value))
-                for value, tid in zip(value_rows[row], id_rows[row], strict=True)
-            ]
-            token_ids[layer] = [int(tid) for tid in id_rows[row]]
-        aggregate = self._jlens_aggregate_rows(
-            None, layers, top_k=k, probabilities=probabilities,
-        )
-        return per_layer, aggregate, token_ids, readings
+        """Live J-LENS payload for one retained authored producer row
+        (delegates to :meth:`LensInstrument.authored_capture`; the
+        token-matching orchestration stays session-side)."""
+        return self._lens_instrument.authored_capture(hidden, top_k=top_k)
 
     def _authored_sae_capture(
         self,

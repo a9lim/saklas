@@ -95,8 +95,26 @@ class _StubSession:
     _score_lens_probes = SaklasSession._score_lens_probes
     _score_lens_gate_scalars = SaklasSession._score_lens_gate_scalars
     _effective_return_top_k = SaklasSession._effective_return_top_k
+    _active_jlens_source_label = SaklasSession._active_jlens_source_label
+    _select_tensor_rows = staticmethod(SaklasSession._select_tensor_rows)
+    # Lens state lives on the LensInstrument (constructed in __init__);
+    # borrow the session's delegating property objects so the plain
+    # attribute assignments below route into the instrument exactly as the
+    # real session's do.
+    _lens_probes = SaklasSession._lens_probes
+    _live_lens = SaklasSession._live_lens
+    _lens_step_stash = SaklasSession._lens_step_stash
+    _last_lens_step_readings = SaklasSession._last_lens_step_readings
+    _live_lens_active_for_generation = (
+        SaklasSession._live_lens_active_for_generation
+    )
+    _generation_jlens = SaklasSession._generation_jlens
+    _generation_jlens_active = SaklasSession._generation_jlens_active
 
     def __init__(self, *, n_layers: int = 3) -> None:
+        from saklas.core.instruments.lens import LensInstrument
+
+        self._lens_instrument = LensInstrument(self)  # type: ignore[arg-type]
         model = frozen_toy(n_layers=n_layers)
         self._model = model
         self._tokenizer = CharTokenizer()
@@ -105,21 +123,21 @@ class _StubSession:
         self._profiles: dict[str, Any] = {}
         self._jlens: Any = None
         self._jlens_identity: Any = None
-        self._generation_jlens: Any = None
+        self._generation_jlens = None
         self._generation_jlens_active = False
-        self._live_lens: Any = None
+        self._live_lens = None
         self._capture: Any = None
         self._capture_buffers: dict[int, torch.Tensor] = {}
         self._compiled_clean_eligible = False
         self._steering_uses_compiled_offsets = False
         self._steering: Any = None
-        self._lens_probes: dict[str, Any] = {}
+        self._lens_probes = {}
         self._live_lens_active_for_generation = True
         self._live_sae: Any = None
         self._sae_probes: dict[str, Any] = {}
         self._probe_hash_cache: dict[str, str] = {}
-        self._lens_step_stash: Any = None
-        self._last_lens_step_readings: Any = None
+        self._lens_step_stash = None
+        self._last_lens_step_readings = None
         self._jlens_readout_module_cache: Any = None
         self._jlens_device_cache: dict[Any, Any] = {}
         self._jlens_depths_cache: dict[Any, list[float]] = {}
