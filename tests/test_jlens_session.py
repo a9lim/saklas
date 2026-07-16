@@ -1572,6 +1572,31 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         assert spread >= 0.0
 
 
+def test_live_lens_readout_step_avoids_float64_for_mps_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_to = torch.Tensor.to
+
+    def reject_float64(
+        self: torch.Tensor, *args: Any, **kwargs: Any,
+    ) -> torch.Tensor:
+        dtype = kwargs.get("dtype")
+        if args and isinstance(args[0], torch.dtype):
+            dtype = args[0]
+        if dtype is torch.float64:
+            raise AssertionError("device-side float64 is unsupported on MPS")
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", reject_float64)
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s.enable_live_lens(layers=[0, 1])
+    s._capture = _FakeCapture({0: torch.randn(6), 1: torch.randn(6)})
+
+    step = s._live_lens_readout_step(top_k=3)
+    assert step is not None
+
+
 def test_jlens_row_selector_avoids_copy_for_identity_and_contiguous_rows() -> None:
     tensor = torch.arange(24, dtype=torch.float32).reshape(4, 6)
 

@@ -411,6 +411,17 @@ def readout_probabilities(logits: torch.Tensor) -> torch.Tensor:
     return logits.float().softmax(dim=-1)
 
 
+def pack_readout_rows_to_host(*rows: torch.Tensor) -> torch.Tensor:
+    """Pack selected readout rows for one accelerator-to-host transfer.
+
+    The packed payload stays fp32 on the accelerator because MPS does not
+    support float64.  fp32 still represents every practical vocabulary id
+    exactly (up to 2**24), so integer token-id rows can share the transfer with
+    probability/statistic rows without changing the public values.
+    """
+    return torch.cat([row.float() for row in rows], dim=0).detach().cpu()
+
+
 def aggregate_readout_from_probabilities(
     probabilities: torch.Tensor,
     depths: "Sequence[float]",
@@ -441,14 +452,7 @@ def aggregate_readout_from_probabilities(
         top_k=top_k,
         depth_tensor=depth_tensor,
     )
-    # Public list surface: one packed host transfer. Keep the device-side
-    # payload in fp32: MPS does not support float64, while fp32 still represents
-    # every practical vocabulary id exactly (up to 2**24) and avoids a second
-    # accelerator synchronization.
-    host = torch.cat(
-        [stats.float(), idxs.reshape(1, -1).to(torch.float32)],
-        dim=0,
-    ).cpu()
+    host = pack_readout_rows_to_host(stats, idxs.reshape(1, -1))
     return [
         (
             int(host[3, j]),

@@ -3690,6 +3690,7 @@ class SaklasSession:
         # the top-k selection is unchanged from the raw-logit ranking).
         from saklas.core.jlens import (
             aggregate_readout_tensors_from_probabilities,
+            pack_readout_rows_to_host,
         )
 
         k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
@@ -3703,20 +3704,17 @@ class SaklasSession:
             top_k=k,
             depth_tensor=depth_tensor,
         )
-        # The per-layer cards and aggregate chips used to cross the CUDA
+        # The per-layer cards and aggregate chips used to cross the accelerator
         # boundary in four blocking transfers, with aggregate kernels not even
         # submitted until the first pair had synchronized. Pack the tiny
-        # K-wide result (float64 keeps token ids exact) and synchronize once.
+        # K-wide result through the shared MPS-safe helper and synchronize once.
         n_layers = len(layers_present)
-        host_rows = torch.cat(
-            [
-                vals.to(torch.float64),
-                idxs.to(torch.float64),
-                agg_stats.to(torch.float64),
-                agg_idxs.reshape(1, -1).to(torch.float64),
-            ],
-            dim=0,
-        ).detach().cpu().tolist()
+        host_rows = pack_readout_rows_to_host(
+            vals,
+            idxs,
+            agg_stats,
+            agg_idxs.reshape(1, -1),
+        ).tolist()
         all_vals = host_rows[:n_layers]
         all_idxs = host_rows[n_layers:2 * n_layers]
         agg_host = host_rows[2 * n_layers:]
