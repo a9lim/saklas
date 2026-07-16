@@ -33,8 +33,12 @@ from typing import Any, Mapping, TYPE_CHECKING
 import torch
 
 from saklas.core.instruments.types import (
+    AGG_TAIL_DEPTH,
     Axis,
     GateRef,
+    InstrumentPlan,
+    ReadRequest,
+    parse_gate_ref,
     validate_gate_channels,
 )
 
@@ -102,6 +106,46 @@ class SaeInstrument:
 
     def validate_gate(self, ref: GateRef) -> None:
         validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
+
+    # ---------------------------------------------------------------- planning
+
+    def plan(self, request: ReadRequest) -> InstrumentPlan:
+        """Declare the SAE family's capture demand for one generation.
+
+        The family reads one resident hook layer: live discovery captures
+        the live config's layer; pinned probes capture the resident
+        runtime layer whenever a finalize aggregate or an active gate will
+        read them (the resident layer is session-side runtime state shared
+        with steering atoms, consulted only when probes are attached).
+        """
+        live = self.live if request.live else None
+        probes = self.probes
+        gate_keys = frozenset(
+            key for key in request.gate_keys
+            if parse_gate_ref(key).probe in probes
+        )
+        latest: set[int] = set()
+        tail: set[int] = set()
+        if live is not None:
+            latest.add(int(live["layer"]))
+        if probes and (request.final_aggregate or gate_keys):
+            layer = self._session._sae_layer
+            if layer is not None:
+                latest.add(int(layer))
+                if request.final_aggregate:
+                    tail.add(int(layer))
+        return InstrumentPlan(
+            family=self.family,
+            latest_layers=frozenset(latest),
+            tail_layers=frozenset(tail),
+            tail_depth=AGG_TAIL_DEPTH if tail else 0,
+            per_step=bool(live is not None or gate_keys),
+            gate_keys=gate_keys,
+            final_aggregate=bool(probes and request.final_aggregate),
+            batch_aggregate=bool(
+                request.batch and probes and request.final_aggregate
+            ),
+        )
 
     def probe_hash(self, name: str) -> str | None:
         """Readout-channel identity digest.

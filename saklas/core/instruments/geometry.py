@@ -26,7 +26,10 @@ from saklas.core.instruments.types import (
     Distance,
     Fraction,
     GateRef,
+    InstrumentPlan,
     Membership,
+    ReadRequest,
+    parse_gate_ref,
     validate_gate_channels,
 )
 
@@ -103,6 +106,57 @@ class GeometryInstrument:
 
     def validate_gate(self, ref: GateRef) -> None:
         validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
+
+    # ---------------------------------------------------------------- planning
+
+    def plan(self, request: ReadRequest) -> InstrumentPlan:
+        """Declare the monitor roster's capture demand for one generation.
+
+        Demand, not mechanics (``protocol.py``): which layers must be
+        captured for the roster to read, whether anything reads per step,
+        and which gate scalar keys belong to this family.  The session
+        planner unions plans across families and picks physical retention.
+
+        When probe gates are the family's *sole* per-token consumer and
+        the caller disabled final probe readings, demand narrows to the
+        gated probes' layer union — dormant pinned probes must not keep
+        capture alive (FIX #4's layer-union half).
+        """
+        monitor = self._session._monitor
+        names = set(monitor.probe_names)
+        if not names:
+            return InstrumentPlan(family=self.family)
+        gate_keys = frozenset(
+            key for key in request.gate_keys
+            if parse_gate_ref(key).probe in names
+        )
+        per_token = bool(gate_keys or request.per_token_consumers)
+        if not (per_token or request.final_aggregate):
+            # Dormant roster: probes attached, but nothing this generation
+            # consumes a reading (no gate, no per-token consumer, final
+            # readings disabled).
+            return InstrumentPlan(family=self.family, gate_keys=gate_keys)
+        narrow_to_gated = bool(
+            gate_keys
+            and not request.per_token_consumers
+            and not request.final_aggregate
+        )
+        if narrow_to_gated:
+            gated_names = {parse_gate_ref(key).probe for key in gate_keys}
+            probe_layers = monitor.probe_layers(gated_names)
+        else:
+            # Bare call — the full-roster union (also what duck-typed
+            # monitor stubs without the subset parameter implement).
+            probe_layers = monitor.probe_layers()
+        latest = frozenset(int(layer) for layer in probe_layers)
+        return InstrumentPlan(
+            family=self.family,
+            latest_layers=latest,
+            per_step=per_token,
+            gate_keys=gate_keys,
+            final_aggregate=bool(request.final_aggregate),
+            batch_aggregate=bool(request.batch and request.final_aggregate),
+        )
 
     def probe_hash(self, name: str) -> str | None:
         """sha256 of the probe's baked tensor bytes (deterministic across

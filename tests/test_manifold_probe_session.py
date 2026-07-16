@@ -124,11 +124,18 @@ def _stub_session() -> SaklasSession:
     session._lens_probes = {}
     session._live_sae = None
     session._sae_probes = {}
-    # Geometry attaches route through the instrument adapter now; a real
-    # adapter over this stub reproduces the old inline add_probe flow
-    # (exclusive section + whitener touch + resolve + monitor.add_probe).
+    # All three families route through real instruments now: geometry for
+    # the add_probe flow (exclusive section + whitener touch + resolve +
+    # monitor.add_probe), lens/SAE because ``_begin_capture`` consumes
+    # their ``plan()`` demand — a MagicMock plan would poison the capture
+    # layer union.  Lens/SAE state (live config, probe registry) lives ON
+    # the instruments; tests set ``session._lens_instrument.live`` etc.
     from saklas.core.instruments.geometry import GeometryInstrument
+    from saklas.core.instruments.lens import LensInstrument
+    from saklas.core.instruments.sae import SaeInstrument
     session._geometry_instrument = GeometryInstrument(session)
+    session._lens_instrument = LensInstrument(session)
+    session._sae_instrument = SaeInstrument(session)
     session._lens_step_stash = None
     session._live_lens_active_for_generation = True
     session._incremental_readings = []
@@ -266,7 +273,9 @@ def test_begin_capture_live_lens_uses_persistent_capture_when_available():
     """Live J-lens layers ride compile-clean persistent capture buffers."""
     session = _stub_session()
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
-    session._live_lens = {"layers": [1, 3]}
+    # Live-lens state lives on the instrument; ``_begin_capture`` reads it
+    # through the lens family's declared plan.
+    session._lens_instrument.live = {"layers": [1, 3]}
     session._compiled_clean_eligible = True
     session._steering_uses_compiled_offsets = False
     session._capture_buffers = {
@@ -306,7 +315,7 @@ def test_begin_capture_live_lens_ignored_without_consumer():
     that cannot surface ``TokenEvent.lens_readout``."""
     session = _stub_session()
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]
-    session._live_lens = {"layers": [1, 3]}
+    session._lens_instrument.live = {"layers": [1, 3]}
     session._capture.attach = lambda *args, **kw: None
     session._capture.clear = lambda: None
     session._incremental_readings = []

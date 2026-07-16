@@ -50,6 +50,13 @@ if TYPE_CHECKING:
 
 InstrumentFamily = Literal["geometry", "lens", "sae"]
 
+#: Depth of the bounded capture tail ring finalize aggregates pool from —
+#: deep enough to walk back past trailing special tokens to the last
+#: content token.  Declared here (the plan vocabulary) so instruments can
+#: state the ring depth they demand; the session planner's own uses alias
+#: this value.
+AGG_TAIL_DEPTH = 8
+
 DepthBasis = Literal[
     # geometry: mass = share_weight_L * |coord_L[axis]| (monitor _depth_stats)
     "share_weighted_coord_mass",
@@ -329,6 +336,7 @@ LiveConfig = Union[GeometryLiveConfig, LensLiveConfig, SaeLiveConfig]
 
 
 __all__ = [
+    "AGG_TAIL_DEPTH",
     "Assignment",
     "Axis",
     "DepthBasis",

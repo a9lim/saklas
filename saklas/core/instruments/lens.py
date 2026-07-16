@@ -29,8 +29,12 @@ from typing import Any, Sequence, TYPE_CHECKING, cast
 import torch
 
 from saklas.core.instruments.types import (
+    AGG_TAIL_DEPTH,
     Axis,
     GateRef,
+    InstrumentPlan,
+    ReadRequest,
+    parse_gate_ref,
     validate_gate_channels,
 )
 
@@ -131,6 +135,54 @@ class LensInstrument:
 
     def validate_gate(self, ref: GateRef) -> None:
         validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
+
+    # ---------------------------------------------------------------- planning
+
+    def plan(self, request: ReadRequest) -> InstrumentPlan:
+        """Declare the lens family's capture demand for one generation.
+
+        ``latest_layers`` — the live workspace readout's layer set plus the
+        pinned probes' fitted band (full band when a finalize aggregate
+        will pool it; the gated probes' band when gates are the only
+        per-step consumer with final readings disabled).  ``tail_layers``
+        is the finalize-pooling demand: pinned probes' aggregates pool the
+        last content token from the capture tail ring, which must span the
+        probe band at ring depth ``AGG_TAIL_DEPTH``.
+        """
+        live = self.live if request.live else None
+        probes = self.probes
+        gate_keys = frozenset(
+            key for key in request.gate_keys
+            if parse_gate_ref(key).probe in probes
+        )
+        latest: set[int] = set()
+        tail: set[int] = set()
+        if live is not None:
+            latest.update(int(layer) for layer in live["layers"])
+        if probes and request.final_aggregate:
+            band = {int(layer) for layer in self.probe_layers()}
+            latest.update(band)
+            tail.update(band)
+        elif gate_keys:
+            # Gate-only pinned probes need per-step latest slices, but
+            # dormant probes must not keep capture alive when the caller
+            # disabled final probe readings.
+            gated_names = {parse_gate_ref(key).probe for key in gate_keys}
+            latest.update(
+                int(layer) for layer in self.probe_layers(gated_names)
+            )
+        return InstrumentPlan(
+            family=self.family,
+            latest_layers=frozenset(latest),
+            tail_layers=frozenset(tail),
+            tail_depth=AGG_TAIL_DEPTH if tail else 0,
+            per_step=bool(live is not None or gate_keys),
+            gate_keys=gate_keys,
+            final_aggregate=bool(probes and request.final_aggregate),
+            batch_aggregate=bool(
+                request.batch and probes and request.final_aggregate
+            ),
+        )
 
     def probe_hash(self, name: str) -> str | None:
         """Readout-channel identity digest (no baked tensor exists).

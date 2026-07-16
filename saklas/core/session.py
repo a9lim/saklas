@@ -70,6 +70,7 @@ from saklas.core.model import (
     loaded_model_fingerprint,
     workspace_layer_indices,
 )
+from saklas.core.instruments.types import AGG_TAIL_DEPTH, ReadRequest
 from saklas.core.monitor import Monitor
 from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile, load_profile as _load_profile
@@ -219,7 +220,9 @@ _CORPUS_GEN_BATCH = 16
 # consumer): how many trailing hidden slices to retain so finalize can pool the
 # last *content* token after walking back past trailing special tokens (EOS,
 # end-of-turn). 8 comfortably covers any chat template's trailing-marker run.
-_AGG_TAIL_DEPTH = 8
+# Canonical value lives in the instrument-plan vocabulary so families can
+# declare the ring depth they demand.
+_AGG_TAIL_DEPTH = AGG_TAIL_DEPTH
 
 # Floor on the shared token prefix ``generate_batch`` will KV-cache.  Below
 # this the saved prefill is in the noise and the double-render + cache-management
@@ -5527,6 +5530,13 @@ class SaklasSession:
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
 
+        The capture layer set is **plan-driven**: each instrument family
+        declares its demand via ``Instrument.plan(ReadRequest) ->
+        InstrumentPlan`` and this planner unions the declared layers.
+        Retention (incremental vs tail ring vs full stack) remains the
+        planner's decision below — cross-instrument resource sharing the
+        plans deliberately do not decide (``protocol.py``).
+
         ``widen=False`` (default): cover the union of vector-probe
         layers and manifold-probe layers — what both monitors need.
         Fast path; matches v1 behavior when only vector probes are
@@ -5558,25 +5568,49 @@ class SaklasSession:
         gated probe layers and keeps no full-roster tail. ``None`` (or empty)
         keeps the full per-token scoring.
         """
+        # ---- Per-family capture demand (Instrument.plan) -------------------
+        # The planner hands each family what the session knows about this
+        # generation's read demand; each family answers with its declared
+        # ``InstrumentPlan``.  The union of declared layers replaces the
+        # former inline per-family union branches.  RETENTION (incremental
+        # vs tail ring vs full stack) stays session logic below — the
+        # ``INCREMENTAL -> set_tail_with_sink`` upgrade is cross-instrument
+        # resource sharing, which plans deliberately do not decide
+        # (``protocol.py`` division of labor).
+        per_token_full_consumer = bool(
+            need_per_token and gating_only_probes is None
+        )
+        geometry_plan = self._geometry_instrument.plan(ReadRequest(
+            gate_keys=frozenset(gating_probe_keys or ()),
+            per_token_consumers=per_token_full_consumer,
+            final_aggregate=final_probe_aggregate,
+            return_hidden=widen,
+        ))
+        lens_plan = self._lens_instrument.plan(ReadRequest(
+            gate_keys=frozenset(lens_gating_probe_keys or ()),
+            live=live_lens_active,
+            per_token_consumers=per_token_full_consumer,
+            final_aggregate=final_probe_aggregate,
+            return_hidden=widen,
+        ))
+        sae_plan = self._sae_instrument.plan(ReadRequest(
+            gate_keys=frozenset(sae_gating_probe_keys or ()),
+            live=live_sae_active,
+            per_token_consumers=per_token_full_consumer,
+            final_aggregate=final_probe_aggregate,
+            return_hidden=widen,
+        ))
+        has_lens_gate = bool(lens_plan.gate_keys)
+        has_sae_gate = bool(sae_plan.gate_keys)
+
         # Refresh an externally replaced/removed J-lens exactly once before
         # fixing this generation's capture layers.  Every token, gate, and
         # final aggregate below consumes the same resident generation even if
-        # another process switches ``jlens.json`` mid-decode.
-        configured_live_lens = (
-            self._live_lens if live_lens_active else None
-        )
-        configured_lens_probes = self._lens_probes
-        configured_lens_gate_names = {
-            key.split("[", 1)[0]
-            for key in (lens_gating_probe_keys or set())
-            if key.split("[", 1)[0] in configured_lens_probes
-        }
+        # another process switches ``jlens.json`` mid-decode.  The pin is
+        # needed exactly when the lens family declared any capture demand
+        # (live readout, gated probes, or finalize aggregates).
         needs_lens_snapshot = bool(
-            configured_live_lens is not None
-            or (
-                configured_lens_probes
-                and (final_probe_aggregate or configured_lens_gate_names)
-            )
+            lens_plan.latest_layers or lens_plan.tail_layers
         )
         # A prior defensive/standalone capture may not have run the ordinary
         # generation-finally cleanup. Never let its snapshot suppress this
@@ -5586,17 +5620,6 @@ class SaklasSession:
         self._generation_jlens = self.jlens if needs_lens_snapshot else None
         self._generation_jlens_active = needs_lens_snapshot
 
-        live_lens = self._live_lens if live_lens_active else None
-        lens_probes = self._lens_probes
-        live_sae = self._live_sae if live_sae_active else None
-        sae_probes = self._sae_probes
-        lens_gate_probe_names = {
-            key.split("[", 1)[0]
-            for key in (lens_gating_probe_keys or set())
-            if key.split("[", 1)[0] in lens_probes
-        }
-        has_lens_gate = bool(lens_gate_probe_names)
-        has_sae_gate = bool(sae_gating_probe_keys)
         # Per-generation reset of the per-forward lens stash + display row.
         self._lens_step_stash = None
         self._last_lens_step_readings = None
@@ -5605,40 +5628,11 @@ class SaklasSession:
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
-            gate_only_no_final = bool(
-                gating_only_probes
-                and need_per_token
-                and not final_probe_aggregate
-                and self._monitor.probe_names
+            union: set[int] = set(
+                geometry_plan.latest_layers
+                | lens_plan.latest_layers | lens_plan.tail_layers
+                | sae_plan.latest_layers | sae_plan.tail_layers
             )
-            gate_probe_names = (
-                set(gating_only_probes)
-                if gate_only_no_final and gating_only_probes is not None
-                else None
-            )
-            union: set[int] = set()
-            if self._monitor.probe_names and (need_per_token or final_probe_aggregate):
-                union.update(self._monitor.probe_layers(gate_probe_names))
-            if live_lens is not None:
-                # The live workspace readout consumes the same latest-slice
-                # buffers the monitor does — its layers join the capture set.
-                union = union | set(live_lens["layers"])
-            if lens_probes and final_probe_aggregate:
-                # Final pinned lens-probe aggregates read their full band.
-                union = union | self._lens_probe_layers()
-            elif has_lens_gate:
-                # Gate-only lens probes need per-step latest slices, but
-                # dormant pinned probes should not keep capture alive when the
-                # caller explicitly disabled final probe readings.
-                union = union | self._lens_probe_layers(lens_gate_probe_names)
-            if live_sae is not None:
-                union.add(int(live_sae["layer"]))
-            if (
-                sae_probes
-                and self._sae_layer is not None
-                and (final_probe_aggregate or has_sae_gate)
-            ):
-                union.add(int(self._sae_layer))
             if not union:
                 # No probes ⇒ the degenerate FULL (capture-disabled) state.
                 self._capture_state = CaptureState(
@@ -5771,22 +5765,20 @@ class SaklasSession:
                 )
 
             if (
-                (lens_probes and (final_probe_aggregate or has_lens_gate))
-                or (sae_probes and (final_probe_aggregate or has_sae_gate))
+                lens_plan.final_aggregate or has_lens_gate
+                or sae_plan.final_aggregate or has_sae_gate
             ):
                 # Lens probes pool their finalize aggregate from the tail
                 # ring; ``set_incremental``'s length-1 buffers can't walk back
                 # past trailing specials, so arm the ring alongside the sink.
                 # When final probe aggregates are disabled, pinned J-lens/SAE
                 # probes still need the latest slice for gates/live consumers,
-                # but do not need the 8-deep EOS walk-back ring.
-                readout_tail_layers: set[int] | None = None
-                if final_probe_aggregate:
-                    readout_tail_layers = set()
-                    if lens_probes:
-                        readout_tail_layers.update(self._lens_probe_layers())
-                    if sae_probes and self._sae_layer is not None:
-                        readout_tail_layers.add(int(self._sae_layer))
+                # but do not need the 8-deep EOS walk-back ring.  The ring's
+                # layer span is the readout families' declared finalize-
+                # pooling demand (empty when final readings are off).
+                readout_tail_layers = set(
+                    lens_plan.tail_layers | sae_plan.tail_layers
+                )
                 self._capture.set_tail_with_sink(
                     _AGG_TAIL_DEPTH if final_probe_aggregate else 1,
                     _score_step,
@@ -5809,10 +5801,8 @@ class SaklasSession:
             self._capture_state.mode = CaptureMode.AGGREGATE_ONLY
             self._monitor.enable_curved_warm(False)
         elif not widen and (
-            live_lens is not None
-            or (lens_probes and (final_probe_aggregate or has_lens_gate))
-            or live_sae is not None
-            or (sae_probes and (final_probe_aggregate or has_sae_gate))
+            lens_plan.latest_layers or lens_plan.tail_layers
+            or sae_plan.latest_layers or sae_plan.tail_layers
         ):
             # Lens/SAE-only capture (live readout on and/or readout probes
             # pinned, no monitor probes): a bounded tail ring keeps the
@@ -9960,13 +9950,21 @@ class SaklasSession:
                 probe_names or has_lens_probes or has_sae_probes
             )
             if capture_probe_aggregates:
+                # Batch rows read only end-of-row aggregates: each family
+                # declares its layers under a batch ReadRequest (no live
+                # readouts, no per-token consumers, no gates).
+                batch_request = ReadRequest(
+                    final_aggregate=return_probe_readings,
+                    batch=True,
+                )
                 layer_set: set[int] = set()
-                if probe_names:
-                    layer_set.update(int(layer) for layer in self._monitor.probe_layers())
-                if has_lens_probes:
-                    layer_set.update(int(layer) for layer in self._lens_probe_layers())
-                if has_sae_probes and self._sae_layer is not None:
-                    layer_set.add(int(self._sae_layer))
+                for batch_plan in (
+                    self._geometry_instrument.plan(batch_request),
+                    self._lens_instrument.plan(batch_request),
+                    self._sae_instrument.plan(batch_request),
+                ):
+                    layer_set |= batch_plan.latest_layers
+                    layer_set |= batch_plan.tail_layers
                 layer_idxs = sorted(layer_set)
                 self._capture.clear()
                 if layer_idxs:
