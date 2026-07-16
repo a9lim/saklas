@@ -441,11 +441,12 @@ def aggregate_readout_from_probabilities(
         top_k=top_k,
         depth_tensor=depth_tensor,
     )
-    # Public list surface: one packed host transfer. Token ids are promoted to
-    # float64 only in this tiny K-wide payload, which represents every practical
-    # vocabulary id exactly and avoids a second CUDA synchronization.
+    # Public list surface: one packed host transfer. Keep the device-side
+    # payload in fp32: MPS does not support float64, while fp32 still represents
+    # every practical vocabulary id exactly (up to 2**24) and avoids a second
+    # accelerator synchronization.
     host = torch.cat(
-        [stats.to(torch.float64), idxs.reshape(1, -1).to(torch.float64)],
+        [stats.float(), idxs.reshape(1, -1).to(torch.float32)],
         dim=0,
     ).cpu()
     return [
