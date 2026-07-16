@@ -540,18 +540,23 @@ class TestTreeGet:
             "logprob": -1.5,
             "probes": {"calm": 0.42},
             "per_layer_scores": {"5": {"calm": 0.38}, "10": {"calm": 0.45}},
-            "captured": {
-                "lens": {
-                    "provenance": "captured",
-                    "source": "local:default",
-                    "steering": None,
-                    "layers": [{
-                        "layer": 5,
-                        "tokens": [{
-                            "token": "hello", "id": 100, "logprob": -0.1,
-                        }],
-                    }],
-                    "aggregate": [],
+            "measurements": {
+                "version": 1,
+                "scope": "token",
+                "provenance": "captured",
+                "instruments": {
+                    "lens": {
+                        "readout": {
+                            "layers": [{
+                                "layer": 5,
+                                "tokens": [{
+                                    "token": "hello", "id": 100, "logprob": -0.1,
+                                }],
+                            }],
+                            "aggregate": [],
+                        },
+                        "binding": {"source": "local:default", "steering": None},
+                    },
                 },
             },
         })
@@ -579,7 +584,10 @@ class TestTreeGet:
         assert first["per_layer_scores"] == {
             "5": {"calm": 0.38}, "10": {"calm": 0.45},
         }
-        assert first["captured"]["lens"]["layers"][0]["tokens"][0] == {
+        lens_readout = (
+            first["measurements"]["instruments"]["lens"]["readout"]
+        )
+        assert lens_readout["layers"][0]["tokens"][0] == {
             "token": "hello", "id": 100, "logprob": -0.1,
         }
 

@@ -101,11 +101,14 @@ def test_set_authored_token_scores_is_one_tree_mutation():
         {
             "token_id": 7,
             "text": "hello",
-            "captured": {
-                "probes": {
-                    "provenance": "captured",
-                    "scores": {"formal": 0.25},
+            "measurements": {
+                "version": 1,
+                "scope": "token",
+                "provenance": "captured",
+                "instruments": {
+                    "geometry": {"readings": {"formal": {"coords": [0.25]}}},
                 },
+                "scores": {"formal": 0.25},
             },
         },
     ])
@@ -113,7 +116,7 @@ def test_set_authored_token_scores_is_one_tree_mutation():
     assert t.rev == before + 1
     tokens = t.nodes[uid].tokens
     assert tokens is not None
-    assert tokens[0]["captured"]["probes"]["scores"] == {
+    assert tokens[0]["measurements"]["scores"] == {
         "formal": 0.25,
     }
     assert seen[-1].op == "capture_authored"

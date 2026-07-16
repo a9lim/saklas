@@ -1324,13 +1324,12 @@ capture-widen union in `_begin_capture` (which also forces transient — not
 persistent — capture routing, and arms a bounded tail ring when no probes are
 attached), and `_live_lens_readout_step` runs at the token tap post-forward —
 no new forward hooks, `static_steerable` untouched — returning `(per_layer,
-aggregate, token_ids)` and landing the compatibility pair view on
-`TokenEvent.lens_readout` /
-`TokenEvent.lens_aggregate` and the `_last_token_probe_payload["lens"]` /
-`["lens_aggregate"]` slots. `token_ids` are the ids already selected by the
-same top-k; `TokenProbePayload.to_token_payload` combines them with those
-probabilities into the endpoint-shaped, JSON-safe `captured.lens` record
-without another softmax. The aggregate covers every live layer, and its
+aggregate, token_ids)`. The tap passes those into
+`TokenProbePayload.to_token_payload` (`lens=`/`lens_aggregate=`/`lens_token_ids=`),
+which folds them — with the same probabilities, no second softmax — into the
+5.x measurement envelope's `instruments.lens.readout` block (`build_measurements`);
+`generate_stream` forwards that envelope onto `TokenEvent.measurements`. The
+aggregate covers every live layer, and its
 top-k width follows the generation's resolved logit-alternative
 `return_top_k` (8 only when alternatives are disabled). The default layer set
 is **every fitted layer**; pass an explicit `layers` list to trade coverage for
@@ -1340,13 +1339,19 @@ policy; the library stays opt-in).
 
 ## loom.py
 
-Visible token rows own the canonical `captured` measurement record. The decode
-tap creates it for generated tokens; selective prefill capture creates the same
-shape for authored tokens from the producer rows that were already forward
-passed. Both stamp instrument source plus recipe steering and live directly on
-the loom node. Because token rows already ride the compressed token sidecar,
-explicit loom save/load preserves these rich historical channels without a
-separate cache or schema path. `set_authored_token_scores` installs one authored
+Visible token rows own the canonical `measurements` envelope (5.x — the record
+that replaced the `captured` key and the six per-token scalar aliases). The
+decode tap creates it for generated tokens; selective prefill capture creates
+the same shape for authored tokens from the producer rows that were already
+forward passed. Both stamp instrument source plus recipe steering inside the
+envelope's per-family `binding` and live directly on the loom node. The
+`TokenScoreDict` rows are stored opaquely (the sidecar reader validates only the
+node-level `tokens`/`thinking_tokens`/`raw_token_ids` fields, not the inner
+`measurements` shape), so the `TOKEN_SIDECAR_FORMAT_VERSION` did not change; a
+pre-5.x row still carrying a `captured` key loads fine but reads empty in a
+`measurements`-aware client (clean break — no migration). Because token rows
+already ride the compressed token sidecar, explicit loom save/load preserves
+these rich historical channels without a separate cache or schema path. `set_authored_token_scores` installs one authored
 channel atomically and emits `LoomMutated(op="capture_authored")`; unlike the
 hot-loop `append_token`, it advances the tree revision so clients receive the
 updated authored node.
@@ -1441,10 +1446,12 @@ context. Surfaced as `session.score_choices` / `session.score_template`.
 `ProbeReading`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s), and
-— while the live lens is on —
-`lens_readout` (per-layer top-k) + `lens_aggregate` (the layer-aggregated
-`[(token, strength, com, spread)]` chip list). `GenerationResult`
+`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s — the
+compat channel feeding the OpenAI/Ollama `x-saklas-probe-readings` vendor
+extension and the traits SSE, merged across families), and `measurements` (the
+5.x envelope — geometry/lens/sae `instruments` + flat `scores`/`per_layer_scores`
+views, `build_measurements`; replaced the former `lens_readout`/`lens_aggregate`/
+`sae_readout` fields). `GenerationResult`
 carries `prompt_tokens`, `finish_reason`, optional `logprobs`,
 `probe_readings`, and `applied_steering` (the
 canonical expression, round-trips through `parse_expr`). `ProbeReading`

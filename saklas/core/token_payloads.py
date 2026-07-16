@@ -2,22 +2,53 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 
+from saklas.core.measurements import build_measurements
 from saklas.core.results import ProbeReading
+
+# Per-family reading slot names, keyed by the ``family`` argument to
+# :meth:`TokenProbePayload.merge_readings`.
+_FAMILY_SLOTS = {
+    "geometry": "geometry_readings",
+    "lens": "lens_readings",
+    "sae": "sae_readings",
+}
 
 
 @dataclass(slots=True)
 class TokenProbePayload:
-    """Probe-derived payloads for one generated token."""
+    """Probe-derived payloads for one generated token.
+
+    Readings are kept in per-family slots (``geometry_readings`` /
+    ``lens_readings`` / ``sae_readings``) so the 5.x measurement envelope can
+    split them into ``instruments.geometry`` / ``.lens`` / ``.sae`` while the
+    flat ``scores`` / ``per_layer_scores`` cross-family views stay derived from
+    all three.
+    """
 
     scores: dict[str, float] | None = None
     per_layer_scores: dict[str, dict[str, float]] | None = None
-    probe_readings: dict[str, ProbeReading] | None = None
+    geometry_readings: dict[str, ProbeReading] | None = None
+    lens_readings: dict[str, ProbeReading] | None = None
+    sae_readings: dict[str, ProbeReading] | None = None
+
+    @property
+    def all_readings(self) -> dict[str, ProbeReading]:
+        """The three family slots merged into one per-probe dict.
+
+        Some internal consumers (the library ``TokenEvent.probe_readings``
+        field, the aggregate split) want the cross-family union rather than a
+        single family's slot.
+        """
+        merged: dict[str, ProbeReading] = {}
+        for slot in (self.geometry_readings, self.lens_readings, self.sae_readings):
+            if slot:
+                merged.update(slot)
+        return merged
 
     def to_token_payload(
         self,
@@ -31,39 +62,55 @@ class TokenProbePayload:
         sae_layer: int | None = None,
         steering: str | None = None,
     ) -> dict[str, Any]:
-        payload = {
-            "scores": self.scores,
-            "per_layer_scores": self.per_layer_scores,
-            "probe_readings": self.probe_readings,
-            "lens": lens,
-            "lens_aggregate": lens_aggregate,
-            "sae": sae,
-        }
-        captured = serialize_captured_token_channels(
-            payload,
+        """Shape this token's payload as ``{"measurements": <envelope>}``.
+
+        The single 5.x wire record — the envelope replaces the former
+        ``captured`` record and the six top-level scalar aliases.  ``lens`` is
+        the native per-layer readout (``lens_readout`` in the envelope) and
+        ``sae`` the native feature discovery (``sae_features``); the attached
+        per-family readings come from the payload's own slots.
+        """
+        measurements = build_measurements(
+            scope="token",
+            geometry_readings=self.geometry_readings,
+            lens_readings=self.lens_readings,
+            sae_readings=self.sae_readings,
+            per_layer_scores=self.per_layer_scores,
+            lens_readout=lens,
+            lens_aggregate=lens_aggregate,
             lens_token_ids=lens_token_ids,
             lens_source=lens_source,
+            sae_features=sae,
             sae_source=sae_source,
             sae_layer=sae_layer,
             steering=steering,
         )
-        if captured:
-            payload["captured"] = captured
-        return payload
+        return {"measurements": measurements}
 
     def merge_readings(
         self,
         extra: dict[str, ProbeReading],
         *,
+        family: str,
         per_layer: bool = False,
     ) -> None:
-        """Merge additional per-probe readings (e.g. J-lens token probes,
-        which score on the lens path rather than through the Monitor) into
-        the canonical rich channel and its derived scalar views."""
+        """Merge additional per-probe readings into a named family's slot.
+
+        ``family`` is one of ``"geometry"`` / ``"lens"`` / ``"sae"`` — J-lens
+        token probes and SAE feature probes score on their own paths rather
+        than through the Monitor, so their readings land in their own slot.
+        The flat ``scores`` (and, when ``per_layer``, ``per_layer_scores``)
+        cross-family views are updated the same way regardless of family.
+        """
         if not extra:
             return
+        try:
+            slot_name = _FAMILY_SLOTS[family]
+        except KeyError:
+            raise ValueError(f"unknown reading family {family!r}") from None
         self.scores = {**(self.scores or {}), **_axis0_scores(extra)}
-        self.probe_readings = {**(self.probe_readings or {}), **extra}
+        current: dict[str, ProbeReading] | None = getattr(self, slot_name)
+        setattr(self, slot_name, {**(current or {}), **extra})
         if per_layer:
             merged = dict(self.per_layer_scores or {})
             for layer, row in (_per_layer_axis0(extra) or {}).items():
@@ -92,111 +139,6 @@ def _per_layer_axis0(
     return by_layer or None
 
 
-def serialize_captured_token_channels(
-    payload: dict[str, Any],
-    *,
-    lens_token_ids: dict[int, list[int]] | None = None,
-    lens_source: str | None = None,
-    sae_source: str | None = None,
-    sae_layer: int | None = None,
-    steering: str | None = None,
-) -> dict[str, Any]:
-    """Return the JSON-safe, loom-owned measurement record for one token.
-
-    The decode tap calls this once, then places the same ``captured`` object
-    on both the loom token row and the native WebSocket frame.  Legacy scalar
-    aliases remain outside this record for existing consumers, but this is the
-    authoritative rich shape used by historical hover and drilldown surfaces.
-    """
-    captured: dict[str, Any] = {}
-
-    scores = payload.get("scores")
-    per_layer_scores = payload.get("per_layer_scores")
-    readings = payload.get("probe_readings")
-    if scores or per_layer_scores or readings:
-        probes: dict[str, Any] = {"provenance": "captured"}
-        if scores:
-            probes["scores"] = {
-                str(name): round(float(value), 6)
-                for name, value in scores.items()
-            }
-        if per_layer_scores:
-            probes["per_layer_scores"] = per_layer_scores
-        if readings:
-            probes["readings"] = {
-                str(name): reading.to_dict()
-                for name, reading in readings.items()
-            }
-        captured["probes"] = probes
-
-    lens = cast(
-        dict[int, list[tuple[str, float]]] | None,
-        payload.get("lens"),
-    )
-    aggregate = cast(
-        list[tuple[str, float, float, float]] | None,
-        payload.get("lens_aggregate"),
-    )
-    if lens or aggregate:
-        id_rows = lens_token_ids or {}
-        layers: list[dict[str, Any]] = []
-        for layer, row in sorted(lens.items() if lens else ()):
-            token_ids = id_rows.get(int(layer), [])
-            tokens: list[dict[str, Any]] = []
-            for index, pair in enumerate(row):
-                token, probability = pair
-                token_id = token_ids[index] if index < len(token_ids) else -1
-                # The live display already calibrated this row once.  Convert
-                # that probability into the endpoint's logprob unit without a
-                # second softmax; the floor keeps strict JSON finite.
-                logprob = math.log(max(float(probability), 1e-45))
-                tokens.append({
-                    "token": str(token),
-                    "id": int(token_id),
-                    "logprob": float(logprob),
-                })
-            layers.append({"layer": int(layer), "tokens": tokens})
-        captured["lens"] = {
-            "provenance": "captured",
-            "source": lens_source,
-            "steering": steering,
-            "layers": layers,
-            "aggregate": [
-                {
-                    "token": str(token),
-                    "strength": float(strength),
-                    "com": float(com),
-                    "spread": float(spread),
-                }
-                for token, strength, com, spread in (aggregate or ())
-            ],
-        }
-
-    sae = payload.get("sae")
-    if sae:
-        captured["sae"] = {
-            "provenance": "captured",
-            "source": sae_source,
-            "steering": steering,
-            "layer": int(sae_layer) if sae_layer is not None else None,
-            "features": [
-                {
-                    "id": int(row[0]),
-                    "activation": float(row[1]),
-                    "label": row[2],
-                    "max_act": (
-                        float(row[3])
-                        if len(row) > 3 and row[3] is not None
-                        else None
-                    ),
-                }
-                for row in sae
-            ],
-        }
-
-    return captured
-
-
 def build_token_probe_payload(
     *,
     monitor: Any,
@@ -213,6 +155,7 @@ def build_token_probe_payload(
     a typed helper. It performs at most one monitor geometry pass: either reuse
     the most recent incremental reading, or score the latest captured hidden
     states once and derive all scalar/per-layer/live payloads from that result.
+    The monitor readings land in the ``geometry`` family slot.
     """
     if not needs_scores:
         return TokenProbePayload()
@@ -245,5 +188,5 @@ def build_token_probe_payload(
             if assistant_node_id is not None and persists_layer_scores
             else None
         ),
-        probe_readings=readings,
+        geometry_readings=readings,
     )

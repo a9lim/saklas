@@ -50,73 +50,16 @@ def build_token_event(
     # loom rows: doing so creates a second wire authority and masks tap bugs.
     payload = session.token_probe_payload
 
-    scores_blob = payload.get("scores")
-    if scores_blob:
-        event["scores"] = {
-            name: round(float(value), 6)
-            for name, value in scores_blob.items()
-        }
-    per_layer_blob = (
-        payload.get("per_layer_scores")
-    )
-    if per_layer_blob:
-        event["per_layer_scores"] = per_layer_blob
-
-    # Rich channel: the full per-probe reading (coords + fraction + nearest)
-    # for the latest token. ``probe_readings`` is the unified per-probe dict;
-    # the token tap is the single owner
-    # of live probe scoring, so event shaping never reaches into private capture
-    # buffers or re-scores the token on the WebSocket path.
-    readings = payload.get("probe_readings")
-    if readings:
-        event["probe_readings"] = {
-            name: r.to_dict() for name, r in readings.items()
-        }
-
-    # Canonical historical record. The token tap builds this once and stores
-    # this exact JSON-safe object on the loom row; the WebSocket forwards it
-    # verbatim so live and rehydrated tokens have one rich-channel authority.
-    captured = payload.get("captured")
-    if captured:
-        event["captured"] = captured
-
-    # Live J-lens workspace readout: the step's top-k lens tokens per selected
-    # layer (``enable_live_lens``), stashed by the token tap alongside the
-    # probe readings.  String layer keys to match ``per_layer_scores``' wire
-    # shape; ``[token, score]`` pairs serialize as 2-arrays.
-    lens = payload.get("lens")
-    if lens:
-        event["lens_readout"] = {
-            str(layer): [[tok, float(score)] for tok, score in pairs]
-            for layer, pairs in lens.items()
-        }
-        # The layer-aggregated chip list riding the same step: ``[token,
-        # strength, com, spread]`` 4-arrays, strength-descending (mean
-        # band probability + probability-mass-weighted depth center of mass).
-    agg = payload.get("lens_aggregate")
-    if agg:
-        event["lens_aggregate"] = [
-            [tok, float(s), float(com), float(spread)]
-            for tok, s, com, spread in agg
-        ]
-
-    sae = payload.get("sae")
-    if sae:
-        # ``max_act`` is the cached Neuronpedia maxActApprox (the strength
-        # unit — clients render ``activation / max_act`` as the normalized
-        # 0..1 strength); ``None`` until the metadata backfill lands.
-        event["sae_readout"] = [
-            {
-                "id": int(row[0]),
-                "activation": float(row[1]),
-                "label": row[2],
-                "max_act": (
-                    float(row[3])
-                    if len(row) > 3 and row[3] is not None
-                    else None
-                ),
-            }
-            for row in sae
-        ]
+    # The 5.x measurement envelope is the single read-side wire record: geometry
+    # / lens / SAE ``instruments`` plus the flat ``scores`` / ``per_layer_scores``
+    # views (:func:`saklas.core.measurements.build_measurements`).  The token tap
+    # builds it once and stores it on the loom row; the WebSocket forwards it
+    # verbatim so live and rehydrated tokens share one rich-channel authority.
+    # It replaces the former top-level ``scores`` / ``per_layer_scores`` /
+    # ``probe_readings`` / ``captured`` / ``lens_readout`` / ``lens_aggregate`` /
+    # ``sae_readout`` aliases, which are gone from the token frame.
+    measurements = payload.get("measurements")
+    if measurements:
+        event["measurements"] = measurements
 
     return event

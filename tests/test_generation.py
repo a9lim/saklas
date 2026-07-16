@@ -240,9 +240,11 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
         "jlens/yes": 0.8,
         "sae/12": 0.5,
     }
-    assert set(row["captured"]) == {"probes", "lens", "sae"}
-    assert row["captured"]["lens"]["layers"][0]["tokens"][0]["id"] == 9
-    assert row["captured"]["sae"]["features"][0]["id"] == 12
+    instruments = row["measurements"]["instruments"]
+    assert set(instruments) == {"geometry", "lens", "sae"}
+    assert instruments["geometry"]["readings"]["formal"]["coords"] == [0.25]
+    assert instruments["lens"]["readout"]["layers"][0]["tokens"][0]["id"] == 9
+    assert instruments["sae"]["readout"]["features"][0]["id"] == 12
 
 
 def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -610,6 +612,13 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     )
     reading = ProbeReading(0.0, [], coords=(0.7,))
     flags: dict[str, bool] = {}
+    # The readout-suppression mechanism now lives at the tap: ``live_readouts``
+    # gates the consumer's ``lens_readout`` / ``sae_readout`` compute flags, so
+    # the tap never builds lens/SAE readout instruments.  The measurement
+    # envelope the tap produced forwards verbatim onto ``TokenEvent.measurements``
+    # (here the tap is faked, so the envelope carries only what the fake set),
+    # and ``probe_readings`` still rides the compat channel under ``live_scores``.
+    envelope = {"version": 1, "scope": "token", "instruments": {}}
 
     session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
 
@@ -617,12 +626,8 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
         on_token = kwargs["on_token"]
         flags["lens"] = on_token.options.lens_readout
         flags["sae"] = on_token.options.sae_readout
-        session._last_token_probe_payload = {
-                "probe_readings": {"sae/0": reading},
-            "lens": {1: [("tok", 0.5)]},
-            "lens_aggregate": [("tok", 0.5, 0.5, 0.0)],
-            "sae": [(0, 1.0, None, None)],
-        }
+        session._last_token_probe_readings = {"sae/0": reading}
+        session._last_token_probe_payload = {"measurements": envelope}
         on_token("ok", False, 7, None, None, None)
         return result
 
@@ -631,8 +636,10 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
         probe_names=[],
         update_live=lambda _readings: None,
     )
+    session._lens_probes = {}
     session._sae_probes = {"sae/0": {"feature_id": 0}}
     session._last_token_probe_payload = {}
+    session._last_token_probe_readings = None
     session._generate_core = _fake_generate_core
 
     events = list(session.generate_stream(
@@ -641,9 +648,7 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
 
     assert flags == {"lens": False, "sae": False}
     assert events[0].probe_readings == {"sae/0": reading}
-    assert events[0].lens_readout is None
-    assert events[0].lens_aggregate is None
-    assert events[0].sae_readout is None
+    assert events[0].measurements is envelope
 
 
 def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(

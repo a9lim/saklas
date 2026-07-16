@@ -1559,7 +1559,8 @@ class TestLensLiveToggle:
 
 
 class TestWSTokenEventLens:
-    """``build_token_event`` copies the token tap's lens slot onto the frame."""
+    """``build_token_event`` forwards the token tap's 5.x ``measurements``
+    envelope verbatim onto the frame and carries no legacy per-token aliases."""
 
     @staticmethod
     def _event(payload: Any) -> dict[str, Any]:
@@ -1582,41 +1583,53 @@ class TestWSTokenEventLens:
             top_alts=None,
         )
 
-    def test_scores_prefer_token_payload_without_tree_lookup(self) -> None:
-        from types import SimpleNamespace
-
-        from saklas.server.ws_events import build_token_event
-
-        class ExplodingTree:
-            @property
-            def active_node_id(self) -> str:
-                raise AssertionError("payload path should not read active node")
-
-            @property
-            def nodes(self) -> Any:
-                raise AssertionError("payload path should not read tree rows")
-
-        session = SimpleNamespace(
-            token_probe_payload={
-                "scores": {"calm": 0.4242429},
-                "per_layer_scores": {"5": {"calm": 0.38}},
+    def test_measurements_ride_token_frame_verbatim(self) -> None:
+        """The envelope forwards by identity — the token tap is the single
+        authority; event shaping never rebuilds or reshapes channels."""
+        measurements = {
+            "version": 1,
+            "scope": "token",
+            "provenance": "captured",
+            "scores": {"calm": 0.424243},
+            "per_layer_scores": {"5": {"calm": 0.38}},
+            "instruments": {
+                "geometry": {"readings": {"calm": {"coords": [0.424243]}}},
+                "lens": {
+                    "readout": {
+                        "layers": [{
+                            "layer": 12,
+                            "tokens": [
+                                {"token": " a", "id": 7, "logprob": -0.25},
+                            ],
+                        }],
+                        "aggregate": [
+                            {"token": " a", "strength": 0.41,
+                             "com": 0.31, "spread": 0.05},
+                        ],
+                    },
+                    "binding": {"source": "local:default", "steering": None},
+                },
+                "sae": {
+                    "readout": {
+                        "features": [
+                            {"id": 362, "activation": 3216.0,
+                             "label": "code blocks", "max_act": 4000.0},
+                        ],
+                    },
+                    "binding": {
+                        "source": "saelens:x", "steering": None, "layer": 12,
+                    },
+                },
             },
-            tree=ExplodingTree(),
-            generation_state=SimpleNamespace(emit_map=[]),
-        )
-
-        event = build_token_event(
-            cast(Any, session),
-            ["node-1"],
-            text=" x",
-            is_thinking=False,
-            tid=5,
-            lp=None,
-            top_alts=None,
-        )
-
-        assert event["scores"] == {"calm": 0.424243}
-        assert event["per_layer_scores"] == {"5": {"calm": 0.38}}
+        }
+        event = self._event({"measurements": measurements})
+        assert event["measurements"] is measurements
+        # The six legacy per-token aliases are gone from the frame.
+        for dead in (
+            "scores", "per_layer_scores", "probe_readings",
+            "lens_readout", "lens_aggregate", "sae_readout", "captured",
+        ):
+            assert dead not in event
 
     def test_perplexity_rides_token_frame(self) -> None:
         from types import SimpleNamespace
@@ -1641,13 +1654,23 @@ class TestWSTokenEventLens:
 
         assert event["perplexity"] == 2.75
 
-    def test_scores_are_not_reconstructed_from_tree_rows(self) -> None:
+    def test_measurements_not_reconstructed_from_tree_rows(self) -> None:
         from types import SimpleNamespace
 
         from saklas.server.ws_events import build_token_event
 
+        class ExplodingTree:
+            @property
+            def active_node_id(self) -> str:
+                raise AssertionError("payload path should not read active node")
+
+            @property
+            def nodes(self) -> Any:
+                raise AssertionError("payload path should not read tree rows")
+
         session = SimpleNamespace(
             token_probe_payload={},
+            tree=ExplodingTree(),
             generation_state=SimpleNamespace(emit_map=[]),
         )
 
@@ -1661,96 +1684,15 @@ class TestWSTokenEventLens:
             top_alts=None,
         )
 
-        assert "scores" not in event
-        assert "per_layer_scores" not in event
+        assert "measurements" not in event
 
-    def test_lens_readout_rides_token_frame(self) -> None:
-        event = self._event(
-            {
-                "readings": None,
-                "lens": {12: [(" a", 0.5), (" b", -1.0)], 18: [(" c", 2.0)]},
-            }
-        )
-        # String layer keys (the ``per_layer_scores`` wire convention);
-        # pairs serialize as 2-arrays.
-        assert event["lens_readout"] == {
-            "12": [[" a", 0.5], [" b", -1.0]],
-            "18": [[" c", 2.0]],
-        }
-
-    def test_canonical_capture_rides_token_frame_verbatim(self) -> None:
-        captured = {
-            "lens": {
-                "provenance": "captured",
-                "source": "local:default",
-                "steering": None,
-                "layers": [{
-                    "layer": 12,
-                    "tokens": [{"token": " a", "id": 7, "logprob": -0.25}],
-                }],
-                "aggregate": [],
-            },
-        }
-        event = self._event({"captured": captured})
-
-        assert event["captured"] is captured
-
-    def test_absent_when_lens_off(self) -> None:
-        event = self._event({"readings": None, "lens": None})
-        assert "lens_readout" not in event
+    def test_absent_when_no_measurements(self) -> None:
+        event = self._event({"measurements": None})
+        assert "measurements" not in event
 
     def test_absent_when_no_payload(self) -> None:
         event = self._event(None)
-        assert "lens_readout" not in event
-
-    def test_lens_aggregate_rides_token_frame(self) -> None:
-        event = self._event(
-            {
-                "readings": None,
-                "lens": {12: [(" a", 0.5)]},
-                "lens_aggregate": [
-                    (" a", 0.41, 0.31, 0.05),
-                    (" b", 0.2, 0.8, 0.1),
-                ],
-            }
-        )
-        # 4-arrays: [token, strength, com, spread], strength-descending.
-        assert event["lens_aggregate"] == [
-            [" a", 0.41, 0.31, 0.05],
-            [" b", 0.2, 0.8, 0.1],
-        ]
-
-    def test_lens_aggregate_absent_when_off(self) -> None:
-        event = self._event(
-            {"readings": None, "lens": None, "lens_aggregate": None}
-        )
-        assert "lens_aggregate" not in event
-
-    def test_sae_readout_rides_token_frame(self) -> None:
-        event = self._event(
-            {
-                "readings": None,
-                "lens": None,
-                "sae": [
-                    (362, 3216.0, "code blocks", 4000.0),
-                    (148, 1832.0, None, None),
-                ],
-            }
-        )
-        # Rows carry the raw activation AND the cached maxActApprox (the
-        # strength unit) — clients render activation / max_act as the
-        # normalized 0..1 strength; null until the metadata backfill lands.
-        assert event["sae_readout"] == [
-            {
-                "id": 362, "activation": 3216.0, "label": "code blocks",
-                "max_act": 4000.0,
-            },
-            {"id": 148, "activation": 1832.0, "label": None, "max_act": None},
-        ]
-
-    def test_sae_readout_absent_when_off(self) -> None:
-        event = self._event({"readings": None, "lens": None, "sae": None})
-        assert "sae_readout" not in event
+        assert "measurements" not in event
 
 
 class TestProbesLiveToggle:

@@ -118,6 +118,7 @@ class TestTokenEvent:
         assert event.finish_reason is None
         assert event.probe_readings is None
         assert event.perplexity is None
+        assert event.measurements is None
 
     def test_logprobs_carried_through(self):
         """Populated logprob + top_alts (phase 1 logit pass) land on the

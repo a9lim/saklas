@@ -404,7 +404,8 @@ in-flight stream and applies to the next generation). Enabling moves the
 selected layers' `J_l` device-resident; `layers` omitted enables every fitted
 layer. Returns `{enabled,
 layers}` (the resolved list). While enabled, the native WS `token` frame
-carries the per-step matrix as `lens_readout` (see ws_stream below) and
+carries the per-step matrix inside its `measurements` envelope
+(`instruments.lens.readout`; see ws_stream below) and
 session info reports the layer list as `live_lens_layers` (`null` while off —
 the dashboard's WORKSPACE-panel rehydration read). The generation's resolved
 logit-alternative `return_top_k` also sets the live lens width. Errors:
@@ -508,23 +509,32 @@ modes:
 
 Fork / prefill / commit are mutually exclusive (400 on mix). `n>1` fans out N sibling
 assistant nodes on one shared user parent, generated serially with deterministic
-derived seeds. Server → client: `started` (node_id filled lazily by the first
-token), `tree_mutated`, `token` (per token — `logprob`/`top_alts`/`perplexity`
-when captured, plus the token tap's canonical `captured` object — the same
-JSON-safe rich record appended to the loom row — with optional probe, J-LENS,
-and SAE channels and their original source/steering provenance). Compatibility
-aliases remain: `scores`/`per_layer_scores`/`probe_readings`, `lens_readout` +
-`lens_aggregate`, and `sae_readout`. The stream wraps `_on_token` in a typed
-`TokenConsumer` whose options request the live readouts; `build_token_event`
-forwards `captured` verbatim rather than rebuilding it from loom rows), `done`
-(`result` with `text`, `tokens`,
-`finish_reason`, `usage`, `mean_logprob`, `mean_surprise`,
-`probe_readings` aggregate), `error` (validation errors keep the connection open;
-other failures close 1011).
+derived seeds.
 
 A roster mutation (`LoomMutated(op="cast")`) forwards as a `tree_mutated`
 frame with empty `added`/`updated` plus a `cast` key inlining the full roster
 (`{label: {recipe?, notes?}}`), so clients reconcile without a refetch.
+
+Server → client: `started` (node_id filled lazily by the first token),
+`tree_mutated`, `token` (per token — `logprob`/`top_alts`/`perplexity` when
+captured, plus the token tap's 5.x **`measurements`** envelope — the single
+JSON-safe read-side record, the same object appended to the loom row: `version`
+/ `scope="token"` / `provenance`, the flat `scores`/`per_layer_scores` views,
+and per-family `instruments` (`geometry`/`lens`/`sae`, each with its attached-probe
+`readings` and — for lens/sae — the native `readout` discovery surface plus a
+`binding` recording source + recipe steering)). The token frame carries **no**
+legacy per-token aliases: the pre-5.x top-level `scores`/`per_layer_scores`/
+`probe_readings`/`lens_readout`/`lens_aggregate`/`sae_readout`/`captured` keys
+are gone — everything lives inside `measurements`. The stream wraps `_on_token`
+in a typed `TokenConsumer` whose options request the live readouts;
+`build_token_event` forwards `measurements` verbatim rather than rebuilding it
+from loom rows. `done` (`result` with `text`, `tokens`, `finish_reason`,
+`usage`, `mean_logprob`, `mean_surprise`, the `probe_readings` aggregate **and**
+an aggregate-scope `measurements` envelope — `probe_measurements_aggregate`
+splits the result's readings by family: geometry = Monitor probes, lens =
+`session.lens_probe_names`, sae = `session.sae_probe_names`, with source/steering
+binding from the live configs), `error` (validation errors keep the connection
+open; other failures close 1011).
 
 Concurrency: one perpetual reader task owns `receive_json()` and feeds a shared
 `incoming` queue; `tree_mutated` ride a connection-level

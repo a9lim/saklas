@@ -345,7 +345,8 @@ Three read surfaces over either source, plus local fit and external fetch:
   cover every requested fitted layer. `session.enable_live_lens()` streams the
   same top-k width as the generation's logit-alternative readout per
   selected layer plus the aggregate chip list every decode step
-  (`TokenEvent.lens_readout` / `TokenEvent.lens_aggregate`, displayed in the
+  (`TokenEvent.measurements` — the 5.x envelope's `instruments.lens.readout`
+  per-layer matrix + aggregate block, displayed in the
   dashboard WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's
   latest slices post-forward at the token tap — no new forward hooks, so steering
   fast-path/compile eligibility is untouched. The default live layer set is
@@ -364,8 +365,9 @@ Three read surfaces over either source, plus local fit and external fetch:
   best compatible official provider release, then enables its live readout by
   default; `--no-web` does not acquire or download an SAE implicitly.
   `POST /saklas/v1/sessions/{id}/lens/live` toggles the live
-  lens, the native WS `token` frame carries the per-step matrix as
-  `lens_readout` + the chip list as `lens_aggregate`, and session info's
+  lens, the native WS `token` frame carries the per-step matrix + chip list
+  inside its `measurements` envelope (`instruments.lens.readout`), and session
+  info's
   `live_lens_layers` rehydrates the toggle across reloads. The tab's STEER
   section authors `α jlens/<word>` cards into the shared steering expression;
   its **PROBE section is the merged workspace readout** — pinned

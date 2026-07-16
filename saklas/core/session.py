@@ -1285,6 +1285,13 @@ class SaklasSession:
         self._last_result: GenerationResult | None = None
         self._last_per_token_scores: dict[str, list[float]] | None = None
         self._last_token_probe_payload: dict[str, Any] | None = None
+        # The merged per-family :class:`ProbeReading` dict for the latest token
+        # (the union of all three families' slots).  The measurement envelope
+        # on ``_last_token_probe_payload`` carries the serialized readings; this
+        # keeps the live objects so ``generate_stream`` can populate
+        # ``TokenEvent.probe_readings`` (the compat vendor-extension / traits
+        # channel) without reconstructing them from the envelope.
+        self._last_token_probe_readings: dict[str, "ProbeReading"] | None = None
 
         # Probe content-hash cache for transcript export / replay (v2.3
         # phase 5).  Keyed by probe name → sha256 hex of the baked tensor
@@ -7862,6 +7869,7 @@ class SaklasSession:
             if monitor_active:
                 payload.merge_readings(
                     self._monitor.score_single_token(hidden),
+                    family="geometry",
                     per_layer=persist_per_layer_scores,
                 )
 
@@ -7878,7 +7886,9 @@ class SaklasSession:
                         lens_readings,
                     ) = lens_capture
                     payload.merge_readings(
-                        lens_readings, per_layer=persist_per_layer_scores,
+                        lens_readings,
+                        family="lens",
+                        per_layer=persist_per_layer_scores,
                     )
 
             sae_payload = None
@@ -7887,7 +7897,9 @@ class SaklasSession:
                 if sae_capture is not None:
                     sae_payload, sae_readings = sae_capture
                     payload.merge_readings(
-                        sae_readings, per_layer=persist_per_layer_scores,
+                        sae_readings,
+                        family="sae",
+                        per_layer=persist_per_layer_scores,
                     )
 
             shaped = payload.to_token_payload(
@@ -7909,8 +7921,8 @@ class SaklasSession:
                 ),
                 steering=steering,
             )
-            captured = shaped.get("captured")
-            if not captured:
+            measurements = shaped.get("measurements")
+            if not measurements:
                 continue
             row = output_rows[match_index][token_index]
             if payload.scores:
@@ -7920,7 +7932,7 @@ class SaklasSession:
                 }
             if payload.per_layer_scores:
                 row["per_layer_scores"] = payload.per_layer_scores
-            row["captured"] = captured
+            row["measurements"] = measurements
             populated_matches.add(match_index)
 
         for match_index in sorted(populated_matches):
@@ -8686,6 +8698,7 @@ class SaklasSession:
             ) -> None:
                 nonlocal mean_logprob_sum, mean_logprob_count
                 self._last_token_probe_payload = None
+                self._last_token_probe_readings = None
                 if logprobs_list is not None and tid is not None and tid >= 0 and not is_thinking:
                     logprobs_list.append((tid, lp if lp is not None else 0.0, top_alts or []))
                 if lp is not None and tid is not None and tid >= 0 and not is_thinking:
@@ -8736,6 +8749,7 @@ class SaklasSession:
                         payload = TokenProbePayload()
                     payload.merge_readings(
                         self._last_lens_step_readings,
+                        family="lens",
                         per_layer=(
                             assistant_node_id is not None
                             and _persists_layer_scores
@@ -8746,6 +8760,7 @@ class SaklasSession:
                         payload = TokenProbePayload()
                     payload.merge_readings(
                         self._last_sae_step_readings,
+                        family="sae",
                         per_layer=(
                             assistant_node_id is not None
                             and _persists_layer_scores
@@ -8773,12 +8788,13 @@ class SaklasSession:
                         and (
                             payload.scores
                             or payload.per_layer_scores
-                            or payload.probe_readings
+                            or payload.all_readings
                         )
                     )
                 ):
                     if payload is None:
                         payload = TokenProbePayload()
+                    self._last_token_probe_readings = payload.all_readings or None
                     recipe_steering = None
                     if assistant_node_id is not None:
                         node = self.tree.nodes.get(assistant_node_id)
@@ -8830,13 +8846,13 @@ class SaklasSession:
                         }
                     if per_layer_payload:
                         token_row["per_layer_scores"] = per_layer_payload
-                    captured = (
-                        self._last_token_probe_payload.get("captured")
+                    measurements = (
+                        self._last_token_probe_payload.get("measurements")
                         if self._last_token_probe_payload is not None
                         else None
                     )
-                    if captured:
-                        token_row["captured"] = captured
+                    if measurements:
+                        token_row["measurements"] = measurements
                     self.tree.append_token(
                         assistant_node_id,
                         token_row,
@@ -9219,6 +9235,7 @@ class SaklasSession:
             # streaming target is no longer live.
             self._active_gen_reservation = None
             self._last_token_probe_payload = None
+            self._last_token_probe_readings = None
             self._live_lens_active_for_generation = True
             self._live_sae_active_for_generation = True
             self._generation_jlens = None
@@ -9500,28 +9517,25 @@ class SaklasSession:
         ) -> None:
             payload = self._last_token_probe_payload or {}
             probe_readings: dict[str, "ProbeReading"] | None = None
-            # Monitor probes AND pinned lens probes (readout channel) both
-            # land in the payload's merged ``readings`` — a lens-only roster
-            # still carries per-token readings while the live lens is on.
+            # Monitor probes AND pinned lens/SAE probes (readout channels) all
+            # land in the merged per-family readings — a lens-only roster still
+            # carries per-token readings while the live lens is on.  This is the
+            # ``TokenEvent.probe_readings`` compat channel (vendor extension /
+            # traits SSE), kept as live :class:`ProbeReading` objects; the
+            # serialized envelope rides ``measurements``.
             if live_scores and (
                 self._monitor.probe_names
                 or self._lens_probes
                 or self._sae_probes
             ):
-                raw_readings = payload.get("probe_readings")
+                raw_readings = self._last_token_probe_readings
                 if isinstance(raw_readings, dict) and raw_readings:
                     probe_readings = raw_readings
-                    # The event carries the rich readings directly; the live
-                    # stream consumes ``fraction`` / ``nearest`` / ``coords``.
             event = TokenEvent(
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
                 probe_readings=probe_readings, perplexity=perplexity,
-                lens_readout=payload.get("lens") if live_readouts else None,
-                lens_aggregate=(
-                    payload.get("lens_aggregate") if live_readouts else None
-                ),
-                sae_readout=payload.get("sae") if live_readouts else None,
+                measurements=payload.get("measurements"),
             )
             idx_counter[0] += 1
             q.put(event)
@@ -10093,6 +10107,7 @@ class SaklasSession:
                 self._end_capture()
                 self._active_gen_reservation = None
                 self._last_token_probe_payload = None
+                self._last_token_probe_readings = None
                 self._generation_jlens = None
                 self._generation_jlens_active = False
                 self._capture_state = CaptureState()
