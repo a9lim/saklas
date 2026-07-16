@@ -745,6 +745,34 @@ def test_bound_run_reads_prepare_time_live_state() -> None:
     inst.live = None
 
 
+def test_lens_state_lock_serializes_getter_against_snapshot() -> None:
+    """The one lens-state boundary (sol's round-4 P1): the getter's
+    refresh/adopt/evict transaction and ``prepare``'s snapshot hold the
+    same reentrant lock, so an un-locked read (the session-info route)
+    cannot land inside a generation boundary's snapshot — it blocks
+    until the snapshot completes."""
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS, force=True)
+    inst = session._lens_instrument
+
+    entered = threading.Event()
+    seen: list[Any] = []
+
+    def _getter_read() -> None:
+        entered.set()
+        seen.append(session.jlens)
+
+    with inst.state_lock:
+        reader = threading.Thread(target=_getter_read)
+        reader.start()
+        assert entered.wait(timeout=5.0)
+        reader.join(timeout=0.2)
+        assert reader.is_alive()  # blocked on the lens-state lock
+    reader.join(timeout=5.0)
+    assert not reader.is_alive()
+    assert seen and seen[0] is not None
+
+
 def test_prepare_pin_demand_formula() -> None:
     """Pin demand = a live readout, or attached probes with a final
     aggregate or a lens gate — the one formula both generation
@@ -787,23 +815,23 @@ def test_prepare_on_a_bound_run_raises() -> None:
     """The jlens getter short-circuits on a bound run's pin flag, so a
     prepare taken without closing the prior run would silently skip the
     refresh — every family rejects it instead."""
-    from saklas.core.instruments.types import InstrumentPlan, ReadRequest
+    from saklas.core.instruments.types import ReadRequest
 
     session = _StubSession()
     session._monitor = SimpleNamespace(probe_names=[])
     request = ReadRequest(final_aggregate=False)
     instruments = (
-        ("lens", session._lens_instrument),
-        ("sae", session._sae_instrument),
-        ("geometry", session._geometry_instrument),
+        session._lens_instrument,
+        session._sae_instrument,
+        session._geometry_instrument,
     )
-    for family, inst in instruments:
+    for inst in instruments:
         prep = inst.prepare(request)
-        inst.bind(InstrumentPlan(family=family), prep)
+        inst.bind(inst.plan(prep), prep)
         with pytest.raises(RuntimeError, match="bound run"):
             inst.prepare(request)
     session._close_instrument_runs()
-    for _family, inst in instruments:
+    for inst in instruments:
         inst.prepare(request)  # idle runs again — every prepare passes
 
 
@@ -864,6 +892,56 @@ def test_bind_and_plan_reject_foreign_or_missing_preps() -> None:
     with pytest.raises(ValueError, match="plan family"):
         geometry.bind(InstrumentPlan(family="lens"), geometry_prep)
     assert geometry.current_run.bound is False
+
+
+def test_bind_rejects_same_family_plan_prep_crossing() -> None:
+    """sol's round-4 P2: a plan derived from prep A must not bind with
+    prep B of the same family — the session's capture union would retain
+    A's layers while the run measures B.  The per-preparation token the
+    plan echoes is compared at bind, in every family (a hand-built plan,
+    which carries no token, is rejected the same way)."""
+    from saklas.core.instruments.types import InstrumentPlan, ReadRequest
+
+    session = _StubSession()
+    session._monitor = SimpleNamespace(probe_names=[])
+    request = ReadRequest(final_aggregate=False)
+    for inst in (
+        session._lens_instrument,
+        session._sae_instrument,
+        session._geometry_instrument,
+    ):
+        prep_a = inst.prepare(request)
+        prep_b = inst.prepare(request)
+        plan_a = inst.plan(prep_a)
+        assert plan_a.prep_token == prep_a.token != prep_b.token
+        with pytest.raises(ValueError, match="prep_token"):
+            inst.bind(plan_a, prep_b)
+        with pytest.raises(ValueError, match="prep_token"):
+            inst.bind(InstrumentPlan(family=inst.family), prep_a)
+        assert inst.current_run.bound is False
+        inst.bind(plan_a, prep_a)  # the matched pair binds
+        session._close_instrument_runs()
+
+
+def test_prepare_rejects_a_layerless_pin_demanded_lens() -> None:
+    """A pin-demanded lens without ``source_layers`` is structurally
+    broken (layers align captures, specs, and Jacobians) — it fails at
+    the prepare boundary, not as a mid-generation KeyError."""
+    from saklas.core.instruments.types import ReadRequest
+
+    class _BrokenLensStub(_StubSession):
+        _broken_lens: Any
+
+        @property
+        def jlens(self) -> Any:
+            return self._broken_lens
+
+    session = _BrokenLensStub()
+    session._broken_lens = object()  # no source_layers
+    inst = session._lens_instrument
+    inst.live = {"layers": [0]}
+    with pytest.raises(RuntimeError, match="source_layers"):
+        inst.prepare(ReadRequest(final_aggregate=False, live=True))
 
 
 def test_generation_lens_snapshot_avoids_per_token_disk_validation(

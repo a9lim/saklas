@@ -1908,81 +1908,99 @@ class SaklasSession:
         immutable Saklas-owned shards; external bindings read provider-owned
         cache bytes. Fit or fetch one with ``saklas lens fit|fetch``. Returns a
         :class:`saklas.core.jlens.JacobianLens`.
+
+        The refresh/adopt/evict transaction runs under the lens-state
+        lock (``LensInstrument.state_lock``) — the same boundary
+        ``prepare``'s snapshot holds — so an un-locked read (this getter
+        serves the session-info route) cannot tear a generation
+        boundary's snapshot mid-``prepare``.
         """
-        if self._generation_jlens_active:
-            return self._generation_jlens
+        with self._lens_instrument.state_lock:
+            if self._generation_jlens_active:
+                return self._generation_jlens
 
-        from saklas.io.lens import load_lens, load_lens_sidecar
+            from saklas.io.lens import load_lens, load_lens_sidecar
 
-        sidecar = load_lens_sidecar(self.model_id)
-        if sidecar is None:
-            if self._jlens is not None:
-                SaklasSession._evict_resident_jlens(self)
-            return None
-        if not _jlens_matches_loaded_model(sidecar, self._model, self.model_id):
-            if self._jlens is not None:
-                SaklasSession._evict_resident_jlens(self)
-            _log.warning(
-                "ignoring stale Jacobian lens for %s: loaded-model "
-                "identity is missing or changed; fetch or re-fit the lens",
-                self.model_id,
-            )
-            return None
-        disk_identity = _jlens_sidecar_identity(sidecar)
-        if self._jlens is not None and self._jlens_identity == disk_identity:
-            return self._jlens
-        loaded = load_lens(self.model_id)
-        if loaded is None:
-            SaklasSession._evict_resident_jlens(self)
-            return None
-        if not _jlens_matches_loaded_model(
-            loaded[1], self._model, self.model_id,
-        ):
-            SaklasSession._evict_resident_jlens(self)
-            _log.warning(
-                "ignoring concurrently replaced Jacobian lens for %s: "
-                "loaded payload does not match the live model",
-                self.model_id,
-            )
-            return None
-        SaklasSession._adopt_fitted_jlens(
-            self, loaded[0], sidecar=loaded[1],
-        )
-        return self._jlens
-
-    def has_compatible_jlens(self) -> bool:
-        """Whether lens metadata matches the currently loaded weights."""
-        if self._generation_jlens_active:
-            return self._generation_jlens is not None
-
-        from saklas.io.lens import load_lens, load_lens_sidecar
-
-        sidecar = load_lens_sidecar(self.model_id)
-        compatible = _jlens_matches_loaded_model(
-            sidecar, self._model, self.model_id,
-        )
-        if not compatible:
-            if self._jlens is not None:
-                SaklasSession._evict_resident_jlens(self)
-            return False
-        assert sidecar is not None
-        if (
-            self._jlens is not None
-            and self._jlens_identity != _jlens_sidecar_identity(sidecar)
-        ):
+            sidecar = load_lens_sidecar(self.model_id)
+            if sidecar is None:
+                if self._jlens is not None:
+                    SaklasSession._evict_resident_jlens(self)
+                return None
+            if not _jlens_matches_loaded_model(
+                sidecar, self._model, self.model_id,
+            ):
+                if self._jlens is not None:
+                    SaklasSession._evict_resident_jlens(self)
+                _log.warning(
+                    "ignoring stale Jacobian lens for %s: loaded-model "
+                    "identity is missing or changed; fetch or re-fit the "
+                    "lens",
+                    self.model_id,
+                )
+                return None
+            disk_identity = _jlens_sidecar_identity(sidecar)
+            if (
+                self._jlens is not None
+                and self._jlens_identity == disk_identity
+            ):
+                return self._jlens
             loaded = load_lens(self.model_id)
             if loaded is None:
                 SaklasSession._evict_resident_jlens(self)
-                return False
+                return None
             if not _jlens_matches_loaded_model(
                 loaded[1], self._model, self.model_id,
             ):
                 SaklasSession._evict_resident_jlens(self)
-                return False
+                _log.warning(
+                    "ignoring concurrently replaced Jacobian lens for %s: "
+                    "loaded payload does not match the live model",
+                    self.model_id,
+                )
+                return None
             SaklasSession._adopt_fitted_jlens(
                 self, loaded[0], sidecar=loaded[1],
             )
-        return True
+            return self._jlens
+
+    def has_compatible_jlens(self) -> bool:
+        """Whether lens metadata matches the currently loaded weights.
+
+        Runs un-locked on the session-info route, so its adopt/evict
+        side effects serialize on the lens-state lock like the getter's.
+        """
+        with self._lens_instrument.state_lock:
+            if self._generation_jlens_active:
+                return self._generation_jlens is not None
+
+            from saklas.io.lens import load_lens, load_lens_sidecar
+
+            sidecar = load_lens_sidecar(self.model_id)
+            compatible = _jlens_matches_loaded_model(
+                sidecar, self._model, self.model_id,
+            )
+            if not compatible:
+                if self._jlens is not None:
+                    SaklasSession._evict_resident_jlens(self)
+                return False
+            assert sidecar is not None
+            if (
+                self._jlens is not None
+                and self._jlens_identity != _jlens_sidecar_identity(sidecar)
+            ):
+                loaded = load_lens(self.model_id)
+                if loaded is None:
+                    SaklasSession._evict_resident_jlens(self)
+                    return False
+                if not _jlens_matches_loaded_model(
+                    loaded[1], self._model, self.model_id,
+                ):
+                    SaklasSession._evict_resident_jlens(self)
+                    return False
+                SaklasSession._adopt_fitted_jlens(
+                    self, loaded[0], sidecar=loaded[1],
+                )
+            return True
 
     def _require_jlens(self) -> "Any":
         from saklas.core.jlens import LensNotFittedError
@@ -1998,25 +2016,26 @@ class SaklasSession:
 
     def _evict_resident_jlens(self) -> None:
         """Drop a removed/replaced disk lens and every derived resident view."""
-        self._jlens = None
-        self._jlens_identity = None
-        self._jlens_device_cache = {}
-        self._jlens_readout_module_cache = None
-        self._jlens_depths_cache = {}
-        self._jlens_depth_tensor_cache = {}
-        self._readout_long_tensor_cache = {}
-        self._jlens_decode_cache = {}
-        self._lens_step_stash = None
-        self._last_lens_step_readings = None
-        for key in list(self._profiles):
-            if key.startswith("jlens/"):
-                self._profiles.pop(key, None)
-        for name, spec in self._lens_probes.items():
-            spec["layers"] = []
-            self._probe_hash_cache.pop(name, None)
-        self._live_lens = None
-        self._invalidate_prefix_cache()
-        self._invalidate_analytics_cache()
+        with self._lens_instrument.state_lock:
+            self._jlens = None
+            self._jlens_identity = None
+            self._jlens_device_cache = {}
+            self._jlens_readout_module_cache = None
+            self._jlens_depths_cache = {}
+            self._jlens_depth_tensor_cache = {}
+            self._readout_long_tensor_cache = {}
+            self._jlens_decode_cache = {}
+            self._lens_step_stash = None
+            self._last_lens_step_readings = None
+            for key in list(self._profiles):
+                if key.startswith("jlens/"):
+                    self._profiles.pop(key, None)
+            for name, spec in self._lens_probes.items():
+                spec["layers"] = []
+                self._probe_hash_cache.pop(name, None)
+            self._live_lens = None
+            self._invalidate_prefix_cache()
+            self._invalidate_analytics_cache()
 
     def select_jlens_source(self, source: str) -> None:
         """Select a prepared local/external lens and evict derived live state.
@@ -2032,50 +2051,63 @@ class SaklasSession:
     def _adopt_fitted_jlens(
         self, lens: "Any", *, sidecar: "Mapping[str, Any] | None" = None,
     ) -> "Any":
-        """Replace a fitted lens and rebuild every derived live consumer."""
-        previous_live = self._live_lens
-        previous_layers = (
-            list(previous_live["layers"]) if previous_live is not None else []
-        )
-        previous_used_all_layers = bool(
-            previous_live is not None
-            and previous_live.get("uses_all_layers", False)
-        )
+        """Replace a fitted lens and rebuild every derived live consumer.
 
-        self._jlens = lens
-        self._jlens_identity = _jlens_sidecar_identity(sidecar)
-        self._jlens_device_cache = {}
-        self._jlens_readout_module_cache = None
-        self._jlens_depths_cache = {}
-        self._jlens_depth_tensor_cache = {}
-        self._readout_long_tensor_cache = {}
-        self._jlens_decode_cache = {}
-        self._lens_step_stash = None
-        self._last_lens_step_readings = None
-        for key in list(self._profiles):
-            if key.startswith("jlens/"):
-                self._profiles.pop(key, None)
-
-        readout_layers = [int(layer) for layer in lens.source_layers]
-        for name, spec in self._lens_probes.items():
-            spec["layers"] = list(readout_layers)
-            self._probe_hash_cache.pop(name, None)
-        if self._lens_probes and readout_layers:
-            self._jlens_transport_stack(
-                lens, sorted(readout_layers), self._device,
+        One lens-state transaction: the registry rewrite and the
+        live-state rebuild land atomically under the lens-state lock, so
+        a concurrent ``prepare`` snapshot sees either the old or the new
+        world, never a mix.
+        """
+        with self._lens_instrument.state_lock:
+            previous_live = self._live_lens
+            previous_layers = (
+                list(previous_live["layers"])
+                if previous_live is not None else []
+            )
+            previous_used_all_layers = bool(
+                previous_live is not None
+                and previous_live.get("uses_all_layers", False)
             )
 
-        if previous_live is not None:
-            valid = [layer for layer in previous_layers if layer in lens.jacobians]
-            self.enable_live_lens(
-                layers=(None if previous_used_all_layers else (valid or None)),
-            )
-        else:
-            self._live_lens = None
+            self._jlens = lens
+            self._jlens_identity = _jlens_sidecar_identity(sidecar)
+            self._jlens_device_cache = {}
+            self._jlens_readout_module_cache = None
+            self._jlens_depths_cache = {}
+            self._jlens_depth_tensor_cache = {}
+            self._readout_long_tensor_cache = {}
+            self._jlens_decode_cache = {}
+            self._lens_step_stash = None
+            self._last_lens_step_readings = None
+            for key in list(self._profiles):
+                if key.startswith("jlens/"):
+                    self._profiles.pop(key, None)
 
-        self._invalidate_prefix_cache()
-        self._invalidate_analytics_cache()
-        return lens
+            readout_layers = [int(layer) for layer in lens.source_layers]
+            for name, spec in self._lens_probes.items():
+                spec["layers"] = list(readout_layers)
+                self._probe_hash_cache.pop(name, None)
+            if self._lens_probes and readout_layers:
+                self._jlens_transport_stack(
+                    lens, sorted(readout_layers), self._device,
+                )
+
+            if previous_live is not None:
+                valid = [
+                    layer for layer in previous_layers
+                    if layer in lens.jacobians
+                ]
+                self.enable_live_lens(
+                    layers=(
+                        None if previous_used_all_layers else (valid or None)
+                    ),
+                )
+            else:
+                self._live_lens = None
+
+            self._invalidate_prefix_cache()
+            self._invalidate_analytics_cache()
+            return lens
 
     def fit_jlens(
         self,

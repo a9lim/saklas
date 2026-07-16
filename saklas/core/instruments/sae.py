@@ -28,6 +28,7 @@ composition-preflight error (``validate_gate``), not a silent constant.
 from __future__ import annotations
 
 import hashlib
+import itertools
 from typing import Any, Mapping, TYPE_CHECKING
 
 import torch
@@ -147,6 +148,9 @@ class SaeInstrument:
         self.probes: dict[str, dict[str, Any]] = {}
         # Live feature discovery: {layer, top_k, source}, or None when off.
         self.live: dict[str, Any] | None = None
+        # Per-preparation token sequence (compared at bind — a plan
+        # cannot be bound with a prep from a different prepare() call).
+        self._prep_tokens = itertools.count(1)
         # The current per-generation run (idle passthrough until bind()).
         self.current_run = SaeRun(
             self, InstrumentBinding(family=self.family),
@@ -194,7 +198,11 @@ class SaeInstrument:
                 "SaeInstrument.prepare() on a bound run: close the prior "
                 "generation's run (_close_instrument_runs) first"
             )
-        return InstrumentPrep(family=self.family, request=request)
+        return InstrumentPrep(
+            family=self.family,
+            request=request,
+            token=next(self._prep_tokens),
+        )
 
     def bind(self, plan: InstrumentPlan, prep: InstrumentPrep) -> SaeRun:
         """Bind an immutable per-generation run from a declared plan.
@@ -215,6 +223,12 @@ class SaeInstrument:
             raise ValueError(
                 f"SaeInstrument.bind: plan family {plan.family!r} is not "
                 f"{self.family!r}"
+            )
+        if plan.prep_token != prep.token:
+            raise ValueError(
+                "SaeInstrument.bind: the plan was not derived from this "
+                "prep (prep_token mismatch) — derive the plan from the same "
+                "prepare() call"
             )
         live_active = prep.request.live
         session = self._session
@@ -345,6 +359,7 @@ class SaeInstrument:
             batch_aggregate=bool(
                 request.batch and probes and request.final_aggregate
             ),
+            prep_token=prep.token,
         )
 
     def probe_hash(self, name: str) -> str | None:

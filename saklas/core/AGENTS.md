@@ -927,9 +927,11 @@ not mechanics — the session planner unions plans and picks physical
 retention; the `INCREMENTAL → set_tail_with_sink` upgrade is
 cross-instrument resource sharing and stays session-side);
 **`InstrumentPrep`** / **`LensPrep`** (the generation-boundary source
-snapshot, produced by `prepare` and consumed by `plan` + `bind` — the
-lens prep carries the disk refresh + pin plus the authoritative
-spec/live snapshot derived from the prepared identity);
+snapshot, produced by `prepare` and consumed by `plan` + `bind` — every
+prep carries a per-preparation `token` the derived plan echoes and bind
+compares; the lens prep additionally carries the disk refresh + pin,
+the authoritative spec/live snapshot derived from the prepared
+identity, and the sidecar fingerprint the binding stamps);
 **`InstrumentBinding`** (immutable per-generation source/spec snapshot, so
 un-locked mutations like the SAE metadata backfill can't change what a
 running generation measures); per-family `LiveConfig` dataclasses (user
@@ -1030,20 +1032,36 @@ family reads the disk-refreshing `session.jlens`
 getter under pin demand there (the one formula both boundaries reduce
 to: a live readout, or attached probes with a final aggregate or a lens
 gate) and returns the `LensPrep` carrying the pin **and the
-authoritative spec/live snapshot** (spec layers derived from the
-prepared lens identity, the live runtime dict by reference); geometry/SAE
-preps carry the request forward. `plan` and `bind` consume the prep only
+authoritative spec/live/fingerprint snapshot** (spec layers derived from
+the prepared lens identity — a pin-demanded lens without
+`source_layers` is a hard prepare failure, and narrow test stubs use
+real-shaped `SimpleNamespace(source_layers=…)` lenses; the live runtime
+dict by reference; the sidecar identity for the binding); geometry/SAE
+preps carry the request forward. The whole lens snapshot is ONE atomic
+transaction under `LensInstrument.state_lock` — a reentrant leaf lock
+(outer locks like `_gen_lock`/`_model_exclusive` are always taken
+first) that also serializes the getter's refresh/adopt/evict,
+`has_compatible_jlens`, `_adopt_fitted_jlens`/`_evict_resident_jlens`,
+probe attach/detach, and the live toggles — so the snapshot cannot tear
+mid-`prepare` (sol's round-4 P1: without it, an adoption landing
+between the refresh and the live-state read paired lens A's specs with
+lens B's live device stack). `plan` and `bind` consume the prep only
 — never the live registry — so an interleaved adoption inside the
 prepare→bind window (the un-locked `has_compatible_jlens` on the
 session-info route can trigger one from another thread) cannot pair the
 prep's pinned lens with the replacement's rewritten layers (sol's
-round-3 P1; regression tests pin the interleaving). Every family's
+round-3 P1; regression tests pin both interleavings). Every family's
 `prepare` raises on a still-bound run (a stale pin would short-circuit
 the very refresh the step exists for). **Formal runs:** `bind(plan,
 prep)` — prep mandatory, family provenance validated on BOTH plan and
 prep (a bare `bind(plan)`, a wrong-family prep, or a wrong-family
-`LensPrep` all raise) — freezes an `InstrumentBinding` from the prep's
-specs (the SAE binding resolves `max_act` at bind, so the un-locked
+`LensPrep` all raise), and the plan must echo the prep's
+per-preparation `token` (`InstrumentPlan.prep_token` — same-family
+plan/prep crossing from different prepare() calls raises, sol's round-4
+P2) — freezes an `InstrumentBinding` from the prep's
+specs and the prep's `fingerprint` (a bind-time live identity read
+could stamp a concurrently adopted replacement onto a run pinned to the
+older lens; the SAE binding resolves `max_act` at bind, so the un-locked
 Neuronpedia backfill can no longer change a running generation's
 strength unit — sol's race), installs the prep's pin/live decisions, and
 returns the family's

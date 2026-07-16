@@ -24,6 +24,8 @@ is only the per-row computation.
 from __future__ import annotations
 
 import hashlib
+import itertools
+import threading
 from typing import Any, Mapping, Sequence, TYPE_CHECKING, cast
 
 import torch
@@ -164,6 +166,19 @@ class LensInstrument:
         # disabling drops this dict but transported stacks stay in the
         # session's device cache.
         self.live: dict[str, Any] | None = None
+        # THE lens-state boundary (sol's round-4 P1): one reentrant lock
+        # covering source refresh/adoption/eviction, registry and
+        # live-state mutation, and ``prepare``'s complete snapshot, so
+        # the snapshot cannot tear mid-``prepare`` under a concurrent
+        # un-locked getter read.  A leaf lock: nothing acquires
+        # ``_gen_lock``/``_model_exclusive`` while holding it (callers
+        # hold those first).  Reentrant because adoption runs inside the
+        # getter and ``prepare`` reads the getter inside its own hold.
+        self.state_lock = threading.RLock()
+        # Per-preparation token sequence: stamps each prep, echoed by the
+        # plan it derives, compared at bind — a plan cannot be bound with
+        # a prep from a different prepare() call.
+        self._prep_tokens = itertools.count(1)
         # The current per-generation run (idle passthrough until bind()).
         # All generation-scoped state — stash, display readings, active
         # flag, disk-identity pin — lives on it.
@@ -252,50 +267,68 @@ class LensInstrument:
                 "generation's run (_close_instrument_runs) before preparing "
                 "the next — a stale pin suppresses the lens disk refresh"
             )
-        # One C-level snapshot of the registry items: the un-locked
-        # detach route may mutate the dict concurrently.
-        items = list(self.probes.items())
-        gate_hit = any(
-            parse_gate_ref(key).probe in self.probes
-            for key in request.gate_keys
-        )
-        pin_demand = bool(
-            (request.live and self.live is not None)
-            or (items and (request.final_aggregate or gate_hit))
-        )
-        lens = self._session.jlens if pin_demand else None
-        # Spec layers under a pin come from the prepared identity itself —
-        # an atomically consistent source for every probe, where registry
-        # lists could tear mid-copy under a concurrent adoption (the
-        # production invariant keeps them identical to ``source_layers``
-        # anyway: attach records the full fitted set and adoption rewrites
-        # every probe).  Without one — a vanished lens, whose eviction
-        # path already zeroed the registry lists the copies reflect
-        # (validated-missing), or a duck-typed narrow stub lens without
-        # ``source_layers`` (the same narrow-stub tolerance the SAE
-        # metadata cache gets) — the post-refresh registry copies stand.
-        source_layers = (
-            getattr(lens, "source_layers", None) if pin_demand else None
-        )
-        if source_layers is not None:
-            layers = [int(layer) for layer in source_layers]
-            specs = {
-                name: {**spec, "layers": list(layers)}
-                for name, spec in items
-            }
-        else:
-            specs = {
-                name: {**spec, "layers": list(spec["layers"])}
-                for name, spec in items
-            }
-        return LensPrep(
-            family=self.family,
-            request=request,
-            lens=lens,
-            pinned=pin_demand,
-            specs=specs,
-            live_state=self.live,
-        )
+        # The WHOLE snapshot is one atomic lens-state transaction (sol's
+        # round-4 P1): items, gate demand, pin demand, the getter
+        # refresh, spec derivation, the live-state reference, and the
+        # sidecar fingerprint are all read under ``state_lock`` — the
+        # same lock the getter's refresh/adoption/eviction, the registry
+        # mutations, and the live toggles hold — so a concurrent
+        # ``has_compatible_jlens`` adoption can no longer land between
+        # the refresh and the live-state read (pairing lens A's specs
+        # with lens B's live device stack), and a concurrent detach can
+        # no longer split gate demand from the captured roster.
+        with self.state_lock:
+            items = list(self.probes.items())
+            names = {name for name, _spec in items}
+            gate_hit = any(
+                parse_gate_ref(key).probe in names
+                for key in request.gate_keys
+            )
+            pin_demand = bool(
+                (request.live and self.live is not None)
+                or (items and (request.final_aggregate or gate_hit))
+            )
+            lens = self._session.jlens if pin_demand else None
+            # Spec layers under a pin come from the prepared identity
+            # itself — the atomically consistent source for every probe
+            # (the production invariant keeps registry lists identical to
+            # ``source_layers``: attach records the full fitted set and
+            # adoption rewrites every probe).  A pin-demanded lens
+            # without them is structurally broken — layers are what align
+            # captures, specs, and Jacobians — so it fails here, at the
+            # boundary, not as a mid-generation KeyError.  A vanished
+            # lens (None) pins the validated-missing state: its eviction
+            # path already zeroed the registry lists the copies reflect.
+            if pin_demand and lens is not None and not hasattr(
+                lens, "source_layers",
+            ):
+                raise RuntimeError(
+                    "LensInstrument.prepare(): the resident lens has no "
+                    "source_layers — a pin-demanded lens must carry its "
+                    "fitted layer set"
+                )
+            if pin_demand and lens is not None:
+                layers = [int(layer) for layer in lens.source_layers]
+                specs = {
+                    name: {**spec, "layers": list(layers)}
+                    for name, spec in items
+                }
+            else:
+                specs = {
+                    name: {**spec, "layers": list(spec["layers"])}
+                    for name, spec in items
+                }
+            identity = getattr(self._session, "_jlens_identity", None)
+            return LensPrep(
+                family=self.family,
+                request=request,
+                token=next(self._prep_tokens),
+                lens=lens,
+                pinned=pin_demand,
+                specs=specs,
+                live_state=self.live,
+                fingerprint=str(identity) if identity is not None else None,
+            )
 
     def bind(self, plan: InstrumentPlan, prep: InstrumentPrep) -> LensRun:
         """Bind an immutable per-generation run from a declared plan.
@@ -320,20 +353,24 @@ class LensInstrument:
                 f"LensInstrument.bind: plan family {plan.family!r} is not "
                 f"{self.family!r}"
             )
-        session = self._session
+        if plan.prep_token != prep.token:
+            raise ValueError(
+                "LensInstrument.bind: the plan was not derived from this "
+                "prep (prep_token mismatch) — derive the plan from the same "
+                "prepare() call"
+            )
         run = LensRun(
             self,
             InstrumentBinding(
                 family=self.family,
                 # ``source`` stays None: the public source label lives in
                 # ``active.json`` and reading it here would put a disk hit
-                # on every generation; the in-memory sidecar identity below
-                # is the binding's cheap fingerprint.
-                fingerprint=(
-                    str(identity)
-                    if (identity := getattr(session, "_jlens_identity", None))
-                    is not None else None
-                ),
+                # on every generation; the prep's sidecar identity — taken
+                # in the same atomic snapshot as the pin — is the binding's
+                # cheap fingerprint (a bind-time live read could stamp a
+                # concurrently adopted replacement's identity onto a run
+                # pinned to the older lens).
+                fingerprint=prep.fingerprint,
                 specs={
                     name: {**spec, "layers": list(spec["layers"])}
                     for name, spec in prep.specs.items()
@@ -397,21 +434,26 @@ class LensInstrument:
             "add_probe called while another model operation is in "
             "flight; retry shortly"
         ):
-            lens = session._require_jlens()
-            token_id = resolve_word_token(session._tokenizer, word)
-            readout_layers = [int(l) for l in lens.source_layers]
-            session._jlens_transport_stack(
-                lens, sorted(readout_layers), session._device,
-            )
-            self.probes[name] = {
-                "word": word,
-                "token_id": int(token_id),
-                "layers": readout_layers,
-            }
+            # Lens-state boundary inside the exclusive section (consistent
+            # outer→leaf lock order): the lens read and the registry write
+            # land in one lens-state transaction.
+            with self.state_lock:
+                lens = session._require_jlens()
+                token_id = resolve_word_token(session._tokenizer, word)
+                readout_layers = [int(l) for l in lens.source_layers]
+                session._jlens_transport_stack(
+                    lens, sorted(readout_layers), session._device,
+                )
+                self.probes[name] = {
+                    "word": word,
+                    "token_id": int(token_id),
+                    "layers": readout_layers,
+                }
         return name
 
     def detach(self, name: str) -> None:
-        del self.probes[name]
+        with self.state_lock:
+            del self.probes[name]
 
     def specs(self) -> dict[str, dict[str, Any]]:
         """Snapshot of attached probe specifications."""
@@ -500,6 +542,7 @@ class LensInstrument:
             batch_aggregate=bool(
                 request.batch and probes and request.final_aggregate
             ),
+            prep_token=prep.token,
         )
 
     def probe_hash(self, name: str) -> str | None:
@@ -788,41 +831,49 @@ class LensInstrument:
         if session._device.type == "cuda":
             torch.set_float32_matmul_precision("high")
 
-        lens = session._require_jlens()
-        uses_all_layers = layers is None
-        if layers is None:
-            layers = sorted(int(layer) for layer in lens.source_layers)
-        else:
-            layers = sorted(set(int(l) for l in layers))
-            missing = [l for l in layers if l not in lens.jacobians]
-            if missing:
-                raise ValueError(
-                    f"layers {missing} not in the fitted lens "
-                    f"(fitted: {lens.source_layers[0]}..{lens.source_layers[-1]})"
+        # One lens-state transaction: the lens read and the live-state
+        # rebuild must be consistent (adoption calls this while holding
+        # the same reentrant lock).
+        with self.state_lock:
+            lens = session._require_jlens()
+            uses_all_layers = layers is None
+            if layers is None:
+                layers = sorted(int(layer) for layer in lens.source_layers)
+            else:
+                layers = sorted(set(int(l) for l in layers))
+                missing = [l for l in layers if l not in lens.jacobians]
+                if missing:
+                    raise ValueError(
+                        f"layers {missing} not in the fitted lens "
+                        f"(fitted: {lens.source_layers[0]}.."
+                        f"{lens.source_layers[-1]})"
+                    )
+            device = session._device
+            layer_list = list(layers)
+            if layer_list:
+                j_stack = session._jlens_transport_stack(
+                    lens, layer_list, device,
                 )
-        device = session._device
-        layer_list = list(layers)
-        if layer_list:
-            j_stack = session._jlens_transport_stack(lens, layer_list, device)
-        else:
-            sample = next(iter(lens.jacobians.values()))
-            j_stack = torch.empty(
-                (0, *sample.shape), device=device, dtype=torch.float32,
-            )
-        self.live = {
-            "layers": layer_list,
-            "uses_all_layers": uses_all_layers,
-            "J_stack": j_stack,
-            "layer_rows": {l: i for i, l in enumerate(layer_list)},
-            "unembed": get_unembedding(session._model),
-            "norm": get_final_norm(session._model),
-            "source": session._active_jlens_source_label(),
-        }
-        return list(layers)
+            else:
+                sample = next(iter(lens.jacobians.values()))
+                j_stack = torch.empty(
+                    (0, *sample.shape), device=device, dtype=torch.float32,
+                )
+            self.live = {
+                "layers": layer_list,
+                "uses_all_layers": uses_all_layers,
+                "J_stack": j_stack,
+                "layer_rows": {l: i for i, l in enumerate(layer_list)},
+                "unembed": get_unembedding(session._model),
+                "norm": get_final_norm(session._model),
+                "source": session._active_jlens_source_label(),
+            }
+            return list(layers)
 
     def disable_live(self) -> None:
         """Stop streaming the live readout and free the device J_l copies."""
-        self.live = None
+        with self.state_lock:
+            self.live = None
 
     @property
     def live_layers(self) -> list[int] | None:

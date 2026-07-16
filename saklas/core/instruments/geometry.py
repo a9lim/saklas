@@ -16,6 +16,7 @@ can enumerate families uniformly.
 from __future__ import annotations
 
 import hashlib
+import itertools
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -126,6 +127,9 @@ class GeometryInstrument:
 
     def __init__(self, session: "SaklasSession") -> None:
         self._session = session
+        # Per-preparation token sequence (compared at bind — a plan
+        # cannot be bound with a prep from a different prepare() call).
+        self._prep_tokens = itertools.count(1)
         # The current per-generation run (idle passthrough until bind()).
         self.current_run = GeometryRun(
             self, InstrumentBinding(family=self.family),
@@ -143,7 +147,11 @@ class GeometryInstrument:
                 "GeometryInstrument.prepare() on a bound run: close the "
                 "prior generation's run (_close_instrument_runs) first"
             )
-        return InstrumentPrep(family=self.family, request=request)
+        return InstrumentPrep(
+            family=self.family,
+            request=request,
+            token=next(self._prep_tokens),
+        )
 
     def bind(self, plan: InstrumentPlan, prep: InstrumentPrep) -> GeometryRun:
         """Bind an immutable per-generation run.
@@ -164,6 +172,12 @@ class GeometryInstrument:
             raise ValueError(
                 f"GeometryInstrument.bind: plan family {plan.family!r} is "
                 f"not {self.family!r}"
+            )
+        if plan.prep_token != prep.token:
+            raise ValueError(
+                "GeometryInstrument.bind: the plan was not derived from "
+                "this prep (prep_token mismatch) — derive the plan from "
+                "the same prepare() call"
             )
         run = GeometryRun(
             self,
@@ -282,7 +296,7 @@ class GeometryInstrument:
         monitor = self._session._monitor
         names = set(monitor.probe_names)
         if not names:
-            return InstrumentPlan(family=self.family)
+            return InstrumentPlan(family=self.family, prep_token=prep.token)
         gate_keys = frozenset(
             key for key in request.gate_keys
             if parse_gate_ref(key).probe in names
@@ -292,7 +306,11 @@ class GeometryInstrument:
             # Dormant roster: probes attached, but nothing this generation
             # consumes a reading (no gate, no per-token consumer, final
             # readings disabled).
-            return InstrumentPlan(family=self.family, gate_keys=gate_keys)
+            return InstrumentPlan(
+                family=self.family,
+                gate_keys=gate_keys,
+                prep_token=prep.token,
+            )
         narrow_to_gated = bool(
             gate_keys
             and not request.per_token_consumers
@@ -313,6 +331,7 @@ class GeometryInstrument:
             gate_keys=gate_keys,
             final_aggregate=bool(request.final_aggregate),
             batch_aggregate=bool(request.batch and request.final_aggregate),
+            prep_token=prep.token,
         )
 
     def probe_hash(self, name: str) -> str | None:

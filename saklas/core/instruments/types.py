@@ -287,10 +287,17 @@ class InstrumentPrep:
     derives solely from the prep, so a live-registry mutation landing
     between prepare and bind cannot desynchronize the plan from the
     binding (sol's round-3 P1).
+
+    ``token`` is the per-preparation identity (a per-instrument
+    sequence): the plan a prep derives echoes it as ``prep_token``, and
+    ``bind`` refuses a plan/prep pair from different prepare() calls —
+    same-family crossing would let the session's capture union retain
+    one prep's layers while the run measures another's (round-4 P2).
     """
 
     family: str
     request: ReadRequest = field(default_factory=ReadRequest)
+    token: int = 0
 
 
 @dataclass(frozen=True)
@@ -318,12 +325,23 @@ class LensPrep(InstrumentPrep):
     * ``live_state`` — the live-readout runtime dict as of prepare
       (adoption rebuilds it against the new lens; the bound run must
       keep reading the one that matches its pin).
+    * ``fingerprint`` — the resident sidecar identity captured in the
+      same atomic snapshot, so the binding's provenance matches the
+      lens the run actually measures (round-4 P2: a bind-time live
+      read could stamp a concurrently adopted replacement's identity
+      onto a run pinned to the older lens).
+
+    The whole snapshot is taken under the instrument's ``state_lock``
+    — the one lens-state boundary that also serializes the getter's
+    refresh/adoption/eviction and the registry/live mutations — so it
+    cannot tear mid-``prepare`` (round-4 P1).
     """
 
     lens: Any = None
     pinned: bool = False
     specs: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     live_state: Mapping[str, Any] | None = None
+    fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -347,6 +365,9 @@ class InstrumentPlan:
     gate_keys: frozenset[str] = frozenset()
     final_aggregate: bool = False
     batch_aggregate: bool = False
+    #: The token of the prep this plan derived from (``InstrumentPrep.
+    #: token``); ``bind`` refuses a plan/prep pair whose tokens differ.
+    prep_token: int | None = None
 
 
 @dataclass(frozen=True)

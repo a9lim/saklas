@@ -1155,13 +1155,21 @@ the normalization unit at bind, immunizing a running generation against the
 un-locked metadata backfill) plus the generation-scoped stashes, flags, and the
 lens disk-identity pin. Ordering contract: a capture transaction is the uniform
 protocol sequence `close_run → prepare → plan → bind`, and it is enforced —
-prep-less or foreign-family plan/bind calls raise.
+prep-less or foreign-family plan/bind calls raise, and the plan must echo the
+prep's per-preparation token (same-family plan/prep crossing from different
+prepare() calls raises).
 `prepare(ReadRequest) -> InstrumentPrep` is the source-boundary step: the lens
 family takes its disk refresh + pin there and snapshots probe specs (layers
-derived from the prepared identity) plus the live-readout state; `plan`/`bind`
+derived from the prepared identity — a pin-demanded lens without
+`source_layers` fails hard), the live-readout state, and the sidecar
+fingerprint the binding stamps; `plan`/`bind`
 consume the prep only, never the live registry, because an interleaved unpinned
 getter read (the un-locked `has_compatible_jlens` on the session-info route)
 can adopt a newer disk lens inside the prepare→bind window and rewrite both.
+The snapshot itself is one atomic transaction under the lens-state lock
+(`LensInstrument.state_lock`, a reentrant leaf lock that also serializes the
+getter's refresh/adopt/evict, registry attach/detach, and the live toggles),
+so it cannot tear mid-`prepare`.
 A bound run symmetrically reads the prep's live-state snapshot
 (`_measurement_live`), and every family's `prepare`
 raises on a still-bound run (a stale pin would suppress that refresh). Every

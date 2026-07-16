@@ -78,16 +78,38 @@ class _CurrentSessionStub(SaklasSession):
 
 
 def _complete_capture_session(session: Any) -> None:
-    """Install the current capture collaborator roster on a narrow stub."""
+    """Install the current capture collaborator roster on a narrow stub.
+
+    The stub lens is real-shaped (``source_layers`` = the fixture's
+    declared live + probe layer union): a pin-demanded lens without its
+    fitted layer set is a hard ``prepare()`` failure now, and production
+    keeps every probe's registry list identical to ``source_layers``
+    anyway (attach records the full fitted set; adoption rewrites every
+    probe), so an ``object()`` lens only modeled an impossible state.
+    """
     if not hasattr(session, "_lens_probes"):
         session._lens_probes = {}
     if not hasattr(session, "_sae_probes"):
         session._sae_probes = {}
     if not hasattr(session, "_live_sae"):
         session._live_sae = None
-    session._jlens = (
-        object() if session._live_lens is not None or session._lens_probes else None
+    live_layers = (
+        (session._live_lens or {}).get("layers") or []
+        if session._live_lens is not None else []
     )
+    probe_layers = {
+        int(layer)
+        for spec in session._lens_probes.values()
+        for layer in spec.get("layers", [])
+    }
+    if session._live_lens is not None or session._lens_probes:
+        session._jlens = SimpleNamespace(
+            source_layers=sorted(
+                {int(layer) for layer in live_layers} | probe_layers
+            ),
+        )
+    else:
+        session._jlens = None
     session._jlens_identity = None
 
 
@@ -1543,7 +1565,13 @@ def test_lens_gate_without_final_aggregate_attaches_gated_probe_layers() -> None
     )
 
     assert attached is True
-    assert capture.attached == [3]
+    # The gated probes' band.  Production bands are uniform (every probe's
+    # registry list equals the resident lens's source_layers — attach
+    # records the full fitted set, adoption rewrites every probe), so the
+    # prepared snapshot stamps the fixture's [3, 6] union onto both probes;
+    # the FIX-#4 observable is gate-keeps-the-band-alive vs the dormant
+    # roster attaching nothing (the sibling test above).
+    assert capture.attached == [3, 6]
     assert capture.aggregate_depth == 1
 
 

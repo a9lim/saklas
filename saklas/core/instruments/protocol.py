@@ -94,15 +94,22 @@ class Instrument(Protocol):
 
         The one step allowed to touch disk-backed source identity: the
         lens family refreshes/adopts the on-disk artifact here, decides
-        source pinning, and snapshots its probe specs + live config
-        against the prepared identity.  ``plan`` and ``bind`` consume
+        source pinning, and snapshots its probe specs, live config, and
+        sidecar fingerprint against the prepared identity — the whole
+        snapshot one atomic transaction under the family's lens-state
+        lock, the same boundary the getter's refresh/adopt/evict and the
+        registry/live mutations hold, so it cannot tear mid-``prepare``.
+        ``plan`` and ``bind`` consume
         the prep — never the live registry — so a registry mutation
         landing inside the prepare→bind window (adoption rewrites live
         probe layer lists; the un-locked ``has_compatible_jlens`` can
         trigger it from another thread) cannot desynchronize what the
         run measures from the source it pinned.  Families without a
         source lifecycle return the bare prep so the session boundary
-        stays uniform.  Raises ``RuntimeError`` on a still-bound run — a
+        stays uniform.  Every prep carries a per-preparation ``token``
+        that the plan it derives echoes; ``bind`` compares them, so a
+        plan cannot be bound with a prep from a different prepare()
+        call.  Raises ``RuntimeError`` on a still-bound run — a
         stale pin would short-circuit the very refresh this step exists
         for, so callers must ``close_run`` first."""
         ...
