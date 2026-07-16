@@ -427,9 +427,12 @@ scrubbing disciplines are copied verbatim from the routes it replaces.
   `readout.aggregate`); sae = `session.sae_token_readout` (`readout.features`);
   geometry = `session.geometry_token_readout` — the Monitor-roster replay
   (`instruments.geometry.readings` full `ProbeReading`s + a
-  `binding: {steering}`; the post-hoc read for aggregate-only generations
+  `binding: {source: null, steering}`, the shared binding shape with no
+  source lifecycle; the post-hoc read for aggregate-only generations
   and probes attached after the fact; `top_k`/`layers` ignored — the
-  roster's own fitted layers drive the capture; no attached probe → 400).
+  roster's own fitted layers drive the capture; no attached probe → 400,
+  rechecked under the exclusive section so a racing detach keeps the
+  caller-facing message).
   Same lock/error mapping as before
   (`LensNotFittedError`/`UnknownNodeError` → 404, `InvalidNodeOperationError`/bad
   `layers`/`top_k` → 400).

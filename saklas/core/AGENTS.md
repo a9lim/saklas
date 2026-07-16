@@ -926,9 +926,10 @@ measurement envelope lands); **`InstrumentPlan`** (declared capture demand,
 not mechanics — the session planner unions plans and picks physical
 retention; the `INCREMENTAL → set_tail_with_sink` upgrade is
 cross-instrument resource sharing and stays session-side);
-**`InstrumentPrep`** / **`LensPrep`** (generation-boundary source
-decisions, produced by `prepare` and threaded opaquely into `bind` — the
-lens prep carries the disk refresh + pin);
+**`InstrumentPrep`** / **`LensPrep`** (the generation-boundary source
+snapshot, produced by `prepare` and consumed by `plan` + `bind` — the
+lens prep carries the disk refresh + pin plus the authoritative
+spec/live snapshot derived from the prepared identity);
 **`InstrumentBinding`** (immutable per-generation source/spec snapshot, so
 un-locked mutations like the SAE metadata backfill can't change what a
 running generation measures); per-family `LiveConfig` dataclasses (user
@@ -1018,35 +1019,48 @@ lens/SAE-attached gate references at generation preflight
 `re.split("[\\[:@~]")` truncation of variant-suffixed probe names.
 
 Both formerly deferred slices are landed. **Plan-driven capture:** every
-family implements `plan(ReadRequest) -> InstrumentPlan` and
+family implements `plan(prep) -> InstrumentPlan` and
 `_begin_capture` (plus the batch preamble) unions the declared
 `latest_layers`/`tail_layers` instead of hand-rolled per-family branches;
 retention-mode selection stays session-side (the
 `INCREMENTAL → set_tail_with_sink` upgrade is cross-instrument resource
 sharing). **Source prep:** `prepare(ReadRequest) -> InstrumentPrep` is
-the generation-boundary source step, run after `close_run` and before
-`plan()` — the lens family reads the disk-refreshing `session.jlens`
+the generation-boundary source step, run after `close_run` — the lens
+family reads the disk-refreshing `session.jlens`
 getter under pin demand there (the one formula both boundaries reduce
 to: a live readout, or attached probes with a final aggregate or a lens
-gate) and returns the `LensPrep` carrying the pin; geometry/SAE return
-the bare prep for boundary uniformity. Every family's `prepare` raises
-on a still-bound run (a stale pin would short-circuit the very refresh
-the step exists for). **Formal runs:** `bind(plan, prep)` freezes an
-`InstrumentBinding`
-(spec snapshot; the SAE binding resolves `max_act` at bind, so the
-un-locked Neuronpedia backfill can no longer change a running
-generation's strength unit — sol's race), installs the prep's pin/live
-decisions, and returns the family's
+gate) and returns the `LensPrep` carrying the pin **and the
+authoritative spec/live snapshot** (spec layers derived from the
+prepared lens identity, the live runtime dict by reference); geometry/SAE
+preps carry the request forward. `plan` and `bind` consume the prep only
+— never the live registry — so an interleaved adoption inside the
+prepare→bind window (the un-locked `has_compatible_jlens` on the
+session-info route can trigger one from another thread) cannot pair the
+prep's pinned lens with the replacement's rewritten layers (sol's
+round-3 P1; regression tests pin the interleaving). Every family's
+`prepare` raises on a still-bound run (a stale pin would short-circuit
+the very refresh the step exists for). **Formal runs:** `bind(plan,
+prep)` — prep mandatory, family provenance validated on BOTH plan and
+prep (a bare `bind(plan)`, a wrong-family prep, or a wrong-family
+`LensPrep` all raise) — freezes an `InstrumentBinding` from the prep's
+specs (the SAE binding resolves `max_act` at bind, so the un-locked
+Neuronpedia backfill can no longer change a running generation's
+strength unit — sol's race), installs the prep's pin/live decisions, and
+returns the family's
 run (`LensRun`/`SaeRun`/`GeometryRun`), which owns the instrument-side
 generation-scoped state: step stashes, display readings, active flags,
-the lens disk-identity pin, and the `observe` step-memo (memoized only
+the lens disk-identity pin, the prepare-time live-state snapshot, and
+the `observe` step-memo (memoized only
 while bound — the idle run persists indefinitely, so it never memoizes).
 Geometry's curved warm feet stay in the Monitor engine and the four
 capture modes stay session/HiddenCapture wiring. Instruments keep the
 historical state names as delegating properties over `current_run` (an
 idle passthrough run backs out-of-generation reads — measurement specs
 come from `_measurement_specs()`: the frozen binding when bound, the
-live registry when idle).
+live registry when idle; the live-readout state symmetrically from
+`_measurement_live()`: the run's prepare-time snapshot when bound, so a
+bound run keeps reading the live stack that matches its pin even after
+an adoption rebuilds the instrument-level `live`).
 
 Post-review hardening (sol, gaslamp thread `instrument-protocol`):
 
@@ -1055,13 +1069,16 @@ Post-review hardening (sol, gaslamp thread `instrument-protocol`):
   boundaries (`_begin_capture` and the batch preamble): the defensive
   `_close_instrument_runs()` first, then `prepare` takes the lens disk
   refresh + pin (`session.jlens`, whose adoption path REWRITES live
-  probe layer lists), and only then plans/binds — a plan or freeze taken
-  before the refresh pairs the new lens with stale layers and KeyErrors
-  in the transport stack. Pin demand is the registry boolean, not plan
+  probe layer lists) and snapshots specs/live against that identity, and
+  `plan`/`bind` consume the snapshot — a plan or freeze read off the
+  live registry can pair the prep's lens with a concurrently adopted
+  replacement's layers and KeyError in the transport stack. Pin demand
+  is the registry boolean, not plan
   emptiness (probes whose lens vanished still pin the validated-missing
   state). Formerly the refresh/pin dance was session special-casing
   around `bind(lens=, pinned=)` kwargs; it is protocol shape now
-  (`LensInstrument.prepare`).
+  (`LensInstrument.prepare`), and the ordering is enforced, not
+  advisory: prep-less or foreign-family plan/bind calls raise.
 - **Every capture transaction closes its runs, exception-hard** — the
   generation finallys, the batch finally, and the joint-logprob replay
   all reach `_close_instrument_runs()` through nested finallys, so a

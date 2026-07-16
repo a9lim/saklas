@@ -653,7 +653,7 @@ def test_prepare_is_the_refresh_site_and_supplies_the_pin() -> None:
     """The refresh/pin protocol step: a bare ``prepare()`` — no session
     special-casing around it — adopts an external replacement lens
     (rewriting the live probe layer lists before any plan is taken) and
-    returns the ``LensPrep`` whose pin ``bind`` installs."""
+    returns the ``LensPrep`` snapshot that ``plan``/``bind`` consume."""
     from saklas.core.instruments.types import LensPrep, ReadRequest
 
     session_a = _StubSession()
@@ -673,13 +673,76 @@ def test_prepare_is_the_refresh_site_and_supplies_the_pin() -> None:
     assert isinstance(prep, LensPrep)
     assert prep.pinned is True
     assert prep.lens is not None and list(prep.lens.source_layers) == [1]
-    # The adoption rewrote the live registry inside prepare, so the plans
-    # and the bind-time spec freeze that follow see the refreshed layers.
+    # The adoption rewrote the live registry inside prepare, and the prep's
+    # spec snapshot carries the layers derived from the prepared identity.
     assert session_a._lens_probes["jlens/example"]["layers"] == [1]
-    run = inst.bind(inst.plan(ReadRequest(final_aggregate=True)), prep)
+    assert list(prep.specs["jlens/example"]["layers"]) == [1]
+    run = inst.bind(inst.plan(prep), prep)
     assert run.pinned is True and run.lens is prep.lens
     assert list(run.binding.specs["jlens/example"]["layers"]) == [1]
     session_a._close_instrument_runs()
+
+
+def test_interleaved_adoption_cannot_desync_plan_from_pin() -> None:
+    """sol's round-3 P1: prepare pins lens A; before plan/bind, the
+    un-locked ``has_compatible_jlens`` (the session-info route runs it
+    without the generation lock) observes a replacement lens B and adopts
+    it, rewriting the live probe layer lists.  Because plan and bind
+    consume the prep's snapshot — never the live registry — the run still
+    measures A's layers with A pinned; the old registry reread paired A
+    with B's layers and KeyErrored in the transport stack."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session_a = _StubSession()
+    session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    inst = session_a._lens_instrument
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    assert prep.lens is not None and list(prep.lens.source_layers) == [0]
+
+    # Another process swaps the artifact; the un-locked path adopts it
+    # INSIDE the prepare->bind window.
+    corpus_b = [
+        f"replacement disjoint prompt {i} with enough content" for i in range(4)
+    ]
+    _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
+    assert session_a.has_compatible_jlens() is True  # adopts B
+    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+
+    plan = inst.plan(prep)
+    run = inst.bind(plan, prep)
+    # Plan layers, frozen binding, and the pinned lens all agree on A.
+    assert set(plan.latest_layers) == {0}
+    assert list(run.binding.specs["jlens/example"]["layers"]) == [0]
+    assert run.lens is prep.lens
+    hidden_dim = int(session_a._model.lm_head.weight.shape[1])
+    readings = inst.score_probes({0: torch.randn(hidden_dim)})
+    assert "jlens/example" in readings
+    session_a._close_instrument_runs()
+
+
+def test_bound_run_reads_prepare_time_live_state() -> None:
+    """The live-readout runtime dict is part of the prep snapshot: an
+    interleaved adoption rebuilds the instrument-level ``live`` against
+    the NEW lens, and a bound run must keep reading the state that
+    matches its pin.  Idle runs pass through to the live config."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _StubSession()
+    inst = session._lens_instrument
+    state_a = {"layers": [0]}
+    inst.live = state_a
+    prep = inst.prepare(ReadRequest(final_aggregate=False, live=True))
+    assert prep.live_state is state_a
+
+    inst.live = {"layers": [1]}  # the adoption rebuild lands in the window
+    inst.bind(inst.plan(prep), prep)
+    assert inst._measurement_live() is state_a
+    session._close_instrument_runs()
+    assert inst._measurement_live() is inst.live
+    inst.live = None
 
 
 def test_prepare_pin_demand_formula() -> None:
@@ -716,7 +779,7 @@ def test_prepare_pin_demand_formula() -> None:
     del session._lens_probes["jlens/example"]
     inst.live = {"layers": [0]}
     prep = inst.prepare(ReadRequest(final_aggregate=False, live=True))
-    assert prep.pinned is True and prep.live_active is True
+    assert prep.pinned is True and prep.request.live is True
     inst.live = None
 
 
@@ -735,7 +798,8 @@ def test_prepare_on_a_bound_run_raises() -> None:
         ("geometry", session._geometry_instrument),
     )
     for family, inst in instruments:
-        inst.bind(InstrumentPlan(family=family))
+        prep = inst.prepare(request)
+        inst.bind(InstrumentPlan(family=family), prep)
         with pytest.raises(RuntimeError, match="bound run"):
             inst.prepare(request)
     session._close_instrument_runs()
@@ -743,22 +807,63 @@ def test_prepare_on_a_bound_run_raises() -> None:
         inst.prepare(request)  # idle runs again — every prepare passes
 
 
-def test_lens_bind_rejects_a_foreign_prep() -> None:
-    """A wrong-family prep is a caller bug, loud rather than defaulted."""
+def test_bind_and_plan_reject_foreign_or_missing_preps() -> None:
+    """The transaction contract is enforced, not advisory: a bare
+    ``bind(plan)`` is a TypeError, a wrong-family prep (including a
+    wrong-family ``LensPrep``) is rejected by every family, and plans are
+    validated for family provenance too."""
     from saklas.core.instruments.types import (
         InstrumentPlan,
         InstrumentPrep,
+        LensPrep,
         ReadRequest,
     )
 
     session = _StubSession()
-    inst = session._lens_instrument
-    plan = inst.plan(ReadRequest(final_aggregate=False))
+    session._monitor = SimpleNamespace(probe_names=[])
+    request = ReadRequest(final_aggregate=False)
+
+    lens = session._lens_instrument
+    lens_prep = lens.prepare(request)
+    with pytest.raises(TypeError):
+        lens.bind(InstrumentPlan(family="lens"))  # type: ignore[call-arg]  # bare bind: prep required
     with pytest.raises(TypeError, match="LensPrep"):
-        inst.bind(plan, InstrumentPrep(family="sae"))
-    assert inst.current_run.bound is False
-    inst.bind(InstrumentPlan(family="lens"))  # bare bind stays valid
-    session._close_instrument_runs()
+        lens.bind(InstrumentPlan(family="lens"), InstrumentPrep(family="lens"))
+    with pytest.raises(TypeError, match="LensPrep"):
+        lens.bind(
+            InstrumentPlan(family="lens"), LensPrep(family="sae"),
+        )
+    with pytest.raises(TypeError, match="LensPrep"):
+        lens.plan(InstrumentPrep(family="lens"))
+    with pytest.raises(ValueError, match="plan family"):
+        lens.bind(InstrumentPlan(family="sae"), lens_prep)
+    assert lens.current_run.bound is False
+
+    sae = session._sae_instrument
+    sae_prep = sae.prepare(request)
+    with pytest.raises(TypeError):
+        sae.bind(InstrumentPlan(family="sae"))  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="family"):
+        sae.bind(InstrumentPlan(family="sae"), InstrumentPrep(family="lens"))
+    with pytest.raises(TypeError, match="family"):
+        sae.plan(InstrumentPrep(family="geometry"))
+    with pytest.raises(ValueError, match="plan family"):
+        sae.bind(InstrumentPlan(family="lens"), sae_prep)
+    assert sae.current_run.bound is False
+
+    geometry = session._geometry_instrument
+    geometry_prep = geometry.prepare(request)
+    with pytest.raises(TypeError):
+        geometry.bind(InstrumentPlan(family="geometry"))  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="family"):
+        geometry.bind(
+            InstrumentPlan(family="geometry"), InstrumentPrep(family="sae"),
+        )
+    with pytest.raises(TypeError, match="family"):
+        geometry.plan(InstrumentPrep(family="lens"))
+    with pytest.raises(ValueError, match="plan family"):
+        geometry.bind(InstrumentPlan(family="lens"), geometry_prep)
+    assert geometry.current_run.bound is False
 
 
 def test_generation_lens_snapshot_avoids_per_token_disk_validation(

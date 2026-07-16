@@ -85,6 +85,11 @@ recipes/notes; effective roster rows carry `origin`.
   supplies raw-ness). Backs `TokenDrilldownDrawer`'s **j-lens** tab via
   `apiInstruments.tokenReadout`; gated on the session-info `jlens_fitted` flag
   (unfitted → the tab shows the `saklas lens fit` hint).
+  `apiInstruments.tokenReadout` accepts every `InstrumentFamily`: the geometry
+  replay (`instruments.geometry.readings` + `binding: {source: null,
+  steering}` — readings, not a `readout` discovery block) is typed and
+  callable from the headless client, though no drilldown tab consumes it yet
+  (`GeometryInstrumentJSON.binding?` carries the replay's applied steering).
 - **POST `/sessions/{id}/instruments/lens/token/validate`** — read-only `{word}` →
   `{word, token_id}` single-token check (`apiInstruments.validateLensToken`).
   Both J-LENS add forms call it before

@@ -169,3 +169,26 @@ def test_geometry_token_readout_errors() -> None:
     s._monitor = _StubMonitor([], set())
     with pytest.raises(ValueError, match="no geometry probes attached"):
         s.geometry_token_readout(node_id, 0)
+
+
+def test_geometry_token_readout_detach_race_keeps_caller_error() -> None:
+    """sol's round-3 P3: a detach winning the gap between the entry roster
+    check and the exclusive section must still surface the caller-facing
+    "no geometry probes attached" error — not a capture-layer
+    implementation leak.  The roster check is repeated under
+    ``_model_exclusive``; this session's exclusive guard performs the
+    detach to pin the interleaving deterministically."""
+    from contextlib import contextmanager
+
+    s = _GeometryStubSession()
+    node_id = _tree_with_assistant(s, s._tokenizer.encode("abc"))
+
+    @contextmanager
+    def _detaching_exclusive(msg: str, **_kw: Any):
+        del msg
+        s._monitor = _StubMonitor([], set())  # the detach lands here
+        yield
+
+    s._model_exclusive = _detaching_exclusive
+    with pytest.raises(ValueError, match="no geometry probes attached"):
+        s.geometry_token_readout(node_id, 0)

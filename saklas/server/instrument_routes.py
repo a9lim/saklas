@@ -946,7 +946,10 @@ def register_instrument_routes(app: FastAPI) -> None:
             scope="replay",
             provenance="replayed",
             geometry_readings=out.get("readings"),
+            # The shared MeasurementBinding wire shape carries both keys;
+            # geometry has no source lifecycle, so source is always null.
             geometry_binding={
+                "source": None,
                 "steering": (out.get("steering") if steered else None),
             },
         )

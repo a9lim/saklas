@@ -528,7 +528,7 @@ def test_bound_run_freezes_sae_unit_against_metadata_backfill() -> None:
     generation lock) must not change a running generation's strength unit.
     Between generations (idle run) the refresh applies immediately, as
     before."""
-    from saklas.core.instruments.types import InstrumentPlan
+    from saklas.core.instruments.types import InstrumentPlan, ReadRequest
 
     session = _session()
     inst = session._sae_instrument
@@ -539,7 +539,10 @@ def test_bound_run_freezes_sae_unit_against_metadata_backfill() -> None:
     acts = session._encode_sae_hidden(
         session._capture.latest_per_layer()[1]
     )
-    inst.bind(InstrumentPlan(family="sae"))
+    inst.bind(
+        InstrumentPlan(family="sae"),
+        inst.prepare(ReadRequest(final_aggregate=True)),
+    )
     before = {n: v for n, _f, _r, v in inst.probe_values(acts)}
     assert before["sae/1"] == pytest.approx(3.0)  # raw
 
@@ -561,7 +564,7 @@ def test_sae_bind_resolves_unit_from_meta_cache() -> None:
     unit exists in the metadata cache freezes the RESOLVED unit — the
     live-cache fallback never runs under a bound run, so a mid-generation
     cache mutation cannot flip the unit either."""
-    from saklas.core.instruments.types import InstrumentPlan
+    from saklas.core.instruments.types import InstrumentPlan, ReadRequest
 
     session = _session()
     inst = session._sae_instrument
@@ -573,7 +576,10 @@ def test_sae_bind_resolves_unit_from_meta_cache() -> None:
     acts = session._encode_sae_hidden(
         session._capture.latest_per_layer()[1]
     )
-    inst.bind(InstrumentPlan(family="sae"))
+    inst.bind(
+        InstrumentPlan(family="sae"),
+        inst.prepare(ReadRequest(final_aggregate=True)),
+    )
     assert inst.current_run.binding.specs["sae/2"]["max_act"] == 10.0
     values = {n: v for n, _f, _r, v in inst.probe_values(acts)}
     assert values["sae/2"] == pytest.approx(5.0 / 10.0)
@@ -589,14 +595,17 @@ def test_detach_during_bound_generation_keeps_aggregate_roster() -> None:
     (e.g. the synchronous DELETE route, which takes no generation lock)
     stays in the bound generation's aggregate roster; the next bind sees
     the removal."""
-    from saklas.core.instruments.types import InstrumentPlan
+    from saklas.core.instruments.types import InstrumentPlan, ReadRequest
 
     session = _session()
     inst = session._sae_instrument
     session._sae_probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
-    inst.bind(InstrumentPlan(family="sae"))
+    inst.bind(
+        InstrumentPlan(family="sae"),
+        inst.prepare(ReadRequest(final_aggregate=True)),
+    )
     pooled = session._capture.latest_per_layer()
 
     del inst.probes["sae/1"]  # the un-locked detach lands mid-generation

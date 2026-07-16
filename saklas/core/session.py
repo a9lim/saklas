@@ -4353,6 +4353,16 @@ class SaklasSession:
                 phase_msg="session.geometry_token_readout called while a "
                 "generation is in flight",
             ):
+                # Repeat the roster check under the exclusive section: a
+                # detach winning the gap since the entry check would
+                # otherwise surface as a capture-layer implementation error
+                # instead of the intended caller-facing message.
+                if not self._monitor.probe_names:
+                    raise ValueError(
+                        "geometry_token_readout: no geometry probes "
+                        "attached — attach one with "
+                        "session.add_probe(selector) first"
+                    )
                 layer_idxs = sorted(self._monitor.probe_layers())
                 hidden = _capture_all_hidden_states(
                     self._model, self._layers, ids,
@@ -5672,8 +5682,9 @@ class SaklasSession:
         """Attach hidden-state capture. Returns True if attached.
 
         The capture layer set is **plan-driven**: each instrument family
-        declares its demand via ``Instrument.plan(ReadRequest) ->
-        InstrumentPlan`` and this planner unions the declared layers.
+        prepares its source snapshot (``Instrument.prepare(ReadRequest)``),
+        declares its demand via ``Instrument.plan(prep) ->
+        InstrumentPlan``, and this planner unions the declared layers.
         Retention (incremental vs tail ring vs full stack) remains the
         planner's decision below — cross-instrument resource sharing the
         plans deliberately do not decide (``protocol.py``).
@@ -5728,35 +5739,35 @@ class SaklasSession:
         # and a stale binding would keep serving frozen specs to idle
         # reads.  ``prepare`` is the source-boundary step: the lens
         # family reads the disk-refreshing ``jlens`` getter under pin
-        # demand there, BEFORE the plans and spec freezes are taken
-        # (``LensInstrument.prepare`` carries the ordering rationale).
+        # demand there and snapshots specs + live config against that
+        # identity; ``plan``/``bind`` consume the prep only, so an
+        # interleaved adoption (the un-locked ``has_compatible_jlens``)
+        # cannot desynchronize them (``LensInstrument.prepare`` carries
+        # the ordering + snapshot rationale).
         self._close_instrument_runs()
-        geometry_request = ReadRequest(
+        geometry_prep = self._geometry_instrument.prepare(ReadRequest(
             gate_keys=frozenset(gating_probe_keys or ()),
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
             return_hidden=widen,
-        )
-        lens_request = ReadRequest(
+        ))
+        lens_prep = self._lens_instrument.prepare(ReadRequest(
             gate_keys=frozenset(lens_gating_probe_keys or ()),
             live=live_lens_active,
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
             return_hidden=widen,
-        )
-        sae_request = ReadRequest(
+        ))
+        sae_prep = self._sae_instrument.prepare(ReadRequest(
             gate_keys=frozenset(sae_gating_probe_keys or ()),
             live=live_sae_active,
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
             return_hidden=widen,
-        )
-        geometry_prep = self._geometry_instrument.prepare(geometry_request)
-        lens_prep = self._lens_instrument.prepare(lens_request)
-        sae_prep = self._sae_instrument.prepare(sae_request)
-        geometry_plan = self._geometry_instrument.plan(geometry_request)
-        lens_plan = self._lens_instrument.plan(lens_request)
-        sae_plan = self._sae_instrument.plan(sae_request)
+        ))
+        geometry_plan = self._geometry_instrument.plan(geometry_prep)
+        lens_plan = self._lens_instrument.plan(lens_prep)
+        sae_plan = self._sae_instrument.plan(sae_prep)
         has_lens_gate = bool(lens_plan.gate_keys)
         has_sae_gate = bool(sae_plan.gate_keys)
 
@@ -10110,12 +10121,13 @@ class SaklasSession:
             # Batched generation bypasses ``_begin_capture`` but still owns
             # one generation transaction, and runs the same uniform
             # sequence: close → prepare → plan → bind.  The lens prepare
-            # takes the disk refresh + pin BEFORE the plans freeze specs
-            # (its pin-demand formula reduces to "probes attached and a
-            # final aggregate wanted" on a batch request); one pinned lens
-            # then serves every row aggregate rather than reopening all
-            # shards per batch item, and the bindings freeze probe specs
-            # against concurrent metadata backfills for the whole batch.
+            # takes the disk refresh + pin and snapshots specs against
+            # that identity BEFORE the plans/bindings consume them (its
+            # pin-demand formula reduces to "probes attached and a final
+            # aggregate wanted" on a batch request); one pinned lens then
+            # serves every row aggregate rather than reopening all shards
+            # per batch item, and the bindings freeze probe specs against
+            # concurrent mutation for the whole batch.
             self._close_instrument_runs()
             batch_request = ReadRequest(
                 final_aggregate=return_probe_readings,
@@ -10124,9 +10136,9 @@ class SaklasSession:
             geometry_prep = self._geometry_instrument.prepare(batch_request)
             lens_prep = self._lens_instrument.prepare(batch_request)
             sae_prep = self._sae_instrument.prepare(batch_request)
-            geometry_plan = self._geometry_instrument.plan(batch_request)
-            lens_plan = self._lens_instrument.plan(batch_request)
-            sae_plan = self._sae_instrument.plan(batch_request)
+            geometry_plan = self._geometry_instrument.plan(geometry_prep)
+            lens_plan = self._lens_instrument.plan(lens_prep)
+            sae_plan = self._sae_instrument.plan(sae_prep)
             self._geometry_instrument.bind(geometry_plan, geometry_prep)
             self._lens_instrument.bind(lens_plan, lens_prep)
             self._sae_instrument.bind(sae_plan, sae_prep)

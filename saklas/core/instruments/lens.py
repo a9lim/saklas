@@ -24,7 +24,7 @@ is only the per-row computation.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Sequence, TYPE_CHECKING, cast
+from typing import Any, Mapping, Sequence, TYPE_CHECKING, cast
 
 import torch
 
@@ -66,6 +66,7 @@ class LensRun:
         lens: Any = None,
         pinned: bool = False,
         active: bool = True,
+        live_state: "Mapping[str, Any] | None" = None,
         bound: bool = False,
     ) -> None:
         self._instrument = instrument
@@ -76,6 +77,11 @@ class LensRun:
         self.pinned = pinned
         #: Live-readout activity for this generation.
         self.active = active
+        #: The live-readout runtime dict snapshotted at prepare — an
+        #: interleaved adoption rebuilds the instrument-level ``live``
+        #: against the NEW lens, so a bound run must keep reading the
+        #: state that matches its pin (idle runs pass through instead).
+        self.live_state = live_state
         #: True for a generation-bound run (idle runs pass through).
         self.bound = bound
         self.step_stash: dict[str, Any] | None = None
@@ -136,6 +142,7 @@ class LensRun:
         self.lens = None
         self.pinned = False
         self.active = True
+        self.live_state = None
 
 
 class LensInstrument:
@@ -222,6 +229,16 @@ class LensInstrument:
         the refreshed registry (a plan taken earlier pairs the new lens
         with stale layers and KeyErrors in the transport stack).
 
+        The prep is the **authoritative snapshot** (sol's round-3 P1):
+        spec ``layers`` are derived from the prepared lens identity
+        itself — never left to a later registry reread — and the live
+        runtime dict is captured by reference, because an interleaved
+        unpinned getter read (``has_compatible_jlens`` runs un-locked on
+        the session-info route) can adopt a *newer* disk lens inside the
+        prepare→bind window and rewrite both.  ``plan``/``bind`` consume
+        only this snapshot, so the run's lens, plan layers, and frozen
+        specs agree by construction.
+
         Pin demand is the registry boolean, not plan emptiness — probes
         whose lens vanished still pin the validated-missing state so
         per-token paths never reopen the sidecar.  The getter
@@ -235,43 +252,73 @@ class LensInstrument:
                 "generation's run (_close_instrument_runs) before preparing "
                 "the next — a stale pin suppresses the lens disk refresh"
             )
-        probes = self.probes
+        # One C-level snapshot of the registry items: the un-locked
+        # detach route may mutate the dict concurrently.
+        items = list(self.probes.items())
         gate_hit = any(
-            parse_gate_ref(key).probe in probes for key in request.gate_keys
+            parse_gate_ref(key).probe in self.probes
+            for key in request.gate_keys
         )
         pin_demand = bool(
             (request.live and self.live is not None)
-            or (probes and (request.final_aggregate or gate_hit))
+            or (items and (request.final_aggregate or gate_hit))
         )
+        lens = self._session.jlens if pin_demand else None
+        # Spec layers under a pin come from the prepared identity itself —
+        # an atomically consistent source for every probe, where registry
+        # lists could tear mid-copy under a concurrent adoption (the
+        # production invariant keeps them identical to ``source_layers``
+        # anyway: attach records the full fitted set and adoption rewrites
+        # every probe).  Without one — a vanished lens, whose eviction
+        # path already zeroed the registry lists the copies reflect
+        # (validated-missing), or a duck-typed narrow stub lens without
+        # ``source_layers`` (the same narrow-stub tolerance the SAE
+        # metadata cache gets) — the post-refresh registry copies stand.
+        source_layers = (
+            getattr(lens, "source_layers", None) if pin_demand else None
+        )
+        if source_layers is not None:
+            layers = [int(layer) for layer in source_layers]
+            specs = {
+                name: {**spec, "layers": list(layers)}
+                for name, spec in items
+            }
+        else:
+            specs = {
+                name: {**spec, "layers": list(spec["layers"])}
+                for name, spec in items
+            }
         return LensPrep(
             family=self.family,
-            live_active=request.live,
-            lens=self._session.jlens if pin_demand else None,
+            request=request,
+            lens=lens,
             pinned=pin_demand,
+            specs=specs,
+            live_state=self.live,
         )
 
-    def bind(
-        self, plan: InstrumentPlan, prep: InstrumentPrep | None = None,
-    ) -> LensRun:
+    def bind(self, plan: InstrumentPlan, prep: InstrumentPrep) -> LensRun:
         """Bind an immutable per-generation run from a declared plan.
 
-        The **prep supplies the pin** (``prepare``, the protocol step
-        that runs before ``plan()`` — see its docstring for the ordering
-        rationale).  ``bind`` therefore only freezes the (already
-        refreshed) registry and installs the pin it is handed; a bare
-        ``bind(plan)`` binds unpinned with live defaults.  The frozen
-        spec copies own their ``layers`` list — the live registry's lists
-        are replaced in place by the adoption/eviction paths.
+        The **prep supplies the pin and the spec snapshot** (``prepare``
+        — see its docstring for the ordering + snapshot rationale).
+        ``bind`` freezes the prep's specs (never the live registry, which
+        an interleaved adoption may have rewritten since prepare) and
+        installs the pin and live-state reference it is handed.  The
+        frozen spec copies own their ``layers`` list — the live
+        registry's lists are replaced in place by the adoption/eviction
+        paths.
         """
-        del plan  # demand consumed by the planner; the pin decision is prep's
-        if prep is None:
-            lens_prep = LensPrep(family=self.family, live_active=True)
-        elif isinstance(prep, LensPrep):
-            lens_prep = prep
-        else:
+        if not isinstance(prep, LensPrep) or prep.family != self.family:
             raise TypeError(
                 "LensInstrument.bind takes the LensPrep its own prepare() "
-                f"returned, got {type(prep).__name__}"
+                f"returned, got {type(prep).__name__} "
+                f"(family={getattr(prep, 'family', None)!r})"
+            )
+        if plan.family != self.family:
+            raise ValueError(
+                f"LensInstrument.bind: plan family {plan.family!r} is not "
+                f"{self.family!r}"
             )
         session = self._session
         run = LensRun(
@@ -289,12 +336,13 @@ class LensInstrument:
                 ),
                 specs={
                     name: {**spec, "layers": list(spec["layers"])}
-                    for name, spec in self.probes.items()
+                    for name, spec in prep.specs.items()
                 },
             ),
-            lens=lens_prep.lens,
-            pinned=lens_prep.pinned,
-            active=lens_prep.live_active,
+            lens=prep.lens,
+            pinned=prep.pinned,
+            active=prep.request.live,
+            live_state=prep.live_state,
             bound=True,
         )
         self.current_run = run
@@ -314,6 +362,15 @@ class LensInstrument:
         live registry."""
         run = self.current_run
         return run.binding.specs if run.bound else self.probes
+
+    def _measurement_live(self) -> "Mapping[str, Any] | None":
+        """The live-readout state for measurement: a bound run's
+        prepare-time snapshot (an interleaved adoption rebuilds the
+        instrument-level ``live`` against the NEW lens — the run must
+        keep reading the state that matches its pin), else the live
+        config."""
+        run = self.current_run
+        return run.live_state if run.bound else self.live
 
     # -------------------------------------------------------------- registry
 
@@ -379,8 +436,15 @@ class LensInstrument:
 
     # ---------------------------------------------------------------- planning
 
-    def plan(self, request: ReadRequest) -> InstrumentPlan:
+    def plan(self, prep: InstrumentPrep) -> InstrumentPlan:
         """Declare the lens family's capture demand for one generation.
+
+        Derived **solely from the prep** — the spec snapshot whose layers
+        match the prepared lens identity, and the live state captured at
+        prepare — never the live registry, which an interleaved adoption
+        may have rewritten since (sol's round-3 P1: a plan read off the
+        rewritten registry pairs the prep's older lens with the new
+        lens's layers and KeyErrors in the transport stack).
 
         ``latest_layers`` — the live workspace readout's layer set plus the
         pinned probes' fitted band (full band when a finalize aggregate
@@ -390,18 +454,33 @@ class LensInstrument:
         last content token from the capture tail ring, which must span the
         probe band at ring depth ``AGG_TAIL_DEPTH``.
         """
-        live = self.live if request.live else None
-        probes = self.probes
+        if not isinstance(prep, LensPrep) or prep.family != self.family:
+            raise TypeError(
+                "LensInstrument.plan takes the LensPrep its own prepare() "
+                f"returned, got {type(prep).__name__}"
+            )
+        request = prep.request
+        probes: Mapping[str, Mapping[str, Any]] = prep.specs
+        live = prep.live_state if request.live else None
         gate_keys = frozenset(
             key for key in request.gate_keys
             if parse_gate_ref(key).probe in probes
         )
+
+        def _band(names: "set[str] | None" = None) -> set[int]:
+            return {
+                int(layer)
+                for name, spec in probes.items()
+                if names is None or name in names
+                for layer in spec["layers"]
+            }
+
         latest: set[int] = set()
         tail: set[int] = set()
         if live is not None:
             latest.update(int(layer) for layer in live["layers"])
         if probes and request.final_aggregate:
-            band = {int(layer) for layer in self.probe_layers()}
+            band = _band()
             latest.update(band)
             tail.update(band)
         elif gate_keys:
@@ -409,9 +488,7 @@ class LensInstrument:
             # dormant probes must not keep capture alive when the caller
             # disabled final probe readings.
             gated_names = {parse_gate_ref(key).probe for key in gate_keys}
-            latest.update(
-                int(layer) for layer in self.probe_layers(gated_names)
-            )
+            latest.update(_band(gated_names))
         return InstrumentPlan(
             family=self.family,
             latest_layers=frozenset(latest),
@@ -597,7 +674,8 @@ class LensInstrument:
             if not only:
                 return {}
         live_display_needs_full_probs = bool(
-            self.live is not None and self.active_for_generation
+            self._measurement_live() is not None
+            and self.active_for_generation
         )
         # When the token tap will immediately need every pinned probe reading
         # for the live payload, compute that superset once in the gate
@@ -773,7 +851,7 @@ class LensInstrument:
         gate callback's stash rows when the layer sets overlap.
         """
         session = self._session
-        state = self.live
+        state = self._measurement_live()
         if state is None or not self.active_for_generation:
             return None
         buckets = session._capture.per_layer_buckets()
@@ -990,7 +1068,7 @@ class LensInstrument:
         authored-prefill orchestration.
         """
         session = self._session
-        state = self.live
+        state = self._measurement_live()
         if state is None or not self.active_for_generation:
             return None
         layers = [int(layer) for layer in state["layers"] if int(layer) in hidden]

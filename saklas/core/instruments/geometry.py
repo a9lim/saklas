@@ -136,19 +136,16 @@ class GeometryInstrument:
     def prepare(self, request: ReadRequest) -> InstrumentPrep:
         """Generation-boundary prep — geometry has no source lifecycle
         (nothing to refresh or pin) and no run-level live channel, so
-        the bare prep is returned purely to keep the session's capture
-        transaction uniform across families."""
+        the prep only carries the request forward for ``plan``, keeping
+        the session's capture transaction uniform across families."""
         if self.current_run.bound:
             raise RuntimeError(
                 "GeometryInstrument.prepare() on a bound run: close the "
                 "prior generation's run (_close_instrument_runs) first"
             )
-        del request
-        return InstrumentPrep(family=self.family)
+        return InstrumentPrep(family=self.family, request=request)
 
-    def bind(
-        self, plan: InstrumentPlan, prep: InstrumentPrep | None = None,
-    ) -> GeometryRun:
+    def bind(self, plan: InstrumentPlan, prep: InstrumentPrep) -> GeometryRun:
         """Bind an immutable per-generation run.
 
         The binding carries the probe-name roster only: geometry specs
@@ -156,9 +153,18 @@ class GeometryInstrument:
         ``_model_exclusive``), so unlike the SAE family there is no
         mid-generation mutation to freeze against, and the full spec walk
         (which touches Monitor internals) stays off the per-generation
-        path.  The prep is threaded for protocol uniformity only.
+        path.
         """
-        del plan, prep  # demand already consumed by the capture planner
+        if prep.family != self.family:
+            raise TypeError(
+                "GeometryInstrument.bind takes the InstrumentPrep its own "
+                f"prepare() returned, got family={prep.family!r}"
+            )
+        if plan.family != self.family:
+            raise ValueError(
+                f"GeometryInstrument.bind: plan family {plan.family!r} is "
+                f"not {self.family!r}"
+            )
         run = GeometryRun(
             self,
             InstrumentBinding(
@@ -252,19 +258,27 @@ class GeometryInstrument:
 
     # ---------------------------------------------------------------- planning
 
-    def plan(self, request: ReadRequest) -> InstrumentPlan:
+    def plan(self, prep: InstrumentPrep) -> InstrumentPlan:
         """Declare the monitor roster's capture demand for one generation.
 
         Demand, not mechanics (``protocol.py``): which layers must be
         captured for the roster to read, whether anything reads per step,
         and which gate scalar keys belong to this family.  The session
         planner unions plans across families and picks physical retention.
+        The prep carries the request; roster mutations hold
+        ``_model_exclusive``, so there is no snapshot to consume.
 
         When probe gates are the family's *sole* per-token consumer and
         the caller disabled final probe readings, demand narrows to the
         gated probes' layer union — dormant pinned probes must not keep
         capture alive (FIX #4's layer-union half).
         """
+        if prep.family != self.family:
+            raise TypeError(
+                "GeometryInstrument.plan takes the InstrumentPrep its own "
+                f"prepare() returned, got family={prep.family!r}"
+            )
+        request = prep.request
         monitor = self._session._monitor
         names = set(monitor.probe_names)
         if not names:

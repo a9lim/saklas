@@ -916,12 +916,15 @@ export const apiInstruments = {
 
   /** Loom token-drilldown readout at one decode step — the forward that
    *  produced the clicked token, wrapped in the 5.x ``measurements`` replay
-   *  envelope (``instruments.<family>.readout`` + ``binding``).  ``steered``
-   *  (default true) replays under the node's recipe steering; ``raw`` marks
-   *  a flat-buffer node (raw-ness isn't stamped server-side).  lens accepts
-   *  ``layers``; sae ignores it. */
+   *  envelope.  lens/sae return a native ``readout`` discovery block +
+   *  ``binding``; geometry returns the Monitor roster's ``readings`` +
+   *  ``binding`` (no readout — subspace probes have no vocabulary/feature
+   *  dictionary).  ``steered`` (default true) replays under the node's
+   *  recipe steering; ``raw`` marks a flat-buffer node (raw-ness isn't
+   *  stamped server-side).  lens accepts ``layers``; sae/geometry ignore it
+   *  (and geometry ignores ``topK``). */
   tokenReadout(
-    family: "lens" | "sae",
+    family: InstrumentFamily,
     nodeId: string,
     rawIndex: number,
     opts: { topK?: number; steered?: boolean; raw?: boolean; layers?: string } = {},

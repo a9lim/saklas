@@ -89,26 +89,31 @@ class Instrument(Protocol):
 
     def prepare(self, request: ReadRequest) -> InstrumentPrep:
         """Generation-boundary source preparation — the first protocol
-        step of a capture transaction, run after the prior run is closed
-        and BEFORE ``plan()``.
+        step of a capture transaction, run after the prior run is
+        closed.
 
         The one step allowed to touch disk-backed source identity: the
-        lens family refreshes/adopts the on-disk artifact here and
-        decides source pinning (adoption rewrites live probe layer
-        lists, so a plan or spec freeze taken earlier would pair the new
-        source with stale specs — the refresh-then-plan ordering).
-        Families without a source lifecycle return the bare prep so the
-        session boundary stays uniform.  Returns the family's
-        ``InstrumentPrep``, which the session threads opaquely into
-        ``bind``.  Raises ``RuntimeError`` on a still-bound run — a
+        lens family refreshes/adopts the on-disk artifact here, decides
+        source pinning, and snapshots its probe specs + live config
+        against the prepared identity.  ``plan`` and ``bind`` consume
+        the prep — never the live registry — so a registry mutation
+        landing inside the prepare→bind window (adoption rewrites live
+        probe layer lists; the un-locked ``has_compatible_jlens`` can
+        trigger it from another thread) cannot desynchronize what the
+        run measures from the source it pinned.  Families without a
+        source lifecycle return the bare prep so the session boundary
+        stays uniform.  Raises ``RuntimeError`` on a still-bound run — a
         stale pin would short-circuit the very refresh this step exists
         for, so callers must ``close_run`` first."""
         ...
 
-    def plan(self, request: ReadRequest) -> InstrumentPlan: ...
+    def plan(self, prep: InstrumentPrep) -> InstrumentPlan:
+        """Declared capture demand, derived solely from the prep (its
+        ``request`` + frozen snapshot) — never from the live registry."""
+        ...
 
     def bind(
-        self, plan: InstrumentPlan, prep: InstrumentPrep | None = None,
+        self, plan: InstrumentPlan, prep: InstrumentPrep,
     ) -> "InstrumentRun": ...
 
     def close_run(self) -> None:

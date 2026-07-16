@@ -362,7 +362,10 @@ class _MockSession:
         from saklas.core.instruments.geometry import GeometryInstrument
         from saklas.core.instruments.lens import LensInstrument
         from saklas.core.instruments.sae import SaeInstrument
-        from saklas.core.instruments.types import InstrumentPlan
+        from saklas.core.instruments.types import (
+            InstrumentPlan,
+            ReadRequest,
+        )
         from saklas.core.session import SaklasSession
 
         self.tokenizer = _MockTokenizer()
@@ -390,9 +393,19 @@ class _MockSession:
         self._sae_instrument = SaeInstrument(self)  # type: ignore[arg-type]
 
         def _bind_all(**_kwargs: Any) -> bool:
-            self._geometry_instrument.bind(InstrumentPlan(family="geometry"))
-            self._lens_instrument.bind(InstrumentPlan(family="lens"))
-            self._sae_instrument.bind(InstrumentPlan(family="sae"))
+            request = ReadRequest(final_aggregate=False)
+            self._geometry_instrument.bind(
+                InstrumentPlan(family="geometry"),
+                self._geometry_instrument.prepare(request),
+            )
+            self._lens_instrument.bind(
+                InstrumentPlan(family="lens"),
+                self._lens_instrument.prepare(request),
+            )
+            self._sae_instrument.bind(
+                InstrumentPlan(family="sae"),
+                self._sae_instrument.prepare(request),
+            )
             return False
 
         self._begin_capture = _bind_all

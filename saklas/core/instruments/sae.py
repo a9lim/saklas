@@ -185,19 +185,18 @@ class SaeInstrument:
     def prepare(self, request: ReadRequest) -> InstrumentPrep:
         """Generation-boundary prep — no disk-backed source to refresh
         (backend residency is explicit lifecycle, ``load_sae``/
-        ``train_sae``), so the prep only echoes the live flag back for
-        ``bind``.  The bound-run guard keeps the transaction contract
-        uniform across families."""
+        ``train_sae``) and no lens-style identity coupling between the
+        registry and the source, so the prep only carries the request
+        forward for ``plan``/``bind``.  The bound-run guard keeps the
+        transaction contract uniform across families."""
         if self.current_run.bound:
             raise RuntimeError(
                 "SaeInstrument.prepare() on a bound run: close the prior "
                 "generation's run (_close_instrument_runs) first"
             )
-        return InstrumentPrep(family=self.family, live_active=request.live)
+        return InstrumentPrep(family=self.family, request=request)
 
-    def bind(
-        self, plan: InstrumentPlan, prep: InstrumentPrep | None = None,
-    ) -> SaeRun:
+    def bind(self, plan: InstrumentPlan, prep: InstrumentPrep) -> SaeRun:
         """Bind an immutable per-generation run from a declared plan.
 
         The binding freezes each attached probe's spec **with its
@@ -205,10 +204,19 @@ class SaeInstrument:
         session metadata cache at bind time, so a mid-generation
         Neuronpedia backfill (which mutates specs and cache without the
         generation lock) cannot change what a running generation measures.
-        A bare ``bind(plan)`` binds with live defaults.
         """
-        del plan  # demand already consumed by the capture planner
-        live_active = prep.live_active if prep is not None else True
+        if not isinstance(prep, InstrumentPrep) or prep.family != self.family:
+            raise TypeError(
+                "SaeInstrument.bind takes the InstrumentPrep its own "
+                f"prepare() returned, got {type(prep).__name__} "
+                f"(family={getattr(prep, 'family', None)!r})"
+            )
+        if plan.family != self.family:
+            raise ValueError(
+                f"SaeInstrument.bind: plan family {plan.family!r} is not "
+                f"{self.family!r}"
+            )
+        live_active = prep.request.live
         session = self._session
         # Duck-typed narrow stubs may lack the metadata cache; a real
         # session always carries it (set in ``__init__``).
@@ -291,7 +299,7 @@ class SaeInstrument:
 
     # ---------------------------------------------------------------- planning
 
-    def plan(self, request: ReadRequest) -> InstrumentPlan:
+    def plan(self, prep: InstrumentPrep) -> InstrumentPlan:
         """Declare the SAE family's capture demand for one generation.
 
         The family reads one resident hook layer: live discovery captures
@@ -299,7 +307,17 @@ class SaeInstrument:
         runtime layer whenever a finalize aggregate or an active gate will
         read them (the resident layer is session-side runtime state shared
         with steering atoms, consulted only when probes are attached).
+        The prep carries the request; unlike the lens there is no
+        registry↔source identity coupling to snapshot, so demand reads the
+        live registry (a racing detach only shrinks or widens capture — the
+        binding still freezes what the run measures).
         """
+        if prep.family != self.family:
+            raise TypeError(
+                "SaeInstrument.plan takes the InstrumentPrep its own "
+                f"prepare() returned, got family={prep.family!r}"
+            )
+        request = prep.request
         live = self.live if request.live else None
         probes = self.probes
         gate_keys = frozenset(

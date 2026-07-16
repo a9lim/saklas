@@ -459,7 +459,9 @@ class TestTokenReadout:
         assert m["scope"] == "replay"
         assert m["provenance"] == "replayed"
         geo = m["instruments"]["geometry"]
-        assert geo["binding"] == {"steering": "0.3 formal.casual"}
+        assert geo["binding"] == {
+            "source": None, "steering": "0.3 formal.casual",
+        }
         reading = geo["readings"]["formal.casual"]
         assert reading["coords"] == [0.7]
         assert m["scores"]["formal.casual"] == 0.7
@@ -478,7 +480,7 @@ class TestTokenReadout:
         )
         assert resp.status_code == 200
         geo = resp.json()["measurements"]["instruments"]["geometry"]
-        assert geo["binding"] == {"steering": None}
+        assert geo["binding"] == {"source": None, "steering": None}
         call = session.geometry_token_readout.call_args
         assert call.kwargs["apply_steering"] is False
 

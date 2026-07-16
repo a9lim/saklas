@@ -269,9 +269,13 @@ export interface MeasurementBindingJSON {
   layer?: number | null;
 }
 
-/** Geometry (Monitor subspace) family — attached-probe readings only. */
+/** Geometry (Monitor subspace) family — attached-probe readings.  Live
+ *  token/aggregate envelopes carry readings only (the recipe lives on the
+ *  loom node); the token-readout replay envelope additionally records what
+ *  it applied as a binding (source always null — no source lifecycle). */
 export interface GeometryInstrumentJSON {
   readings: Record<string, ProbeReadingJSON>;
+  binding?: MeasurementBindingJSON;
 }
 
 /** The J-lens native discovery readout: per-layer top-k matrix +

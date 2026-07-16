@@ -275,39 +275,55 @@ class ReadRequest:
 
 @dataclass(frozen=True)
 class InstrumentPrep:
-    """A family's generation-boundary source decisions — produced by
-    ``Instrument.prepare`` (after the prior run is closed, BEFORE
-    ``plan``) and consumed by the same family's ``bind``.
+    """A family's generation-boundary source snapshot — produced by
+    ``Instrument.prepare`` (after the prior run is closed), consumed by
+    the same family's ``plan`` and ``bind``.
 
     Family-opaque to the session planner: it threads the prep from
-    prepare to bind without reading it, so source-boundary work (a disk
-    refresh, a pin decision) is protocol shape rather than session
-    special-casing.
-
-    ``live_active`` is the request's ``live`` flag echoed back — whether
-    a live-readout consumer exists this generation (the run's ``active``
-    flag; families without a live channel ignore it).
+    prepare through plan into bind without reading it, so
+    source-boundary work (a disk refresh, a pin decision, a spec
+    snapshot) is protocol shape rather than session special-casing.
+    ``request`` carries the generation's read demand forward — ``plan``
+    derives solely from the prep, so a live-registry mutation landing
+    between prepare and bind cannot desynchronize the plan from the
+    binding (sol's round-3 P1).
     """
 
     family: str
-    live_active: bool = False
+    request: ReadRequest = field(default_factory=ReadRequest)
 
 
 @dataclass(frozen=True)
 class LensPrep(InstrumentPrep):
-    """The lens family's prep: the refresh/pin decision.
+    """The lens family's prep: the refresh/pin decision AND the
+    authoritative source/spec snapshot.
 
     ``prepare`` reads the disk-refreshing ``session.jlens`` getter under
     pin demand — the adoption path rewrites live probe layer lists when
     an external replacement lens landed, which is exactly why the read
-    must precede ``plan()`` and the bind-time spec freeze.  ``lens`` is
-    the refreshed resident lens (``None`` when demand was absent or the
-    artifact is validated-missing); ``pinned`` records the demand itself,
-    so per-token paths never reopen the sidecar even for a vanished lens.
+    must precede planning and the spec freeze.  Because the pin itself
+    only lands at ``bind``, an interleaved **unpinned** getter read (the
+    un-locked ``has_compatible_jlens`` on the session-info route) can
+    adopt a *newer* disk lens inside the prepare→bind window and rewrite
+    the live registry again; the prep therefore carries everything
+    downstream steps may consume:
+
+    * ``lens`` — the refreshed resident lens (``None`` when demand was
+      absent or the artifact is validated-missing); ``pinned`` records
+      the demand itself, so per-token paths never reopen the sidecar
+      even for a vanished lens.
+    * ``specs`` — the probe registry snapshot with ``layers`` derived
+      from ``lens`` (the prepared identity), never reread from the live
+      registry by ``plan``/``bind``.
+    * ``live_state`` — the live-readout runtime dict as of prepare
+      (adoption rebuilds it against the new lens; the bound run must
+      keep reading the one that matches its pin).
     """
 
     lens: Any = None
     pinned: bool = False
+    specs: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    live_state: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
