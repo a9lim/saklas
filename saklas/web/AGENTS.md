@@ -87,9 +87,9 @@ recipes/notes; effective roster rows carry `origin`.
   (unfitted → the tab shows the `saklas lens fit` hint).
   `apiInstruments.tokenReadout` accepts every `InstrumentFamily`: the geometry
   replay (`instruments.geometry.readings` + `binding: {source: null,
-  steering}` — readings, not a `readout` discovery block) is typed and
-  callable from the headless client, though no drilldown tab consumes it yet
-  (`GeometryInstrumentJSON.binding?` carries the replay's applied steering).
+  steering}` — readings, not a `readout` discovery block) backs the drilldown's
+  **geometry** tab (`GeometryInstrumentJSON.binding?` carries the replay's
+  applied steering).
 - **POST `/sessions/{id}/instruments/lens/token/validate`** — read-only `{word}` →
   `{word, token_id}` single-token check (`apiInstruments.validateLensToken`).
   Both J-LENS add forms call it before
@@ -266,6 +266,15 @@ webui/src/
      Help,Export,Rack,ManifoldBuilder,ProbeInspector,TemplateLab,
      ManifoldMerge,ManifoldPacks,TokenDrilldown,AdvancedSampling,Health,SessionAdmin,Correlation,
      NodeCompare,Transcript}Drawer.svelte
+    token/                    # drilldown internals (TokenDrilldownDrawer is the shell)
+      cursor.ts               # conversation-walking cursor: segments, step/jump/clamp
+      readout.svelte.ts       # ReplayReadout — one captured-or-replay resource per family
+      drilldown.svelte.ts     # page-session sticky tab state (default: lens)
+      InstrumentHeader.svelte # shared provenance · source · steering · apply-recipe row
+      TokenRibbon.svelte      # windowed clickable context strip (highlight-probe tinted)
+      PinnedReadings.svelte   # instruments.<family>.readings rows for the lens/sae tabs
+      EmptyState.svelte       # standardized reason + action empty state
+      {Geometry,Logits,Sae,Lens}Tab.svelte  # the four presentational tab bodies
     index.ts                  # barrel re-exports for App.svelte's switch
 ```
 
@@ -440,18 +449,35 @@ that generation may still use its loom replay endpoint after the hover dwell;
 the drawer also replays for the explicit unsteered J-LENS counterfactual.
 Replayed values are never written back or mislabeled as original capture.
 Clicking any token opens the `token_drilldown` drawer regardless of whether a
-highlight probe is selected — four `SegmentedTabs` on one toolbar row (only
-**j-lens** and **sae** carry their pillar hue; the steered/unsteered A/B branch
-toggle sits right on the same row when the turn has an `abPair`): **probes** (the
-per-layer × per-probe heatmap), **logits** (ranked top-K alts + logit fork),
-**sae** (captured resident-hook top features, replay fallback), and **j-lens**
-(the captured all-fitted-layer readout — aggregate chip row then per-layer matrix
-— with replay fallback and an `apply recipe steering` checkbox for the unsteered
-counterfactual). Captured rows show their provenance and source even if that
-instrument is no longer active. A **token scrubber** in the drawer header
-(`◀ N / M ▶`, or `←`/`→` anywhere in the drawer outside a focusable field) walks the
-inspected position along the turn's token list while preserving the selected
-tab/branch; a fresh token click snaps back to its own index.
+highlight probe is selected. The drawer is a shell (`drawers/token/`) over four
+family tabs — **geometry** (the full whitened Monitor readings: per-probe cards
+with coords, fraction, residual, membership, nearest/assignment chips,
+per-layer strip, depth CoM; captured envelopes render directly, the geometry
+token-readout replay covers aggregate-only generations and late-attached
+probes), **logits** (ranked top-K alts with absolute-probability bars + the
+logit fork), **sae**, and **j-lens** (each: pinned-probe readings from
+`instruments.<family>.readings` when captured live, then the native readout —
+sae feature meters in the panel's strength unit, lens aggregate chips + the
+all-fitted-layer matrix). Only **j-lens** and **sae** carry their pillar hue;
+the steered/unsteered A/B branch toggle sits on the tab row when the turn has
+an `abPair`. The selected tab is **sticky for the page session**
+(`drilldown.svelte.ts`, default j-lens) — a fresh token click keeps it. The
+pre-5.x **probes** heatmap tab is gone (the geometry cards subsume it). All
+three replay families share one `ReplayReadout` resource
+(captured-envelope-preferred, request-sequenced) and one `InstrumentHeader`
+provenance row — origin · source · steering chip · `apply recipe steering`
+toggle, so the sae tab now has the unsteered counterfactual too. Captured rows
+show their provenance and source even if that instrument is no longer active.
+The header carries the token's identity chips (turn · role · segment — the
+segment chip jumps thinking ⇄ response — vocabulary `id`, `raw` decode index
+or a `no replay` marker, and the chosen `p / logp / rank` when captured) over a
+**context ribbon** (a windowed, highlight-tinted, clickable strip of the
+segment around the inspected token). Navigation is a conversation-walking
+cursor: `◀ ▶` / `←`/`→` step tokens and roll across segment and turn
+boundaries (thinking → response → next turn — chat mode walks the same flat
+stream the raw buffer shows), `▲ ▼` / `↑`/`↓` jump turns, Home/End jump
+segment bounds, and `↩` snaps back to the clicked anchor; keys are ignored
+inside focusable fields and `role="slider"` layer strips.
 
 ## Toasts
 
