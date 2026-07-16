@@ -1137,6 +1137,22 @@ Post-review hardening (sol, gaslamp thread `instrument-protocol`):
   `session.remove_probe` routes geometry removals through the instrument.
   A true Monitor roster snapshot (extending the next-generation contract
   to geometry) is deferred — it is engine surgery, not guard cleanup.
+- **Geometry carries its own `state_lock`** — the same reentrant leaf-lock
+  boundary as lens/SAE, covering roster mutation (attach/detach, the
+  session's fit-promotion and failed-override walks in
+  `_adopt_fitted_manifold`/`_evict_failed_manifold_override`, the lazy
+  `set_whitener` factor rebuild) against the coherent read surfaces
+  (`names`/`specs()`/`manifolds()`/`probe_hash`, the `plan`/`bind` roster
+  reads) and the idle-passthrough run reads (`GeometryRun.observe`/
+  `gate_scalars`/`observe_aggregate` when unbound).  An un-locked reader
+  iterating the roster (`Monitor.probe_layers` walks a live generator;
+  `Monitor.manifolds` is a comprehension) RuntimeErrors under a concurrent
+  idle detach — the lens round-5 tear class, closed the same way.
+  `session.probes`, `probe_hashes`, the analytics roster, and
+  `score_hidden`'s dim preflight consume the locked `manifolds()`/`names`
+  snapshots.  NEVER taken on the bound per-token scoring path —
+  mid-generation mutation stays excluded by the reject contract above,
+  not by this lock.
 
 Per-step gate→display matrix reuse remains the stash mechanism inside
 the workers, run-scoped by construction; `observe(step_id)` is

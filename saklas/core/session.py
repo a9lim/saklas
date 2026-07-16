@@ -1539,11 +1539,13 @@ class SaklasSession:
         from saklas.core.capture import is_foldable_vector_manifold
 
         names = set(self._profiles)  # registered vectors are always R=1
-        for pname in self._monitor.probe_names:
+        # One locked roster snapshot — this serves un-locked analytics
+        # polling, where a raw per-name ``manifolds`` rebuild tears under
+        # a concurrent detach.
+        for pname, manifold in self._geometry_instrument.manifolds().items():
             if pname in names:
                 continue  # a registered vector wins the same-named probe
-            manifold = self._monitor.manifolds.get(pname)
-            if manifold is not None and is_foldable_vector_manifold(manifold):
+            if is_foldable_vector_manifold(manifold):
                 names.add(pname)
         return sorted(names)
 
@@ -1616,14 +1618,14 @@ class SaklasSession:
 
     @property
     def probes(self) -> dict[str, dict[str, Any]]:
+        # All three families via the instruments' LOCKED snapshots: this
+        # property serves the un-locked session-info route, and a raw
+        # registry iteration tears under a concurrent detach (round-7 for
+        # lens/SAE; the geometry state_lock closed the Monitor sibling).
         out: dict[str, dict[str, Any]] = {
             name: {"manifold": m}
-            for name, m in self._monitor.manifolds.items()
+            for name, m in self._geometry_instrument.manifolds().items()
         }
-        # Pinned J-lens / SAE probes (readout channels, not monitor
-        # probes) — via the instruments' LOCKED spec snapshots: this
-        # property serves the un-locked session-info route, and a raw
-        # registry iteration tears under a concurrent detach (round-7).
         out.update(
             {name: {"lens": spec}
              for name, spec in self._lens_instrument.specs().items()}
@@ -1852,10 +1854,13 @@ class SaklasSession:
             return
         self._whitener = self._build_whitener_from_cache_or_compute()
         # Keep the trait monitor's read metric in lock-step with the session
-        # whitener when it is built lazily.
+        # whitener when it is built lazily.  ``set_whitener`` rebuilds every
+        # attached probe's whitened factors in place — a roster mutation, so
+        # it lands under the geometry-state boundary like attach/detach.
         monitor = getattr(self, "_monitor", None)
         if monitor is not None and self._whitener is not None:
-            monitor.set_whitener(self._whitener)
+            with self._geometry_instrument.state_lock:
+                monitor.set_whitener(self._whitener)
 
     def _build_whitener_from_cache_or_compute(self) -> "Any":
         """Compute or load the per-model whitener.
@@ -5137,14 +5142,20 @@ class SaklasSession:
         # the Monitor through its constructor roster instead.
         monitor = getattr(self, "_monitor", None)
         if monitor is not None:
-            for probe_name, attached in monitor.attached_probes().items():
-                if id(attached.manifold) not in old_objects:
-                    continue
-                assert promoted is not None
-                top_n = attached.top_n
-                monitor.remove_probe(probe_name)
-                monitor.add_probe(probe_name, promoted, top_n=top_n)
-                self._probe_hash_cache.pop(probe_name, None)
+            # Geometry-state boundary: this walk mutates the Monitor roster
+            # outside the instrument's attach/detach, so the remove+add
+            # pair must land atomically against the un-locked coherent
+            # readers (session.probes, specs, plan).  The fit path already
+            # holds ``_gen_lock`` (outer) — state_lock is a leaf.
+            with self._geometry_instrument.state_lock:
+                for probe_name, attached in monitor.attached_probes().items():
+                    if id(attached.manifold) not in old_objects:
+                        continue
+                    assert promoted is not None
+                    top_n = attached.top_n
+                    monitor.remove_probe(probe_name)
+                    monitor.add_probe(probe_name, promoted, top_n=top_n)
+                    self._probe_hash_cache.pop(probe_name, None)
 
         matching_profiles = [key for key in self._profiles if _matches_key(key)]
         if matching_profiles and is_foldable_vector_manifold(manifold):
@@ -5196,10 +5207,15 @@ class SaklasSession:
 
         monitor = getattr(self, "_monitor", None)
         if monitor is not None:
-            for probe_name, attached in list(monitor.attached_probes().items()):
-                if id(attached.manifold) in old_objects:
-                    monitor.remove_probe(probe_name)
-                    self._probe_hash_cache.pop(probe_name, None)
+            # Geometry-state boundary — same contract as the promotion
+            # walk in ``_adopt_fitted_manifold``.
+            with self._geometry_instrument.state_lock:
+                for probe_name, attached in list(
+                    monitor.attached_probes().items()
+                ):
+                    if id(attached.manifold) in old_objects:
+                        monitor.remove_probe(probe_name)
+                        self._probe_hash_cache.pop(probe_name, None)
 
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
@@ -6312,9 +6328,10 @@ class SaklasSession:
         # probe that covers that layer. Without this, a shape mismatch
         # would leak a raw torch RuntimeError at the scoring matmul,
         # violating the "all public errors are SaklasError" invariant.
+        probe_manifolds = self._geometry_instrument.manifolds()
         for layer_idx, t in hidden.items():
             actual_dim = t.shape[-1]
-            for probe_name, manifold in self._monitor.manifolds.items():
+            for probe_name, manifold in probe_manifolds.items():
                 sub = manifold.layers.get(layer_idx)
                 if sub is None:
                     continue
@@ -6608,7 +6625,7 @@ class SaklasSession:
         """
         out: dict[str, str] = {}
         for name in (
-            *self._monitor.probe_names,
+            *self._geometry_instrument.names,
             *self._lens_instrument.names,
             *self._sae_instrument.names,
         ):

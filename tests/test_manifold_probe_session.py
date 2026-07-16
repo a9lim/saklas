@@ -376,6 +376,243 @@ def test_geometry_detach_rejects_while_generation_holds_the_lock():
     assert "toy" not in session._monitor.probe_names
 
 
+# ================================================== geometry state lock ===
+
+def test_geometry_state_lock_serializes_detach_and_reads():
+    """The geometry-state boundary (the Monitor sibling of the lens
+    round-5 fix): the session's ``remove_probe`` geometry branch and the
+    coherent read surfaces (``specs``) hold the instrument's state lock —
+    an idle detach can no longer land inside a concurrent registry
+    iteration or tear it."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    inst = session._geometry_instrument
+
+    detach_entered = threading.Event()
+    read_entered = threading.Event()
+    read_out: list[Any] = []
+
+    def _detach() -> None:
+        detach_entered.set()
+        session.remove_probe("toy")
+
+    def _read_specs() -> None:
+        read_entered.set()
+        read_out.append(inst.specs())
+
+    with inst.state_lock:
+        detacher = threading.Thread(target=_detach)
+        reader = threading.Thread(target=_read_specs)
+        detacher.start()
+        reader.start()
+        assert detach_entered.wait(timeout=5.0)
+        assert read_entered.wait(timeout=5.0)
+        detacher.join(timeout=0.2)
+        reader.join(timeout=0.2)
+        assert detacher.is_alive()  # both blocked on the geometry-state lock
+        assert reader.is_alive()
+        assert "toy" in session._monitor.probe_names  # nothing mutated mid-hold
+    detacher.join(timeout=5.0)
+    reader.join(timeout=5.0)
+    assert not detacher.is_alive() and not reader.is_alive()
+    assert "toy" not in session._monitor.probe_names
+    assert read_out and isinstance(read_out[0], dict)
+
+
+def test_geometry_idle_run_reads_hold_the_state_lock():
+    """Idle-passthrough reads (an unbound ``GeometryRun.observe``) pair
+    with the roster under the state lock — the round-6 idle-coherence
+    contract, geometry edition.  The bound per-token path stays
+    lock-free (mid-generation mutation is excluded by the detach
+    reject contract, not by this lock)."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    inst = session._geometry_instrument
+    assert inst.current_run.bound is False
+    hidden = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+
+    entered = threading.Event()
+    out: list[Any] = []
+
+    def _idle_read() -> None:
+        entered.set()
+        out.append(inst.current_run.observe(0, hidden))
+
+    with inst.state_lock:
+        reader = threading.Thread(target=_idle_read)
+        reader.start()
+        assert entered.wait(timeout=5.0)
+        reader.join(timeout=0.2)
+        assert reader.is_alive()  # blocked on the geometry-state lock
+    reader.join(timeout=5.0)
+    assert not reader.is_alive()
+    assert out and "toy" in out[0]
+
+
+def test_geometry_roster_reads_do_not_tear_under_concurrent_detach():
+    """The tear repro: ``plan()``'s roster walk (``probe_names`` +
+    ``probe_layers``) iterates live ``Monitor._probes`` state and raised
+    ``RuntimeError: dictionary changed size during iteration`` under a
+    concurrent idle attach/detach before the state lock existed (the
+    exact class the lens round-5 fix closed).  Hammer both sides; any
+    exception on either thread fails."""
+    import time as _time
+
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _stub_session()
+    manifolds = {f"toy{i}": _toy_manifold() for i in range(6)}
+
+    def _load(key: str) -> None:
+        session._manifolds.update({key: manifolds[key]})
+
+    session.ensure_manifold_loaded = _load
+    for name in manifolds:
+        session.add_probe(name)
+    inst = session._geometry_instrument
+
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def _mutate() -> None:
+        try:
+            i = 0
+            while not stop.is_set():
+                name = f"toy{i % 6}"
+                session.remove_probe(name)
+                session.add_probe(name)
+                i += 1
+        except BaseException as exc:  # noqa: BLE001 — the assertion payload
+            errors.append(exc)
+
+    def _read() -> None:
+        try:
+            while not stop.is_set():
+                prep = inst.prepare(ReadRequest(final_aggregate=True))
+                inst.plan(prep)
+                inst.specs()
+                inst.manifolds()
+                _ = inst.names
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_mutate),
+        threading.Thread(target=_read),
+    ]
+    for t in threads:
+        t.start()
+    _time.sleep(0.5)
+    stop.set()
+    for t in threads:
+        t.join(timeout=10.0)
+    assert not any(t.is_alive() for t in threads)
+    assert not errors, errors
+
+
+class _RecordingLock:
+    """RLock shim recording hold depth (every production use is ``with``)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.held = 0
+
+    def __enter__(self) -> "_RecordingLock":
+        self._lock.acquire()
+        self.held += 1
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        self.held -= 1
+        self._lock.release()
+        return False
+
+
+def _record_roster_mutations(
+    session: Any, shim: _RecordingLock,
+) -> list[tuple[str, bool]]:
+    """Wrap the stub monitor's roster mutators to record whether the
+    geometry-state shim was held at each call."""
+    monitor = session._monitor
+    real_remove, real_add = monitor.remove_probe, monitor.add_probe
+    held_at_call: list[tuple[str, bool]] = []
+
+    def _rec_remove(name: str) -> None:
+        held_at_call.append(("remove", shim.held > 0))
+        real_remove(name)
+
+    def _rec_add(name: str, manifold: Any, *, top_n: int = 3) -> None:
+        held_at_call.append(("add", shim.held > 0))
+        real_add(name, manifold, top_n=top_n)
+
+    monitor.remove_probe = _rec_remove
+    monitor.add_probe = _rec_add
+    return held_at_call
+
+
+def test_manifold_promotion_walk_holds_geometry_state_lock():
+    """``_adopt_fitted_manifold``'s probe-promotion walk mutates the
+    Monitor roster outside the instrument's attach/detach — the
+    remove+add pair must land under the geometry-state lock so a
+    coherent reader can't observe a half-applied promotion."""
+    session = _stub_session()
+    m_old = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m_old},
+    )
+    session.add_probe("toy")
+    session._manifolds = {"toy": m_old}
+    session._device = torch.device("cpu")
+    session._profiles = {}
+    inst = session._geometry_instrument
+    shim = _RecordingLock()
+    inst.state_lock = shim  # type: ignore[assignment]
+    held_at_call = _record_roster_mutations(session, shim)
+
+    m_new = _toy_manifold()
+    SaklasSession._adopt_fitted_manifold(session, "default/toy", m_new)
+
+    assert ("remove", True) in held_at_call
+    assert ("add", True) in held_at_call
+    assert all(held for _op, held in held_at_call)
+
+
+def test_failed_override_eviction_holds_geometry_state_lock():
+    """``_evict_failed_manifold_override``'s probe eviction is the same
+    out-of-instrument roster mutation — it must hold the geometry-state
+    lock too."""
+    session = _stub_session()
+    m_old = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m_old},
+    )
+    session.add_probe("toy")
+    session._manifolds = {"toy": m_old}
+    session._profiles = {}
+    inst = session._geometry_instrument
+    shim = _RecordingLock()
+    inst.state_lock = shim  # type: ignore[assignment]
+    held_at_call = _record_roster_mutations(session, shim)
+
+    SaklasSession._evict_failed_manifold_override(
+        session, "default/toy", sae=None,
+    )
+
+    assert ("remove", True) in held_at_call
+    assert "toy" not in session._monitor.probe_names
+
+
 # ===================================================== gating callback ===
 
 def test_gating_callback_emits_probe_scalars():

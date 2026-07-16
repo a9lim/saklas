@@ -16,6 +16,7 @@ can enumerate families uniformly.
 from __future__ import annotations
 
 import hashlib
+import threading
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -73,9 +74,16 @@ class GeometryRun:
         """Full whitened readings for the roster at this step, memoized by
         ``step_id``.  An idle run never memoizes (it persists
         indefinitely; a repeated ``step_id`` with different hidden states
-        must not read stale)."""
+        must not read stale).  The idle read holds the geometry-state
+        lock — the Monitor's roster walk tears under a concurrent idle
+        attach/detach; the bound path stays lock-free (per-token hot
+        path — mid-generation mutation is excluded by ``detach``'s
+        reject-during-generation contract, not by a lock)."""
         if not self.bound:
-            return self._instrument._session._monitor.score_single_token(hidden)
+            with self._instrument.state_lock:
+                return self._instrument._session._monitor.score_single_token(
+                    hidden,
+                )
         if self._memo_step == step_id and self._memo_readings is not None:
             return self._memo_readings
         readings = self._instrument._session._monitor.score_single_token(hidden)
@@ -89,9 +97,16 @@ class GeometryRun:
         hidden: dict[int, torch.Tensor],
         gate_keys: frozenset[str] | set[str],
     ) -> dict[str, float]:
-        """The gated subset's scalar channels at this step."""
+        """The gated subset's scalar channels at this step (idle reads
+        hold the state lock; the bound path is the per-token hot path)."""
         del step_id
         monitor = self._instrument._session._monitor
+        if not self.bound:
+            with self._instrument.state_lock:
+                plan = monitor.plan_gate_scalars(set(gate_keys))
+                if not plan:
+                    return {}
+                return monitor.score_planned_gate_scalars(hidden, plan)
         plan = monitor.plan_gate_scalars(set(gate_keys))
         if not plan:
             return {}
@@ -101,7 +116,14 @@ class GeometryRun:
         self, pooled: dict[int, torch.Tensor],
     ) -> dict[str, Any]:
         """One full-roster read at the pooled last-content slice —
-        bit-identical to a live read at that token."""
+        bit-identical to a live read at that token.  Idle reads hold the
+        state lock; the bound finalize read runs under ``_gen_lock``,
+        which every roster mutation also takes (``_model_exclusive``)."""
+        if not self.bound:
+            with self._instrument.state_lock:
+                return self._instrument._session._monitor.score_single_token(
+                    pooled,
+                )
         return self._instrument._session._monitor.score_single_token(pooled)
 
     def observe_many(
@@ -127,6 +149,21 @@ class GeometryInstrument:
 
     def __init__(self, session: "SaklasSession") -> None:
         self._session = session
+        # THE geometry-state boundary — the roster-coherence sibling of the
+        # lens/SAE ``state_lock``s.  One reentrant leaf lock serializing
+        # every Monitor roster mutation (attach/detach, the session's
+        # fit-promotion and failed-override eviction walks, the whitener
+        # rebuild) against the coherent read surfaces (``names``/``specs``/
+        # ``manifolds``/``probe_hash``, the ``plan``/``bind`` roster reads,
+        # and the idle-passthrough run reads) — an un-locked reader
+        # iterating ``Monitor._probes`` RuntimeErrors under a concurrent
+        # idle detach, the same tear class the lens round-5 fix closed.
+        # A leaf lock: nothing acquires ``_gen_lock``/``_model_exclusive``
+        # while holding it (callers take those first), and it is NEVER
+        # taken on the bound per-token scoring path — mid-generation
+        # mutation is excluded by ``detach``'s reject-during-generation
+        # contract (``_model_exclusive``), not by this lock.
+        self.state_lock = threading.RLock()
         # The current per-generation run (idle passthrough until bind()).
         self.current_run = GeometryRun(
             self, InstrumentBinding(family=self.family),
@@ -176,15 +213,14 @@ class GeometryInstrument:
                 "this prep (prep_token mismatch) — derive the plan from "
                 "the same prepare() call"
             )
+        with self.state_lock:
+            specs = {
+                str(name): {}
+                for name in self._session._monitor.probe_names
+            }
         run = GeometryRun(
             self,
-            InstrumentBinding(
-                family=self.family,
-                specs={
-                    str(name): {}
-                    for name in self._session._monitor.probe_names
-                },
-            ),
+            InstrumentBinding(family=self.family, specs=specs),
             bound=True,
         )
         self.current_run = run
@@ -226,7 +262,12 @@ class GeometryInstrument:
             # cannot race it.
             _ = session.whitener
             manifold = session._resolve_probe_manifold(selector)
-            session._monitor.add_probe(name, manifold, top_n=top_n)
+            # Geometry-state boundary: the roster write lands atomically
+            # against the un-locked coherent readers (consistency against
+            # eviction/promotion comes from ``_model_exclusive``, which
+            # those walks' callers hold).
+            with self.state_lock:
+                session._monitor.add_probe(name, manifold, top_n=top_n)
         return name
 
     def detach(self, name: str) -> None:
@@ -238,31 +279,47 @@ class GeometryInstrument:
         an in-flight generation would change what that generation measures
         and can race the Monitor's cache rebuilds.  A detach during a
         generation therefore rejects with retry-shortly semantics instead
-        of racing.
+        of racing.  The roster write itself additionally holds the
+        geometry-state lock so an *idle* coherent reader (``specs``,
+        ``plan``, the session-info route) can't tear mid-removal.
         """
         with self._session._model_exclusive(
             "remove_probe called while another model operation is in "
             "flight; retry shortly"
         ):
-            self._session._monitor.remove_probe(name)
+            with self.state_lock:
+                self._session._monitor.remove_probe(name)
 
     @property
     def names(self) -> list[str]:
-        return list(self._session._monitor.probe_names)
+        with self.state_lock:
+            return list(self._session._monitor.probe_names)
 
     def specs(self) -> dict[str, dict[str, Any]]:
         """Attached probe spec snapshots — the geometry analogue of the
         lens/SAE spec dicts (manifold identity + shape flags; the full
-        wire info shape stays in ``server/probe_routes``)."""
-        out: dict[str, dict[str, Any]] = {}
-        for name, probe in self._session._monitor.attached_probes().items():
-            out[name] = {
-                "manifold": probe.manifold.name,
-                "top_n": int(probe.top_n),
-                "is_affine": bool(probe.is_affine),
-                "layers": sorted(probe.manifold.layers),
-            }
-        return out
+        wire info shape stays in ``server/probe_routes``).  One coherent
+        state-lock read — a concurrent detach cannot tear the iteration."""
+        with self.state_lock:
+            out: dict[str, dict[str, Any]] = {}
+            for name, probe in (
+                self._session._monitor.attached_probes().items()
+            ):
+                out[name] = {
+                    "manifold": probe.manifold.name,
+                    "top_n": int(probe.top_n),
+                    "is_affine": bool(probe.is_affine),
+                    "layers": sorted(probe.manifold.layers),
+                }
+            return out
+
+    def manifolds(self) -> "dict[str, Any]":
+        """Locked snapshot of the attached probes' manifolds (name →
+        :class:`Manifold`) — the geometry read behind ``session.probes``
+        and the analytics roster; a raw ``Monitor.manifolds`` comprehension
+        tears under a concurrent detach (the round-7 class)."""
+        with self.state_lock:
+            return self._session._monitor.manifolds
 
     def validate_gate(self, ref: GateRef) -> None:
         validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
@@ -291,35 +348,45 @@ class GeometryInstrument:
             )
         request = prep.request
         monitor = self._session._monitor
-        names = set(monitor.probe_names)
-        if not names:
-            return InstrumentPlan(family=self.family, prep_token=prep.token)
-        gate_keys = frozenset(
-            key for key in request.gate_keys
-            if parse_gate_ref(key).probe in names
-        )
-        per_token = bool(gate_keys or request.per_token_consumers)
-        if not (per_token or request.final_aggregate):
-            # Dormant roster: probes attached, but nothing this generation
-            # consumes a reading (no gate, no per-token consumer, final
-            # readings disabled).
-            return InstrumentPlan(
-                family=self.family,
-                gate_keys=gate_keys,
-                prep_token=prep.token,
+        # One state-lock hold for the roster reads: the name set and the
+        # layer union must come from the same roster (an un-locked
+        # ``probe_layers`` iterates a live generator over ``_probes`` and
+        # RuntimeErrors under a concurrent idle detach; the two-read
+        # TOCTOU could also pair a name set with a mutated layer union).
+        with self.state_lock:
+            names = set(monitor.probe_names)
+            if not names:
+                return InstrumentPlan(
+                    family=self.family, prep_token=prep.token,
+                )
+            gate_keys = frozenset(
+                key for key in request.gate_keys
+                if parse_gate_ref(key).probe in names
             )
-        narrow_to_gated = bool(
-            gate_keys
-            and not request.per_token_consumers
-            and not request.final_aggregate
-        )
-        if narrow_to_gated:
-            gated_names = {parse_gate_ref(key).probe for key in gate_keys}
-            probe_layers = monitor.probe_layers(gated_names)
-        else:
-            # Bare call — the full-roster union (also what duck-typed
-            # monitor stubs without the subset parameter implement).
-            probe_layers = monitor.probe_layers()
+            per_token = bool(gate_keys or request.per_token_consumers)
+            if not (per_token or request.final_aggregate):
+                # Dormant roster: probes attached, but nothing this
+                # generation consumes a reading (no gate, no per-token
+                # consumer, final readings disabled).
+                return InstrumentPlan(
+                    family=self.family,
+                    gate_keys=gate_keys,
+                    prep_token=prep.token,
+                )
+            narrow_to_gated = bool(
+                gate_keys
+                and not request.per_token_consumers
+                and not request.final_aggregate
+            )
+            if narrow_to_gated:
+                gated_names = {
+                    parse_gate_ref(key).probe for key in gate_keys
+                }
+                probe_layers = monitor.probe_layers(gated_names)
+            else:
+                # Bare call — the full-roster union (also what duck-typed
+                # monitor stubs without the subset parameter implement).
+                probe_layers = monitor.probe_layers()
         latest = frozenset(int(layer) for layer in probe_layers)
         return InstrumentPlan(
             family=self.family,
@@ -338,7 +405,12 @@ class GeometryInstrument:
         scalar monitor's drift check; a multi-node / curved probe hashes
         the per-layer subspace geometry directly."""
         session = self._session
-        manifold = session._monitor.manifolds.get(name)
+        # Fetch under the state lock (the ``manifolds`` comprehension
+        # iterates the roster); hash outside it — the manifold object is
+        # immutable after attach (promotion swaps in a NEW object), so a
+        # reference fetched here stays valid for the tensor walk below.
+        with self.state_lock:
+            manifold = session._monitor.manifolds.get(name)
         if manifold is None:
             return None
         from saklas.core.capture import folded_directions

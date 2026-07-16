@@ -1587,6 +1587,13 @@ class TestAnalyticsMultiNodeProbe:
         session._monitor.manifolds = {"vp": vp, "fan": fan}
         session.gen_lock = threading.Lock()
         session._analytics_cpu_cache = {}
+        # ``analytics_names`` reads the roster through the geometry
+        # instrument's LOCKED ``manifolds()`` snapshot now — a bare MagicMock
+        # instrument silently yields an empty roster, so wire the real one
+        # (it reads the same ``session._monitor.manifolds`` stub above).
+        from saklas.core.instruments.geometry import GeometryInstrument
+
+        session._geometry_instrument = GeometryInstrument(session)
         # Bind the real analytics methods onto the mock so the endpoint
         # exercises the production fold path, not a vacuous MagicMock.
         session.analytics_names = lambda: SaklasSession.analytics_names(session)
