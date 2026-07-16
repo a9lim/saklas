@@ -30,7 +30,7 @@
     lensSourceState,
     saeSourceState,
   } from "../lib/stores.svelte";
-  import { ApiError, apiLens, apiSae } from "../lib/api";
+  import { ApiError, apiInstruments } from "../lib/api";
   import type {
     ChatTurn,
     LensTokenReadoutJSON,
@@ -330,8 +330,8 @@
 
   // ---- j-lens + SAE historical channels ---------------------------------
   //
-  // The token's loom-owned ``captured`` record is authoritative.  Replay is
-  // reserved for old/missing channels and the explicit unsteered J-LENS
+  // The token's loom-owned ``measurements`` envelope is authoritative.  Replay
+  // is reserved for old/missing channels and the explicit unsteered J-LENS
   // counterfactual; replayed responses are kept only as the drawer's current
   // view, never cached or written back as original data.
 
@@ -361,30 +361,30 @@
   let saeRequestSeq = 0;
 
   const capturedLensData = $derived.by<LensTokenReadoutJSON | null>(() => {
-    const captured = token?.captured?.lens;
-    if (!captured || !token) return null;
+    const lens = token?.measurements?.instruments.lens;
+    if (!lens?.readout || !token) return null;
     return {
       node_id: loomNodeId ?? "",
       raw_index: token.rawIndex ?? -1,
       token_id: token.tokenId ?? -1,
       token_text: token.text,
-      steering: captured.steering,
-      aggregate: captured.aggregate,
-      layers: captured.layers,
+      steering: lens.binding.steering,
+      aggregate: lens.readout.aggregate,
+      layers: lens.readout.layers,
     };
   });
 
   const capturedSaeData = $derived.by<SaeTokenReadoutJSON | null>(() => {
-    const captured = token?.captured?.sae;
-    if (!captured || !token) return null;
+    const sae = token?.measurements?.instruments.sae;
+    if (!sae?.readout || !token) return null;
     return {
       node_id: loomNodeId ?? "",
       raw_index: token.rawIndex ?? -1,
       token_id: token.tokenId ?? -1,
       token_text: token.text,
-      steering: captured.steering,
-      layer: captured.layer ?? -1,
-      features: captured.features,
+      steering: sae.binding.steering,
+      layer: sae.binding.layer ?? -1,
+      features: sae.readout.features,
     };
   });
 
@@ -395,7 +395,7 @@
     if (captured) {
       saeData = captured;
       saeOrigin = "captured";
-      saeSource = token?.captured?.sae?.source ?? null;
+      saeSource = token?.measurements?.instruments.sae?.binding.source ?? null;
       saeLoading = false;
       saeError = null;
       return;
@@ -409,12 +409,22 @@
     const rawIndex = token?.rawIndex;
     if (!nodeId || rawIndex == null) return;
     saeLoading = true; saeError = null; saeData = null;
-    apiSae.tokenReadout(nodeId, rawIndex, { raw: effectiveRawMode() })
-      .then((data) => {
+    apiInstruments.tokenReadout("sae", nodeId, rawIndex, { raw: effectiveRawMode() })
+      .then((res) => {
         if (request !== saeRequestSeq) return;
-        saeData = data;
+        const sae = res.measurements.instruments.sae;
+        saeData = {
+          node_id: nodeId,
+          raw_index: rawIndex,
+          token_id: token?.tokenId ?? -1,
+          token_text: token?.text ?? "",
+          steering: sae?.binding.steering ?? null,
+          layer: sae?.binding.layer ?? -1,
+          features: sae?.readout?.features ?? [],
+        };
         saeOrigin = "replayed";
         saeSource =
+          sae?.binding.source ??
           saeSourceState.sources.find((source) => source.active)?.source ??
           sessionState.info?.sae_info?.release ?? null;
       })
@@ -434,7 +444,7 @@
     if (lensSteered && captured) {
       lensData = captured;
       lensOrigin = "captured";
-      lensSource = token?.captured?.lens?.source ?? null;
+      lensSource = token?.measurements?.instruments.lens?.binding.source ?? null;
       lensLoading = false;
       lensError = null;
       return;
@@ -450,18 +460,28 @@
     lensLoading = true;
     lensError = null;
     lensData = null;
-    apiLens
-      .tokenReadout(nodeId, rawIndex, {
+    apiInstruments
+      .tokenReadout("lens", nodeId, rawIndex, {
         topK: lensTopK,
         steered: lensSteered,
         raw: effectiveRawMode(),
         layers: "all",
       })
-      .then((d) => {
+      .then((res) => {
         if (request !== lensRequestSeq) return;
-        lensData = d;
+        const lens = res.measurements.instruments.lens;
+        lensData = {
+          node_id: nodeId,
+          raw_index: rawIndex,
+          token_id: token?.tokenId ?? -1,
+          token_text: token?.text ?? "",
+          steering: lens?.binding.steering ?? null,
+          aggregate: lens?.readout?.aggregate ?? [],
+          layers: lens?.readout?.layers ?? [],
+        };
         lensOrigin = "replayed";
         lensSource =
+          lens?.binding.source ??
           lensSourceState.sources.find((source) => source.active)?.source ?? null;
       })
       .catch((e) => {

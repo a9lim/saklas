@@ -27,7 +27,7 @@
   import SaeSteerCard from "./rack/SaeSteerCard.svelte";
   import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
-  import { apiSae } from "../lib/api";
+  import { apiInstruments } from "../lib/api";
   import {
     activeProbeNames,
     addSaeToRack,
@@ -158,8 +158,8 @@
 
   $effect(() => {
     if (releases.length > 0) return;
-    void apiSae.releases().then((result) => {
-      releases = result.releases.filter((row) => row.source !== "local");
+    void apiInstruments.sources("sae").then((result) => {
+      releases = (result.releases ?? []).filter((row) => row.source !== "local");
       if (!selectedSource && releases.length > 0) {
         selectedSource = `saelens:${releases[0].release}`;
       }
@@ -352,7 +352,7 @@
       pushToast("feature id must be a non-negative integer", { kind: "error" });
       return null;
     }
-    const validated = await apiSae.validateFeature(id);
+    const validated = await apiInstruments.validateSaeFeature(id);
     return validated.id;
   }
 
@@ -377,7 +377,7 @@
     if (featureBusy || probeRack.active.includes(`sae/${id}`)) return;
     featureBusy = true;
     try {
-      await apiSae.validateFeature(id);
+      await apiInstruments.validateSaeFeature(id);
       const live = discoveryBase.find((row) => row.id === id);
       const meta = saeState.meta.get(id);
       const preAttachMaxAct = live?.max_act ?? meta?.max_act ?? null;

@@ -22,28 +22,26 @@ import type {
   JointLogprobRowJSON,
   JointLogprobsJSON,
   InstrumentSourceJSON,
-  LensFetchStatusJSON,
-  LensFitStatusJSON,
   LensTokenValidationJSON,
-  LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
   ManifoldListResponse,
+  MeasurementsEnvelopeJSON,
   MergeManifoldRequest,
   NodeDiffJSON,
   PairwiseCompareResponse,
+  PreparationOp,
+  PreparationStatusJSON,
   ProbeDefaultsResponse,
   ProbeGeometryResponse,
   ProbeInfo,
   ProbeListResponse,
   ProbeRequest,
+  ProfileListResponse,
   RemoteManifoldInfo,
   ScoreTemplateResponse,
   SaeFeatureMetaResponse,
-  SaeLoadStatusJSON,
-  SaeTrainStatusJSON,
-  SaeTokenReadoutJSON,
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
@@ -51,7 +49,6 @@ import type {
   TranscriptLoadResponseJSON,
   UpdateManifoldRequest,
   VectorInfo,
-  VectorListResponse,
   WSClientMessage,
   WSServerMessage,
 } from "./types";
@@ -74,28 +71,26 @@ export type {
   JointLogprobRowJSON,
   JointLogprobsJSON,
   InstrumentSourceJSON,
-  LensFetchStatusJSON,
-  LensFitStatusJSON,
   LensTokenValidationJSON,
-  LensTokenReadoutJSON,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
   ManifoldListResponse,
+  MeasurementsEnvelopeJSON,
   MergeManifoldRequest,
   NodeDiffJSON,
   PairwiseCompareResponse,
+  PreparationOp,
+  PreparationStatusJSON,
   ProbeDefaultsResponse,
   ProbeGeometryResponse,
   ProbeInfo,
   ProbeListResponse,
   ProbeRequest,
+  ProfileListResponse,
   RemoteManifoldInfo,
   ScoreTemplateResponse,
   SaeFeatureMetaResponse,
-  SaeLoadStatusJSON,
-  SaeTrainStatusJSON,
-  SaeTokenReadoutJSON,
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
@@ -103,7 +98,6 @@ export type {
   TranscriptLoadResponseJSON,
   UpdateManifoldRequest,
   VectorInfo,
-  VectorListResponse,
   WSClientMessage,
   WSServerMessage,
 } from "./types";
@@ -281,18 +275,18 @@ export const apiSessions = {
   },
 };
 
-// ============================================================ vectors ==
+// =========================================================== profiles ==
 
-export const apiVectors = {
-  list(id: string = SESSION): Promise<VectorListResponse> {
-    return request(`${SESSION_BASE(id)}/vectors`);
+export const apiProfiles = {
+  list(id: string = SESSION): Promise<ProfileListResponse> {
+    return request(`${SESSION_BASE(id)}/profiles`);
   },
   get(name: string, id: string = SESSION): Promise<VectorInfo> {
-    return request(`${SESSION_BASE(id)}/vectors/${encodeURIComponent(name)}`);
+    return request(`${SESSION_BASE(id)}/profiles/${encodeURIComponent(name)}`);
   },
   delete(name: string, id: string = SESSION): Promise<void> {
     return request<void>(
-      `${SESSION_BASE(id)}/vectors/${encodeURIComponent(name)}`,
+      `${SESSION_BASE(id)}/profiles/${encodeURIComponent(name)}`,
       { method: "DELETE" },
     );
   },
@@ -308,7 +302,7 @@ export const apiVectors = {
     const q = names && names.length ? `?names=${encodeURIComponent(names.join(","))}` : "";
     return request(`${SESSION_BASE(id)}/correlation${q}`);
   },
-  /** Cross-layer cosine matrix between two named vectors / probes —
+  /** Cross-layer cosine matrix between two named profiles / probes —
    *  backs the pairwise-compare drawer.  Distinct from ``correlation``:
    *  one pair, two-axis matrix indexed by layer rather than by name. */
   pairwise(
@@ -317,7 +311,7 @@ export const apiVectors = {
     id: string = SESSION,
   ): Promise<PairwiseCompareResponse> {
     const q = new URLSearchParams({ a, b }).toString();
-    return request(`${SESSION_BASE(id)}/vectors/pairwise?${q}`);
+    return request(`${SESSION_BASE(id)}/profiles/pairwise?${q}`);
   },
 };
 
@@ -349,16 +343,6 @@ export const apiProbes = {
     return request(
       `${SESSION_BASE(id)}/probes/${encodeURIComponent(name)}/geometry`,
     );
-  },
-  /** CAA live toggle — enable/disable live per-token monitor scoring.
-   *  Off ⇒ probes report only the end-of-gen aggregate (no per-token
-   *  stream / loom rows / trait events); probe gates still force what
-   *  they need. */
-  setLive(
-    req: { enabled: boolean },
-    id: string = SESSION,
-  ): Promise<{ enabled: boolean }> {
-    return request(`${SESSION_BASE(id)}/probes/live`, jsonBody(req));
   },
 };
 
@@ -819,58 +803,130 @@ export const apiTree = {
   },
 };
 
-// ====================================================== jacobian lens ==
+// ========================================================= instruments ==
 
-export const apiLens = {
-  sources(
-    id: string = SESSION,
-  ): Promise<{ sources: InstrumentSourceJSON[] }> {
-    return request(`${SESSION_BASE(id)}/lens/sources`);
+/** The three read-side instrument families the ``/instruments`` route tree
+ *  unifies (the 5.x replacement for the per-family ``/lens/*`` / ``/sae/*``
+ *  groups and ``POST /probes/live``). */
+export type InstrumentFamily = "geometry" | "lens" | "sae";
+
+/** Per-family listing row from ``GET /instruments``. */
+export interface InstrumentFamilyJSON {
+  family: InstrumentFamily;
+  live:
+    | { enabled: boolean }
+    | { enabled: boolean; layers: number[] | null }
+    | { enabled: boolean; layer: number | null; top_k: number | null };
+  source: string | null;
+  probes: string[];
+  capabilities: {
+    sources: boolean;
+    preparations: PreparationOp[];
+    token_readout: boolean;
+    source_switch: boolean;
+  };
+}
+
+/** The unified read-side instrument client — one surface over geometry /
+ *  lens / sae.  The former per-family live toggles, source lifecycle, the
+ *  polled preparations resource, and token-readout replay all live here; the
+ *  store slices adapt these to the panel-facing state. */
+export const apiInstruments = {
+  /** Enumerate the three families (live state, active source, probes,
+   *  capabilities). */
+  list(id: string = SESSION): Promise<{ instruments: InstrumentFamilyJSON[] }> {
+    return request(`${SESSION_BASE(id)}/instruments`);
   },
 
-  use(
+  /** Uniform live toggle.  geometry = the CAA per-token monitor scoring
+   *  switch (``POST /probes/live`` before 5.x); lens = the workspace
+   *  readout (``layers`` optional); sae = the feature-discovery readout
+   *  (``top_k`` optional).  A field the family can't consume → 400. */
+  setLive(
+    family: InstrumentFamily,
+    body: { enabled: boolean; layers?: number[] | null; top_k?: number },
+    id: string = SESSION,
+  ): Promise<{
+    enabled: boolean;
+    layers?: number[] | null;
+    layer?: number | null;
+    top_k?: number | null;
+  }> {
+    return request(`${SESSION_BASE(id)}/instruments/${family}/live`, jsonBody(body));
+  },
+
+  /** Prepared sources.  lens → ``{sources}``; sae → ``{sources, releases}``
+   *  (prepared sources merged with provider release candidates); geometry
+   *  404s (no source lifecycle). */
+  sources(
+    family: InstrumentFamily,
+    id: string = SESSION,
+  ): Promise<{
+    sources: InstrumentSourceJSON[];
+    releases?: {
+      release: string; model?: string | null; layers: number[];
+      repo_id?: string | null; neuronpedia?: boolean;
+      source?: "local" | "saelens";
+    }[];
+  }> {
+    return request(`${SESSION_BASE(id)}/instruments/${family}/sources`);
+  },
+
+  /** Synchronous lens source switch (the old ``POST /lens/use`` — lock +
+   *  derived-state eviction + auto-enable live).  lens only. */
+  setLensSource(
     source: string,
     id: string = SESSION,
   ): Promise<{ source: string; live_layers: number[] }> {
-    return request(`${SESSION_BASE(id)}/lens/use`, jsonBody({ source }));
+    return request(`${SESSION_BASE(id)}/instruments/lens/source`, {
+      ...jsonBody({ source }),
+      method: "PUT",
+    });
   },
 
-  fetch(
-    body: { source?: string; force?: boolean } = {},
+  /** Start a background preparation — lens ``fetch``/``fit``, sae
+   *  ``load``/``train``.  202 with the initial status; poll
+   *  ``preparationStatus``. */
+  startPreparation(
+    family: InstrumentFamily,
+    body: { operation: PreparationOp } & Record<string, unknown>,
     id: string = SESSION,
-  ): Promise<LensFetchStatusJSON> {
-    return request(`${SESSION_BASE(id)}/lens/fetch`, jsonBody(body));
+  ): Promise<PreparationStatusJSON> {
+    return request(`${SESSION_BASE(id)}/instruments/${family}/preparations`, jsonBody(body));
   },
 
-  fetchStatus(id: string = SESSION): Promise<LensFetchStatusJSON> {
-    return request(`${SESSION_BASE(id)}/lens/fetch`);
-  },
-
-  /** Check that ``word`` round-trips through the loaded model tokenizer as
-   * exactly one vocabulary token.  Read-only: steering/probe state is not
-   * changed when validation fails. */
-  validateToken(
-    word: string,
+  /** Poll the running-or-last background preparation for the family. */
+  preparationStatus(
+    family: InstrumentFamily,
     id: string = SESSION,
-  ): Promise<LensTokenValidationJSON> {
-    return request(
-      `${SESSION_BASE(id)}/lens/token/validate`,
-      jsonBody({ word }),
-    );
+  ): Promise<PreparationStatusJSON> {
+    return request(`${SESSION_BASE(id)}/instruments/${family}/preparations`);
   },
 
-  /** Workspace readout at one decode step of a loom node — the per-layer
-   * J-lens top-k matrix at the forward that produced the clicked token.
-   * ``steered`` (default true) replays under the node's recipe steering;
-   * pass ``false`` for the unsteered counterfactual read.  ``raw`` marks a
-   * flat-buffer (raw-mode) node — raw-ness isn't stamped server-side, so
-   * the client's render mode supplies it. */
+  /** Cancel: lens cancels a running fit; sae cancels a running train, else
+   *  unloads the resident SAE.  Returns the resulting status. */
+  cancelPreparation(
+    family: InstrumentFamily,
+    id: string = SESSION,
+  ): Promise<PreparationStatusJSON> {
+    return request(`${SESSION_BASE(id)}/instruments/${family}/preparations`, {
+      method: "DELETE",
+    });
+  },
+
+  /** Loom token-drilldown readout at one decode step — the forward that
+   *  produced the clicked token, wrapped in the 5.x ``measurements`` replay
+   *  envelope (``instruments.<family>.readout`` + ``binding``).  ``steered``
+   *  (default true) replays under the node's recipe steering; ``raw`` marks
+   *  a flat-buffer node (raw-ness isn't stamped server-side).  lens accepts
+   *  ``layers``; sae ignores it. */
   tokenReadout(
+    family: "lens" | "sae",
     nodeId: string,
     rawIndex: number,
     opts: { topK?: number; steered?: boolean; raw?: boolean; layers?: string } = {},
     id: string = SESSION,
-  ): Promise<LensTokenReadoutJSON> {
+  ): Promise<{ measurements: MeasurementsEnvelopeJSON }> {
     const params = new URLSearchParams({
       node_id: nodeId,
       raw_index: String(rawIndex),
@@ -879,101 +935,24 @@ export const apiLens = {
       raw: String(opts.raw ?? false),
     });
     if (opts.layers) params.set("layers", opts.layers);
-    return request(`${SESSION_BASE(id)}/lens/token-readout?${params}`);
+    return request(`${SESSION_BASE(id)}/instruments/${family}/token-readout?${params}`);
   },
 
-  /** Toggle the live J-lens readout. While enabled, each WS ``token``
-   * frame carries a ``lens_readout`` matrix (per selected layer, the top-k
-   * lens tokens for that decode step). ``layers`` omitted enables every
-   * fitted layer. The generation's logit-alternative K controls the token
-   * width. Applies to generations started after the call. */
-  setLive(
-    body: { enabled: boolean; layers?: number[] | null },
+  /** Check that ``word`` round-trips through the loaded model tokenizer as
+   * exactly one vocabulary token.  Read-only: steering/probe state is not
+   * changed when validation fails. */
+  validateLensToken(
+    word: string,
     id: string = SESSION,
-  ): Promise<{ enabled: boolean; layers: number[] | null }> {
-    return request(`${SESSION_BASE(id)}/lens/live`, jsonBody(body));
+  ): Promise<LensTokenValidationJSON> {
+    return request(
+      `${SESSION_BASE(id)}/instruments/lens/token/validate`,
+      jsonBody({ word }),
+    );
   },
 
-  /** Kick off a background Jacobian-lens fit (the "fit j-lens" button).
-   * 202 with the initial status; poll ``fitStatus``. Defaults: 100
-   * corpus prompts, all source layers, resume-if-matching. */
-  fit(
-    body: {
-      prompts?: number;
-      seq_len?: number;
-      layers?: string;
-      force?: boolean;
-    } = {},
-    id: string = SESSION,
-  ): Promise<LensFitStatusJSON> {
-    return request(`${SESSION_BASE(id)}/lens/fit`, jsonBody(body));
-  },
-
-  /** Poll the background lens fit's progress / error / completion. */
-  fitStatus(id: string = SESSION): Promise<LensFitStatusJSON> {
-    return request(`${SESSION_BASE(id)}/lens/fit`);
-  },
-
-  /** Request cooperative cancellation after the current estimator pass. */
-  cancelFit(id: string = SESSION): Promise<LensFitStatusJSON> {
-    return request(`${SESSION_BASE(id)}/lens/fit`, { method: "DELETE" });
-  },
-};
-
-// ================================================= sparse autoencoder ==
-
-export const apiSae = {
-  sources(id: string = SESSION): Promise<{ sources: InstrumentSourceJSON[] }> {
-    return request(`${SESSION_BASE(id)}/sae/sources`);
-  },
-  releases(id: string = SESSION): Promise<{ releases: {
-    release: string; model?: string | null; layers: number[];
-    repo_id?: string | null; neuronpedia?: boolean;
-    source?: "local" | "saelens";
-  }[] }> {
-    return request(`${SESSION_BASE(id)}/sae/releases`);
-  },
-  load(
-    body: { release: string; layer?: number | null },
-    id: string = SESSION,
-  ): Promise<SaeLoadStatusJSON> {
-    return request(`${SESSION_BASE(id)}/sae/load`, jsonBody(body));
-  },
-  loadStatus(id: string = SESSION): Promise<SaeLoadStatusJSON> {
-    return request(`${SESSION_BASE(id)}/sae/load`);
-  },
-  train(
-    body: {
-      name: string;
-      layer?: number | null;
-      tokens?: number;
-      seq_len?: number;
-      batch_size?: number;
-      width?: number | null;
-      expansion?: number;
-      learning_rate?: number;
-      l1?: number;
-      dead_threshold?: number;
-      seed?: number;
-      force?: boolean;
-    },
-    id: string = SESSION,
-  ): Promise<SaeTrainStatusJSON> {
-    return request(`${SESSION_BASE(id)}/sae/train`, jsonBody(body));
-  },
-  trainStatus(id: string = SESSION): Promise<SaeTrainStatusJSON> {
-    return request(`${SESSION_BASE(id)}/sae/train`);
-  },
-  cancelTrain(id: string = SESSION): Promise<SaeTrainStatusJSON> {
-    return request(`${SESSION_BASE(id)}/sae/train`, { method: "DELETE" });
-  },
-  setLive(
-    body: { enabled: boolean; top_k?: number },
-    id: string = SESSION,
-  ): Promise<{ enabled: boolean; layer: number | null; top_k: number }> {
-    return request(`${SESSION_BASE(id)}/sae/live`, jsonBody(body));
-  },
-  validateFeature(
+  /** Read-only SAE feature-id check. */
+  validateSaeFeature(
     featureId: number,
     id: string = SESSION,
   ): Promise<{
@@ -981,33 +960,21 @@ export const apiSae = {
     max_act?: number | null;
   }> {
     return request(
-      `${SESSION_BASE(id)}/sae/feature/validate`,
+      `${SESSION_BASE(id)}/instruments/sae/features/validate`,
       jsonBody({ id: featureId }),
     );
   },
-  featuresMetadata(
+
+  /** Neuronpedia discovery backfill — label + maxActApprox for up to 64
+   *  feature ids.  No session lock (network + disk cache only). */
+  saeFeaturesMetadata(
     ids: number[],
     id: string = SESSION,
   ): Promise<SaeFeatureMetaResponse> {
     return request(
-      `${SESSION_BASE(id)}/sae/features/metadata`,
+      `${SESSION_BASE(id)}/instruments/sae/features/metadata`,
       jsonBody({ ids }),
     );
-  },
-  tokenReadout(
-    nodeId: string,
-    rawIndex: number,
-    opts: { topK?: number; steered?: boolean; raw?: boolean } = {},
-    id: string = SESSION,
-  ): Promise<SaeTokenReadoutJSON> {
-    const params = new URLSearchParams({
-      node_id: nodeId,
-      raw_index: String(rawIndex),
-      top_k: String(opts.topK ?? 8),
-      steered: String(opts.steered ?? true),
-      raw: String(opts.raw ?? false),
-    });
-    return request(`${SESSION_BASE(id)}/sae/token-readout?${params}`);
   },
 };
 

@@ -94,7 +94,7 @@
     | SaeSteerRow;
 
   interface SnapshotShape {
-    version: 5;
+    version: 6;
     savedAt: string;
     model_id: string;
     session_id: string;
@@ -124,7 +124,7 @@
   function isSnapshotShape(v: unknown): v is SnapshotShape {
     if (!v || typeof v !== "object") return false;
     const obj = v as Record<string, unknown>;
-    if (obj.version !== 5 || typeof obj.savedAt !== "string") return false;
+    if (obj.version !== 6 || typeof obj.savedAt !== "string") return false;
     if (typeof obj.model_id !== "string" || typeof obj.session_id !== "string") return false;
     if (!obj.tree || typeof obj.tree !== "object" || !Array.isArray(obj.steerRack)) return false;
     const tree = obj.tree as Record<string, unknown>;
@@ -208,7 +208,7 @@
     }
     if (!isSnapshotShape(json)) {
       parseError =
-        "unsupported conversation file: expected the complete saklas conversation schema version 5";
+        "unsupported conversation file: expected the complete saklas conversation schema version 6";
       return;
     }
     parsed = json;

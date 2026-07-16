@@ -79,7 +79,7 @@
             <article class:active={sessionState.info?.id === s.id}>
               <strong>{s.id}</strong>
               <code>{s.model_id}</code>
-              <span>{s.device}/{s.dtype} · {s.vectors.length} vectors · {s.probes.length} probes</span>
+              <span>{s.device}/{s.dtype} · {s.profiles.length} profiles · {s.probes.length} probes</span>
             </article>
           {/each}
         {/if}

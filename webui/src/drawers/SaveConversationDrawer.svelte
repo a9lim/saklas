@@ -30,7 +30,7 @@
   // would otherwise capture a partial turn.  User can re-open the drawer
   // to refresh.
   const snapshot = $derived.by(() => ({
-    version: 5 as const,
+    version: 6 as const,
     savedAt: new Date().toISOString(),
     model_id: sessionState.info!.model_id,
     session_id: sessionState.info!.id,

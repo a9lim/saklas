@@ -34,7 +34,7 @@
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
   import JLensSteerCard from "./rack/JLensSteerCard.svelte";
   import JLensTokenCard from "./rack/JLensTokenCard.svelte";
-  import { ApiError, apiLens } from "../lib/api";
+  import { ApiError, apiInstruments } from "../lib/api";
   import {
     addJLensToRack,
     activeProbeNames,
@@ -166,7 +166,7 @@
     if (!word || steerBusy) return;
     steerBusy = true;
     try {
-      const validated = await apiLens.validateToken(word);
+      const validated = await apiInstruments.validateLensToken(word);
       addJLensToRack(validated.word);
       if (steerInput === submitted) steerInput = "";
     } catch (e) {
@@ -324,7 +324,7 @@
     if (probeRack.active.includes(selector)) return true;
     probeBusy = true;
     try {
-      const validated = await apiLens.validateToken(bare);
+      const validated = await apiInstruments.validateLensToken(bare);
       const validatedSelector = `jlens/${validated.word}`;
       const live = lensState.aggregate?.find(
         ([token]) => token.trim() === validated.word,

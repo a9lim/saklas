@@ -6,11 +6,11 @@
   // probes); the body renders an L_A × L_B heatmap structurally akin to
   // the correlation matrix, but indexed by layer rather than by name.
   //
-  // Data: GET /vectors/pairwise?a=&b= — the server falls back to monitor
+  // Data: GET /profiles/pairwise?a=&b= — the server falls back to monitor
   // profiles when a name isn't a registered steering vector, so probe
   // names resolve cleanly without a new endpoint.
 
-  import { apiVectors, ApiError } from "../lib/api";
+  import { apiProfiles, ApiError } from "../lib/api";
   import {
     closeDrawer,
     probeRack,
@@ -84,7 +84,7 @@
     loading = true;
     error = null;
     try {
-      data = await apiVectors.pairwise(a, b);
+      data = await apiProfiles.pairwise(a, b);
     } catch (e) {
       if (e instanceof ApiError) {
         const detail =
