@@ -903,6 +903,43 @@ affine-coord helpers, and `_woodbury_apply`. The hot path in `monitor.py` import
 `_attach_manifold_probe` back from this module (no circular dependency —
 `monitor_attach` imports only `mahalanobis` and `manifold`).
 
+## instruments/
+
+The read-side instrument protocol (phase 1 of the 5.x unification — the
+read-side analogue of `SteeringComposer`). One contract over the three read
+families: geometry (Monitor subspace probes), the Jacobian-lens readout
+channel, SAE feature reads. `types.py` is the shared vocabulary:
+**`GateRef`** (structured probe-gate reference; `parse_gate_ref` is the ONE
+place the scalar-key discrimination lives — it inverts the key family
+`Monitor.flat_scalars` emits; the hot-path runtime lookup stays the verbatim
+string) + `validate_gate_channels` (composition-preflight rejection of
+channels a family can never produce — `@when:sae/123:membership` raises
+`UnsupportedProbeChannelError` (400) instead of sitting silently inactive;
+a *supported* channel temporarily absent this step still reads inactive);
+**`ScalarReading`** (the honest one-channel reading for lens/SAE, with an
+explicit `unit` — `mean_token_probability` / `activation_over_max` /
+`raw_activation` — and a `DepthSummary` that carries its mass `basis`,
+because `depth_com` means three mathematically unrelated things across
+families; `to_probe_reading()` is the phase-1 wire bridge reproducing the
+historical synthesized-`ProbeReading` shape bit-for-bit until the phase-2
+measurement envelope lands); **`InstrumentPlan`** (declared capture demand,
+not mechanics — the session planner unions plans and picks physical
+retention; the `INCREMENTAL → set_tail_with_sink` upgrade is
+cross-instrument resource sharing and stays session-side);
+**`InstrumentBinding`** (immutable per-generation source/spec snapshot, so
+un-locked mutations like the SAE metadata backfill can't change what a
+running generation measures); per-family `LiveConfig` dataclasses (user
+intent, discriminated — deliberately NOT unified with runtime residency:
+lens "enabled" is not device residency, SAE residency precedes its toggle).
+`protocol.py` holds the `Instrument` / `InstrumentRun` contracts —
+`InstrumentRun.observe` memoizes by `step_id` so the gate callback (before
+the token tap) and the display step share one computation, `observe_many`
+covers batch generation, and authored-prefill orchestration (token matching,
+`j-1` producer semantics, loom persistence) deliberately stays session-side.
+Family implementations land incrementally: lens + SAE instruments extract
+their session.py regions; geometry stays a thin adapter over `Monitor` (the
+four capture modes are session/HiddenCapture state, not Monitor internals).
+
 ## triggers.py
 
 `Trigger` (frozen): phase flags + optional `ProbeGate`. `Trigger.active(ctx)`

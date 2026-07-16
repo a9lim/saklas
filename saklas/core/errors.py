@@ -81,6 +81,18 @@ class SaeFeatureError(ValueError, SaklasError):
         return (400, str(self) or self.__class__.__name__)
 
 
+class UnsupportedProbeChannelError(ValueError, SaklasError):
+    """Raised at steering-composition preflight when a probe gate references
+    a channel its instrument family can never produce (e.g.
+    ``@when:sae/123:membership`` — SAE readings carry only the activation
+    axis).  Distinct from a *supported* channel that is temporarily absent
+    this step (prefill, capture unavailable), which stays quietly inactive.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
+
 class AmbiguousVariantError(ValueError, SaklasError):
     """Raised when a :sae selector matches more than one extracted release."""
 
