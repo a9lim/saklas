@@ -112,8 +112,11 @@ class InstrumentRun(Protocol):
         step_id: int,
         hidden: Mapping[int, torch.Tensor],
     ) -> dict[str, Reading]:
-        """Readings for every attached probe at this step.  Memoized by
-        ``step_id`` — gate and display callers share one computation."""
+        """Readings for every attached probe at this step.  Repeated
+        calls with the same ``step_id`` are memoized while the run is
+        bound (never while idle).  The production gate→display reuse is
+        the workers' stash mechanism, not this method — see the module
+        docstring."""
         ...
 
     def gate_scalars(

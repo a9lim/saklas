@@ -87,10 +87,10 @@ class LensRun:
         self, step_id: int, hidden: dict[int, torch.Tensor],
     ) -> dict[str, "ProbeReading"]:
         """Readings for every attached probe at this step, memoized by
-        ``step_id`` so the gate callback (pre-token-tap) and the display
-        step share one computation.  An idle run never memoizes — it
-        persists indefinitely, so a repeated ``step_id`` with different
-        hidden states would return stale readings."""
+        ``step_id`` while bound (the production gate→display reuse is the
+        worker stash mechanism, not this method).  An idle run never
+        memoizes — it persists indefinitely, so a repeated ``step_id``
+        with different hidden states would return stale readings."""
         if not self.bound:
             return self._instrument.score_probes(hidden)
         if self._memo_step == step_id and self._memo_readings is not None:

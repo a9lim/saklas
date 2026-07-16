@@ -932,8 +932,9 @@ running generation measures); per-family `LiveConfig` dataclasses (user
 intent, discriminated — deliberately NOT unified with runtime residency:
 lens "enabled" is not device residency, SAE residency precedes its toggle).
 `protocol.py` holds the `Instrument` / `InstrumentRun` contracts —
-`InstrumentRun.observe` memoizes by `step_id` so the gate callback (before
-the token tap) and the display step share one computation, `observe_many`
+`InstrumentRun.observe` memoizes by `step_id` while bound (the production
+gate→display reuse is the workers' stash mechanism, run-scoped by
+construction; see the post-review hardening notes below), `observe_many`
 covers batch generation, and authored-prefill orchestration (token matching,
 `j-1` producer semantics, loom persistence) deliberately stays session-side.
 Family implementations land incrementally: lens + SAE instruments extract
