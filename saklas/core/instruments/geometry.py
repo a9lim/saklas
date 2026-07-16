@@ -119,13 +119,23 @@ class GeometryRun:
     def gate_scalars(
         self,
         step_id: int,
-        hidden: dict[int, torch.Tensor],
-        gate_keys: frozenset[str] | set[str],
+        hidden: dict[int, torch.Tensor] | None,
+        gate_keys: frozenset[str] | set[str] | None,
     ) -> dict[str, float]:
         """The gated subset's scalar channels at this step (idle reads
-        hold the state lock; the bound path is the per-token hot path)."""
-        del step_id
-        monitor = self._instrument._session._monitor
+        hold the state lock; the bound path is the per-token hot path).
+        Uniform None semantics (the protocol contract): ``hidden=None``
+        reads the capture's latest slices; ``gate_keys=None`` scores the
+        full roster (``flat_scalars`` over ``observe``, sharing its step
+        memo)."""
+        session = self._instrument._session
+        monitor = session._monitor
+        if hidden is None:
+            hidden = session._capture.latest_per_layer()
+        if gate_keys is None:
+            from saklas.core.monitor import Monitor
+
+            return Monitor.flat_scalars(self.observe(step_id, hidden))
         if not self.bound:
             with self._instrument.state_lock:
                 plan = monitor.plan_gate_scalars(set(gate_keys))

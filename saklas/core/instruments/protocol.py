@@ -184,14 +184,17 @@ class InstrumentRun(Protocol):
     def gate_scalars(
         self,
         step_id: int,
-        hidden: Mapping[int, torch.Tensor],
-        gate_keys: frozenset[str],
+        hidden: Mapping[int, torch.Tensor] | None,
+        gate_keys: frozenset[str] | set[str] | None,
     ) -> dict[str, float]:
-        """The gate channels' scalar values for this step (the subset the
-        active gates reference), keyed by verbatim scalar key.  ``step_id``
-        keys the worker's per-forward stash so the display step reuses
-        this forward's rows (step identity replaced the ``fresh``
-        handshake)."""
+        """The gate channels' scalar values for this step, keyed by
+        verbatim scalar key.  ``step_id`` keys the worker's per-forward
+        stash so the display step reuses this forward's rows (step
+        identity replaced the ``fresh`` handshake).  ``hidden=None`` means
+        "read the capture's latest slices yourself" (the lens/SAE workers
+        always do; geometry fetches them); ``gate_keys=None`` scores the
+        full attached roster — the session gate forwarders' bare-call
+        shape."""
         ...
 
     def observe_aggregate(

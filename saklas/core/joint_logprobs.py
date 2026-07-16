@@ -579,7 +579,11 @@ def _replay_branch_logprobs(
                     prefill = False
 
                     if gating_callback is not None:
-                        ctx.probe_scores = gating_callback()
+                        # The replay's forward index IS the step identity the
+                        # loop already stamps on ``ctx.gen_step`` — the same
+                        # per-forward value the live decode loop threads
+                        # (sol's round-2 P1: a zero-arg call TypeErrors now).
+                        ctx.probe_scores = gating_callback(forced_idx)
 
                     if not no_cache_mode:
                         past_key_values = getattr(outputs, "past_key_values", None)

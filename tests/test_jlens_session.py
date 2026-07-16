@@ -2283,6 +2283,56 @@ def test_lens_full_roster_gate_read_primes_bound_observe_memo() -> None:
     inst.close_run()
 
 
+def test_lens_gate_keys_none_vs_empty_contract() -> None:
+    """``gate_keys=None`` scores the full roster; an explicit ``set()``
+    scores nothing (the worker's old ``if gate_keys:`` treated both as
+    full-roster — sol's round-3 P2).  The lens member of the three-family
+    contract pin."""
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s._add_lens_probe("jlens/g", as_name=None)
+    layers = [int(layer) for layer in s.jlens.source_layers]
+    d_model = next(iter(s.jlens.jacobians.values())).shape[0]
+    s._capture = _FakeCapture({
+        layer: torch.randn(
+            d_model, generator=torch.Generator().manual_seed(layer),
+        )
+        for layer in layers
+    })
+    inst = s._lens_instrument
+    full = inst.gate_scalars(None, step_id=0)
+    assert "jlens/g" in full
+    assert inst.gate_scalars(set(), step_id=0) == {}
+
+
+def test_lens_negative_step_observe_never_caches() -> None:
+    """``step_id < 0`` (the no-identity sentinel) never populates the lens
+    run's observe memo — repeated negative observations rescore (sol's
+    round-2 coverage gap: the geometry test alone didn't pin the shared
+    fix on this family)."""
+    from saklas.core.instruments.types import ReadRequest
+
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s._add_lens_probe("jlens/g", as_name=None)
+    inst = s._lens_instrument
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    run = inst.bind(inst.plan(prep), prep)
+
+    calls: list[int] = []
+
+    def _fresh_probes(_hidden: Any, **_kw: Any) -> dict[str, Any]:
+        calls.append(1)
+        return {"jlens/g": object()}
+
+    inst.score_probes = _fresh_probes  # type: ignore[method-assign]
+    first = run.observe(-1, {})
+    second = run.observe(-1, {})
+    assert len(calls) == 2 and first is not second
+    assert run._memo_step is None
+    inst.close_run()
+
+
 def test_live_lens_readout_step_none_when_off() -> None:
     s = _StubSession()
     assert s._live_lens_readout_step() is None

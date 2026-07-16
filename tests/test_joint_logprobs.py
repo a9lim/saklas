@@ -417,6 +417,37 @@ class _MockSession:
             assert instrument.current_run.bound is False, instrument.family
 
 
+def test_gated_replay_passes_the_forward_step_to_the_gate_callback():
+    """The replay's gate callback receives the loop's ``forced_idx`` — the
+    same per-forward step identity the live decode loop threads.  A
+    zero-arg call TypeErrors under the step-aware contract (sol's observe
+    round-2 P1: the rest of this suite never exercises gated steering, so
+    the regression was invisible here)."""
+    from saklas.core.joint_logprobs import compute_joint_logprobs
+
+    session: Any = _MockSession()
+    steps: list[int] = []
+
+    def _gate(step_id: int) -> dict[str, float]:
+        steps.append(step_id)
+        return {}
+
+    session._steering_needs_probe_gating = lambda: True
+    session._build_gating_score_callback = lambda: _gate
+
+    result = compute_joint_logprobs(session, "a1", "a2")
+
+    assert result.a_id == "a1"
+    assert steps and steps[0] == 0
+    # Each branch's replay counts its own forwards 0, 1, 2, … — this
+    # two-branch fixture must show exactly two resets (one per branch),
+    # with no skips or repeats within a branch.
+    resets = [i for i, s in enumerate(steps) if s == 0]
+    assert len(resets) == 2
+    for start, end in zip(resets, resets[1:] + [len(steps)]):
+        assert steps[start:end] == list(range(end - start))
+
+
 def test_compute_joint_logprobs_runs_end_to_end_on_mock():
     from saklas.core.joint_logprobs import compute_joint_logprobs
 

@@ -560,7 +560,10 @@ class SaeInstrument:
             return {}
         _backend, layer, _width = session._require_sae()
         only = None
-        if gate_keys:
+        if gate_keys is not None:
+            # ``None`` is the full-roster sentinel; an explicit empty set
+            # means "no gated probes" and scores nothing (the protocol's
+            # None-vs-empty distinction — sol's round-3 P2).
             only = {
                 key.split("[", 1)[0]
                 for key in gate_keys

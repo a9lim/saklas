@@ -631,6 +631,47 @@ def test_sae_bind_resolves_unit_from_meta_cache() -> None:
     assert values["sae/2"] == pytest.approx(5.0 / 10.0)
 
 
+def test_sae_gate_keys_none_vs_empty_contract() -> None:
+    """``gate_keys=None`` scores the full roster; an explicit ``set()``
+    scores nothing.  The SAE member of the three-family contract pin."""
+    session = _session()
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
+    }
+    inst = session._sae_instrument
+    full = inst.gate_scalars(None, step_id=0)
+    assert "sae/2" in full
+    assert inst.gate_scalars(set(), step_id=0) == {}
+
+
+def test_sae_negative_step_observe_never_caches() -> None:
+    """``step_id < 0`` never populates the SAE run's observe memo —
+    repeated negative observations rescore (the family-parameterized pin
+    of the shared negative-step fix)."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _session()
+    inst = session._sae_instrument
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": None, "max_act": 10.0,
+    }
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    run = inst.bind(inst.plan(prep), prep)
+
+    calls: list[int] = []
+
+    def _fresh_probes(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        calls.append(1)
+        return {"sae/2": object()}
+
+    inst.score_probes = _fresh_probes  # type: ignore[method-assign]
+    first = run.observe(-1, {})
+    second = run.observe(-1, {})
+    assert len(calls) == 2 and first is not second
+    assert run._memo_step is None
+    inst.close_run()
+
+
 def test_detach_during_bound_generation_keeps_aggregate_roster() -> None:
     """Mutations apply next generation: a probe detached mid-generation
     (e.g. the synchronous DELETE route, which takes no generation lock)
