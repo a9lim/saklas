@@ -985,6 +985,31 @@ on a channel the family can never produce is a composition-preflight error
 (`validate_gate` → `UnsupportedProbeChannelError`), wired at the composer
 in the plan/run slice.
 
+`geometry.py` — **`GeometryInstrument`**, the thin adapter giving the
+Monitor family the same face as its siblings: `attach` (the exclusive-GPU
+whitener-touch + resolve + `monitor.add_probe` flow), `detach`, `specs`,
+`names`, `validate_gate` (every channel — axes, fraction, membership,
+distance, assignment), and `probe_hash` (the baked-tensor / subspace-
+geometry digest). The Monitor engine and the four capture modes stay
+untouched (folding them in would combine an orchestration extraction with
+an engine rewrite). `session.instruments` is the uniform registry —
+`{"geometry", "lens", "sae"}` → instrument — behind the probe-hash roster,
+gate preflight, and the server's phase-2 instrument enumeration.
+
+The composer's four gate-key walks collapsed onto one structured
+`_gated_refs()` pass (`parse_gate_ref`), which also **channel-validates**
+lens/SAE-attached gate references at generation preflight
+(`UnsupportedProbeChannelError`, 400) and fixes the old
+`re.split("[\\[:@~]")` truncation of variant-suffixed probe names.
+
+Deferred to a follow-up slice (deliberately, not silently): plan-driven
+`_begin_capture` layer-union (`InstrumentPlan` production/consumption —
+the per-family union branches in `_begin_capture` remain explicit
+session logic), and the formal `InstrumentRun` objectification (the
+step-stash gate→display compute-reuse contract its `observe` memoization
+would formalize is implemented by the per-family stashes and pinned by
+tests).
+
 ## triggers.py
 
 `Trigger` (frozen): phase flags + optional `ProbeGate`. `Trigger.active(ctx)`

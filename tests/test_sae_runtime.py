@@ -334,6 +334,37 @@ def test_composer_detects_attached_sae_gate() -> None:
     assert composer.gated_sae_probe_keys() == {"sae/2"}
 
 
+def test_unsupported_sae_gate_channel_raises_at_preflight() -> None:
+    """A gate on a channel the SAE family can never produce is a preflight
+    error (the 5.x replacement for the silently-constant fake channels)."""
+    from saklas.core.errors import UnsupportedProbeChannelError
+    from saklas.core.instruments.sae import SaeInstrument
+
+    stub = SimpleNamespace(
+        _lens_probes={},
+        _monitor=SimpleNamespace(probe_names=()),
+    )
+    instrument = SaeInstrument(stub)  # type: ignore[arg-type]
+    instrument.probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": None, "max_act": None,
+    }
+    stub._sae_instrument = instrument
+    stub._sae_probes = instrument.probes
+    composer = SteeringComposer(stub)  # type: ignore[arg-type]
+    steering = parse_expr("0.3 sae/2@when:sae/2:membership>0.5")
+    composer._stack.append(dict(steering.alphas))  # type: ignore[arg-type]
+    with pytest.raises(UnsupportedProbeChannelError) as exc_info:
+        composer.gated_sae_probe_keys()
+    status, text = exc_info.value.user_message()
+    assert status == 400
+    assert "sae/2:membership" in text
+    # A supported-channel gate on the same probe still composes.
+    composer._stack.clear()
+    ok = parse_expr("0.3 sae/2@when:sae/2>3")
+    composer._stack.append(dict(ok.alphas))  # type: ignore[arg-type]
+    assert composer.gated_sae_probe_keys() == {"sae/2"}
+
+
 @pytest.mark.parametrize(
     "expr",
     [

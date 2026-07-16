@@ -86,6 +86,9 @@ from saklas.core.steering_expr import AblationTerm, ManifoldTerm, ProjectedTerm
 from saklas.core.manifold import Manifold
 
 if TYPE_CHECKING:
+    from saklas.core.instruments.geometry import GeometryInstrument
+    from saklas.core.instruments.lens import LensInstrument
+    from saklas.core.instruments.sae import SaeInstrument
     from saklas.core.scoring import ChoiceScores
     from saklas.core.steering_composer import SteeringComposer
     from saklas.io.templates import TemplateFolder
@@ -3518,6 +3521,30 @@ class SaklasSession:
     def _live_sae_active_for_generation(self, value: bool) -> None:
         self._sae_instrument.active_for_generation = bool(value)
 
+    @property
+    def _geometry_instrument(self) -> "GeometryInstrument":
+        """The geometry instrument (thin Monitor adapter), created lazily
+        on first touch like its lens/SAE siblings."""
+        inst = self.__dict__.get("_geometry_instrument")
+        if inst is None:
+            from saklas.core.instruments.geometry import GeometryInstrument
+
+            inst = GeometryInstrument(self)
+            self.__dict__["_geometry_instrument"] = inst
+        return inst
+
+    @property
+    def instruments(self) -> dict[str, Any]:
+        """The three read-family instruments keyed by family name —
+        ``geometry`` (the Monitor adapter), ``lens``, ``sae``.  The
+        uniform registry behind the probe-hash roster, gate preflight,
+        and the server's instrument enumeration."""
+        return {
+            "geometry": self._geometry_instrument,
+            "lens": self._lens_instrument,
+            "sae": self._sae_instrument,
+        }
+
     def enable_live_lens(
         self,
         *,
@@ -6144,24 +6171,12 @@ class SaklasSession:
             return self._add_lens_probe(selector, as_name=as_name)
         if selector.startswith("sae/"):
             return self._add_sae_probe(selector, as_name=as_name)
-        name = as_name if as_name is not None else selector
-        # Probe attach loads the manifold onto the model device and builds
-        # device-resident whitened factors — GPU work that must not run
-        # concurrently with a fit / extract / generation on PyTorch's single
-        # global MPS command buffer (which would abort the process).  Hold the
-        # exclusive-GPU ``_gen_lock`` non-blocking: a cross-thread model op in
-        # flight refuses rather than races; same-thread reentry passes (RLock).
-        with self._model_exclusive(
-            "add_probe called while another model operation is in "
-            "flight; retry shortly"
-        ):
-            # Manifold reads are Mahalanobis-only. Build the neutral artifact
-            # under this same exclusive section so a concurrent generation
-            # cannot race it; the lazy property refuses an active steering
-            # scope before persisting anything under a neutral identity.
-            _ = self.whitener
-            manifold = self._resolve_probe_manifold(selector)
-            self._monitor.add_probe(name, manifold, top_n=top_n)
+        # Geometry (Monitor) probes attach through their instrument like the
+        # other families; the whitener build + manifold resolution + monitor
+        # registration run under the exclusive-GPU section inside it.
+        name = self._geometry_instrument.attach(
+            selector, as_name=as_name, top_n=top_n,
+        )
         # New probe → _begin_capture attaches a different layer set than was
         # live when the prefix was prefilled; drop the cache so the next gen
         # re-prefills with the fresh capture-attach layout in place.
@@ -6354,42 +6369,11 @@ class SaklasSession:
             # unit change.
             self._probe_hash_cache[name] = sae_digest
             return sae_digest
-        manifold = self._monitor.manifolds.get(name)
-        if manifold is None:
+        geometry_digest = self._geometry_instrument.probe_hash(name)
+        if geometry_digest is None:
             return None
-        # Hash the probe's baked direction view (the folded ``{L: δ̂_L ·
-        # share_L}``) for continuity with the pre-coords scalar monitor:
-        # the per-layer baked tensor is what the transcript-drift check
-        # compared, and it's stable across the manifold round-trip.
-        from saklas.core.capture import folded_directions
-        import hashlib
-        h = hashlib.sha256()
-        try:
-            # 2-node R=1 concept probe: hash the folded baked-direction view,
-            # for continuity with the pre-coords scalar monitor's drift check.
-            profile = folded_directions(manifold)
-            per_layer = {L: [profile[L]] for L in profile}
-        except ValueError:
-            # Multi-node / curved probe (e.g. ``personas``): no R=1 fold exists.
-            # Hash the per-layer subspace geometry directly — mean + basis (+ the
-            # real node_coords when stamped) — a deterministic digest for any
-            # manifold shape, so attaching a multi-node probe is reproducible too.
-            per_layer = {}
-            for layer_idx, sub in manifold.layers.items():
-                tensors = [sub.mean, sub.basis]
-                if sub.node_coords is not None:
-                    tensors.append(sub.node_coords)
-                per_layer[layer_idx] = tensors
-        for layer_idx in sorted(per_layer.keys()):
-            for tensor in per_layer[layer_idx]:
-                # ``tensor.detach().cpu().contiguous()`` keeps the hash stable
-                # across device placements; fp32 cast normalizes dtype so
-                # mixed-precision storage doesn't change the hex digest.
-                arr = tensor.detach().to("cpu").to(torch.float32).contiguous()
-                h.update(arr.numpy().tobytes())
-        digest = h.hexdigest()
-        self._probe_hash_cache[name] = digest
-        return digest
+        self._probe_hash_cache[name] = geometry_digest
+        return geometry_digest
 
     def probe_hashes(self) -> dict[str, str]:
         """Return ``{probe_name: sha256_hex}`` for every registered probe."""

@@ -124,6 +124,11 @@ def _stub_session() -> SaklasSession:
     session._lens_probes = {}
     session._live_sae = None
     session._sae_probes = {}
+    # Geometry attaches route through the instrument adapter now; a real
+    # adapter over this stub reproduces the old inline add_probe flow
+    # (exclusive section + whitener touch + resolve + monitor.add_probe).
+    from saklas.core.instruments.geometry import GeometryInstrument
+    session._geometry_instrument = GeometryInstrument(session)
     session._lens_step_stash = None
     session._live_lens_active_for_generation = True
     session._incremental_readings = []

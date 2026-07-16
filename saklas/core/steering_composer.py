@@ -22,7 +22,6 @@ narrow context/generation forwarders where the session boundary is meaningful.
 """
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -42,6 +41,7 @@ from saklas.core.session import (
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 
 if TYPE_CHECKING:
+    from saklas.core.instruments.types import GateRef
     from saklas.core.session import SaklasSession
     from saklas.core.steering import Steering
 
@@ -630,22 +630,18 @@ class SteeringComposer:
                 return True
         return False
 
-    def gated_probe_names(self) -> set[str]:
-        """Registered probe names referenced by active probe gates.
-
-        Walks the flattened steering stack, pulls each trigger's
-        :class:`~saklas.core.triggers.ProbeGate`, and maps the gate's scalar
-        ``probe`` key back to the registered monitor probe NAME — the prefix
-        before the first of ``[`` / ``:`` / ``@`` / ``~`` (e.g.
-        ``"personas[3]"`` → ``"personas"``, ``"emotions:fraction"`` →
-        ``"emotions"``, ``"confident.uncertain"`` → itself).  Only names that
-        are actually attached probes are kept, so a stale / non-probe gate key
-        doesn't shrink an otherwise-empty subset to "score nothing".  Used by
-        :meth:`_begin_capture` to scope the per-token step sink to just the
-        gated probes when gating is the sole per-token consumer (FIX #4).
+    def _gated_refs(self) -> "list[GateRef]":
+        """Every active probe-gate reference, parsed once into its
+        structured form (:func:`parse_gate_ref` — the ONE place the
+        scalar-key discrimination lives).  Walks the flattened steering
+        stack exactly like the historical per-family key walks, which this
+        replaces.  Note the structured parse also fixes the old
+        ``re.split("[\\[:@~]")`` truncation of variant-suffixed probe names
+        (``pirate:role-x`` no longer truncates at ``:role-x``).
         """
-        attached = set(self._session._monitor.probe_names)
-        out: set[str] = set()
+        from saklas.core.instruments.types import parse_gate_ref
+
+        refs = []
         for entry in self.flatten_stack().values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
@@ -654,73 +650,71 @@ class SteeringComposer:
             gate = trig.gate
             if gate is None:
                 continue
-            # Split off the channel suffix: the probe name is everything up to
-            # the first axis/fraction/label/assignment marker.
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(name)
-        return out
+            refs.append((gate.probe, parse_gate_ref(gate.probe)))
+        return refs
+
+    def gated_probe_names(self) -> set[str]:
+        """Registered monitor probe names referenced by active probe gates.
+
+        Only names that are actually attached probes are kept, so a stale /
+        non-probe gate key doesn't shrink an otherwise-empty subset to
+        "score nothing".  Used by ``_begin_capture`` to scope the per-token
+        step sink to just the gated probes when gating is the sole
+        per-token consumer (FIX #4).
+        """
+        attached = set(self._session._monitor.probe_names)
+        return {
+            ref.probe for _key, ref in self._gated_refs()
+            if ref.probe in attached
+        }
 
     def gated_probe_keys(self) -> set[str]:
         """Exact monitor scalar keys referenced by active probe gates."""
         attached = set(self._session._monitor.probe_names)
-        out: set[str] = set()
-        for entry in self.flatten_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            gate = trig.gate
-            if gate is None:
-                continue
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(gate.probe)
-        return out
+        return {
+            key for key, ref in self._gated_refs()
+            if ref.probe in attached
+        }
 
     def gated_lens_probe_keys(self) -> set[str]:
         """Exact gate scalar keys referencing attached J-lens token probes.
 
-        The lens siblings of :meth:`gated_probe_keys`: lens probes live in the
-        session lens-probe registry (readout channel), not the Monitor, and
-        their gate scalars come from ``session._score_lens_gate_scalars`` in
-        the gating score callback.  Only keys whose base name is an attached
-        lens probe count, mirroring the monitor filter.
+        The lens sibling of :meth:`gated_probe_keys`: lens probes live in
+        the session lens instrument (readout channel), not the Monitor.
+        A key whose base name is an attached lens probe is also
+        **channel-validated** here — the lens family produces only the
+        strength axis, so ``@when:jlens/word:membership`` raises
+        ``UnsupportedProbeChannelError`` at generation preflight instead of
+        sitting silently inactive.
         """
         attached = set(self._session._lens_probes)
         if not attached:
             return set()
+        # Historical name for the attachment check (duck-typed stubs supply
+        # a plain dict); the instrument, when present, channel-validates.
+        instrument = getattr(self._session, "_lens_instrument", None)
         out: set[str] = set()
-        for entry in self.flatten_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            gate = trig.gate
-            if gate is None:
-                continue
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(gate.probe)
+        for key, ref in self._gated_refs():
+            if ref.probe in attached:
+                if instrument is not None:
+                    instrument.validate_gate(ref)
+                out.add(key)
         return out
 
     def gated_sae_probe_keys(self) -> set[str]:
-        """Exact gate scalar keys referencing attached SAE feature probes."""
+        """Exact gate scalar keys referencing attached SAE feature probes,
+        channel-validated like the lens sibling (the SAE family produces
+        only the strength axis)."""
         attached = set(self._session._sae_probes)
         if not attached:
             return set()
+        instrument = getattr(self._session, "_sae_instrument", None)
         out: set[str] = set()
-        for entry in self.flatten_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:
-                _alpha, trig = entry
-            gate = trig.gate
-            if gate is None:
-                continue
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(gate.probe)
+        for key, ref in self._gated_refs():
+            if ref.probe in attached:
+                if instrument is not None:
+                    instrument.validate_gate(ref)
+                out.add(key)
         return out
 
     def steering_active_in_prefill(self) -> bool:
