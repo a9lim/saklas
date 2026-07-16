@@ -129,19 +129,7 @@
   .dot.live {
     color: var(--live);
     border-radius: 50%;
-    animation: dot-pulse var(--dur-pulse) var(--ease-in-out) infinite;
-  }
-  /* Reduced-motion is handled by the global kill switch in global.css. */
-  @keyframes dot-pulse {
-    0% {
-      box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 40%, transparent);
-    }
-    70% {
-      box-shadow: 0 0 0 6px transparent;
-    }
-    100% {
-      box-shadow: 0 0 0 0 transparent;
-    }
+    animation: none;
   }
   .dot.done {
     color: var(--fg-muted);

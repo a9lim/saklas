@@ -104,18 +104,18 @@
       border-color var(--dur-fast) var(--ease-out);
   }
   .sk-checkbox:hover:not(.is-disabled) .sk-checkbox-box {
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
   }
   .sk-checkbox:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 2px;
   }
   .sk-checkbox.is-checked .sk-checkbox-box {
-    background: var(--material-glint), var(--accent);
+    background: var(--accent);
     border-color: var(--accent);
   }
   .sk-checkbox.is-checked:hover:not(.is-disabled) .sk-checkbox-box {
-    background: var(--material-glint), var(--accent-light);
+    background: var(--accent-light);
     border-color: var(--accent-light);
   }
   .sk-checkbox.is-disabled {

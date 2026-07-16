@@ -1,6 +1,6 @@
 <script lang="ts">
   // v2 chip — the recipe-bar term, the depth badge, the role tag. A small
-  // mono capsule washed in its hue (gradient = material, per policy).
+  // mono capsule washed in its hue.
   //
   // ``color`` is the hue (pillar or state — pass the CSS color; defaults
   // to chrome white). ``onremove`` grows the trailing ×; ``onclick`` makes
@@ -78,11 +78,7 @@
     color: var(--chip-c);
     /* Borderless: the hue wash IS the chip — a touch deeper than the old
      * outlined version so the shape holds without its hairline. */
-    background: linear-gradient(
-      120deg,
-      color-mix(in srgb, var(--chip-c) 20%, transparent),
-      color-mix(in srgb, var(--chip-c) 10%, transparent)
-    );
+    background: color-mix(in srgb, var(--chip-c) 14%, transparent);
     border: 1px solid transparent;
     white-space: nowrap;
     transition:
@@ -102,11 +98,7 @@
     cursor: pointer;
   }
   .sk-chip.clickable:hover {
-    background: linear-gradient(
-      120deg,
-      color-mix(in srgb, var(--chip-c) 28%, transparent),
-      color-mix(in srgb, var(--chip-c) 14%, transparent)
-    );
+    background: color-mix(in srgb, var(--chip-c) 20%, transparent);
   }
   .body {
     display: inline-flex;

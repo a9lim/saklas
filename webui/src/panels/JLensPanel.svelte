@@ -764,7 +764,7 @@
   .add-input:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
   }
   .add-btn {
     min-height: var(--control-target);

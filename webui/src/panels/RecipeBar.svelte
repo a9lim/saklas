@@ -144,8 +144,7 @@
 </div>
 
 <style>
-  /* A quiet glass well with the faintest lens-blue drift at its right
-   * edge — material, not data (the chips carry the meaning). */
+  /* A quiet glass well; the chips carry the meaning. */
   .recipe {
     display: flex;
     align-items: flex-start;
@@ -154,12 +153,7 @@
     margin: var(--space-4) var(--space-4) 0;
     border-radius: var(--radius);
     border: 1px solid transparent;
-    background: linear-gradient(
-      100deg,
-      var(--glass),
-      var(--top-light-faint) 55%,
-      color-mix(in srgb, var(--pillar-lens) 5%, transparent)
-    );
+    background: var(--glass);
   }
   .lbl {
     font-family: var(--font-mono);

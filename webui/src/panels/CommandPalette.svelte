@@ -228,9 +228,7 @@
     backdrop-filter: blur(12px);
     border: 1px solid var(--glass-line);
     border-radius: var(--radius-lg);
-    box-shadow:
-      inset 0 1px 0 var(--top-light-strong),
-      var(--shadow-overlay);
+    box-shadow: var(--shadow-overlay);
     overflow: hidden;
     animation: palette-in var(--dur) var(--ease-out);
   }

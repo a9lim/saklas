@@ -96,12 +96,10 @@
     cursor: not-allowed;
   }
 
-  /* Active: lifted onto glass tinted toward the item hue, lit from above
-   * — borderless; the fill wash carries the selection, the dot the hue. */
+  /* Active: a quiet hue-tinted glass fill carries selection. */
   .tab.on {
     color: var(--fg);
     background: color-mix(in srgb, var(--tab-c) 9%, var(--glass));
-    box-shadow: inset 0 1px 0 var(--top-light-strong);
   }
 
   .dot {

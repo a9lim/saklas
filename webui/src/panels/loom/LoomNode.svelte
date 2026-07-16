@@ -162,11 +162,10 @@
   }
   .node.streaming {
     background: color-mix(in srgb, var(--live) 8%, transparent);
-    box-shadow: var(--glow-live);
   }
   /* No stripes at all (cast model: roles carry no hue — identity is the
      glyph letter alone; the active path reads from the glass fill +
-     weight, and the streaming node from its live glow). */
+     weight, and streaming state from its green fill). */
   .glyph {
     font-weight: var(--weight-bold);
     width: 14px;

@@ -109,7 +109,7 @@
       border-color var(--dur-fast) var(--ease-out);
   }
   .sk-radio:hover:not(.is-disabled) .sk-radio-box {
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
   }
   .sk-radio:focus-visible {
     outline: 2px solid var(--focus-ring);

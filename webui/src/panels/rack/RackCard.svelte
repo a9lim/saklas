@@ -22,9 +22,8 @@
     /** Dim + de-emphasise the card (a disabled steer term).  Probe cards
      *  pass ``false`` — a probe is always "on". */
     disabled?: boolean;
-    /** Alive right now — hue ring + faint glow (the highlight-selected
-     *  probe, a gate that just fired).  Glow marks what is alive; the
-     *  resting card stays calm. */
+    /** Active selection uses a hue ring (the highlight-selected probe or a
+     *  gate that just fired). */
     active?: boolean;
     /** Top identity line: marker glyph · name · status chips · actions.
      *  One row; the card owns its glyph + chips. */
@@ -56,8 +55,7 @@
 
 <style>
   /* The dense variant of the v2 glass material (lib/ui/GlassCard is the
-   * roomy one) — translucent fill lit from above. Borderless: the fill +
-   * top-light carry the card, the family accent lives in the glyph/text,
+   * roomy one). Borderless: the fill carries the card, the family accent lives in the glyph/text,
    * and the border slot exists only for the active ring (state, not
    * chrome). Hover lifts the fill instead of drawing a line. No backdrop
    * blur: rack cards sit on the opaque panel, so blur would cost

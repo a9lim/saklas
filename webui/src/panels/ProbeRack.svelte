@@ -186,7 +186,7 @@
     color: var(--accent);
   }
   .add-subspace:hover {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
   /* Manifold launcher — purple-tinted to echo the manifold card's accent
    * so the probe-family colour stays consistent across the surfaces. */

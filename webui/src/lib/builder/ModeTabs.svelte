@@ -74,7 +74,6 @@
   .sk-mode-tab.active {
     background: color-mix(in srgb, var(--accent) 9%, var(--glass-strong));
     color: var(--accent);
-    box-shadow: inset 0 1px 0 var(--top-light-strong);
   }
   .sk-mode-tab:focus-visible {
     outline: 2px solid var(--focus-ring);

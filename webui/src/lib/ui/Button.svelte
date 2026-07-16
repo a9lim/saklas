@@ -89,11 +89,9 @@
     border-radius: var(--radius-sm);
   }
 
-  /* solid — lit from above: a faint white top-light over the accent so
-   * the fill reads as material (gradient across, never along, a data
-   * axis — buttons carry no data axis, so this is pure material). */
+  /* Solid buttons use one quiet, legible accent fill. */
   .solid {
-    background: var(--material-glint), var(--btn-accent);
+    background: var(--btn-accent);
     color: var(--text-on-accent);
     border-color: transparent;
   }

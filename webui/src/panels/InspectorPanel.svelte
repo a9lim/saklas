@@ -158,7 +158,6 @@
     height: 5px;
     border-radius: 50%;
     background: var(--live);
-    box-shadow: 0 0 7px color-mix(in srgb, var(--live) 55%, transparent);
   }
   .readout-label {
     text-transform: uppercase;

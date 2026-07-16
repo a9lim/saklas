@@ -79,7 +79,7 @@
   .bubble.editing {
     background: var(--glass-strong);
     border-style: solid;
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
     color: var(--fg);
   }
   .edit-marker {

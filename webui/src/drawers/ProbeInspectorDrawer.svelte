@@ -301,7 +301,7 @@
   <footer class="drawer-footer">
     <span class="hint">
       Whitened-frame geometry — node centroids, neutral anchor, and the manifold
-      overlay in the same Mahalanobis metric the reads use.  The glowing dot is
+      overlay in the same Mahalanobis metric the reads use.  The live dot is
       the current hidden state; the fading trail is the last tokens.
     </span>
   </footer>
@@ -352,7 +352,6 @@
     height: 7px;
     border-radius: 50%;
     background: var(--family);
-    box-shadow: 0 0 6px color-mix(in srgb, var(--family) 45%, transparent);
     flex: none;
   }
   .name {
@@ -404,20 +403,13 @@
     color: var(--accent-red);
   }
 
-  /* The plot well — a deep glass window with a faint family-tinted
-   * ambient (material, not data) so the geometry reads as suspended. */
+  /* The plot well stays quiet so its geometry carries the information. */
   .plot-wrap {
     position: relative;
     flex: 1 1 auto;
     min-height: 0;
     border-radius: var(--radius-lg);
-    background:
-      radial-gradient(
-        90% 75% at 50% 42%,
-        color-mix(in srgb, var(--family) 8%, transparent),
-        transparent 72%
-      ),
-      var(--bg-deep);
+    background: var(--bg-deep);
     box-shadow: var(--shadow-rack);
     overflow: hidden;
     /* Palette hooks read by the canvas renderer (hue ontology). */

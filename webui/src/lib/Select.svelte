@@ -440,7 +440,7 @@
     color: var(--fg);
   }
   .sk-select-opt.is-active.is-highlight {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
   .sk-select-opt.is-disabled {
     color: var(--fg-muted);

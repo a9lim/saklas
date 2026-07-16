@@ -1227,7 +1227,7 @@
     transition: background var(--dur) var(--ease-out);
   }
   .mode-badge:hover {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
   .mode-badge.raw {
     background: color-mix(in srgb, var(--pillar-manifold) 12%, transparent);
@@ -1353,7 +1353,7 @@
   /* Every speaker wears ONE neutral glass card — role identity lives in
    * the chip, while optional analysis artifacts live beside it. Hue stays
    * reserved for spaces and states.  Borderless: the glass fill +
-   * top-light are the card; the border slot exists only so the A/B
+   * quiet fill defines the card; the border slot exists only so the A/B
    * shadow column can wear its violet-tinted hairline (a comparison
    * marker — state, not chrome). */
   .msg {
@@ -1579,7 +1579,7 @@
   }
   .thinking-input:focus-visible {
     outline: none;
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
     color: var(--fg);
   }
   .thinking-warn {

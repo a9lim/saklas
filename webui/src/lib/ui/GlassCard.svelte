@@ -4,8 +4,7 @@
   // soft drop. ``accent`` is the pillar hue; it feeds the children as
   // ``--card-accent`` (the same custom property the legacy RackCard
   // exposes, so card innards port without renames) and, when ``active``,
-  // tints the ring + casts a faint hue glow (the B layer — glow marks
-  // what is alive right now).
+  // tints a hue ring.
 
   import type { Snippet } from "svelte";
 
@@ -13,7 +12,7 @@
     children: Snippet;
     /** Pillar hue — any CSS color; chrome white when unset. */
     accent?: string;
-    /** Alive right now: hue ring + faint glow. */
+    /** Active selection: hue ring. */
     active?: boolean;
     /** Dimmed (disabled term, detached probe). */
     disabled?: boolean;
@@ -28,7 +27,7 @@
 </div>
 
 <style>
-  /* Borderless: fill + top-light + drop carry the card; the border slot
+  /* Borderless: fill and a neutral drop carry the card; the border slot
    * exists only so the active state ring can fade in without reflow. */
   .sk-card {
     --card-accent: var(--accent);

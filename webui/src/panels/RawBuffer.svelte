@@ -575,7 +575,7 @@
     caret-color: var(--accent);
   }
   .buffer-text.has-tint::selection {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
 
   .actions {

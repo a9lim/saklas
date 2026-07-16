@@ -177,10 +177,8 @@ function dot(
   ctx.globalAlpha = 1;
 }
 
-/** The live hidden-state point: white core inside a colored halo ring, so it
- *  reads clearly over both the node accent and the dark background.  Carries
- *  a soft green bloom — glow is reserved for what is alive right now, and
- *  the current hidden state is exactly that. */
+/** The live hidden-state point: white core inside a colored ring, so it reads
+ *  clearly over both the node accent and the dark background. */
 function liveDot(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -188,14 +186,11 @@ function liveDot(
   pal: Palette,
 ): void {
   ctx.globalAlpha = 0.95;
-  ctx.shadowColor = pal.live;
-  ctx.shadowBlur = 10;
   ctx.beginPath();
   ctx.arc(x, y, 6.5, 0, Math.PI * 2);
   ctx.strokeStyle = pal.live;
   ctx.lineWidth = 2;
   ctx.stroke();
-  ctx.shadowBlur = 0;
   ctx.beginPath();
   ctx.arc(x, y, 3.2, 0, Math.PI * 2);
   ctx.fillStyle = pal.light;

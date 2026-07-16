@@ -1688,7 +1688,7 @@
     align-self: flex-start;
   }
   .add-node:hover {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
 
   /* Templated-tab (user, assistant) template editor rows. */
@@ -1733,7 +1733,7 @@
     align-self: flex-start;
   }
   .add-pair-btn:hover {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
 
   .save-btn {

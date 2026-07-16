@@ -188,6 +188,6 @@
     text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
   li.highlight { background: var(--bg-hover); color: var(--fg); }
   li.active { background: var(--accent-subtle); }
-  li.active.highlight { background: var(--accent-glow); }
+  li.active.highlight { background: var(--accent-strong); }
   li.empty { color: var(--fg-muted); cursor: default; }
 </style>

@@ -8,15 +8,13 @@
  *       subspace = white · manifold = violet · sae = gold · lens/surprise =
  *       blue (logit-space family) · live/probe+ = green · error/probe− = red.
  *     Warm hue belongs to SAE alone. Roles carry no hue (the cast model).
- *   - Gradients are MATERIAL, not data: surfaces/washes/rings may glow;
- *     data marks gradient across the encoding axis, never along it
+ *   - Gradients belong to data marks only, and run across the encoding axis
  *     (along-axis only where the gradient IS the data: depth, time).
- *   - Glow is reserved for what is alive right now (streaming, moving
- *     probes, firing gates) — the room stays calm.
-   *   - Elevation = translucency + light (inset top-light, shadow), no longer
-   *     shade steps alone.
+ *   - Live state is communicated by hue and motion, never a halo.
+ *   - Elevation comes from spacing, fill contrast, and only where needed a
+ *     neutral shadow — not a decorative edge highlight.
  *   - BORDERLESS BY DEFAULT (Phase 6): separation comes from space, then
- *     fill contrast (the surface ladder), then light (top-light, shadow,
+ *     fill contrast (the surface ladder), then a shadow where elevation
  *     scroll-shadow) — a hairline is the LAST resort, reserved for
  *     meaning: focus rings, active/selected state rings, the outer edge
  *     of a floating surface (sheet / palette / popover / toast), and
@@ -43,7 +41,7 @@
 
   /* ---- Surfaces -----------------------------------------------------
    * Ground carries a faint blue-violet ambient (set in global.css).
-   * Glass tier = the card material (translucent + blur + top-light). */
+   * Glass tier = the card material (translucent fill + blur). */
   /* Borderless leans on this ladder — the steps are a touch wider than
    * v2.0 so fill contrast alone separates tiers on mediocre panels. */
   --bg-deep: #04050a;       /* rail — the floor; also the well tone */
@@ -101,11 +99,10 @@
   --accent-amber: #b08b52;   /* demoted: pending/edit chrome, anchor rings */
   --accent-yellow: #c2a44f;  /* demoted: warn chips */
   --accent-subtle: rgba(237, 239, 247, 0.08);  /* accent fill wash */
-  --accent-glow: rgba(237, 239, 247, 0.18);    /* focus ring + accent hover */
+  --accent-strong: rgba(237, 239, 247, 0.18);  /* accent hover */
   --focus-ring: #a3a8bd;                       /* visible keyboard focus */
 
   --live: var(--accent-green);
-  --glow-live: 0 0 12px rgba(52, 211, 153, 0.4);
 
   /* ---- Highlight ramps ----------------------------------------------
    * Runtime mapping lives in tokens.ts. Constant-hue alpha ramps:
@@ -128,35 +125,17 @@
   --layer-cell-lens: #aed3ff;
 
   /* ---- Elevation ----------------------------------------------------
-   * Cards are lit from above (inset top-light) and cast down. Overlay
-   * shadow is for sheets/modals/popovers/toasts. --shadow-sticky is the
-   * borderless replacement for a sticky table header's bottom rule —
-   * elevation that only reads once content scrolls underneath. */
-  --top-light-faint: rgba(255, 255, 255, 0.02);
-  --top-light-subtle: rgba(255, 255, 255, 0.03);
-  --top-light: rgba(255, 255, 255, 0.04);
-  --top-light-card: rgba(255, 255, 255, 0.05);
-  --top-light-strong: rgba(255, 255, 255, 0.06);
-  --material-glint: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.18),
-    transparent 55%
-  );
-  --shadow-well: inset 0 1px 0 var(--top-light-subtle);
-  --shadow-rack: inset 0 1px 0 var(--top-light);
-  --shadow-card: inset 0 1px 0 var(--top-light-card),
-    0 8px 24px rgba(0, 0, 0, 0.35);
-  --shadow-rack-active:
-    inset 0 1px 0 var(--top-light),
-    0 0 0 1px color-mix(in srgb, var(--card-accent) 18%, transparent),
-    0 0 18px color-mix(in srgb, var(--card-accent) 7%, transparent);
+   * Cards and wells stay flat. Overlay shadows establish modality; sticky
+   * headers use a neutral depth cue only once content scrolls beneath them. */
+  --shadow-well: none;
+  --shadow-rack: none;
+  --shadow-card: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-rack-active: 0 0 0 1px color-mix(in srgb, var(--card-accent) 18%, transparent);
   --shadow-card-active:
-    inset 0 1px 0 var(--top-light-card),
     0 0 0 1px color-mix(in srgb, var(--card-accent) 20%, transparent),
-    0 0 24px color-mix(in srgb, var(--card-accent) 7%, transparent),
     0 8px 28px rgba(0, 0, 0, 0.4);
   --shadow-overlay: 0 12px 40px rgba(0, 0, 0, 0.5);
-  --shadow-sheet: inset 0 1px 0 var(--top-light), var(--shadow-overlay);
+  --shadow-sheet: var(--shadow-overlay);
   --shadow-sticky: 0 2px 8px rgba(0, 0, 0, 0.45);
   --shadow-sticky-inline: 2px 0 8px rgba(0, 0, 0, 0.45);
   --shadow-data-label: 0 0 2px rgba(0, 0, 0, 0.6);
@@ -215,18 +194,7 @@
   --warn-bg: rgba(194, 164, 79, 0.06);
 
   /* Page-wide material effects live here so components never invent
-   * almost-matching scrims, selection fills, or ambient fields. */
+   * almost-matching scrims or selection fills. */
   --selection-bg: rgba(237, 239, 247, 0.22);
-  --ambient-canvas:
-    radial-gradient(
-      1200px 560px at 72% -12%,
-      rgba(103, 116, 190, 0.09),
-      transparent 60%
-    ),
-    radial-gradient(
-      900px 480px at 6% 108%,
-      rgba(167, 139, 250, 0.05),
-      transparent 65%
-    ),
-    var(--bg);
+  --ambient-canvas: var(--bg);
 }

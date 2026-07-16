@@ -188,7 +188,7 @@
     color: var(--accent);
   }
   .add-subspace:hover {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
   /* Manifold launcher — purple-tinted to echo the manifold card's accent
    * so the two surfaces read as one feature. */
