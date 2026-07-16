@@ -6248,13 +6248,21 @@ class SaklasSession:
         return name
 
     def remove_probe(self, name: str) -> None:
-        """Detach a previously-attached probe (any shape)."""
+        """Detach a previously-attached probe (any shape).
+
+        Lens/SAE detaches are safe mid-generation — a bound run's frozen
+        binding keeps measuring the bind-time roster, so the removal
+        applies at the next generation boundary.  A geometry detach
+        mutates the live Monitor roster in-flight scoring walks, so it
+        routes through the instrument's exclusive section and rejects
+        while a generation is running (retry when idle).
+        """
         if name in self._lens_probes:
             del self._lens_probes[name]
         elif name in self._sae_probes:
             del self._sae_probes[name]
         else:
-            self._monitor.remove_probe(name)
+            self._geometry_instrument.detach(name)
         self._invalidate_prefix_cache()
         self._probe_hash_cache.pop(name, None)
         self._invalidate_analytics_cache()
@@ -9251,41 +9259,52 @@ class SaklasSession:
                 self._exit_internal_steering(steering_cm, swallow=True)
             raise
         finally:
-            # Defense-in-depth: even if the inner finally never ran (e.g. a
-            # BaseException between the outer try entry and ``begin_capture``),
-            # any hooks that did get attached must come off.  Idempotent.
-            self._end_capture()
-            # Probe-inspector subspace-coords post-pass is per-generation; clear
-            # it so it never leaks into a later gen that didn't opt in.
-            self._monitor.set_subspace_coords(False)
-            # Release the loom-tree reservation in the same scope as the
-            # gen-lock release.  Even if finalize raised, mutators (edit /
-            # delete on this subtree) need to be free again now that the
-            # streaming target is no longer live.
-            self._active_gen_reservation = None
-            self._last_token_probe_payload = None
-            self._last_token_probe_readings = None
-            # Close each family's per-generation run (releases stashes, step
-            # memos, and the lens pin; restores the idle passthrough run with
-            # default-active flags — finalize consumed the aggregates above).
-            self._close_instrument_runs()
-            # Reset capture state to the default (FULL, non-persistent) so the
-            # next gen starts clean (finalize has already consumed the rows by
-            # now). Belt-and-suspenders: ``_begin_capture`` resets it at gen start
-            # too.
-            self._capture_state = CaptureState()
-            self._compiled_clean_eligible = False
-            self._incremental_readings = []
-            self._incremental_gate_scores = []
-            # Zero the persistent compile-clean steering offsets so a static-
-            # affine push can't leak into a later generation that takes the
-            # eager / unsteered path without re-running ``_install_composed_
-            # steering`` (unsteered gens have no steering scope to reset them).
-            self._steering_uses_compiled_offsets = False
-            if self._steering.has_compiled_offsets():
-                self._steering.zero_compiled_offsets()
-            self._gen_phase = GenState.IDLE
-            self._gen_lock.release()
+            try:
+                try:
+                    # Defense-in-depth: even if the inner finally never ran
+                    # (e.g. a BaseException between the outer try entry and
+                    # ``begin_capture``), any hooks that did get attached
+                    # must come off.  Idempotent.
+                    self._end_capture()
+                    # Probe-inspector subspace-coords post-pass is
+                    # per-generation; clear it so it never leaks into a
+                    # later gen that didn't opt in.
+                    self._monitor.set_subspace_coords(False)
+                    # Release the loom-tree reservation in the same scope as
+                    # the gen-lock release.  Even if finalize raised,
+                    # mutators (edit / delete on this subtree) need to be
+                    # free again now that the streaming target is no longer
+                    # live.
+                    self._active_gen_reservation = None
+                    self._last_token_probe_payload = None
+                    self._last_token_probe_readings = None
+                finally:
+                    # Run closure and capture-state resets must survive a
+                    # teardown failure above (a raising hook detach must not
+                    # leave a bound run pinning a stale lens).
+                    self._close_instrument_runs()
+                    # Reset capture state to the default (FULL,
+                    # non-persistent) so the next gen starts clean (finalize
+                    # has already consumed the rows by now).
+                    # Belt-and-suspenders: ``_begin_capture`` resets it at
+                    # gen start too.
+                    self._capture_state = CaptureState()
+                    self._compiled_clean_eligible = False
+                    self._incremental_readings = []
+                    self._incremental_gate_scores = []
+                    # Zero the persistent compile-clean steering offsets so a
+                    # static-affine push can't leak into a later generation
+                    # that takes the eager / unsteered path without
+                    # re-running ``_install_composed_steering`` (unsteered
+                    # gens have no steering scope to reset them).
+                    self._steering_uses_compiled_offsets = False
+                    if self._steering.has_compiled_offsets():
+                        self._steering.zero_compiled_offsets()
+            finally:
+                # Unconditional: an earlier teardown exception must not
+                # leave the session phase-wedged or the gen lock held.
+                self._gen_phase = GenState.IDLE
+                self._gen_lock.release()
 
     def _generate_runset(
         self,
@@ -10146,21 +10165,30 @@ class SaklasSession:
             raise
         finally:
             try:
-                if steering_cm is not None:
-                    self._exit_internal_steering(steering_cm, swallow=failed)
+                try:
+                    if steering_cm is not None:
+                        self._exit_internal_steering(steering_cm, swallow=failed)
+                finally:
+                    try:
+                        self._end_capture()
+                        self._active_gen_reservation = None
+                        self._last_token_probe_payload = None
+                        self._last_token_probe_readings = None
+                    finally:
+                        # Run closure and state resets must survive a
+                        # teardown failure above (a raising hook detach must
+                        # not leave a bound run pinning a stale lens).
+                        self._close_instrument_runs()
+                        self._capture_state = CaptureState()
+                        self._compiled_clean_eligible = False
+                        self._incremental_readings = []
+                        self._incremental_gate_scores = []
+                        self._steering_uses_compiled_offsets = False
+                        if self._steering.has_compiled_offsets():
+                            self._steering.zero_compiled_offsets()
             finally:
-                self._end_capture()
-                self._active_gen_reservation = None
-                self._last_token_probe_payload = None
-                self._last_token_probe_readings = None
-                self._close_instrument_runs()
-                self._capture_state = CaptureState()
-                self._compiled_clean_eligible = False
-                self._incremental_readings = []
-                self._incremental_gate_scores = []
-                self._steering_uses_compiled_offsets = False
-                if self._steering.has_compiled_offsets():
-                    self._steering.zero_compiled_offsets()
+                # Unconditional: an earlier teardown exception must not
+                # leave the session phase-wedged or the gen lock held.
                 self._gen_phase = GenState.IDLE
                 self._gen_lock.release()
 

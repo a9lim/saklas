@@ -236,6 +236,10 @@ class LensInstrument:
             self,
             InstrumentBinding(
                 family=self.family,
+                # ``source`` stays None: the public source label lives in
+                # ``active.json`` and reading it here would put a disk hit
+                # on every generation; the in-memory sidecar identity below
+                # is the binding's cheap fingerprint.
                 fingerprint=(
                     str(identity)
                     if (identity := getattr(session, "_jlens_identity", None))

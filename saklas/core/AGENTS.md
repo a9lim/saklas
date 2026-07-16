@@ -1044,18 +1044,25 @@ Post-review hardening (sol, gaslamp thread `instrument-protocol`):
   in the transport stack. Pin demand is the registry boolean, not plan
   emptiness (probes whose lens vanished still pin the validated-missing
   state).
-- **Every capture transaction closes its runs** — the generation finallys,
-  the batch finally, and the joint-logprob replay all reach
-  `_close_instrument_runs()`; `close_run` is protocol surface (the
+- **Every capture transaction closes its runs, exception-hard** — the
+  generation finallys, the batch finally, and the joint-logprob replay
+  all reach `_close_instrument_runs()` through nested finallys, so a
+  raising hook detach cannot skip run closure, and the gen-lock release
+  sits behind the outermost finally (an earlier teardown exception must
+  not wedge the session).  `close_run` is protocol surface (the
   bind/close asymmetry is what let the replay leak bound runs, pinning a
   stale lens between generations).
-- **Mutations apply next generation** — lens/SAE measurement guards
-  (score/aggregate/live/authored/batch-row) consult
+- **Mutations apply next generation — lens/SAE only.** Their measurement
+  guards (score/aggregate/live/authored/batch-row) consult
   `_measurement_specs()`, so an un-locked mid-generation detach (the
   synchronous DELETE route) cannot change a bound generation's roster.
-  Geometry's roster remains live-Monitor-backed (attach/detach are
-  `_model_exclusive`-guarded; a served detach mid-generation is a known,
-  pre-existing narrower exposure).
+  Geometry has **no roster snapshot yet** (Monitor scoring walks the live
+  `_probes` dict), so `GeometryInstrument.detach` takes
+  `_model_exclusive` like `attach` and a served detach during a running
+  generation **rejects with retry-shortly semantics** instead of racing;
+  `session.remove_probe` routes geometry removals through the instrument.
+  A true Monitor roster snapshot (extending the next-generation contract
+  to geometry) is deferred — it is engine surgery, not guard cleanup.
 
 Per-step gate→display matrix reuse remains the stash mechanism inside
 the workers, run-scoped by construction; `observe(step_id)` is

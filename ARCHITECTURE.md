@@ -1148,10 +1148,12 @@ metadata backfill) plus the generation-scoped stashes, flags, and the lens
 disk-identity pin. Ordering contract: the lens disk refresh + pin happens
 BEFORE planning/freezing (the adoption path rewrites live probe layer lists),
 and every capture transaction — generation, batch, joint-logprob replay —
-closes its runs in its finally (`close_run` is protocol surface). Lens/SAE
-measurement guards consult the frozen binding, so mid-generation roster
-mutations apply at the next generation boundary; an idle passthrough run backs
-out-of-generation reads against the live registry.
+closes its runs exception-hard in its finally (`close_run` is protocol
+surface; the gen-lock release is outermost). Lens/SAE measurement guards
+consult the frozen binding, so mid-generation roster mutations apply at the
+next generation boundary; geometry has no roster snapshot yet, so its detach
+takes the exclusive section and rejects during a running generation. An idle
+passthrough run backs out-of-generation reads against the live registry.
 
 ---
 

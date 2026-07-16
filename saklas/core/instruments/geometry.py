@@ -197,7 +197,21 @@ class GeometryInstrument:
         return name
 
     def detach(self, name: str) -> None:
-        self._session._monitor.remove_probe(name)
+        """Detach under the exclusive section, like ``attach``.
+
+        Monitor scoring walks the live roster (the geometry family has no
+        per-generation roster snapshot yet — unlike lens/SAE, whose frozen
+        bindings make mid-generation detach harmless), so a removal racing
+        an in-flight generation would change what that generation measures
+        and can race the Monitor's cache rebuilds.  A detach during a
+        generation therefore rejects with retry-shortly semantics instead
+        of racing.
+        """
+        with self._session._model_exclusive(
+            "remove_probe called while another model operation is in "
+            "flight; retry shortly"
+        ):
+            self._session._monitor.remove_probe(name)
 
     @property
     def names(self) -> list[str]:

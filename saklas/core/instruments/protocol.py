@@ -6,14 +6,17 @@ against the channels the family can actually produce, declares capture
 demand for a generation (``plan``), and binds an immutable per-generation
 **InstrumentRun**.
 
-An **InstrumentRun** owns everything generation-scoped: the immutable
-source/spec binding, step stashes, warm state (curved feet live in the
-geometry family), and per-generation active flags.  ``observe`` may be
-called more than once for the same step — first by the gating score
-callback (before the token tap), later by the display step — and MUST
-memoize by ``step_id`` so the second caller reuses the first result's
-computation (the one-forward-one-computation contract the per-family
-stashes implemented implicitly).
+An **InstrumentRun** owns the instrument-side generation-scoped state:
+the immutable source/spec binding, step stashes, and per-generation
+active flags (geometry's curved warm feet stay in the Monitor engine).
+Repeated ``observe`` calls for the same ``step_id`` are memoized while
+the run is bound — an idle run never memoizes, since it persists
+indefinitely and a repeated step id with different hidden states must
+not read stale.  Note the production per-step gate→display reuse is
+NOT routed through ``observe`` today: the workers' stash mechanism (run-
+scoped by construction) carries that one-forward-one-computation
+contract; ``observe`` is the protocol face for external/aggregate
+callers until the hot paths converge on it.
 
 Division of labor the protocol deliberately does NOT own:
 

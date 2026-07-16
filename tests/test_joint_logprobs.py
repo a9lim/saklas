@@ -464,6 +464,22 @@ def test_joint_logprobs_closes_runs_on_replay_failure():
     session.assert_runs_closed()
 
 
+def test_joint_logprobs_closes_runs_when_detach_raises():
+    """Teardown is exception-hard: a raising hook detach must not skip run
+    closure (a leaked bound run pins a stale lens between generations)."""
+    from saklas.core.joint_logprobs import compute_joint_logprobs
+
+    session: Any = _MockSession()
+
+    def _detach_boom() -> None:
+        raise RuntimeError("detach failed")
+
+    session._end_capture = _detach_boom
+    with pytest.raises(RuntimeError, match="detach failed"):
+        compute_joint_logprobs(session, "a1", "a2")
+    session.assert_runs_closed()
+
+
 def test_compute_joint_logprobs_to_dict_round_trip():
     from saklas.core.joint_logprobs import compute_joint_logprobs
 

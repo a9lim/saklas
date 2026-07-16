@@ -616,12 +616,15 @@ def _replay_branch_logprobs(
                     next_token = forced_tensor[:, forced_idx:forced_idx + 1]
                     _advance_current_input(next_token)
         finally:
-            session._end_capture()
-            # The replay is a full capture transaction: without this, the
-            # bound runs leak past the request — the stale lens pin
-            # suppresses disk refresh between generations and the SAE
-            # binding keeps serving frozen units to idle reads.
-            session._close_instrument_runs()
+            # The replay is a full capture transaction: bound runs must not
+            # leak past the request (a stale lens pin suppresses disk
+            # refresh between generations; a stale SAE binding keeps
+            # serving frozen units to idle reads) — even when the hook
+            # detach itself raises, hence the nested finally.
+            try:
+                session._end_capture()
+            finally:
+                session._close_instrument_runs()
 
     return row_logps if vocab_size is not None else {}
 

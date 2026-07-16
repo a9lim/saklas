@@ -327,6 +327,55 @@ def test_begin_capture_live_lens_ignored_without_consumer():
     assert ok is False
 
 
+def test_geometry_detach_rejects_while_generation_holds_the_lock():
+    """Geometry has no per-generation roster snapshot (Monitor scoring
+    walks the live dict), so a detach racing a generation must reject with
+    retry-shortly semantics instead of mutating the roster mid-flight —
+    the same exclusive section ``attach`` takes."""
+    import threading as _threading
+
+    from saklas.core.session import ConcurrentExtractionError
+
+    session = _stub_session()
+    # The MagicMock default no-ops the exclusive section; this test is
+    # about exactly that guard, so bind the real one (it needs only
+    # ``_gen_lock``, which the fixture provides).
+    session._model_exclusive = types.MethodType(
+        SaklasSession._model_exclusive, session,
+    )
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m}
+    )
+    session.add_probe("toy")
+    assert "toy" in session._monitor.probe_names
+
+    # Simulate an in-flight generation: another thread holds the gen lock.
+    held = _threading.Event()
+    release = _threading.Event()
+
+    def _hold() -> None:
+        with session._gen_lock:
+            held.set()
+            release.wait(timeout=5)
+
+    holder = _threading.Thread(target=_hold)
+    holder.start()
+    try:
+        assert held.wait(timeout=5)
+        with pytest.raises(ConcurrentExtractionError, match="retry shortly"):
+            session.remove_probe("toy")
+        # The roster is untouched — the reject protected the in-flight read.
+        assert "toy" in session._monitor.probe_names
+    finally:
+        release.set()
+        holder.join(timeout=5)
+
+    # Idle again: the detach applies normally.
+    session.remove_probe("toy")
+    assert "toy" not in session._monitor.probe_names
+
+
 # ===================================================== gating callback ===
 
 def test_gating_callback_emits_probe_scalars():
