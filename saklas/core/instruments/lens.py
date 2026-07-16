@@ -34,6 +34,8 @@ from saklas.core.instruments.types import (
     GateRef,
     InstrumentBinding,
     InstrumentPlan,
+    InstrumentPrep,
+    LensPrep,
     ReadRequest,
     parse_gate_ref,
     validate_gate_channels,
@@ -210,27 +212,67 @@ class LensInstrument:
 
     # ------------------------------------------------------------ run lifecycle
 
+    def prepare(self, request: ReadRequest) -> LensPrep:
+        """The refresh/pin protocol step (sol's slice-B finding 2).
+
+        Reads the disk-refreshing ``session.jlens`` getter under pin
+        demand BEFORE any plan is taken: the adoption path rewrites the
+        live probe layer lists when an external replacement lens landed,
+        so the capture plan AND the bind-time spec freeze must both see
+        the refreshed registry (a plan taken earlier pairs the new lens
+        with stale layers and KeyErrors in the transport stack).
+
+        Pin demand is the registry boolean, not plan emptiness — probes
+        whose lens vanished still pin the validated-missing state so
+        per-token paths never reopen the sidecar.  The getter
+        short-circuits on a bound run's pin flag, which is why prepare
+        requires the prior run closed (a stale pin would suppress the
+        very refresh this step exists for).
+        """
+        if self.current_run.bound:
+            raise RuntimeError(
+                "LensInstrument.prepare() on a bound run: close the prior "
+                "generation's run (_close_instrument_runs) before preparing "
+                "the next — a stale pin suppresses the lens disk refresh"
+            )
+        probes = self.probes
+        gate_hit = any(
+            parse_gate_ref(key).probe in probes for key in request.gate_keys
+        )
+        pin_demand = bool(
+            (request.live and self.live is not None)
+            or (probes and (request.final_aggregate or gate_hit))
+        )
+        return LensPrep(
+            family=self.family,
+            live_active=request.live,
+            lens=self._session.jlens if pin_demand else None,
+            pinned=pin_demand,
+        )
+
     def bind(
-        self,
-        plan: InstrumentPlan,
-        *,
-        live_active: bool = True,
-        lens: Any = None,
-        pinned: bool = False,
+        self, plan: InstrumentPlan, prep: InstrumentPrep | None = None,
     ) -> LensRun:
         """Bind an immutable per-generation run from a declared plan.
 
-        The **session planner supplies the pin**: the disk-refreshing
-        ``session.jlens`` read must happen BEFORE ``plan()`` — its adoption
-        path rewrites the live probe layer lists when an external
-        replacement lens is adopted, so a plan (and a spec freeze) taken
-        earlier would pair the new lens with stale layers (sol's slice-B
-        review, finding 2).  ``bind`` therefore only freezes the (already
-        refreshed) registry and installs the pin it is handed.  The frozen
+        The **prep supplies the pin** (``prepare``, the protocol step
+        that runs before ``plan()`` — see its docstring for the ordering
+        rationale).  ``bind`` therefore only freezes the (already
+        refreshed) registry and installs the pin it is handed; a bare
+        ``bind(plan)`` binds unpinned with live defaults.  The frozen
         spec copies own their ``layers`` list — the live registry's lists
         are replaced in place by the adoption/eviction paths.
         """
-        del plan  # demand consumed by the planner; the pin decision is its
+        del plan  # demand consumed by the planner; the pin decision is prep's
+        if prep is None:
+            lens_prep = LensPrep(family=self.family, live_active=True)
+        elif isinstance(prep, LensPrep):
+            lens_prep = prep
+        else:
+            raise TypeError(
+                "LensInstrument.bind takes the LensPrep its own prepare() "
+                f"returned, got {type(prep).__name__}"
+            )
         session = self._session
         run = LensRun(
             self,
@@ -250,9 +292,9 @@ class LensInstrument:
                     for name, spec in self.probes.items()
                 },
             ),
-            lens=lens,
-            pinned=pinned,
-            active=live_active,
+            lens=lens_prep.lens,
+            pinned=lens_prep.pinned,
+            active=lens_prep.live_active,
             bound=True,
         )
         self.current_run = run

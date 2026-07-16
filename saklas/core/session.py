@@ -73,7 +73,6 @@ from saklas.core.model import (
 from saklas.core.instruments.types import (
     AGG_TAIL_DEPTH,
     ReadRequest,
-    parse_gate_ref,
 )
 from saklas.core.monitor import Monitor
 from saklas.io.probes_bootstrap import bootstrap_layer_means
@@ -5596,53 +5595,42 @@ class SaklasSession:
         per_token_full_consumer = bool(
             need_per_token and gating_only_probes is None
         )
-        # Close any run a standalone capture path may have left bound
-        # (defensive — the generation finallys are the ordinary teardown):
-        # a stale pin would short-circuit the lens disk refresh below, and
-        # a stale binding would keep serving frozen specs to idle reads.
+        # The uniform capture transaction (``protocol.py``): close →
+        # prepare → plan → bind.  The defensive close first (the
+        # generation finallys are the ordinary teardown) — a stale pin
+        # would short-circuit the lens disk refresh inside ``prepare``,
+        # and a stale binding would keep serving frozen specs to idle
+        # reads.  ``prepare`` is the source-boundary step: the lens
+        # family reads the disk-refreshing ``jlens`` getter under pin
+        # demand there, BEFORE the plans and spec freezes are taken
+        # (``LensInstrument.prepare`` carries the ordering rationale).
         self._close_instrument_runs()
-        # Lens disk refresh + pin BEFORE planning: the ``jlens`` getter's
-        # adoption path rewrites the live probe layer lists when an
-        # external replacement lens landed, so the capture plan AND the
-        # frozen binding must both see the refreshed registry (a plan taken
-        # earlier pairs the new lens with stale layers and KeyErrors in the
-        # transport stack).  Pin demand is the registry boolean, not plan
-        # emptiness — probes whose lens vanished still pin the validated-
-        # missing state so per-token paths never reopen the sidecar.
-        lens_probes_live = self._lens_probes
-        lens_gate_hit = any(
-            parse_gate_ref(key).probe in lens_probes_live
-            for key in (lens_gating_probe_keys or ())
-        )
-        lens_pin_demand = bool(
-            (live_lens_active and self._live_lens is not None)
-            or (
-                lens_probes_live
-                and (final_probe_aggregate or lens_gate_hit)
-            )
-        )
-        pinned_lens = self.jlens if lens_pin_demand else None
-
-        geometry_plan = self._geometry_instrument.plan(ReadRequest(
+        geometry_request = ReadRequest(
             gate_keys=frozenset(gating_probe_keys or ()),
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
             return_hidden=widen,
-        ))
-        lens_plan = self._lens_instrument.plan(ReadRequest(
+        )
+        lens_request = ReadRequest(
             gate_keys=frozenset(lens_gating_probe_keys or ()),
             live=live_lens_active,
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
             return_hidden=widen,
-        ))
-        sae_plan = self._sae_instrument.plan(ReadRequest(
+        )
+        sae_request = ReadRequest(
             gate_keys=frozenset(sae_gating_probe_keys or ()),
             live=live_sae_active,
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
             return_hidden=widen,
-        ))
+        )
+        geometry_prep = self._geometry_instrument.prepare(geometry_request)
+        lens_prep = self._lens_instrument.prepare(lens_request)
+        sae_prep = self._sae_instrument.prepare(sae_request)
+        geometry_plan = self._geometry_instrument.plan(geometry_request)
+        lens_plan = self._lens_instrument.plan(lens_request)
+        sae_plan = self._sae_instrument.plan(sae_request)
         has_lens_gate = bool(lens_plan.gate_keys)
         has_sae_gate = bool(sae_plan.gate_keys)
 
@@ -5650,17 +5638,12 @@ class SaklasSession:
         # specs freeze into the immutable ``InstrumentBinding`` (a concurrent
         # SAE metadata backfill can no longer change what this generation
         # measures), stashes and step memos start fresh, and the lens run
-        # carries the pin taken above — every token, gate, and final
+        # carries the pin its prep took — every token, gate, and final
         # aggregate below consumes the same resident lens even if another
         # process switches ``jlens.json`` mid-decode.
-        self._geometry_instrument.bind(geometry_plan)
-        self._lens_instrument.bind(
-            lens_plan,
-            live_active=live_lens_active,
-            lens=pinned_lens,
-            pinned=lens_pin_demand,
-        )
-        self._sae_instrument.bind(sae_plan, live_active=live_sae_active)
+        self._geometry_instrument.bind(geometry_plan, geometry_prep)
+        self._lens_instrument.bind(lens_plan, lens_prep)
+        self._sae_instrument.bind(sae_plan, sae_prep)
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
@@ -9999,27 +9982,28 @@ class SaklasSession:
             has_lens_probes = bool(return_probe_readings and self._lens_probes)
             has_sae_probes = bool(return_probe_readings and self._sae_probes)
             # Batched generation bypasses ``_begin_capture`` but still owns
-            # one generation transaction: defensive close, then the lens
-            # disk refresh + pin BEFORE the plans freeze specs (the same
-            # refresh-then-plan ordering ``_begin_capture`` uses), then
-            # plan + bind each family's run.  One pinned lens serves every
-            # row aggregate rather than reopening all shards per batch
-            # item, and the bindings freeze probe specs against concurrent
-            # metadata backfills for the whole batch.
+            # one generation transaction, and runs the same uniform
+            # sequence: close → prepare → plan → bind.  The lens prepare
+            # takes the disk refresh + pin BEFORE the plans freeze specs
+            # (its pin-demand formula reduces to "probes attached and a
+            # final aggregate wanted" on a batch request); one pinned lens
+            # then serves every row aggregate rather than reopening all
+            # shards per batch item, and the bindings freeze probe specs
+            # against concurrent metadata backfills for the whole batch.
             self._close_instrument_runs()
-            pinned_lens = self.jlens if has_lens_probes else None
             batch_request = ReadRequest(
                 final_aggregate=return_probe_readings,
                 batch=True,
             )
+            geometry_prep = self._geometry_instrument.prepare(batch_request)
+            lens_prep = self._lens_instrument.prepare(batch_request)
+            sae_prep = self._sae_instrument.prepare(batch_request)
             geometry_plan = self._geometry_instrument.plan(batch_request)
             lens_plan = self._lens_instrument.plan(batch_request)
             sae_plan = self._sae_instrument.plan(batch_request)
-            self._geometry_instrument.bind(geometry_plan)
-            self._lens_instrument.bind(
-                lens_plan, lens=pinned_lens, pinned=has_lens_probes,
-            )
-            self._sae_instrument.bind(sae_plan)
+            self._geometry_instrument.bind(geometry_plan, geometry_prep)
+            self._lens_instrument.bind(lens_plan, lens_prep)
+            self._sae_instrument.bind(sae_plan, sae_prep)
             capture_probe_aggregates = bool(
                 probe_names or has_lens_probes or has_sae_probes
             )

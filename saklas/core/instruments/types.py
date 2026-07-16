@@ -256,13 +256,14 @@ class ScalarReading:
 
 
 # --------------------------------------------------------------------------
-# Plans, bindings, live configs
+# Plans, preps, bindings, live configs
 # --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ReadRequest:
     """What the session knows about a generation's read demand when it
-    plans capture — the input to ``Instrument.plan``."""
+    plans capture — the input to ``Instrument.prepare`` and
+    ``Instrument.plan``."""
 
     gate_keys: frozenset[str] = frozenset()
     live: bool = False
@@ -270,6 +271,43 @@ class ReadRequest:
     final_aggregate: bool = True
     batch: bool = False
     return_hidden: bool = False
+
+
+@dataclass(frozen=True)
+class InstrumentPrep:
+    """A family's generation-boundary source decisions — produced by
+    ``Instrument.prepare`` (after the prior run is closed, BEFORE
+    ``plan``) and consumed by the same family's ``bind``.
+
+    Family-opaque to the session planner: it threads the prep from
+    prepare to bind without reading it, so source-boundary work (a disk
+    refresh, a pin decision) is protocol shape rather than session
+    special-casing.
+
+    ``live_active`` is the request's ``live`` flag echoed back — whether
+    a live-readout consumer exists this generation (the run's ``active``
+    flag; families without a live channel ignore it).
+    """
+
+    family: str
+    live_active: bool = False
+
+
+@dataclass(frozen=True)
+class LensPrep(InstrumentPrep):
+    """The lens family's prep: the refresh/pin decision.
+
+    ``prepare`` reads the disk-refreshing ``session.jlens`` getter under
+    pin demand — the adoption path rewrites live probe layer lists when
+    an external replacement lens landed, which is exactly why the read
+    must precede ``plan()`` and the bind-time spec freeze.  ``lens`` is
+    the refreshed resident lens (``None`` when demand was absent or the
+    artifact is validated-missing); ``pinned`` records the demand itself,
+    so per-token paths never reopen the sidecar even for a vanished lens.
+    """
+
+    lens: Any = None
+    pinned: bool = False
 
 
 @dataclass(frozen=True)

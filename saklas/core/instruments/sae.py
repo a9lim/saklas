@@ -38,6 +38,7 @@ from saklas.core.instruments.types import (
     GateRef,
     InstrumentBinding,
     InstrumentPlan,
+    InstrumentPrep,
     ReadRequest,
     parse_gate_ref,
     validate_gate_channels,
@@ -181,7 +182,22 @@ class SaeInstrument:
 
     # ------------------------------------------------------------ run lifecycle
 
-    def bind(self, plan: InstrumentPlan, *, live_active: bool = True) -> SaeRun:
+    def prepare(self, request: ReadRequest) -> InstrumentPrep:
+        """Generation-boundary prep — no disk-backed source to refresh
+        (backend residency is explicit lifecycle, ``load_sae``/
+        ``train_sae``), so the prep only echoes the live flag back for
+        ``bind``.  The bound-run guard keeps the transaction contract
+        uniform across families."""
+        if self.current_run.bound:
+            raise RuntimeError(
+                "SaeInstrument.prepare() on a bound run: close the prior "
+                "generation's run (_close_instrument_runs) first"
+            )
+        return InstrumentPrep(family=self.family, live_active=request.live)
+
+    def bind(
+        self, plan: InstrumentPlan, prep: InstrumentPrep | None = None,
+    ) -> SaeRun:
         """Bind an immutable per-generation run from a declared plan.
 
         The binding freezes each attached probe's spec **with its
@@ -189,8 +205,10 @@ class SaeInstrument:
         session metadata cache at bind time, so a mid-generation
         Neuronpedia backfill (which mutates specs and cache without the
         generation lock) cannot change what a running generation measures.
+        A bare ``bind(plan)`` binds with live defaults.
         """
         del plan  # demand already consumed by the capture planner
+        live_active = prep.live_active if prep is not None else True
         session = self._session
         # Duck-typed narrow stubs may lack the metadata cache; a real
         # session always carries it (set in ``__init__``).

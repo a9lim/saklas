@@ -28,6 +28,7 @@ from saklas.core.instruments.types import (
     GateRef,
     InstrumentBinding,
     InstrumentPlan,
+    InstrumentPrep,
     Membership,
     ReadRequest,
     parse_gate_ref,
@@ -132,7 +133,22 @@ class GeometryInstrument:
 
     # ------------------------------------------------------------ run lifecycle
 
-    def bind(self, plan: InstrumentPlan) -> GeometryRun:
+    def prepare(self, request: ReadRequest) -> InstrumentPrep:
+        """Generation-boundary prep — geometry has no source lifecycle
+        (nothing to refresh or pin) and no run-level live channel, so
+        the bare prep is returned purely to keep the session's capture
+        transaction uniform across families."""
+        if self.current_run.bound:
+            raise RuntimeError(
+                "GeometryInstrument.prepare() on a bound run: close the "
+                "prior generation's run (_close_instrument_runs) first"
+            )
+        del request
+        return InstrumentPrep(family=self.family)
+
+    def bind(
+        self, plan: InstrumentPlan, prep: InstrumentPrep | None = None,
+    ) -> GeometryRun:
         """Bind an immutable per-generation run.
 
         The binding carries the probe-name roster only: geometry specs
@@ -140,9 +156,9 @@ class GeometryInstrument:
         ``_model_exclusive``), so unlike the SAE family there is no
         mid-generation mutation to freeze against, and the full spec walk
         (which touches Monitor internals) stays off the per-generation
-        path.
+        path.  The prep is threaded for protocol uniformity only.
         """
-        del plan  # demand already consumed by the capture planner
+        del plan, prep  # demand already consumed by the capture planner
         run = GeometryRun(
             self,
             InstrumentBinding(

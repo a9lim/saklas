@@ -649,6 +649,118 @@ def test_external_lens_replacement_plans_and_freezes_refreshed_layers() -> None:
     assert "jlens/example" in readings
 
 
+def test_prepare_is_the_refresh_site_and_supplies_the_pin() -> None:
+    """The refresh/pin protocol step: a bare ``prepare()`` — no session
+    special-casing around it — adopts an external replacement lens
+    (rewriting the live probe layer lists before any plan is taken) and
+    returns the ``LensPrep`` whose pin ``bind`` installs."""
+    from saklas.core.instruments.types import LensPrep, ReadRequest
+
+    session_a = _StubSession()
+    session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    assert session_a.jlens is not None  # resident before the swap
+
+    corpus_b = [
+        f"replacement disjoint prompt {i} with enough content" for i in range(4)
+    ]
+    _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
+
+    inst = session_a._lens_instrument
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    assert isinstance(prep, LensPrep)
+    assert prep.pinned is True
+    assert prep.lens is not None and list(prep.lens.source_layers) == [1]
+    # The adoption rewrote the live registry inside prepare, so the plans
+    # and the bind-time spec freeze that follow see the refreshed layers.
+    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+    run = inst.bind(inst.plan(ReadRequest(final_aggregate=True)), prep)
+    assert run.pinned is True and run.lens is prep.lens
+    assert list(run.binding.specs["jlens/example"]["layers"]) == [1]
+    session_a._close_instrument_runs()
+
+
+def test_prepare_pin_demand_formula() -> None:
+    """Pin demand = a live readout, or attached probes with a final
+    aggregate or a lens gate — the one formula both generation
+    boundaries (``_begin_capture`` and the batch preamble) reduce to."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS, force=True)
+    inst = session._lens_instrument
+
+    # No probes, no live consumer -> unpinned, no disk read taken.
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    assert prep.pinned is False and prep.lens is None
+
+    # Probes + final aggregate (also the batch shape) -> pinned.
+    session._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    prep = inst.prepare(ReadRequest(final_aggregate=True, batch=True))
+    assert prep.pinned is True and prep.lens is not None
+
+    # Final readings disabled: dormant probes do not pin — a lens gate does.
+    prep = inst.prepare(ReadRequest(final_aggregate=False))
+    assert prep.pinned is False
+    prep = inst.prepare(ReadRequest(
+        final_aggregate=False,
+        gate_keys=frozenset({"jlens/example"}),
+    ))
+    assert prep.pinned is True
+
+    # A live-readout consumer pins with an empty probe registry.
+    del session._lens_probes["jlens/example"]
+    inst.live = {"layers": [0]}
+    prep = inst.prepare(ReadRequest(final_aggregate=False, live=True))
+    assert prep.pinned is True and prep.live_active is True
+    inst.live = None
+
+
+def test_prepare_on_a_bound_run_raises() -> None:
+    """The jlens getter short-circuits on a bound run's pin flag, so a
+    prepare taken without closing the prior run would silently skip the
+    refresh — every family rejects it instead."""
+    from saklas.core.instruments.types import InstrumentPlan, ReadRequest
+
+    session = _StubSession()
+    session._monitor = SimpleNamespace(probe_names=[])
+    request = ReadRequest(final_aggregate=False)
+    instruments = (
+        ("lens", session._lens_instrument),
+        ("sae", session._sae_instrument),
+        ("geometry", session._geometry_instrument),
+    )
+    for family, inst in instruments:
+        inst.bind(InstrumentPlan(family=family))
+        with pytest.raises(RuntimeError, match="bound run"):
+            inst.prepare(request)
+    session._close_instrument_runs()
+    for _family, inst in instruments:
+        inst.prepare(request)  # idle runs again — every prepare passes
+
+
+def test_lens_bind_rejects_a_foreign_prep() -> None:
+    """A wrong-family prep is a caller bug, loud rather than defaulted."""
+    from saklas.core.instruments.types import (
+        InstrumentPlan,
+        InstrumentPrep,
+        ReadRequest,
+    )
+
+    session = _StubSession()
+    inst = session._lens_instrument
+    plan = inst.plan(ReadRequest(final_aggregate=False))
+    with pytest.raises(TypeError, match="LensPrep"):
+        inst.bind(plan, InstrumentPrep(family="sae"))
+    assert inst.current_run.bound is False
+    inst.bind(InstrumentPlan(family="lens"))  # bare bind stays valid
+    session._close_instrument_runs()
+
+
 def test_generation_lens_snapshot_avoids_per_token_disk_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

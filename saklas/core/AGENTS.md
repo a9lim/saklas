@@ -926,6 +926,9 @@ measurement envelope lands); **`InstrumentPlan`** (declared capture demand,
 not mechanics — the session planner unions plans and picks physical
 retention; the `INCREMENTAL → set_tail_with_sink` upgrade is
 cross-instrument resource sharing and stays session-side);
+**`InstrumentPrep`** / **`LensPrep`** (generation-boundary source
+decisions, produced by `prepare` and threaded opaquely into `bind` — the
+lens prep carries the disk refresh + pin);
 **`InstrumentBinding`** (immutable per-generation source/spec snapshot, so
 un-locked mutations like the SAE metadata backfill can't change what a
 running generation measures); per-family `LiveConfig` dataclasses (user
@@ -1020,10 +1023,20 @@ family implements `plan(ReadRequest) -> InstrumentPlan` and
 `latest_layers`/`tail_layers` instead of hand-rolled per-family branches;
 retention-mode selection stays session-side (the
 `INCREMENTAL → set_tail_with_sink` upgrade is cross-instrument resource
-sharing). **Formal runs:** `bind(plan)` freezes an `InstrumentBinding`
+sharing). **Source prep:** `prepare(ReadRequest) -> InstrumentPrep` is
+the generation-boundary source step, run after `close_run` and before
+`plan()` — the lens family reads the disk-refreshing `session.jlens`
+getter under pin demand there (the one formula both boundaries reduce
+to: a live readout, or attached probes with a final aggregate or a lens
+gate) and returns the `LensPrep` carrying the pin; geometry/SAE return
+the bare prep for boundary uniformity. Every family's `prepare` raises
+on a still-bound run (a stale pin would short-circuit the very refresh
+the step exists for). **Formal runs:** `bind(plan, prep)` freezes an
+`InstrumentBinding`
 (spec snapshot; the SAE binding resolves `max_act` at bind, so the
 un-locked Neuronpedia backfill can no longer change a running
-generation's strength unit — sol's race) and returns the family's
+generation's strength unit — sol's race), installs the prep's pin/live
+decisions, and returns the family's
 run (`LensRun`/`SaeRun`/`GeometryRun`), which owns the instrument-side
 generation-scoped state: step stashes, display readings, active flags,
 the lens disk-identity pin, and the `observe` step-memo (memoized only
@@ -1037,14 +1050,18 @@ live registry when idle).
 
 Post-review hardening (sol, gaslamp thread `instrument-protocol`):
 
-- **Ordering contract** — `_begin_capture` (and the batch preamble)
-  defensively `_close_instrument_runs()`, then takes the lens disk
+- **Ordering contract** — a capture transaction is the uniform protocol
+  sequence `close_run → prepare → plan → bind` at both generation
+  boundaries (`_begin_capture` and the batch preamble): the defensive
+  `_close_instrument_runs()` first, then `prepare` takes the lens disk
   refresh + pin (`session.jlens`, whose adoption path REWRITES live
   probe layer lists), and only then plans/binds — a plan or freeze taken
   before the refresh pairs the new lens with stale layers and KeyErrors
   in the transport stack. Pin demand is the registry boolean, not plan
   emptiness (probes whose lens vanished still pin the validated-missing
-  state).
+  state). Formerly the refresh/pin dance was session special-casing
+  around `bind(lens=, pinned=)` kwargs; it is protocol shape now
+  (`LensInstrument.prepare`).
 - **Every capture transaction closes its runs, exception-hard** — the
   generation finallys, the batch finally, and the joint-logprob replay
   all reach `_close_instrument_runs()` through nested finallys, so a

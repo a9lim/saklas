@@ -2,9 +2,12 @@
 
 An **Instrument** is the persistent, session-lifetime object for one read
 family: it owns the attached-probe registry, validates gate references
-against the channels the family can actually produce, declares capture
-demand for a generation (``plan``), and binds an immutable per-generation
-**InstrumentRun**.
+against the channels the family can actually produce, prepares its source
+at the generation boundary (``prepare`` — the disk refresh + pin
+decision), declares capture demand (``plan``), and binds an immutable
+per-generation **InstrumentRun**.  A capture transaction is the uniform
+sequence ``close_run → prepare → plan → bind`` — source refresh strictly
+precedes planning because adoption may rewrite live probe specs.
 
 An **InstrumentRun** owns the instrument-side generation-scoped state:
 the immutable source/spec binding, step stashes, and per-generation
@@ -43,6 +46,7 @@ from saklas.core.instruments.types import (
     GateRef,
     InstrumentBinding,
     InstrumentPlan,
+    InstrumentPrep,
     ReadRequest,
     ScalarReading,
 )
@@ -83,9 +87,29 @@ class Instrument(Protocol):
         recipe stamping), or None when not attached."""
         ...
 
+    def prepare(self, request: ReadRequest) -> InstrumentPrep:
+        """Generation-boundary source preparation — the first protocol
+        step of a capture transaction, run after the prior run is closed
+        and BEFORE ``plan()``.
+
+        The one step allowed to touch disk-backed source identity: the
+        lens family refreshes/adopts the on-disk artifact here and
+        decides source pinning (adoption rewrites live probe layer
+        lists, so a plan or spec freeze taken earlier would pair the new
+        source with stale specs — the refresh-then-plan ordering).
+        Families without a source lifecycle return the bare prep so the
+        session boundary stays uniform.  Returns the family's
+        ``InstrumentPrep``, which the session threads opaquely into
+        ``bind``.  Raises ``RuntimeError`` on a still-bound run — a
+        stale pin would short-circuit the very refresh this step exists
+        for, so callers must ``close_run`` first."""
+        ...
+
     def plan(self, request: ReadRequest) -> InstrumentPlan: ...
 
-    def bind(self, plan: InstrumentPlan) -> "InstrumentRun": ...
+    def bind(
+        self, plan: InstrumentPlan, prep: InstrumentPrep | None = None,
+    ) -> "InstrumentRun": ...
 
     def close_run(self) -> None:
         """Close the current run and restore an idle passthrough run.

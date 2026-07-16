@@ -1130,8 +1130,8 @@ readout channel, and SAE feature reads — share one contract under
 on a channel a family can never produce raises `UnsupportedProbeChannelError` at
 composition preflight, not silently inactive), `ScalarReading` (the honest
 one-channel lens/SAE reading, unit-tagged), `InstrumentBinding`/`InstrumentPlan`/
-per-family `LiveConfig`; `protocol.py` holds the `Instrument`/`InstrumentRun`
-contracts. `LensInstrument` and `SaeInstrument` own their extracted read surfaces
+`InstrumentPrep`/per-family `LiveConfig`; `protocol.py` holds the
+`Instrument`/`InstrumentRun` contracts. `LensInstrument` and `SaeInstrument` own their extracted read surfaces
 (probe registry, gate scalars, aggregate, live readout, `validate_gate`);
 `GeometryInstrument` is a thin adapter over the `Monitor`. `session.instruments`
 is the `{"geometry", "lens", "sae"}` registry, and `session.lens` / `session.sae`
@@ -1140,14 +1140,18 @@ methods survive as delegating forwarders. Artifact/source lifecycle
 (`fit_jlens`, `train_sae`/`load_sae`, token replay) stays session-side — source
 management is not measurement. Capture is plan-driven: each family declares
 demand via `plan(ReadRequest) -> InstrumentPlan` and the session planner unions
-the declared layers, keeping retention-mode selection to itself. `bind(plan)`
-opens the formal per-generation `InstrumentRun` — an immutable
+the declared layers, keeping retention-mode selection to itself.
+`bind(plan, prep)` opens the formal per-generation `InstrumentRun` — an immutable
 `InstrumentBinding` (probe specs frozen at bind; the SAE binding resolves the
 normalization unit there, immunizing a running generation against the un-locked
 metadata backfill) plus the generation-scoped stashes, flags, and the lens
-disk-identity pin. Ordering contract: the lens disk refresh + pin happens
-BEFORE planning/freezing (the adoption path rewrites live probe layer lists),
-and every capture transaction — generation, batch, joint-logprob replay —
+disk-identity pin. Ordering contract: a capture transaction is the uniform
+protocol sequence `close_run → prepare → plan → bind`.
+`prepare(ReadRequest) -> InstrumentPrep` is the source-boundary step — the lens
+family takes its disk refresh + pin there, BEFORE planning/freezing (the
+adoption path rewrites live probe layer lists), and every family's `prepare`
+raises on a still-bound run (a stale pin would suppress that refresh). Every
+capture transaction — generation, batch, joint-logprob replay —
 closes its runs exception-hard in its finally (`close_run` is protocol
 surface; the gen-lock release is outermost). Lens/SAE measurement guards
 consult the frozen binding, so mid-generation roster mutations apply at the
