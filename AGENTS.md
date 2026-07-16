@@ -392,7 +392,14 @@ Three read surfaces over either source, plus local fit and external fetch:
   `live_probe_scores`): off ⇒ per-token monitor scoring is disabled for
   UI/trait/loom consumers (aggregate-only capture; gates still force the
   subset they need), so a compute-constrained session can run with neither
-  family live.
+  family live. The post-hoc complement is `session.geometry_token_readout`
+  (`GET .../instruments/geometry/token-readout`, a `scope=replay`
+  measurements envelope) — the Monitor-roster sibling of the lens/SAE
+  token replays: rebuild the node's prompt render + decode prefix, one
+  capture forward under the recipe steering, score the full roster at the
+  clicked token's producing position, so aggregate-only generations and
+  probes attached after the fact still drill down (no dashboard tab yet;
+  `steered=false` reads the unsteered counterfactual).
   `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
   behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
   sessions/{id}/instruments/lens/token-readout`): rebuild the node's prompt render + raw

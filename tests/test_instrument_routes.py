@@ -78,7 +78,7 @@ class TestListing:
         assert geo["source"] is None
         assert geo["capabilities"] == {
             "sources": False, "preparations": [],
-            "token_readout": False, "source_switch": False,
+            "token_readout": True, "source_switch": False,
         }
 
         lens = fams["lens"]
@@ -428,11 +428,79 @@ class TestTokenReadout:
         "aggregate": [(" a", 0.41, 0.31, 0.05), (" b", 0.2, 0.8, 0.1)],
     }
 
-    def test_geometry_404(self, session_and_client: Any) -> None:
-        _session, client = session_and_client
+    @staticmethod
+    def _geometry_out(steering: "str | None") -> dict[str, Any]:
+        from saklas.core.results import ProbeReading
+
+        return {
+            "node_id": "n1", "raw_index": 3, "token_id": 42,
+            "token_text": " magic", "steering": steering,
+            "readings": {
+                "formal.casual": ProbeReading(
+                    fraction=0.4,
+                    nearest=[("formal", 1.2)],
+                    coords=(0.7,),
+                    residual=0.0,
+                ),
+            },
+        }
+
+    def test_geometry_replay_envelope(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.geometry_token_readout.return_value = self._geometry_out(
+            "0.3 formal.casual",
+        )
+        resp = client.get(
+            f"{_BASE}/geometry/token-readout",
+            params={"node_id": "n1", "raw_index": 3},
+        )
+        assert resp.status_code == 200
+        m = resp.json()["measurements"]
+        assert m["scope"] == "replay"
+        assert m["provenance"] == "replayed"
+        geo = m["instruments"]["geometry"]
+        assert geo["binding"] == {"steering": "0.3 formal.casual"}
+        reading = geo["readings"]["formal.casual"]
+        assert reading["coords"] == [0.7]
+        assert m["scores"]["formal.casual"] == 0.7
+        kwargs = session.geometry_token_readout.call_args.kwargs
+        assert kwargs["apply_steering"] is True
+        assert kwargs["raw"] is False
+
+    def test_geometry_unsteered_nulls_binding_steering(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.geometry_token_readout.return_value = self._geometry_out(None)
+        resp = client.get(
+            f"{_BASE}/geometry/token-readout",
+            params={"node_id": "n1", "raw_index": 3, "steered": "false"},
+        )
+        assert resp.status_code == 200
+        geo = resp.json()["measurements"]["instruments"]["geometry"]
+        assert geo["binding"] == {"steering": None}
+        call = session.geometry_token_readout.call_args
+        assert call.kwargs["apply_steering"] is False
+
+    def test_geometry_no_probes_400(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.geometry_token_readout.side_effect = ValueError(
+            "no geometry probes attached",
+        )
         resp = client.get(
             f"{_BASE}/geometry/token-readout",
             params={"node_id": "n1", "raw_index": 0},
+        )
+        assert resp.status_code == 400
+
+    def test_geometry_unknown_node_404(self, session_and_client: Any) -> None:
+        from saklas.core.loom import UnknownNodeError
+
+        session, client = session_and_client
+        session.geometry_token_readout.side_effect = UnknownNodeError("gone")
+        resp = client.get(
+            f"{_BASE}/geometry/token-readout",
+            params={"node_id": "nope", "raw_index": 0},
         )
         assert resp.status_code == 404
 

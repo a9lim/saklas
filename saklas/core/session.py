@@ -4243,6 +4243,132 @@ class SaklasSession:
             "features": features,
         }
 
+    def geometry_token_readout(
+        self,
+        node_id: str,
+        raw_index: int,
+        *,
+        apply_steering: bool = True,
+        raw: bool = False,
+    ) -> dict[str, Any]:
+        """Whitened subspace-probe readings at the forward that produced a
+        loom token — the geometry family's token replay.
+
+        Rebuilds the exact token stream that produced the clicked token
+        (the same render :meth:`fork_from_token` and the lens/SAE replays
+        use), runs one capture forward at the attached probes' layer
+        union, and scores the full Monitor roster at the final position
+        via :meth:`Monitor.score_single_token` — so the reading shape
+        (coords / fraction / nearest / residual / assignment / membership
+        + per-layer traces) matches the live per-token read at that
+        position.  Post-hoc by construction: it reads generations that ran
+        aggregate-only (live probe scores off) and probes attached after
+        the fact, and ``apply_steering=False`` reads the unsteered
+        counterfactual.  Same steering-fidelity class as the fork replay:
+        an always-active affine term reproduces the original decode
+        injections exactly (the slide is position-independent);
+        phase-split and probe-gated terms fire as the trigger context's
+        rest state decides.  Curved probes score with a cold foot solve
+        (warm-start is the sequential live path's optimization; a stale
+        foot from a prior generation must not seed a one-shot replay).
+
+        Returns ``{node_id, raw_index, token_id, token_text, steering,
+        readings: {probe_name: ProbeReading}}``.  Raises ``ValueError``
+        with no geometry probe attached, :class:`UnknownNodeError` /
+        :class:`InvalidNodeOperationError` on a bad target (mirrors
+        :meth:`fork_from_token`), and ``WhitenerError`` when the whitener
+        doesn't cover the probed layers.
+        """
+        from saklas.core.capture import _capture_all_hidden_states
+
+        if not self._monitor.probe_names:
+            raise ValueError(
+                "geometry_token_readout: no geometry probes attached — "
+                "attach one with session.add_probe(selector) first"
+            )
+        node = self.tree.get(node_id)
+        if node.role not in ("assistant", "user"):
+            raise InvalidNodeOperationError(
+                f"geometry_token_readout: {node_id!r} is a {node.role} "
+                f"node — only a turn with a decode record can be read out"
+            )
+        raw_ids = node.raw_token_ids
+        if not raw_ids:
+            raise InvalidNodeOperationError(
+                f"geometry_token_readout: {node_id!r} has no raw token "
+                f"record (transcript-loaded node)"
+            )
+        if not 0 <= raw_index < len(raw_ids):
+            raise InvalidNodeOperationError(
+                f"geometry_token_readout: raw_index {raw_index} out of "
+                f"range [0, {len(raw_ids)}) for {node_id!r}"
+            )
+        recipe = node.recipe
+        steering_expr = (
+            recipe.steering if (apply_steering and recipe is not None) else None
+        )
+        # The steering scope opens OUTSIDE the exclusive-GPU guard — the
+        # composer's push/pop take ``_gen_lock`` blocking, so nesting it
+        # inside ``_model_exclusive`` would self-deadlock (same ordering
+        # as the lens/SAE replays and ``score_choices``).
+        scope = self.steering(steering_expr) if steering_expr else nullcontext()
+        with scope:
+            thinking_req = recipe.thinking if recipe is not None else None
+            use_thinking = (
+                supports_thinking(self._tokenizer)
+                if thinking_req is None
+                else bool(thinking_req) and supports_thinking(self._tokenizer)
+            )
+            if raw:
+                prompt_ids = self._prepare_input(
+                    "", raw=True, parent_node_id=node.parent_id,
+                )
+            else:
+                # Continue-mode rebuild — seat-general, mirrors
+                # ``jlens_token_readout``.
+                prompt_ids = self._prepare_input(
+                    None,
+                    thinking=use_thinking,
+                    parent_node_id=node.parent_id,
+                    user_role=(
+                        node.role_label if node.role == "user" else None
+                    ),
+                    assistant_role=(
+                        node.role_label if node.role == "assistant" else None
+                    ),
+                    gen_seat=node.role,
+                )
+            if raw_index > 0:
+                prefix = torch.tensor(
+                    [[int(token) for token in raw_ids[:raw_index]]],
+                    dtype=prompt_ids.dtype,
+                    device=prompt_ids.device,
+                )
+                ids = torch.cat([prompt_ids, prefix], dim=1)
+            else:
+                ids = prompt_ids
+            with self._model_exclusive(
+                "session.geometry_token_readout called while another model "
+                "use is in flight",
+                phase_msg="session.geometry_token_readout called while a "
+                "generation is in flight",
+            ):
+                layer_idxs = sorted(self._monitor.probe_layers())
+                hidden = _capture_all_hidden_states(
+                    self._model, self._layers, ids,
+                    layer_indices=layer_idxs, pool_index=ids.shape[1] - 1,
+                )
+                self._monitor.enable_curved_warm(False)
+                readings = self._monitor.score_single_token(hidden)
+        return {
+            "node_id": node_id,
+            "raw_index": int(raw_index),
+            "token_id": int(raw_ids[raw_index]),
+            "token_text": str(self._tokenizer.decode([int(raw_ids[raw_index])])),
+            "steering": steering_expr,
+            "readings": readings,
+        }
+
     def jspace_decompose(
         self,
         selector: str,

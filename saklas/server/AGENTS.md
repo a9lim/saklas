@@ -377,7 +377,7 @@ scrubbing disciplines are copied verbatim from the routes it replaces.
   the resident release normalized to `saelens:`/`local:` (from `session.sae_info`),
   geometry = `null`. **capabilities** declares per-family support so clients never
   guess: `{sources: bool, preparations: [ops], token_readout: bool,
-  source_switch: bool}` (geometry `False/[]/False/False`; lens
+  source_switch: bool}` (geometry `False/[]/True/False`; lens
   `True/["fetch","fit"]/True/True`; sae `True/["load","train"]/True/False`).
 
 - `POST .../instruments/{family}/live` — uniform body `{enabled, layers?, top_k?}`.
@@ -424,8 +424,13 @@ scrubbing disciplines are copied verbatim from the routes it replaces.
   readout: {…}}}}}` built via `core.measurements.build_measurements`
   (`steered=false` → `binding.steering` null). lens = the old
   `session.jlens_token_readout` (per-layer top-k `readout.layers` + the all-layer
-  `readout.aggregate`); sae = `session.sae_token_readout` (`readout.features`).
-  geometry: 404. Same lock/error mapping as before
+  `readout.aggregate`); sae = `session.sae_token_readout` (`readout.features`);
+  geometry = `session.geometry_token_readout` — the Monitor-roster replay
+  (`instruments.geometry.readings` full `ProbeReading`s + a
+  `binding: {steering}`; the post-hoc read for aggregate-only generations
+  and probes attached after the fact; `top_k`/`layers` ignored — the
+  roster's own fitted layers drive the capture; no attached probe → 400).
+  Same lock/error mapping as before
   (`LensNotFittedError`/`UnknownNodeError` → 404, `InvalidNodeOperationError`/bad
   `layers`/`top_k` → 400).
 

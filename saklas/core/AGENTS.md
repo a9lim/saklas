@@ -1283,7 +1283,16 @@ readout channel, see "Lens probes" below), else resolves via
 `_resolve_probe_manifold`
 (a 2-node `pca` concept folds to a rank-1 probe via `_fold_profile_probe`; a
 multi-node manifold attaches whole) and registers on the unified `_monitor`;
-`remove_probe(name)` detaches either kind. `_begin_capture` widens to `_monitor.probe_layers()`
+`remove_probe(name)` detaches either kind. `geometry_token_readout(node_id,
+raw_index, *, apply_steering=, raw=)` is the geometry family's token replay —
+the loom-anchored sibling of `jlens_token_readout`/`sae_token_readout` (same
+prompt rebuild + one capture forward at the roster's layer union + the same
+steering-scope-outside-`_model_exclusive` ordering), scored through
+`Monitor.score_single_token` at the position that produced the clicked token
+(curved warm-start forced off — a one-shot read must not seed from a prior
+generation's foot). Post-hoc by construction: it reads aggregate-only
+generations and probes attached after the fact; no attached probe raises
+`ValueError`. `_begin_capture` widens to `_monitor.probe_layers()`
 and picks the `CaptureMode` from `need_per_token` (gate ∨ loom row ∨ trait stream ∨
 live scores ∨ per-layer persist — see hooks.py `HiddenCapture`), storing it on the
 `CaptureState` dataclass (`mode` + `persistent` + the GATING_SUBSET subset/keys —

@@ -950,7 +950,15 @@ last non-special token per layer and calls the *same* `_score_probe_full`, so th
 aggregate at a token index is bit-identical to the live read at that token), plus
 the live-mean trio `begin/update/end_live`. The one-shot re-render text scorer
 (`measure`) is gone — every read source is live hooks scoring captured hidden
-states. The bundled probe roster is the fitted 2-node manifolds tagged in each
+states; the one deliberate exception is `session.geometry_token_readout`, the
+family's loom-prefix token replay (the sibling of `jlens_token_readout` /
+`sae_token_readout`): rebuild the node's prompt render + raw decode prefix, one
+capture forward at the roster's layer union under the recipe steering, score
+the full roster via `score_single_token` at the position that produced the
+clicked token — in-conversation-context by construction, unlike the removed
+`measure`. Post-hoc: it reads aggregate-only generations, probes attached after
+the fact, and the `steered=false` counterfactual (curved warm-start forced off
+for the one-shot read). The bundled probe roster is the fitted 2-node manifolds tagged in each
 requested category — plus, in the default (`probes is None`) roster, every
 already-fitted bundled multi-node manifold (`personas`, `emotions`) attached
 under its `default/<name>` selector — handed in directly by

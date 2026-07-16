@@ -391,7 +391,7 @@ def register_instrument_routes(app: FastAPI) -> None:
             "capabilities": {
                 "sources": False,
                 "preparations": [],
-                "token_readout": False,
+                "token_readout": True,
                 "source_switch": False,
             },
         }
@@ -907,16 +907,50 @@ def register_instrument_routes(app: FastAPI) -> None:
         resolve_session_id(session_id)
         _require_family(family)
         if family == "geometry":
-            raise HTTPException(
-                404,
-                "geometry has no token-readout (subspace probes read live, "
-                "not from a workspace/feature dictionary)",
+            # ``top_k``/``layers`` don't apply: the roster's own fitted
+            # layers drive the capture (same silent-ignore the SAE
+            # branch gives ``layers``).
+            return await _geometry_token_readout(
+                node_id, raw_index, steered, raw,
             )
         if family == "lens":
             return await _lens_token_readout(
                 node_id, raw_index, top_k, steered, raw, layers,
             )
         return await _sae_token_readout(node_id, raw_index, top_k, steered, raw)
+
+    async def _geometry_token_readout(
+        node_id: str, raw_index: int, steered: bool, raw: bool,
+    ) -> dict[str, Any]:
+        async with acquire_session_lock(session) as acquired:
+            if not acquired:
+                raise HTTPException(503, "session locked")
+            try:
+                out = await asyncio.to_thread(
+                    session.geometry_token_readout,
+                    node_id,
+                    raw_index,
+                    apply_steering=steered,
+                    raw=raw,
+                )
+            except UnknownNodeError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            except InvalidNodeOperationError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except SaklasError as exc:
+                status, message = exc.user_message()
+                raise HTTPException(status, message) from exc
+        measurements = build_measurements(
+            scope="replay",
+            provenance="replayed",
+            geometry_readings=out.get("readings"),
+            geometry_binding={
+                "steering": (out.get("steering") if steered else None),
+            },
+        )
+        return {"measurements": measurements}
 
     async def _lens_token_readout(
         node_id: str, raw_index: int, top_k: int, steered: bool,

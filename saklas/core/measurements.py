@@ -73,6 +73,7 @@ def build_measurements(
     scope: str,
     provenance: str = "captured",
     geometry_readings: Mapping[str, ProbeReading] | None = None,
+    geometry_binding: Mapping[str, Any] | None = None,
     lens_readings: Mapping[str, ProbeReading] | None = None,
     sae_readings: Mapping[str, ProbeReading] | None = None,
     per_layer_scores: Mapping[str, Mapping[str, float]] | None = None,
@@ -96,9 +97,16 @@ def build_measurements(
 
     if geometry_readings:
         scores.update(_axis0(geometry_readings))
-        instruments["geometry"] = {
+        geometry_channel: dict[str, Any] = {
             "readings": _readings_dict(geometry_readings),
         }
+        # Opt-in only (the replay envelope records its applied steering,
+        # mirroring lens/sae): live token/aggregate envelopes stay
+        # binding-less on the geometry channel — the recipe already lives
+        # on the loom node.
+        if geometry_binding is not None:
+            geometry_channel["binding"] = dict(geometry_binding)
+        instruments["geometry"] = geometry_channel
 
     lens_channel: dict[str, Any] = {}
     if lens_readings:
