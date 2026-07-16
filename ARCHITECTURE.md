@@ -1098,22 +1098,48 @@ discovery; `--no-web` leaves SAE acquisition explicit.
 The runtime has the same three consumers as the J-lens, but is single-layer:
 
 - **readout**: `SAE.encode(h_L)` after the decode forward, followed by top-k;
-  the WebSocket `sae_readout` channel carries feature id, raw post-nonlinearity
-  activation, and an optional cached label. It reuses the existing capture tap
-  and adds no hook. `sae_token_readout` is the loom-prefix replay variant;
+  the token frame's `measurements.instruments.sae.readout` block carries feature
+  id, raw post-nonlinearity activation, and an optional cached label. It reuses
+  the existing capture tap and adds no hook. `sae_token_readout` is the
+  loom-prefix replay variant;
 - **steering atoms**: `sae/<id>` lazily registers decoder row `W_dec[id]` as a
   one-layer ordinary profile. It lowers through the same affine synthesis and
   `subspace_inject` path as every other vector. `!sae/<id>` is therefore the
   existing directional mean-ablation, not an encode-clamp-decode operator;
 - **probes + gates**: `add_probe("sae/<id>")` lands in the session SAE-probe
-  registry, not the `Monitor`. Its single coordinate is the feature activation,
-  so `@when:sae/<id>>N` compares the SAE's own units. A gate forces one encode
+  registry, not the `Monitor`. Its single coordinate is the normalized feature
+  strength, so `@when:sae/<id>>N` compares the SAE's own units. The 5.x clean
+  break dropped the former fake gate channels: an SAE probe emits **only** its
+  real strength channel, and a gate on a channel the family can never produce
+  (e.g. `@when:sae/<id>:membership`) is a composition-preflight
+  `UnsupportedProbeChannelError`, not a silent constant. A gate forces one encode
   per forward even with live discovery off and does not force monitor scoring.
   The finalize aggregate pools the last content token from the capture tail.
 
 One encode is shared by live top-k, pinned probes, and SAE gate scalars on a
 step. Activation values are comparable over tokens for one feature, not across
 features; the dashboard scales each card against its own recent maximum.
+
+### 6.6 The instrument protocol (read-side unification)
+
+The three read families — geometry (Monitor subspace probes), the Jacobian-lens
+readout channel, and SAE feature reads — share one contract under
+`core/instruments/`: the read-side analogue of `SteeringComposer`.
+`types.py` is the shared vocabulary — `GateRef` + `validate_gate_channels`
+(`parse_gate_ref` is the single place the scalar-key discrimination lives; a gate
+on a channel a family can never produce raises `UnsupportedProbeChannelError` at
+composition preflight, not silently inactive), `ScalarReading` (the honest
+one-channel lens/SAE reading, unit-tagged), `InstrumentBinding`/`InstrumentPlan`/
+per-family `LiveConfig`; `protocol.py` holds the `Instrument`/`InstrumentRun`
+contracts. `LensInstrument` and `SaeInstrument` own their extracted read surfaces
+(probe registry, gate scalars, aggregate, live readout, `validate_gate`);
+`GeometryInstrument` is a thin adapter over the `Monitor`. `session.instruments`
+is the `{"geometry", "lens", "sae"}` registry, and `session.lens` / `session.sae`
+are the typed public facades; the historical `session._score_*` / `_live_*`
+methods survive as delegating forwarders. Artifact/source lifecycle
+(`fit_jlens`, `train_sae`/`load_sae`, token replay) stays session-side — source
+management is not measurement. Deferred, not silent: the plan-driven
+`_begin_capture` layer-union and the formal `InstrumentRun` objectification.
 
 ---
 
@@ -1275,5 +1301,5 @@ no session/IO coupling — the on-disk tensor codec `save_manifold`/`load_manifo
 and the `ActivationRowStore` row spool live in `io/manifold_tensors.py`, since
 persistence is io's job). The whitener is `core/mahalanobis.py`; capture + fold +
 projection `core/capture.py`; the fit pipeline `core/extraction.py`; dispatch +
-injection `core/session.py` + `core/hooks.py`; reads `core/monitor.py`; grammar
-`core/steering_expr.py`.*
+injection `core/session.py` + `core/hooks.py`; reads `core/monitor.py` +
+`core/instruments/`; grammar `core/steering_expr.py`.*

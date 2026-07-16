@@ -44,7 +44,7 @@ Result actions/rendering key off artifacts (`recipe`, token rows,
 user/assistant plus labels observed anywhere in the tree, overlaid by configured
 recipes/notes; effective roster rows carry `origin`.
 
-- **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. Every measured `token` event carries the 5.x **`measurements`** envelope — the single JSON-safe read-side record, byte-for-byte the same object stored on its loom token row: `version` / `scope:"token"` / `provenance`, the flat `scores` / `per_layer_scores` cross-family views, and per-family `instruments` — `geometry` (attached-probe `readings`), `lens` (`readings` for pinned probes plus the native `readout`: endpoint-shaped `layers[].tokens[]` with token/id/logprob and the `aggregate` chip list, plus a `binding` recording `source` + recipe `steering`), and `sae` (`readings` plus the native `readout.features` and a `binding` with `source` / `steering` / resident `layer`). The envelope **replaces** the former `captured` record and the six top-level per-token aliases (`scores`, `per_layer_scores`, `probe_readings`, `lens_readout`, `lens_aggregate`, `sae_readout`) — those are gone from the token frame; the WebUI adopts `measurements` in a follow-up task. `raw_index` is the decode-step join into the backing node's `raw_token_ids`. The `done` event's `result` carries the aggregate `probe_readings` (same `ProbeReading` shape) **and** an aggregate-scope `measurements` envelope (families split by attachment). The composer uses `type:"submit"`; authored-only submissions return `result.kind="append"`. A `generate` message with `fork_node_id`/`fork_raw_index`/`fork_alt_token_id` is the **logit fork** — replays the node's raw decode prefix with one token swapped, resampling the continuation as a sibling. A `generate` with `prefill_node_id`/`prefill_text` is the compatibility **answer-prefill** path. Legacy `commit_role`/`commit_text` fields remain accepted for older clients and keep their legacy `result.kind="commit"`; new UI code must not use them for the composer.
+- **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. Every measured `token` event carries the 5.x **`measurements`** envelope — the single JSON-safe read-side record, byte-for-byte the same object stored on its loom token row: `version` / `scope:"token"` / `provenance`, the flat `scores` / `per_layer_scores` cross-family views, and per-family `instruments` — `geometry` (attached-probe `readings`), `lens` (`readings` for pinned probes plus the native `readout`: endpoint-shaped `layers[].tokens[]` with token/id/logprob and the `aggregate` chip list, plus a `binding` recording `source` + recipe `steering`), and `sae` (`readings` plus the native `readout.features` and a `binding` with `source` / `steering` / resident `layer`). The envelope **replaces** the former `captured` record and the six top-level per-token aliases (`scores`, `per_layer_scores`, `probe_readings`, `lens_readout`, `lens_aggregate`, `sae_readout`) — those are gone from the token frame; the WebUI consumes `measurements` directly. `raw_index` is the decode-step join into the backing node's `raw_token_ids`. The `done` event's `result` carries the aggregate `probe_readings` (same `ProbeReading` shape) **and** an aggregate-scope `measurements` envelope (families split by attachment). The composer uses `type:"submit"`; authored-only submissions return `result.kind="append"`. A `generate` message with `fork_node_id`/`fork_raw_index`/`fork_alt_token_id` is the **logit fork** — replays the node's raw decode prefix with one token swapped, resampling the continuation as a sibling. A `generate` with `prefill_node_id`/`prefill_text` is the compatibility **answer-prefill** path. Legacy `commit_role`/`commit_text` fields remain accepted for older clients and keep their legacy `result.kind="commit"`; new UI code must not use them for the composer.
 - **GET `/sessions/{id}/correlation[?names=…]`** — N×N magnitude-weighted cosine matrix; default pool unions steering vectors + active probes.
 - **GET `/sessions/{id}/profiles/pairwise?a=…&b=…`** — cross-layer cosine matrix between two named profiles / probes. Distinct from `correlation`: one pair, two-axis matrix indexed by layer rather than by name; backs the pairwise-compare analysis drawer. Registered *before* `GET /profiles/{name}` so the literal path wins the routing match.
 - **GET `/sessions/{id}/profiles`** — registered steering profiles. Profile authoring rides the session routes (`POST /extract`, `/profiles/bake`); discover-manifold union is `POST /manifolds/merge`, alongside the manifold install/browse routes. There is **no `/saklas/v1/packs*` surface**, **no `/manifold-probes`**, **no `/extract/preview`**, and **no `/profiles/clone`** — all removed in the 4.0 collapse.
@@ -54,23 +54,25 @@ recipes/notes; effective roster rows carry `origin`.
 - **POST `/sessions/{id}/profiles/bake`** (JSON), **POST `/sessions/{id}/extract`** (SSE progress on `Accept: text/event-stream`, JSON otherwise).
 - **Loom tree** under `/sessions/{id}/tree` — full-tree GET plus atomic full-tree PUT restore (model-bound, the dashboard v4 save/load inverse), `tree/active` GET; `navigate`/`edit`/`branch`/`delete`/`star`/`note`/`reset` mutations; `edge_label`, `filter`, `diff`, `joint_logprobs`; `transcript` export/import.
 - **GET `/sessions/{id}/traits/stream`** — live per-token probe SSE.
-> **5.x server migration (webui adoption pending).** The lens / sae / CAA-live
-> lifecycle **routes moved under `/sessions/{id}/instruments/*`** — the per-family
-> `/lens/*` and `/sae/*` groups and `POST /probes/live` are gone server-side (see
-> `server/AGENTS.md`). The bullets below describe the current dashboard calls
-> against the *old* paths; the mapping is: `POST /probes/live` /
-> `POST /lens/live` / `POST /sae/live` → `POST /instruments/{family}/live`;
+> **5.x instrument routes.** The lens / sae / CAA-live lifecycle lives under
+> **`/sessions/{id}/instruments/{family}/*`** (`family` ∈ `geometry`/`lens`/`sae`)
+> — the 5.x unification that replaced the former per-family `/lens/*` and
+> `/sae/*` groups and `POST /probes/live` (see `server/AGENTS.md`). The dashboard
+> calls these paths and consumes the `measurements` envelope directly. The bullets
+> below describe each endpoint under its current `/instruments/…` path; for
+> reference, the 5.x consolidation mapped the pre-5.x paths as: `POST /probes/live`
+> / `POST /lens/live` / `POST /sae/live` → `POST /instruments/{family}/live`;
 > `GET /lens/sources` / `GET /sae/sources` → `GET /instruments/{family}/sources`;
 > `POST /lens/use` → `PUT /instruments/lens/source`; the polled `/lens/fetch` /
 > `/lens/fit` / `/sae/load` / `/sae/train` jobs → the unified
 > `POST/GET/DELETE /instruments/{family}/preparations` (`{operation}` body);
 > `GET /lens/token-readout` / `GET /sae/token-readout` →
-> `GET /instruments/{family}/token-readout` (now wrapped in the `measurements`
+> `GET /instruments/{family}/token-readout` (wrapped in the `measurements`
 > replay envelope); `POST /lens/token/validate` /
 > `POST /sae/feature{,s}/validate` / `POST /sae/features/metadata` → the
-> `/instruments/{family}/…` extras. The WebUI adopts these in a follow-up task.
+> `/instruments/{family}/…` extras.
 
-- **GET `/sessions/{id}/lens/token-readout?node_id=&raw_index=…`** — the J-lens
+- **GET `/sessions/{id}/instruments/lens/token-readout?node_id=&raw_index=…`** — the J-lens
   readout at one decode step: per-layer top-k matrix
   (`layers: [{layer, tokens:[{token, id, logprob}]}]`) plus the
   layer-aggregated `aggregate: [{token, strength, com, spread}]` block
@@ -81,35 +83,40 @@ recipes/notes; effective roster rows carry `origin`.
   under the node's recipe steering; `steered=false` for the unsteered
   counterfactual, `raw=true` for flat-buffer nodes — the client's render mode
   supplies raw-ness). Backs `TokenDrilldownDrawer`'s **j-lens** tab via
-  `apiLens.tokenReadout`; gated on the session-info `jlens_fitted` flag
+  `apiInstruments.tokenReadout`; gated on the session-info `jlens_fitted` flag
   (unfitted → the tab shows the `saklas lens fit` hint).
-- **POST `/sessions/{id}/lens/token/validate`** — read-only `{word}` →
-  `{word, token_id}` single-token check. Both J-LENS add forms call it before
+- **POST `/sessions/{id}/instruments/lens/token/validate`** — read-only `{word}` →
+  `{word, token_id}` single-token check (`apiInstruments.validateLensToken`).
+  Both J-LENS add forms call it before
   mutating the steering rack or attaching a probe; a rejected word remains in
   the input and is surfaced as an error toast.
-- **POST `/sessions/{id}/lens/live`** — toggle the *live* J-lens readout
+- **POST `/sessions/{id}/instruments/lens/live`** — toggle the *live* J-lens readout
   (`{enabled, layers?}` → `{enabled, layers}`; layers omitted picks every
   fitted layer). The generation's logit-alternative `return_top_k` also sets
   the live lens width. While on, each WS `token` frame carries
   the per-layer matrix + aggregate chip list inside its `measurements` envelope
   (`instruments.lens.readout`) and session info
   reports `live_lens_layers` (`null` while off — the J-LENS tab's rehydration
-  read). `apiLens.setLive`; backs the live toggle on `JLensPanel`'s merged
-  PROBE section.
-- **POST `/sessions/{id}/probes/live`** — the CAA live toggle (`{enabled}` →
+  read). `apiInstruments.setLive("lens", …)`; backs the live toggle on
+  `JLensPanel`'s merged PROBE section.
+- **POST `/sessions/{id}/instruments/geometry/live`** — the CAA live toggle (`{enabled}` →
   `{enabled}`): off ⇒ per-token monitor scoring is disabled for UI/trait/loom
   consumers (probes settle to end-of-gen aggregates; gates still fire).
-  Session info reports `live_probe_scores` (default-on). `apiProbes.setLive` +
-  `probesLiveState`/`setLiveProbes`; backs the live toggle on `ProbeRack`'s
+  Session info reports `live_probe_scores` (default-on). `apiInstruments.setLive("geometry", …)`
+  + `probesLiveState`/`setLiveProbes`; backs the live toggle on `ProbeRack`'s
   PROBE header — with it and the lens toggle both off, a compute-constrained
   session pays no per-token scoring at all.
-- **J-LENS source lifecycle** — `GET /sessions/{id}/lens/sources`, `POST
-  /lens/use`, and polled `POST/GET /lens/fetch` back the tab's SOURCE section.
-  Fetch leaves official payloads in the Hugging Face cache and writes only the
-  binding; use/fetch activation turns the live workspace on. The existing
-  polled/cancellable `/lens/fit` is the Saklas-owned local sibling.
-- **SAE source lifecycle** — `GET /sessions/{id}/sae/sources`, background
-  `POST/GET /sae/load`, and polled/cancellable `POST/GET/DELETE /sae/train` back
+- **J-LENS source lifecycle** — `GET /sessions/{id}/instruments/lens/sources`,
+  `PUT /instruments/lens/source`, and the polled
+  `POST/GET /instruments/lens/preparations` (`{operation:"fetch"}`) back the tab's
+  SOURCE section. Fetch leaves official payloads in the Hugging Face cache and
+  writes only the binding; source switch / fetch activation turns the live
+  workspace on. The polled/cancellable `{operation:"fit"}` preparation is the
+  Saklas-owned local sibling.
+- **SAE source lifecycle** — `GET /sessions/{id}/instruments/sae/sources`,
+  background `POST/GET /instruments/sae/preparations` (`{operation:"load"}`), and
+  the polled/cancellable `POST/GET/DELETE /instruments/sae/preparations`
+  (`{operation:"train"}`) back
   the symmetric SOURCE section. Load accepts `local:<name>` or
   `saelens:<release>` plus an optional hook `layer`; the SAE tab's second
   dropdown selects that resident measurement layer, and the selection is
@@ -229,7 +236,7 @@ webui/src/
                               # family's single "+ … steer" launcher
     ProbeRack.svelte          # PROBE section of one instrument tab — same ``family``
                               # prop (subspace ⇔ info.is_affine); header live toggle
-                              # (probesLiveState → apiProbes.setLive — the ONE
+                              # (probesLiveState → apiInstruments.setLive("geometry") — the ONE
                               # monitor per-token scoring switch, rendered in both
                               # tabs driving the same state); footer keeps the
                               # family's single "+ … probe" launcher
@@ -403,7 +410,7 @@ Svelte 5's `$state` does NOT track `Map.set` / `Set.add` / inner-object property
 
 The server loom tree is authoritative. The browser keeps a first-paint cache of the latest `LoomTreeJSON` plus `highlightState` in `localStorage` under `saklas.chat.v3.<model_id>`; only that exact version and the server's list-shaped `nodes` wire are accepted. There is no flat-log migration or synthetic tree hydration. Saves are debounced ~250 ms after mutations, and `refreshLoomTree()` overwrites the cache with server state once the required tree endpoint responds. `pendingIndex` is force-cleared on restore so an in-flight turn from a killed tab can't ghost the UI.
 
-Downloaded conversations likewise use one exact schema (`version: 5`): complete Loom tree, visual steering rack (or an authoritative custom full-grammar expression), probe rack, highlight, and sampling sections are required. Loading an older or partial file is a visible error; the client never guesses at missing state.
+Downloaded conversations likewise use one exact schema (`version: 6` — bumped in 5.x because embedded loom token rows carry `measurements` instead of `captured`; no migration, a v5 file is a visible load error): complete Loom tree, visual steering rack (or an authoritative custom full-grammar expression), probe rack, highlight, and sampling sections are required. Loading an older or partial file is a visible error; the client never guesses at missing state.
 
 ## Per-token highlighting
 
@@ -421,7 +428,7 @@ tint strength = opacity, hue = meaning — with `signed` green/red probe poles,
 blue surprise/J-LENS, and gold SAE families. Pinned SAE/J-LENS cards expose the
 same explicit `highlight` action as geometry probes; both read their native
 `[0,1]` strength on a unit saturation scale. Hover and drawer history read the
-loom-owned `token.captured` channels directly, so refreshes, source switches,
+loom-owned `token.measurements` envelopes directly, so refreshes, source switches,
 and explicit loom save/load preserve the original generation measurements
 without a browser retention cache or token-count cap. A channel disabled during
 that generation may still use its loom replay endpoint after the hover dwell;

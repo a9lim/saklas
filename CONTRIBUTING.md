@@ -60,7 +60,7 @@ changes must include the rebuilt bundle. CI rebuilds it and fails on any diff.
 
 ## Adding a new model architecture
 
-If you want to add another model's architecture, add an entry to `saklas/core/model.py:_LAYER_ACCESSORS`, keyed by the HuggingFace `model_type`. The accessor takes a loaded model and returns the list of transformer blocks. The rest of the code (`vectors.py`, `hooks.py`, `monitor.py`) doesn't depend on the architecture.
+If you want to add another model's architecture, add an entry to `saklas/core/model.py:_LAYER_ACCESSORS`, keyed by the HuggingFace `model_type`. The accessor takes a loaded model and returns the list of transformer blocks. The rest of the code (`capture.py`, `hooks.py`, `monitor.py`) doesn't depend on the architecture.
 
 If the model is quirky (multimodal text extraction, FP8 dequantization,
 nonstandard tokenizer behavior), inspect the existing text-only multimodal path

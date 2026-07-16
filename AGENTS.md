@@ -214,7 +214,15 @@ not a stored node. It competes in the nearest-node ranking, so the channel is
 present whenever neutral lands in a probe's top-N; suppressed only when a manifold
 already carries a real node named `neutral`. Every shape flows through one
 `ProbeGate` (full namespaced string stored verbatim, matching the keys
-`Monitor.flat_scalars` emits) and round-trips byte-for-byte.
+`Monitor.flat_scalars` emits) and round-trips byte-for-byte. At generation
+preflight the composer channel-validates every gate through `parse_gate_ref`
+against the attached instrument's supported channels (`validate_gate_channels`):
+a gate on a channel the family can never produce — e.g. `@when:sae/123:membership`
+(SAE has only the strength channel) — raises `UnsupportedProbeChannelError` (400)
+instead of sitting silently inactive. The 5.x SAE clean break dropped the former
+fake gate channels: an SAE probe now emits **only** its real normalized-strength
+channel (`sae/<id>` / `sae/<id>[0]`), not the constant `:fraction = 0.0` /
+`:membership = 1.0` values that masqueraded as geometry reads.
 
 `%` is the manifold operator: `<manifold> % <position>` places a generation at a
 point of a fitted manifold. `<position>` is `<coord_list>` (a comma-separated list
@@ -904,9 +912,11 @@ Key contracts:
   `ChoiceScores`/`ChoiceScore`; `parse_expr`/`format_expr`; term types
   `ManifoldTerm`/`ProjectedTerm`/`AblationTerm`; selector errors
   `SelectorError`/`AmbiguousSelectorError`;
-  `ManifoldNotRegisteredError`/`ProfileNotRegisteredError`; and the Jacobian-lens
+  `ManifoldNotRegisteredError`/`ProfileNotRegisteredError`; the Jacobian-lens
   suite `JacobianLens`/`JSpaceDecomposition` with errors
-  `JacobianLensError`/`LensNotFittedError`/`MultiTokenWordError`). `from saklas
+  `JacobianLensError`/`LensNotFittedError`/`MultiTokenWordError`; and the read-side
+  instrument facades `GeometryInstrument`/`LensInstrument`/`SaeInstrument` with
+  `UnsupportedProbeChannelError`). `from saklas
   import X` is stable; private submodule paths are not.
 
 ## Cache layout

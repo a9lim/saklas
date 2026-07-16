@@ -90,8 +90,8 @@ route inventory into this file.
 - Add shared primitives under `lib/ui/`; do not duplicate button, tab, card, or
   drawer chrome inside a feature.
 - Keep `lib/types.ts` aligned with the Pydantic/native WebSocket schemas. New UI
-  code reads the canonical `captured` token payload; top-level readout fields are
-  compatibility aliases.
+  code reads the canonical `measurements` envelope on each token; the pre-5.x
+  top-level `captured` / per-token readout aliases are gone.
 - Long-running generate/fit/train work uses one updateable toast or the existing
   progress surface, not a stream of transient notifications.
 

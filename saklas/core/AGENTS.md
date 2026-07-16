@@ -1293,7 +1293,8 @@ session lens-probe registry (`_lens_probes: name -> {word, token_id, layers}`,
 all fitted layers; `_add_lens_probe` validates the artifact + single-token word
 and pre-warms the device transport stack) — **never** the Monitor, never a
 direction fold, no whitener. The reading is the readout-channel synthesis of
-`ProbeReading` (`_score_lens_probes` over `jlens.token_readout_stats`):
+`ProbeReading` (`_score_lens_probes`, now a thin delegating forwarder to
+`LensInstrument.score_probes`, over `jlens.token_readout_stats`):
 `coords = (strength,)` — the ONE channel, mean fitted-layer probability
 `mean_l p_l(v)` (the gate channel `@when:jlens/<word>` and the workspace
 card's `strength`) — `coords_per_layer[l] = (p_l,)`, probability-mass-weighted
@@ -1320,7 +1321,7 @@ not force per-token *monitor* scoring — `need_per_token` keys on
 monitor-attached gate keys (`gated_probe_keys`), while
 `SteeringComposer.gated_lens_probe_keys` detects lens gates for the callback
 merge. `probe_hashes`/`_probe_hash` stamp lens probes with a deterministic
-identity digest (`jlens-readout-v1`, model, word, token id, layers).
+identity digest (`jlens-readout-v2`, model, word, token id, layers).
 
 **CAA live toggle.** `live_probe_scores` / `set_live_probe_scores(bool)` —
 when off, `_generate_core` masks every per-token monitor consumer at the
