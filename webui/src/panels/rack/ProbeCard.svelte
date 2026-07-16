@@ -173,8 +173,8 @@
     setHighlightTarget(isHighlight ? null : name);
   }
 
-  // Open the per-probe inspector (whitened geometry plot + layer norms + live
-  // trail).  Distinct gesture from the identity-cluster highlight toggle, so
+  // Open the per-probe inspector (whitened geometry plot + live trail).
+  // Distinct gesture from the identity-cluster highlight toggle, so
   // ``stopPropagation`` keeps the two from colliding.
   function onInspect(): void {
     openDrawer("probe_inspector", { name });

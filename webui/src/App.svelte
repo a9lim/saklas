@@ -340,16 +340,8 @@
             <Drawers.TokenDrilldown params={drawerState.params} />
           {:else if drawerState.open === "correlation"}
             <Drawers.Correlation params={drawerState.params} />
-          {:else if drawerState.open === "layer_norms"}
-            <Drawers.LayerNorms params={drawerState.params} />
           {:else if drawerState.open === "probe_inspector"}
             <Drawers.ProbeInspector params={drawerState.params} />
-          {:else if drawerState.open === "experiment_lab"}
-            <Drawers.ExperimentLab params={drawerState.params} />
-          {:else if drawerState.open === "activation_atlas"}
-            <Drawers.ActivationAtlas params={drawerState.params} />
-          {:else if drawerState.open === "recipe_builder"}
-            <Drawers.RecipeBuilder params={drawerState.params} />
           {:else if drawerState.open === "advanced_sampling"}
             <Drawers.AdvancedSampling params={drawerState.params} />
           {:else if drawerState.open === "health"}
@@ -480,11 +472,10 @@
     flex-direction: column;
     padding: var(--space-5);
   }
-  /* Two-row grid: steering rack and probe rack.  Reference views
-   * (correlation N×N, per-name layer norms) live in drawer overlays
-   * launched from the command palette — keeping them out of the rack
-   * zone gives both racks the full vertical budget.  Each rack handles
-   * its own internal scroll so its actions row stays anchored. */
+  /* Two-row grid: steering rack and probe rack. The correlation drawer
+   * stays out of the rack zone, so both racks retain their full vertical
+   * budget. Each rack handles its own internal scroll so its actions row
+   * stays anchored. */
   .rack-zone {
     min-height: 0;
     overflow: hidden;

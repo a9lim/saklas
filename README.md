@@ -84,10 +84,8 @@ Press `Cmd+K` or `Ctrl+K` elsewhere to open a menu with further options:
 
 - build, fit, merge, install, and inspect manifolds;
 - author and score restricted-choice templates;
-- manage the cast and steering recipe;
-- run alpha-grid experiments;
-- inspect correlations, pairwise layer geometry, layer norms, and the activation
-  atlas;
+- manage the cast and steering;
+- inspect correlations and pairwise layer geometry;
 - save, load, import, export, and inspect session state;
 - check model, device, source, and server health.
 

@@ -685,16 +685,9 @@ export interface FitManifoldRequest {
 
 // ----------------------------------------------------- vectors --
 
-export interface VectorTopLayer {
-  layer: number;
-  magnitude: number;
-}
-
 export interface VectorInfo {
   name: string;
   layers: number[];
-  top_layers: VectorTopLayer[];
-  per_layer_norms: Record<string, number>;
   metadata: Record<string, unknown>;
 }
 
@@ -732,35 +725,6 @@ export interface ExtractResponse {
   progress: string[];
 }
 
-
-/** Output of GET /sessions/{id}/vectors/{name}/diagnostics — per-layer
- * ``||baked||`` magnitudes + bucket histogram + (optional) probe-quality
- * diagnostics from ``saklas vector why``.  Resolves either steering
- * vectors or active probes — the server falls back to monitor profiles
- * on miss. */
-export interface VectorDiagnosticsResponse {
-  name: string;
-  model: string;
-  total_layers: number;
-  /** Bucket histogram for the WHY view.  ``buckets`` is the bucket count
-   * (HIST_BUCKETS, 16 by default); ``data`` is the per-bucket entries. */
-  histogram: {
-    buckets: number;
-    data: { lo: number; hi: number; mean_norm: number }[];
-  };
-  /** Full per-layer ``||baked||`` magnitudes — one entry per retained
-   * model layer, sorted ascending.  Drives the layer-norms overlay. */
-  layers: { layer: number; magnitude: number }[];
-  /** Probe-quality diagnostics when the profile carries them (v1.6+). */
-  diagnostics_by_layer?: Record<string, Record<string, number>>;
-  diagnostics_summary?: {
-    evr: number | null;
-    intra_pair_variance_mean: number | null;
-    inter_pair_alignment: number | null;
-    diff_principal_projection: number | null;
-    stoplight: "solid" | "shaky" | "poor" | "unknown";
-  };
-}
 
 // ----------------------------------------------------- probes --
 
@@ -1394,40 +1358,6 @@ export interface TranscriptLoadResponseJSON {
   guards: string[];
 }
 
-// ----------------------------------------------------- experiments --
-
-export interface ExperimentFanRequest {
-  prompt: unknown;
-  /** concept name -> alpha grid */
-  grid: Record<string, number[]>;
-  base_steering?: string | null;
-  sampling?: WSSampling | null;
-  thinking?: boolean | null;
-  raw?: boolean;
-}
-
-export interface ExperimentFanRow {
-  idx: number;
-  alpha_values: Record<string, number>;
-  node_id: string | null;
-  result: {
-    text: string;
-    token_count: number;
-    tok_per_sec: number;
-    elapsed: number;
-    finish_reason: string;
-    applied_steering: string | null;
-    readings: Record<string, number>;
-  };
-}
-
-export interface ExperimentFanResponse {
-  kind: "fan" | string;
-  total: number;
-  node_ids: Array<string | null>;
-  rows: ExperimentFanRow[];
-}
-
 /** Per-op delta sent on every tree mutation.  Clients apply in-place
  * keyed by ``rev`` continuity; full re-fetch on gap.
  *
@@ -1804,15 +1734,11 @@ export type DrawerName =
   | "system_prompt"
   | "token_drilldown"
   | "correlation"
-  | "layer_norms"
   /** Per-probe inspector — subsumes the layer-norms view for probes and
    *  adds a rank-aware whitened geometry plot (line / 2D scatter / 3D PCA
    *  scatter) with a layer scrubber and a fading live trajectory trail.
    *  Opened from a probe card's ⓘ button.  ``params: { name }``. */
   | "probe_inspector"
-  | "experiment_lab"
-  | "activation_atlas"
-  | "recipe_builder"
   | "advanced_sampling"
   | "health"
   | "session_admin"

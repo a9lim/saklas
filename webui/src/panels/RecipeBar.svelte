@@ -1,5 +1,5 @@
 <script lang="ts">
-  // The recipe bar — the composed steering expression made permanently
+  // The steering bar — the composed steering expression made permanently
   // visible.  Every racked term renders as a pillar-colored chip regardless
   // of which instrument tab is open: subspace white, manifold violet,
   // j-lens blue (sae gold, once the runtime lands).  Click a chip to jump
@@ -16,7 +16,6 @@
     removeJLensFromRack,
     removeSaeFromRack,
     currentSteeringExpression,
-    openDrawer,
   } from "../lib/stores.svelte";
   import type { InspectorTab } from "../lib/stores.svelte";
   import {
@@ -109,29 +108,14 @@
 </script>
 
 <div class="recipe" title={expression || "no active steering"}>
-  <button
-    type="button"
-    class="lbl edit"
-    title="edit steering recipe"
-    aria-label="Edit steering recipe"
-    onclick={() => openDrawer("recipe_builder")}
-  >recipe</button>
+  <span class="lbl">steering</span>
   {#if custom}
-    <button
-      type="button"
-      class="custom-expression"
-      title="advanced expression — click to edit"
-      onclick={() => openDrawer("recipe_builder")}
-    >
+    <span class="custom-expression">
       <span class="custom-badge">custom</span>
       <code>{expression || "unsteered"}</code>
-    </button>
+    </span>
   {:else if chips.length === 0}
-    <button
-      type="button"
-      class="empty edit-empty"
-      onclick={() => openDrawer("recipe_builder")}
-    >none · edit</button>
+    <span class="empty">none</span>
   {:else}
     <div class="chips">
       {#each chips as chip (chip.name)}
@@ -186,25 +170,11 @@
     padding-top: 3px;
     flex: none;
   }
-  button.lbl,
-  .edit-empty,
-  .custom-expression {
-    border: 0;
-    background: transparent;
-    cursor: pointer;
-  }
-  button.lbl:hover,
-  .edit-empty:hover {
-    color: var(--fg);
-  }
   .empty {
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     color: var(--fg-muted);
     padding-top: 1px;
-  }
-  .edit-empty {
-    padding: 1px 0 0;
   }
   .custom-expression {
     display: flex;
@@ -212,7 +182,6 @@
     gap: var(--space-2);
     flex: 1 1 auto;
     min-width: 0;
-    padding: 0;
     text-align: left;
   }
   .custom-expression code {

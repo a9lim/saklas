@@ -13,8 +13,6 @@ import type {
   CreateManifoldRequest,
   CreateTemplateRequest,
   CreateManifoldFromTemplateRequest,
-  ExperimentFanRequest,
-  ExperimentFanResponse,
   ExtractRequest,
   ExtractResponse,
   FilterMatchesJSON,
@@ -52,7 +50,6 @@ import type {
   TraitsEvent,
   TranscriptLoadResponseJSON,
   UpdateManifoldRequest,
-  VectorDiagnosticsResponse,
   VectorInfo,
   VectorListResponse,
   WSClientMessage,
@@ -70,8 +67,6 @@ export type {
   CreateManifoldFromTemplateRequest,
   FitManifoldRequest,
   GenerateManifoldRequest,
-  ExperimentFanRequest,
-  ExperimentFanResponse,
   ExtractRequest,
   ExtractResponse,
   FilterMatchesJSON,
@@ -107,7 +102,6 @@ export type {
   TraitsEvent,
   TranscriptLoadResponseJSON,
   UpdateManifoldRequest,
-  VectorDiagnosticsResponse,
   VectorInfo,
   VectorListResponse,
   WSClientMessage,
@@ -306,14 +300,6 @@ export const apiVectors = {
    * ``apiExtractStream`` instead. */
   extract(req: ExtractRequest, id: string = SESSION): Promise<ExtractResponse> {
     return request(`${SESSION_BASE(id)}/extract`, jsonBody(req));
-  },
-  diagnostics(
-    name: string,
-    id: string = SESSION,
-  ): Promise<VectorDiagnosticsResponse> {
-    return request(
-      `${SESSION_BASE(id)}/vectors/${encodeURIComponent(name)}/diagnostics`,
-    );
   },
   correlation(
     names?: string[] | null,
@@ -829,20 +815,6 @@ export const apiTree = {
     return request(
       `${SESSION_BASE(id)}/tree/joint_logprobs`,
       jsonBody({ a_id, b_id }),
-    );
-  },
-};
-
-// ======================================================= experiments ==
-
-export const apiExperiments = {
-  fan(
-    body: ExperimentFanRequest,
-    id: string = SESSION,
-  ): Promise<ExperimentFanResponse> {
-    return request(
-      `${SESSION_BASE(id)}/experiments/fan`,
-      jsonBody(body),
     );
   },
 };

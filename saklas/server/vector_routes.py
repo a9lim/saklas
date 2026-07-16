@@ -1,7 +1,7 @@
 """Native vectors route group (``/saklas/v1/sessions/{id}/vectors/*``).
 
 Steering-vector lifecycle under the session: list / profile JSON / delete /
-extract / bake / diagnostics, plus the
+extract / bake, plus the
 cross-layer whitened ``pairwise`` matrix and the N×N ``correlation``
 matrix across loaded vectors and probes.
 """
@@ -11,7 +11,6 @@ matrix across loaded vectors and probes.
 from __future__ import annotations
 
 import asyncio
-from operator import itemgetter
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,7 +24,6 @@ from saklas.server.vector_models import (
     BakeVectorRequest,
     ExtractRequest,
     extract_registry_name,
-    probe_profile_tensors,
     profile_to_json,
 )
 
@@ -434,76 +432,3 @@ def register_vector_routes(app: FastAPI) -> None:
             profile = await asyncio.to_thread(_load_folded)
             session.steer(req.name, profile)
         return profile_to_json(req.name, profile)
-
-    @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}/diagnostics")
-    def vector_diagnostics(session_id: str, name: str):
-        """Per-layer ``||baked||`` histogram + diagnostics for a registered vector.
-
-        Mirrors what ``saklas manifold why <concept> -m MODEL --json`` produces:
-        a 16-bucket layer-magnitude histogram plus the ``diagnostics_by_layer``
-        / ``diagnostics_summary`` block when the profile carries them.
-        Drives the WHY-histogram strip in the web UI's probe rack.
-        """
-        from saklas.core.histogram import (
-            HIST_BUCKETS,
-            bucketize,
-            summarize_diagnostics,
-        )
-
-        resolve_session_id(session_id)
-        # Probes and steering vectors share the per-layer ``dict[int,
-        # Tensor]`` direction shape but live in different registries —
-        # session.vectors holds steering profiles; a vector probe lives as a
-        # flat manifold in ``session.monitor`` and folds back to the same
-        # baked-direction view via ``probe_profile_tensors``.  The
-        # diagnostics endpoint serves either; the layer-norms drawer overlay
-        # in the web UI hits this for every selected name (vector or probe).
-        profile = session.vectors.get(name)
-        if profile is None:
-            folded = probe_profile_tensors(session, name)
-            profile = Profile(folded) if folded is not None else None
-        if profile is None:
-            raise HTTPException(404, f"vector or probe '{name}' not found")
-
-        layer_mags: list[tuple[int, float]] = sorted(
-            ((layer, float(vec.norm().item())) for layer, vec in profile.items()),
-            key=itemgetter(0),
-        )
-        buckets = bucketize(layer_mags, HIST_BUCKETS)
-        # Buckets: ``(lo_layer, hi_layer, mean_norm)`` triples — same shape the
-        # CLI ``manifold why`` text path renders, JSON-friendly here.
-        bucket_payload = [
-            {"lo": lo, "hi": hi, "mean_norm": round(mag, 6)}
-            for lo, hi, mag in buckets
-        ]
-
-        # ``diagnostics`` is a Profile attribute; a probe folded from its
-        # manifold carries no ``diagnostics`` block.  ``getattr`` covers both.
-        diagnostics = profile.diagnostics
-        # ``total_layers`` is the *model's* layer count, not the profile's
-        # — the layer-norms drawer in the web UI fills layers absent from
-        # the profile with zero so the user can read the DLS pattern.
-        # Using ``len(profile)`` here used to lie when DLS dropped layers
-        # (the drawer would stop at the profile's deepest layer instead
-        # of the model's true depth).
-        model_layers = int(session.model_info.get("num_layers") or len(profile))
-        payload: dict[str, Any] = {
-            "name": name,
-            "model": session.model_id,
-            "total_layers": model_layers,
-            "histogram": {
-                "buckets": HIST_BUCKETS,
-                "data": bucket_payload,
-            },
-            "layers": [
-                {"layer": layer, "magnitude": round(mag, 6)}
-                for layer, mag in layer_mags
-            ],
-        }
-        if diagnostics is not None:
-            payload["diagnostics_by_layer"] = {
-                str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
-                for layer, metrics in sorted(diagnostics.items())
-            }
-            payload["diagnostics_summary"] = summarize_diagnostics(diagnostics)
-        return payload

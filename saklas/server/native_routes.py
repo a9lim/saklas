@@ -32,10 +32,6 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     register_probe_routes(app)
 
-    from saklas.server.experiment_routes import register_experiment_routes
-
-    register_experiment_routes(app)
-
     from saklas.server.traits_routes import register_traits_routes
 
     register_traits_routes(app)

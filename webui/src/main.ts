@@ -15,19 +15,11 @@ import "./lib/style/global.css";
 // ``mount`` API (the legacy ``new App({target})`` form was removed in
 // Svelte 5).  Component-scoped CSS comes through automatically.
 //
-// /styleguide mounts the living design-system page instead of the app —
-// the server's SPA fallback already serves index.html on any path, and
-// mounting StyleGuide (not App) means no WS/bootstrap runs there.
-import StyleGuide from "./styleguide/StyleGuide.svelte";
-
 const target = document.getElementById("app");
 if (!target) throw new Error("saklas web: #app element missing in index.html");
 
-const isStyleGuide =
-  window.location.pathname.replace(/\/+$/, "") === "/styleguide";
-// Installed once outside either page root so every current/future `title`
-// authoring surface uses Saklas tooltip chrome, including drawers, portals,
-// the command palette, and the standalone styleguide.
+// Installed once so every current/future `title` authoring surface uses
+// Saklas tooltip chrome, including drawers, portals, and the command palette.
 installTooltipLayer();
-const app = mount(isStyleGuide ? StyleGuide : App, { target });
+const app = mount(App, { target });
 export default app;

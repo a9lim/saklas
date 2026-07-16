@@ -77,22 +77,6 @@ export const RAIL_CATEGORIES: RailCategory[] = [
         drawer: "compare",
         keywords: "cross-layer cosine",
       },
-      { label: "layer norms…", drawer: "layer_norms", keywords: "magnitude" },
-      {
-        label: "atlas…",
-        drawer: "activation_atlas",
-        keywords: "heatmap token layer probe",
-      },
-      {
-        label: "experiments…",
-        drawer: "experiment_lab",
-        keywords: "alpha grid fan sweep",
-      },
-      {
-        label: "recipe…",
-        drawer: "recipe_builder",
-        keywords: "expression steering terms",
-      },
     ],
   },
   {
@@ -119,8 +103,7 @@ export const RAIL_CATEGORIES: RailCategory[] = [
 
 export type PaletteAction =
   | { kind: "drawer"; drawer: DrawerName }
-  | { kind: "tab"; tab: InspectorTab }
-  | { kind: "styleguide" };
+  | { kind: "tab"; tab: InspectorTab };
 
 export interface PaletteCommand {
   label: string;
@@ -168,11 +151,5 @@ export function paletteCommands(): PaletteCommand[] {
       });
     }
   }
-  cmds.push({
-    label: "style guide",
-    group: "pages",
-    action: { kind: "styleguide" },
-    keywords: "design tokens specimens /styleguide",
-  });
   return cmds;
 }

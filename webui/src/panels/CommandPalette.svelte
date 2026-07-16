@@ -71,9 +71,6 @@
       case "tab":
         setInspectorTab(cmd.action.tab);
         break;
-      case "styleguide":
-        window.open("/styleguide", "_blank");
-        break;
     }
   }
 

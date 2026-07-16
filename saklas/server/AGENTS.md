@@ -21,7 +21,6 @@ those registrars import):
 - `tree_routes.register_tree_routes` — the loom `/sessions/{id}/tree/*` routes
 - `vector_routes.register_vector_routes` — the `/sessions/{id}/vectors/*` routes + `/sessions/{id}/correlation`
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
-- `experiment_routes.register_experiment_routes` — `/sessions/{id}/experiments/fan`
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
 - `lens_routes.register_lens_routes` — `/sessions/{id}/lens/*` (source list/use,
   background official fetch/local fit, token readout + the live-lens toggle)
@@ -121,7 +120,6 @@ bodies and serializers live beside their route groups:
 - `vector_models.py` — vector/extract/bake request bodies and vector serializers.
 - `tree_models.py` — loom-tree request bodies and tree serializers.
 - `ws_models.py` — WebSocket request bodies, sampling conversion, token/result helpers.
-- `experiment_models.py` — experiment request bodies.
 
 URL paths carry `{session_id}` for a multi-session shape, but the impl is
 single-session: the one session has exactly id `"default"`; everything else 404s.
@@ -305,8 +303,6 @@ not a re-render pass.
 
 - `GET` list, `GET /{name}` profile JSON, `DELETE /{name}`
   (also drops the name from `default_steering`).
-- `GET /{name}/diagnostics` — 16-bucket `‖baked‖` histogram + per-layer magnitudes +
-  the `diagnostics_by_layer` blocks when present.
 - `GET /vectors/pairwise?a=&b=` — cross-layer **whitened** cosine matrix between two
   named vectors / probes. Mahalanobis-only (no `metric` param, no Euclidean path):
   whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer frame.
@@ -346,14 +342,6 @@ Cast roster (phase 3): `GET .../tree/cast` (label → member), `PUT
 non-empty) and the `op="cast"` `tree_mutated` frame. `tree/branch` takes an
 optional `role` override — with the engine's scene mode this is the seat-swap
 branch primitive.
-
-### experiment_routes.py
-
-`POST /sessions/{id}/experiments/fan` — JSON alpha grid over one prompt. Body
-`{prompt, grid: {name: [alphas]}, base_steering?, sampling?, thinking?, raw?}`. The
-grid is validated server-side (empty → 400), then `session.generate_sweep(...,
-stateless=False)` runs in a worker thread under the lock. Returns `{kind, total,
-node_ids, rows}`.
 
 ### lens_routes.py — Jacobian-lens routes
 

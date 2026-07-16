@@ -51,6 +51,7 @@ def register_web_routes(app: FastAPI) -> None:
     ``--no-web`` opts out for production / proxied deployments.
     Library callers using ``create_app`` directly default-off.
     """
+    from fastapi import HTTPException
     from fastapi.responses import FileResponse
     from fastapi.staticfiles import StaticFiles
 
@@ -97,6 +98,16 @@ def register_web_routes(app: FastAPI) -> None:
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def _spa_fallback(full_path: str) -> FileResponse:
+        # Never turn a removed native route into a successful SPA response.
+        # The style guide is an internal development artifact, not a public
+        # dashboard page; its old route and descendants stay unavailable too.
+        if full_path == "styleguide" or full_path.startswith("styleguide/"):
+            raise HTTPException(404, "not found")
+        if (
+            full_path in {"api", "v1", "saklas"}
+            or full_path.startswith(("api/", "v1/", "saklas/"))
+        ):
+            raise HTTPException(404, "not found")
         direct = top_level_files.get(full_path)
         if direct is not None:
             return FileResponse(str(direct))

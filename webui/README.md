@@ -44,16 +44,14 @@ The desktop shell has three permanent work areas:
 
 Below 1280 px those same areas become explicit `threads`, `chat`, and
 `instruments` views. Dense tools open in a focus-trapped drawer. The command
-palette (`⌘K` / `Ctrl+K`) is the global launcher. `/styleguide` mounts the living
-component and token specimen without bootstrapping a Saklas session.
+palette (`⌘K` / `Ctrl+K`) is the global launcher.
 
 ## Source map
 
 ```text
 src/
-  main.ts                    app/styleguide entry point
+  main.ts                    app entry point
   App.svelte                 shell, compact navigation, drawer host
-  styleguide/                living design-system page
   panels/
     Chat.svelte              turn surface and role-plan composer
     RawBuffer.svelte         raw transcript surface

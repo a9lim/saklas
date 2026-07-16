@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from operator import itemgetter
 from typing import Any
 
 from saklas.core.profile import Profile
-from saklas.core.session import SaklasSession
 from saklas.server.native_common import NativeRequest
 
 
@@ -29,14 +27,9 @@ class BakeVectorRequest(NativeRequest):
 
 
 def profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
-    layer_norms = [(idx, float(vec.norm().item())) for idx, vec in profile.items()]
-    top = sorted(layer_norms, key=itemgetter(1), reverse=True)[:5]
-    per_layer_norms = {str(idx): round(mag, 6) for idx, mag in sorted(layer_norms)}
     return {
         "name": name,
         "layers": profile.layers,
-        "top_layers": [{"layer": idx, "magnitude": round(m, 4)} for idx, m in top],
-        "per_layer_norms": per_layer_norms,
         "metadata": profile.metadata,
     }
 
@@ -49,20 +42,3 @@ def extract_registry_name(canonical: str, namespace: str | None) -> str:
         bare, suffix = canonical.rsplit(":", 1)
         return f"{namespace}/{bare}:{suffix}"
     return f"{namespace}/{canonical}"
-
-
-def probe_profile_tensors(
-    session: SaklasSession, name: str,
-) -> dict[int, Any] | None:
-    """Folded per-layer direction view of a vector probe, or ``None``."""
-    manifold = session.monitor.manifolds.get(name)
-    if manifold is None:
-        return None
-    from saklas.core.vectors import (
-        folded_vector_directions,
-        is_foldable_vector_manifold,
-    )
-
-    if not is_foldable_vector_manifold(manifold):
-        return None
-    return folded_vector_directions(manifold)

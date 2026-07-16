@@ -9,7 +9,7 @@
   //   lens     — the Jacobian-lens surface (JLensPanel) · blue
   //
   // The split is presentational — a lens steer chip and a subspace card
-  // serialize into the same expression, which the persistent RecipeBar
+  // serialize into the same expression, which the persistent steering bar
   // above the tabs keeps visible across all four.  With no fitted lens the
   // lens tab hosts the "fit j-lens" button, so the absent channel
   // advertises itself; the SAE tab offers a release picker when unloaded.
