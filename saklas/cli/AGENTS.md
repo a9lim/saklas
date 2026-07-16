@@ -13,7 +13,24 @@ fetch/ls/show/use/rm), with lens retaining top/decompose. There is no
 — install via `pack install` and export via `pack export gguf`. Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
 - `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
-- `cli/runners.py` — every `_run_X` plus the shared helpers below
+- `cli/runners/` — every `_run_X`, one module per verb group, re-exported from
+  the package `__init__`:
+  - `runners/shared.py` — the cross-group helpers below (`_make_session`,
+    `_load_effective_config`, `_print_startup` / `_print_model_info`,
+    `_setup_steering_vectors` / `_warmup_session`, `_resolve_probes`, and the
+    `_resolve_manifold_ns_name` / `_resolve_manifold_folder` /
+    `_split_manifold_ns_name` / `_iter_manifold_folders` name resolvers)
+  - `runners/{serve,manifold,pack,template,config,lens,sae,experiment}.py` — the
+    `_run_*` runners for each verb group plus that group's dispatch dict
+    (`_MANIFOLD_RUNNERS` / `_PACK_RUNNERS` / …), kept next to their runners
+  - `runners/__init__.py` re-exports every runner + helper, so the historical
+    `saklas.cli.runners.<name>` import/patch surface is unchanged. The
+    session/config helpers the test-suite swaps at the package level
+    (`_make_session`, `_print_startup`, `_print_model_info`,
+    `_load_effective_config`, the `_fold_*` folders,
+    `_load_or_fit_transfer_alignment`) are invoked by the submodule runners
+    *through* the package object (`import saklas.cli.runners as _pkg`), so a
+    `monkeypatch.setattr("saklas.cli.runners.<name>", …)` still lands.
 - `cli/config_file.py` — `ConfigFile` dataclass + `compose` / `apply_flag_overrides`
   / `ensure_vectors_installed`
 
@@ -81,8 +98,8 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
 
 ## Config loading
 
-`_load_effective_config(args)` (in `runners.py`) is the shared entry point every
-`-c`-taking subcommand calls. It composes `~/.saklas/config.yaml` + explicit `-c`
+`_load_effective_config(args)` (in `runners/shared.py`) is the shared entry point
+every `-c`-taking subcommand calls. It composes `~/.saklas/config.yaml` + explicit `-c`
 files via `ConfigFile.effective(extras, include_default=True)`, runs
 `apply_flag_overrides` for CLI-supplied values, then stamps in place: `args.model`
 (if YAML supplied it), `args.temperature`, `args.top_p`, `args.thinking`,
@@ -205,7 +222,10 @@ and acquisition.
 - `manifold transfer`: `name`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
   Fits/loads a Procrustes alignment and writes the target's `from-<safe_src>`
   **manifold** tensor via `transfer_manifold` — one transfer path (the old
-  vector-side transfer bridge is gone). The runner materializes the target's
+  vector-side transfer bridge is gone). `_run_manifold_transfer` is now a thin
+  caller: the single-flight locking / cache-proof / retry-on-race orchestration
+  lives in `io.alignment.load_or_fit_transfer_alignment` (see io/AGENTS.md).
+  That orchestration materializes the target's
   proven neutral cache only for source-tensor layers and builds the whitener from
   those resident rows. A cached alignment loads no model; if requested map layers
   are missing and both

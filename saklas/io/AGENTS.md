@@ -422,9 +422,29 @@ model. Existing factor pointers are carried forward and only missing requested
 layers are fitted/written; `-f` recomputes alignment/transfer output but does not
 recapture an exact neutral cache. A narrow transfer therefore does not digest,
 materialize, fit, or whiten unrelated layers. When a cold cache fill necessarily
-captures a full roster before requested coverage is known, the transfer runner
+captures a full roster before requested coverage is known, the orchestration
 immediately narrows both seed mappings and releases unrequested tensor owners;
 the complete roster remains only in the reusable durable cache.
+
+`load_or_fit_transfer_alignment(src_model, tgt_model, *, force, label,
+requested_layers=None) → (M, quality_per_layer, map_path, source_identity,
+target_identity, target_whitener, target_layer_means)` is the **public**
+single-flight orchestrator that wraps the primitives above (was
+`cli/runners.py::_load_or_fit_transfer_alignment`; promoted here so it lives
+beside them). `manifold transfer`'s runner is now a thin caller. The concurrency
+semantics are load-bearing: the `alignment_fit_lock` wraps the whole directional
+transaction and the per-model `neutral_fit_lock` is taken **before** model
+construction (so concurrent cold transfers sharing a model never duplicate the
+load); cache/source identity is proven by `validate_neutral_cache_metadata(...,
+verify_payload=False)` + `neutral_cache_identity` **without hashing any tensor
+payload**; a complete cached-map hit drops the source seed rows and never builds
+the source model; the roster is narrowed to `requested_layers ∩ available`; and a
+cache writer racing the metadata preflight is handled by restarting the
+directional transaction (`_load_or_fit_transfer_alignment_locked` recursion) under
+the already-held outer lock. It calls `sys.exit(1)` (with the caller's `label`
+prefix) on no-shared-layers / `AlignmentError`, exactly as the former CLI helper
+did.
+
 `fit_alignment(src, tgt, *, min_shared_layers=10, requested_layers=...,
 available_shared_layers=...) → {layer: LayerAlignment}`
 (row-space orthogonal Procrustes for matched dim, rectangular minimum-norm

@@ -31,11 +31,12 @@ import hashlib
 import json
 import math
 import logging
+import sys
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import torch
 from safetensors import safe_open
@@ -1254,3 +1255,255 @@ def load_alignment_map(
                 src_model_id, tgt_model_id, e,
             )
             return None
+
+
+# ---------------------------------------------------------------------------
+# Transfer-alignment orchestration
+# ---------------------------------------------------------------------------
+#
+# Single-flight locking + cache-proof + retry-on-race orchestration that loads
+# or fits a complete source->target Procrustes alignment and returns the
+# identity-matched target metric.  Promoted out of ``cli/runners.py`` so it
+# lives beside the primitives it wraps (``load_alignment_map`` /
+# ``validate_neutral_cache_metadata`` / ``fit_alignment`` / ``save_alignment_map``).
+# Concurrency semantics (locking order, proof-checking without payload hashing,
+# roster narrowing, model-construction avoidance on cache hit, retry-on-race
+# recursion) are load-bearing and documented in ``io/AGENTS.md``.
+
+
+def _target_whitener_from_neutral_activations(
+    activations: dict[int, Any],
+) -> Any:
+    """Build the transfer target metric from an already-proven row roster."""
+    from saklas.core.mahalanobis import LayerWhitener
+
+    return LayerWhitener.from_neutral_activations(
+        activations,
+        {
+            layer: tensor.mean(dim=0)
+            for layer, tensor in activations.items()
+        },
+    )
+
+
+def load_or_fit_transfer_alignment(
+    src_model: str,
+    tgt_model: str,
+    *,
+    force: bool,
+    label: str,
+    requested_layers: "Sequence[int] | None" = None,
+) -> tuple[
+    dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any], Any,
+    dict[int, Any],
+]:
+    """Single-flight a complete alignment plus its target metric."""
+    with alignment_fit_lock(src_model, tgt_model):
+        return _load_or_fit_transfer_alignment_locked(
+            src_model, tgt_model, force=force, label=label,
+            requested_layers=requested_layers,
+        )
+
+
+def _load_or_fit_transfer_alignment_locked(
+    src_model: str,
+    tgt_model: str,
+    *,
+    force: bool,
+    label: str,
+    requested_layers: "Sequence[int] | None" = None,
+) -> tuple[
+    dict[int, Any], dict[int, float], Path, dict[str, Any], dict[str, Any], Any,
+    dict[int, Any],
+]:
+    """Load or fit an alignment and return its identity-matched target whitener."""
+    from saklas.core.model import model_source_fingerprint
+    from saklas.core.session import SaklasSession
+
+    wanted_arg = (
+        None if requested_layers is None
+        else {int(layer) for layer in requested_layers}
+    )
+
+    def _proven_sidecar(model_id: str) -> dict[str, Any] | None:
+        """Prove cache/source identity without hashing any tensor payload."""
+        try:
+            source = model_source_fingerprint(model_id)
+            if source is None:
+                return None
+            sidecar = validate_neutral_cache_metadata(
+                model_id, verify_payload=False,
+            )
+            if sidecar.get("model_source_fingerprint") != source:
+                return None
+            return sidecar
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+            return None
+
+    def _load_proven_rows(
+        model_id: str, layers: set[int] | None,
+    ) -> tuple[dict[int, Any], dict[str, Any]] | None:
+        before = _proven_sidecar(model_id)
+        if before is None:
+            return None
+        try:
+            rows, after = load_validated_neutral_cache(
+                model_id, requested_layers=layers,
+            )
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+            return None
+        if neutral_cache_identity(before) != neutral_cache_identity(after):
+            return None
+        return rows, after
+
+    def _load_or_capture_rows(
+        model_id: str, layers: set[int] | None,
+    ) -> tuple[dict[int, Any], dict[str, Any]]:
+        cached_rows = _load_proven_rows(model_id, layers)
+        if cached_rows is not None:
+            return cached_rows
+        # Single-flight starts before model construction, not merely before the
+        # neutral forward. Two directional transfers sharing a cold model cache
+        # therefore incur one large model load as well as one capture.
+        with neutral_fit_lock(model_id):
+            cached_rows = _load_proven_rows(model_id, layers)
+            if cached_rows is not None:
+                return cached_rows
+            with SaklasSession.from_pretrained(
+                model_id, device="auto", probes=[],
+            ) as session:
+                all_rows, sidecar = (
+                    _load_or_compute_neutral_activations_with_metadata_locked(
+                        session.model, session.tokenizer, session.layers,
+                        model_id=model_id, force=False,
+                    )
+                )
+            if layers is None:
+                return all_rows, sidecar
+            return (
+                {layer: value for layer, value in all_rows.items() if layer in layers},
+                sidecar,
+            )
+
+    src_sidecar = _proven_sidecar(src_model)
+    tgt_sidecar = _proven_sidecar(tgt_model)
+    src_seed_rows: dict[int, Any] | None = None
+    tgt_seed_rows: dict[int, Any] | None = None
+    if src_sidecar is None:
+        src_seed_rows, src_sidecar = _load_or_capture_rows(src_model, None)
+    if tgt_sidecar is None:
+        tgt_seed_rows, tgt_sidecar = _load_or_capture_rows(tgt_model, None)
+
+    src_identity = neutral_cache_identity(src_sidecar)
+    tgt_identity = neutral_cache_identity(tgt_sidecar)
+    expected_tgt_identity = tgt_identity
+    available = set(int(layer) for layer in src_sidecar.get("layers", [])) & set(
+        int(layer) for layer in tgt_sidecar.get("layers", [])
+    )
+    wanted = available if wanted_arg is None else (available & wanted_arg)
+    if not wanted:
+        print(f"{label}: source and target have no requested shared layers", file=sys.stderr)
+        sys.exit(1)
+
+    # A cold cache fill necessarily captures the model's full neutral roster,
+    # but a narrow transfer must not retain every layer from both models for
+    # the rest of the transaction. Rebinding here drops unrequested tensor
+    # owners as soon as shared coverage is known.
+    if src_seed_rows is not None:
+        src_seed_rows = {layer: src_seed_rows[layer] for layer in wanted}
+    if tgt_seed_rows is not None:
+        tgt_seed_rows = {layer: tgt_seed_rows[layer] for layer in wanted}
+
+    cached = load_alignment_map(
+        src_model, tgt_model,
+        source_identity=src_identity, target_identity=tgt_identity,
+        requested_layers=(set() if force else wanted),
+    )
+    cached_M: dict[int, Any] = {}
+    cached_sidecar: dict[str, Any] = {}
+    if cached is not None:
+        cached_M, cached_sidecar = cached
+    complete_hit = not force and set(cached_M) >= wanted
+    if complete_hit:
+        # The cached map proves the source side; only the target rows are still
+        # needed to reconstruct the exact target metric.
+        src_seed_rows = None
+
+    # Target rows are always needed for the exact target-metric re-bake, but
+    # only for layers the source profile can actually transfer.
+    tgt_loaded = (
+        ({layer: tgt_seed_rows[layer] for layer in wanted}, tgt_sidecar)
+        if tgt_seed_rows is not None else _load_proven_rows(tgt_model, wanted)
+    )
+    if tgt_loaded is None:
+        tgt_acts, tgt_sidecar = _load_or_capture_rows(tgt_model, wanted)
+    else:
+        tgt_acts, tgt_sidecar = tgt_loaded
+    tgt_seed_rows = None
+    if neutral_cache_identity(tgt_sidecar) != expected_tgt_identity:
+        # A cache writer raced the metadata preflight. Restart this directional
+        # transaction under the outer alignment fit lock with the new identity.
+        return _load_or_fit_transfer_alignment_locked(
+            src_model, tgt_model, force=force, label=label,
+            requested_layers=requested_layers,
+        )
+
+    raw_q = cached_sidecar.get("quality_per_layer") or {}
+    quality_per_layer = {int(k): float(v) for k, v in raw_q.items()}
+    map_path, _ = alignment_cache_path(src_model, tgt_model)
+    if complete_hit:
+        selected_quality = {
+            layer: quality_per_layer[layer]
+            for layer in sorted(wanted) if layer in quality_per_layer
+        }
+        return (
+            {layer: cached_M[layer] for layer in sorted(wanted)},
+            selected_quality, map_path, src_identity, expected_tgt_identity,
+            _target_whitener_from_neutral_activations(tgt_acts),
+            {layer: tensor.mean(dim=0) for layer, tensor in tgt_acts.items()},
+        )
+
+    missing = wanted if force else (wanted - set(cached_M))
+    src_loaded = (
+        ({layer: src_seed_rows[layer] for layer in missing}, src_sidecar)
+        if src_seed_rows is not None else _load_proven_rows(src_model, missing)
+    )
+    if src_loaded is None:
+        src_acts, src_sidecar = _load_or_capture_rows(src_model, missing)
+    else:
+        src_acts, src_sidecar = src_loaded
+    src_seed_rows = None
+    if neutral_cache_identity(src_sidecar) != src_identity:
+        return _load_or_fit_transfer_alignment_locked(
+            src_model, tgt_model, force=force, label=label,
+            requested_layers=requested_layers,
+        )
+    tgt_missing = {layer: tgt_acts[layer] for layer in missing}
+    try:
+        fitted = fit_alignment(
+            src_acts, tgt_missing,
+            requested_layers=missing,
+            available_shared_layers=available,
+        )
+    except AlignmentError as e:
+        print(f"{label}: {e}", file=sys.stderr)
+        sys.exit(1)
+    fitted_quality = alignment_quality(fitted, src_acts, tgt_missing)
+    quality_per_layer.update(fitted_quality)
+    map_path = save_alignment_map(
+        fitted, src_model, tgt_model,
+        source_identity=src_identity, target_identity=tgt_identity,
+        quality_per_layer=fitted_quality, extend=bool(cached_sidecar),
+    )
+    result_M = dict(cached_M)
+    result_M.update(fitted)
+    selected_quality = {
+        layer: quality_per_layer[layer]
+        for layer in sorted(wanted) if layer in quality_per_layer
+    }
+    return (
+        {layer: result_M[layer] for layer in sorted(wanted)},
+        selected_quality, map_path, src_identity, expected_tgt_identity,
+        _target_whitener_from_neutral_activations(tgt_acts),
+        {layer: tensor.mean(dim=0) for layer, tensor in tgt_acts.items()},
+    )
