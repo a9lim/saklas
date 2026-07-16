@@ -964,6 +964,27 @@ delegating properties, and `_lens_instrument` itself is a lazy property
 (first touch constructs it — ctor only stores the session ref) so narrow
 test stubs that skip `__init__` self-heal.
 
+`sae.py` — **`SaeInstrument`**, the extracted SAE family (the former
+~560-line session region), same shape: probe registry, live-discovery
+config (`live` — `{layer, top_k, source}`), per-forward stash (one encode
+shared by gates, pinned probes, and the live display on a step),
+per-generation flag, and the read surfaces (`attach`/`detach`/`specs`,
+`score_probes`/`probe_values`, `gate_scalars`, `score_aggregate`,
+`live_readout_step`, `authored_capture`, `enable_live`/`disable_live`/
+`is_live`, `probe_hash` — the `sae-readout-v2` unit-carrying digest,
+`validate_gate` — strength axis only). Backend *residency*
+(`_sae_backend`/`_sae_layer`/`_sae_width`, `_require_sae`,
+`_encode_sae_hidden`), the Neuronpedia metadata cache/fetchers, the
+train/load/unload lifecycle, and the offline `sae_token_readout` stay
+session-side (residency is runtime state shared with steering atoms, not
+probe intent). Session re-exposes state via the same delegating-property +
+lazy-instrument pattern. **Deliberate 5.x semantics change:** SAE gate
+scalars no longer emit the fake `:fraction = 0.0` / `:membership = 1.0`
+constants — only the real strength channel (`<name>`/`<name>[0]`); a gate
+on a channel the family can never produce is a composition-preflight error
+(`validate_gate` → `UnsupportedProbeChannelError`), wired at the composer
+in the plan/run slice.
+
 ## triggers.py
 
 `Trigger` (frozen): phase flags + optional `ProbeGate`. `Trigger.active(ctx)`

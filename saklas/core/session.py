@@ -1368,11 +1368,12 @@ class SaklasSession:
         # ``max_act`` (maxActApprox — the corpus-max activation) normalizes the
         # readout channel to a 0..1 strength; entries are lazily fetched.
         self._sae_feature_meta: dict[str, dict[str, Any]] = {}
-        self._live_sae: dict[str, Any] | None = None
-        self._live_sae_active_for_generation: bool = True
-        self._sae_probes: dict[str, dict[str, Any]] = {}
-        self._sae_step_stash: dict[str, Any] | None = None
-        self._last_sae_step_readings: dict[str, "ProbeReading"] | None = None
+        # The SAE read family's probe/live state lives on its instrument
+        # (lazy property, like the lens family); backend residency
+        # (`_sae_backend`/`_sae_layer`/`_sae_width`) and the Neuronpedia
+        # metadata cache stay session-side (shared with steering atoms and
+        # the offline token replay).
+        _ = self._sae_instrument
         # CAA live toggle: when False, per-token monitor scoring is disabled
         # for UI/trait/loom consumers (aggregate-only capture); probe gates
         # still force the per-token subset they need.
@@ -3461,6 +3462,62 @@ class SaklasSession:
     def _generation_jlens_active(self, value: bool) -> None:
         self._lens_instrument.generation_lens_active = bool(value)
 
+    # -- SAE instrument state (delegating views) --
+
+    @property
+    def _sae_instrument(self) -> "SaeInstrument":
+        """The SAE instrument, created lazily on first touch (stub-safe,
+        like ``_lens_instrument``)."""
+        inst = self.__dict__.get("_sae_instrument")
+        if inst is None:
+            from saklas.core.instruments.sae import SaeInstrument
+
+            inst = SaeInstrument(self)
+            self.__dict__["_sae_instrument"] = inst
+        return inst
+
+    @property
+    def _sae_probes(self) -> dict[str, dict[str, Any]]:
+        return self._sae_instrument.probes
+
+    @_sae_probes.setter
+    def _sae_probes(self, value: dict[str, dict[str, Any]]) -> None:
+        self._sae_instrument.probes = value
+
+    @property
+    def _live_sae(self) -> dict[str, Any] | None:
+        return self._sae_instrument.live
+
+    @_live_sae.setter
+    def _live_sae(self, value: "dict[str, Any] | None") -> None:
+        self._sae_instrument.live = value
+
+    @property
+    def _sae_step_stash(self) -> dict[str, Any] | None:
+        return self._sae_instrument.step_stash
+
+    @_sae_step_stash.setter
+    def _sae_step_stash(self, value: "dict[str, Any] | None") -> None:
+        self._sae_instrument.step_stash = value
+
+    @property
+    def _last_sae_step_readings(self) -> "dict[str, ProbeReading] | None":
+        return self._sae_instrument.last_step_readings
+
+    @_last_sae_step_readings.setter
+    def _last_sae_step_readings(
+        self, value: "dict[str, ProbeReading] | None",
+    ) -> None:
+        self._sae_instrument.last_step_readings = value
+
+    @property
+    def _live_sae_active_for_generation(self) -> bool:
+        return self._sae_instrument.active_for_generation
+
+    @_live_sae_active_for_generation.setter
+    def _live_sae_active_for_generation(self, value: bool) -> None:
+        self._sae_instrument.active_for_generation = bool(value)
+
     def enable_live_lens(
         self,
         *,
@@ -3948,29 +4005,16 @@ class SaklasSession:
         return name
 
     def enable_live_sae(self, *, top_k: int = 8) -> dict[str, Any]:
-        """Enable the one-matvec live feature readout at the resident layer."""
-        if not 1 <= int(top_k) <= 100:
-            raise ValueError("top_k must be in [1, 100]")
-        backend, layer, _width = self._require_sae()
-        release = str(backend.release)
-        source = (
-            release
-            if release.startswith(("local:", "saelens:"))
-            else f"saelens:{release}"
-        )
-        self._live_sae = {
-            "layer": layer,
-            "top_k": int(top_k),
-            "source": source,
-        }
-        return {"layer": layer, "top_k": int(top_k)}
+        """Enable the one-matvec live feature readout at the resident layer
+        (delegates to :meth:`SaeInstrument.enable_live`)."""
+        return self._sae_instrument.enable_live(top_k=top_k)
 
     def disable_live_sae(self) -> None:
-        self._live_sae = None
+        self._sae_instrument.disable_live()
 
     @property
     def live_sae(self) -> bool:
-        return self._live_sae is not None
+        return self._sae_instrument.is_live
 
     def _encode_sae_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         backend, layer, width = self._require_sae()
@@ -3997,25 +4041,11 @@ class SaklasSession:
         only: "set[str] | None" = None,
         raw_by_fid: Mapping[int, float] | None = None,
     ) -> dict[str, "ProbeReading"]:
-        if not self._sae_probes:
-            return {}
-        _backend, layer, _width = self._require_sae()
-        if activations is None:
-            if hidden is None or layer not in hidden:
-                return {}
-            activations = self._encode_sae_hidden(hidden[layer])
-        assert activations is not None
-        out: dict[str, ProbeReading] = {}
-        for name, _fid, _raw_value, value in self._sae_probe_values(
-            activations, only=only, raw_by_fid=raw_by_fid,
-        ):
-            out[name] = ProbeReading(
-                fraction=0.0, nearest=[], coords=(value,), residual=0.0,
-                coords_per_layer={layer: (value,)},
-                depth_com=(layer / max(len(self._layers) - 1, 1),),
-                depth_spread=(0.0,),
-            )
-        return out
+        """Score attached SAE probes (delegates to
+        :meth:`SaeInstrument.score_probes`)."""
+        return self._sae_instrument.score_probes(
+            hidden, activations=activations, only=only, raw_by_fid=raw_by_fid,
+        )
 
     def _sae_probe_values(
         self,
@@ -4024,146 +4054,27 @@ class SaklasSession:
         only: "set[str] | None" = None,
         raw_by_fid: Mapping[int, float] | None = None,
     ) -> list[tuple[str, int, float, float]]:
-        """Pinned SAE probe values as ``(name, fid, raw, normalized)``.
-
-        ``raw_by_fid`` is a per-forward cache from a caller that has already
-        transferred selected feature activations (currently the live top-k
-        readout). Normalization always reads the current probe metadata, so a
-        Neuronpedia maxActApprox refresh changes the unit immediately.
-        """
-        names = [
-            name for name in self._sae_probes
-            if only is None or name in only
-        ]
-        if not names:
-            return []
-        fids = [int(self._sae_probes[name]["feature_id"]) for name in names]
-        raw_values_by_fid: dict[int, float] = {
-            int(fid): float(value)
-            for fid, value in (raw_by_fid or {}).items()
-        }
-        missing_fids = [
-            fid for fid in fids
-            if fid not in raw_values_by_fid
-        ]
-        if missing_fids:
-            fid_tensor = self._readout_long_tensor(missing_fids, activations.device)
-            # One host transfer for every not-already-read pinned SAE probe
-            # value.  Live readout top-k rows seed ``raw_by_fid`` first, so
-            # pinned cards that came from the visible top-k avoid a second
-            # selected-feature gather + CPU transfer.
-            raw_values = (
-                activations.index_select(0, fid_tensor)
-                .detach()
-                .to("cpu")
-                .tolist()
-            )
-            for fid, raw_value in zip(missing_fids, raw_values, strict=True):
-                raw_values_by_fid[int(fid)] = float(raw_value)
-        out: list[tuple[str, int, float, float]] = []
-        for name, fid in zip(names, fids, strict=True):
-            spec = self._sae_probes[name]
-            raw_value = float(raw_values_by_fid[fid])
-            value = raw_value
-            # The ONE channel is normalized strength — ``activation /
-            # maxActApprox`` ∈ ~[0,1], apples-to-apples across features like
-            # the lens probes' mean fitted-layer probability. Raw activation only
-            # when no metadata exists (offline / not on Neuronpedia).
-            max_act = spec.get("max_act")
-            if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
-                max_act = self._sae_max_act(fid)
-            if max_act is not None:
-                value = value / float(max_act)
-            out.append((name, fid, raw_value, value))
-        return out
+        """Pinned SAE probe values (delegates to
+        :meth:`SaeInstrument.probe_values`)."""
+        return self._sae_instrument.probe_values(
+            activations, only=only, raw_by_fid=raw_by_fid,
+        )
 
     def _score_sae_gate_scalars(
         self, gate_keys: "set[str] | None" = None,
     ) -> dict[str, float]:
-        if not self._sae_probes:
-            return {}
-        _backend, layer, _width = self._require_sae()
-        only = None
-        if gate_keys:
-            only = {
-                key.split("[", 1)[0]
-                for key in gate_keys
-                if key.split("[", 1)[0] in self._sae_probes
-            }
-            if not only:
-                return {}
-        latest = self._capture.latest_per_layer()
-        if layer not in latest:
-            return {}
-        acts = self._encode_sae_hidden(latest[layer])
-        scalars: dict[str, float] = {}
-        values = self._sae_probe_values(
-            acts, only=only,
-        )
-        self._sae_step_stash = {
-            "activations": acts,
-            "fresh": True,
-            "raw_by_fid": {
-                int(fid): float(raw_value)
-                for _name, fid, raw_value, _value in values
-            },
-        }
-        for name, _fid, _raw_value, value in values:
-            scalars[name] = value
-            scalars[f"{name}[0]"] = value
-            scalars[f"{name}:fraction"] = 0.0
-            scalars[f"{name}:membership"] = 1.0
-        return scalars
+        """Per-forward SAE gate scalars (delegates to
+        :meth:`SaeInstrument.gate_scalars`; emits only the real strength
+        channel — the historical fake ``:fraction``/``:membership``
+        constants are gone)."""
+        return self._sae_instrument.gate_scalars(gate_keys)
 
     def _live_sae_readout_step(
         self,
     ) -> list[tuple[int, float, str | None, float | None]] | None:
-        state = self._live_sae
-        if state is None or not self._live_sae_active_for_generation:
-            return None
-        layer = int(state["layer"])
-        buckets = self._capture.per_layer_buckets()
-        if not buckets.get(layer):
-            return None
-        stash = self._sae_step_stash
-        stashed_raw_by_fid: dict[int, float] = {}
-        if stash is not None and stash.get("fresh"):
-            stash["fresh"] = False
-            acts = stash["activations"]
-            stashed_raw_by_fid = {
-                int(fid): float(value)
-                for fid, value in (stash.get("raw_by_fid") or {}).items()
-            }
-        else:
-            acts = self._encode_sae_hidden(buckets[layer][-1])
-        k = min(int(state["top_k"]), int(acts.numel()))
-        values, indices = torch.topk(acts, k=k)
-        value_list = values.detach().to("cpu").tolist()
-        id_list = indices.detach().to("cpu").tolist()
-        raw_by_fid = {
-            fid: value for fid, value in zip(id_list, value_list, strict=True)
-        }
-        if stashed_raw_by_fid:
-            raw_by_fid = {**stashed_raw_by_fid, **raw_by_fid}
-        if self._sae_probes:
-            self._last_sae_step_readings = self._score_sae_probes(
-                activations=acts,
-                raw_by_fid=raw_by_fid,
-            )
-        else:
-            self._last_sae_step_readings = None
-        # Rows carry ``max_act`` (cached-only — the decode loop never fetches)
-        # so clients can render the normalized 0..1 strength beside the raw
-        # activation; ``None`` until the metadata backfill lands.
-        return [
-            (
-                int(idx),
-                float(value),
-                self._sae_label(int(idx)),
-                self._sae_max_act(int(idx)),
-            )
-            for value, idx in zip(value_list, id_list, strict=True)
-        ]
+        """One decode step's live SAE top-k (delegates to
+        :meth:`SaeInstrument.live_readout_step`)."""
+        return self._sae_instrument.live_readout_step()
 
     def _score_sae_probes_aggregate(
         self,
@@ -4171,21 +4082,11 @@ class SaklasSession:
         *,
         pooled: dict[int, torch.Tensor] | None = None,
     ) -> dict[str, "ProbeReading"]:
-        if not self._sae_probes or not generated_ids:
-            return {}
-        if pooled is None:
-            agg_fwd = self._aggregate_forward_index(generated_ids)
-            if agg_fwd is None:
-                return {}
-            pooled = self._capture.tail_slice_at(agg_fwd)
-            if not pooled:
-                stacked = self._capture.stacked()
-                pooled = {
-                    layer: rows[agg_fwd]
-                    for layer, rows in stacked.items()
-                    if rows.shape[0] > agg_fwd
-                }
-        return self._score_sae_probes(pooled) if pooled else {}
+        """End-of-gen SAE-probe aggregate (delegates to
+        :meth:`SaeInstrument.score_aggregate`)."""
+        return self._sae_instrument.score_aggregate(
+            generated_ids, pooled=pooled,
+        )
 
     def sae_token_readout(
         self,
@@ -6286,20 +6187,10 @@ class SaklasSession:
         return name
 
     def _add_sae_probe(self, selector: str, *, as_name: str | None) -> str:
-        """Attach a resident SAE feature as a one-channel readout probe."""
-        raw_id = selector.split("/", 1)[1]
-        validated = self.validate_sae_feature(raw_id)
-        idx = int(validated["id"])
-        name = as_name if as_name is not None else f"sae/{idx}"
-        with self._model_exclusive(
-            "add_probe called while another model operation is in flight; retry shortly"
-        ):
-            self._sae_probes[name] = {
-                "feature_id": idx,
-                "layer": int(validated["layer"]),
-                "label": validated.get("label"),
-                "max_act": validated.get("max_act"),
-            }
+        """Attach a resident SAE feature as a one-channel readout probe
+        (delegates to :meth:`SaeInstrument.attach`; the session owns the
+        cache invalidation at this boundary)."""
+        name = self._sae_instrument.attach(selector, as_name=as_name)
         self._invalidate_prefix_cache()
         self._probe_hash_cache.pop(name, None)
         self._invalidate_analytics_cache()
@@ -6333,12 +6224,12 @@ class SaklasSession:
 
     @property
     def sae_probe_names(self) -> list[str]:
-        return list(self._sae_probes)
+        return self._sae_instrument.names
 
     @property
     def sae_probe_specs(self) -> dict[str, dict[str, Any]]:
         """Snapshot of attached SAE probe specifications."""
-        return {name: dict(spec) for name, spec in self._sae_probes.items()}
+        return self._sae_instrument.specs()
 
     def _score_lens_probes(
         self,
@@ -6456,22 +6347,13 @@ class SaklasSession:
             # so transcript drift detection works across a semantics change.
             self._probe_hash_cache[name] = lens_digest
             return lens_digest
-        sae_spec = self._sae_probes.get(name)
-        if sae_spec is not None:
-            # v2: the channel is normalized strength (activation /
-            # maxActApprox) when metadata exists, raw activation otherwise —
-            # ``max_act`` is therefore part of the channel identity (it sets
-            # the unit), so drift detection catches a unit change.
-            import hashlib
-            info = self.sae_info or {}
-            digest = hashlib.sha256(repr((
-                "sae-readout-v2", self.model_id, info.get("fingerprint"),
-                info.get("release"), sae_spec["layer"],
-                sae_spec["feature_id"],
-                self._sae_max_act(int(sae_spec["feature_id"])),
-            )).encode("utf-8")).hexdigest()
-            self._probe_hash_cache[name] = digest
-            return digest
+        sae_digest = self._sae_instrument.probe_hash(name)
+        if sae_digest is not None:
+            # The instrument hashes the readout-channel identity; ``max_act``
+            # is part of it (it sets the unit), so drift detection catches a
+            # unit change.
+            self._probe_hash_cache[name] = sae_digest
+            return sae_digest
         manifold = self._monitor.manifolds.get(name)
         if manifold is None:
             return None
@@ -7938,35 +7820,9 @@ class SaklasSession:
         list[tuple[int, float, str | None, float | None]],
         dict[str, ProbeReading],
     ] | None:
-        """Live SAE payload for one retained authored producer row."""
-        state = self._live_sae
-        if state is None or not self._live_sae_active_for_generation:
-            return None
-        layer = int(state["layer"])
-        if layer not in hidden:
-            return None
-        activations = self._encode_sae_hidden(hidden[layer])
-        k = min(int(state["top_k"]), int(activations.numel()))
-        values, indices = torch.topk(activations, k=k)
-        value_list = values.detach().to("cpu").tolist()
-        id_list = indices.detach().to("cpu").tolist()
-        raw_by_fid = {
-            int(fid): float(value)
-            for fid, value in zip(id_list, value_list, strict=True)
-        }
-        readings = self._score_sae_probes(
-            activations=activations, raw_by_fid=raw_by_fid,
-        ) if self._sae_probes else {}
-        rows = [
-            (
-                int(fid),
-                float(value),
-                self._sae_label(int(fid)),
-                self._sae_max_act(int(fid)),
-            )
-            for value, fid in zip(value_list, id_list, strict=True)
-        ]
-        return rows, readings
+        """Live SAE payload for one retained authored producer row
+        (delegates to :meth:`SaeInstrument.authored_capture`)."""
+        return self._sae_instrument.authored_capture(hidden)
 
     def _persist_authored_prompt_captures(
         self,

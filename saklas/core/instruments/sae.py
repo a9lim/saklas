@@ -1,0 +1,418 @@
+"""The SAE instrument: feature probes, gates, live discovery.
+
+Owns everything SAE-probe-shaped that used to live inline in
+``SaklasSession`` (the ~560-line SAE region): the probe registry, the
+live-discovery config, the per-forward stash, the per-generation active
+flag, and the read surfaces (attach / per-step scoring / gate scalars /
+finalize aggregate / live display step / authored-prefill computation).
+The session re-exposes the state fields under their historical private
+names via delegating properties.
+
+Backend *residency* stays session-side (``_sae_backend``/``_sae_layer``/
+``_sae_width``, ``_require_sae``, ``_encode_sae_hidden``, the Neuronpedia
+metadata cache + fetchers, train/load/unload lifecycle): residency is
+runtime state shared with steering atoms and the offline token replay,
+not probe intent — the same RuntimeState/LiveConfig split the lens
+family keeps.
+
+Deliberate semantics change riding this extraction (the 5.x clean
+break): **the fake gate channels die.**  SAE gate scalars historically
+emitted ``<name>:fraction = 0.0`` and ``<name>:membership = 1.0`` —
+constants masquerading as measurements, an artifact of pretending a
+feature activation is a geometry reading.  An SAE probe now emits only
+its one real channel (``<name>`` / ``<name>[0]``, the normalized
+strength); a gate on a channel the family can never produce is a
+composition-preflight error (``validate_gate``), not a silent constant.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from typing import Any, Mapping, TYPE_CHECKING
+
+import torch
+
+from saklas.core.instruments.types import (
+    Axis,
+    GateRef,
+    validate_gate_channels,
+)
+
+if TYPE_CHECKING:
+    from saklas.core.results import ProbeReading
+    from saklas.core.session import SaklasSession
+
+
+class SaeInstrument:
+    """Session-lifetime handle for the SAE read family."""
+
+    family = "sae"
+
+    #: Gate channels an SAE probe can produce: the one activation axis.
+    _GATE_CHANNELS: tuple[type, ...] = (Axis,)
+
+    def __init__(self, session: "SaklasSession") -> None:
+        self._session = session
+        # Pinned SAE feature probes: name -> {feature_id, layer, label,
+        # max_act}.  NOT monitor probes — they read the encoder channel.
+        self.probes: dict[str, dict[str, Any]] = {}
+        # Live feature discovery: {layer, top_k, source}, or None when off.
+        self.live: dict[str, Any] | None = None
+        # Per-forward stash: the gate callback encodes first (score_callback
+        # runs before the token tap), the display step reuses the encoded
+        # activations + already-transferred raw values.  Reset per generation.
+        self.step_stash: dict[str, Any] | None = None
+        self.active_for_generation: bool = True
+        self.last_step_readings: dict[str, "ProbeReading"] | None = None
+
+    # -------------------------------------------------------------- registry
+
+    def attach(self, selector: str, *, as_name: str | None = None) -> str:
+        """Attach a resident SAE feature as a one-channel readout probe.
+
+        Cache invalidation (prefix cache, probe-hash cache, analytics) is
+        the session's job at its ``add_probe`` boundary.
+        """
+        session = self._session
+        raw_id = selector.split("/", 1)[1]
+        validated = session.validate_sae_feature(raw_id)
+        idx = int(validated["id"])
+        name = as_name if as_name is not None else f"sae/{idx}"
+        with session._model_exclusive(
+            "add_probe called while another model operation is in flight; retry shortly"
+        ):
+            self.probes[name] = {
+                "feature_id": idx,
+                "layer": int(validated["layer"]),
+                "label": validated.get("label"),
+                "max_act": validated.get("max_act"),
+            }
+        return name
+
+    def detach(self, name: str) -> None:
+        del self.probes[name]
+
+    def specs(self) -> dict[str, dict[str, Any]]:
+        """Snapshot of attached probe specifications."""
+        return {name: dict(spec) for name, spec in self.probes.items()}
+
+    @property
+    def names(self) -> list[str]:
+        return list(self.probes)
+
+    def validate_gate(self, ref: GateRef) -> None:
+        validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
+
+    def probe_hash(self, name: str) -> str | None:
+        """Readout-channel identity digest.
+
+        v2: the channel is normalized strength (activation / maxActApprox)
+        when metadata exists, raw activation otherwise — ``max_act`` is
+        part of the channel identity (it sets the unit), so drift
+        detection catches a unit change.
+        """
+        spec = self.probes.get(name)
+        if spec is None:
+            return None
+        session = self._session
+        info = session.sae_info or {}
+        return hashlib.sha256(repr((
+            "sae-readout-v2", session.model_id, info.get("fingerprint"),
+            info.get("release"), spec["layer"],
+            spec["feature_id"],
+            session._sae_max_act(int(spec["feature_id"])),
+        )).encode("utf-8")).hexdigest()
+
+    # ---------------------------------------------------------------- scoring
+
+    def score_probes(
+        self, hidden: dict[int, torch.Tensor] | None = None,
+        *, activations: torch.Tensor | None = None,
+        only: "set[str] | None" = None,
+        raw_by_fid: Mapping[int, float] | None = None,
+    ) -> dict[str, "ProbeReading"]:
+        from saklas.core.results import ProbeReading
+
+        session = self._session
+        if not self.probes:
+            return {}
+        _backend, layer, _width = session._require_sae()
+        if activations is None:
+            if hidden is None or layer not in hidden:
+                return {}
+            activations = session._encode_sae_hidden(hidden[layer])
+        assert activations is not None
+        out: dict[str, ProbeReading] = {}
+        for name, _fid, _raw_value, value in self.probe_values(
+            activations, only=only, raw_by_fid=raw_by_fid,
+        ):
+            out[name] = ProbeReading(
+                fraction=0.0, nearest=[], coords=(value,), residual=0.0,
+                coords_per_layer={layer: (value,)},
+                depth_com=(layer / max(len(session._layers) - 1, 1),),
+                depth_spread=(0.0,),
+            )
+        return out
+
+    def probe_values(
+        self,
+        activations: torch.Tensor,
+        *,
+        only: "set[str] | None" = None,
+        raw_by_fid: Mapping[int, float] | None = None,
+    ) -> list[tuple[str, int, float, float]]:
+        """Pinned SAE probe values as ``(name, fid, raw, normalized)``.
+
+        ``raw_by_fid`` is a per-forward cache from a caller that has already
+        transferred selected feature activations (currently the live top-k
+        readout). Normalization always reads the current probe metadata, so a
+        Neuronpedia maxActApprox refresh changes the unit immediately.
+        """
+        session = self._session
+        names = [
+            name for name in self.probes
+            if only is None or name in only
+        ]
+        if not names:
+            return []
+        fids = [int(self.probes[name]["feature_id"]) for name in names]
+        raw_values_by_fid: dict[int, float] = {
+            int(fid): float(value)
+            for fid, value in (raw_by_fid or {}).items()
+        }
+        missing_fids = [
+            fid for fid in fids
+            if fid not in raw_values_by_fid
+        ]
+        if missing_fids:
+            fid_tensor = session._readout_long_tensor(
+                missing_fids, activations.device,
+            )
+            # One host transfer for every not-already-read pinned SAE probe
+            # value.  Live readout top-k rows seed ``raw_by_fid`` first, so
+            # pinned cards that came from the visible top-k avoid a second
+            # selected-feature gather + CPU transfer.
+            raw_values = (
+                activations.index_select(0, fid_tensor)
+                .detach()
+                .to("cpu")
+                .tolist()
+            )
+            for fid, raw_value in zip(missing_fids, raw_values, strict=True):
+                raw_values_by_fid[int(fid)] = float(raw_value)
+        out: list[tuple[str, int, float, float]] = []
+        for name, fid in zip(names, fids, strict=True):
+            spec = self.probes[name]
+            raw_value = float(raw_values_by_fid[fid])
+            value = raw_value
+            # The ONE channel is normalized strength — ``activation /
+            # maxActApprox`` ∈ ~[0,1], apples-to-apples across features like
+            # the lens probes' mean fitted-layer probability. Raw activation
+            # only when no metadata exists (offline / not on Neuronpedia).
+            max_act = spec.get("max_act")
+            if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
+                max_act = session._sae_max_act(fid)
+            if max_act is not None:
+                value = value / float(max_act)
+            out.append((name, fid, raw_value, value))
+        return out
+
+    def gate_scalars(
+        self, gate_keys: "set[str] | None" = None,
+    ) -> dict[str, float]:
+        """Per-forward SAE gate scalars from the latest capture slice.
+
+        Emits ONLY the channels an SAE probe actually measures — ``<name>``
+        and ``<name>[0]`` (the normalized strength axis).  The historical
+        fake constants (``:fraction`` 0.0 / ``:membership`` 1.0) are gone:
+        a gate referencing a channel this family can never produce is a
+        composition-preflight error (:meth:`validate_gate`), never a
+        silently-constant comparison.
+        """
+        session = self._session
+        if not self.probes:
+            return {}
+        _backend, layer, _width = session._require_sae()
+        only = None
+        if gate_keys:
+            only = {
+                key.split("[", 1)[0]
+                for key in gate_keys
+                if key.split("[", 1)[0] in self.probes
+            }
+            if not only:
+                return {}
+        latest = session._capture.latest_per_layer()
+        if layer not in latest:
+            return {}
+        acts = session._encode_sae_hidden(latest[layer])
+        scalars: dict[str, float] = {}
+        values = self.probe_values(acts, only=only)
+        self.step_stash = {
+            "activations": acts,
+            "fresh": True,
+            "raw_by_fid": {
+                int(fid): float(raw_value)
+                for _name, fid, raw_value, _value in values
+            },
+        }
+        for name, _fid, _raw_value, value in values:
+            scalars[name] = value
+            scalars[f"{name}[0]"] = value
+        return scalars
+
+    def score_aggregate(
+        self,
+        generated_ids: list[int],
+        *,
+        pooled: dict[int, torch.Tensor] | None = None,
+    ) -> dict[str, "ProbeReading"]:
+        """End-of-gen aggregate pooled at the last content token."""
+        session = self._session
+        if not self.probes or not generated_ids:
+            return {}
+        if pooled is None:
+            agg_fwd = session._aggregate_forward_index(generated_ids)
+            if agg_fwd is None:
+                return {}
+            pooled = session._capture.tail_slice_at(agg_fwd)
+            if not pooled:
+                stacked = session._capture.stacked()
+                pooled = {
+                    layer: rows[agg_fwd]
+                    for layer, rows in stacked.items()
+                    if rows.shape[0] > agg_fwd
+                }
+        return self.score_probes(pooled) if pooled else {}
+
+    # ----------------------------------------------------------- live readout
+
+    def enable_live(self, *, top_k: int = 8) -> dict[str, Any]:
+        """Enable the one-matvec live feature readout at the resident layer."""
+        session = self._session
+        if not 1 <= int(top_k) <= 100:
+            raise ValueError("top_k must be in [1, 100]")
+        backend, layer, _width = session._require_sae()
+        release = str(backend.release)
+        source = (
+            release
+            if release.startswith(("local:", "saelens:"))
+            else f"saelens:{release}"
+        )
+        self.live = {
+            "layer": layer,
+            "top_k": int(top_k),
+            "source": source,
+        }
+        return {"layer": layer, "top_k": int(top_k)}
+
+    def disable_live(self) -> None:
+        self.live = None
+
+    @property
+    def is_live(self) -> bool:
+        return self.live is not None
+
+    def live_readout_step(
+        self,
+    ) -> list[tuple[int, float, str | None, float | None]] | None:
+        """One decode step's live feature top-k from the latest capture slice.
+
+        Reuses the gate callback's encoded activations + raw values when the
+        stash is fresh (one encode shared by gates, pinned probes, and the
+        live display on a step).
+        """
+        session = self._session
+        state = self.live
+        if state is None or not self.active_for_generation:
+            return None
+        layer = int(state["layer"])
+        buckets = session._capture.per_layer_buckets()
+        if not buckets.get(layer):
+            return None
+        stash = self.step_stash
+        stashed_raw_by_fid: dict[int, float] = {}
+        if stash is not None and stash.get("fresh"):
+            stash["fresh"] = False
+            acts = stash["activations"]
+            stashed_raw_by_fid = {
+                int(fid): float(value)
+                for fid, value in (stash.get("raw_by_fid") or {}).items()
+            }
+        else:
+            acts = session._encode_sae_hidden(buckets[layer][-1])
+        k = min(int(state["top_k"]), int(acts.numel()))
+        values, indices = torch.topk(acts, k=k)
+        value_list = values.detach().to("cpu").tolist()
+        id_list = indices.detach().to("cpu").tolist()
+        raw_by_fid = {
+            fid: value for fid, value in zip(id_list, value_list, strict=True)
+        }
+        if stashed_raw_by_fid:
+            raw_by_fid = {**stashed_raw_by_fid, **raw_by_fid}
+        if self.probes:
+            self.last_step_readings = self.score_probes(
+                activations=acts,
+                raw_by_fid=raw_by_fid,
+            )
+        else:
+            self.last_step_readings = None
+        # Rows carry ``max_act`` (cached-only — the decode loop never fetches)
+        # so clients can render the normalized 0..1 strength beside the raw
+        # activation; ``None`` until the metadata backfill lands.
+        return [
+            (
+                int(idx),
+                float(value),
+                session._sae_label(int(idx)),
+                session._sae_max_act(int(idx)),
+            )
+            for value, idx in zip(value_list, id_list, strict=True)
+        ]
+
+    # ------------------------------------------------------- authored prefill
+
+    def authored_capture(
+        self,
+        hidden: dict[int, torch.Tensor],
+    ) -> tuple[
+        list[tuple[int, float, str | None, float | None]],
+        dict[str, "ProbeReading"],
+    ] | None:
+        """Live SAE payload for one retained authored producer row.
+
+        Computation only — the token-matching orchestration stays in the
+        session's authored-prefill path.
+        """
+        session = self._session
+        state = self.live
+        if state is None or not self.active_for_generation:
+            return None
+        layer = int(state["layer"])
+        if layer not in hidden:
+            return None
+        activations = session._encode_sae_hidden(hidden[layer])
+        k = min(int(state["top_k"]), int(activations.numel()))
+        values, indices = torch.topk(activations, k=k)
+        value_list = values.detach().to("cpu").tolist()
+        id_list = indices.detach().to("cpu").tolist()
+        raw_by_fid = {
+            int(fid): float(value)
+            for fid, value in zip(id_list, value_list, strict=True)
+        }
+        readings = self.score_probes(
+            activations=activations, raw_by_fid=raw_by_fid,
+        ) if self.probes else {}
+        rows = [
+            (
+                int(fid),
+                float(value),
+                session._sae_label(int(fid)),
+                session._sae_max_act(int(fid)),
+            )
+            for value, fid in zip(value_list, id_list, strict=True)
+        ]
+        return rows, readings
+
+
+__all__ = ["SaeInstrument"]

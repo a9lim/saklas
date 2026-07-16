@@ -165,7 +165,7 @@ def test_live_sae_readout_seeds_topk_raw_values_for_pinned_probes() -> None:
     }
     session.enable_live_sae(top_k=3)
     seen_raw: dict[int, float] = {}
-    original = session._sae_probe_values
+    original = session._sae_instrument.probe_values
 
     def spy_probe_values(
         activations: torch.Tensor,
@@ -178,7 +178,7 @@ def test_live_sae_readout_seeds_topk_raw_values_for_pinned_probes() -> None:
             activations, only=only, raw_by_fid=raw_by_fid,
         )
 
-    session._sae_probe_values = spy_probe_values  # type: ignore[method-assign]
+    session._sae_instrument.probe_values = spy_probe_values  # type: ignore[method-assign]
 
     session._live_sae_readout_step()
 
@@ -204,8 +204,11 @@ def test_sae_gate_scalar_stashes_activations_for_live_step() -> None:
     scalars = session._score_sae_gate_scalars()
     assert scalars["sae/1"] == pytest.approx(3.0)
     assert scalars["sae/1[0]"] == pytest.approx(3.0)
-    assert scalars["sae/1:fraction"] == pytest.approx(0.0)
-    assert scalars["sae/1:membership"] == pytest.approx(1.0)
+    # The fake geometry constants are gone (5.x): an SAE probe emits only
+    # its real strength channel; unsupported channels are a preflight error,
+    # never a silently-constant comparison.
+    assert "sae/1:fraction" not in scalars
+    assert "sae/1:membership" not in scalars
     assert session._sae_step_stash is not None
     assert session._sae_step_stash["fresh"] is True
 
@@ -243,7 +246,7 @@ def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
     }
     session.enable_live_sae(top_k=1)  # feature 2 wins; gated feature 0 is outside top-k.
     seen_raw: dict[int, float] = {}
-    original = session._sae_probe_values
+    original = session._sae_instrument.probe_values
 
     def spy_probe_values(
         activations: torch.Tensor,
@@ -255,7 +258,7 @@ def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
         seen_raw.update(raw_by_fid or {})
         return original(activations, raw_by_fid=raw_by_fid)
 
-    session._sae_probe_values = spy_probe_values  # type: ignore[method-assign]
+    session._sae_instrument.probe_values = spy_probe_values  # type: ignore[method-assign]
 
     scalars = session._score_sae_gate_scalars({"sae/0"})
     readout = session._live_sae_readout_step()
