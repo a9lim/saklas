@@ -1,19 +1,19 @@
 """Unit tests for canonical_concept_name / _slug.
 
 CPU-only: tests pure string normalization without loading a model.
-Bipolar separator is `.` (see saklas.session.BIPOLAR_SEP).
+Bipolar separator is `.` (see saklas.core.naming.BIPOLAR_SEP).
 """
 from __future__ import annotations
 
 from typing import Any
 
+from saklas.core.naming import canonical_concept_name
 from saklas.core.session import (
     SaklasSession,
     _humanize_concept,
     _role_for,
     _split_composite_source,
     _system_for,
-    canonical_concept_name,
 )
 
 
@@ -103,7 +103,7 @@ class TestHumanize:
 
     def test_generate_responses_humanizes_and_sets_role(self, monkeypatch: Any):
         """generate_responses humanizes the system prompt + sets the kind role."""
-        from saklas.core import vectors as V
+        from saklas.core import capture as V
         monkeypatch.setattr(
             V, "_load_baseline_prompts", lambda: ["How are you today?"],
         )
@@ -127,7 +127,7 @@ class TestHumanize:
         assert captured["role"] == "someone_artificial_intelligence"
         # 2 samples x 1 baseline prompt = 2 responses, each paired with the bare
         # prompt (the shared brevity directive rides the system prompt instead).
-        from saklas.core.vectors import _LENGTH_DIRECTIVE
+        from saklas.core.capture import _LENGTH_DIRECTIVE
         assert len(out["artificial_intelligence"]) == 2
         assert captured["prompts"] == ["How are you today?", "How are you today?"]
         assert captured["system"].startswith(_LENGTH_DIRECTIVE)

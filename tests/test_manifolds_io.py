@@ -3429,7 +3429,7 @@ def test_bundled_manifold_names_skips_incomplete_package_data(
 
 def _baked_manifold(name: str = "merged", n_layers: int = 3):
     """Build an affine R=1 Manifold (the merge/import shape) via the fold."""
-    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.core.capture import fold_directions_to_subspace
 
     directions = {i: torch.randn(8) for i in range(n_layers)}
     whitener = _target_whitener(dim=8, layers=tuple(range(n_layers)))
@@ -3445,7 +3445,7 @@ def _baked_manifold(name: str = "merged", n_layers: int = 3):
 def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     from saklas.io.manifold_tensors import load_manifold
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.core.capture import folded_directions
 
     manifold, directions = _baked_manifold("merged")
     folder, mf = create_baked_manifold_folder(
@@ -3467,7 +3467,7 @@ def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     # The tensor folds back to the per-layer directions it was baked from.
     (tensor,) = list(folder.glob("*.safetensors"))
-    folded = folded_vector_directions(load_manifold(tensor))
+    folded = folded_directions(load_manifold(tensor))
     assert set(folded) == set(directions)
 
 

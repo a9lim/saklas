@@ -18,11 +18,11 @@ from typing import Any
 import pytest
 import torch
 
-from saklas.core import vectors as V
+from saklas.core import capture as V
 from saklas.core.events import EventBus
 from saklas.core.extraction import ManifoldExtractionPipeline
 from saklas.core.sae import MockSaeBackend
-from saklas.core.vectors import folded_vector_directions
+from saklas.core.capture import folded_directions
 from saklas.io.manifolds import ManifoldFolder, create_discover_manifold_folder
 from saklas.io.paths import manifold_dir
 from tests._whitener import synthetic_whitener
@@ -128,7 +128,7 @@ def test_monopolar_fits_one_node_ray() -> None:
     assert manifold.metadata.get("method") == "manifold_monopolar"
     assert manifold.metadata.get("monopolar") is True
     # Every layer is an affine rank-1 ray, so it folds to a steering vector.
-    dirs = folded_vector_directions(manifold)
+    dirs = folded_directions(manifold)
     assert sorted(dirs) == list(range(_N_LAYERS))
     for vec in dirs.values():
         assert torch.isfinite(vec).all()
@@ -170,8 +170,8 @@ def test_monopolar_cache_hit_reloads_ray() -> None:
     # Second fit cache-hits on the unchanged 1-node corpus and reloads the ray.
     second = pipe.fit(folder)
     assert second.node_labels == first.node_labels == ["agentic"]
-    d1 = folded_vector_directions(first)
-    d2 = folded_vector_directions(second)
+    d1 = folded_directions(first)
+    d2 = folded_directions(second)
     assert sorted(d1) == sorted(d2)
     for L in d1:
         assert torch.allclose(d1[L], d2[L], atol=1e-5)

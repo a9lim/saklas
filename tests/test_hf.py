@@ -23,7 +23,7 @@ def _write_fitted_manifold(
 
     from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
     from saklas.io.manifold_tensors import save_manifold
-    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.core.capture import fold_directions_to_subspace
     from saklas.io.manifolds import ManifoldFolder
     from saklas.io.paths import tensor_filename
     from tests._whitener import isotropic_whitener

@@ -27,8 +27,8 @@ from saklas.core.events import (
     EventBus,
     GenerationFinished,
     GenerationStarted,
+    ManifoldExtracted,
     ProbeScored,
-    VectorExtracted,
 )
 from saklas.core.generation import (
     GenerationConfig,
@@ -40,6 +40,8 @@ from saklas.core.generation import (
     supports_thinking,
 )
 from saklas.core.hooks import HiddenCapture, SteeringManager
+from saklas.core.naming import BIPOLAR_SEP, _slug, canonical_concept_name
+from saklas.io import selectors as _selectors
 from saklas.core.token_callback import (
     TokenCallback,
     TokenConsumer,
@@ -348,19 +350,6 @@ PROBE_CATEGORIES = [
 ]
 MIN_ELAPSED_FOR_RATE = 0.1
 
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
-BIPOLAR_SEP = "."
-
-
-def _slug(s: str) -> str:
-    """Normalize a single pole label to `[a-z0-9_]`.
-
-    Collapses any non-alphanumeric run to `_`. Never produces the bipolar
-    separator `.` — that is reserved for joining two slugged poles in
-    `canonical_concept_name`.
-    """
-    return _SLUG_RE.sub("_", s.strip().lower()).strip("_")
-
 
 def _humanize_concept(name: str) -> str:
     """Invert the slug `_` convention for LLM-facing prompts.
@@ -441,24 +430,6 @@ def _split_composite_source(
         return pos.strip(), neg.strip()
     return concept, baseline
 
-
-def canonical_concept_name(concept: str, baseline: str | None = None) -> str:
-    """Return the canonical on-disk name for a concept.
-
-    Monopolar: `_slug(concept)`.
-    Bipolar:   `f"{_slug(concept)}.{_slug(baseline)}"`.
-
-    If `baseline` is None and `concept` already contains the bipolar
-    separator `.`, the input is treated as a pre-composed bipolar name
-    and each side is slugged independently. This makes `/steer happy.sad`
-    and `/steer happy - sad` resolve to the same cache entry.
-    """
-    if baseline is None:
-        if BIPOLAR_SEP in concept:
-            pos, neg = concept.split(BIPOLAR_SEP, 1)
-            return f"{_slug(pos)}{BIPOLAR_SEP}{_slug(neg)}"
-        return _slug(concept)
-    return f"{_slug(concept)}{BIPOLAR_SEP}{_slug(baseline)}"
 
 class GenState(IntEnum):
     """Lifecycle phases of a single generation call.
@@ -1344,7 +1315,6 @@ class SaklasSession:
         from saklas.io.templates import (
             materialize_bundled_templates as _materialize_bundled_templates,
         )
-        from saklas.io import selectors as _selectors
         # Templates first: a bundled manifold may ``template_ref`` a bundled
         # ``default/<name>`` template, and its fit resolves that ref.
         _materialize_bundled_templates()
@@ -1578,7 +1548,7 @@ class SaklasSession:
         ``R = 1`` manifold has.  Listing one would only render an all-null
         row in the correlation matrix (or a misleading miss in ``pairwise``)
         and, before the guard below, made the fold raise a 500."""
-        from saklas.core.vectors import is_foldable_vector_manifold
+        from saklas.core.capture import is_foldable_vector_manifold
 
         names = set(self._profiles)  # registered vectors are always R=1
         for pname in self._monitor.probe_names:
@@ -1597,18 +1567,18 @@ class SaklasSession:
 
         Returns ``None`` for a multi-node / curved probe — it has no single
         direction to fold, so the direction analytics skip it rather than
-        crashing on ``folded_vector_directions``."""
+        crashing on ``folded_directions``."""
         prof = self._profiles.get(name)
         if prof is not None:
             return dict(prof)
         manifold = self._monitor.manifolds.get(name)
         if manifold is not None:
-            from saklas.core.vectors import (
-                folded_vector_directions,
+            from saklas.core.capture import (
+                folded_directions,
                 is_foldable_vector_manifold,
             )
             if is_foldable_vector_manifold(manifold):
-                return folded_vector_directions(manifold)
+                return folded_directions(manifold)
         return None
 
     def analytics_profile(self, name: str) -> "Profile | None":
@@ -3167,7 +3137,7 @@ class SaklasSession:
         requested fitted layer: the model-specific depth profile remains visible
         in ``com``/``spread`` rather than being pre-filtered by a fixed band.
         """
-        from saklas.core.vectors import _capture_all_hidden_states
+        from saklas.core.capture import _capture_all_hidden_states
 
         lens = self._require_jlens()
         req = self._resolve_jlens_layers(lens, layers)
@@ -3271,7 +3241,7 @@ class SaklasSession:
         :class:`InvalidNodeOperationError` on a bad target (mirrors
         :meth:`fork_from_token`), ``ValueError`` on an unfitted layer.
         """
-        from saklas.core.vectors import _capture_all_hidden_states
+        from saklas.core.capture import _capture_all_hidden_states
 
         lens = self._require_jlens()
         req = self._resolve_jlens_layers(lens, layers)
@@ -4414,7 +4384,7 @@ class SaklasSession:
         raw: bool = False,
     ) -> dict[str, Any]:
         """SAE feature readout at the forward that produced a loom token."""
-        from saklas.core.vectors import _capture_all_hidden_states
+        from saklas.core.capture import _capture_all_hidden_states
 
         _backend, layer, width = self._require_sae()
         if not 1 <= top_k <= min(width, 100):
@@ -4722,7 +4692,7 @@ class SaklasSession:
 
         For every ``(concept, kind)`` the model answers the shared baseline
         prompts *in character* -- the concept rides the system prompt
-        (:func:`_system_for`, led by the shared :data:`~saklas.core.vectors._LENGTH_DIRECTIVE`
+        (:func:`_system_for`, led by the shared :data:`~saklas.core.capture._LENGTH_DIRECTIVE`
         so responses stay one short paragraph) and the swapped assistant-role
         label (:func:`_role_for`, overridable per concept via ``roles``).  The
         length directive is common-mode with the neutral corpus and with capture
@@ -4745,7 +4715,7 @@ class SaklasSession:
         support raises ``RoleSubstitutionUnsupportedError`` at generation);
         ``custom`` is the system-only exception.
         """
-        from saklas.core.vectors import _LENGTH_DIRECTIVE, _load_baseline_prompts
+        from saklas.core.capture import _LENGTH_DIRECTIVE, _load_baseline_prompts
 
         if any((k or "abstract") == "custom" for k in kinds) and not custom_system:
             raise ValueError(
@@ -4795,7 +4765,7 @@ class SaklasSession:
 
         The neutral counterpart to :meth:`generate_responses`: the model answers
         the shared baseline prompts under the shared
-        :data:`~saklas.core.vectors._LENGTH_DIRECTIVE` as its *only* system prompt
+        :data:`~saklas.core.capture._LENGTH_DIRECTIVE` as its *only* system prompt
         (no persona) with the standard assistant label, so the corpus is the
         model\'s own voice -- just brief.  The directive is the only framing it
         shares with the node corpora (same on every node system + every capture),
@@ -4805,7 +4775,7 @@ class SaklasSession:
         holds under 4.0 -- regenerate it with this and the per-model
         ``layer_means`` / neutral-activation caches recompute conversationally.
         """
-        from saklas.core.vectors import _LENGTH_DIRECTIVE, _load_baseline_prompts
+        from saklas.core.capture import _LENGTH_DIRECTIVE, _load_baseline_prompts
 
         prompts = _load_baseline_prompts()
         reps = max(1, samples_per_prompt)
@@ -4892,7 +4862,8 @@ class SaklasSession:
 
         Returns ``(canonical_name, Profile)`` — the folded per-layer direction
         view of the fitted manifold (the in-memory steering-vector shape), with
-        the manifold the single on-disk artifact.  Emits ``VectorExtracted``.
+        the manifold the single on-disk artifact.  Emits ``ManifoldExtracted``
+        (with its ``profile`` field carrying the folded view).
 
         Flags:
 
@@ -5109,18 +5080,23 @@ class SaklasSession:
         runs :class:`ManifoldExtractionPipeline` directly (the public
         :meth:`fit` re-acquires ``_gen_lock``, which the callers
         already hold), folds the fitted manifold to a per-layer direction
-        :class:`Profile`, and emits ``VectorExtracted``.
+        :class:`Profile`, and emits a single ``ManifoldExtracted`` carrying that
+        folded profile (the pipeline's own emission is suppressed).
 
         The returned name carries the variant tail (``:sae-<release>`` /
         ``:role-<slug>``) so the caller steers the right per-model tensor; the
         on-disk manifold folder stays the bare canonical name.
         """
         from saklas.core.extraction import ManifoldExtractionPipeline
-        from saklas.core.vectors import folded_vector_directions
+        from saklas.core.capture import folded_directions
 
         pipe = ManifoldExtractionPipeline(self, self.events)
+        # Suppress the pipeline's own ``ManifoldExtracted`` so the vector path
+        # fires exactly one event: the enriched emit below carries the folded
+        # ``Profile`` and the variant-tailed name.
         manifold = pipe.fit(
             folder, sae=sae, sae_revision=sae_revision, on_progress=on_progress,
+            emit_event=False,
         )
         self._adopt_fitted_manifold(folder, manifold)
         if sae:
@@ -5130,15 +5106,16 @@ class SaklasSession:
         else:
             ret_name = name
         profile = Profile(
-            folded_vector_directions(manifold),
+            folded_directions(manifold),
             metadata={
                 "method": "manifold_pca",
                 "name": ret_name,
                 "share_metric": manifold.metadata.get("share_metric"),
             },
         )
-        self.events.emit(VectorExtracted(
-            name=ret_name, profile=profile, metadata=dict(profile.metadata),
+        self.events.emit(ManifoldExtracted(
+            name=ret_name, manifold=manifold,
+            metadata=dict(manifold.metadata), profile=profile,
         ))
         if ret_name in self._profiles:
             self._profiles[ret_name] = self._promote_profile(profile.as_dict())
@@ -5153,8 +5130,8 @@ class SaklasSession:
         geometry with the new fit in the same session.
         """
         from pathlib import Path
-        from saklas.core.vectors import (
-            folded_vector_directions,
+        from saklas.core.capture import (
+            folded_directions,
             is_foldable_vector_manifold,
         )
 
@@ -5211,7 +5188,7 @@ class SaklasSession:
 
         matching_profiles = [key for key in self._profiles if _matches_key(key)]
         if matching_profiles and is_foldable_vector_manifold(manifold):
-            folded = self._promote_profile(folded_vector_directions(manifold))
+            folded = self._promote_profile(folded_directions(manifold))
             for key in matching_profiles:
                 self._profiles[key] = dict(folded)
         else:
@@ -5360,7 +5337,7 @@ class SaklasSession:
         from saklas.io.paths import tensor_filename
         from saklas.io.manifold_tensors import load_manifold
         from saklas.core.model import loaded_model_fingerprint
-        from saklas.core.vectors import folded_vector_directions
+        from saklas.core.capture import folded_directions
 
         live_fingerprint = loaded_model_fingerprint(self._model, self.model_id)
         dst_folder = merge_into_manifold(
@@ -5373,7 +5350,7 @@ class SaklasSession:
                 f"bake produced no tensor for {self.model_id} at {tensor_path}"
             )
         manifold = load_manifold(str(tensor_path))
-        profile = Profile(folded_vector_directions(manifold))
+        profile = Profile(folded_directions(manifold))
         self.steer(name, profile)
         return name, profile
 
@@ -6190,7 +6167,7 @@ class SaklasSession:
             and getattr(self._gen_state, "response_text", None) is not None
         ):
             return None
-        from saklas.core.vectors import last_content_index
+        from saklas.core.capture import last_content_index
         return last_content_index(generated_ids, self._tokenizer)
 
     def _empty_readings(self, names: list[str]) -> dict[str, "ProbeReading"]:
@@ -6859,7 +6836,7 @@ class SaklasSession:
         if not self._layer_means:
             _ = self.layer_means
             self._monitor.layer_means = self._layer_means
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         return fold_directions_to_subspace(
             name, dict(profile), self._layer_means, whitener=self.whitener,
         )
@@ -6921,13 +6898,13 @@ class SaklasSession:
         # share_L}``) for continuity with the pre-coords scalar monitor:
         # the per-layer baked tensor is what the transcript-drift check
         # compared, and it's stable across the manifold round-trip.
-        from saklas.core.vectors import folded_vector_directions
+        from saklas.core.capture import folded_directions
         import hashlib
         h = hashlib.sha256()
         try:
             # 2-node R=1 concept probe: hash the folded baked-direction view,
             # for continuity with the pre-coords scalar monitor's drift check.
-            profile = folded_vector_directions(manifold)
+            profile = folded_directions(manifold)
             per_layer = {L: [profile[L]] for L in profile}
         except ValueError:
             # Multi-node / curved probe (e.g. ``personas``): no R=1 fold exists.
@@ -10374,7 +10351,7 @@ class SaklasSession:
         """Shared final-token pooled slice for one batched generation row."""
         if not generated_ids:
             return {}
-        from saklas.core.vectors import last_content_index
+        from saklas.core.capture import last_content_index
         agg_fwd = last_content_index(generated_ids, self._tokenizer)
         return self._capture.batch_tail_slice_at(row_index, agg_fwd)
 

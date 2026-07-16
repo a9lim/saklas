@@ -1013,7 +1013,7 @@ def test_node_stats_returns_normalized_accumulator_ownership(
 ) -> None:
     """Centroid normalization does not allocate a second K x D roster."""
     import saklas.core.manifold as manifold_module
-    from saklas.core import vectors
+    from saklas.core import capture
 
     captured_accumulators: list[torch.Tensor] = []
     real_zeros = torch.zeros
@@ -1030,7 +1030,7 @@ def test_node_stats_returns_normalized_accumulator_ownership(
         ])}
 
     monkeypatch.setattr(manifold_module.torch, "zeros", tracked_zeros)
-    monkeypatch.setattr(vectors, "_encode_and_capture_all_batch", fake_capture)
+    monkeypatch.setattr(capture, "_encode_and_capture_all_batch", fake_capture)
     centroids, retained = compute_manifold_node_stats(
         torch.nn.Linear(1, 1), object(),
         torch.nn.ModuleList([torch.nn.Identity()]), torch.device("cpu"),

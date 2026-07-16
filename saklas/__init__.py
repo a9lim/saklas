@@ -19,7 +19,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "Steering": ("saklas.core.steering", "Steering"),
     "Trigger": ("saklas.core.triggers", "Trigger"),
     "EventBus": ("saklas.core.events", "EventBus"),
-    "VectorExtracted": ("saklas.core.events", "VectorExtracted"),
+    "ManifoldExtracted": ("saklas.core.events", "ManifoldExtracted"),
     "SteeringApplied": ("saklas.core.events", "SteeringApplied"),
     "SteeringCleared": ("saklas.core.events", "SteeringCleared"),
     "ProbeScored": ("saklas.core.events", "ProbeScored"),
@@ -93,7 +93,7 @@ __all__ = [
     "Steering",
     "Trigger",
     "EventBus",
-    "VectorExtracted",
+    "ManifoldExtracted",
     "SteeringApplied",
     "SteeringCleared",
     "ProbeScored",
@@ -179,7 +179,7 @@ if TYPE_CHECKING:
         ProbeScored as ProbeScored,
         SteeringApplied as SteeringApplied,
         SteeringCleared as SteeringCleared,
-        VectorExtracted as VectorExtracted,
+        ManifoldExtracted as ManifoldExtracted,
     )
     from saklas.core.loom import (
         CastMember as CastMember,

@@ -3,7 +3,7 @@
 Tests the production fold path (saklas 4.0 §5): ``fold_directions_to_subspace``
 folds an arbitrary per-layer direction into a neutral-anchored one-pole ray —
 basis = d̂, **neutral-anchored** ``mean = P_basis(ν)``, **real** per-layer pole
-coord ``‖d‖``, the direction-magnitude share — and ``folded_vector_directions``
+coord ``‖d‖``, the direction-magnitude share — and ``folded_directions``
 is its reverse view ``{L: δ̂_L · share_L}`` (refusing a curved manifold).
 
 The legacy bipolar-centroid fold (``_fold_centroids_to_affine_manifold``) was
@@ -16,9 +16,9 @@ from __future__ import annotations
 import torch
 import pytest
 
-from saklas.core.vectors import (
+from saklas.core.capture import (
     fold_directions_to_subspace,
-    folded_vector_directions,
+    folded_directions,
     is_foldable_vector_manifold,
 )
 
@@ -39,7 +39,7 @@ def _whitener(layers: list[int], dim: int):
 
 # --------------------------------------------------------------- geometry ---
 
-def test_folded_vector_directions_rejects_curved():
+def test_folded_directions_rejects_curved():
     """A curved (RBF-fitted, non-affine) manifold has no single direction —
     the view must refuse it."""
     from saklas.core.manifold import (
@@ -62,7 +62,7 @@ def test_folded_vector_directions_rejects_curved():
         feature_space="sae-test",
     )
     with pytest.raises(ValueError, match="affine"):
-        folded_vector_directions(mfld)
+        folded_directions(mfld)
     # ...and the foldability predicate agrees, so analytics skip it.
     assert not is_foldable_vector_manifold(mfld)
 
@@ -92,7 +92,7 @@ def test_is_foldable_vector_manifold_rejects_multinode_affine():
     )
     assert not is_foldable_vector_manifold(mfld)
     with pytest.raises(ValueError, match="affine R=1"):
-        folded_vector_directions(mfld)
+        folded_directions(mfld)
 
 
 def test_is_foldable_vector_manifold_accepts_r1_and_rejects_empty():

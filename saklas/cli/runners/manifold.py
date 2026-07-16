@@ -143,7 +143,7 @@ def _fold_manifold_to_profile_with_identity(
     """
     from saklas.core.profile import Profile
     from saklas.io.manifold_tensors import load_manifold
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.core.capture import folded_directions
     from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
     from saklas.io.selectors import AmbiguousSelectorError
 
@@ -180,7 +180,7 @@ def _fold_manifold_to_profile_with_identity(
         )
     try:
         manifold = load_manifold(hits[0])
-        dirs = folded_vector_directions(manifold)
+        dirs = folded_directions(manifold)
     except Exception:
         return None
     ns = hits[0].parent.parent.name
@@ -199,7 +199,7 @@ def _fold_all_fitted_manifolds(
     """
     from saklas.core.profile import Profile
     from saklas.io.manifold_tensors import load_manifold
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.core.capture import folded_directions
     from saklas.io.paths import manifolds_dir, tensor_filename
 
     out: dict[str, Profile] = {}
@@ -220,7 +220,7 @@ def _fold_all_fitted_manifolds(
             if not tensor.is_file():
                 continue
             try:
-                dirs = folded_vector_directions(load_manifold(tensor))
+                dirs = folded_directions(load_manifold(tensor))
             except Exception:
                 continue  # not a foldable 2-node affine (curved / rank > 1)
             out[f"{ns_dir.name}/{mdir.name}"] = Profile(dirs)

@@ -85,8 +85,8 @@ class TestMergeVector:
         # on disk so the route's ``load_manifold`` + fold has a valid target
         # via the mocked ``merge_into_manifold`` output.
         monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-        from saklas.core.vectors import (
-            fold_directions_to_subspace, folded_vector_directions,
+        from saklas.core.capture import (
+            fold_directions_to_subspace, folded_directions,
         )
         from saklas.io.manifold_tensors import load_manifold
         from saklas.core.model import loaded_model_fingerprint
@@ -125,7 +125,7 @@ class TestMergeVector:
             ),
         )
         tensor_path = merged_folder / tensor_filename(session.model_id)
-        expected = folded_vector_directions(load_manifold(tensor_path))
+        expected = folded_directions(load_manifold(tensor_path))
 
         with patch(
             "saklas.io.merge.merge_into_manifold",

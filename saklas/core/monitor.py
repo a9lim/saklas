@@ -1804,7 +1804,7 @@ class Monitor:
             per_token = self._per_token_coord_stream(captured, n)
             return agg, per_token
         if aggregate_index is None:
-            from saklas.core.vectors import last_content_index
+            from saklas.core.capture import last_content_index
             agg_idx = last_content_index(generated_ids, tokenizer)
         else:
             agg_idx = max(0, min(int(aggregate_index), n - 1))

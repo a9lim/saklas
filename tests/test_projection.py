@@ -26,7 +26,7 @@ from saklas.core.session import (
 from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import parse_expr
 from saklas.core.triggers import Trigger
-from saklas.core.vectors import project_profile
+from saklas.core.capture import project_profile
 from tests._whitener import synthetic_whitener
 
 
@@ -427,7 +427,7 @@ class TestComputeDlsAxesBipolarGuard:
         directions: dict[int, torch.Tensor],
         layer_means: dict[int, torch.Tensor] | None,
     ) -> set[int]:
-        from saklas.core.vectors import compute_dls_axes
+        from saklas.core.capture import compute_dls_axes
         node_centroids = {
             L: torch.stack([mu_pos[L].reshape(-1), mu_neg[L].reshape(-1)])
             for L in mu_pos
@@ -509,7 +509,7 @@ class TestComputeDlsAxes:
         # Three nodes, neutral at 0.  Axis 0 (x): projections {+2, 0.5, -1}
         # straddle zero ⇒ KEEP.  Axis 1 (y): projections {1, 2, 3} all
         # positive ⇒ no straddle ⇒ DROP (a common offset, not a contrast).
-        from saklas.core.vectors import compute_dls_axes
+        from saklas.core.capture import compute_dls_axes
         node_centroids = {
             7: torch.tensor([
                 [2.0, 1.0],
@@ -523,7 +523,7 @@ class TestComputeDlsAxes:
         assert out == {7: {0}}
 
     def test_n_node_disabled_keeps_every_axis(self):
-        from saklas.core.vectors import compute_dls_axes
+        from saklas.core.capture import compute_dls_axes
         node_centroids = {0: torch.randn(4, 3), 1: torch.randn(4, 3)}
         bases = {0: torch.eye(3), 1: torch.eye(3)}
         out = compute_dls_axes(node_centroids, bases, None)
@@ -531,14 +531,14 @@ class TestComputeDlsAxes:
 
     def test_n_node_missing_baseline_conservative_keep(self):
         # A layer whose neutral baseline is absent keeps every checkable axis.
-        from saklas.core.vectors import compute_dls_axes
+        from saklas.core.capture import compute_dls_axes
         node_centroids = {3: torch.randn(5, 4)}
         bases = {3: torch.eye(4)}
         out = compute_dls_axes(node_centroids, bases, {})  # empty ⇒ disabled
         assert out == {3: {0, 1, 2, 3}}
 
     def test_n_node_degenerate_row_skipped(self):
-        from saklas.core.vectors import compute_dls_axes
+        from saklas.core.capture import compute_dls_axes
         node_centroids = {0: torch.tensor([[1.0, 0.0], [-1.0, 0.0]])}
         bases = {0: torch.tensor([[1.0, 0.0], [0.0, 0.0]])}  # row 1 zero-norm
         layer_means = {0: torch.zeros(2)}
@@ -547,7 +547,7 @@ class TestComputeDlsAxes:
 
     def test_n_node_all_fail_fallback(self):
         import warnings as _warnings
-        from saklas.core.vectors import compute_dls_axes
+        from saklas.core.capture import compute_dls_axes
         # Every node on the same side of neutral on both axes ⇒ no straddle.
         node_centroids = {0: torch.tensor([[0.5, 0.7], [0.3, 0.4], [0.6, 0.9]])}
         bases = {0: torch.eye(2)}

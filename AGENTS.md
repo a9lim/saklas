@@ -131,7 +131,7 @@ raising on cross-tier collision. A steering expression composing role-augmented 
 role; plain `:raw` terms compose with role terms but emit a one-time
 `RoleBaselineMismatchWarning`.
 
-Canonical naming: `canonical_concept_name` (module-level in `core/session.py`)
+Canonical naming: `canonical_concept_name` (module-level in `core/naming.py`)
 slugs poles via `[^a-z0-9]+ → _` and joins bipolar poles with `BIPOLAR_SEP = "."`,
 so `/steer formal . casual` and `/steer formal.casual` resolve to the same manifold.
 `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$`; `@` is forbidden (HF revision separator),
@@ -457,7 +457,7 @@ pole, node 1 the negative — and fits it via
 `{positive, negative}` / `statements.json` / baked-DiM artifact; the corpus lives
 as the manifold's two node groups. `extract()` returns `(canonical_name, Profile)`
 where the `Profile` is the **folded** per-layer direction view of the fitted 2-node
-manifold (`core/vectors.py::folded_vector_directions`) — the in-memory
+manifold (`core/capture.py::folded_directions`) — the in-memory
 steering-vector shape callers expect, with the manifold the single on-disk
 artifact. A tensor cache hit (sidecar `nodes_sha256` matches the folder)
 short-circuits the forward passes.
@@ -498,7 +498,7 @@ each layer's `LayerSubspace` (mean, basis, real `node_coords`): the activation-s
 magnitude lives in the neutral-anchored real coords (`coord_pos − coord_neg =
 ‖δ_L‖`), and a separate per-layer Mahalanobis `share` carries the cross-layer
 budget. The in-memory steering vector is the folded view `δ̂_L · share_L`
-(`folded_vector_directions`); for GGUF export llama.cpp's uniform control-vector
+(`folded_directions`); for GGUF export llama.cpp's uniform control-vector
 scalar reproduces the relative per-layer weighting from those magnitudes.
 
 Discriminative Layer Selection (Selective Steering, Dang & Ngo 2026 Eq. 9): a

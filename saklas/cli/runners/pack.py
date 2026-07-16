@@ -355,7 +355,7 @@ def _run_pack_export(args: argparse.Namespace) -> None:
     """Export a fitted 2-node ``pca`` manifold to an interchange format (gguf).
 
     Folds the manifold down to a single steering direction
-    (:func:`~saklas.core.vectors.folded_vector_directions`) and writes a
+    (:func:`~saklas.core.capture.folded_directions`) and writes a
     llama.cpp control-vector GGUF.
     """
     fmt = getattr(args, "format", None)

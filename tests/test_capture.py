@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from saklas.core.vectors import _ReusablePooledCapture, _capture_all_hidden_states
+from saklas.core.capture import _ReusablePooledCapture, _capture_all_hidden_states
 
 
 class _AddLayer(torch.nn.Module):

@@ -44,7 +44,7 @@ fallback path):
 
 * :meth:`saklas.core.profile.Profile.cosine_similarity` — the whitened
   cosine metric.
-* :func:`saklas.core.vectors.project_profile` — LEACE-flavored ``|`` / ``~``
+* :func:`saklas.core.capture.project_profile` — LEACE-flavored ``|`` / ``~``
   projection.
 
 Both call sites **require** a :class:`LayerWhitener` covering every shared /
@@ -178,7 +178,7 @@ class LayerWhitener:
         """Build a whitener from raw per-layer neutral activations.
 
         ``neutral_activations`` is ``{layer: [N, D] fp32 tensor}`` (the
-        shape produced by :func:`saklas.core.vectors.compute_neutral_activations`).
+        shape produced by :func:`saklas.core.capture.compute_neutral_activations`).
         ``layer_means`` is ``{layer: [D]}`` — typically the cached means
         from :func:`saklas.io.probes_bootstrap.bootstrap_layer_means`.
 

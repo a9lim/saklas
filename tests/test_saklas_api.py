@@ -394,7 +394,7 @@ class TestProbes:
         from types import SimpleNamespace
         import torch
 
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from tests._whitener import isotropic_whitener
 
         session, client = session_and_client
@@ -1094,7 +1094,7 @@ class TestScoreSingleToken:
         import torch
         from saklas.core.monitor import Monitor
         from saklas.core.results import ProbeReading
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
         dim = 16
@@ -1120,7 +1120,7 @@ class TestScoreSingleToken:
     def test_consistent_with_measure_from_hidden(self):
         import torch
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
         dim = 16
@@ -1531,7 +1531,7 @@ class TestPairwiseMetric:
 class TestAnalyticsMultiNodeProbe:
     """A multi-node / curved probe (the ``personas`` rank-R fan) has no single
     steering direction, so the direction-cosine analytics must *exclude* it —
-    not 500 on ``folded_vector_directions`` (regression: a rank-8 probe attached
+    not 500 on ``folded_directions`` (regression: a rank-8 probe attached
     while the web UI polled ``/correlation`` aborted the request)."""
 
     def _wire(self, session_and_client: Any) -> tuple[Any, TestClient]:
@@ -1544,7 +1544,7 @@ class TestAnalyticsMultiNodeProbe:
             CustomDomain, LayerSubspace, Manifold,
         )
         from saklas.core.session import SaklasSession
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         session, client = session_and_client
         torch.manual_seed(3)

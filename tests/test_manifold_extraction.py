@@ -1,7 +1,7 @@
 """ManifoldExtractionPipeline tests — CPU only, synthetic encoder.
 
 Mirrors the stub-encoder pattern in :mod:`tests.test_dim_extraction`:
-monkeypatch :func:`saklas.core.vectors._encode_and_capture_all` so no
+monkeypatch :func:`saklas.core.capture._encode_and_capture_all` so no
 real model is needed.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from saklas.core import vectors as V
+from saklas.core import capture as V
 from saklas.core.events import EventBus, ManifoldExtracted
 from saklas.core.extraction import ManifoldExtractionPipeline
 from saklas.core.sae import MockSaeBackend
@@ -2660,7 +2660,7 @@ def test_auto_curved_partial_topup_reuses_durable_rows_without_recapture(
 
 
 def _fold_test_direction(name: str, direction: torch.Tensor):
-    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.core.capture import fold_directions_to_subspace
 
     whitener = synthetic_whitener([0], int(direction.numel()))
     return fold_directions_to_subspace(
@@ -2720,10 +2720,10 @@ def test_adopt_fitted_manifold_rebinds_loaded_probe_profile_and_prefix(
     attached = session._monitor.probes["mood-probe"]
     assert attached.manifold is live
     assert attached.top_n == 4
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.core.capture import folded_directions
 
     assert torch.allclose(
-        session._profiles["local/mood"][0], folded_vector_directions(new)[0],
+        session._profiles["local/mood"][0], folded_directions(new)[0],
     )
     assert session._prefix_cache is None
     assert session._analytics_cpu_cache == {}

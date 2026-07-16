@@ -395,7 +395,7 @@ def register_vector_routes(app: FastAPI) -> None:
         from saklas.io.merge import merge_into_manifold, MergeError
         from saklas.io.paths import tensor_filename
         from saklas.io.manifold_tensors import load_manifold
-        from saklas.core.vectors import folded_vector_directions
+        from saklas.core.capture import folded_directions
         from saklas.server.manifold_routes import _refuse_if_busy
         resolve_session_id(session_id)
 
@@ -427,7 +427,7 @@ def register_vector_routes(app: FastAPI) -> None:
 
             def _load_folded() -> Profile:
                 manifold = load_manifold(str(tensor_path))
-                return Profile(folded_vector_directions(manifold))
+                return Profile(folded_directions(manifold))
 
             profile = await asyncio.to_thread(_load_folded)
             session.steer(req.name, profile)

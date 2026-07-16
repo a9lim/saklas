@@ -8,10 +8,10 @@ from saklas.core.events import (
     EventBus,
     GenerationFinished,
     GenerationStarted,
+    ManifoldExtracted,
     ProbeScored,
     SteeringApplied,
     SteeringCleared,
-    VectorExtracted,
 )
 from saklas.core.triggers import Trigger
 
@@ -86,10 +86,20 @@ def test_subscriber_that_unsubscribes_mid_emit():
     assert len(seen) == 1
 
 
-def test_vector_extracted_fields():
-    ev = VectorExtracted(name="angry.calm", profile={"a": 1}, metadata={"method": "pca"})
+def test_manifold_extracted_fields():
+    ev = ManifoldExtracted(name="angry.calm", manifold=object(), metadata={"method": "pca"})
     assert ev.name == "angry.calm"
     assert ev.metadata["method"] == "pca"
+    assert ev.profile is None  # optional; folded view only on the vector path
+
+
+def test_manifold_extracted_carries_folded_profile():
+    """The 2-node ``pca`` fit rides its folded ``Profile`` on the same event."""
+    ev = ManifoldExtracted(
+        name="angry.calm", manifold=object(),
+        metadata={"method": "manifold_pca"}, profile={"a": 1},
+    )
+    assert ev.profile == {"a": 1}
 
 
 def test_steering_applied_entries_carries_trigger():

@@ -1354,7 +1354,7 @@ def test_jlens_readout_shape_and_default_position() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
     seen_pool: list[int | None] = []
-    import saklas.core.vectors as _vectors
+    import saklas.core.capture as _vectors
 
     real_capture = _vectors._capture_all_hidden_states
 
@@ -1824,7 +1824,7 @@ def test_jlens_token_readout_shape_and_position() -> None:
     node_id = _tree_with_assistant(s, raw_ids)
 
     seen_lens: list[tuple[int, int | None]] = []
-    import saklas.core.vectors as _vectors
+    import saklas.core.capture as _vectors
 
     real_capture = _vectors._capture_all_hidden_states
 
@@ -1876,7 +1876,7 @@ def test_jlens_token_readout_index_zero_reads_prompt_only() -> None:
     node_id = _tree_with_assistant(s, s._tokenizer.encode("abc"))
 
     seen_lens: list[tuple[int, int | None]] = []
-    import saklas.core.vectors as _vectors
+    import saklas.core.capture as _vectors
 
     real_capture = _vectors._capture_all_hidden_states
 

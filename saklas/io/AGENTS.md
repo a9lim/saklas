@@ -326,7 +326,7 @@ Both gutted to the surface that survives the collapse.
 
 `cache_ops.py` is now just GGUF export: `export_gguf_manifold(ns, name, *,
 model_scope, output, model_hint)` folds a fitted 2-node `pca` manifold to a single
-direction (`folded_vector_directions`) and writes a llama.cpp control-vector GGUF
+direction (`folded_directions`) and writes a llama.cpp control-vector GGUF
 (one `.gguf` per model; refuses in-place export for bundled manifolds);
 `_resolve_model_hint` derives `controlvector.model_hint` from the base model's
 `AutoConfig.model_type`. The old pack data layer
@@ -395,7 +395,7 @@ sources bundled probe directions by folding fitted 2-node manifolds
 Offline direction merging into a corpus-less `fit_mode="baked"` manifold.
 `merge_into_manifold(name, expression, model, *, force, strict)` resolves each
 component to a per-layer direction by folding a fitted 2-node `pca` manifold
-(`folded_vector_directions`), linearly combines the directions (`linear_sum`,
+(`folded_directions`), linearly combines the directions (`linear_sum`,
 over the union of their layer coverage), folds the result to a one-pole ray
 (`fold_directions_to_subspace`), and writes a baked manifold to
 `manifolds/local/<name>/` — one fitted tensor per shared model

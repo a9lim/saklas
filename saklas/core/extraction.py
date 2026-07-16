@@ -868,14 +868,14 @@ def prepare_manifold_capture_identity(
             context.messages() for context in tmpl.contexts
         ]
     else:
-        from saklas.core.vectors import _load_baseline_prompts
+        from saklas.core.capture import _load_baseline_prompts
 
         baseline_prompts = list(_load_baseline_prompts())
     tokenizer = handle.tokenizer
     prepared_rows: list[tuple[torch.Tensor, int]] | None = None
     capture_sha: str | None = None
     if callable(tokenizer):
-        from saklas.core.vectors import _prepare_capture_batch
+        from saklas.core.capture import _prepare_capture_batch
 
         flat_prompts: list[str | list[dict[str, str]]] = []
         flat_responses: list[str] = []
@@ -986,7 +986,7 @@ def _authoring_snapshot_locked(
             context.messages() for context in tmpl.contexts
         ]
     else:
-        from saklas.core.vectors import _load_baseline_prompts
+        from saklas.core.capture import _load_baseline_prompts
 
         baseline = list(_load_baseline_prompts())
     groups = mf.node_groups()
@@ -1071,6 +1071,7 @@ class ManifoldExtractionPipeline:
         hyperparams: Mapping[str, object] | None = None,
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
+        emit_event: bool = True,
     ):
         """Fit against a stable authoring snapshot, publishing by revision CAS.
 
@@ -1078,6 +1079,11 @@ class ManifoldExtractionPipeline:
         one folder may compute concurrently and readers keep using the prior
         published artifact.  The folder lock is held only while taking the exact
         authoring snapshot and again during final compare-and-swap publication.
+
+        ``emit_event=False`` suppresses this method's ``ManifoldExtracted``
+        emission: :meth:`SaklasSession._fit_vector_manifold` re-emits a single
+        enriched event carrying the folded :class:`Profile`, so the vector path
+        fires exactly one event rather than two.
         """
         from saklas.io.atomic import artifact_lock
         from saklas.io.manifold_folder import _locked_manifest, manifold_pair_lock
@@ -1115,6 +1121,7 @@ class ManifoldExtractionPipeline:
                 _authoring_revision=revision,
                 _node_groups_snapshot=groups,
                 _baseline_prompts_snapshot=baseline,
+                emit_event=emit_event,
             )
 
     def _fit_locked(
@@ -1137,6 +1144,7 @@ class ManifoldExtractionPipeline:
         _baseline_prompts_snapshot: list[str | list[dict[str, str]]] | None = None,
         _release_capture_lock: Callable[[], None] | None = None,
         _resolved_whitener: Any | None = None,
+        emit_event: bool = True,
     ):
         """Fit (or load from cache) a manifold for the session's model.
 
@@ -1174,7 +1182,7 @@ class ManifoldExtractionPipeline:
             prepare_rbf_fit_plan,
             subspace_share,
         )
-        from saklas.core.vectors import compute_dls_axes
+        from saklas.core.capture import compute_dls_axes
         from saklas.io.manifolds import (
             ManifoldFolder, ManifoldSidecar, min_nodes,
         )
@@ -1388,10 +1396,11 @@ class ManifoldExtractionPipeline:
                 except (OSError, RuntimeError, ValueError) as exc:
                     _progress(f"Activation capture cache cleanup skipped: {exc}")
             _progress(f"Loaded cached manifold '{mf.name}'.")
-            self._events.emit(ManifoldExtracted(
-                name=mf.name, manifold=cached_manifold,
-                metadata=dict(cached_manifold.metadata),
-            ))
+            if emit_event:
+                self._events.emit(ManifoldExtracted(
+                    name=mf.name, manifold=cached_manifold,
+                    metadata=dict(cached_manifold.metadata),
+                ))
             return cached_manifold
 
         # SAE coverage — fail-fast.  Validate the fit-layer set here, before
@@ -1482,6 +1491,7 @@ class ManifoldExtractionPipeline:
                     _baseline_prompts_snapshot=_baseline_prompts_snapshot,
                     _release_capture_lock=transaction.release,
                     _resolved_whitener=maha_whitener,
+                    emit_event=emit_event,
                 )
             finally:
                 # The inner cache stage normally releases early. Reacquire before
@@ -1715,7 +1725,7 @@ class ManifoldExtractionPipeline:
                 f"Pooling {len(node_groups)} nodes in fit-wide batches "
                 f"({sum(node_sizes)} responses, layers {capture_layers})..."
             )
-            from saklas.core.vectors import _ReusablePooledCapture
+            from saklas.core.capture import _ReusablePooledCapture
 
             # Protocol-only test/dummy handles can expose opaque layer
             # sentinels while monkeypatching the encoder seam.  Production HF
@@ -1888,7 +1898,7 @@ class ManifoldExtractionPipeline:
         #     recognizes the shape structurally (a flat ``pca`` fit otherwise
         #     needs ``k + 1 ≥ 2`` poised nodes).
         if mf.fit_mode == "pca" and K == 1:
-            from saklas.core.vectors import fold_directions_to_subspace
+            from saklas.core.capture import fold_directions_to_subspace
             per_node = [
                 {idx: stacks_cached[idx][0] for idx in fit_layers}
             ]
@@ -1958,9 +1968,10 @@ class ManifoldExtractionPipeline:
                 manifold=manifold, tensor_path=tensor_path, metadata=metadata,
             )
             manifold.metadata.update(metadata)
-            self._events.emit(ManifoldExtracted(
-                name=mf.name, manifold=manifold, metadata=metadata,
-            ))
+            if emit_event:
+                self._events.emit(ManifoldExtracted(
+                    name=mf.name, manifold=manifold, metadata=metadata,
+                ))
             _progress(
                 f"Fit complete in {time.perf_counter() - fit_started:.1f}s."
             )
@@ -2492,7 +2503,7 @@ class ManifoldExtractionPipeline:
                 }
                 missing_row_layers = sorted(set(fit_layers) - covered_rows)
                 if missing_row_layers:
-                    from saklas.core.vectors import _ReusablePooledCapture
+                    from saklas.core.capture import _ReusablePooledCapture
 
                     reusable = all(
                         hasattr(layers[idx], "register_forward_hook")
@@ -2661,8 +2672,9 @@ class ManifoldExtractionPipeline:
         )
         manifold.metadata.update(metadata)
 
-        self._events.emit(ManifoldExtracted(
-            name=mf.name, manifold=manifold, metadata=metadata,
-        ))
+        if emit_event:
+            self._events.emit(ManifoldExtracted(
+                name=mf.name, manifold=manifold, metadata=metadata,
+            ))
         _progress(f"Fit complete in {time.perf_counter() - fit_started:.1f}s.")
         return manifold

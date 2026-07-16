@@ -85,7 +85,7 @@ def _patch_compute(
         return {idx: t.clone() for idx, t in acts.items()}
 
     # Patched on the source module so alignment's deferred import resolves it.
-    import saklas.core.vectors as vectors
+    import saklas.core.capture as vectors
 
     monkeypatch.setattr(vectors, "compute_neutral_activations", _fake_compute)
     return calls

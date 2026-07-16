@@ -477,7 +477,7 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
     input-precision loss, at the cost of ~2× disk on this one cache.
     """
     from saklas.core.model import loaded_model_fingerprint
-    from saklas.core.vectors import (
+    from saklas.core.capture import (
         _neutral_pairs,
         _prepare_capture_batch,
         compute_neutral_activations,

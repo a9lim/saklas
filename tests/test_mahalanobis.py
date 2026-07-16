@@ -20,7 +20,7 @@ from saklas.core.mahalanobis import (
     WhitenerError,
 )
 from saklas.core.profile import Profile
-from saklas.core.vectors import project_profile
+from saklas.core.capture import project_profile
 
 
 # ---------------------------------------------------------------- helpers ---

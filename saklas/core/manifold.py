@@ -26,7 +26,7 @@ order-2 polyharmonic spline *is* the natural cubic), so this module
 subsumes the former cubic-spline machinery rather than running beside it.
 
 This module is pure tensor math (fp32, no session/IO coupling), mirroring
-how :mod:`saklas.core.vectors` holds the low-level extraction primitives.
+how :mod:`saklas.core.capture` holds the low-level extraction primitives.
 The RBF fit solves a small dense symmetric-indefinite saddle system with
 ``torch.linalg.solve`` -- node counts are tiny (on the order of ten to
 thirty) and fitting is a one-shot operation, not a hot path. scipy is not
@@ -4368,11 +4368,11 @@ def compute_node_centroid(
     ``responses[i] -> prompts[i % len(prompts)]``.  Each is captured as a
     ``[system: length directive, user: prompt, assistant: response]`` turn
     (the shared brevity directive only -- *not* the generation-time persona --
-    standard label) via :func:`saklas.core.vectors._encode_and_capture_all`,
+    standard label) via :func:`saklas.core.capture._encode_and_capture_all`,
     matching the framing the corpus was generated under so it isn't
     out-of-distribution and cancels as common-mode against the neutral baseline.
     Same last-content-token, fp32 pooling discipline that backs
-    :func:`saklas.core.vectors.compute_neutral_activations`, with the same MPS
+    :func:`saklas.core.capture.compute_neutral_activations`, with the same MPS
     ``empty_cache`` discipline between forward passes.
 
     ``role`` (optional): substitute a custom assistant-role label into the
@@ -4384,7 +4384,7 @@ def compute_node_centroid(
     ``layer_indices`` narrows capture to a subset; ``None`` captures every layer.
     Returns ``{layer_idx: centroid (D,)}`` in fp32 on CPU.
     """
-    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
+    from saklas.core.capture import _CAPTURE_BATCH, _encode_and_capture_all_batch
 
     if not responses:
         raise ValueError("manifold node has no responses")
@@ -4453,7 +4453,7 @@ def compute_node_activation_rows(
     to a centroid.  Curved raw manifold fits use it to derive both centroids and
     the fuzzy-manifold σ-field from one capture pass.
     """
-    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
+    from saklas.core.capture import _CAPTURE_BATCH, _encode_and_capture_all_batch
 
     if not responses:
         raise ValueError("manifold node has no responses")
@@ -4525,7 +4525,7 @@ def compute_manifold_node_stats(
     matches every fit consumer and avoids rebuilding each stack from ``K`` row
     views immediately after capture.
     """
-    from saklas.core.vectors import (
+    from saklas.core.capture import (
         _CAPTURE_BATCH_MAX,
         _encode_and_capture_all_batch,
         _prepare_capture_batch,
@@ -4789,7 +4789,7 @@ def compute_node_reduced_covariance(
     off-surface reduction of these covariances into per-node ``σ`` lives in the
     extraction pipeline.  fp32 on CPU, same MPS ``empty_cache`` discipline.
     """
-    from saklas.core.vectors import _CAPTURE_BATCH, _encode_and_capture_all_batch
+    from saklas.core.capture import _CAPTURE_BATCH, _encode_and_capture_all_batch
 
     if not responses:
         raise ValueError("manifold node has no responses")

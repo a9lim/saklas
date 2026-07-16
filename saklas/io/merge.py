@@ -101,7 +101,7 @@ def _resolve_component(
     """Load a merge component as ``(profile, source_tensor_path)``.
 
     Folds a fitted 2-node ``pca`` manifold down to a single direction
-    (:func:`~saklas.core.vectors.folded_vector_directions`).  The returned path
+    (:func:`~saklas.core.capture.folded_directions`).  The returned path
     is the manifold's fitted tensor file, so provenance hashing is uniform.
     """
     mpath = _manifold_tensor_path(ns, name, sid, variant)
@@ -110,7 +110,7 @@ def _resolve_component(
             f"component {coord} not installed (no fitted manifold for {sid})"
         )
     from saklas.io.manifold_tensors import load_manifold
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.core.capture import folded_directions
     manifold = load_manifold(mpath)
     metadata = dict(manifold.metadata)
     raw_roles = metadata.get("node_roles")
@@ -144,7 +144,7 @@ def _resolve_component(
                 f"{requested_source!r}"
             )
     try:
-        folded = folded_vector_directions(manifold)
+        folded = folded_directions(manifold)
     except Exception as e:
         raise MergeError(
             f"component {coord} is a manifold that does not fold to a single "
@@ -431,10 +431,10 @@ def _merge_into_manifold_locked(
     Each component resolves to a per-layer ``dict[int, Tensor]`` direction (a
     fitted 2-node ``pca`` manifold folded down), the
     directions are linearly combined, and the result is folded to a one-pole
-    ray (:func:`~saklas.core.vectors.fold_directions_to_subspace`) and frozen
+    ray (:func:`~saklas.core.capture.fold_directions_to_subspace`) and frozen
     into the baked tensor.  Returns the manifold folder path.
     """
-    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.core.capture import fold_directions_to_subspace
     from saklas.io.manifolds import (
         create_baked_manifold_folder,
         save_baked_manifold_tensor,

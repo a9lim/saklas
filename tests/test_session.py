@@ -26,7 +26,7 @@ MODEL_ID = "google/gemma-3-4b-it"
 
 
 def _corpus(response: str) -> list[str]:
-    from saklas.core.vectors import _load_baseline_prompts
+    from saklas.core.capture import _load_baseline_prompts
 
     return [response] * len(_load_baseline_prompts())
 
@@ -262,7 +262,7 @@ class TestAblation:
         "under Euclidean ablation, so a monitor-based assertion no longer "
         "matches the operator. Recommended rewrite: assert directly on the "
         "metric-agnostic Euclidean projection of the post-ablation hidden "
-        "onto folded_vector_directions(session._monitor.manifolds[probe]) "
+        "onto folded_directions(session._monitor.manifolds[probe]) "
         "(the exact component the operator zeros) instead of a monitor read. "
         "Deferred to the monitor-shape pass (GPU, owner: a9); also revisit the "
         "fixture, which bootstraps the dropped 'affect' category."

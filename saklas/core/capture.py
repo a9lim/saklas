@@ -975,7 +975,7 @@ def fold_directions_to_subspace(
 
 def is_foldable_vector_manifold(manifold: "Manifold") -> bool:
     """True iff *manifold* is a folded (affine ``R = 1``) steering vector —
-    the only shape :func:`folded_vector_directions` accepts.
+    the only shape :func:`folded_directions` accepts.
 
     A multi-node / curved fit (a rank-``R`` subspace, e.g. the ``personas``
     fan or the ``emotions`` surface) is **not** a single steering direction, so it
@@ -992,7 +992,7 @@ def is_foldable_vector_manifold(manifold: "Manifold") -> bool:
     )
 
 
-def folded_vector_directions(manifold: "Manifold") -> dict[int, torch.Tensor]:
+def folded_directions(manifold: "Manifold") -> dict[int, torch.Tensor]:
     """Baked-direction view of a folded (affine ``R = 1``) vector manifold.
 
     Returns ``{L: δ̂_L · share_L}`` — the steering-vector-equivalent baked
@@ -1020,7 +1020,7 @@ def folded_vector_directions(manifold: "Manifold") -> dict[int, torch.Tensor]:
     for idx, sub in manifold.layers.items():
         if not sub.is_affine or sub.rank != 1:
             raise ValueError(
-                "folded_vector_directions requires affine R=1 layers; "
+                "folded_directions requires affine R=1 layers; "
                 f"layer {idx} is rank {sub.rank}, affine={sub.is_affine}"
             )
         share = float(share_map[idx])

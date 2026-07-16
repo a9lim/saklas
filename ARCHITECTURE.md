@@ -32,7 +32,7 @@ The unifying facts:
   a 2-node flat subspace". `session.extract("formal.casual")` authors a 2-node
   discover-`pca` manifold (node 0 = `formal`, node 1 = `casual`) and fits it; the
   in-memory `Profile` callers get back is a *folded view* of that fit
-  (`folded_vector_directions`). There is no separate baked-DiM artifact, no
+  (`folded_directions`). There is no separate baked-DiM artifact, no
   `statements.json`, no `vectors/` storage — the concept's only on-disk form is
   the 2-node manifold under `manifolds/`.
 - **Whitened PCA on two centroids is `Σ⁻¹δ`** (the LDA / Fisher discriminant).
@@ -165,7 +165,7 @@ vector; an N-node fit is a manifold. The session wraps it: `extract` /
 
 ### 3.1 Forward capture and pooling
 
-`core/vectors.py` owns the low-level capture. Statements are captured in
+`core/capture.py` owns the low-level capture. Statements are captured in
 **right-padded batches** (`_encode_and_capture_all_batch`, `_CAPTURE_BATCH`
 pairs per forward; `_encode_and_capture_all` is the single-pair sibling);
 rendering, special-token walkback, and padding remain on CPU, then the complete
@@ -254,13 +254,14 @@ work merely to rediscover the shared model intersection.
      per-layer PCA, no DLS. The bare-label tier resolves `0.5 <concept>` to this
      node, so it steers exactly like a bipolar pole.
 4. Fits via `ManifoldExtractionPipeline` and returns `(canonical_name,
-   folded_vector_directions(manifold))`.
+   folded_directions(manifold))`.
 
 `extract_vector_from_corpora` is the corpus-in sibling (hand-authored pairs —
-skips generation). Both emit `VectorExtracted`; the `Profile` they return
-is the folded view, not a separately stored tensor.
+skips generation). Both emit a single `ManifoldExtracted` whose `profile` field
+carries the folded view; the `Profile` they return is that folded view, not a
+separately stored tensor.
 
-`folded_vector_directions(manifold)` reverses the fold: `{L: δ̂_L · share_L}`, the
+`folded_directions(manifold)` reverses the fold: `{L: δ̂_L · share_L}`, the
 baked-direction equivalent, used to back the `Profile`-returning surface
 (`extract()`, `manifold compare`/`why`, GGUF export) without a second stored
 representation. It raises on a curved or multi-dim manifold.
@@ -428,7 +429,7 @@ The per-tensor bakes:
 For a vector, the activation-space magnitude lives in the real `node_coords`
 (`coord_+ − coord_− = ‖δ_L‖`), so a fixed slide fraction displaces proportionally
 more where the concept signal is bigger — there is no separate `ref_norm` factor.
-The folded view `folded_vector_directions` returns `δ̂_L · share_L` for the
+The folded view `folded_directions` returns `δ̂_L · share_L` for the
 scale-invariant surfaces (`compare`/`why`) and GGUF export, where llama.cpp's
 uniform control-vector scalar reproduces the relative per-layer weighting
 (`io/gguf_io.py`). There is **no lever bake** (§5.5 explains why).
@@ -561,11 +562,11 @@ composes the unified backend:
 `session.ensure_profile_registered`, in order: (1) an in-memory baked direction
 already in `_profiles` (ad-hoc `extract`/`merge`/projection results); (2) a
 fitted 2-node `pca` manifold on disk — `_try_fold_manifold` loads it
-(`ensure_manifold_loaded`) and folds via `folded_vector_directions`, memoizing the
+(`ensure_manifold_loaded`) and folds via `folded_directions`, memoizing the
 result. Pre-manifold vector folders are not part of the current runtime format.
 
 **Folding to a push fragment.** `fold_directions_to_subspace(name, directions,
-neutral_means)` (`core/vectors.py`) folds a resolved per-layer direction into a
+neutral_means)` (`core/capture.py`) folds a resolved per-layer direction into a
 neutral-anchored affine `R=1` `Manifold` — a one-pole ray with `basis = d̂_L`,
 `node_coords = [[‖d_L‖]]`, and `share = ‖d_L‖_M`. `session._affine_manifold_push`
 then splits it into per-layer `(unit_dir rows, [‖d_L‖] coord)`, so the
@@ -821,7 +822,7 @@ has room; tune α per target.
 `0.3 formal.casual`:
 
 1. `ensure_profile_registered("formal.casual")` loads the 2-node `pca` manifold,
-   folds it (`folded_vector_directions` → `{L: δ̂_L·share_L}`), memoizes.
+   folds it (`folded_directions` → `{L: δ̂_L·share_L}`), memoizes.
 2. `fold_directions_to_subspace` rebuilds a neutral-anchored `R=1` ray:
    `basis = δ̂_L`, `node_coords = [[‖d_L‖]]`, `share = ‖d_L‖_M`.
 3. `_affine_manifold_push` → push fragment `(δ̂_L rows, [‖d_L‖] coord, coeff 0.3)`.
@@ -1273,6 +1274,6 @@ straight-chord additive baseline alongside.
 no session/IO coupling — the on-disk tensor codec `save_manifold`/`load_manifold`
 and the `ActivationRowStore` row spool live in `io/manifold_tensors.py`, since
 persistence is io's job). The whitener is `core/mahalanobis.py`; capture + fold +
-projection `core/vectors.py`; the fit pipeline `core/extraction.py`; dispatch +
+projection `core/capture.py`; the fit pipeline `core/extraction.py`; dispatch +
 injection `core/session.py` + `core/hooks.py`; reads `core/monitor.py`; grammar
 `core/steering_expr.py`.*

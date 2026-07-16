@@ -165,7 +165,7 @@ re-solve as a tiny projected-gradient NNLS per step — returning
 `JSpaceDecomposition(layer, share, tokens)`. Errors: `JacobianLensError` (422),
 `LensNotFittedError` (404), `MultiTokenWordError` (400), all `SaklasError`s.
 
-## vectors.py
+## capture.py
 
 Low-level capture, pooling, DLS, the vector⇄subspace fold, and profile I/O. **No
 `extract_difference_of_means`** — extraction authors a 2-node `pca` manifold now
@@ -229,7 +229,7 @@ per-layer direction (a `merge` linear-combination, a `~`/`|` projection, or a
 folded bundled concept) into a neutral-anchored affine `R=1` `Manifold` — a
 one-pole ray (the live 2-node-vector read goes through extraction's whitened
 `fit_affine_subspace`; the legacy bipolar-centroid fold was retired in the
-Mahalanobis-only collapse). `folded_vector_directions(manifold)` is the **reverse view**:
+Mahalanobis-only collapse). `folded_directions(manifold)` is the **reverse view**:
 `{L: δ̂_L · share_L}`, the baked-direction view of a 2-node affine manifold, used
 to back the `Profile`-returning surface (`extract()`, `manifold compare`/`why`,
 GGUF export) without a second stored representation. It raises on a curved or
@@ -1025,7 +1025,7 @@ frame, pooled in standard-assistant space)) author each node's corpus.
 `extract(concept, baseline, *, kind="abstract", ...)` authors a 2-node
 discover-`pca` manifold (`create_discover_manifold_folder`,
 `hyperparams={"max_dim": 1}`) and fits it via `ManifoldExtractionPipeline`,
-returning `(canonical_name, folded_vector_directions(manifold))`. The corpus is
+returning `(canonical_name, folded_directions(manifold))`. The corpus is
 generated conversationally — `generate_responses(concepts, kinds, *, roles=None,
 custom_system=None, samples_per_prompt=1, …)` has each pole answer the shared baseline prompts *in
 character*, the concept riding both the system prompt (`_system_for`) and the
@@ -1064,7 +1064,7 @@ resolves a direction from, in order: (1) an in-memory baked direction already in
 fitted Jacobian lens (raising `LensNotFittedError`/`MultiTokenWordError`, never
 falling through to extraction); (2) a fitted
 2-node `pca` manifold on disk — `try_fold_manifold` → `ensure_manifold_loaded`
-(load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
+(load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_directions`,
 memoized into `_profiles`. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
 probe-roster bootstrap — one pass, two tiers. **Tagged concept axes**: for each
 `default/` manifold tagged in a requested category, fit-or-load the 2-node
@@ -1125,7 +1125,7 @@ push/pop invalidation (a prefill-inactive scope preserves the cache, so a
 per row). The alpha *sweep* steers the prompt at varying strength by construction
 (`BOTH` terms), so it can't share a prefill — that's expected, not a gap. Hot-path
 events: `GenerationStarted`/`SteeringApplied`/
-`SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
+`SteeringCleared`/`ProbeScored`/`GenerationFinished` +
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
 
 **Jacobian-lens surface.** `session.jlens` validates v6 sidecar/live-weight

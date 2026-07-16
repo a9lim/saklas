@@ -10,7 +10,7 @@ import torch
 
 from saklas.core.model import loaded_model_fingerprint
 from saklas.core.steering_composer import SteeringComposer
-from saklas.core.vectors import fold_directions_to_subspace
+from saklas.core.capture import fold_directions_to_subspace
 from saklas.io.manifold_folder import ManifoldFormatError
 from saklas.io.manifolds import create_baked_manifold_folder, transfer_manifold
 from saklas.io.paths import encode_release_id

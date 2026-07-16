@@ -26,7 +26,7 @@ from typing import Any
 
 from saklas.core.manifold import Manifold
 from saklas.core.monitor import Monitor
-from saklas.core.vectors import fold_directions_to_subspace
+from saklas.core.capture import fold_directions_to_subspace
 from tests._whitener import synthetic_means, synthetic_whitener
 
 # A probe along axis 0, layer 0, dim 4 — easy to reason about.  The fold

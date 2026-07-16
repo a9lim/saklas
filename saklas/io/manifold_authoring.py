@@ -556,7 +556,7 @@ def create_baked_manifold_folder(
     The single producer for corpus-less directions — ``merge`` outputs and
     imported control vectors.  ``manifold`` is an already-fitted
     :class:`saklas.core.manifold.Manifold` (typically the affine ``R = 1`` ray
-    from :func:`saklas.core.vectors.fold_directions_to_subspace`); its geometry
+    from :func:`saklas.core.capture.fold_directions_to_subspace`); its geometry
     is frozen into the per-model ``<safe_model>.safetensors`` tensor, the folder
     carries no ``nodes/`` corpus, and it can never re-fit.
 

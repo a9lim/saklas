@@ -73,7 +73,7 @@ class SteeringComposer:
 
         Ensures the ``base`` and ``onto`` profiles are loaded (invoking
         the autoload path when needed), runs
-        :func:`saklas.core.vectors.project_profile` to build the derived
+        :func:`saklas.core.capture.project_profile` to build the derived
         tensor dict, and registers it under the synthetic key
         ``"<base><op><onto>"``.  The synthetic key matches what the parser
         used for the ``Steering.alphas`` key, so downstream pole
@@ -99,7 +99,7 @@ class SteeringComposer:
         shared across all active scopes.
         """
         from saklas.core.steering_expr import ProjectedTerm
-        from saklas.core.vectors import project_profile
+        from saklas.core.capture import project_profile
 
         profiles = self._session._profiles
 
@@ -404,7 +404,7 @@ class SteeringComposer:
            derivations) — returned verbatim;
         2. a fitted 2-node ``pca`` manifold on disk — loaded via
            :meth:`ensure_manifold_loaded`
-           and folded by :func:`~saklas.core.vectors.folded_vector_directions`,
+           and folded by :func:`~saklas.core.capture.folded_directions`,
            then memoized in ``_profiles``;
 
         Raises :class:`VectorNotRegisteredError` when nothing resolves.
@@ -462,9 +462,9 @@ class SteeringComposer:
             self.ensure_manifold_loaded(name)
         except Exception:
             return None
-        from saklas.core.vectors import folded_vector_directions
+        from saklas.core.capture import folded_directions
         try:
-            return folded_vector_directions(self._session._manifolds[name])
+            return folded_directions(self._session._manifolds[name])
         except Exception as e:
             raise VectorNotRegisteredError(
                 f"'{name}' is a manifold that does not fold to a single "
@@ -972,7 +972,7 @@ class SteeringComposer:
         def _bucket(trigger: Trigger) -> dict[str, list[Any]]:
             return grouped.setdefault(trigger, {"push": [], "ablate": []})
 
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         for name, entry in entries.items():
             if isinstance(entry, AblationTerm):

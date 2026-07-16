@@ -13,7 +13,7 @@ from saklas.io.manifolds import (
     create_baked_manifold_folder, save_baked_manifold_tensor,
 )
 from saklas.io.manifold_tensors import load_manifold
-from saklas.core.vectors import fold_directions_to_subspace, folded_vector_directions
+from saklas.core.capture import fold_directions_to_subspace, folded_directions
 from saklas.io.paths import encode_release_id, model_dir, safe_model_id, tensor_filename
 from tests._whitener import isotropic_whitener
 
@@ -329,7 +329,7 @@ def test_merge_into_manifold_single_model(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert sc.components["0:default/happy"]["alpha"] == 0.5
     # The baked tensor folds back to the linear combination:
     # 0.5·[1,0] + 0.25·[0,2] = [0.5, 0.5].
-    folded = folded_vector_directions(load_manifold(tensor_path))
+    folded = folded_directions(load_manifold(tensor_path))
     assert folded[0][0] > 0
     assert folded[0][0] == pytest.approx(float(folded[0][1]), abs=1e-5)
 

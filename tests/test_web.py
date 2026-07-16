@@ -283,7 +283,7 @@ class TestScoreSingleTokenPerLayer:
         # Build a real TraitMonitor, register two probes that share
         # layer 0, score against a hidden state.  No torch model needed.
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
         means = {0: torch.zeros(4)}
@@ -316,7 +316,7 @@ class TestScoreSingleTokenPerLayer:
 
     def test_empty_input_returns_empty(self) -> None:
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from tests._whitener import isotropic_whitener
 
         means = {0: torch.zeros(4)}
@@ -330,7 +330,7 @@ class TestScoreSingleTokenPerLayer:
 
     def test_layers_outside_probe_cache_omitted(self) -> None:
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from tests._whitener import isotropic_whitener
 
         means = {0: torch.zeros(4)}

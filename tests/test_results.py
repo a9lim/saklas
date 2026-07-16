@@ -317,7 +317,7 @@ class TestTraitMonitorScoring:
     @classmethod
     def _make_monitor(cls):
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from tests._whitener import synthetic_whitener
         probe_vec = torch.zeros(cls._DIM)
         probe_vec[0] = 1.0  # unit vector along dim 0
