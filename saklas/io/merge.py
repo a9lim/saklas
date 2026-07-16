@@ -109,7 +109,7 @@ def _resolve_component(
         raise MergeError(
             f"component {coord} not installed (no fitted manifold for {sid})"
         )
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.core.vectors import folded_vector_directions
     manifold = load_manifold(mpath)
     metadata = dict(manifold.metadata)

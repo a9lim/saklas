@@ -76,7 +76,7 @@ def export_gguf_manifold(
     from saklas.io.paths import (
         manifold_dir, parse_tensor_filename, tensor_filename,
     )
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.core.vectors import folded_vector_directions
 
     mdir = manifold_dir(ns, name)

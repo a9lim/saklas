@@ -708,7 +708,7 @@ def save_baked_manifold_tensor(
     an interruption between them is repaired by overwriting/adopting the target
     on the next producer retry.  Returns the tensor path.
     """
-    from saklas.core.manifold import save_manifold
+    from saklas.io.manifold_tensors import save_manifold
     from saklas.io.paths import tensor_filename
 
     # ``nodes_sha256`` is provenance-only for baked (never re-fits), computed

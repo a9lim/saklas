@@ -458,6 +458,13 @@ into the unified `Monitor` via `set_whitener`.
 
 Pure-tensor (fp32, no session/IO) subspace + manifold math. Goodfire "Manifold
 Steering" (arXiv 2605.05115), generalized to arbitrary intrinsic dim/topology.
+The on-disk **tensor codec** (`save_manifold`/`load_manifold`) and the disk-backed
+`ActivationRowStore` row spool live in the io layer now
+(`io/manifold_tensors.py`) — that persistence lived here only because the codec
+needs these dataclasses, and io importing core's types is the correct layering
+arrow. Fit-capture math (`compute_manifold_node_stats` etc.) still produces the
+spool, so it lazy-imports `ActivationRowStore` from io (the established core→io
+reference pattern).
 
 Domains: `ManifoldDomain` ABC + `BoxDomain` (open/periodic axes), `SphereDomain`
 (Sⁿ chordal), `CustomDomain` (explicit immersion; also the identity carrier for
@@ -529,7 +536,8 @@ for MPS). Hook-time gain compensation keeps `along·κ` equal to the user α.
 `norm_cap = 3·‖h‖` is the only norm guard. `invert_parameterization` is the cold/eval-only damped-LM nearest-
 point projection.
 
-`save_manifold`/`load_manifold` round-trip the per-model tensor (`layer_<L>.{mean,
+`save_manifold`/`load_manifold` (the codec — **moved to `io/manifold_tensors.py`**)
+round-trip the per-model tensor (`layer_<L>.{mean,
 basis[,affine_map][,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
 `node_coords` + optional `origin`) + sidecar (`mahalanobis_share_per_layer`,
 `origin_per_layer`, `share_metric`, `subspace_metric` — no

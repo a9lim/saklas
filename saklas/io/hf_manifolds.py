@@ -447,7 +447,7 @@ def push_manifold(
                             )
                 # Stage the fitted tensors that survive the model/variant
                 # filter, each with its sidecar.
-                from saklas.core.manifold import load_manifold
+                from saklas.io.manifold_tensors import load_manifold
 
                 # Iterate the candidate set whose logical locks we acquired.
                 # A lower-level writer that bypasses the documented

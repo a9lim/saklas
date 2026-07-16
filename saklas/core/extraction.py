@@ -169,7 +169,7 @@ def _publish_fit_if_current(
 ) -> None:
     """CAS-publish a fitted pair while the authoring revision is unchanged."""
 
-    from saklas.core.manifold import save_manifold
+    from saklas.io.manifold_tensors import save_manifold
     from saklas.io.manifold_folder import _locked_manifest
 
     with _locked_manifest(folder):
@@ -513,7 +513,7 @@ def _capture_generation_is_complete(
     if files and not verify_integrity(capture_dir, files)[0]:
         return False
     if row_layers:
-        from saklas.core.manifold import ActivationRowStore
+        from saklas.io.manifold_tensors import ActivationRowStore
 
         for idx in sorted(row_layers):
             key = str(idx)
@@ -1303,7 +1303,7 @@ class ManifoldExtractionPipeline:
         )
         cached_manifold: Manifold | None = None
         if not force and not _verified_cache_miss:
-            from saklas.core.manifold import _load_manifold_locked
+            from saklas.io.manifold_tensors import _load_manifold_locked
             from saklas.io.manifold_folder import manifold_pair_lock
             from saklas.io.packs import verify_integrity
 
@@ -1562,7 +1562,7 @@ class ManifoldExtractionPipeline:
         # of the durable union and must not be silently unlinked by a scoped fit.
         if cache_meta is not None and cache_meta.exists():
             try:
-                from saklas.core.manifold import ActivationRowStore
+                from saklas.io.manifold_tensors import ActivationRowStore
                 from saklas.io.packs import verify_integrity
 
                 with open(cache_meta) as handle:
@@ -1760,7 +1760,7 @@ class ManifoldExtractionPipeline:
             set(new_rows.layer_indices) if new_rows is not None else set()
         )
         if retain_node_rows:
-            from saklas.core.manifold import ActivationRowStore
+            from saklas.io.manifold_tensors import ActivationRowStore
 
             if cached_rows is not None and new_rows is None:
                 retained_rows = cached_rows
@@ -2455,7 +2455,7 @@ class ManifoldExtractionPipeline:
         sigma_field_per_layer: dict[int, dict[str, float]] = {}
         if effective_fit_mode != "pca" and sae_backend is None and layer_subs:
             if mf.fit_mode == "auto":
-                from saklas.core.manifold import ActivationRowStore
+                from saklas.io.manifold_tensors import ActivationRowStore
 
                 stores: list[ActivationRowStore] = []
                 if retained_rows is not None:

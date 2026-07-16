@@ -152,7 +152,7 @@ class SteeringComposer:
         manifolds = self._session._manifolds
         if key in manifolds:
             return
-        from saklas.core.manifold import load_manifold
+        from saklas.io.manifold_tensors import load_manifold
         from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
 
         model_id = self._session.model_id

@@ -1270,7 +1270,9 @@ straight-chord additive baseline alongside.
 ---
 
 *Pure manifold/subspace math lives in `core/manifold.py` (fp32, dependency-free,
-no session/IO coupling). The whitener is `core/mahalanobis.py`; capture + fold +
+no session/IO coupling — the on-disk tensor codec `save_manifold`/`load_manifold`
+and the `ActivationRowStore` row spool live in `io/manifold_tensors.py`, since
+persistence is io's job). The whitener is `core/mahalanobis.py`; capture + fold +
 projection `core/vectors.py`; the fit pipeline `core/extraction.py`; dispatch +
 injection `core/session.py` + `core/hooks.py`; reads `core/monitor.py`; grammar
 `core/steering_expr.py`.*

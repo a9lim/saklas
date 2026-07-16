@@ -5358,7 +5358,7 @@ class SaklasSession:
         """
         from saklas.io.merge import MergeError, merge_into_manifold
         from saklas.io.paths import tensor_filename
-        from saklas.core.manifold import load_manifold
+        from saklas.io.manifold_tensors import load_manifold
         from saklas.core.model import loaded_model_fingerprint
         from saklas.core.vectors import folded_vector_directions
 

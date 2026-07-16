@@ -24,8 +24,9 @@ from saklas import cli
 from saklas.cli.runners import _run_manifold_compare, _run_manifold_why
 from saklas.core.manifold import (
     MANIFOLD_FIT_POLICY_VERSION, CustomDomain, Manifold,
-    fit_affine_subspace, save_manifold, subspace_share,
+    fit_affine_subspace, subspace_share,
 )
+from saklas.io.manifold_tensors import save_manifold
 from saklas.io.paths import manifold_dir, model_dir, tensor_filename
 
 _MODEL = "test/model"
@@ -464,7 +465,7 @@ class TestGgufFold:
 def test_default_probe_preflight_skips_unrelated_variant_hashes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.core.session import SaklasSession
     from saklas.io import packs
     from saklas.io.manifolds import ManifoldFolder

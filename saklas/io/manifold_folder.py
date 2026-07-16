@@ -29,7 +29,7 @@ The user authors ``manifold.json`` (each node carries a ``label`` and its
 authoring ``coords``) and the ``nodes/*.json`` corpus files by hand;
 ``saklas manifold fit`` produces the per-model tensors and
 back-fills the ``files`` integrity manifest.  Tensor save/load itself
-lives in :mod:`saklas.core.manifold` (``save_manifold`` / ``load_manifold``);
+lives in :mod:`saklas.io.manifold_tensors` (``save_manifold`` / ``load_manifold``);
 this module owns folder discovery, the node corpus, and integrity.
 """
 from __future__ import annotations
@@ -946,7 +946,7 @@ class ManifoldFolder:
     """A manifold artifact folder on disk.
 
     Discovery + corpus + integrity only — the fitted RBF tensors are
-    loaded through :func:`saklas.core.manifold.load_manifold`.
+    loaded through :func:`saklas.io.manifold_tensors.load_manifold`.
 
     Two folder shapes share this class via the ``fit_mode`` field:
 

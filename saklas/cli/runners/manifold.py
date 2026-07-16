@@ -142,7 +142,7 @@ def _fold_manifold_to_profile_with_identity(
     overwrite earlier ones.
     """
     from saklas.core.profile import Profile
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.core.vectors import folded_vector_directions
     from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
     from saklas.io.selectors import AmbiguousSelectorError
@@ -198,7 +198,7 @@ def _fold_all_fitted_manifolds(
     ``exclude_identity`` drops the target by exact ``(namespace, name)``.
     """
     from saklas.core.profile import Profile
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.core.vectors import folded_vector_directions
     from saklas.io.paths import manifolds_dir, tensor_filename
 

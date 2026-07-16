@@ -88,7 +88,7 @@ class TestMergeVector:
         from saklas.core.vectors import (
             fold_directions_to_subspace, folded_vector_directions,
         )
-        from saklas.core.manifold import load_manifold
+        from saklas.io.manifold_tensors import load_manifold
         from saklas.core.model import loaded_model_fingerprint
         from saklas.io.manifolds import create_baked_manifold_folder
         from saklas.io.paths import tensor_filename

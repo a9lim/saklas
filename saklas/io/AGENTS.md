@@ -107,7 +107,7 @@ share/subspace metrics, fit_mode, hyperparams, diagnostics, and
 `node_spread_per_layer` — the whitened between-node spread `{str(L): tr(G_L)}`,
 a diagnostic concept-signal-by-layer profile measured before DLS, whose keys are
 the evaluated-layer roster and may strictly contain `fitted_layers` when DLS
-drops a layer); the tensor save/load itself lives in `core/manifold.py`; its
+drops a layer); the tensor save/load itself lives in `manifold_tensors.py`; its
 tensor-derived layer roster must equal the sidecar's `fitted_layers`. Merge component provenance always
 carries a manifest-proven lowercase sha256. `hash_manifold_files` reuses
 `packs.hash_file` for the per-file sha256 integrity manifest. After the first
@@ -159,10 +159,10 @@ become anisotropic, and transforms `origin` into the target frame), then writes 
 `_from-<safe_src>` variant + patches the transfer-provenance sidecar. The core
 function raises a plain `ValueError` when the alignment covers no fitted layer; this
 function surfaces it as `ManifoldFormatError` (the `WhitenerError`, a `ValueError`
-subclass, propagates verbatim via a `SaklasError`-first `except`). The lazy core
-imports are now just `load_manifold` / `save_manifold` /
-`transfer_manifold_subspaces` — no `LayerSubspace` / `eval_rbf` / `subspace_share` /
-`mahalanobis.WhitenerError`. `manifold_summary(folder)` is the session-independent
+subclass, propagates verbatim via a `SaklasError`-first `except`). The lazy imports
+are now just `load_manifold` / `save_manifold` (sibling `manifold_tensors.py`) +
+`core.manifold.transfer_manifold_subspaces` — no `LayerSubspace` / `eval_rbf` /
+`subspace_share` / `mahalanobis.WhitenerError`. `manifold_summary(folder)` is the session-independent
 serializer shared by `pack show -j` + the HTTP summary route.
 `clear` / `rm` garbage-collect shared format-v4 per-layer capture shards only
 after the last fitted-sidecar owner disappears, under the same capture-stem lock
@@ -224,6 +224,28 @@ template's `sha256()` so a context/value edit re-fits. The template is the autho
 source of truth; the corpus is its materialization. There is **no embedded
 `template` block** — the pre-migration `{slot, values, pairs}` block, `expand_template`,
 `_validate_template_block`, and `create_templated_manifold_folder` are gone.
+
+## manifold_tensors.py
+
+The fitted per-model **tensor codec** plus the curved-fit activation-row spool —
+lifted out of `core/manifold.py` to restore that module's pure-tensor, no-IO
+contract (io importing core's `Manifold`/`LayerSubspace`/`ManifoldDomain`
+dataclasses is the correct layering arrow; the codec only lived in core because it
+needs those types). `save_manifold(manifold, path, metadata)` /
+`load_manifold(path, *, verify_manifest=True)` round-trip the safetensors payload
+(per-layer mean/basis[/affine_map] or the curved RBF/σ triple + shared
+`node_coords` + optional `origin`) and its lean JSON sidecar under the folder pair
+lock, staging both through same-directory tempfiles with fsync + `os.replace`
+(`_replace_manifold_file` is the atomic-replace seam the publication
+failure-injection tests monkeypatch; `_load_manifold_locked` is the pair-locked
+read half, reused by `core/extraction.py`'s cache-hit fast path). Re-exported
+through the `manifolds.py` barrel for a coherent public io surface. `ActivationRowStore`
+is the temporary layer-major mmap row spool a curved fit uses after the
+centroid-derived basis exists (one `torch.from_file` shared-memory tensor per
+layer, `persist`/`load`/`load_shards`/`combine_disjoint` for the v4 sharded
+capture cache); `core.manifold.compute_manifold_node_stats` produces it,
+`compute_store_reduced_covariances` consumes it, both lazy-importing it back from
+here.
 
 ## templates.py
 

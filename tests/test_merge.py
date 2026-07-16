@@ -12,7 +12,7 @@ from saklas.io.manifolds import (
     ManifoldFolder, ManifoldSidecar,
     create_baked_manifold_folder, save_baked_manifold_tensor,
 )
-from saklas.core.manifold import load_manifold
+from saklas.io.manifold_tensors import load_manifold
 from saklas.core.vectors import fold_directions_to_subspace, folded_vector_directions
 from saklas.io.paths import encode_release_id, model_dir, safe_model_id, tensor_filename
 from tests._whitener import isotropic_whitener

@@ -12,8 +12,12 @@ from typing import Any
 import pytest
 import torch
 
-from saklas.core.manifold import (
+from saklas.io.manifold_tensors import (
     ActivationRowStore,
+    load_manifold,
+    save_manifold,
+)
+from saklas.core.manifold import (
     BoxAxis,
     BoxDomain,
     CustomDomain,
@@ -39,8 +43,6 @@ from saklas.core.manifold import (
     subspace_inject,
     LayerSubspace,
     invert_parameterization,
-    load_manifold,
-    save_manifold,
 )
 
 

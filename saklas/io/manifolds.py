@@ -8,6 +8,8 @@ keeps working unchanged everywhere:
 - :mod:`saklas.io.manifold_folder` — the on-disk format core: the
   dataclasses, integrity/sha256, ``manifold.json`` load/save, and the
   shared module-private validators + payload builders.
+- :mod:`saklas.io.manifold_tensors` — the fitted per-model tensor codec
+  (``save_manifold`` / ``load_manifold``) and the activation-row spool.
 - :mod:`saklas.io.manifold_authoring` — folder discovery and the
   create/init/append/plan/merge/update authoring path.
 - :mod:`saklas.io.manifold_lifecycle` — lifecycle (rm/clear/refresh),
@@ -57,6 +59,9 @@ from saklas.io.manifold_folder import (
     hash_manifold_files,
     min_nodes,
 )
+
+# -- fitted-tensor codec ------------------------------------------------
+from saklas.io.manifold_tensors import load_manifold, save_manifold
 
 # -- discovery + authoring ----------------------------------------------
 from saklas.io.manifold_authoring import (
@@ -409,6 +414,8 @@ __all__ = [
     "BakedManifoldError",
     "ManifoldSidecar",
     "ManifoldFolder",
+    "save_manifold",
+    "load_manifold",
     "hash_manifold_files",
     "iter_manifold_folders",
     "create_manifold_folder",

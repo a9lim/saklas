@@ -93,7 +93,7 @@ def _run_pack_show(args: argparse.Namespace) -> None:
     # header read.  Soft-fails to an empty list if the tensor isn't there.
     derived_node_coords: list[list[float]] = []
     if mf.is_discover and fitted:
-        from saklas.core.manifold import load_manifold
+        from saklas.io.manifold_tensors import load_manifold
         stem_for_session = fitted[0]["stem"]
         try:
             m = load_manifold(mf.tensor_path(stem_for_session))

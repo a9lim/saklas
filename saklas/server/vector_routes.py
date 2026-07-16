@@ -394,7 +394,7 @@ def register_vector_routes(app: FastAPI) -> None:
         """
         from saklas.io.merge import merge_into_manifold, MergeError
         from saklas.io.paths import tensor_filename
-        from saklas.core.manifold import load_manifold
+        from saklas.io.manifold_tensors import load_manifold
         from saklas.core.vectors import folded_vector_directions
         from saklas.server.manifold_routes import _refuse_if_busy
         resolve_session_id(session_id)
