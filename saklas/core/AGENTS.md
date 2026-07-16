@@ -1042,7 +1042,15 @@ transaction under `LensInstrument.state_lock` — a reentrant leaf lock
 (outer locks like `_gen_lock`/`_model_exclusive` are always taken
 first) that also serializes the getter's refresh/adopt/evict,
 `has_compatible_jlens`, `_adopt_fitted_jlens`/`_evict_resident_jlens`,
-probe attach/detach, and the live toggles — so the snapshot cannot tear
+probe attach/detach — the session's `remove_probe` routes lens removals
+through the instrument's atomic `try_detach` (a bare membership check +
+direct registry delete bypassed the boundary; round-5) — the live
+toggles, `fit_jlens`'s restore→adopt transitions (the `_live_lens`
+restore primes the adoption's rebuild; both land as one transaction),
+and the coherent read surfaces
+(`specs`/`names`/`probe_layers`/`probe_hash`/`live_layers` — an
+un-locked `specs()` iteration could RuntimeError under a concurrent
+detach) — so the snapshot cannot tear
 mid-`prepare` (sol's round-4 P1: without it, an adoption landing
 between the refresh and the live-state read paired lens A's specs with
 lens B's live device stack). `plan` and `bind` consume the prep only
@@ -1058,7 +1066,9 @@ prep (a bare `bind(plan)`, a wrong-family prep, or a wrong-family
 `LensPrep` all raise), and the plan must echo the prep's
 per-preparation `token` (`InstrumentPlan.prep_token` — same-family
 plan/prep crossing from different prepare() calls raises, sol's round-4
-P2) — freezes an `InstrumentBinding` from the prep's
+P2; tokens draw from ONE process-wide sequence, `types.next_prep_token`
+— per-instance counters collided across instrument instances, round-5)
+— freezes an `InstrumentBinding` from the prep's
 specs and the prep's `fingerprint` (a bind-time live identity read
 could stamp a concurrently adopted replacement onto a run pinned to the
 older lens; the SAE binding resolves `max_act` at bind, so the un-locked

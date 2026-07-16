@@ -28,7 +28,6 @@ composition-preflight error (``validate_gate``), not a silent constant.
 from __future__ import annotations
 
 import hashlib
-import itertools
 from typing import Any, Mapping, TYPE_CHECKING
 
 import torch
@@ -41,6 +40,7 @@ from saklas.core.instruments.types import (
     InstrumentPlan,
     InstrumentPrep,
     ReadRequest,
+    next_prep_token,
     parse_gate_ref,
     validate_gate_channels,
 )
@@ -148,9 +148,6 @@ class SaeInstrument:
         self.probes: dict[str, dict[str, Any]] = {}
         # Live feature discovery: {layer, top_k, source}, or None when off.
         self.live: dict[str, Any] | None = None
-        # Per-preparation token sequence (compared at bind — a plan
-        # cannot be bound with a prep from a different prepare() call).
-        self._prep_tokens = itertools.count(1)
         # The current per-generation run (idle passthrough until bind()).
         self.current_run = SaeRun(
             self, InstrumentBinding(family=self.family),
@@ -201,7 +198,7 @@ class SaeInstrument:
         return InstrumentPrep(
             family=self.family,
             request=request,
-            token=next(self._prep_tokens),
+            token=next_prep_token(),
         )
 
     def bind(self, plan: InstrumentPlan, prep: InstrumentPrep) -> SaeRun:

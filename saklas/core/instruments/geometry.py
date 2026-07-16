@@ -16,7 +16,6 @@ can enumerate families uniformly.
 from __future__ import annotations
 
 import hashlib
-import itertools
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -32,6 +31,7 @@ from saklas.core.instruments.types import (
     InstrumentPrep,
     Membership,
     ReadRequest,
+    next_prep_token,
     parse_gate_ref,
     validate_gate_channels,
 )
@@ -127,9 +127,6 @@ class GeometryInstrument:
 
     def __init__(self, session: "SaklasSession") -> None:
         self._session = session
-        # Per-preparation token sequence (compared at bind — a plan
-        # cannot be bound with a prep from a different prepare() call).
-        self._prep_tokens = itertools.count(1)
         # The current per-generation run (idle passthrough until bind()).
         self.current_run = GeometryRun(
             self, InstrumentBinding(family=self.family),
@@ -150,7 +147,7 @@ class GeometryInstrument:
         return InstrumentPrep(
             family=self.family,
             request=request,
-            token=next(self._prep_tokens),
+            token=next_prep_token(),
         )
 
     def bind(self, plan: InstrumentPlan, prep: InstrumentPrep) -> GeometryRun:

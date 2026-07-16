@@ -2770,20 +2770,28 @@ class SaklasSession:
             if base is not None and not usable:
                 try:
                     merged = _save_full(base)
-                    if pre_evicted_live is not None:
-                        self._live_lens = pre_evicted_live
-                    return SaklasSession._adopt_fitted_jlens(
-                        self, merged, sidecar=load_lens_sidecar(self.model_id),
-                    )
+                    # The live-state restore primes the locked adoption's
+                    # rebuild; both must land as one lens-state
+                    # transaction (round-5: an un-locked restore write
+                    # between them could be observed torn).
+                    with self._lens_instrument.state_lock:
+                        if pre_evicted_live is not None:
+                            self._live_lens = pre_evicted_live
+                        return SaklasSession._adopt_fitted_jlens(
+                            self,
+                            merged,
+                            sidecar=load_lens_sidecar(self.model_id),
+                        )
                 except BaseException:
                     if resident_evicted_early:
                         restored = load_lens(self.model_id)
                         if restored is not None:
-                            if pre_evicted_live is not None:
-                                self._live_lens = pre_evicted_live
-                            SaklasSession._adopt_fitted_jlens(
-                                self, restored[0], sidecar=restored[1],
-                            )
+                            with self._lens_instrument.state_lock:
+                                if pre_evicted_live is not None:
+                                    self._live_lens = pre_evicted_live
+                                SaklasSession._adopt_fitted_jlens(
+                                    self, restored[0], sidecar=restored[1],
+                                )
                     raise
 
             resident = self._jlens
@@ -2838,21 +2846,23 @@ class SaklasSession:
                 else:
                     merged = _save_full(merged)
                     sidecar = load_lens_sidecar(self.model_id)
-                if resume_live is not None:
-                    self._live_lens = resume_live
-                return SaklasSession._adopt_fitted_jlens(
-                    self, merged, sidecar=sidecar,
-                )
+                with self._lens_instrument.state_lock:
+                    if resume_live is not None:
+                        self._live_lens = resume_live
+                    return SaklasSession._adopt_fitted_jlens(
+                        self, merged, sidecar=sidecar,
+                    )
             except BaseException:
                 if had_resident:
                     restored = load_lens(self.model_id)
                     if restored is not None:
                         restored_lens, restored_sidecar = restored
-                        if resume_live is not None:
-                            self._live_lens = resume_live
-                        SaklasSession._adopt_fitted_jlens(
-                            self, restored_lens, sidecar=restored_sidecar,
-                        )
+                        with self._lens_instrument.state_lock:
+                            if resume_live is not None:
+                                self._live_lens = resume_live
+                            SaklasSession._adopt_fitted_jlens(
+                                self, restored_lens, sidecar=restored_sidecar,
+                            )
                 raise
 
     def _resolve_jlens_layers(
@@ -6407,10 +6417,14 @@ class SaklasSession:
         applies at the next generation boundary.  A geometry detach
         mutates the live Monitor roster in-flight scoring walks, so it
         routes through the instrument's exclusive section and rejects
-        while a generation is running (retry when idle).
+        while a generation is running (retry when idle).  The lens
+        removal is the instrument's atomic ``try_detach`` — a bare
+        membership check + direct registry delete bypassed the
+        lens-state lock and could land inside a ``prepare`` snapshot or
+        an adoption (round-5).
         """
-        if name in self._lens_probes:
-            del self._lens_probes[name]
+        if self._lens_instrument.try_detach(name):
+            pass
         elif name in self._sae_probes:
             del self._sae_probes[name]
         else:

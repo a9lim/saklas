@@ -773,6 +773,49 @@ def test_lens_state_lock_serializes_getter_against_snapshot() -> None:
     assert seen and seen[0] is not None
 
 
+def test_lens_state_lock_serializes_detach_and_reads() -> None:
+    """round-5 P1/P2: the session's ``remove_probe`` lens branch (the
+    HTTP DELETE path) and the coherent read surfaces (``specs``) hold
+    the lens-state lock — a detach can no longer land inside a
+    ``prepare`` snapshot or tear a concurrent registry iteration."""
+    session = _StubSession()
+    session._probe_hash_cache = {}
+    session._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    inst = session._lens_instrument
+
+    detach_entered = threading.Event()
+    read_entered = threading.Event()
+    read_out: list[Any] = []
+
+    def _detach() -> None:
+        detach_entered.set()
+        SaklasSession.remove_probe(cast(Any, session), "jlens/example")
+
+    def _read_specs() -> None:
+        read_entered.set()
+        read_out.append(inst.specs())
+
+    with inst.state_lock:
+        detacher = threading.Thread(target=_detach)
+        reader = threading.Thread(target=_read_specs)
+        detacher.start()
+        reader.start()
+        assert detach_entered.wait(timeout=5.0)
+        assert read_entered.wait(timeout=5.0)
+        detacher.join(timeout=0.2)
+        reader.join(timeout=0.2)
+        assert detacher.is_alive()  # both blocked on the lens-state lock
+        assert reader.is_alive()
+        assert "jlens/example" in inst.probes  # nothing mutated mid-hold
+    detacher.join(timeout=5.0)
+    reader.join(timeout=5.0)
+    assert not detacher.is_alive() and not reader.is_alive()
+    assert "jlens/example" not in inst.probes
+    assert read_out and isinstance(read_out[0], dict)
+
+
 def test_prepare_pin_demand_formula() -> None:
     """Pin demand = a live readout, or attached probes with a final
     aggregate or a lens gate — the one formula both generation
@@ -921,6 +964,19 @@ def test_bind_rejects_same_family_plan_prep_crossing() -> None:
         assert inst.current_run.bound is False
         inst.bind(plan_a, prep_a)  # the matched pair binds
         session._close_instrument_runs()
+
+    # Cross-INSTANCE crossing (round-5): tokens are one process-wide
+    # sequence, so a plan from another instrument instance of the same
+    # family can't bind here either (per-instance counters both started
+    # at 1 and collided).
+    other = _StubSession()
+    other._monitor = SimpleNamespace(probe_names=[])
+    prep_other = other._lens_instrument.prepare(request)
+    plan_other = other._lens_instrument.plan(prep_other)
+    prep_local = session._lens_instrument.prepare(request)
+    assert prep_other.token != prep_local.token
+    with pytest.raises(ValueError, match="prep_token"):
+        session._lens_instrument.bind(plan_other, prep_local)
 
 
 def test_prepare_rejects_a_layerless_pin_demanded_lens() -> None:

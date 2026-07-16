@@ -39,6 +39,7 @@ Design (2026-07-15 instrument unification):
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, TYPE_CHECKING, Union
 
@@ -56,6 +57,17 @@ InstrumentFamily = Literal["geometry", "lens", "sae"]
 #: state the ring depth they demand; the session planner's own uses alias
 #: this value.
 AGG_TAIL_DEPTH = 8
+
+# ONE process-wide per-preparation token sequence.  Per-instance sequences
+# collide across instrument instances (both start at 1), which let a plan
+# from one instrument bind with a prep from another; a single shared
+# sequence makes every token unique process-wide (round-5).
+_PREP_TOKENS = itertools.count(1)
+
+
+def next_prep_token() -> int:
+    """Draw the next process-wide unique per-preparation token."""
+    return next(_PREP_TOKENS)
 
 DepthBasis = Literal[
     # geometry: mass = share_weight_L * |coord_L[axis]| (monitor _depth_stats)
@@ -288,11 +300,14 @@ class InstrumentPrep:
     between prepare and bind cannot desynchronize the plan from the
     binding (sol's round-3 P1).
 
-    ``token`` is the per-preparation identity (a per-instrument
-    sequence): the plan a prep derives echoes it as ``prep_token``, and
-    ``bind`` refuses a plan/prep pair from different prepare() calls —
-    same-family crossing would let the session's capture union retain
-    one prep's layers while the run measures another's (round-4 P2).
+    ``token`` is the per-preparation identity, drawn from ONE
+    process-wide sequence (``next_prep_token`` — per-instance sequences
+    collide across instrument instances, letting a plan from one
+    instrument bind with a prep from another; round-5): the plan a prep
+    derives echoes it as ``prep_token``, and ``bind`` refuses a
+    plan/prep pair from different prepare() calls — same-family crossing
+    would let the session's capture union retain one prep's layers while
+    the run measures another's (round-4 P2).
     """
 
     family: str

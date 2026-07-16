@@ -24,7 +24,6 @@ is only the per-row computation.
 from __future__ import annotations
 
 import hashlib
-import itertools
 import threading
 from typing import Any, Mapping, Sequence, TYPE_CHECKING, cast
 
@@ -39,6 +38,7 @@ from saklas.core.instruments.types import (
     InstrumentPrep,
     LensPrep,
     ReadRequest,
+    next_prep_token,
     parse_gate_ref,
     validate_gate_channels,
 )
@@ -175,10 +175,6 @@ class LensInstrument:
         # hold those first).  Reentrant because adoption runs inside the
         # getter and ``prepare`` reads the getter inside its own hold.
         self.state_lock = threading.RLock()
-        # Per-preparation token sequence: stamps each prep, echoed by the
-        # plan it derives, compared at bind — a plan cannot be bound with
-        # a prep from a different prepare() call.
-        self._prep_tokens = itertools.count(1)
         # The current per-generation run (idle passthrough until bind()).
         # All generation-scoped state — stash, display readings, active
         # flag, disk-identity pin — lives on it.
@@ -322,7 +318,7 @@ class LensInstrument:
             return LensPrep(
                 family=self.family,
                 request=request,
-                token=next(self._prep_tokens),
+                token=next_prep_token(),
                 lens=lens,
                 pinned=pin_demand,
                 specs=specs,
@@ -455,23 +451,45 @@ class LensInstrument:
         with self.state_lock:
             del self.probes[name]
 
+    def try_detach(self, name: str) -> bool:
+        """Atomic membership-check + detach under the lens-state lock.
+
+        The session's ``remove_probe`` dispatch routes lens removals here
+        — a bare ``name in probes`` check followed by a delete is two
+        un-serialized registry touches (round-5: the direct
+        ``del _lens_probes[name]`` bypassed the boundary entirely).
+        Returns False when the name isn't a lens probe.
+        """
+        with self.state_lock:
+            if name not in self.probes:
+                return False
+            del self.probes[name]
+            return True
+
     def specs(self) -> dict[str, dict[str, Any]]:
-        """Snapshot of attached probe specifications."""
-        return {name: dict(spec) for name, spec in self.probes.items()}
+        """Snapshot of attached probe specifications (one coherent
+        lens-state read — a concurrent detach or adoption cannot tear
+        the iteration or mix old/new layer lists)."""
+        with self.state_lock:
+            return {name: dict(spec) for name, spec in self.probes.items()}
 
     @property
     def names(self) -> list[str]:
-        return list(self.probes)
+        with self.state_lock:
+            return list(self.probes)
 
     def probe_layers(self, names: set[str] | None = None) -> set[int]:
-        """Union of the attached probes' fitted layers."""
-        out: set[int] = set()
-        probes = self.probes
-        if names is not None:
-            probes = {name: probes[name] for name in names if name in probes}
-        for spec in probes.values():
-            out.update(spec["layers"])
-        return out
+        """Union of the attached probes' fitted layers (coherent read)."""
+        with self.state_lock:
+            out: set[int] = set()
+            probes = self.probes
+            if names is not None:
+                probes = {
+                    name: probes[name] for name in names if name in probes
+                }
+            for spec in probes.values():
+                out.update(spec["layers"])
+            return out
 
     def validate_gate(self, ref: GateRef) -> None:
         validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
@@ -552,17 +570,19 @@ class LensInstrument:
         mass moved salience→probability within v2 — display-only, the
         coords channel is bit-identical, so no bump.
         """
-        spec = self.probes.get(name)
-        if spec is None:
-            return None
-        return hashlib.sha256(
-            repr(
-                (
-                    "jlens-readout-v2", self._session.model_id, spec["word"],
-                    spec["token_id"], tuple(spec["layers"]),
-                )
-            ).encode("utf-8")
-        ).hexdigest()
+        with self.state_lock:
+            spec = self.probes.get(name)
+            if spec is None:
+                return None
+            return hashlib.sha256(
+                repr(
+                    (
+                        "jlens-readout-v2", self._session.model_id,
+                        spec["word"], spec["token_id"],
+                        tuple(spec["layers"]),
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
 
     # ------------------------------------------------------------- resolution
 
@@ -878,9 +898,10 @@ class LensInstrument:
     @property
     def live_layers(self) -> list[int] | None:
         """The live readout's layer list, or ``None`` when it's off."""
-        if self.live is None:
-            return None
-        return list(self.live["layers"])
+        with self.state_lock:
+            if self.live is None:
+                return None
+            return list(self.live["layers"])
 
     def live_readout_step(
         self, *, top_k: int = 8,
