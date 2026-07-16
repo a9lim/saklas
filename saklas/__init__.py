@@ -74,6 +74,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "ManifoldNotRegisteredError": ("saklas.core.session", "ManifoldNotRegisteredError"),
     "ProfileNotRegisteredError": ("saklas.core.session", "ProfileNotRegisteredError"),
     # Jacobian lens (the verbalizable-workspace readout)
+    "GeometryInstrument": ("saklas.core.instruments.geometry", "GeometryInstrument"),
+    "LensInstrument": ("saklas.core.instruments.lens", "LensInstrument"),
+    "SaeInstrument": ("saklas.core.instruments.sae", "SaeInstrument"),
+    "UnsupportedProbeChannelError": ("saklas.core.errors", "UnsupportedProbeChannelError"),
     "JacobianLens": ("saklas.core.jlens", "JacobianLens"),
     "JSpaceDecomposition": ("saklas.core.jlens", "JSpaceDecomposition"),
     "JacobianLensError": ("saklas.core.jlens", "JacobianLensError"),
@@ -148,6 +152,10 @@ __all__ = [
     "ManifoldNotRegisteredError",
     "ProfileNotRegisteredError",
     # Jacobian lens (the verbalizable-workspace readout)
+    "GeometryInstrument",
+    "LensInstrument",
+    "SaeInstrument",
+    "UnsupportedProbeChannelError",
     "JacobianLens",
     "JSpaceDecomposition",
     "JacobianLensError",
@@ -254,6 +262,18 @@ if TYPE_CHECKING:
         JacobianLens as JacobianLens,
         JacobianLensError as JacobianLensError,
         JSpaceDecomposition as JSpaceDecomposition,
+    )
+    from saklas.core.errors import (
+        UnsupportedProbeChannelError as UnsupportedProbeChannelError,
+    )
+    from saklas.core.instruments.geometry import (
+        GeometryInstrument as GeometryInstrument,
+    )
+    from saklas.core.instruments.lens import (
+        LensInstrument as LensInstrument,
+    )
+    from saklas.core.instruments.sae import (
+        SaeInstrument as SaeInstrument,
         LensNotFittedError as LensNotFittedError,
         MultiTokenWordError as MultiTokenWordError,
     )

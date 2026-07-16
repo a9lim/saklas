@@ -3537,6 +3537,24 @@ class SaklasSession:
             "sae": self._sae_instrument,
         }
 
+    @property
+    def lens(self) -> "LensInstrument":
+        """The J-lens instrument — the typed public face of the lens read
+        family (``session.instruments["lens"]``): probe attach/detach,
+        live-readout enable/disable, per-step and aggregate scoring.
+        Artifact lifecycle (``fit_jlens`` / ``select_jlens_source`` /
+        ``jlens_readout`` / token replay) stays on the session — it is
+        source management, not measurement."""
+        return self._lens_instrument
+
+    @property
+    def sae(self) -> "SaeInstrument":
+        """The SAE instrument — the typed public face of the SAE read
+        family (``session.instruments["sae"]``).  Backend lifecycle
+        (``train_sae`` / ``load_sae`` / ``unload_sae`` / ``sae_info``)
+        stays on the session."""
+        return self._sae_instrument
+
     def enable_live_lens(
         self,
         *,

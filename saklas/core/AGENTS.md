@@ -996,6 +996,17 @@ an engine rewrite). `session.instruments` is the uniform registry —
 `{"geometry", "lens", "sae"}` → instrument — behind the probe-hash roster,
 gate preflight, and the server's phase-2 instrument enumeration.
 
+**Public faces (P3):** `session.instruments` is the family registry;
+`session.lens` / `session.sae` return the instrument objects themselves —
+the typed public API for probe attach/detach, live toggles, and scoring.
+Artifact/source lifecycle (`fit_jlens`, `select_jlens_source`,
+`jlens_readout`, token replay; `train_sae`/`load_sae`/`unload_sae`/
+`sae_info`) stays on the session: source management is not measurement.
+The flat `session._score_*`/`enable_live_*` delegates remain as internal
+forwarders for the server/CLI call sites. `LensInstrument`/`SaeInstrument`/
+`GeometryInstrument`/`UnsupportedProbeChannelError` are exported from
+`saklas/__init__.py`.
+
 The composer's four gate-key walks collapsed onto one structured
 `_gated_refs()` pass (`parse_gate_ref`), which also **channel-validates**
 lens/SAE-attached gate references at generation preflight

@@ -187,3 +187,25 @@ def test_bridge_defaults_without_depth():
     assert bridged.depth_spread == ()
     assert bridged.membership == 1.0
     assert bridged.assignment == []
+
+
+# --------------------------------------------------------------------------
+# Public facade wiring (P3)
+# --------------------------------------------------------------------------
+
+def test_session_facades_are_the_instruments() -> None:
+    """``session.lens`` / ``session.sae`` are the instrument objects
+    themselves — the typed public faces of ``session.instruments``."""
+    from saklas import GeometryInstrument, LensInstrument, SaeInstrument
+    from saklas.core.session import SaklasSession
+
+    session = SaklasSession.__new__(SaklasSession)  # lazy instruments self-heal
+    inst = session.instruments
+    assert set(inst) == {"geometry", "lens", "sae"}
+    assert isinstance(inst["geometry"], GeometryInstrument)
+    assert isinstance(inst["lens"], LensInstrument)
+    assert isinstance(inst["sae"], SaeInstrument)
+    assert session.lens is inst["lens"]
+    assert session.sae is inst["sae"]
+    assert session.lens.family == "lens"
+    assert session.sae.family == "sae"
