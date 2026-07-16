@@ -1620,14 +1620,17 @@ class SaklasSession:
             name: {"manifold": m}
             for name, m in self._monitor.manifolds.items()
         }
-        # Pinned J-lens token probes (readout channel, not monitor probes).
+        # Pinned J-lens / SAE probes (readout channels, not monitor
+        # probes) — via the instruments' LOCKED spec snapshots: this
+        # property serves the un-locked session-info route, and a raw
+        # registry iteration tears under a concurrent detach (round-7).
         out.update(
-            {name: {"lens": dict(spec)}
-             for name, spec in self._lens_probes.items()}
+            {name: {"lens": spec}
+             for name, spec in self._lens_instrument.specs().items()}
         )
         out.update(
-            {name: {"sae": dict(spec)}
-             for name, spec in self._sae_probes.items()}
+            {name: {"sae": spec}
+             for name, spec in self._sae_instrument.specs().items()}
         )
         return out
 
@@ -6596,10 +6599,18 @@ class SaklasSession:
         return geometry_digest
 
     def probe_hashes(self) -> dict[str, str]:
-        """Return ``{probe_name: sha256_hex}`` for every registered probe."""
+        """Return ``{probe_name: sha256_hex}`` for every registered probe.
+
+        Roster names come from the instruments' LOCKED snapshots (raw
+        registry expansion tears under a concurrent detach; round-7);
+        the per-name hash lookup already tolerates a probe vanishing
+        between enumeration and hashing.
+        """
         out: dict[str, str] = {}
         for name in (
-            *self._monitor.probe_names, *self._lens_probes, *self._sae_probes,
+            *self._monitor.probe_names,
+            *self._lens_instrument.names,
+            *self._sae_instrument.names,
         ):
             d = self._probe_hash(name)
             if d is not None:
