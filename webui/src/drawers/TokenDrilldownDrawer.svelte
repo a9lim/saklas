@@ -11,11 +11,13 @@
   // turn.thinkingTokens[tokenIdx] when isThinking is true.
   //
   // Layout: header with the token text + coordinates + position scrubber,
-  // a toolbar with the view tabs (probes / logits / j-lens; only the lens
-  // carries a hue dot — it is the one pillar-owned surface here) and the
-  // steered/unsteered branch toggle, then the per-tab body.  Heatmap cells
-  // tint via tokens.scoreToRgb so highlight saturation matches the chat
-  // tokens themselves; the j-lens matrix tints in the lens family blue.
+  // a toolbar with the view tabs (probes / geometry / logits / sae /
+  // j-lens; only sae and the lens carry a hue dot — the monitor family
+  // splits subspace-white/manifold-violet, so its tabs stay achromatic)
+  // and the steered/unsteered branch toggle, then the per-tab body.
+  // Heatmap cells tint via tokens.scoreToRgb so highlight saturation
+  // matches the chat tokens themselves; the j-lens matrix tints in the
+  // lens family blue.
 
   import {
     drawerState,
@@ -27,6 +29,7 @@
     sessionState,
     effectiveRawMode,
     probeAxisScale,
+    probeRack,
     lensSourceState,
     saeSourceState,
   } from "../lib/stores.svelte";
@@ -34,10 +37,14 @@
   import type {
     ChatTurn,
     LensTokenReadoutJSON,
+    ProbeReadingJSON,
     SaeTokenReadoutJSON,
     TokenScore,
   } from "../lib/types";
   import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
+  import Bar from "../lib/charts/Bar.svelte";
+  import LayerStrip from "../panels/rack/LayerStrip.svelte";
+  import ProbeReadingRow from "../panels/rack/ProbeReadingRow.svelte";
   import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
   import Button from "../lib/ui/Button.svelte";
 
@@ -201,11 +208,16 @@
   // routes the user to the SamplingStrip ``alts`` toggle when capture
   // wasn't on.
 
-  type Tab = "probes" | "logits" | "lens" | "sae";
+  type Tab = "probes" | "geometry" | "logits" | "lens" | "sae";
   let tab: Tab = $state<Tab>("probes");
 
   const TAB_ITEMS: Array<{ value: Tab; label: string; color?: string; title: string }> = [
     { value: "probes", label: "probes", title: "Per-layer × per-probe readings" },
+    {
+      value: "geometry",
+      label: "geometry",
+      title: "Full whitened Monitor readings at this position — coords, fraction, nearest, per-layer (replayable post-hoc)",
+    },
     { value: "logits", label: "logits", title: "Ranked top-K alternatives at this position" },
     {
       value: "sae",
@@ -498,6 +510,156 @@
       });
   });
 
+  // ---- geometry tab (Monitor-roster replay) -----------------------------
+  //
+  // The full whitened readings for every attached geometry (Monitor)
+  // probe at the forward that produced this token.  Live-captured
+  // envelopes are used directly; otherwise the scope=replay endpoint
+  // rebuilds the prompt + decode prefix and scores the current roster
+  // post-hoc — aggregate-only generations and probes attached after the
+  // fact still drill down.  Distinct from the probes heatmap tab, which
+  // shows only the flat axis-0 per-layer view of live-captured tokens.
+
+  interface GeometryTokenReadout {
+    steering: string | null;
+    readings: Record<string, ProbeReadingJSON>;
+  }
+
+  let geometryData = $state<GeometryTokenReadout | null>(null);
+  let geometryLoading = $state(false);
+  let geometryError = $state<string | null>(null);
+  /** Replay under the node's recipe steering (server default); off reads
+   *  the unsteered counterfactual.  Sticky within one drawer life, like
+   *  the lens toggle. */
+  let geometrySteered = $state(true);
+  let geometryOrigin = $state<ReadoutOrigin>(null);
+  let geometryRequestSeq = 0;
+
+  /** ≥1 attached Monitor probe (anything in the rack that isn't a lens or
+   *  SAE readout probe).  The replay endpoint 400s on an empty roster, so
+   *  gate the fetch and show the attach hint instead. */
+  const hasGeometryProbes = $derived(
+    probeRack.active.some((name) => {
+      const info = probeRack.entries.get(name)?.info;
+      return !!info && !info.lens && !info.sae;
+    }),
+  );
+
+  const capturedGeometryData = $derived.by<GeometryTokenReadout | null>(() => {
+    const geometry = token?.measurements?.instruments.geometry;
+    if (!geometry || Object.keys(geometry.readings ?? {}).length === 0) {
+      return null;
+    }
+    return {
+      steering: geometry.binding?.steering ?? null,
+      readings: geometry.readings,
+    };
+  });
+
+  $effect(() => {
+    if (tab !== "geometry") return;
+    const request = ++geometryRequestSeq;
+    const captured = capturedGeometryData;
+    if (geometrySteered && captured) {
+      geometryData = captured;
+      geometryOrigin = "captured";
+      geometryLoading = false;
+      geometryError = null;
+      return;
+    }
+    geometryData = null;
+    geometryOrigin = null;
+    geometryError = null;
+    if (!hasGeometryProbes) return;
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!nodeId || rawIndex == null) return;
+    geometryLoading = true;
+    apiInstruments
+      .tokenReadout("geometry", nodeId, rawIndex, {
+        steered: geometrySteered,
+        raw: effectiveRawMode(),
+      })
+      .then((res) => {
+        if (request !== geometryRequestSeq) return;
+        const geometry = res.measurements.instruments.geometry;
+        geometryData = {
+          steering: geometry?.binding?.steering ?? null,
+          readings: geometry?.readings ?? {},
+        };
+        geometryOrigin = "replayed";
+      })
+      .catch((e) => {
+        if (request !== geometryRequestSeq) return;
+        const detail =
+          e instanceof ApiError &&
+          typeof (e.body as { detail?: unknown } | null)?.detail === "string"
+            ? (e.body as { detail: string }).detail
+            : null;
+        geometryError = detail ?? (e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (request === geometryRequestSeq) geometryLoading = false;
+      });
+  });
+
+  const geometryRows = $derived<[string, ProbeReadingJSON][]>(
+    Object.entries(geometryData?.readings ?? {}).sort(([a], [b]) =>
+      a.localeCompare(b, undefined, { sensitivity: "base" }),
+    ),
+  );
+
+  const geometryHasSteering = $derived(
+    (geometryData?.steering ?? null) !== null || !geometrySteered,
+  );
+
+  /** Axis label: the positive pole for a rank-1 two-node concept axis
+   *  (coords axis 0 is pole-normalized, +1 at node 0), ``c<i>`` otherwise. */
+  function geometryAxisLabel(name: string, axis: number, rank: number): string {
+    const labels = probeRack.entries.get(name)?.info?.node_labels;
+    if (rank === 1 && axis === 0 && labels && labels.length === 2) {
+      return labels[0];
+    }
+    return `c${axis}`;
+  }
+
+  /** Per-layer strip source, mirroring the rack's primary-per-layer rule:
+   *  axis-0 ``coords_per_layer`` for a flat probe, ``fraction_per_layer``
+   *  for a curved one (no single signed coordinate to strip). */
+  function geometryStripCells(
+    name: string,
+    reading: ProbeReadingJSON,
+  ): { layer: number; value: number | null; title: string }[] {
+    const info = probeRack.entries.get(name)?.info;
+    const curved = info ? !info.is_affine : reading.residual !== 0;
+    const source: Record<string, number> = {};
+    if (curved) {
+      Object.assign(source, reading.fraction_per_layer ?? {});
+    } else {
+      for (const [layer, c] of Object.entries(reading.coords_per_layer ?? {})) {
+        source[layer] = Array.isArray(c) && c.length > 0 ? c[0] : 0;
+      }
+    }
+    return Object.keys(source)
+      .sort((a, b) => Number(a) - Number(b))
+      .map((layer) => {
+        const v = source[layer];
+        const sign = v >= 0 ? "+" : "";
+        return {
+          layer: Number(layer),
+          value: v,
+          title: `L${layer} · ${sign}${v.toFixed(3)}`,
+        };
+      });
+  }
+
+  function geometryStripScale(name: string, reading: ProbeReadingJSON): number {
+    const info = probeRack.entries.get(name)?.info;
+    const curved = info ? !info.is_affine : reading.residual !== 0;
+    if (curved) return 1; // fraction strip is already in [0, 1]
+    return probeAxisScale(name, 0);
+  }
+
   /** Whether to offer the steered/unsteered toggle: the node actually has
    *  recipe steering (the steered fetch reported an expression), or the
    *  user already flipped to unsteered and needs the way back. */
@@ -680,6 +842,129 @@
             </tbody>
           </table>
         </div>
+      {/if}
+    {:else if tab === "geometry"}
+      <!-- Geometry tab: the full whitened reading per attached Monitor
+           probe — all coordinate axes, subspace fraction, nearest nodes,
+           soft assignment, tube membership, per-layer strip.  Captured
+           envelopes render directly; the replay endpoint covers
+           aggregate-only generations and late-attached probes. -->
+      {#if geometryLoading}
+        <div class="empty">computing…</div>
+      {:else if geometryError}
+        <div class="empty">readout: {geometryError}</div>
+      {:else if geometryData && geometryRows.length > 0}
+        <div class="tab-summary">
+          <div>
+            produced: <code class="tok-inline">{JSON.stringify(token.text)}</code>
+            {#if geometryOrigin}
+              <span class="kv">{geometryOrigin}</span>
+            {/if}
+            {#if geometryData.steering !== null}
+              <span class="kv steer-chip" title="recipe applied">
+                steered: <code>{geometryData.steering}</code>
+              </span>
+            {:else if !geometrySteered}
+              <span class="kv">unsteered</span>
+            {/if}
+            {#if geometryHasSteering}
+              <label class="kv steer-toggle" title="apply recipe">
+                <input type="checkbox" bind:checked={geometrySteered} />
+                apply recipe steering
+              </label>
+            {/if}
+          </div>
+        </div>
+        <div class="geo-list">
+          {#each geometryRows as [name, reading] (name)}
+            {@const rank = reading.coords.length}
+            {@const stripCells = geometryStripCells(name, reading)}
+            <section class="geo-probe" aria-label={`Probe ${name}`}>
+              <div class="geo-head">
+                <code class="geo-name">{name}</code>
+                <span class="kv" title="in-subspace share of the centered activation">
+                  fraction {(reading.fraction * 100).toFixed(0)}%
+                </span>
+                {#if reading.residual !== 0}
+                  <span class="kv" title="normalized off-surface distance (curved fit)">
+                    residual {reading.residual.toFixed(3)}
+                  </span>
+                {/if}
+                {#if reading.membership != null && reading.membership < 1}
+                  <span class="kv" title="tube-fit density under the fitted within-node thickness">
+                    membership {reading.membership.toFixed(2)}
+                  </span>
+                {/if}
+              </div>
+              <div class="geo-axes">
+                {#each reading.coords as coord, axis (axis)}
+                  <ProbeReadingRow ariaLabel={`${name} axis ${axis}`}>
+                    {#snippet left()}
+                      <span class="geo-axis-label" title={`coordinate axis ${axis}`}>
+                        {geometryAxisLabel(name, axis, rank)}
+                      </span>
+                    {/snippet}
+                    {#snippet bar()}
+                      <Bar
+                        value={coord}
+                        max={probeAxisScale(name, axis)}
+                        bipolar
+                      />
+                    {/snippet}
+                    {#snippet middle()}
+                      {#if reading.depth_com && reading.depth_com[axis] != null}
+                        <span
+                          class="geo-depth"
+                          title={`depth center of mass ±${(reading.depth_spread?.[axis] ?? 0).toFixed(2)} (0 = first block, 1 = last)`}
+                        >
+                          @{reading.depth_com[axis].toFixed(2)}
+                        </span>
+                      {/if}
+                    {/snippet}
+                    {#snippet right()}
+                      <span class="geo-value">{coord.toFixed(3)}</span>
+                    {/snippet}
+                  </ProbeReadingRow>
+                {/each}
+              </div>
+              {#if stripCells.length > 0}
+                <LayerStrip
+                  cells={stripCells}
+                  scale={geometryStripScale(name, reading)}
+                  ariaLabel={`${name} per-layer readings`}
+                />
+              {/if}
+              {#if (reading.nearest ?? []).length > 0 || (reading.assignment ?? []).length > 0}
+                <div class="geo-chips">
+                  {#each reading.nearest ?? [] as [label, dist] (label)}
+                    <span class="geo-chip" title={`whitened distance ${dist.toFixed(3)}`}>
+                      {label} <span class="geo-chip-val">{dist.toFixed(2)}</span>
+                    </span>
+                  {/each}
+                  {#each reading.assignment ?? [] as [label, prob] (label)}
+                    <span
+                      class="geo-chip geo-chip-soft"
+                      title={`soft-assignment posterior ${(prob * 100).toFixed(1)}%`}
+                    >
+                      ~{label} <span class="geo-chip-val">{(prob * 100).toFixed(0)}%</span>
+                    </span>
+                  {/each}
+                </div>
+              {/if}
+            </section>
+          {/each}
+        </div>
+      {:else if !hasGeometryProbes}
+        <div class="empty">
+          <p>no geometry probes attached</p>
+          <p>attach a concept or manifold probe to read its whitened coordinates here</p>
+        </div>
+      {:else if token.rawIndex == null}
+        <div class="empty">no raw decode record</div>
+      {:else if !loomNodeId}
+        <div class="empty">no loom node</div>
+      {:else}
+        <div class="empty">no readings</div>
       {/if}
     {:else if tab === "logits"}
       <!-- Logits tab.  Three states: ranked rows present, alts captured
@@ -919,6 +1204,12 @@
         Tints map each probe's coordinate to its node extent (full color at
         the most extreme node), clamped to ±1. Green = +pole, red = −pole,
         transparent ≈ 0.
+      {:else if tab === "geometry"}
+        Full whitened Monitor readings at the forward that produced this
+        token: coords are domain-frame subspace coordinates, fraction the
+        in-subspace share, nearest the whitened node distances. Replay
+        scores the current roster post-hoc, so aggregate-only generations
+        and probes attached after the fact still read.
       {:else if tab === "logits"}
         Logprob is the chosen-token natural-log probability under the
         post-temperature / post-top-p / post-top-k distribution the sampler
@@ -1062,6 +1353,87 @@
   .empty code {
     font-family: var(--font-mono);
     color: var(--fg-dim);
+  }
+
+  /* Geometry tab — one card per attached Monitor probe: header chips,
+   * per-axis reading rows (the canonical four-column meter), per-layer
+   * strip, nearest/assignment chips.  Achromatic like the probes tab —
+   * the monitor family splits subspace-white/manifold-violet, so no
+   * single pillar hue applies. */
+  .geo-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+  }
+  .geo-probe {
+    background: var(--bg);
+    border-radius: var(--radius);
+    padding: var(--space-4) var(--space-5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .geo-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .geo-name {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--fg);
+    word-break: break-all;
+  }
+  .geo-axes {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .geo-axis-label {
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .geo-depth {
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
+  }
+  .geo-value {
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+  .geo-chips {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+  .geo-chip {
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    background: var(--glass);
+    border-radius: var(--radius-pill);
+    padding: var(--space-1) var(--space-3);
+    white-space: nowrap;
+  }
+  .geo-chip-soft {
+    color: var(--fg-dim);
+  }
+  .geo-chip-val {
+    color: var(--fg-dim);
+    font-variant-numeric: tabular-nums;
   }
 
   /* Data wells — tables recess into a deeper glass window.  Sticky
