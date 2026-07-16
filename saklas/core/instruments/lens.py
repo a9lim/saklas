@@ -97,31 +97,57 @@ class LensRun:
         self, step_id: int, hidden: dict[int, torch.Tensor],
     ) -> dict[str, "ProbeReading"]:
         """Readings for every attached probe at this step, memoized by
-        ``step_id`` while bound (the production gate→display reuse is the
-        worker stash mechanism, not this method).  An idle run never
-        memoizes — it persists indefinitely, so a repeated ``step_id``
-        with different hidden states would return stale readings."""
+        ``step_id`` while bound.  The workers' full-roster reads prime
+        this memo (``prime_observation``); the matrix-granular
+        gate→display reuse stays the step-keyed worker stash.  An idle
+        run never memoizes — it persists indefinitely, so a repeated
+        ``step_id`` with different hidden states would return stale
+        readings."""
         if not self.bound:
             return self._instrument.score_probes(hidden)
-        if self._memo_step == step_id and self._memo_readings is not None:
+        if (
+            step_id >= 0
+            and self._memo_step == step_id
+            and self._memo_readings is not None
+        ):
             return self._memo_readings
         readings = self._instrument.score_probes(hidden)
-        self._memo_step = step_id
-        self._memo_readings = readings
+        if step_id >= 0:
+            # Negative steps are the no-identity sentinel — never cacheable
+            # (a -1 memo would serve stale reads to every later -1 call).
+            self._memo_step = step_id
+            self._memo_readings = readings
         return readings
 
     def gate_scalars(
         self,
         step_id: int,
         hidden: dict[int, Any] | None,
-        gate_keys: frozenset[str] | set[str],
+        gate_keys: frozenset[str] | set[str] | None,
     ) -> dict[str, float]:
         """The gate channels' scalars for this step.  The per-forward
         matrix-level reuse (band logits stashed for the display step)
         stays inside the instrument's worker — the stash lives on this
-        run, so the reuse is generation-scoped by construction."""
-        del step_id, hidden  # worker reads the capture's latest slices
-        return self._instrument.gate_scalars(set(gate_keys))
+        run and is keyed by ``step_id``, so the display reuses rows iff
+        they came from the same forward.  ``gate_keys=None`` scores the
+        full roster (the session forwarder's bare-call shape)."""
+        del hidden  # worker reads the capture's latest slices
+        return self._instrument.gate_scalars(
+            set(gate_keys) if gate_keys is not None else None,
+            step_id=step_id,
+        )
+
+    def prime_observation(
+        self, step_id: int, readings: dict[str, "ProbeReading"],
+    ) -> None:
+        """Prime the step memo with FULL-roster readings a hot-path worker
+        already computed this forward — a later ``observe(step_id, …)``
+        returns them without recomputing.  Bound runs only; callers must
+        never prime an ``only=``-subset read (the completeness trap)."""
+        if not self.bound or step_id < 0:
+            return
+        self._memo_step = step_id
+        self._memo_readings = readings
 
     def observe_aggregate(
         self, pooled: dict[int, Any],
@@ -713,17 +739,22 @@ class LensInstrument:
         return out
 
     def gate_scalars(
-        self, gate_keys: "set[str] | None" = None,
+        self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
     ) -> dict[str, float]:
         """Per-forward gate scalars from the latest capture slices.
 
         Called from the gating score callback (once per decode forward,
         before the token tap). Computes the referenced lens logits, stashes
-        them for the display step to reuse (``step_stash``), and flattens
+        them for the display step to reuse (``step_stash``, keyed by
+        ``step_id`` — the display reuses rows iff ``stash["step"]`` matches
+        its own forward index; step identity replaced the old ``fresh``
+        boolean handshake, making staleness structural and reuse
+        idempotent), and flattens
         the synthesized readings through :meth:`Monitor.flat_scalars` so the
         gate key space is uniform. Gate-only calls score exact
         selected-token softmax columns; live display calls still calibrate
-        the full matrix once for downstream card/aggregate reuse.  Empty
+        the full matrix once for downstream card/aggregate reuse — and
+        full-roster readings prime the run's ``observe`` memo.  Empty
         when nothing is capturable yet.
         """
         from saklas.core.monitor import Monitor
@@ -773,14 +804,14 @@ class LensInstrument:
                 "layers": tuple(layers),
                 "logits": logits,
                 "probabilities": probabilities,
-                "fresh": True,
+                "step": step_id,
             }
             self.step_stash = live_stash
         else:
             self.step_stash = {
                 "layers": tuple(layers),
                 "logits": logits,
-                "fresh": True,
+                "step": step_id,
             }
         if probabilities is not None:
             readings = self.score_probes(
@@ -792,12 +823,19 @@ class LensInstrument:
             live_stash = cast("dict[str, Any]", self.step_stash)
             live_stash["readings"] = readings
             live_stash["readings_layers"] = tuple(layers)
-            live_stash["readings_fresh"] = True
+            live_stash["readings_step"] = step_id
             self.last_step_readings = readings
+            if probe_read_only is None:
+                # Full-roster readings (never an ``only=`` subset — the
+                # completeness trap) prime the run's observe memo, so an
+                # ``observe(step_id, …)`` for this same forward is a hit.
+                self.current_run.prime_observation(step_id, readings)
         else:
             readings = self.score_probes(
                 {}, logits=logits, layers=layers, only=probe_read_only,
             )
+            if probe_read_only is None:
+                self.current_run.prime_observation(step_id, readings)
         if only is None:
             return Monitor.flat_scalars(readings)
         return Monitor.flat_scalars({
@@ -912,7 +950,7 @@ class LensInstrument:
             return list(self.live["layers"])
 
     def live_readout_step(
-        self, *, top_k: int = 8,
+        self, *, top_k: int = 8, step_id: int = -1,
     ) -> (
         tuple[
             dict[int, list[tuple[str, float]]],
@@ -928,7 +966,11 @@ class LensInstrument:
         layer scored by per-layer softmax probability (the one strength
         unit every lens surface reports), the layer-aggregated chip list,
         and the vocabulary ids already selected by ``topk``.  Reuses the
-        gate callback's stash rows when the layer sets overlap.
+        gate callback's stash rows when they came from THIS forward
+        (``stash["step"] == step_id`` — step identity replaced the old
+        ``fresh`` consume-once flag, so staleness is structural and reuse
+        is idempotent; ``step_id < 0`` never matches) and the layer sets
+        overlap.
         """
         session = self._session
         state = self._measurement_live()
@@ -958,13 +1000,16 @@ class LensInstrument:
         probabilities: torch.Tensor | None = None
         cached_logits: dict[int, torch.Tensor] = {}
         cached_probs: dict[int, torch.Tensor] = {}
-        if stash is not None and stash.get("fresh"):
+        if (
+            stash is not None
+            and step_id >= 0
+            and stash.get("step") == step_id
+        ):
             stash_layers = tuple(int(layer) for layer in (stash.get("layers") or ()))
             if stash_layers == tuple(layers_present):
                 # The common gate+live path: exact row-set match.  Keep the
                 # existing zero-copy reuse of the full matrix rather than
                 # restacking full-vocab rows.
-                stash["fresh"] = False
                 logits = stash["logits"]
                 probabilities = stash.get("probabilities")
             else:
@@ -979,8 +1024,6 @@ class LensInstrument:
                         probs = stash.get("probabilities")
                         if probs is not None:
                             cached_probs[int(layer)] = probs[row]
-                if cached_logits:
-                    stash["fresh"] = False
         computed_logits: dict[int, torch.Tensor] = {}
         if logits is None:
             missing = [
@@ -1059,7 +1102,11 @@ class LensInstrument:
         # pinned+gated+live path.
         if self._measurement_specs():
             readings_reused = False
-            if stash is not None and stash.get("readings_fresh"):
+            if (
+                stash is not None
+                and step_id >= 0
+                and stash.get("readings_step") == step_id
+            ):
                 reading_layers = tuple(
                     int(layer) for layer in (stash.get("readings_layers") or ())
                 )
@@ -1068,13 +1115,15 @@ class LensInstrument:
                         "dict[str, ProbeReading]",
                         stash.get("readings") or {},
                     )
-                    stash["readings_fresh"] = False
                     readings_reused = True
-                elif reading_layers:
-                    stash["readings_fresh"] = False
             if not readings_reused:
                 self.last_step_readings = self.score_probes(
                     {}, probabilities=probabilities, layers=list(layers_present),
+                )
+                # The display's readings cover the full roster (no ``only=``),
+                # so prime the run's observe memo for this forward.
+                self.current_run.prime_observation(
+                    step_id, self.last_step_readings,
                 )
         else:
             self.last_step_readings = None

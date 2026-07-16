@@ -15,11 +15,20 @@ active flags (geometry's curved warm feet stay in the Monitor engine).
 Repeated ``observe`` calls for the same ``step_id`` are memoized while
 the run is bound — an idle run never memoizes, since it persists
 indefinitely and a repeated step id with different hidden states must
-not read stale.  Note the production per-step gate→display reuse is
-NOT routed through ``observe`` today: the workers' stash mechanism (run-
-scoped by construction) carries that one-forward-one-computation
-contract; ``observe`` is the protocol face for external/aggregate
-callers until the hot paths converge on it.
+not read stale.  The hot paths are wired through step identity: the
+decode loop owns one ``step_id`` per forward (``len(generated_ids)``
+pre-forward) and hands the SAME value to the capture sink
+(``step_callback``), the gate callback (``score_callback``), and the
+token tap (the internal ``StepTokenCallback``).  Full-roster reads —
+the FULL-incremental sink, the lens/SAE display readings — call
+``prime_observation`` so one forward's gate and payload reads share a
+single scoring pass; partial reads (gating scalar subsets, lean
+``coords_only`` rows, ``only=`` restrictions) NEVER prime.  The
+matrix-granular gate→display reuse (band logits, encoded activations)
+stays the workers' stash mechanism, now step-keyed
+(``stash["step"] == step_id`` — structural staleness, idempotent reuse
+— replaced the ``fresh`` consume-once flags): a reading-level memo
+cannot carry logit-level partial-row reuse without a second host sync.
 
 Division of labor the protocol deliberately does NOT own:
 
@@ -150,9 +159,26 @@ class InstrumentRun(Protocol):
     ) -> dict[str, Reading]:
         """Readings for every attached probe at this step.  Repeated
         calls with the same ``step_id`` are memoized while the run is
-        bound (never while idle).  The production gate→display reuse is
-        the workers' stash mechanism, not this method — see the module
-        docstring."""
+        bound (never while idle).  ``step_id`` is the decode loop's
+        forward index — the hot paths are wired through it: the
+        FULL-incremental sink and the workers' full-roster reads
+        ``prime_observation`` the memo, so the gate callback's
+        full-roster read and the token tap's payload read of one forward
+        share a single scoring pass.  The matrix-granular gate→display
+        reuse (band logits / encoded activations) stays the workers'
+        step-keyed stash — a reading-level memo cannot carry it."""
+        ...
+
+    def prime_observation(
+        self,
+        step_id: int,
+        readings: dict[str, Reading],
+    ) -> None:
+        """Prime the ``observe`` memo with FULL-roster readings a hot-path
+        worker already computed for this forward.  Bound runs only (idle
+        runs never memoize); callers MUST never prime a gating scalar
+        subset or a ``coords_only`` lean row — a partial reading served as
+        the full ``observe`` result is the completeness trap."""
         ...
 
     def gate_scalars(
@@ -162,7 +188,10 @@ class InstrumentRun(Protocol):
         gate_keys: frozenset[str],
     ) -> dict[str, float]:
         """The gate channels' scalar values for this step (the subset the
-        active gates reference), keyed by verbatim scalar key."""
+        active gates reference), keyed by verbatim scalar key.  ``step_id``
+        keys the worker's per-forward stash so the display step reuses
+        this forward's rows (step identity replaced the ``fresh``
+        handshake)."""
         ...
 
     def observe_aggregate(

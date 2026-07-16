@@ -201,7 +201,7 @@ def test_sae_gate_scalar_stashes_activations_for_live_step() -> None:
     session._sae_probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
-    scalars = session._score_sae_gate_scalars()
+    scalars = session._score_sae_gate_scalars(step_id=6)
     assert scalars["sae/1"] == pytest.approx(3.0)
     assert scalars["sae/1[0]"] == pytest.approx(3.0)
     # The fake geometry constants are gone (5.x): an SAE probe emits only
@@ -210,7 +210,7 @@ def test_sae_gate_scalar_stashes_activations_for_live_step() -> None:
     assert "sae/1:fraction" not in scalars
     assert "sae/1:membership" not in scalars
     assert session._sae_step_stash is not None
-    assert session._sae_step_stash["fresh"] is True
+    assert session._sae_step_stash["step"] == 6
 
 
 def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
@@ -229,8 +229,8 @@ def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
 
     session._encode_sae_hidden = counting_encode  # type: ignore[method-assign]
 
-    scalars = session._score_sae_gate_scalars({"sae/2"})
-    readout = session._live_sae_readout_step()
+    scalars = session._score_sae_gate_scalars({"sae/2"}, step_id=2)
+    readout = session._live_sae_readout_step(step_id=2)
 
     assert calls == 1
     assert scalars["sae/2"] == pytest.approx(0.5)
@@ -260,8 +260,8 @@ def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
 
     session._sae_instrument.probe_values = spy_probe_values  # type: ignore[method-assign]
 
-    scalars = session._score_sae_gate_scalars({"sae/0"})
-    readout = session._live_sae_readout_step()
+    scalars = session._score_sae_gate_scalars({"sae/0"}, step_id=9)
+    readout = session._live_sae_readout_step(step_id=9)
 
     assert scalars["sae/0"] == pytest.approx(0.2)
     assert readout is not None

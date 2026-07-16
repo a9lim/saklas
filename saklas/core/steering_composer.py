@@ -803,6 +803,11 @@ class SteeringComposer:
         session = self._session
         capture = session._capture
         monitor = session._monitor
+        # The bound geometry run (the callback is built after the capture
+        # transaction's bind) — the full-roster reads below consult its
+        # step-keyed observe memo, sharing the FULL-incremental sink's
+        # per-forward scoring pass.
+        geometry_run = session._geometry_instrument.current_run
         # J-lens token probes referenced by active gates score on the lens
         # path (readout-channel strength), not through the Monitor —
         # detected once per generation here, merged into every return below.
@@ -843,7 +848,7 @@ class SteeringComposer:
                 if plan else {}
             )
 
-        def _monitor_scalars() -> dict[str, float]:
+        def _monitor_scalars(step_id: int) -> dict[str, float]:
             incremental_readings = session._incremental_readings
             incremental_gate_scores = session._incremental_gate_scores
             # The step sink already scored this token's readings — reuse them so
@@ -862,7 +867,16 @@ class SteeringComposer:
             if gating_subset and incremental_gate_scores:
                 return incremental_gate_scores[-1]
             if state.incremental and incremental_readings:
-                scalars = monitor.flat_scalars(incremental_readings[-1])
+                # FULL-incremental: the sink primed the run's observe memo
+                # for this forward — a hit returns the sink's exact row.
+                # A miss falls back to the sink's appended row (rows align
+                # 1:1 with forwards, so ``[-1]`` IS this forward's — the
+                # miss cases are an empty-capture row, which never primes,
+                # and a narrow test stub's idle run).
+                scalars = monitor.flat_scalars(
+                    geometry_run.observe(step_id, {})
+                    or incremental_readings[-1]
+                )
                 if gate_keys:
                     missing = gate_keys - set(scalars)
                     if missing:
@@ -891,21 +905,34 @@ class SteeringComposer:
             # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
             # ``name@label`` for curved nearest).  Scope to the gated subset
             # when the per-token path is gating-only (avoids the full roster).
-            agg = monitor.score_single_token(
-                latest, only=gating_subset if gating_subset else None,
-            )
+            # The full-roster read goes through the geometry run's step-keyed
+            # ``observe`` — same scope as the token tap's read of this
+            # forward, so whichever runs first primes the memo and the other
+            # hits it (subset reads stay on the planned direct path above:
+            # widening them to the full roster would regress large-K).
+            if gating_subset:
+                agg = monitor.score_single_token(latest, only=gating_subset)
+            else:
+                agg = session._geometry_instrument.current_run.observe(
+                    step_id, latest,
+                )
             return monitor.flat_scalars(agg)
 
-        def _score() -> dict[str, float]:
-            out = _monitor_scalars()
+        def _score(step_id: int) -> dict[str, float]:
+            out = _monitor_scalars(step_id)
             if has_lens_gates:
                 # Once per forward: band lens logits → strength
-                # scalars (also stashed for the display step to reuse).
-                lens_scalars = session._score_lens_gate_scalars(lens_gate_keys)
+                # scalars (also stashed step-keyed for the display step to
+                # reuse — step identity replaced the freshness handshake).
+                lens_scalars = session._score_lens_gate_scalars(
+                    lens_gate_keys, step_id=step_id,
+                )
                 if lens_scalars:
                     out = {**out, **lens_scalars}
             if has_sae_gates:
-                sae_scalars = session._score_sae_gate_scalars(sae_gate_keys)
+                sae_scalars = session._score_sae_gate_scalars(
+                    sae_gate_keys, step_id=step_id,
+                )
                 if sae_scalars:
                     out = {**out, **sae_scalars}
             return out

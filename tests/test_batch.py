@@ -523,7 +523,10 @@ class TestGenerateBatch:
             value = float(hidden[0].reshape(-1)[0])
             return {"jlens/g": ProbeReading(0.0, [], coords=(value,))}
 
-        s_any._score_lens_probes = _score_lens_probes
+        # The batch per-row aggregate routes through the lens run's
+        # ``observe_aggregate``, which consumes the INSTRUMENT's
+        # ``score_probes`` — stub that (the session forwarder is bypassed).
+        s_any._lens_instrument.score_probes = _score_lens_probes
 
         def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
             raise AssertionError("serial generation path should not run")

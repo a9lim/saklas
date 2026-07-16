@@ -2149,10 +2149,11 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     )
 
     # A gated pinned probe calibrates before the token tap and stashes the
-    # matrix. Cards, pinned readings, and aggregate must all reuse it.
-    scalars = s._score_lens_gate_scalars()
+    # matrix, keyed by this forward's step id. Cards, pinned readings, and
+    # aggregate must all reuse it — the display passes the SAME step.
+    scalars = s._score_lens_gate_scalars(step_id=4)
     assert scalars
-    assert s._live_lens_readout_step(top_k=3) is not None
+    assert s._live_lens_readout_step(top_k=3, step_id=4) is not None
     assert calls == 1
     assert stat_calls == 1
     assert s._last_lens_step_readings is not None
@@ -2207,16 +2208,20 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
 
     probabilities = jlens_module.readout_probabilities(logits)
     s._lens_step_stash = {
-        "fresh": True,
+        "step": 5,
         "layers": (1,),
         "logits": logits,
         "probabilities": probabilities,
     }
 
-    step = s._live_lens_readout_step(top_k=3)
+    step = s._live_lens_readout_step(top_k=3, step_id=5)
 
     assert step is not None
-    assert s._lens_step_stash["fresh"] is False
+    # Step-keyed reuse is idempotent — a second same-step consumer also
+    # rides the stash (the old ``fresh`` flag was consume-once); a
+    # different step never matches, so staleness is structural.
+    assert s._live_lens_readout_step(top_k=3, step_id=5) is not None
+    assert s._lens_step_stash["step"] == 5
 
 
 def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
@@ -2230,7 +2235,7 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
         1: torch.randn(6, generator=torch.Generator().manual_seed(1)),
     })
 
-    assert s._score_lens_gate_scalars({"jlens/g"})
+    assert s._score_lens_gate_scalars({"jlens/g"}, step_id=3)
     assert s._lens_step_stash is not None
     assert s._lens_step_stash["layers"] == (1,)
     # Poison the live transport row for the gated layer after the gate callback.
@@ -2240,7 +2245,7 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     row = s._live_lens["layer_rows"][1]
     s._live_lens["J_stack"][row].fill_(float("nan"))
 
-    step = s._live_lens_readout_step(top_k=3)
+    step = s._live_lens_readout_step(top_k=3, step_id=3)
 
     assert step is not None
     per_layer, aggregate, token_ids = step
@@ -2248,6 +2253,34 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     assert set(token_ids) == {0, 1}
     assert all(torch.isfinite(torch.tensor(score)) for _tok, score in per_layer[1])
     assert all(torch.isfinite(torch.tensor(row[1])) for row in aggregate)
+
+
+def test_lens_full_roster_gate_read_primes_bound_observe_memo() -> None:
+    """A bound generation's gate callback computing FULL-roster readings
+    (the live-display superset path) primes the run's observe memo — a
+    same-step ``observe`` is a hit; the memo is exactly the stashed
+    readings object."""
+    from saklas.core.instruments.types import ReadRequest
+
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s.enable_live_lens(layers=[0, 1])
+    s._add_lens_probe("jlens/g", as_name=None)
+    s._capture = _FakeCapture({
+        0: torch.randn(6, generator=torch.Generator().manual_seed(30)),
+        1: torch.randn(6, generator=torch.Generator().manual_seed(31)),
+    })
+    inst = s._lens_instrument
+    prep = inst.prepare(ReadRequest(live=True, final_aggregate=True))
+    run = inst.bind(inst.plan(prep), prep)
+
+    scalars = s._score_lens_gate_scalars({"jlens/g"}, step_id=7)
+
+    assert scalars
+    assert run._memo_step == 7
+    # Memo hit — no recompute (empty hidden would otherwise score empty).
+    assert run.observe(7, {}) is run.last_step_readings
+    inst.close_run()
 
 
 def test_live_lens_readout_step_none_when_off() -> None:

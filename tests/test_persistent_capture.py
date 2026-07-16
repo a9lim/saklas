@@ -61,16 +61,18 @@ def _toy_stack() -> tuple[torch.nn.ModuleList, list[float]]:
 
 def _drive(
     stack: torch.nn.ModuleList, clock: list[float], n_forward: int,
-    *, after: "Callable[[], None] | None" = None,
+    *, after: "Callable[[int], None] | None" = None,
 ) -> None:
-    """Run ``n_forward`` forwards through the stack (each block sees the prior)."""
+    """Run ``n_forward`` forwards through the stack (each block sees the
+    prior).  ``after`` receives the forward index — the decode loop's
+    ``step_id`` the post-forward ``ingest_persistent`` now takes."""
     for f in range(n_forward):
         clock[0] = float(f)
         x = torch.ones(1, 1, _D)
         for blk in stack:
             x = blk(x)[0]
         if after is not None:
-            after()
+            after(f)
 
 
 def test_persistent_ingest_matches_transient_tail_ring():
@@ -124,7 +126,7 @@ def test_persistent_ingest_matches_transient_selective_tail_with_sink():
     cap_t.attach(stack_t, list(_LAYERS))
     cap_t.set_tail_with_sink(
         3,
-        lambda latest: rows_t.append({
+        lambda _step, latest: rows_t.append({
             k: v.clone() for k, v in latest.items()
         }),
         tail_layers={2},
@@ -139,7 +141,7 @@ def test_persistent_ingest_matches_transient_selective_tail_with_sink():
     cap_p.attach_persistent(list(_LAYERS), buffers)
     cap_p.set_tail_with_sink(
         3,
-        lambda latest: rows_p.append({
+        lambda _step, latest: rows_p.append({
             k: v.clone() for k, v in latest.items()
         }),
         tail_layers={2},
@@ -174,7 +176,7 @@ def test_persistent_ingest_matches_transient_incremental_and_sink():
     stack_t, clock_t = _toy_stack()
     cap_t = HiddenCapture()
     cap_t.attach(stack_t, list(_LAYERS))
-    cap_t.set_incremental(lambda latest: rows_t.append(
+    cap_t.set_incremental(lambda _step, latest: rows_t.append(
         {k: v.clone() for k, v in latest.items()}
     ))
     # In-hook incremental accumulates during the forward; the FIX-F1 sink fires
@@ -187,7 +189,7 @@ def test_persistent_ingest_matches_transient_incremental_and_sink():
     )
     cap_p = HiddenCapture()
     cap_p.attach_persistent(list(_LAYERS), buffers)
-    cap_p.set_incremental(lambda latest: rows_p.append(
+    cap_p.set_incremental(lambda _step, latest: rows_p.append(
         {k: v.clone() for k, v in latest.items()}
     ))
     try:
@@ -247,5 +249,5 @@ def test_attach_persistent_registers_no_hooks_and_detach_clears_buffers():
     cap.detach()
     assert cap._persistent_buffers == {}
     # ingest is a no-op once the buffer source is gone.
-    cap.ingest_persistent()
+    cap.ingest_persistent(0)
     assert cap._forward_count == 0

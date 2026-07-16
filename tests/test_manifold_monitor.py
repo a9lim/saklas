@@ -1210,7 +1210,7 @@ def test_tail_with_sink_can_keep_deep_tail_on_selected_layers_only():
     cap.attach(layers, [0, 1, 2])
     cap.set_tail_with_sink(
         3,
-        lambda latest: rows.append({
+        lambda _step, latest: rows.append({
             layer: row.clone() for layer, row in latest.items()
         }),
         tail_layers={2},
@@ -1220,7 +1220,7 @@ def test_tail_with_sink_can_keep_deep_tail_on_selected_layers_only():
         for layer in range(3):
             value = torch.full((1, 1, 4), float(layer * 100 + step))
             layers[layer](value)
-        cap.fire_step_sink()
+        cap.fire_step_sink(step)
 
     assert [len(cap._per_layer[layer]) for layer in range(3)] == [1, 1, 3]
     assert set(cap.latest_per_layer()) == {0, 1, 2}

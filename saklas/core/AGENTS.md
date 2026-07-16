@@ -1154,9 +1154,32 @@ Post-review hardening (sol, gaslamp thread `instrument-protocol`):
   mid-generation mutation stays excluded by the reject contract above,
   not by this lock.
 
-Per-step gate→display matrix reuse remains the stash mechanism inside
-the workers, run-scoped by construction; `observe(step_id)` is
-protocol-complete but the hot paths are not yet routed through it.
+**Step identity (the observe wiring).** The decode loop owns ONE
+`step_id` per forward — `len(generated_ids)` before that forward, set
+after every pre-forward break (`last_forward_step` survives the loop
+for the post-loop partial-UTF-8 flush) — and hands the SAME value to
+the capture sink (`step_callback(step)`), the gate callback
+(`score_callback(step)`), and the token tap (the internal 7-argument
+`StepTokenCallback`; the session-facing `TokenCallback` stays
+6-argument — `_token_tap` absorbs the step and invokes user callbacks
+with the public shape).  Buffered partial-UTF-8 emits all carry the
+*flushing* forward's step, matching their reading semantics.  The
+workers' per-forward stashes are step-keyed (`stash["step"] ==
+step_id` replaced the `fresh`/`readings_fresh` consume-once flags:
+staleness is structural, reuse is idempotent, `step_id < 0` never
+matches); the matrix-granular gate→display reuse (band logits, partial
+row overlap, the shared SAE encode) survives verbatim beneath that
+predicate.  Full-roster reads prime the runs' `observe` memos
+(`prime_observation` — the FULL-incremental sink, the lens/SAE display
+readings, the lens gate's live-display superset), so one forward's
+gate and payload reads share a single scoring pass; partial reads
+(gating scalar subsets, `coords_only` lean rows, `only=` restrictions)
+NEVER prime — a partial reading served as the full `observe` result is
+the completeness trap.  Geometry's finalize aggregate and the batch
+per-row lens/SAE aggregates route through `observe_aggregate`; the
+composer's planned-gate subset path is deliberately untouched (its
+plan cache and narrow scope are the large-K guard — routing it through
+`observe` would widen a gated subset to the full roster).
 
 ## triggers.py
 

@@ -72,9 +72,14 @@ class HiddenCapture:
         # Incremental-mode state. ``_incremental`` flips the per-layer
         # hook from append to overwrite; ``_step_sink`` is invoked once
         # per forward after the highest hooked layer (``_max_layer``)
-        # stores this step's slice. All reset on attach/clear.
+        # stores this step's slice. All reset on attach/clear.  The sink
+        # receives ``(step_id, latest_per_layer)`` — the decode loop's
+        # forward index rides along so per-token scorers can prime the
+        # instrument runs' step-keyed observe memos.
         self._incremental: bool = False
-        self._step_sink: Callable[[dict[int, torch.Tensor]], None] | None = None
+        self._step_sink: (
+            Callable[[int, dict[int, torch.Tensor]], None] | None
+        ) = None
         self._max_layer: int | None = None
         # Bounded-tail (aggregate-only) state: when ``_tail_depth > 1`` the
         # incremental hook keeps the last ``_tail_depth`` slices per layer (a
@@ -241,14 +246,15 @@ class HiddenCapture:
             )
 
     def set_incremental(
-        self, step_sink: Callable[[dict[int, torch.Tensor]], None],
+        self, step_sink: Callable[[int, dict[int, torch.Tensor]], None],
     ) -> None:
         """Enable incremental mode: overwrite buckets + per-step scoring.
 
         Must be called after :meth:`attach`. Flips the per-layer hook from
         append to length-1 overwrite and records the highest hooked layer
         as the per-forward counter trigger. ``step_sink`` receives
-        :meth:`latest_per_layer` once per forward via :meth:`fire_step_sink`,
+        ``(step_id, latest_per_layer)`` once per forward via
+        :meth:`fire_step_sink`,
         which ``generate_steered`` invokes **post-forward** (FIX F1) — not from
         inside the capture hook — so the score read doesn't drain the device
         pipeline mid-forward.
@@ -278,7 +284,7 @@ class HiddenCapture:
     def set_tail_with_sink(
         self,
         depth: int,
-        step_sink: Callable[[dict[int, torch.Tensor]], None],
+        step_sink: Callable[[int, dict[int, torch.Tensor]], None],
         *,
         tail_layers: set[int] | frozenset[int] | None = None,
     ) -> None:
@@ -333,7 +339,7 @@ class HiddenCapture:
             idx: buffers[idx] for idx in layer_indices if idx in buffers
         }
 
-    def ingest_persistent(self) -> None:
+    def ingest_persistent(self, step_id: int) -> None:
         """Post-forward accumulation from the persistent buffers (compiled path).
 
         The compile-clean mirror of the in-hook accumulation: for each captured
@@ -381,7 +387,7 @@ class HiddenCapture:
                 bucket.append(src.clone())
         self._forward_count += 1
         if self._step_sink is not None:
-            self._step_sink(self.latest_per_layer())
+            self._step_sink(step_id, self.latest_per_layer())
 
     def detach(self) -> None:
         for h in self._handles:
@@ -519,7 +525,7 @@ class HiddenCapture:
         """
         return bool(self._handles)
 
-    def fire_step_sink(self) -> None:
+    def fire_step_sink(self, step_id: int) -> None:
         """Run the per-token step sink once, **after** the model forward (FIX F1).
 
         Invoked by ``generate_steered`` post-``model()`` rather than from inside
@@ -530,10 +536,11 @@ class HiddenCapture:
         layer.  No-op when no sink is installed (aggregate-only / full-retention /
         no-probe captures).  Reads the latest per-layer slice the forward just
         stored — valid until the next forward overwrites the length-1 buffer (or
-        rotates the tail ring).
+        rotates the tail ring).  ``step_id`` is the loop's forward index,
+        forwarded to the sink for step-keyed memo priming.
         """
         if self._step_sink is not None:
-            self._step_sink(self.latest_per_layer())
+            self._step_sink(step_id, self.latest_per_layer())
 
 
 class SteeringHook:

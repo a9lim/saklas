@@ -429,6 +429,127 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     assert result.text == "Hello"
 
 
+def test_decode_loop_hands_one_step_id_to_sink_gate_and_tap():
+    """The loop-owned forward index: the capture sink (``step_callback``),
+    the gate callback (``score_callback``), and the token tap
+    (``on_token``'s trailing ``step_id``) all receive the SAME value for
+    one forward, and the value is ``len(generated_ids)`` before that
+    forward — what lets the instrument runs' step-keyed memos pair one
+    forward's gate and display reads."""
+    from saklas.core.triggers import TriggerContext
+
+    model: Any = _StopModel()
+    tokenizer: Any = _StopTokenizer()
+    state = GenerationState()
+    sink_steps: list[int] = []
+    gate_steps: list[int] = []
+    tap_steps: list[int] = []
+
+    def _gate(step: int) -> dict[str, float]:
+        gate_steps.append(step)
+        return {}
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=3, temperature=0.0),
+        state,
+        on_token=lambda _t, _th, _tid, _lp, _alts, _ppl, step: (
+            tap_steps.append(step)
+        ),
+        trigger_ctx=TriggerContext(),
+        score_callback=_gate,
+        step_callback=sink_steps.append,
+    )
+
+    assert generated_ids == [0, 1, 2]
+    assert sink_steps == [0, 1, 2]
+    assert gate_steps == [0, 1, 2]
+    assert tap_steps == [0, 1, 2]
+
+
+class _Utf8SplitTokenizer(_StopTokenizer):
+    """ids 1 and 2 are partial UTF-8 pieces that only decode as a group."""
+
+    name_or_path = "utf8-split-tokenizer"
+    vocab_size = 5
+    eos_token_id = 4
+    all_special_ids = [4]
+    _pieces = {0: "A", 1: "�", 2: "�", 3: "B", 4: ""}
+
+    def decode(self, ids: Any, skip_special_tokens: bool = False) -> str:
+        ids = [int(t) for t in ids]
+        if ids == [1, 2]:
+            return "é"
+        if ids == [1, 2, 3]:
+            return "éB"
+        return super().decode(ids, skip_special_tokens)
+
+
+class _Utf8SplitModel(_StopModel):
+    config = SimpleNamespace(vocab_size=5)
+    generation_config = SimpleNamespace(eos_token_id=4)
+
+    def __init__(self, tokens: list[int]):
+        self._tokens = tokens
+        self._idx = 0
+
+
+def test_buffered_utf8_group_emits_carry_the_flush_forwards_step():
+    """Partial-UTF-8 tokens buffer in ``pending_ids`` and flush as a group
+    — every emit in the group carries the FLUSHING forward's step (the
+    group's readings semantics: they all read that forward's captures)."""
+    model: Any = _Utf8SplitModel([0, 1, 2, 3])
+    tokenizer: Any = _Utf8SplitTokenizer()
+    state = GenerationState()
+    emits: list[tuple[str, int]] = []
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=4, temperature=0.0),
+        state,
+        on_token=lambda text, _th, _tid, _lp, _alts, _ppl, step: (
+            emits.append((text, step))
+        ),
+        cache_token_text=False,
+    )
+
+    assert generated_ids == [0, 1, 2, 3]
+    # "A" emitted by forward 0; tokens 1+2 buffer (partial pieces); the
+    # completing token 3 flushes the group at forward 3.
+    assert emits == [("A", 0), ("éB", 3)]
+
+
+def test_post_loop_utf8_flush_uses_the_last_forwards_step():
+    """A generation ending with a still-buffered partial flushes post-loop
+    with ``last_forward_step`` (no fresh forward ran since)."""
+    model: Any = _Utf8SplitModel([0, 1])
+    tokenizer: Any = _Utf8SplitTokenizer()
+    state = GenerationState()
+    emits: list[tuple[str, int]] = []
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=2, temperature=0.0),
+        state,
+        on_token=lambda text, _th, _tid, _lp, _alts, _ppl, step: (
+            emits.append((text, step))
+        ),
+        cache_token_text=False,
+    )
+
+    assert generated_ids == [0, 1]
+    assert emits[0] == ("A", 0)
+    # The trailing lone partial flushed after the loop with the last
+    # forward's step (1), not a stale or synthetic index.
+    assert emits[1][1] == 1
+
+
 def test_stop_sequence_split_across_tokens_trims_final_text():
     model: Any = _SplitStopModel()
     tokenizer: Any = _SplitStopTokenizer()
@@ -1204,11 +1325,16 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
         _lens_probes={},
         _sae_probes={},
         _profiles={},
+        # A memo-less run: the incremental branch's ``observe`` read falls
+        # back to the sink's appended row, which is what this test pins.
+        _geometry_instrument=SimpleNamespace(
+            current_run=SimpleNamespace(observe=lambda _step, _hidden: {}),
+        ),
     )
 
     callback = SteeringComposer(session).build_gating_score_callback()
-    scores = callback()
-    scores_again = callback()
+    scores = callback(0)
+    scores_again = callback(1)
 
     assert scores == {"toy@nearest": -0.1, "toy@hidden": -2.0}
     assert scores_again == scores
@@ -1269,19 +1395,25 @@ def test_readout_only_gates_skip_monitor_probe_scoring(
         _incremental_gate_scores=[],
         _lens_probes={},
         _sae_probes={},
+        _geometry_instrument=SimpleNamespace(
+            current_run=SimpleNamespace(observe=lambda _step, _hidden: {}),
+        ),
+    )
+    setattr(
+        session, score_attr,
+        lambda _keys, *, step_id=-1: dict(expected),
     )
     setattr(session, registry_attr, {next(iter(expected)): {}})
-    setattr(session, score_attr, lambda _keys: dict(expected))
     other_score_attr = (
         "_score_sae_gate_scalars"
         if score_attr == "_score_lens_gate_scalars"
         else "_score_lens_gate_scalars"
     )
-    setattr(session, other_score_attr, lambda _keys: {})
+    setattr(session, other_score_attr, lambda _keys, *, step_id=-1: {})
     composer = SteeringComposer(session)
     composer._stack.append(cast(Any, dict(parse_expr(expr).alphas)))
 
-    assert composer.build_gating_score_callback()() == expected
+    assert composer.build_gating_score_callback()(0) == expected
 
 
 def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
@@ -1328,8 +1460,13 @@ def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
         _incremental_gate_scores=[],
         _lens_probes={"jlens/g": {}},
         _sae_probes={},
-        _score_lens_gate_scalars=lambda _keys: {"jlens/g": 0.7},
-        _score_sae_gate_scalars=lambda _keys: {},
+        _score_lens_gate_scalars=(
+            lambda _keys, *, step_id=-1: {"jlens/g": 0.7}
+        ),
+        _score_sae_gate_scalars=lambda _keys, *, step_id=-1: {},
+        _geometry_instrument=SimpleNamespace(
+            current_run=SimpleNamespace(observe=lambda _step, _hidden: {}),
+        ),
     )
     composer = SteeringComposer(session)
     steering = parse_expr(
@@ -1337,7 +1474,7 @@ def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
     )
     composer._stack.append(cast(Any, dict(steering.alphas)))
 
-    scores = composer.build_gating_score_callback()()
+    scores = composer.build_gating_score_callback()(0)
 
     assert scores == {"toy": 0.2, "jlens/g": 0.7}
     assert monitor.requested == {"toy"}
@@ -1976,7 +2113,7 @@ def test_gate_only_capture_reuses_preplanned_gate_scalars() -> None:
 
     assert monitor.plan_calls == [({"gate"}, {"gate"})]
     assert capture.sink is not None
-    capture.sink({2: torch.ones(4)})
+    capture.sink(0, {2: torch.ones(4)})
     assert monitor.score_plans == [(plan,)]
     assert session._incremental_gate_scores == [{"gate": 0.25}]
 

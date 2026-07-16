@@ -42,6 +42,7 @@ from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.naming import BIPOLAR_SEP, _slug, canonical_concept_name
 from saklas.io import selectors as _selectors
 from saklas.core.token_callback import (
+    StepTokenCallback,
     TokenCallback,
     TokenConsumer,
     TokenConsumerOptions,
@@ -3665,7 +3666,7 @@ class SaklasSession:
         return workspace_layer_indices(list(lens.source_layers), n)
 
     def _live_lens_readout_step(
-        self, *, top_k: int = 8,
+        self, *, top_k: int = 8, step_id: int = -1,
     ) -> (
         tuple[
             dict[int, list[tuple[str, float]]],
@@ -3677,10 +3678,13 @@ class SaklasSession:
         """One decode step's live lens readout (token-tap, post-forward).
 
         Delegates to :meth:`LensInstrument.live_readout_step` — stash reuse
-        with the gate callback, per-layer softmax probabilities, aggregate
-        chips, one packed host transfer.
+        with the gate callback (step-keyed: rows are reused iff the stash
+        came from this same forward), per-layer softmax probabilities,
+        aggregate chips, one packed host transfer.
         """
-        return self._lens_instrument.live_readout_step(top_k=top_k)
+        return self._lens_instrument.live_readout_step(
+            top_k=top_k, step_id=step_id,
+        )
 
     # -- Sparse-autoencoder runtime -------------------------------------
 
@@ -4176,20 +4180,24 @@ class SaklasSession:
         )
 
     def _score_sae_gate_scalars(
-        self, gate_keys: "set[str] | None" = None,
+        self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
     ) -> dict[str, float]:
-        """Per-forward SAE gate scalars (delegates to
-        :meth:`SaeInstrument.gate_scalars`; emits only the real strength
-        channel — the historical fake ``:fraction``/``:membership``
-        constants are gone)."""
-        return self._sae_instrument.gate_scalars(gate_keys)
+        """Per-forward SAE gate scalars — through the run protocol face
+        (:meth:`SaeRun.gate_scalars` → the instrument worker; emits only
+        the real strength channel — the historical fake
+        ``:fraction``/``:membership`` constants are gone).  ``step_id``
+        keys the encode stash so the display step reuses this forward's
+        activations."""
+        return self._sae_instrument.current_run.gate_scalars(
+            step_id, None, gate_keys,
+        )
 
     def _live_sae_readout_step(
-        self,
+        self, *, step_id: int = -1,
     ) -> list[tuple[int, float, str | None, float | None]] | None:
         """One decode step's live SAE top-k (delegates to
-        :meth:`SaeInstrument.live_readout_step`)."""
-        return self._sae_instrument.live_readout_step()
+        :meth:`SaeInstrument.live_readout_step`; step-keyed stash reuse)."""
+        return self._sae_instrument.live_readout_step(step_id=step_id)
 
     def _score_sae_probes_aggregate(
         self,
@@ -5928,11 +5936,16 @@ class SaklasSession:
                 gate_keys, probe_names=subset,
             )
 
-            def _score_step_subset(latest: dict[int, torch.Tensor]) -> None:
+            def _score_step_subset(
+                step_id: int, latest: dict[int, torch.Tensor],
+            ) -> None:
                 # Score ONLY the exact gate scalar keys each token (the gate's
                 # sole consumer); append even an empty dict to keep row indices
                 # aligned with decode forwards.  The full roster is pooled once at
                 # finalize from the tail ring (``_score_aggregate_only``).
+                # NEVER primes the observe memo — these rows are a scalar
+                # subset, not full readings (the completeness trap).
+                del step_id
                 self._incremental_gate_scores.append(
                     self._monitor.score_planned_gate_scalars(latest, gate_plan)
                     if latest and gate_plan else {}
@@ -5967,7 +5980,14 @@ class SaklasSession:
             # per-layer host reconstruction), store the lean rows for the per-token
             # stream, and keep a bounded tail ring so finalize re-scores the FULL
             # aggregate once via ``_score_lean_incremental``.
-            def _score_step_lean(latest: dict[int, torch.Tensor]) -> None:
+            def _score_step_lean(
+                step_id: int, latest: dict[int, torch.Tensor],
+            ) -> None:
+                # NEVER primes the observe memo — ``coords_only`` readings
+                # omit nearest / assignment / per-layer traces, so exposing
+                # them as the full ``observe()`` result would be the second
+                # completeness trap beyond the gating subset.
+                del step_id
                 self._incremental_readings.append(
                     self._monitor.score_single_token(latest, coords_only=True)
                     if latest else {}
@@ -5982,14 +6002,26 @@ class SaklasSession:
             self._monitor.reset_curved_feet()
             self._monitor.enable_curved_warm(True)
         elif not widen and self._monitor.probe_names and need_per_token:
-            def _score_step(latest: dict[int, torch.Tensor]) -> None:
+            geometry_run = self._geometry_instrument.current_run
+
+            def _score_step(
+                step_id: int, latest: dict[int, torch.Tensor],
+            ) -> None:
                 # Score once while the just-produced hidden slice is still the
                 # only retained device payload.  Append even an empty dict so
                 # row indices remain aligned with decode forwards; finalization
                 # trims any terminal EOS-only overcapture to generated_ids.
-                self._incremental_readings.append(
+                readings = (
                     self._monitor.score_single_token(latest) if latest else {}
                 )
+                self._incremental_readings.append(readings)
+                # FULL-incremental rows ARE the complete per-probe readings,
+                # so prime the geometry run's step-keyed observe memo — the
+                # gate callback and the token tap consult ``observe(step)``
+                # for this forward and hit it instead of rescoring.  The
+                # gating-subset and lean sinks never prime (partial rows).
+                if readings:
+                    geometry_run.prime_observation(step_id, readings)
 
             if (
                 lens_plan.final_aggregate or has_lens_gate
@@ -6219,9 +6251,14 @@ class SaklasSession:
         # cold foot solve so the aggregate is reproducible (it pools the last
         # *content* token, which may differ from the live loop's last forward,
         # so a warm foot seeded during gating-only subset scoring would not be
-        # the right warm start here).
+        # the right warm start here).  Routed through the geometry run's
+        # ``observe_aggregate`` (the run protocol face — the last finalize
+        # read that bypassed its run); the cold-foot reset above stays
+        # session-side.
         self._monitor.enable_curved_warm(False)
-        agg_vals = self._monitor.score_aggregate(pooled)
+        agg_vals = self._geometry_instrument.current_run.observe_aggregate(
+            pooled,
+        )
         # Fill any probe the pool missed (e.g. a layer absent from the ring).
         agg_vals = {name: agg_vals.get(name, empty[name]) for name in names}
         if accumulate and agg_vals:
@@ -6506,11 +6543,15 @@ class SaklasSession:
         )
 
     def _score_lens_gate_scalars(
-        self, gate_keys: "set[str] | None" = None,
+        self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
     ) -> dict[str, float]:
-        """Per-forward lens gate scalars (delegates to
-        :meth:`LensInstrument.gate_scalars`)."""
-        return self._lens_instrument.gate_scalars(gate_keys)
+        """Per-forward lens gate scalars — through the run protocol face
+        (:meth:`LensRun.gate_scalars`, which reaches the instrument worker;
+        ``step_id`` keys the band-logit stash so the display step reuses
+        this forward's rows)."""
+        return self._lens_instrument.current_run.gate_scalars(
+            step_id, None, gate_keys,
+        )
 
     def _score_lens_probes_aggregate(
         self,
@@ -8543,7 +8584,7 @@ class SaklasSession:
         *,
         use_thinking: bool,
         want_hidden: bool,
-        effective_tap: TokenCallback | None,
+        effective_tap: "StepTokenCallback | None",
         seed: int | None,
         stop_list: list[str] | None,
         logit_bias: dict[int, float] | None,
@@ -8606,7 +8647,7 @@ class SaklasSession:
         )
         prompt_capture_pending = bool(authored_matches)
 
-        def _step_callback() -> None:
+        def _step_callback(step_id: int) -> None:
             nonlocal prompt_capture_pending
             # The first callback follows the full/suffix prefill.  Score the
             # visible authored positions in prompt order before the ordinary
@@ -8625,7 +8666,7 @@ class SaklasSession:
                     ),
                     steering=authored_capture.steering,
                 )
-            base_step_callback()
+            base_step_callback(step_id)
 
         start = time.monotonic()
         composer = self._steering_composer
@@ -8936,7 +8977,14 @@ class SaklasSession:
             def _token_tap(
                 text: str, is_thinking: bool, tid: int | None, lp: float | None,
                 top_alts: list[TokenAlt] | None, perplexity: float | None = None,
+                step_id: int = -1,
             ) -> None:
+                # ``step_id`` is the decode loop's forward index (the internal
+                # StepTokenCallback contract) — the SAME value this forward's
+                # gate callback received, so the lens/SAE display steps below
+                # can reuse the gate's step-keyed stash rows and the geometry
+                # payload can hit the run's observe memo.  User callbacks keep
+                # the public six-argument TokenCallback shape (invoked below).
                 nonlocal mean_logprob_sum, mean_logprob_count
                 self._last_token_probe_payload = None
                 self._last_token_probe_readings = None
@@ -8961,6 +9009,8 @@ class SaklasSession:
                         capture=self._capture,
                         capture_state=self._capture_state,
                         incremental_readings=self._incremental_readings,
+                        geometry_run=self._geometry_instrument.current_run,
+                        step_id=step_id,
                         needs_scores=needs_scores,
                         persists_layer_scores=_persists_layer_scores,
                         assistant_node_id=assistant_node_id,
@@ -8970,14 +9020,18 @@ class SaklasSession:
                 )
                 # Live J-lens readout (None when off): the step's top-k
                 # lens tokens per selected layer + the layer-aggregated
-                # chip list.
+                # chip list.  ``step_id`` lets the display reuse the gate
+                # callback's stash rows iff they came from THIS forward
+                # (step identity replaced the old freshness handshake).
                 lens_step = (
-                    self._live_lens_readout_step(top_k=jlens_top_k)
+                    self._live_lens_readout_step(
+                        top_k=jlens_top_k, step_id=step_id,
+                    )
                     if _has_lens_consumer
                     else None
                 )
                 sae_step = (
-                    self._live_sae_readout_step()
+                    self._live_sae_readout_step(step_id=step_id)
                     if _has_sae_consumer
                     else None
                 )
@@ -9991,8 +10045,12 @@ class SaklasSession:
             pooled = self._batch_pooled_aggregate_for_row(row_index, generated_ids)
         if not pooled:
             return empty
+        # Routed through the geometry run like the serial finalize
+        # (``_score_aggregate_only``); the cold-foot reset stays here.
         self._monitor.enable_curved_warm(False)
-        agg_vals = self._monitor.score_aggregate(pooled)
+        agg_vals = self._geometry_instrument.current_run.observe_aggregate(
+            pooled,
+        )
         return {name: agg_vals.get(name, empty[name]) for name in probe_names}
 
     def _batch_pooled_aggregate_for_row(
@@ -10022,9 +10080,13 @@ class SaklasSession:
             return {}
         out: dict[str, ProbeReading] = {}
         if self._lens_instrument._measurement_specs():
-            out.update(self._score_lens_probes(pooled))
+            out.update(
+                self._lens_instrument.current_run.observe_aggregate(pooled)
+            )
         if self._sae_instrument._measurement_specs():
-            out.update(self._score_sae_probes(pooled))
+            out.update(
+                self._sae_instrument.current_run.observe_aggregate(pooled)
+            )
         return out
 
     @staticmethod

@@ -89,29 +89,54 @@ class SaeRun:
         self, step_id: int, hidden: dict[int, torch.Tensor],
     ) -> dict[str, "ProbeReading"]:
         """Readings for every attached probe at this step, memoized by
-        ``step_id`` while bound (the production gate→display reuse is the
-        worker stash mechanism, not this method).  An idle run never
+        ``step_id`` while bound.  The workers' full-roster reads prime
+        this memo (``prime_observation``); the encode-level gate→display
+        reuse stays the step-keyed worker stash.  An idle run never
         memoizes (it persists indefinitely; a repeated ``step_id`` with
         different hidden states must not read stale)."""
         if not self.bound:
             return self._instrument.score_probes(hidden)
-        if self._memo_step == step_id and self._memo_readings is not None:
+        if (
+            step_id >= 0
+            and self._memo_step == step_id
+            and self._memo_readings is not None
+        ):
             return self._memo_readings
         readings = self._instrument.score_probes(hidden)
-        self._memo_step = step_id
-        self._memo_readings = readings
+        if step_id >= 0:
+            # Negative steps are the no-identity sentinel — never cacheable
+            # (a -1 memo would serve stale reads to every later -1 call).
+            self._memo_step = step_id
+            self._memo_readings = readings
         return readings
 
     def gate_scalars(
         self,
         step_id: int,
         hidden: dict[int, Any] | None,
-        gate_keys: frozenset[str] | set[str],
+        gate_keys: frozenset[str] | set[str] | None,
     ) -> dict[str, float]:
         """The gate channels' scalars for this step (the encode stash the
-        display step reuses lives on this run)."""
-        del step_id, hidden  # worker reads the capture's latest slices
-        return self._instrument.gate_scalars(set(gate_keys))
+        display step reuses lives on this run, keyed by ``step_id``).
+        ``gate_keys=None`` scores the full roster (the session forwarder's
+        bare-call shape)."""
+        del hidden  # worker reads the capture's latest slices
+        return self._instrument.gate_scalars(
+            set(gate_keys) if gate_keys is not None else None,
+            step_id=step_id,
+        )
+
+    def prime_observation(
+        self, step_id: int, readings: dict[str, "ProbeReading"],
+    ) -> None:
+        """Prime the step memo with FULL-roster readings a hot-path worker
+        already computed this forward — a later ``observe(step_id, …)``
+        returns them without recomputing.  Bound runs only; callers must
+        never prime an ``only=``-subset read (the completeness trap)."""
+        if not self.bound or step_id < 0:
+            return
+        self._memo_step = step_id
+        self._memo_readings = readings
 
     def observe_aggregate(
         self, pooled: dict[int, Any],
@@ -516,7 +541,7 @@ class SaeInstrument:
         return out
 
     def gate_scalars(
-        self, gate_keys: "set[str] | None" = None,
+        self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
     ) -> dict[str, float]:
         """Per-forward SAE gate scalars from the latest capture slice.
 
@@ -525,7 +550,9 @@ class SaeInstrument:
         fake constants (``:fraction`` 0.0 / ``:membership`` 1.0) are gone:
         a gate referencing a channel this family can never produce is a
         composition-preflight error (:meth:`validate_gate`), never a
-        silently-constant comparison.
+        silently-constant comparison.  The encode stash is keyed by
+        ``step_id`` — the display step reuses it iff it came from the same
+        forward (step identity replaced the ``fresh`` handshake).
         """
         session = self._session
         specs = self._measurement_specs()
@@ -549,7 +576,7 @@ class SaeInstrument:
         values = self.probe_values(acts, only=only)
         self.step_stash = {
             "activations": acts,
-            "fresh": True,
+            "step": step_id,
             "raw_by_fid": {
                 int(fid): float(raw_value)
                 for _name, fid, raw_value, _value in values
@@ -616,13 +643,15 @@ class SaeInstrument:
         return self.live is not None
 
     def live_readout_step(
-        self,
+        self, *, step_id: int = -1,
     ) -> list[tuple[int, float, str | None, float | None]] | None:
         """One decode step's live feature top-k from the latest capture slice.
 
         Reuses the gate callback's encoded activations + raw values when the
-        stash is fresh (one encode shared by gates, pinned probes, and the
-        live display on a step).
+        stash came from THIS forward (``stash["step"] == step_id`` — one
+        encode shared by gates, pinned probes, and the live display on a
+        step; step identity replaced the ``fresh`` consume-once flag, so
+        reuse is idempotent and ``step_id < 0`` never matches).
         """
         session = self._session
         state = self.live
@@ -634,8 +663,11 @@ class SaeInstrument:
             return None
         stash = self.step_stash
         stashed_raw_by_fid: dict[int, float] = {}
-        if stash is not None and stash.get("fresh"):
-            stash["fresh"] = False
+        if (
+            stash is not None
+            and step_id >= 0
+            and stash.get("step") == step_id
+        ):
             acts = stash["activations"]
             stashed_raw_by_fid = {
                 int(fid): float(value)
@@ -656,6 +688,11 @@ class SaeInstrument:
             self.last_step_readings = self.score_probes(
                 activations=acts,
                 raw_by_fid=raw_by_fid,
+            )
+            # Full-roster readings — prime the run's observe memo for this
+            # forward (never an ``only=`` subset on this path).
+            self.current_run.prime_observation(
+                step_id, self.last_step_readings,
             )
         else:
             self.last_step_readings = None

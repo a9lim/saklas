@@ -84,12 +84,37 @@ class GeometryRun:
                 return self._instrument._session._monitor.score_single_token(
                     hidden,
                 )
-        if self._memo_step == step_id and self._memo_readings is not None:
+        if (
+            step_id >= 0
+            and self._memo_step == step_id
+            and self._memo_readings is not None
+        ):
             return self._memo_readings
         readings = self._instrument._session._monitor.score_single_token(hidden)
+        if step_id >= 0:
+            # A negative step is the "no step identity" sentinel — caching
+            # under it would serve one stale read to every later
+            # sentinel-stepped call (sol's round-1 P2).
+            self._memo_step = step_id
+            self._memo_readings = readings
+        return readings
+
+    def prime_observation(
+        self, step_id: int, readings: dict[str, Any],
+    ) -> None:
+        """Prime the step memo with FULL per-probe readings a hot-path
+        scorer already computed this forward (the FULL-incremental sink) —
+        a later ``observe(step_id, …)`` for the same forward returns them
+        without a second scoring pass.  Bound runs only (an idle run never
+        memoizes); a negative step (the no-identity sentinel) never primes.
+        Callers MUST pass complete-roster readings: a gating
+        scalar subset or a ``coords_only`` lean row primed here would be
+        served as the full reading (the completeness trap), so those sinks
+        never prime."""
+        if not self.bound or step_id < 0:
+            return
         self._memo_step = step_id
         self._memo_readings = readings
-        return readings
 
     def gate_scalars(
         self,
@@ -116,15 +141,20 @@ class GeometryRun:
         self, pooled: dict[int, torch.Tensor],
     ) -> dict[str, Any]:
         """One full-roster read at the pooled last-content slice —
-        bit-identical to a live read at that token.  Idle reads hold the
+        bit-identical to a live read at that token (``Monitor.score_
+        aggregate`` routes through the same full scorer as
+        ``score_single_token``; it additionally fp32-casts and row-selects
+        ``[T, D]`` stacks, so it accepts every pooled shape the finalize
+        paths produce).  The session's ``_score_aggregate_only`` reaches
+        the roster through this method.  Idle reads hold the
         state lock; the bound finalize read runs under ``_gen_lock``,
         which every roster mutation also takes (``_model_exclusive``)."""
         if not self.bound:
             with self._instrument.state_lock:
-                return self._instrument._session._monitor.score_single_token(
+                return self._instrument._session._monitor.score_aggregate(
                     pooled,
                 )
-        return self._instrument._session._monitor.score_single_token(pooled)
+        return self._instrument._session._monitor.score_aggregate(pooled)
 
     def observe_many(
         self, pooled_rows: "list[dict[int, torch.Tensor]]",

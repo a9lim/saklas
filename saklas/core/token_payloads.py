@@ -148,13 +148,18 @@ def build_token_probe_payload(
     needs_scores: bool,
     persists_layer_scores: bool,
     assistant_node_id: str | None,
+    geometry_run: Any = None,
+    step_id: int = -1,
 ) -> TokenProbePayload:
     """Score and shape probe payloads for one generated token.
 
     This is the token-probe slice of ``SaklasSession._token_tap`` extracted into
     a typed helper. It performs at most one monitor geometry pass: either reuse
     the most recent incremental reading, or score the latest captured hidden
-    states once and derive all scalar/per-layer/live payloads from that result.
+    states through the geometry run's step-keyed ``observe`` (FULL-retention
+    mode — a gate callback that already full-roster-scored this forward primed
+    the memo, so the tap hits it instead of rescoring; ``monitor`` remains the
+    fallback for callers without a run).
     The monitor readings land in the ``geometry`` family slot.
     """
     if not needs_scores:
@@ -174,9 +179,29 @@ def build_token_probe_payload(
 
     readings: dict[str, ProbeReading] | None = None
     if has_incremental_reading:
-        readings = incremental_readings[-1] or None
+        if capture_state.lean or geometry_run is None:
+            # LEAN rows are deliberately partial (``coords_only``) and are
+            # never primed into the observe memo — read the sink's row
+            # directly (routing through ``observe`` would either rescore
+            # the full roster per token or serve a partial as full).
+            readings = incremental_readings[-1] or None
+        else:
+            # FULL-incremental: the sink primed the run's memo for this
+            # forward, so ``observe`` is a hit returning the sink's exact
+            # row.  A miss falls back to the sink's appended row (aligned
+            # 1:1 with forwards — the miss cases are an empty-capture row,
+            # which never primes, and a narrow caller's idle run).
+            readings = (
+                geometry_run.observe(step_id, {})
+                or incremental_readings[-1]
+                or None
+            )
     elif latest_hidden_for_token:
-        readings = monitor.score_single_token(latest_hidden_for_token) or None
+        readings = (
+            geometry_run.observe(step_id, latest_hidden_for_token)
+            if geometry_run is not None
+            else monitor.score_single_token(latest_hidden_for_token)
+        ) or None
 
     if not readings:
         return TokenProbePayload()
