@@ -4,7 +4,7 @@ Dual-protocol HTTP on one port: OpenAI `/v1/*`, Ollama `/api/*`, native
 `/saklas/v1/*`. One model per server; generation across all three protocols
 serializes on a single `asyncio.Lock`. There is **no `/saklas/v1/packs*` surface**
 — concepts are manifolds, so distribution and node-union merge ride the manifold
-routes while session vector routes own extract/bake; HF upload stays CLI-only.
+routes while session profile routes own extract/bake; HF upload stays CLI-only.
 
 ## Module map
 
@@ -19,19 +19,15 @@ those registrars import):
 - `template_routes.register_template_routes` — `/saklas/v1/templates/*` (templated-completion artifact + scorer)
 - `session_routes.register_session_routes` — `/saklas/v1/sessions` CRUD + clear/rewind
 - `tree_routes.register_tree_routes` — the loom `/sessions/{id}/tree/*` routes
-- `vector_routes.register_vector_routes` — the `/sessions/{id}/vectors/*` routes + `/sessions/{id}/correlation`
+- `profile_routes.register_profile_routes` — the `/sessions/{id}/profiles/*` routes + `/sessions/{id}/extract` + `/sessions/{id}/correlation`
 - `probe_routes.register_probe_routes` — `/sessions/{id}/probes/*` (unified: list / defaults / attach / detach — every probe shape)
 - `traits_routes.register_traits_routes` — `/sessions/{id}/traits/stream` (SSE)
-- `lens_routes.register_lens_routes` — `/sessions/{id}/lens/*` (source list/use,
-  background official fetch/local fit, token readout + the live-lens toggle)
-- `sae_routes.register_sae_routes` — `/sessions/{id}/sae/*` (source/release
-  discovery, background provider load/local train, live toggle, feature
-  validation, token readout, and
-  `POST .../sae/features/metadata` — the Neuronpedia metadata backfill:
-  `{ids: [...]}` (≤64) → `session.fetch_sae_feature_meta` in a worker thread,
-  no session lock (network + disk cache only, like validation); the dashboard
-  calls it between generations so discovery cards gain labels + the
-  `max_act` strength unit)
+- `instrument_routes.register_instrument_routes` — the unified `/sessions/{id}/instruments/*`
+  family over the three read instruments (`geometry`/`lens`/`sae`): listing, per-family
+  live toggle, source list/switch, the polled background-preparations resource
+  (lens `fetch`/`fit`, sae `load`/`train`), token-readout replay, and the family
+  extras (`token/validate`, `features/metadata`, `features/validate`). Replaces the
+  former `lens_routes` / `sae_routes` groups and `POST /probes/live`.
 - `ws_stream.register_ws_stream` — the `WS /sessions/{id}/stream` co-stream engine
 
 `server/sse.py`, `server/streaming.py`, `server/ws_events.py`, and
@@ -132,7 +128,7 @@ bodies and serializers live beside their route groups:
   unknown fields (`extra="forbid"`); nested native objects are strict too. The
   OpenAI/Ollama protocol models remain protocol-specific.
 - `session_models.py` — session request bodies and `session_info`.
-- `vector_models.py` — vector/extract/bake request bodies and vector serializers.
+- `profile_models.py` — profile/extract/bake request bodies (`ExtractRequest`, `BakeProfileRequest`) and profile serializers.
 - `tree_models.py` — loom-tree request bodies and tree serializers.
 - `ws_models.py` — WebSocket request bodies, sampling conversion, token/result helpers.
 
@@ -300,10 +296,8 @@ monitor unification onto the session's single `Monitor`.
   `intrinsic_dim: 1` — the one `strength` axis, no `node_coords`),
   and `POST /probes` returns the same shape for a lens attach. `GET
   .../geometry` 404s on a lens probe (no subspace geometry behind it).
-- `POST /probes/live` body `{enabled}` → `session.set_live_probe_scores` under
-  the session lock — the **CAA live toggle**: off ⇒ per-token monitor scoring
-  is disabled for UI/trait/loom consumers (aggregate-only capture; probe gates
-  still force the subset they need). Session info reports the state as
+  The **CAA live toggle** moved to `POST /instruments/geometry/live` (was
+  `POST /probes/live`); session info still reports the state as
   `live_probe_scores`.
 - `GET /probes/{name:path}/geometry` → `session._monitor.probe_geometry(name)`, the
   static per-layer geometry (centroids, neutral anchor, PCA rotation for rank≥3,
@@ -317,27 +311,32 @@ scoring during generation is unchanged: it rides the traits SSE stream and the
 probe reading extensions on the OpenAI / Ollama / WS paths, which use live hooks,
 not a re-render pass.
 
-### Vectors under `/sessions/{id}/vectors` (in `vector_routes.py`)
+### Profiles under `/sessions/{id}/profiles` (in `profile_routes.py`)
 
-- `GET` list, `GET /{name}` profile JSON, `DELETE /{name}`
-  (also drops the name from `default_steering`).
-- `GET /vectors/pairwise?a=&b=` — cross-layer **whitened** cosine matrix between two
-  named vectors / probes. Mahalanobis-only (no `metric` param, no Euclidean path):
+The 5.x rename of the former `/vectors` group (a steering vector is the 2-node
+`pca` case of a profile). `session.profiles` is the canonical registry
+(`dict[name, dict[int, Tensor]]`); the routes wrap each entry in a `Profile` for
+the wire.
+
+- `GET /profiles` list (`{"profiles": [...]}`), `GET /profiles/{name}` profile JSON,
+  `DELETE /profiles/{name}` (also drops the name from `default_steering`).
+- `GET /profiles/pairwise?a=&b=` — cross-layer **whitened** cosine matrix between two
+  named profiles / probes. Mahalanobis-only (no `metric` param, no Euclidean path):
   whitened cosine is single-layer, so each cell is whitened in `a`'s row-layer frame.
   `session.whitener` must cover every row-layer of `a`, else 409 (regenerate the
-  neutral cache). Registered *before* `GET /vectors/{name}` so the literal path wins.
-- `POST /extract` — in `asyncio.to_thread`; SSE / JSON. The exact request shape is
-  `{concept, baseline?, sae?, role?, namespace?, force?}` and routes to
-  `session.extract`: a concept with a baseline fits a 2-node `pca`; a monopolar
+  neutral cache). Registered *before* `GET /profiles/{name}` so the literal path wins.
+- `POST /extract` — in `asyncio.to_thread`; SSE / JSON (path unchanged). The exact
+  request shape is `{concept, baseline?, sae?, role?, namespace?, force?}` and routes
+  to `session.extract`: a concept with a baseline fits a 2-node `pca`; a monopolar
   concept fits the 1-node neutral-anchored ray. The resulting manifold's folded
   profile is always registered in the live session. `namespace` controls the
   destination and `force` bypasses the tensor cache. There is no `/extract/preview` (the A0
   scenario/preview machinery was removed — A2 has no scenarios).
-- `POST /vectors/bake` (`BakeVectorRequest`) body `{name, expression}` — wraps
+- `POST /profiles/bake` (`BakeProfileRequest`) body `{name, expression}` — wraps
   `merge_into_manifold` (model-scoped, `force=True`): lands a corpus-less baked
   manifold, folds the fitted tensor back to a steering Profile, registers it. The
   server mirror of CLI `manifold bake`. `_refuse_if_busy` first (409).
-  `MergeError` → 400. (Cloning was removed in 4.0 — no `/vectors/clone` route.)
+  `MergeError` → 400. (Cloning was removed in 4.0 — no `/profiles/clone` route.)
 
 `GET /sessions/{id}/correlation?names=…` — N×N Mahalanobis-cosine matrix across
 loaded steering vectors and active probes (a steering vector wins a name collision
@@ -361,94 +360,89 @@ non-empty) and the `op="cast"` `tree_mutated` frame. `tree/branch` takes an
 optional `role` override — with the engine's scene mode this is the seat-swap
 branch primitive.
 
-### lens_routes.py — Jacobian-lens routes
+### instrument_routes.py — the unified `/instruments` family
 
-`GET /sessions/{id}/lens/sources` lists prepared `local:default` and
-`neuronpedia` sources. `POST .../lens/use` selects one under the session lock,
-evicts derived lens state, and auto-enables its all-fitted-layer live readout.
-`POST/GET .../lens/fetch` starts/polls an official Neuronpedia fetch: provider
-bytes stay in the Hugging Face cache, the worker publishes only a Saklas binding,
-then activates it under the lock. Fetch and local fit are mutually exclusive.
-Both are `background_job.BackgroundJob`s (`app.state.lens_fit` /
-`app.state.lens_fetch`, shared 409 group); only the fit is cooperatively
-cancellable, and `_stop_lens_fit` drains both at shutdown.
+One route tree over `session.instruments` (`geometry`/`lens`/`sae`). It supersedes
+the former per-family `/lens/*` and `/sae/*` groups **and** `POST /probes/live`.
+Auth / `acquire_session_lock` / `SaklasError.user_message()` / `background_job`
+scrubbing disciplines are copied verbatim from the routes it replaces.
+`{family}` outside `geometry`/`lens`/`sae` → 404.
 
-`POST /sessions/{id}/lens/token/validate` body `{word}` — a read-only tokenizer
-check for the dashboard's J-lens STEER and PROBE add forms. Returns
-`{word, token_id}` only when the word round-trips as exactly one vocabulary
-token; multi-token words return 400. It never registers a direction or probe;
-the engine registration boundaries still revalidate the invariant.
+- `GET /sessions/{id}/instruments` — enumerate the three families. Per family
+  `{family, live, source, probes, capabilities}`. **live** is family-discriminated:
+  geometry `{enabled: session.live_probe_scores}`; lens `{enabled: bool,
+  layers: session.live_lens_layers}`; sae `{enabled: session.live_sae, layer,
+  top_k}` (layer/top_k from the live config when on, else `null`). **source**:
+  lens = the active source label (`session._active_jlens_source_label()`), sae =
+  the resident release normalized to `saelens:`/`local:` (from `session.sae_info`),
+  geometry = `null`. **capabilities** declares per-family support so clients never
+  guess: `{sources: bool, preparations: [ops], token_readout: bool,
+  source_switch: bool}` (geometry `False/[]/False/False`; lens
+  `True/["fetch","fit"]/True/True`; sae `True/["load","train"]/True/False`).
 
-`GET /sessions/{id}/lens/token-readout?node_id=&raw_index=[&top_k=8][&steered=
-true][&raw=false][&layers=csv]` — the J-lens readout at one decode step of a
-loom node (`session.jlens_token_readout` in `asyncio.to_thread` under
-`acquire_session_lock`, 503 on timeout): the per-layer J-lens top-k matrix at
-the forward that produced the clicked token, each row
-`{layer, tokens:[{token, id, logprob}]}` sorted ascending, plus the
-layer-aggregated `aggregate: [{token, strength, com, spread}]` block
-(per-layer softmax → mean fitted-layer probability + probability-mass-weighted
-depth center of mass across all requested layers,
-strength-descending; `[]` from a session dict without the key). `steered` (default on) replays under the node's
-recipe steering — `steered=false` is the unsteered counterfactual; `raw` marks
-a flat-buffer node (raw-ness isn't stamped server-side, the client's render
-mode supplies it). Errors: `LensNotFittedError`/`UnknownNodeError` → 404,
-`InvalidNodeOperationError`/bad `layers`/`top_k` → 400, other `SaklasError`s →
-their `user_message()` status. Discovery rides
-the session-info `jlens_fitted` field (v6 shard sidecar + live-weight compatibility,
-never the ~GB lazy artifact load).
+- `POST .../instruments/{family}/live` — uniform body `{enabled, layers?, top_k?}`.
+  geometry → `session.set_live_probe_scores(enabled)` (layers/top_k → 400); lens →
+  `enable_live_lens(layers=…)` / `disable_live_lens()` under the session lock
+  (top_k → 400); sae → `enable_live_sae(top_k=…)` / `disable_live_sae()` (layers →
+  400). Returns the family's resolved live state (same shape as the GET listing's
+  live field). **Replaces** `POST /probes/live` and `POST /lens/live`.
 
-`POST /sessions/{id}/lens/live` body `{enabled, layers?}` — toggle
-the **live** J-lens readout (`session.enable_live_lens` /
-`disable_live_lens` under `acquire_session_lock`, so it never races an
-in-flight stream and applies to the next generation). Enabling moves the
-selected layers' `J_l` device-resident; `layers` omitted enables every fitted
-layer. Returns `{enabled,
-layers}` (the resolved list). While enabled, the native WS `token` frame
-carries the per-step matrix inside its `measurements` envelope
-(`instruments.lens.readout`; see ws_stream below) and
-session info reports the layer list as `live_lens_layers` (`null` while off —
-the dashboard's WORKSPACE-panel rehydration read). The generation's resolved
-logit-alternative `return_top_k` also sets the live lens width. Errors:
-`LensNotFittedError` → 404, bad `layers` → 400. `saklas serve` auto-enables
-the live lens at startup only when the artifact matches the loaded weights, so
-the dashboard opens hot; the toggle
-still disables per session.
+- `GET .../instruments/{family}/sources` — lens: the prepared-sources listing
+  (`list_lens_sources`, `path` stripped). sae: `{sources, releases}` merging
+  prepared sources (`list_sae_sources`) with provider release candidates
+  (`list_sae_releases`) so the dashboard sees both prepared and
+  still-needs-fetching rows. geometry: 404 (no source lifecycle).
 
-`POST /sessions/{id}/lens/fit` body `{prompts?=100, seq_len?, prompt_batch?,
-layers?="all", force?=false}` — kick off the **background lens fit** (the
-dashboard's "fit j-lens" button; the former CLI-only policy). 202 + the
-initial status; one fit at a time (409 while running); `layers="sample"`
-rejected (not fittable). The job resolves an immutable Hub revision, then streams the default fineweb-edu corpus
-(`io.lens.stream_default_lens_corpus` — needs the optional `datasets` dep,
-else a clean typed error), runs `session.fit_jlens` (resume-by-default,
-checkpointed) in a worker thread, and auto-enables the all-layer live lens
-when the artifact lands. Deliberately **polled, not SSE**: the fit is hours
-of wall clock and progress must survive page reloads. `GET
-/sessions/{id}/lens/fit` returns `{running, prompts_done, prompts_total,
-message, error, started_at, finished_at, live_layers}` (per-prompt counts
-parsed from the engine's `prompt N/M` progress lines). Error text follows
-the SSE scrubbing discipline (typed `user_message()`, else exception type
-only). Generations attempted while the fit holds the model raise through
-the ordinary busy path — surfaced client-side by the sticky WS error toast.
-`DELETE .../lens/fit` cancels either phase: corpus acquisition returns promptly
-even if its provider iterator is blocked, while estimator work stops after the
-current output-dimension VJP block and drains accelerator work before returning.
+- `PUT .../instruments/{family}/source` body `{source}` — lens only (synchronous
+  switch: the old `POST /lens/use` semantics — lock + derived-state eviction +
+  auto-enable live). sae → 409 (source switching loads weights → use preparations
+  `load`); geometry → 404.
 
-### sae_routes.py — sparse-autoencoder routes
+- `POST/GET/DELETE .../instruments/{family}/preparations` — the unified
+  background-job resource over `background_job.py` (still polled, never SSE;
+  resumable/cancel semantics preserved). POST body `{operation, …op fields}`:
+  lens supports `fetch` (old `/lens/fetch`) and `fit` (old `/lens/fit`), sae
+  supports `load` (old `/sae/load`) and `train` (old `/sae/train`); the fields are
+  re-parsed into the exact old per-op request models (unknown/invalid → 400).
+  GET returns the running-or-last job status in a common shape:
+  `{state: idle|running|done|error, operation, progress: {current, total, unit} |
+  null, message, error, started_at, finished_at, cancellable, …op extras}`
+  (fit `unit="prompts"`, train `unit="tokens"`; fetch/load → `progress null` +
+  message; extras: fit/fetch `live_layers`, load `release`/`info`, train
+  `name`/`info`). Mutual exclusions preserved exactly (lens fetch XOR fit, sae
+  load XOR train → 409). DELETE: lens cancels a running fit (fetch isn't
+  cancellable → 409 when only a fetch runs / nothing runs); sae cancels a running
+  train, else unloads the resident SAE (the old `DELETE /sae/load` teardown). The
+  jobs keep the historical `app.state.lens_fit` / `lens_fetch` / `sae_load` /
+  `sae_train` attributes and the `_stop_lens_fit` / `_stop_sae_train` shutdown
+  hooks. geometry → 404.
 
-`GET /sessions/{id}/sae/sources` lists prepared `local:<name>` and
-`saelens:<release>` sources. The background `POST/GET .../sae/load` accepts
-either harmonized source string (the `saelens:` prefix is stripped only at the
-provider-adapter boundary), so it both fetches a new provider release and
-switches an existing source; successful load also enables the 12-card live SAE
-readout. `POST/GET/DELETE .../sae/train` starts, polls, and
-cooperatively cancels native local training over the default FineWeb-Edu stream;
-status carries token progress. A successful train makes the local source
-resident and enables live SAE discovery. Provider load and local train are
-mutually exclusive — both are `background_job.BackgroundJob`s
-(`app.state.sae_load` / `app.state.sae_train`, shared 409 group); only the train
-is cooperatively cancellable (`_stop_sae_train` drains it at shutdown), the load's
-DELETE being the unload.
+- `GET .../instruments/{family}/token-readout?node_id=&raw_index=[&top_k=][&steered=
+  ][&raw=][&layers=]` — the loom token-drilldown readout, wrapped in the 5.x
+  `measurements` **replay** envelope: `{measurements: {version, scope: "replay",
+  provenance: "replayed", instruments: {<family>: {binding: {source, steering},
+  readout: {…}}}}}` built via `core.measurements.build_measurements`
+  (`steered=false` → `binding.steering` null). lens = the old
+  `session.jlens_token_readout` (per-layer top-k `readout.layers` + the all-layer
+  `readout.aggregate`); sae = `session.sae_token_readout` (`readout.features`).
+  geometry: 404. Same lock/error mapping as before
+  (`LensNotFittedError`/`UnknownNodeError` → 404, `InvalidNodeOperationError`/bad
+  `layers`/`top_k` → 400).
+
+- Family extras (moved under the family): `POST .../instruments/lens/token/validate`
+  (`{word}` → `{word, token_id}`, read-only single-token check; multi-token → 400),
+  `POST .../instruments/sae/features/metadata` (the Neuronpedia backfill:
+  `{ids}` ≤64 → `session.fetch_sae_feature_meta`, no session lock — network +
+  disk cache only), and `POST .../instruments/sae/features/validate` (was
+  `POST /sae/feature/validate`).
+
+**Deleted routes** (clean break, no aliases): `POST /probes/live`,
+`GET /lens/sources`, `POST /lens/use`, `POST/GET /lens/fetch`,
+`POST/GET/DELETE /lens/fit`, `POST /lens/live`, `POST /lens/token/validate`,
+`GET /lens/token-readout`, `GET /sae/sources`, `GET /sae/releases`,
+`POST/GET/DELETE /sae/load`, `POST/GET/DELETE /sae/train`, `POST /sae/live`,
+`POST /sae/feature/validate`, `POST /sae/features/metadata`,
+`GET /sae/token-readout`. `lens_routes.py` and `sae_routes.py` are gone.
 
 ### traits_routes.py — live traits SSE
 

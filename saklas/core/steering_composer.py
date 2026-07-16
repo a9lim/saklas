@@ -34,7 +34,7 @@ from saklas.core.session import (
     ManifoldNotRegisteredError,
     SteeringStackEntry,
     Trigger,
-    VectorNotRegisteredError,
+    ProfileNotRegisteredError,
     _PROFILE_ABSENT,
     _affine_manifold_push,
 )
@@ -407,7 +407,7 @@ class SteeringComposer:
            and folded by :func:`~saklas.core.capture.folded_directions`,
            then memoized in ``_profiles``;
 
-        Raises :class:`VectorNotRegisteredError` when nothing resolves.
+        Raises :class:`ProfileNotRegisteredError` when nothing resolves.
         """
         profiles = self._session._profiles
         existing = profiles.get(name)
@@ -444,8 +444,8 @@ class SteeringComposer:
             profiles[name] = folded
             return folded
 
-        raise VectorNotRegisteredError(
-            f"No vector registered for {role} '{name}'"
+        raise ProfileNotRegisteredError(
+            f"No profile registered for {role} '{name}'"
         )
 
     def try_fold_manifold(
@@ -466,7 +466,7 @@ class SteeringComposer:
         try:
             return folded_directions(self._session._manifolds[name])
         except Exception as e:
-            raise VectorNotRegisteredError(
+            raise ProfileNotRegisteredError(
                 f"'{name}' is a manifold that does not fold to a single "
                 f"steering direction (not a 2-node affine subspace): {e}"
             ) from e
@@ -480,7 +480,7 @@ class SteeringComposer:
         """Push an entries dict onto the steering stack and rebuild hooks.
 
         If ``rebuild_hooks`` raises (e.g. an unknown vector
-        name hits ``VectorNotRegisteredError``) the just-pushed entry is
+        name hits ``ProfileNotRegisteredError``) the just-pushed entry is
         rolled back before the exception propagates, so the stack is
         never left with stale half-committed state.
 

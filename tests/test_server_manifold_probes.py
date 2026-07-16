@@ -117,7 +117,7 @@ def _mock_session():
     session.config.max_new_tokens = 1024
     session.config.system_prompt = None
 
-    session.vectors = {}
+    session.profiles = {}
     session.probes = {}
     session.manifolds = {}
     session.tree = MagicMock()

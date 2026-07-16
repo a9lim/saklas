@@ -21,7 +21,7 @@ import torch
 from saklas.core.events import EventBus
 from saklas.core.mahalanobis import WhitenerError
 from saklas.core.session import (
-    SaklasSession, VectorNotRegisteredError,
+    SaklasSession, ProfileNotRegisteredError,
 )
 from saklas.core.steering_composer import SteeringComposer
 from saklas.core.steering_expr import parse_expr
@@ -217,7 +217,7 @@ class _Stub(SaklasSession):
         flat = self._steering_composer.flatten_stack()
         for name in flat:
             if name not in self._profiles:
-                raise VectorNotRegisteredError(f"No vector registered for '{name}'")
+                raise ProfileNotRegisteredError(f"No profile registered for '{name}'")
         self._rebuild_entries.append(dict(flat))
         flat_any: dict[str, Any] = flat
         self._rebuild_calls.append(
@@ -274,7 +274,7 @@ class TestSessionProjection:
     def test_projection_missing_base_raises(self):
         s = _Stub({"b": _profile_b()})  # no "a" registered
         steering = parse_expr("0.5 a|b")
-        with pytest.raises(VectorNotRegisteredError) as ei:
+        with pytest.raises(ProfileNotRegisteredError) as ei:
             with s.steering(steering):
                 pass
         assert "a" in str(ei.value) or "projection" in str(ei.value)
@@ -282,7 +282,7 @@ class TestSessionProjection:
     def test_projection_missing_onto_raises(self):
         s = _Stub({"a": _profile_a()})  # no "b"
         steering = parse_expr("0.5 a|b")
-        with pytest.raises(VectorNotRegisteredError):
+        with pytest.raises(ProfileNotRegisteredError):
             with s.steering(steering):
                 pass
 

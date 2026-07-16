@@ -160,7 +160,7 @@ Extraction is a single pipeline, `ManifoldExtractionPipeline.fit`
 same operation: pool per-node centroids, fit a per-layer subspace, bake the
 per-layer share, write the per-model tensor. A 2-node `pca` fit is a steering
 vector; an N-node fit is a manifold. The session wraps it: `extract` /
-`extract_vector_from_corpora` author a 2-node `pca` folder then fit;
+`extract_from_corpora` author a 2-node `pca` folder then fit;
 `fit` fits an authored/discover folder directly.
 
 ### 3.1 Forward capture and pooling
@@ -256,7 +256,7 @@ work merely to rediscover the shared model intersection.
 4. Fits via `ManifoldExtractionPipeline` and returns `(canonical_name,
    folded_directions(manifold))`.
 
-`extract_vector_from_corpora` is the corpus-in sibling (hand-authored pairs —
+`extract_from_corpora` is the corpus-in sibling (hand-authored pairs —
 skips generation). Both emit a single `ManifoldExtracted` whose `profile` field
 carries the folded view; the `Profile` they return is that folded view, not a
 separately stored tensor.

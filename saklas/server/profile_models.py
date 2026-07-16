@@ -1,4 +1,4 @@
-"""Vector route schemas and serializers for native saklas routes."""
+"""Profile route schemas and serializers for native saklas routes."""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ class ExtractRequest(NativeRequest):
     force: bool = False
 
 
-class BakeVectorRequest(NativeRequest):
-    """Body for ``POST /saklas/v1/sessions/{id}/vectors/bake``."""
+class BakeProfileRequest(NativeRequest):
+    """Body for ``POST /saklas/v1/sessions/{id}/profiles/bake``."""
 
     name: str
     expression: str
@@ -35,7 +35,7 @@ def profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
 
 
 def extract_registry_name(canonical: str, namespace: str | None) -> str:
-    """Return the steerable key for a freshly extracted vector."""
+    """Return the steerable key for a freshly extracted profile."""
     if namespace is None:
         return canonical
     if ":" in canonical:

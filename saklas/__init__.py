@@ -72,7 +72,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "SelectorError": ("saklas.io.selectors", "SelectorError"),
     "AmbiguousSelectorError": ("saklas.io.selectors", "AmbiguousSelectorError"),
     "ManifoldNotRegisteredError": ("saklas.core.session", "ManifoldNotRegisteredError"),
-    "VectorNotRegisteredError": ("saklas.core.session", "VectorNotRegisteredError"),
+    "ProfileNotRegisteredError": ("saklas.core.session", "ProfileNotRegisteredError"),
     # Jacobian lens (the verbalizable-workspace readout)
     "JacobianLens": ("saklas.core.jlens", "JacobianLens"),
     "JSpaceDecomposition": ("saklas.core.jlens", "JSpaceDecomposition"),
@@ -146,7 +146,7 @@ __all__ = [
     "SelectorError",
     "AmbiguousSelectorError",
     "ManifoldNotRegisteredError",
-    "VectorNotRegisteredError",
+    "ProfileNotRegisteredError",
     # Jacobian lens (the verbalizable-workspace readout)
     "JacobianLens",
     "JSpaceDecomposition",
@@ -248,7 +248,7 @@ if TYPE_CHECKING:
     )
     from saklas.core.session import (
         ManifoldNotRegisteredError as ManifoldNotRegisteredError,
-        VectorNotRegisteredError as VectorNotRegisteredError,
+        ProfileNotRegisteredError as ProfileNotRegisteredError,
     )
     from saklas.core.jlens import (
         JacobianLens as JacobianLens,

@@ -75,26 +75,26 @@ class TestConstruction:
         assert session.tree.messages_for() == []
 
     def test_vectors_starts_empty(self, session: SaklasSession) -> None:
-        assert session.vectors == {}
+        assert session.profiles == {}
 
     def test_last_result_starts_none(self, session: SaklasSession) -> None:
         assert session.last_result is None
 
 class TestSteering:
     def test_extract_and_steer(self, session: SaklasSession) -> None:
-        name, profile = session.extract_vector_from_corpora(
+        name, profile = session.extract_from_corpora(
             "happy", _corpus("I am happy"), _corpus("I am sad"),
         )
         assert isinstance(profile, Profile)
         assert all(isinstance(k, int) for k in profile)
         session.steer("happy", profile)
-        assert "happy" in session.vectors
-        # vectors registry speaks Profile, not bare dicts (saklas 1.x → 3.x).
-        assert isinstance(session.vectors["happy"], Profile)
+        assert "happy" in session.profiles
+        # profile registry stores raw per-layer tensor dicts (wrap in Profile for the public view).
+        assert isinstance(session.profiles["happy"], dict)
 
     def test_unsteer(self, session: SaklasSession) -> None:
         session.unsteer("happy")
-        assert "happy" not in session.vectors
+        assert "happy" not in session.profiles
 
     def test_extract_curated(self, session: SaklasSession) -> None:
         name, profile = session.extract("happy", baseline="sad")
@@ -103,7 +103,7 @@ class TestSteering:
         assert len(profile) > 0
 
     def test_extract_datasource(self, session: SaklasSession) -> None:
-        name, profile = session.extract_vector_from_corpora(
+        name, profile = session.extract_from_corpora(
             "formal.casual", _corpus("formal"), _corpus("casual"),
         )
         assert isinstance(profile, Profile)
@@ -112,7 +112,7 @@ class TestMonitoring:
     def test_monitor_and_unmonitor(self, session: SaklasSession) -> None:
         # Extract registers the folded direction; ``add_probe`` resolves it
         # (the unified probe API — one attach for vector + manifold probes).
-        name, _profile = session.extract_vector_from_corpora(
+        name, _profile = session.extract_from_corpora(
             "honest", _corpus("I am honest"), _corpus("I am deceptive"),
         )
         session.add_probe(name, as_name="test_probe")
@@ -155,7 +155,7 @@ class TestGeneration:
         assert messages[1]["role"] == "assistant"
 
     def test_generate_with_alphas(self, session: SaklasSession) -> None:
-        name, profile = session.extract_vector_from_corpora(
+        name, profile = session.extract_from_corpora(
             "formal.casual", _corpus("formal"), _corpus("casual"),
         )
         session.steer(name, profile)
@@ -176,7 +176,7 @@ class TestGeneration:
 
     def test_ab_comparison(self, session: SaklasSession) -> None:
         """A/B test: same prompt, with and without steering."""
-        name, profile = session.extract_vector_from_corpora(
+        name, profile = session.extract_from_corpora(
             "happy", _corpus("I am happy"), _corpus("I am sad"),
         )
         session.steer(name, profile)
@@ -241,7 +241,7 @@ class TestStreamingGeneration:
         assert session.last_result.token_count == len(tokens)
 
     def test_stream_with_alphas(self, session: SaklasSession) -> None:
-        name, profile = session.extract_vector_from_corpora(
+        name, profile = session.extract_from_corpora(
             "happy", _corpus("I am happy"), _corpus("I am sad"),
         )
         session.steer(name, profile)
@@ -430,8 +430,8 @@ class TestPrefixCache:
         assert session._prefix_cache is not None
 
         # Make sure there's a steering vector to push.
-        if not session.has_vector("happy"):
-            _, prof = session.extract_vector_from_corpora(
+        if not session.has_profile("happy"):
+            _, prof = session.extract_from_corpora(
                 "happy", _corpus("I am happy"), _corpus("I am sad"),
             )
             session.steer("happy", prof)

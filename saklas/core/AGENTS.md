@@ -1145,11 +1145,11 @@ authors a 2-node folder and generates both poles. **Monopolar** (`baseline=None`
 authors a genuinely **1-node** folder (only the concept pole is generated); the
 pipeline folds `concept − ν` into a 1-node neutral-anchored ray (see
 `extraction.py`), neutral implicit via `layer_means`. `generate_neutral_responses`
-is the neutral-corpus sibling (no system, standard label). `extract_vector_from_corpora(..., kind=...)` is the corpus-in sibling
+is the neutral-corpus sibling (no system, standard label). `extract_from_corpora(..., kind=...)` is the corpus-in sibling
 (hand-authored pairs skip generation; corpora pooled conversationally, each length
 a multiple of the baseline prompt set); `fit(folder)` is the multi-node delegate
 that returns a `Manifold`. All gate against `GenState.IDLE`
-(fitting runs forward passes). `_fit_vector_manifold` is the shared tail. (The
+(fitting runs forward passes). `_fit_concept_manifold` is the shared tail. (The
 training-free `clone_from_corpus` / `io.cloning` path is removed in 4.0.)
 
 `generate` / `generate_stream` are keyword-only and accept `steering: str |
@@ -1316,7 +1316,7 @@ when off, `_generate_core` masks every per-token monitor consumer at the
 source (trait stream, loom probe rows, live token scores, per-layer persist,
 subspace-coords persist, the tap's `needs_scores`), so generations run
 aggregate-only capture; probe gates still force the subset they need.
-Surfaced as `POST .../probes/live` + session info `live_probe_scores`.
+Surfaced as `POST .../instruments/geometry/live` + session info `live_probe_scores`.
 
 **Live lens** (`enable_live_lens`/`disable_live_lens`/
 `live_lens_layers`): the selected layers' `J_l` go device-resident, join the

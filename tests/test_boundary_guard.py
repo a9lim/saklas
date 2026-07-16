@@ -199,7 +199,7 @@ def test_promoted_names_not_imported_by_old_underscore_form() -> None:
     future decision):
       server/traits_routes.py:   _resolve_session_id  (internal server helper)
       server/probe_routes.py:    _resolve_session_id  (internal server helper)
-      server/vector_routes.py:   _refuse_if_busy (internal)
+      server/profile_routes.py:  _refuse_if_busy (internal)
       cli/main.py:               _build_root_parser, _COMMAND_RUNNERS (internal CLI)
     """
     offenders = _find_promoted_old_name_imports()

@@ -24,9 +24,9 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     register_tree_routes(app)
 
-    from saklas.server.vector_routes import register_vector_routes
+    from saklas.server.profile_routes import register_profile_routes
 
-    register_vector_routes(app)
+    register_profile_routes(app)
 
     from saklas.server.probe_routes import register_probe_routes
 
@@ -36,13 +36,9 @@ def register_saklas_routes(app: FastAPI) -> None:
 
     register_traits_routes(app)
 
-    from saklas.server.lens_routes import register_lens_routes
+    from saklas.server.instrument_routes import register_instrument_routes
 
-    register_lens_routes(app)
-
-    from saklas.server.sae_routes import register_sae_routes
-
-    register_sae_routes(app)
+    register_instrument_routes(app)
 
     from saklas.server.ws_stream import register_ws_stream
 

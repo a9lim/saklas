@@ -24,7 +24,7 @@ class ManifoldExtracted:
     name: str
     manifold: Any  # Manifold — forward ref to avoid import cycle
     metadata: dict[str, Any]
-    # A 2-node ``pca`` fit (``session.extract`` / ``extract_vector_from_corpora``)
+    # A 2-node ``pca`` fit (``session.extract`` / ``extract_from_corpora``)
     # also folds the manifold to a per-layer-direction ``Profile``; it rides here
     # so the single fit event carries the vector view without a second event type.
     # ``None`` for a general multi-node fit (the folded view is undefined /

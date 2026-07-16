@@ -119,7 +119,7 @@ def session_info(
         "dtype": dtype,
         "created": created_ts,
         "config": session_config_dict(session),
-        "vectors": sorted(session.vectors.keys()),
+        "profiles": sorted(session.profiles.keys()),
         "probes": sorted(session.probes.keys()),
         "history_length": len(session.tree.messages_for()),
         "supports_thinking": thinks,

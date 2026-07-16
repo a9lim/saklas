@@ -64,7 +64,11 @@ def _mock_session_with_vectors(vectors: dict[str, Profile]):
     session.config.system_prompt = None
     session.config.thinking = None
 
-    session.vectors = vectors
+    # The profile registry stores raw per-layer tensor dicts; the route wraps
+    # each in a Profile for the wire.  Analytics still read Profiles below.
+    session.profiles = {
+        name: dict(prof.items()) for name, prof in vectors.items()
+    }
     session.probes = {}
     session.history = []
     session.monitor = MagicMock()
@@ -255,7 +259,7 @@ class TestCorrelationEndpoint:
 class TestRemovedDashboardSurfaces:
     def test_vector_profile_omits_layer_norm_payload(self, web_client: Any) -> None:
         _session, client = web_client
-        r = client.get("/saklas/v1/sessions/default/vectors/honest")
+        r = client.get("/saklas/v1/sessions/default/profiles/honest")
         assert r.status_code == 200
         data = r.json()
         assert set(data) == {"name", "layers", "metadata"}
@@ -265,7 +269,7 @@ class TestRemovedDashboardSurfaces:
     ) -> None:
         _session, client = web_client
         for path in (
-            "/saklas/v1/sessions/default/vectors/honest/diagnostics",
+            "/saklas/v1/sessions/default/profiles/honest/diagnostics",
             "/saklas/v1/sessions/default/experiments/fan",
             "/styleguide",
             "/styleguide/anything",

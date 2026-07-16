@@ -1,9 +1,9 @@
-"""Native vectors route group (``/saklas/v1/sessions/{id}/vectors/*``).
+"""Native profiles route group (``/saklas/v1/sessions/{id}/profiles/*``).
 
-Steering-vector lifecycle under the session: list / profile JSON / delete /
+Steering-profile lifecycle under the session: list / profile JSON / delete /
 extract / bake, plus the
 cross-layer whitened ``pairwise`` matrix and the N×N ``correlation``
-matrix across loaded vectors and probes.
+matrix across loaded profiles and probes.
 """
 
 # pyright: reportUnusedFunction=false
@@ -19,32 +19,32 @@ from fastapi.responses import Response
 from saklas.core.profile import Profile
 from saklas.server.app import acquire_session_lock
 from saklas.server.native_common import resolve_session_id
-from saklas.server.sse import ProgressCallback, progress_sse_response
-from saklas.server.vector_models import (
-    BakeVectorRequest,
+from saklas.server.profile_models import (
+    BakeProfileRequest,
     ExtractRequest,
     extract_registry_name,
     profile_to_json,
 )
+from saklas.server.sse import ProgressCallback, progress_sse_response
 
 
-def register_vector_routes(app: FastAPI) -> None:
-    """Mount the ``/sessions/{id}/vectors/*`` + ``/correlation`` routes."""
+def register_profile_routes(app: FastAPI) -> None:
+    """Mount the ``/sessions/{id}/profiles/*`` + ``/correlation`` routes."""
     session = app.state.session
 
-    @app.get("/saklas/v1/sessions/{session_id}/vectors")
-    def list_vectors(session_id: str):
+    @app.get("/saklas/v1/sessions/{session_id}/profiles")
+    def list_profiles(session_id: str):
         resolve_session_id(session_id)
         return {
-            "vectors": [
-                profile_to_json(name, profile)
-                for name, profile in sorted(session.vectors.items())
+            "profiles": [
+                profile_to_json(name, Profile(tensors))
+                for name, tensors in sorted(session.profiles.items())
             ],
         }
 
-    @app.get("/saklas/v1/sessions/{session_id}/vectors/pairwise")
+    @app.get("/saklas/v1/sessions/{session_id}/profiles/pairwise")
     def pairwise_compare(session_id: str, a: str, b: str):
-        """Cross-layer whitened cosine matrix between two named vectors / probes.
+        """Cross-layer whitened cosine matrix between two named profiles / probes.
 
         Query: ``?a=<name>&b=<name>``.  Each cell ``matrix[i][j]`` is the
         Mahalanobis cosine between vector ``a``'s layer ``layers_a[i]`` and
@@ -60,9 +60,9 @@ def register_vector_routes(app: FastAPI) -> None:
               "model": "google/gemma-3-4b-it",
             }
 
-        Pool unions ``session.vectors`` and ``monitor.probe_names`` (same
+        Pool unions ``session.profiles`` and ``monitor.probe_names`` (same
         as :func:`correlation_matrix`) so probes that were never
-        registered as steering vectors still resolve.  Near-zero layer
+        registered as steering profiles still resolve.  Near-zero layer
         norms land as ``None`` so the client can render them as empty
         cells.  The matrix is the structural signal the webui
         pairwise-compare heatmap reads, distinct from the aggregate
@@ -80,7 +80,7 @@ def register_vector_routes(app: FastAPI) -> None:
         one that doesn't cover every row-layer of ``a``, is a 409 (the
         neutral activation cache must be regenerated).
 
-        Registered *before* ``GET /vectors/{name}`` so the literal path
+        Registered *before* ``GET /profiles/{name}`` so the literal path
         wins the routing match — Starlette matches in registration order
         and ``pairwise`` would otherwise be swallowed by ``{name}``.
         """
@@ -189,13 +189,13 @@ def register_vector_routes(app: FastAPI) -> None:
             "model": session.model_id,
         }
 
-    @app.get("/saklas/v1/sessions/{session_id}/vectors/{name}")
-    def get_vector(session_id: str, name: str):
+    @app.get("/saklas/v1/sessions/{session_id}/profiles/{name}")
+    def get_profile(session_id: str, name: str):
         resolve_session_id(session_id)
-        vectors = session.vectors
-        if name not in vectors:
-            raise HTTPException(404, f"vector '{name}' not found")
-        return profile_to_json(name, vectors[name])
+        profiles = session.profiles
+        if name not in profiles:
+            raise HTTPException(404, f"profile '{name}' not found")
+        return profile_to_json(name, Profile(profiles[name]))
 
     @app.get("/saklas/v1/sessions/{session_id}/correlation")
     def correlation_matrix(session_id: str, names: str | None = None):
@@ -321,13 +321,13 @@ def register_vector_routes(app: FastAPI) -> None:
             "layers_shared": layers_shared,
         }
 
-    @app.delete("/saklas/v1/sessions/{session_id}/vectors/{name}", status_code=204)
-    def delete_vector(session_id: str, name: str):
+    @app.delete("/saklas/v1/sessions/{session_id}/profiles/{name}", status_code=204)
+    def delete_profile(session_id: str, name: str):
         resolve_session_id(session_id)
-        if name not in session.vectors:
-            raise HTTPException(404, f"vector '{name}' not found")
+        if name not in session.profiles:
+            raise HTTPException(404, f"profile '{name}' not found")
         session.unsteer(name)
-        # Drop the vector from the default steering (if present) so the
+        # Drop the profile from the default steering (if present) so the
         # next request doesn't autoload it back under a stale alpha.
         ds = app.state.default_steering
         if ds is not None and name in ds.alphas:
@@ -339,7 +339,7 @@ def register_vector_routes(app: FastAPI) -> None:
         return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/extract")
-    async def extract_vector(session_id: str, req: ExtractRequest, request: Request):
+    async def extract_profile(session_id: str, req: ExtractRequest, request: Request):
         resolve_session_id(session_id)
 
         def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
@@ -382,15 +382,15 @@ def register_vector_routes(app: FastAPI) -> None:
             "progress": progress_msgs,
         }
 
-    @app.post("/saklas/v1/sessions/{session_id}/vectors/bake")
-    async def bake_vector(session_id: str, req: BakeVectorRequest):
+    @app.post("/saklas/v1/sessions/{session_id}/profiles/bake")
+    async def bake_profile(session_id: str, req: BakeProfileRequest):
         """Merge an expression of installed directions into a baked manifold.
 
         Wraps :func:`saklas.io.bake.merge_into_manifold` (model-scoped to
         the session's loaded model) — the merge lands a corpus-less
         ``fit_mode="baked"`` manifold — then folds the fitted tensor back to a
         steering Profile and registers it so it's immediately steerable.
-        Returns the same profile-JSON shape ``GET /vectors/{name}`` produces.
+        Returns the same profile-JSON shape ``GET /profiles/{name}`` produces.
         """
         from saklas.io.bake import merge_into_manifold, MergeError
         from saklas.io.paths import tensor_filename

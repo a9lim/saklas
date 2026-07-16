@@ -72,7 +72,7 @@ class _StubSession:
         cfg.system_prompt = "You are a stub."
         self.config = cfg
 
-        self.vectors: dict[str, Any] = {}
+        self.profiles: dict[str, Any] = {}
         self.probes: dict[str, Any] = {}
 
         monitor = MagicMock()

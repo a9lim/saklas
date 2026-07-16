@@ -1081,7 +1081,7 @@ class ManifoldExtractionPipeline:
         authoring snapshot and again during final compare-and-swap publication.
 
         ``emit_event=False`` suppresses this method's ``ManifoldExtracted``
-        emission: :meth:`SaklasSession._fit_vector_manifold` re-emits a single
+        emission: :meth:`SaklasSession._fit_concept_manifold` re-emits a single
         enriched event carrying the folded :class:`Profile`, so the vector path
         fires exactly one event rather than two.
         """

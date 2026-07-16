@@ -356,7 +356,8 @@ Three read surfaces over either source, plus local fit and external fetch:
   SOURCE section lists `local:default` and fetched
   `neuronpedia` bindings, switches an existing source, fetches the official
   artifact into the Hugging Face cache, or drives the background local fit
-  route `POST /saklas/v1/sessions/{id}/lens/fit` (all layers, polled,
+  preparation `POST /saklas/v1/sessions/{id}/instruments/lens/preparations`
+  (`{operation:"fit"}`, all layers, polled,
   cancellable); either successful preparation activates the source and turns
   the live readout on. The SAE tab has the same SOURCE/STEER/PROBE shape:
   prepared `local:<name>` / `saelens:<release>` sources, provider fetch/load,
@@ -364,7 +365,7 @@ Three read surfaces over either source, plus local fit and external fetch:
   dashboard is served, Saklas restores an explicitly active SAE or attaches the
   best compatible official provider release, then enables its live readout by
   default; `--no-web` does not acquire or download an SAE implicitly.
-  `POST /saklas/v1/sessions/{id}/lens/live` toggles the live
+  `POST /saklas/v1/sessions/{id}/instruments/lens/live` toggles the live
   lens, the native WS `token` frame carries the per-step matrix + chip list
   inside its `measurements` envelope (`instruments.lens.readout`), and session
   info's
@@ -378,7 +379,7 @@ Three read surfaces over either source, plus local fit and external fetch:
   add form, with the live-lens toggle in
   the section header (live off ⇒ no per-step lens compute; pinned probes
   settle to the end-of-gen aggregate). The CAA tab's PROBE section carries
-  the symmetric **live toggle** (`POST /saklas/v1/sessions/{id}/probes/live`
+  the symmetric **live toggle** (`POST /saklas/v1/sessions/{id}/instruments/geometry/live`
   → `session.set_live_probe_scores`, rehydrated via session info's
   `live_probe_scores`): off ⇒ per-token monitor scoring is disabled for
   UI/trait/loom consumers (aggregate-only capture; gates still force the
@@ -386,7 +387,7 @@ Three read surfaces over either source, plus local fit and external fetch:
   family live.
   `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
   behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
-  sessions/{id}/lens/token-readout`): rebuild the node's prompt render + raw
+  sessions/{id}/instruments/lens/token-readout`): rebuild the node's prompt render + raw
   decode prefix, one capture forward under the node's recipe steering (exact for
   always-active affine terms — the slide is position-independent; phase/gated
   terms don't reproduce on a bare forward), and read the full fitted-layer top-k
@@ -875,7 +876,7 @@ Key contracts:
   carrying `node_ids`/`grid`, with `.first` (the underlying `GenerationResult`) and
   common attributes delegating to it. `session.last_result` is the `GenerationResult`.
 - `extract()` returns `(name, Profile)`; the `Profile` is the folded view of the
-  2-node manifold. `extract_vector_from_corpora` is the corpus-in sibling;
+  2-node manifold. `extract_from_corpora` is the corpus-in sibling;
   `fit(folder)` fits a multi-node manifold and returns a `Manifold`;
   `bake(name, expression)` lands a corpus-less baked manifold from qualified
   additive scalar terms (the mirror of `manifold bake`). `Profile` wraps `dict[int, Tensor]`
@@ -903,7 +904,7 @@ Key contracts:
   `ChoiceScores`/`ChoiceScore`; `parse_expr`/`format_expr`; term types
   `ManifoldTerm`/`ProjectedTerm`/`AblationTerm`; selector errors
   `SelectorError`/`AmbiguousSelectorError`;
-  `ManifoldNotRegisteredError`/`VectorNotRegisteredError`; and the Jacobian-lens
+  `ManifoldNotRegisteredError`/`ProfileNotRegisteredError`; and the Jacobian-lens
   suite `JacobianLens`/`JSpaceDecomposition` with errors
   `JacobianLensError`/`LensNotFittedError`/`MultiTokenWordError`). `from saklas
   import X` is stable; private submodule paths are not.

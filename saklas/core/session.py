@@ -543,8 +543,8 @@ class ConcurrentGenerationError(RuntimeError, SaklasError):
         return (409, str(self) or self.__class__.__name__)
 
 
-class VectorNotRegisteredError(KeyError, SaklasError):
-    """Raised when a steering call references a vector not in the registry."""
+class ProfileNotRegisteredError(KeyError, SaklasError):
+    """Raised when a steering call references a profile not in the registry."""
 
     def user_message(self) -> tuple[int, str]:
         # KeyError str-formats the message as repr; reach into args
@@ -710,7 +710,7 @@ class _SteeringContext:
 
     def __enter__(self) -> "_SteeringContext":
         # _push_steering rolls its own stack entry back if _rebuild_steering_hooks
-        # raises (e.g. VectorNotRegisteredError).  __enter__ only flips
+        # raises (e.g. ProfileNotRegisteredError).  __enter__ only flips
         # `_entered=True` AFTER a clean push so a mid-__enter__ failure leaves
         # no stale state for __exit__ to pop.
         self._session._push_steering(self._entries)
@@ -1516,23 +1516,8 @@ class SaklasSession:
     def model_id(self) -> str:
         return self._model_info.get("model_id", "unknown")
 
-    def has_vector(self, name: str) -> bool:
+    def has_profile(self, name: str) -> bool:
         return name in self._profiles
-
-    @property
-    def vectors(self) -> dict[str, Profile]:
-        """Registered steering vector profiles: name -> :class:`Profile`.
-
-        Returns a snapshot dict — each entry is a fresh :class:`Profile`
-        wrapping the backing tensors.  The raw tensor dict lives on
-        :attr:`profiles` (internal / mutable accessor); use this property
-        for read-only public access and prefer ``profiles`` when you need
-        in-place mutation of the registry.
-
-        Note: the name ``vectors`` pre-dates the manifold unification;
-        ``profiles`` is the internal canonical name for the same registry.
-        """
-        return {name: Profile(tensors) for name, tensors in self._profiles.items()}
 
     def analytics_names(self) -> list[str]:
         """Names available to read-side analytics: registered steering
@@ -1667,9 +1652,9 @@ class SaklasSession:
     @property
     def profiles(self) -> dict[str, dict[int, torch.Tensor]]:
         """In-memory baked steering-direction registry: name -> per-layer
-        tensors.  The raw backing of :attr:`vectors` (which wraps each entry
-        in a :class:`Profile`); the live dict, mutating it mutates the
-        registry."""
+        tensors.  The canonical steering-profile registry — the live dict,
+        so mutating it mutates the registry; wrap an entry in
+        :class:`Profile` for the read-only public view."""
         return self._profiles
 
     @property
@@ -4694,7 +4679,7 @@ class SaklasSession:
                 on_progress=on_progress,
             )
 
-    def extract_vector_from_corpora(
+    def extract_from_corpora(
         self,
         name: str,
         positive: list[str],
@@ -4724,9 +4709,9 @@ class SaklasSession:
         persona-baselined fit as in :meth:`extract`.
         """
         with self._model_exclusive(
-            "session.extract_vector_from_corpora called while another "
+            "session.extract_from_corpora called while another "
             "model use is in flight",
-            phase_msg="session.extract_vector_from_corpora called while a "
+            phase_msg="session.extract_from_corpora called while a "
             "generation is in flight",
         ):
             SaklasSession._assert_unsteered_artifact_operation(self)
@@ -4758,14 +4743,14 @@ class SaklasSession:
         on_progress: Callable[[str], None] | None,
     ) -> tuple[str, Profile]:
         """Author a 2-node ``pca`` folder (when stale) + fit it — the shared tail
-        of :meth:`extract` / :meth:`extract_vector_from_corpora`.
+        of :meth:`extract` / :meth:`extract_from_corpora`.
 
         Both callers differ only in their corpus source (generate vs given); by
         the time they reach here they hold ``node_corpora`` (label → corpus) and
         ``node_kinds`` (label → kind).  This rmtrees + re-authors the folder when
         ``force`` or the manifest is missing (``node_corpora`` is consulted only
         then, so a cache-hit caller may pass ``None``), then delegates to
-        :meth:`_fit_vector_manifold`.  Runs with ``_gen_lock`` already held by
+        :meth:`_fit_concept_manifold`.  Runs with ``_gen_lock`` already held by
         the caller.
         """
         from saklas.io.manifolds import create_discover_manifold_folder
@@ -4807,12 +4792,12 @@ class SaklasSession:
                     hyperparams={"max_dim": 1, "var_threshold": 0.7},
                     node_roles=node_roles, node_kinds=node_kinds,
                 )
-        return self._fit_vector_manifold(
+        return self._fit_concept_manifold(
             name, folder, sae=sae, sae_revision=sae_revision,
             role=role, on_progress=on_progress,
         )
 
-    def _fit_vector_manifold(
+    def _fit_concept_manifold(
         self,
         name: str,
         folder: Any,
@@ -4824,7 +4809,7 @@ class SaklasSession:
     ) -> tuple[str, Profile]:
         """Fit a 2-node pca manifold (lock held) and return its folded Profile.
 
-        Shared tail of :meth:`extract` / :meth:`extract_vector_from_corpora`:
+        Shared tail of :meth:`extract` / :meth:`extract_from_corpora`:
         runs :class:`ManifoldExtractionPipeline` directly (the public
         :meth:`fit` re-acquires ``_gen_lock``, which the callers
         already hold), folds the fitted manifold to a per-layer direction
@@ -5155,7 +5140,7 @@ class SaklasSession:
         scope, and the outer entry is restored on ``__exit__``.  One hook
         installation per active layer regardless of nesting depth.
 
-        Unknown vector names raise ``VectorNotRegisteredError``; genuinely
+        Unknown profile names raise ``ProfileNotRegisteredError``; genuinely
         ambiguous pole names propagate ``AmbiguousSelectorError``.
         """
         steering_obj = Steering.from_value(
@@ -5235,7 +5220,7 @@ class SaklasSession:
             if target not in self._profiles:
                 # Resolve via the unified fitted-manifold path. A miss or
                 # non-raw variant error surfaces at hook-install with the
-                # shared VectorNotRegisteredError shape.
+                # shared ProfileNotRegisteredError shape.
                 with suppress(Exception):
                     self.ensure_profile_registered(target, role="ablation")
             resolved[key] = val
