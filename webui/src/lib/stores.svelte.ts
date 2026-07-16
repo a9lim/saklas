@@ -62,6 +62,7 @@ import type {
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
+import { resolveReadoutTopK } from "./readouts";
 import {
   SURPRISE_TARGET,
   HIGHLIGHT_SAT,
@@ -343,7 +344,7 @@ function _fetchLensHover(
   raw: boolean,
 ): Promise<LensHoverSnapshot | null> {
   return apiInstruments.tokenReadout("lens", nodeId, rawIndex, {
-    topK: Math.max(samplingState.return_top_k, 12),
+    topK: resolveReadoutTopK(samplingState.return_top_k),
     steered: true,
     raw,
     layers: "all",
@@ -356,7 +357,7 @@ function _fetchSaeHover(
   raw: boolean,
 ): Promise<SaeFeatureJSON[]> {
   return apiInstruments.tokenReadout("sae", nodeId, rawIndex, {
-    topK: 12,
+    topK: resolveReadoutTopK(samplingState.return_top_k),
     steered: true,
     raw,
   }).then((res) => res.measurements.instruments.sae?.readout?.features ?? []);
@@ -537,7 +538,7 @@ export async function setLiveSae(enabled: boolean): Promise<void> {
   if (saeState.busy) return;
   saeState.busy = true;
   try {
-    const out = await apiInstruments.setLive("sae", { enabled, top_k: 12 });
+    const out = await apiInstruments.setLive("sae", { enabled });
     saeState.live = out.enabled;
     if (!out.enabled) {
       saeState.readout = [];
@@ -763,7 +764,7 @@ export function setInspectorTab(tab: InspectorTab): void {
   inspectorState.tab = tab;
 }
 
-/** Toggle the live J-lens readout server-side. Its token width follows the
+/** Toggle the live J-lens readout server-side. J-lens and SAE both follow the
  * same per-generation ``return_top_k`` value as the logit alternatives. */
 export async function setLiveLens(enabled: boolean): Promise<void> {
   if (lensState.busy) return;

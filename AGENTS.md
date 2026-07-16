@@ -352,7 +352,9 @@ Three read surfaces over either source, plus local fit and external fetch:
   per-layer cards, and this aggregate. The aggregate and per-layer matrix both
   cover every requested fitted layer. `session.enable_live_lens()` streams the
   same top-k width as the generation's logit-alternative readout per
-  selected layer plus the aggregate chip list every decode step
+  selected layer plus the aggregate chip list every decode step; live SAE
+  discovery, hover, captured prefill, and token replay use that same shared
+  width (falling back to 8 when alternatives are disabled)
   (`TokenEvent.measurements` — the 5.x envelope's `instruments.lens.readout`
   per-layer matrix + aggregate block, displayed in the
   dashboard WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's

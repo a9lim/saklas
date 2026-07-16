@@ -172,7 +172,9 @@ class SaeInstrument:
         # Pinned SAE feature probes: name -> {feature_id, layer, label,
         # max_act}.  NOT monitor probes — they read the encoder channel.
         self.probes: dict[str, dict[str, Any]] = {}
-        # Live feature discovery: {layer, top_k, source}, or None when off.
+        # Live feature discovery: {layer, source}, or None when off. The
+        # generation's resolved readout width is shared with logit alts and
+        # J-lens, so it is deliberately not session-lifetime instrument state.
         self.live: dict[str, Any] | None = None
         # The SAE registry boundary (round-6 P2, the lens state_lock's
         # sibling): one reentrant leaf lock covering registry mutation
@@ -618,11 +620,9 @@ class SaeInstrument:
 
     # ----------------------------------------------------------- live readout
 
-    def enable_live(self, *, top_k: int = 8) -> dict[str, Any]:
+    def enable_live(self) -> dict[str, Any]:
         """Enable the one-matvec live feature readout at the resident layer."""
         session = self._session
-        if not 1 <= int(top_k) <= 100:
-            raise ValueError("top_k must be in [1, 100]")
         backend, layer, _width = session._require_sae()
         release = str(backend.release)
         source = (
@@ -632,10 +632,9 @@ class SaeInstrument:
         )
         self.live = {
             "layer": layer,
-            "top_k": int(top_k),
             "source": source,
         }
-        return {"layer": layer, "top_k": int(top_k)}
+        return {"layer": layer}
 
     def disable_live(self) -> None:
         self.live = None
@@ -645,7 +644,7 @@ class SaeInstrument:
         return self.live is not None
 
     def live_readout_step(
-        self, *, step_id: int = -1,
+        self, *, top_k: int = 8, step_id: int = -1,
     ) -> list[tuple[int, float, str | None, float | None]] | None:
         """One decode step's live feature top-k from the latest capture slice.
 
@@ -677,7 +676,7 @@ class SaeInstrument:
             }
         else:
             acts = session._encode_sae_hidden(buckets[layer][-1])
-        k = min(int(state["top_k"]), int(acts.numel()))
+        k = min(int(top_k), int(acts.numel()))
         values, indices = torch.topk(acts, k=k)
         value_list = values.detach().to("cpu").tolist()
         id_list = indices.detach().to("cpu").tolist()
@@ -716,6 +715,8 @@ class SaeInstrument:
     def authored_capture(
         self,
         hidden: dict[int, torch.Tensor],
+        *,
+        top_k: int,
     ) -> tuple[
         list[tuple[int, float, str | None, float | None]],
         dict[str, "ProbeReading"],
@@ -733,7 +734,7 @@ class SaeInstrument:
         if layer not in hidden:
             return None
         activations = session._encode_sae_hidden(hidden[layer])
-        k = min(int(state["top_k"]), int(activations.numel()))
+        k = min(int(top_k), int(activations.numel()))
         values, indices = torch.topk(activations, k=k)
         value_list = values.detach().to("cpu").tolist()
         id_list = indices.detach().to("cpu").tolist()

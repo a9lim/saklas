@@ -816,7 +816,7 @@ export interface InstrumentFamilyJSON {
   live:
     | { enabled: boolean }
     | { enabled: boolean; layers: number[] | null }
-    | { enabled: boolean; layer: number | null; top_k: number | null };
+    | { enabled: boolean; layer: number | null };
   source: string | null;
   probes: string[];
   capabilities: {
@@ -840,17 +840,16 @@ export const apiInstruments = {
 
   /** Uniform live toggle.  geometry = the CAA per-token monitor scoring
    *  switch (``POST /probes/live`` before 5.x); lens = the workspace
-   *  readout (``layers`` optional); sae = the feature-discovery readout
-   *  (``top_k`` optional).  A field the family can't consume → 400. */
+   *  readout (``layers`` optional); sae = the feature-discovery readout.
+   *  Readout width follows the generation's alts field. */
   setLive(
     family: InstrumentFamily,
-    body: { enabled: boolean; layers?: number[] | null; top_k?: number },
+    body: { enabled: boolean; layers?: number[] | null },
     id: string = SESSION,
   ): Promise<{
     enabled: boolean;
     layers?: number[] | null;
     layer?: number | null;
-    top_k?: number | null;
   }> {
     return request(`${SESSION_BASE(id)}/instruments/${family}/live`, jsonBody(body));
   },

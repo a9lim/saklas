@@ -226,16 +226,26 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
     )
     session._live_lens = {"source": "local:default"}
     session._live_sae = {"source": "saelens:test", "layer": 0}
-    session._authored_lens_capture = lambda _hidden, *, top_k: (
-        {0: [("yes", 0.8)]},
-        [("yes", 0.8, 0.5, 0.1)],
-        {0: [9]},
-        {"jlens/yes": _reading(0.8)},
-    )
-    session._authored_sae_capture = lambda _hidden: (
-        [(12, 1.5, "feature", 3.0)],
-        {"sae/12": _reading(0.5)},
-    )
+    seen_top_k: dict[str, int] = {}
+
+    def _lens_capture(_hidden: Any, *, top_k: int) -> Any:
+        seen_top_k["lens"] = top_k
+        return (
+            {0: [("yes", 0.8)]},
+            [("yes", 0.8, 0.5, 0.1)],
+            {0: [9]},
+            {"jlens/yes": _reading(0.8)},
+        )
+
+    def _sae_capture(_hidden: Any, *, top_k: int) -> Any:
+        seen_top_k["sae"] = top_k
+        return (
+            [(12, 1.5, "feature", 3.0)],
+            {"sae/12": _reading(0.5)},
+        )
+
+    session._authored_lens_capture = _lens_capture
+    session._authored_sae_capture = _sae_capture
     match = _AuthoredPromptMatch(
         _AuthoredPromptTarget(user_id, False, (120,), ("x",)),
         (1,),
@@ -248,7 +258,7 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
         monitor_active=True,
         lens_active=True,
         sae_active=True,
-        lens_top_k=8,
+        readout_top_k=8,
         persist_per_layer_scores=True,
         steering="0.2 formal",
     )
@@ -267,6 +277,7 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
     assert instruments["geometry"]["readings"]["formal"]["coords"] == [0.25]
     assert instruments["lens"]["readout"]["layers"][0]["tokens"][0]["id"] == 9
     assert instruments["sae"]["readout"]["features"][0]["id"] == 12
+    assert seen_top_k == {"lens": 8, "sae": 8}
 
 
 def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -293,7 +304,7 @@ def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.Mo
     assert use_thinking is True
 
 
-def test_jlens_top_k_shares_logit_alternative_width() -> None:
+def test_readout_top_k_shares_logit_alternative_width() -> None:
     session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._default_return_top_k = 6
 
@@ -305,6 +316,14 @@ def test_jlens_top_k_shares_logit_alternative_width() -> None:
     assert SaklasSession._effective_return_top_k(
         session, SamplingConfig(return_top_k=0),
     ) == 6
+    assert SaklasSession._effective_readout_top_k(
+        session, SamplingConfig(return_top_k=13),
+    ) == 13
+
+    # Read-side discovery remains useful when alts are disabled.
+    session._default_return_top_k = 0
+    assert SaklasSession._effective_readout_top_k(session, None) == 8
+
 
 def test_prepare_input_raw_feeds_flat_active_path():
     """raw=True walks the loom tree as flat text — no chat template, no
@@ -868,11 +887,11 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
     session._incremental_readings = []
     session._incremental_gate_scores = []
     session._live_lens = {"layers": [0]}
-    session._live_sae = {"layer": 0, "top_k": 3}
+    session._live_sae = {"layer": 0}
     session._live_lens_readout_step = lambda **_kwargs: (
         (_ for _ in ()).throw(AssertionError("lens readout not consumed"))
     )
-    session._live_sae_readout_step = lambda: (
+    session._live_sae_readout_step = lambda **_kwargs: (
         (_ for _ in ()).throw(AssertionError("sae readout not consumed"))
     )
     session._last_lens_step_readings = None
@@ -1746,7 +1765,7 @@ def test_sae_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
     session._steering_uses_compiled_offsets = False
     session._live_lens = None
     session._lens_probes = {}
-    session._live_sae = {"layer": 5, "top_k": 8}
+    session._live_sae = {"layer": 5}
     session._sae_probes = {}
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 

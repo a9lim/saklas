@@ -1106,6 +1106,9 @@ discovery; `--no-web` leaves SAE acquisition explicit.
 The runtime has the same three consumers as the J-lens, but is single-layer:
 
 - **readout**: `SAE.encode(h_L)` after the decode forward, followed by top-k;
+  its width is the generation's resolved logit-alternative `return_top_k`,
+  shared with J-lens (8 when alternatives are disabled). The same rule drives
+  authored-prefill capture, hover, and loom-prefix replay;
   the token frame's `measurements.instruments.sae.readout` block carries feature
   id, raw post-nonlinearity activation, and an optional cached label. It reuses
   the existing capture tap and adds no hook. `sae_token_readout` is the

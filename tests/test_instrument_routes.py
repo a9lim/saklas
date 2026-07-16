@@ -91,7 +91,7 @@ class TestListing:
         }
 
         sae = fams["sae"]
-        assert sae["live"] == {"enabled": False, "layer": None, "top_k": None}
+        assert sae["live"] == {"enabled": False, "layer": None}
         assert sae["source"] == "saelens:scope"
         assert sae["capabilities"] == {
             "sources": True, "preparations": ["load", "train"],
@@ -103,13 +103,11 @@ class TestListing:
         session.live_probe_scores = False
         session.live_lens_layers = [10, 14]
         session.live_sae = True
-        session._live_sae = {"layer": 14, "top_k": 12, "source": "saelens:x"}
+        session._live_sae = {"layer": 14, "source": "saelens:x"}
         fams = {f["family"]: f for f in client.get(_BASE).json()["instruments"]}
         assert fams["geometry"]["live"] == {"enabled": False}
         assert fams["lens"]["live"] == {"enabled": True, "layers": [10, 14]}
-        assert fams["sae"]["live"] == {
-            "enabled": True, "layer": 14, "top_k": 12,
-        }
+        assert fams["sae"]["live"] == {"enabled": True, "layer": 14}
 
 
 # ---------------------------------------------------------------------------
@@ -170,25 +168,30 @@ class TestLiveToggle:
 
     def test_sae_enable(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.enable_live_sae.return_value = {"layer": 14, "top_k": 12}
-        resp = client.post(
-            f"{_BASE}/sae/live", json={"enabled": True, "top_k": 12},
-        )
+        session.enable_live_sae.return_value = {"layer": 14}
+        resp = client.post(f"{_BASE}/sae/live", json={"enabled": True})
         assert resp.status_code == 200
-        assert resp.json() == {"enabled": True, "layer": 14, "top_k": 12}
-        session.enable_live_sae.assert_called_once_with(top_k=12)
+        assert resp.json() == {"enabled": True, "layer": 14}
+        session.enable_live_sae.assert_called_once_with()
 
     def test_sae_disable(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.post(f"{_BASE}/sae/live", json={"enabled": False})
         assert resp.status_code == 200
-        assert resp.json() == {"enabled": False, "layer": None, "top_k": None}
+        assert resp.json() == {"enabled": False, "layer": None}
         session.disable_live_sae.assert_called_once()
 
     def test_sae_rejects_layers(self, session_and_client: Any) -> None:
         _session, client = session_and_client
         resp = client.post(
             f"{_BASE}/sae/live", json={"enabled": True, "layers": [1]},
+        )
+        assert resp.status_code == 400
+
+    def test_sae_rejects_top_k(self, session_and_client: Any) -> None:
+        _session, client = session_and_client
+        resp = client.post(
+            f"{_BASE}/sae/live", json={"enabled": True, "top_k": 12},
         )
         assert resp.status_code == 400
 

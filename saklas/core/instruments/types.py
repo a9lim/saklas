@@ -419,7 +419,6 @@ class SaeLiveConfig:
     """User intent for live SAE feature discovery."""
 
     enabled: bool = False
-    top_k: int = 12
 
 
 LiveConfig = Union[GeometryLiveConfig, LensLiveConfig, SaeLiveConfig]

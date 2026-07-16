@@ -97,8 +97,9 @@ recipes/notes; effective roster rows carry `origin`.
   the input and is surfaced as an error toast.
 - **POST `/sessions/{id}/instruments/lens/live`** — toggle the *live* J-lens readout
   (`{enabled, layers?}` → `{enabled, layers}`; layers omitted picks every
-  fitted layer). The generation's logit-alternative `return_top_k` also sets
-  the live lens width. While on, each WS `token` frame carries
+  fitted layer). The generation's logit-alternative `return_top_k` sets one
+  shared read-side width for J-lens and SAE live capture, authored prefill,
+  hover, and token replay (8 when alts are disabled). While on, each WS `token` frame carries
   the per-layer matrix + aggregate chip list inside its `measurements` envelope
   (`instruments.lens.readout`) and session info
   reports `live_lens_layers` (`null` while off — the J-LENS tab's rehydration

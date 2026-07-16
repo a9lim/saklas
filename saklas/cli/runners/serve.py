@@ -112,7 +112,7 @@ def _enable_serve_live_sae_if_available(session: Any) -> bool:
             if release is None:
                 return False
             info = session.load_sae(release)
-        state = session.enable_live_sae(top_k=12)
+        state = session.enable_live_sae()
         print(
             "Live SAE readout: on "
             f"({info.get('release', 'active')} at L{state.get('layer')})"

@@ -71,14 +71,14 @@ _TRAIN_PROGRESS_RE = re.compile(r"trained ([\d,]+)/([\d,]+) tokens")
 class InstrumentLiveRequest(NativeRequest):
     """Uniform body for ``POST .../instruments/{family}/live``.
 
-    ``layers`` applies to the lens family, ``top_k`` to the sae family; a
-    field the target family cannot consume is rejected (400) rather than
-    silently ignored.
+    ``layers`` applies to the lens family. Readout width is generation state
+    shared with ``return_top_k`` / alts, so ``top_k`` is rejected for every
+    family rather than silently creating an instrument-local width.
     """
 
     enabled: bool
     layers: list[int] | None = None
-    top_k: int | None = Field(default=None, ge=1, le=100)
+    top_k: int | None = Field(default=None, ge=1, le=256)
 
 
 class SourceRequest(NativeRequest):
@@ -418,10 +418,9 @@ def register_instrument_routes(app: FastAPI) -> None:
             live = {
                 "enabled": True,
                 "layer": live_cfg.get("layer"),
-                "top_k": live_cfg.get("top_k"),
             }
         else:
-            live = {"enabled": live_on, "layer": None, "top_k": None}
+            live = {"enabled": live_on, "layer": None}
         return {
             "family": "sae",
             "live": live,
@@ -494,22 +493,23 @@ def register_instrument_routes(app: FastAPI) -> None:
             return {"enabled": True, "layers": resolved}
 
         # sae
-        if body.layers is not None:
-            raise HTTPException(400, "sae live takes no layers")
+        if body.layers is not None or body.top_k is not None:
+            raise HTTPException(
+                400,
+                "sae live takes no layers/top_k; readout width follows alts",
+            )
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
             try:
                 if body.enabled:
-                    top_k = body.top_k if body.top_k is not None else 8
-                    state = session.enable_live_sae(top_k=top_k)
+                    state = session.enable_live_sae()
                     return {
                         "enabled": True,
                         "layer": state.get("layer"),
-                        "top_k": state.get("top_k"),
                     }
                 session.disable_live_sae()
-                return {"enabled": False, "layer": None, "top_k": None}
+                return {"enabled": False, "layer": None}
             except ValueError as e:
                 raise HTTPException(400, str(e)) from e
             except SaklasError as e:
@@ -671,7 +671,7 @@ def register_instrument_routes(app: FastAPI) -> None:
             info = await asyncio.to_thread(
                 session.load_sae, release, layer=body.layer,
             )
-            await asyncio.to_thread(session.enable_live_sae, top_k=12)
+            await asyncio.to_thread(session.enable_live_sae)
         st["info"] = info
         st["message"] = (
             f"loaded {source} · live at L{info.get('layer')} "
@@ -724,7 +724,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         try:
             async with acquire_session_lock(session) as acquired:
                 if acquired:
-                    await asyncio.to_thread(session.enable_live_sae, top_k=12)
+                    await asyncio.to_thread(session.enable_live_sae)
         except Exception:
             log.exception("could not auto-enable live SAE after training")
 

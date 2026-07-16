@@ -394,15 +394,15 @@ def test_serve_attaches_best_sae_and_enables_live(
         model_id = "google/gemma-3-4b-it"
         sae_info = None
         loaded: str | None = None
-        live_top_k: int | None = None
+        live_enabled = False
 
         def load_sae(self, release: str) -> dict[str, Any]:
             self.loaded = release
             return {"release": release, "layer": 22, "width": 16_384}
 
-        def enable_live_sae(self, *, top_k: int) -> dict[str, int]:
-            self.live_top_k = top_k
-            return {"layer": 22, "top_k": top_k}
+        def enable_live_sae(self) -> dict[str, int]:
+            self.live_enabled = True
+            return {"layer": 22}
 
     monkeypatch.setattr(
         "saklas.io.sae.list_sae_sources",
@@ -420,7 +420,7 @@ def test_serve_attaches_best_sae_and_enables_live(
     session = _Session()
     assert cli_runners._enable_serve_live_sae_if_available(session)
     assert session.loaded == "gemma-scope-2-4b-it-res"
-    assert session.live_top_k == 12
+    assert session.live_enabled
 
 
 def test_serve_prefers_cached_sae_over_registry_default(
@@ -435,8 +435,8 @@ def test_serve_prefers_cached_sae_over_registry_default(
             self.loaded = release
             return {"release": release, "layer": 22, "width": 16_384}
 
-        def enable_live_sae(self, *, top_k: int) -> dict[str, int]:
-            return {"layer": 22, "top_k": top_k}
+        def enable_live_sae(self) -> dict[str, int]:
+            return {"layer": 22}
 
     monkeypatch.setattr(
         "saklas.io.sae.list_sae_sources",

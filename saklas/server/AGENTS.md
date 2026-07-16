@@ -371,8 +371,8 @@ scrubbing disciplines are copied verbatim from the routes it replaces.
 - `GET /sessions/{id}/instruments` — enumerate the three families. Per family
   `{family, live, source, probes, capabilities}`. **live** is family-discriminated:
   geometry `{enabled: session.live_probe_scores}`; lens `{enabled: bool,
-  layers: session.live_lens_layers}`; sae `{enabled: session.live_sae, layer,
-  top_k}` (layer/top_k from the live config when on, else `null`). **source**:
+  layers: session.live_lens_layers}`; sae `{enabled: session.live_sae, layer}`
+  (layer from the live config when on, else `null`). **source**:
   lens = the active source label (`session._active_jlens_source_label()`), sae =
   the resident release normalized to `saelens:`/`local:` (from `session.sae_info`),
   geometry = `null`. **capabilities** declares per-family support so clients never
@@ -380,11 +380,11 @@ scrubbing disciplines are copied verbatim from the routes it replaces.
   source_switch: bool}` (geometry `False/[]/True/False`; lens
   `True/["fetch","fit"]/True/True`; sae `True/["load","train"]/True/False`).
 
-- `POST .../instruments/{family}/live` — uniform body `{enabled, layers?, top_k?}`.
+- `POST .../instruments/{family}/live` — uniform body `{enabled, layers?}`.
   geometry → `session.set_live_probe_scores(enabled)` (layers/top_k → 400); lens →
   `enable_live_lens(layers=…)` / `disable_live_lens()` under the session lock
-  (top_k → 400); sae → `enable_live_sae(top_k=…)` / `disable_live_sae()` (layers →
-  400). Returns the family's resolved live state (same shape as the GET listing's
+  (top_k → 400); sae → `enable_live_sae()` / `disable_live_sae()` (layers/top_k →
+  400; width follows the generation's alts). Returns the family's resolved live state (same shape as the GET listing's
   live field). **Replaces** `POST /probes/live` and `POST /lens/live`.
 
 - `GET .../instruments/{family}/sources` — lens: the prepared-sources listing

@@ -101,7 +101,7 @@ from saklas.core.triggers import Trigger
 
 _log = logging.getLogger(__name__)
 
-_DEFAULT_JLENS_TOP_K = 8
+_DEFAULT_READOUT_TOP_K = 8
 
 
 class GenerationStream(Protocol):
@@ -272,7 +272,7 @@ class _AuthoredPromptCapture:
     monitor_active: bool
     lens_active: bool
     sae_active: bool
-    lens_top_k: int
+    readout_top_k: int
     persist_per_layer_scores: bool
     steering: str | None
     search_end: int | None = None
@@ -4123,10 +4123,10 @@ class SaklasSession:
         self._invalidate_analytics_cache()
         return name
 
-    def enable_live_sae(self, *, top_k: int = 8) -> dict[str, Any]:
+    def enable_live_sae(self) -> dict[str, Any]:
         """Enable the one-matvec live feature readout at the resident layer
         (delegates to :meth:`SaeInstrument.enable_live`)."""
-        return self._sae_instrument.enable_live(top_k=top_k)
+        return self._sae_instrument.enable_live()
 
     def disable_live_sae(self) -> None:
         self._sae_instrument.disable_live()
@@ -4193,11 +4193,13 @@ class SaklasSession:
         )
 
     def _live_sae_readout_step(
-        self, *, step_id: int = -1,
+        self, *, top_k: int = _DEFAULT_READOUT_TOP_K, step_id: int = -1,
     ) -> list[tuple[int, float, str | None, float | None]] | None:
         """One decode step's live SAE top-k (delegates to
         :meth:`SaeInstrument.live_readout_step`; step-keyed stash reuse)."""
-        return self._sae_instrument.live_readout_step(step_id=step_id)
+        return self._sae_instrument.live_readout_step(
+            top_k=top_k, step_id=step_id,
+        )
 
     def _score_sae_probes_aggregate(
         self,
@@ -4224,8 +4226,8 @@ class SaklasSession:
         from saklas.core.capture import _capture_all_hidden_states
 
         _backend, layer, width = self._require_sae()
-        if not 1 <= top_k <= min(width, 100):
-            raise ValueError(f"top_k must be in [1, {min(width, 100)}]")
+        if not 1 <= top_k <= min(width, 256):
+            raise ValueError(f"top_k must be in [1, {min(width, 256)}]")
         node = self.tree.get(node_id)
         if node.role not in ("assistant", "user"):
             raise InvalidNodeOperationError(
@@ -8089,13 +8091,15 @@ class SaklasSession:
     def _authored_sae_capture(
         self,
         hidden: dict[int, torch.Tensor],
+        *,
+        top_k: int,
     ) -> tuple[
         list[tuple[int, float, str | None, float | None]],
         dict[str, ProbeReading],
     ] | None:
         """Live SAE payload for one retained authored producer row
         (delegates to :meth:`SaeInstrument.authored_capture`)."""
-        return self._sae_instrument.authored_capture(hidden)
+        return self._sae_instrument.authored_capture(hidden, top_k=top_k)
 
     def _persist_authored_prompt_captures(
         self,
@@ -8104,7 +8108,7 @@ class SaklasSession:
         monitor_active: bool,
         lens_active: bool,
         sae_active: bool,
-        lens_top_k: int,
+        readout_top_k: int,
         persist_per_layer_scores: bool,
         steering: str | None,
     ) -> None:
@@ -8158,7 +8162,7 @@ class SaklasSession:
             lens_payload = lens_aggregate = lens_token_ids = None
             if lens_active:
                 lens_capture = self._authored_lens_capture(
-                    hidden, top_k=lens_top_k,
+                    hidden, top_k=readout_top_k,
                 )
                 if lens_capture is not None:
                     (
@@ -8175,7 +8179,9 @@ class SaklasSession:
 
             sae_payload = None
             if sae_active:
-                sae_capture = self._authored_sae_capture(hidden)
+                sae_capture = self._authored_sae_capture(
+                    hidden, top_k=readout_top_k,
+                )
                 if sae_capture is not None:
                     sae_payload, sae_readings = sae_capture
                     payload.merge_readings(
@@ -8388,11 +8394,19 @@ class SaklasSession:
         """Resolve the generation's logit-alternative width.
 
         Per-call ``return_top_k`` wins when positive; zero inherits the
-        session default. The same resolved width drives both the ordinary
-        logit alternatives and the live J-lens readout.
+        session default.
         """
         top_k = sampling.return_top_k if sampling is not None else 0
         return int(top_k or self._default_return_top_k)
+
+    def _effective_readout_top_k(self, sampling: SamplingConfig | None) -> int:
+        """Resolve the shared logit/J-lens/SAE top-k width.
+
+        Read-side instruments keep the canonical eight-wide view when logit
+        alternatives are disabled; otherwise they use that exact ``alts``
+        width.
+        """
+        return self._effective_return_top_k(sampling) or _DEFAULT_READOUT_TOP_K
 
     def _prepare_generation_call(
         self,
@@ -8660,7 +8674,7 @@ class SaklasSession:
                     monitor_active=authored_capture.monitor_active,
                     lens_active=authored_capture.lens_active,
                     sae_active=authored_capture.sae_active,
-                    lens_top_k=authored_capture.lens_top_k,
+                    readout_top_k=authored_capture.readout_top_k,
                     persist_per_layer_scores=(
                         authored_capture.persist_per_layer_scores
                     ),
@@ -8906,10 +8920,7 @@ class SaklasSession:
                 frequency_penalty,
                 logprobs_list,
             ) = self._prepare_generation_call(steering, sampling, thinking)
-            jlens_top_k = (
-                self._effective_return_top_k(sampling)
-                or _DEFAULT_JLENS_TOP_K
-            )
+            readout_top_k = self._effective_readout_top_k(sampling)
             # Steering synthesis is Mahalanobis-normalized and therefore needs
             # the session whitener.  On a cold ``probes=[]`` session it may not
             # exist yet.  Prime it here while this generation already owns the
@@ -9025,13 +9036,15 @@ class SaklasSession:
                 # (step identity replaced the old freshness handshake).
                 lens_step = (
                     self._live_lens_readout_step(
-                        top_k=jlens_top_k, step_id=step_id,
+                        top_k=readout_top_k, step_id=step_id,
                     )
                     if _has_lens_consumer
                     else None
                 )
                 sae_step = (
-                    self._live_sae_readout_step(step_id=step_id)
+                    self._live_sae_readout_step(
+                        top_k=readout_top_k, step_id=step_id,
+                    )
                     if _has_sae_consumer
                     else None
                 )
@@ -9398,7 +9411,7 @@ class SaklasSession:
                     monitor_active=bool(_live_scores_on and _has_monitor_probes),
                     lens_active=_has_lens_consumer,
                     sae_active=_has_sae_consumer,
-                    lens_top_k=jlens_top_k,
+                    readout_top_k=readout_top_k,
                     persist_per_layer_scores=_persists_layer_scores,
                     steering=authored_recipe_steering,
                     search_end=authored_search_end,

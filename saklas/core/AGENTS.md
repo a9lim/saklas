@@ -973,7 +973,7 @@ test stubs that skip `__init__` self-heal.
 
 `sae.py` — **`SaeInstrument`**, the extracted SAE family (the former
 ~560-line session region), same shape: probe registry, live-discovery
-config (`live` — `{layer, top_k, source}`), per-forward stash (one encode
+config (`live` — `{layer, source}`), per-forward stash (one encode
 shared by gates, pinned probes, and the live display on a step),
 per-generation flag, and the read surfaces (`attach`/`detach`/`specs`,
 `score_probes`/`probe_values`, `gate_scalars`, `score_aggregate`,
@@ -1517,6 +1517,11 @@ is **every fitted layer**; pass an explicit `layers` list to trade coverage for
 device memory. `saklas serve`
 auto-enables the live lens at startup when the artifact exists (serve-side
 policy; the library stays opt-in).
+
+**Live SAE** uses that same per-generation resolved top-k at the token tap and
+for authored-prefill capture. The live SAE config therefore stores only its
+resident `{layer, source}`; it has no independent width. Hover and token replay
+receive the same resolved alts width from the client.
 
 ## loom.py
 

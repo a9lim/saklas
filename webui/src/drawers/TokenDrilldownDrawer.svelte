@@ -59,6 +59,7 @@
   import LogitsTab from "./token/LogitsTab.svelte";
   import SaeTab from "./token/SaeTab.svelte";
   import LensTab from "./token/LensTab.svelte";
+  import { resolveReadoutTopK } from "../lib/readouts";
 
   interface DrawerParams {
     turnIdx: number;
@@ -353,8 +354,8 @@
   const saeLoaded = $derived(sessionState.info?.sae_loaded === true);
 
   // Share the logit-alternative width. Zero means the ordinary logit
-  // capture is off, so retain the canonical 8-wide J-lens view.
-  const lensTopK = $derived(samplingState.return_top_k || 8);
+  // capture is off, so retain the canonical eight-wide read-side view.
+  const readoutTopK = $derived(resolveReadoutTopK(samplingState.return_top_k));
 
   const lensReadout = new ReplayReadout<LensTokenReadoutJSON>();
   const saeReadout = new ReplayReadout<SaeTokenReadoutJSON>();
@@ -437,7 +438,7 @@
       "lens",
       nodeId,
       rawIndex,
-      { topK: lensTopK, steered: lensSteered, raw: effectiveRawMode(), layers: "all" },
+      { topK: readoutTopK, steered: lensSteered, raw: effectiveRawMode(), layers: "all" },
       (m) => {
         const lens = m.instruments.lens;
         return {
@@ -478,7 +479,7 @@
       "sae",
       nodeId,
       rawIndex,
-      { steered: saeSteered, raw: effectiveRawMode() },
+      { topK: readoutTopK, steered: saeSteered, raw: effectiveRawMode() },
       (m) => {
         const sae = m.instruments.sae;
         return {

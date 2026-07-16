@@ -144,8 +144,8 @@ def test_live_sae_readout_and_probe_share_one_encoder_result() -> None:
     session._sae_probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
-    assert session.enable_live_sae(top_k=3) == {"layer": 1, "top_k": 3}
-    readout = session._live_sae_readout_step()
+    assert session.enable_live_sae() == {"layer": 1}
+    readout = session._live_sae_readout_step(top_k=3)
     assert readout == [
         (2, 5.0, "feature two", 10.0),
         (1, 3.0, None, None),
@@ -163,7 +163,7 @@ def test_live_sae_readout_seeds_topk_raw_values_for_pinned_probes() -> None:
     session._sae_probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
-    session.enable_live_sae(top_k=3)
+    session.enable_live_sae()
     seen_raw: dict[int, float] = {}
     original = session._sae_instrument.probe_values
 
@@ -180,7 +180,7 @@ def test_live_sae_readout_seeds_topk_raw_values_for_pinned_probes() -> None:
 
     session._sae_instrument.probe_values = spy_probe_values  # type: ignore[method-assign]
 
-    session._live_sae_readout_step()
+    session._live_sae_readout_step(top_k=3)
 
     assert seen_raw[2] == pytest.approx(5.0)
 
@@ -190,8 +190,8 @@ def test_sae_probe_without_metadata_reads_raw_activation() -> None:
     session._sae_probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
-    session.enable_live_sae(top_k=1)
-    session._live_sae_readout_step()
+    session.enable_live_sae()
+    session._live_sae_readout_step(top_k=1)
     reading = session._last_sae_step_readings["sae/1"]  # type: ignore[index]
     assert reading.coords == (3.0,)
 
@@ -218,7 +218,7 @@ def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
     session._sae_probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
-    session.enable_live_sae(top_k=3)
+    session.enable_live_sae()
     calls = 0
     original = session._encode_sae_hidden
 
@@ -230,7 +230,7 @@ def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
     session._encode_sae_hidden = counting_encode  # type: ignore[method-assign]
 
     scalars = session._score_sae_gate_scalars({"sae/2"}, step_id=2)
-    readout = session._live_sae_readout_step(step_id=2)
+    readout = session._live_sae_readout_step(top_k=3, step_id=2)
 
     assert calls == 1
     assert scalars["sae/2"] == pytest.approx(0.5)
@@ -244,7 +244,7 @@ def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
     session._sae_probes["sae/0"] = {
         "feature_id": 0, "layer": 1, "label": None, "max_act": None,
     }
-    session.enable_live_sae(top_k=1)  # feature 2 wins; gated feature 0 is outside top-k.
+    session.enable_live_sae()  # Feature 2 wins the one-wide generation readout.
     seen_raw: dict[int, float] = {}
     original = session._sae_instrument.probe_values
 
@@ -261,7 +261,7 @@ def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
     session._sae_instrument.probe_values = spy_probe_values  # type: ignore[method-assign]
 
     scalars = session._score_sae_gate_scalars({"sae/0"}, step_id=9)
-    readout = session._live_sae_readout_step(step_id=9)
+    readout = session._live_sae_readout_step(top_k=1, step_id=9)
 
     assert scalars["sae/0"] == pytest.approx(0.2)
     assert readout is not None
