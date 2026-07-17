@@ -9,6 +9,8 @@
   interface Item<T> {
     value: T;
     label: string;
+    /** Optional compact evidence count shown beside the label. */
+    meta?: string;
     /** Pillar hue for the dot + active tint — any CSS color. */
     color?: string;
     title?: string;
@@ -55,7 +57,8 @@
       onclick={() => pick(item.value)}
     >
       {#if item.color}<span class="dot"></span>{/if}
-      {item.label}
+      <span>{item.label}</span>
+      {#if item.meta}<span class="meta">{item.meta}</span>{/if}
     </button>
   {/each}
 </div>
@@ -111,6 +114,22 @@
   }
   .tab:not(.on) .dot {
     opacity: 0.55;
+  }
+
+  .meta {
+    min-width: 1.5em;
+    padding: 1px var(--space-2);
+    border-radius: var(--radius-pill);
+    background: var(--glass);
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+  }
+  .tab.on .meta {
+    color: var(--fg-dim);
+    background: color-mix(in srgb, var(--tab-c) 10%, var(--glass-strong));
   }
 
   .tab:focus-visible {

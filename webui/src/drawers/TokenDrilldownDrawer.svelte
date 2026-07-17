@@ -184,6 +184,50 @@
     loomNodeId != null && token?.rawIndex != null,
   );
 
+  /** The durable generation record behind the inspected token. The
+   *  detail view keeps this recipe beside the token rather than making
+   *  users reconstruct it from the global controls. */
+  const loomNode = $derived(
+    loomNodeId ? (loomTree.nodes.get(loomNodeId) ?? null) : null,
+  );
+  const recipeSampling = $derived(loomNode?.recipe?.sampling ?? null);
+  const recipeSteering = $derived(
+    loomNode?.recipe?.steering ?? inspected?.appliedSteering ?? null,
+  );
+  const turnPerplexity = $derived.by<number | null>(() => {
+    if (inspected?.perplexity != null) return inspected.perplexity;
+    const mean = inspected?.meanLogprob ?? loomNode?.mean_logprob;
+    return mean != null && Number.isFinite(mean) ? Math.exp(-mean) : null;
+  });
+  const finishReason = $derived(
+    inspected?.finishReason ?? loomNode?.finish_reason ?? null,
+  );
+
+  function fmtSetting(value: number | null | undefined): string {
+    if (value == null || !Number.isFinite(value)) return "—";
+    return Number.isInteger(value) ? String(value) : value.toFixed(2);
+  }
+
+  const recipeChips = $derived.by<string[]>(() => {
+    const sampling = recipeSampling;
+    const recipe = loomNode?.recipe;
+    if (!sampling && !recipe) return [];
+    const chips = [
+      `T ${fmtSetting(sampling?.temperature)}`,
+      `top-p ${fmtSetting(sampling?.top_p)}`,
+      `top-k ${fmtSetting(sampling?.top_k)}`,
+      `max ${fmtSetting(sampling?.max_tokens)}`,
+    ];
+    const seed = recipe?.seed ?? sampling?.seed;
+    if (seed != null) chips.push(`seed ${seed}`);
+    if (sampling?.presence_penalty) chips.push(`presence ${fmtSetting(sampling.presence_penalty)}`);
+    if (sampling?.frequency_penalty) chips.push(`frequency ${fmtSetting(sampling.frequency_penalty)}`);
+    if (sampling?.return_top_k != null) chips.push(`alts ${sampling.return_top_k}`);
+    if (recipe?.thinking != null) chips.push(recipe.thinking ? "thinking on" : "thinking off");
+    if ((recipe?.probes.length ?? 0) > 0) chips.push(`${recipe!.probes.length} recipe probes`);
+    return chips;
+  });
+
   // ---- navigation ---------------------------------------------------------
 
   function moveTo(next: TokenCursor | null): void {
@@ -313,32 +357,41 @@
 
   // ---- tabs ----------------------------------------------------------
 
-  const TAB_ITEMS: Array<{
+  const tabItems = $derived<Array<{
     value: DrilldownTab;
     label: string;
+    meta: string;
     color?: string;
     title: string;
-  }> = [
+  }>>([
     {
       value: "geometry",
       label: "geometry",
-      title:
-        "Full whitened Monitor readings at this position — coords, fraction, nearest, per-layer (replayable post-hoc)",
+      meta: String(Object.keys(token?.measurements?.instruments.geometry?.readings ?? {}).length),
+      color: "var(--fg-dim)",
+      title: "Activation geometry",
     },
-    { value: "logits", label: "logits", title: "Ranked top-K alternatives at this position" },
+    {
+      value: "logits",
+      label: "logits",
+      meta: String(token?.topAlts?.length ?? 0),
+      title: "Sampling alternatives",
+    },
     {
       value: "sae",
       label: "sae",
+      meta: String(token?.measurements?.instruments.sae?.readout?.features.length ?? 0),
       color: "var(--pillar-sae)",
-      title: "Sparse feature activations at the resident SAE hook layer",
+      title: "Sparse feature field",
     },
     {
       value: "lens",
       label: "j-lens",
+      meta: String(token?.measurements?.instruments.lens?.readout?.layers.length ?? 0),
       color: "var(--pillar-lens)",
-      title: "Workspace readout — what each layer was disposed to say",
+      title: "J-lens workspace",
     },
-  ];
+  ]);
 
   const hasAbPair = $derived(turn?.abPair != null);
 
@@ -544,7 +597,9 @@
       <span class="eyebrow">token drilldown</span>
       {#if token && effCursor}
         <div class="name-row">
-          <code class="tok-text">{JSON.stringify(token.text)}</code>
+          <code class="tok-text" title={`generated token ${JSON.stringify(token.text)}`}>
+            {JSON.stringify(token.text)}
+          </code>
           <button
             type="button"
             class="kv-chip seg-chip"
@@ -583,7 +638,7 @@
           {/if}
         </div>
         <div class="nav-row">
-          <span class="scrub" title="← / → walk tokens across the whole conversation">
+          <span class="scrub" title="Walk token sequence">
             <button
               type="button"
               class="scrub-btn"
@@ -600,7 +655,7 @@
               aria-label="Next token"
             >▶</button>
           </span>
-          <span class="scrub" title="↑ / ↓ jump turns">
+          <span class="scrub" title="Jump turns">
             <button
               type="button"
               class="scrub-btn"
@@ -625,6 +680,43 @@
               title="back to the clicked token"
             >↩</button>
           {/if}
+        </div>
+        <div class="generation-context">
+          <dl class="context-facts">
+            <div>
+              <dt>model</dt>
+              <dd title={sessionState.info?.model_id ?? undefined}>
+                <code>{sessionState.info?.model_id ?? "unknown"}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>loom node</dt>
+              <dd title={loomNodeId ?? undefined}><code>{loomNodeId?.slice(0, 10) ?? "—"}</code></dd>
+            </div>
+            <div>
+              <dt>turn perplexity</dt>
+              <dd><code>{turnPerplexity == null ? "—" : turnPerplexity.toFixed(3)}</code></dd>
+            </div>
+            <div>
+              <dt>finish</dt>
+              <dd><code>{finishReason ?? "streaming"}</code></dd>
+            </div>
+            {#if inspected?.tokPerSec != null}
+              <div>
+                <dt>throughput</dt>
+                <dd><code>{inspected.tokPerSec.toFixed(1)} tok/s</code></dd>
+              </div>
+            {/if}
+          </dl>
+          <div class="recipe">
+            <span class="recipe-label">generation recipe</span>
+            <code class="recipe-steering" title={recipeSteering ?? "no steering"}>
+              {recipeSteering ?? "unsteered"}
+            </code>
+            {#each recipeChips as chip (chip)}
+              <span>{chip}</span>
+            {/each}
+          </div>
         </div>
       {:else}
         <div class="name-row">
@@ -651,7 +743,7 @@
        an A/B pair.  Tabs always render so users see the other views
        exist even when their capture is off. -->
   <div class="toolbar">
-    <SegmentedTabs items={TAB_ITEMS} bind:value={drilldownUi.tab} ariaLabel="Token detail view" />
+    <SegmentedTabs items={tabItems} bind:value={drilldownUi.tab} ariaLabel="Token detail view" />
     {#if hasAbPair}
       <SegmentedTabs items={BRANCH_ITEMS} bind:value={branch} ariaLabel="Token branch" />
     {/if}
@@ -742,8 +834,9 @@
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--space-3);
     min-width: 0;
+    flex: 1 1 auto;
   }
   .eyebrow {
     color: var(--fg-muted);
@@ -858,6 +951,75 @@
     font-size: var(--text-xs);
   }
 
+  .generation-context {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(280px, 1fr);
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .context-facts,
+  .recipe {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+    min-width: 0;
+    margin: 0;
+    padding: var(--space-3);
+    border-radius: var(--radius);
+    background: var(--input-well);
+  }
+  .context-facts > div {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .context-facts dt,
+  .recipe-label {
+    color: var(--fg-muted);
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+  }
+  .context-facts dd {
+    min-width: 0;
+    margin: 0;
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+  }
+  .context-facts code,
+  .recipe code {
+    background: transparent;
+    font-family: var(--font-mono);
+  }
+  .context-facts dd code {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 28ch;
+  }
+  .recipe {
+    gap: var(--space-2) var(--space-3);
+  }
+  .recipe > span:not(.recipe-label),
+  .recipe-steering {
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .recipe-steering {
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 30ch;
+  }
+
   /* Toolbar — view tabs left, branch toggle right (when A/B). */
   .toolbar {
     display: flex;
@@ -869,6 +1031,9 @@
 
   .body {
     flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
     overflow: auto;
     min-height: 0;
     padding: var(--space-5) var(--space-6);
@@ -887,5 +1052,15 @@
   }
   .hint {
     line-height: 1.5;
+  }
+
+  @media (max-width: 820px) {
+    .generation-context {
+      grid-template-columns: 1fr;
+    }
+    .toolbar {
+      align-items: flex-start;
+      flex-direction: column;
+    }
   }
 </style>

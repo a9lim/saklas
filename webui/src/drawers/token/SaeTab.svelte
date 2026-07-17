@@ -9,15 +9,17 @@
 
   import Bar from "../../lib/charts/Bar.svelte";
   import ProbeReadingRow from "../../panels/rack/ProbeReadingRow.svelte";
+  import RackCard from "../../panels/rack/RackCard.svelte";
   import type {
     ProbeReadingJSON,
     SaeFeatureJSON,
     SaeTokenReadoutJSON,
   } from "../../lib/types";
   import type { ReplayReadout } from "./readout.svelte";
-  import InstrumentHeader from "./InstrumentHeader.svelte";
   import EmptyState from "./EmptyState.svelte";
   import PinnedReadings from "./PinnedReadings.svelte";
+  import DetailSummary from "./DetailSummary.svelte";
+  import DetailSection from "./DetailSection.svelte";
 
   let {
     readout,
@@ -63,6 +65,52 @@
     ];
     return parts.join(" · ");
   }
+
+  const features = $derived(readout.data?.features ?? []);
+  const labeledCount = $derived(features.filter((feature) => !!feature.label).length);
+  const normalizedFeatures = $derived(
+    features
+      .map((feature) => ({ feature, strength: strengthOf(feature) }))
+      .filter((entry): entry is { feature: SaeFeatureJSON; strength: number } =>
+        entry.strength != null,
+      ),
+  );
+  const strongestNormalized = $derived(
+    normalizedFeatures.reduce<(typeof normalizedFeatures)[number] | null>(
+      (best, entry) => !best || entry.strength > best.strength ? entry : best,
+      null,
+    ),
+  );
+  const peakRaw = $derived(
+    features.reduce<SaeFeatureJSON | null>(
+      (best, feature) => !best || feature.activation > best.activation ? feature : best,
+      null,
+    ),
+  );
+  const summaryMetrics = $derived([
+    {
+      label: "active features",
+      value: String(features.length),
+      detail: "top features at this position",
+    },
+    {
+      label: "hook layer",
+      value: readout.data?.layer != null && readout.data.layer >= 0
+        ? `L${readout.data.layer}`
+        : "—",
+      detail: "resident SAE measurement point",
+    },
+    {
+      label: "strongest normalized",
+      value: strongestNormalized ? strongestNormalized.strength.toFixed(3) : "—",
+      detail: strongestNormalized ? `sae/${strongestNormalized.feature.id}` : "metadata unavailable",
+    },
+    {
+      label: "metadata coverage",
+      value: features.length > 0 ? `${labeledCount}/${features.length}` : "—",
+      detail: peakRaw ? `peak raw sae/${peakRaw.id} · ${peakRaw.activation.toFixed(1)}` : "no activations",
+    },
+  ]);
 </script>
 
 {#if readout.loading}
@@ -70,7 +118,12 @@
 {:else if readout.error}
   <EmptyState title={`readout: ${readout.error}`} />
 {:else if readout.data}
-  <InstrumentHeader
+  <DetailSummary
+    accent="var(--pillar-sae)"
+    eyebrow="sae"
+    title="Sparse feature field"
+    description="Which learned sparse features fired at the resident hook layer while the model produced this token."
+    metrics={summaryMetrics}
     origin={readout.origin}
     source={readout.source}
     layer={readout.data.layer}
@@ -79,23 +132,38 @@
     {showToggle}
   />
   {#if pinned && Object.keys(pinned).length > 0}
-    <PinnedReadings readings={pinned} accent="var(--pillar-sae)" />
+    <PinnedReadings readings={pinned} accent="--pillar-sae" shape="triangle" />
   {/if}
   {#if readout.data.features.length === 0}
     <EmptyState title="no features fired at this position" />
   {:else}
-    <div class="sae-list" role="list" aria-label="Top SAE features">
-      {#each readout.data.features as feature, index (feature.id)}
-        {@const strength = strengthOf(feature)}
-        <div class="sae-row" role="listitem" title={rowTitle(feature)}>
-          <span class="sae-rank">{index + 1}</span>
-          <div class="sae-meter">
-            <ProbeReadingRow ariaLabel={`Feature sae/${feature.id}`}>
-              {#snippet left()}
+    <DetailSection
+      title="FEATURE ACTIVATIONS"
+      count={`${readout.data.features.length} retained`}
+      description="Gold bars show normalized strength when maxActApprox metadata exists; otherwise cards use one shared raw-activation scale."
+      accent="var(--pillar-sae)"
+    >
+      <div class="sae-list" role="list" aria-label="Top SAE features">
+        {#each readout.data.features as feature, index (feature.id)}
+          {@const strength = strengthOf(feature)}
+          <div role="listitem" title={rowTitle(feature)}>
+            <RackCard accent="--pillar-sae" disabled={false}>
+              {#snippet statline()}
+                <span class="sae-rank">#{index + 1}</span>
                 <code class="sae-id">sae/{feature.id}</code>
+                <span class="sae-label" title={feature.label ?? undefined}>
+                  {feature.label ?? "unlabeled feature"}
+                </span>
+                <span class="spacer"></span>
+                <span class="layer">L{readout.data?.layer ?? "—"}</span>
               {/snippet}
-              {#snippet bar()}
-                {#if strength != null}
+              {#snippet body()}
+                <ProbeReadingRow ariaLabel={`Feature sae/${feature.id}`}>
+                  {#snippet left()}
+                    <span class="row-label">{strength != null ? "strength" : "activation"}</span>
+                  {/snippet}
+                  {#snippet bar()}
+                    {#if strength != null}
                   <Bar
                     value={Math.max(strength, 0)}
                     max={1}
@@ -107,25 +175,28 @@
                     max={rawScale}
                     color="color-mix(in srgb, var(--pillar-sae) 55%, transparent)"
                   />
-                {/if}
+                    {/if}
+                  {/snippet}
+                  {#snippet middle()}
+                    <span class="row-context">{strength != null ? "normalized" : "shared raw scale"}</span>
+                  {/snippet}
+                  {#snippet right()}
+                    <span class="sae-value">
+                      {strength != null ? strength.toFixed(3) : feature.activation.toFixed(2)}
+                    </span>
+                  {/snippet}
+                </ProbeReadingRow>
+                <div class="feature-meta">
+                  <span>activation <b>{feature.activation.toFixed(3)}</b></span>
+                  <span>maxActApprox <b>{feature.max_act != null ? feature.max_act.toFixed(3) : "—"}</b></span>
+                  <span>unit <b>{strength != null ? "strength" : "raw"}</b></span>
+                </div>
               {/snippet}
-              {#snippet middle()}
-                <span class="sae-label" title={feature.label ?? undefined}>
-                  {feature.label ?? "—"}
-                </span>
-              {/snippet}
-              {#snippet right()}
-                <span class="sae-value">
-                  {strength != null
-                    ? strength.toFixed(2)
-                    : feature.activation.toFixed(2)}
-                </span>
-              {/snippet}
-            </ProbeReadingRow>
+            </RackCard>
           </div>
-        </div>
-      {/each}
-    </div>
+        {/each}
+      </div>
+    </DetailSection>
   {/if}
 {:else if !saeLoaded}
   <EmptyState
@@ -143,30 +214,16 @@
 
 <style>
   .sae-list {
-    display: flex;
-    flex-direction: column;
-    background: var(--bg);
-    border-radius: var(--radius);
-    padding: var(--space-3) var(--space-5);
-  }
-  .sae-row {
-    display: flex;
-    align-items: center;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
-    min-width: 0;
   }
   .sae-rank {
-    color: var(--fg-muted);
+    color: var(--pillar-sae);
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
-    width: 2ch;
-    text-align: right;
     flex: 0 0 auto;
-  }
-  .sae-meter {
-    flex: 1 1 auto;
-    min-width: 0;
   }
   .sae-id {
     color: var(--fg);
@@ -181,6 +238,24 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     display: block;
+    min-width: 0;
+  }
+  .spacer {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .layer {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
+  }
+  .row-label,
+  .row-context {
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-align: right;
   }
   .sae-value {
     color: var(--fg);
@@ -188,5 +263,24 @@
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     text-align: right;
+  }
+  .feature-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+    color: var(--fg-muted);
+    font-size: var(--text-2xs);
+  }
+  .feature-meta b {
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-weight: var(--weight-normal);
+    font-variant-numeric: tabular-nums;
+  }
+  @media (max-width: 760px) {
+    .sae-list {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

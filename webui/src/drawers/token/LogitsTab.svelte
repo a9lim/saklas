@@ -6,9 +6,13 @@
 
   import Bar from "../../lib/charts/Bar.svelte";
   import Button from "../../lib/ui/Button.svelte";
+  import ProbeReadingRow from "../../panels/rack/ProbeReadingRow.svelte";
+  import RackCard from "../../panels/rack/RackCard.svelte";
   import { samplingState, sendFork, closeDrawer } from "../../lib/stores.svelte";
   import type { TokenScore } from "../../lib/types";
   import EmptyState from "./EmptyState.svelte";
+  import DetailSummary from "./DetailSummary.svelte";
+  import DetailSection from "./DetailSection.svelte";
 
   let {
     token,
@@ -47,6 +51,47 @@
       chosen: token.tokenId != null && a.id === token.tokenId,
     }));
   });
+
+  const chosenRow = $derived(rankRows.find((row) => row.chosen) ?? null);
+  const tokenProbability = $derived(
+    token.logprob != null && Number.isFinite(token.logprob)
+      ? Math.exp(token.logprob)
+      : null,
+  );
+  const capturedMass = $derived(rankRows.reduce((sum, row) => sum + row.p, 0));
+  const probabilityMargin = $derived(
+    rankRows.length > 1 ? rankRows[0].p - rankRows[1].p : null,
+  );
+  const tokenPerplexity = $derived(
+    token.logprob != null && Number.isFinite(token.logprob)
+      ? Math.exp(-token.logprob)
+      : null,
+  );
+
+  const summaryMetrics = $derived([
+    {
+      label: "chosen probability",
+      value: tokenProbability == null ? "—" : fmtProb(tokenProbability),
+      detail: token.logprob == null ? "not captured" : `logp ${fmtLogprob(token.logprob)}`,
+    },
+    {
+      label: "chosen rank",
+      value: chosenRow ? `#${chosenRow.rank}` : "—",
+      detail: rankRows.length > 0 ? `of ${rankRows.length} retained` : "no alternatives retained",
+    },
+    {
+      label: "captured mass",
+      value: rankRows.length > 0 ? `${(capturedMass * 100).toFixed(1)}%` : "—",
+      detail: "sum of retained probabilities",
+    },
+    {
+      label: probabilityMargin == null ? "token perplexity" : "top-two margin",
+      value: probabilityMargin == null
+        ? (tokenPerplexity == null ? "—" : tokenPerplexity.toFixed(2))
+        : probabilityMargin.toFixed(4),
+      detail: probabilityMargin == null ? "exp(-logp)" : "absolute probability gap",
+    },
+  ]);
 
   let branchingRank = $state<number | null>(null);
   let branchError = $state<string | null>(null);
@@ -101,138 +146,157 @@
   }
 </script>
 
-{#if rankRows.length > 0}
-  <div class="grid-scroll">
-    <table class="logits-table">
-      <thead>
-        <tr>
-          <th class="num">rank</th>
-          <th class="tok">token</th>
-          <th class="pbar" aria-label="probability bar"></th>
-          <th class="num">p</th>
-          <th class="num">logprob</th>
-          <th class="num">Δ top</th>
-          <th class="num">branch</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each rankRows as row (row.rank)}
-          <tr class:chosen={row.chosen}>
-            <td class="num">
-              {row.chosen ? "* " : ""}{row.rank}
-            </td>
-            <td class="tok">
-              <code>{JSON.stringify(row.text)}</code>
-            </td>
-            <td class="pbar">
-              <Bar
-                value={row.p}
-                max={1}
-                width={72}
-                height={6}
-                color="color-mix(in srgb, var(--accent) 55%, transparent)"
-              />
-            </td>
-            <td class="num">{fmtProb(row.p)}</td>
-            <td class="num">{fmtLogprob(row.logprob)}</td>
-            <td class="num">{fmtDelta(row.delta, row.rank)}</td>
-            <td class="num">
+<DetailSummary
+  accent="var(--pillar-lens)"
+  eyebrow="logits"
+  title="Sampling decision"
+  description="The exact post-temperature, post-top-p, post-top-k distribution from which this token was selected."
+  metrics={summaryMetrics}
+  origin="captured"
+  source="sampler"
+  steering={null}
+  steered={true}
+  showToggle={false}
+/>
+
+<DetailSection
+  title="RANKED ALTERNATIVES"
+  count={rankRows.length > 0 ? `${rankRows.length} retained` : "capture unavailable"}
+  description="Every card uses the same absolute probability scale; branch swaps that token into the raw decode prefix and resamples a sibling."
+  accent="var(--pillar-lens)"
+>
+  {#if rankRows.length > 0}
+    <div class="logit-grid" aria-label="Ranked token alternatives">
+      {#each rankRows as row (row.rank)}
+        <RackCard accent="--pillar-lens" disabled={false} active={row.chosen}>
+          {#snippet statline()}
+            <span class="rank">#{row.rank}</span>
+            <code class="token">{JSON.stringify(row.text)}</code>
+            <span class="token-id">id {row.id}</span>
+            {#if row.chosen}<span class="chosen">generated</span>{/if}
+            <span class="spacer"></span>
+            <span class="prob">p {fmtProb(row.p)}</span>
+          {/snippet}
+          {#snippet body()}
+            <ProbeReadingRow ariaLabel={`Probability ${fmtProb(row.p)}`}>
+              {#snippet left()}<span class="row-label">probability</span>{/snippet}
+              {#snippet bar()}
+                <Bar value={row.p} max={1} color="var(--pillar-lens)" />
+              {/snippet}
+              {#snippet middle()}
+                <span class="row-context">logp {fmtLogprob(row.logprob)}</span>
+              {/snippet}
+              {#snippet right()}<span class="row-value">{fmtProb(row.p)}</span>{/snippet}
+            </ProbeReadingRow>
+            <div class="row-meta">
+              <span>Δ top <b>{fmtDelta(row.delta, row.rank)}</b></span>
+              <span>token id <b>{row.id}</b></span>
+              <span class="spacer"></span>
               <Button
                 size="sm"
                 disabled={row.chosen || branchingRank !== null}
                 onclick={() => branchFromAlt(row)}
                 title="fork with token"
               >
-                {branchingRank === row.rank ? "…" : "fork"}
+                {branchingRank === row.rank ? "branching…" : row.chosen ? "selected" : "branch"}
               </Button>
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-  </div>
-  {#if branchError}
-    <p class="branch-error">{branchError}</p>
+            </div>
+          {/snippet}
+        </RackCard>
+      {/each}
+    </div>
+    {#if branchError}
+      <p class="branch-error">{branchError}</p>
+    {/if}
+  {:else if token.logprob != null}
+    <EmptyState title={`logprob ${fmtLogprob(token.logprob)} · no alternatives captured`}>
+      <Button onclick={enableAlts} disabled={samplingState.return_top_k > 0}>
+        {samplingState.return_top_k > 0 ? "alts on next run" : "enable alts"}
+      </Button>
+    </EmptyState>
+  {:else}
+    <EmptyState title="no logprob data">
+      <Button onclick={enableAlts} disabled={samplingState.return_top_k > 0}>
+        {samplingState.return_top_k > 0 ? "alts on next run" : "enable alts"}
+      </Button>
+    </EmptyState>
   {/if}
-{:else if token.logprob != null}
-  <EmptyState title={`logprob ${fmtLogprob(token.logprob)} · no alternatives captured`}>
-    <Button onclick={enableAlts} disabled={samplingState.return_top_k > 0}>
-      {samplingState.return_top_k > 0 ? "alts on next run" : "enable alts"}
-    </Button>
-  </EmptyState>
-{:else}
-  <EmptyState title="no logprob data">
-    <Button onclick={enableAlts} disabled={samplingState.return_top_k > 0}>
-      {samplingState.return_top_k > 0 ? "alts on next run" : "enable alts"}
-    </Button>
-  </EmptyState>
-{/if}
+</DetailSection>
 
 <style>
-  .grid-scroll {
-    overflow: auto;
-    max-height: 100%;
-    border-radius: var(--radius);
-    background: var(--bg);
+  .logit-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-3);
   }
-  .logits-table {
-    width: 100%;
-    border-collapse: separate;
-    border-spacing: 0;
-    font-variant-numeric: tabular-nums;
-    font-size: var(--text-sm);
-  }
-  .logits-table th,
-  .logits-table td {
-    padding: var(--space-2) var(--space-4);
-    text-align: left;
-    background: var(--bg);
-  }
-  .logits-table thead th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
+  .rank,
+  .token-id,
+  .prob,
+  .chosen {
     color: var(--fg-muted);
-    font-family: var(--font-ui);
-    font-weight: var(--weight-medium);
     font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    box-shadow: var(--shadow-sticky);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
-  .logits-table td {
+  .rank,
+  .prob {
+    color: var(--pillar-lens);
     font-family: var(--font-mono);
   }
-  .logits-table td.num,
-  .logits-table th.num {
-    text-align: right;
-    width: 1%;
-    white-space: nowrap;
-  }
-  .logits-table td.pbar,
-  .logits-table th.pbar {
-    width: 1%;
-    white-space: nowrap;
-    line-height: 0;
-  }
-  .logits-table td.tok code {
-    color: var(--fg-strong);
+  .token {
+    color: var(--fg);
     background: transparent;
-    word-break: break-all;
+    font-size: var(--text-sm);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
-  .logits-table tbody tr:hover td {
-    background: color-mix(in srgb, var(--bg-hover) 60%, var(--bg));
+  .chosen {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--pillar-lens) 12%, transparent);
+    border-radius: var(--radius-sm);
+    padding: 1px var(--space-2);
   }
-  /* Chosen row gets a soft accent wash + a heavier color so it reads at
-     a glance. */
-  .logits-table tr.chosen td,
-  .logits-table tbody tr.chosen:hover td {
-    background: var(--accent-subtle);
-    color: var(--fg-strong);
+  .spacer {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .row-label,
+  .row-context,
+  .row-value,
+  .row-meta {
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+  .row-label,
+  .row-value,
+  .row-meta b {
+    font-family: var(--font-mono);
+  }
+  .row-label,
+  .row-value {
+    text-align: right;
+  }
+  .row-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    min-height: var(--control-target);
+  }
+  .row-meta b {
+    color: var(--fg-dim);
+    font-weight: var(--weight-normal);
   }
   .branch-error {
     color: var(--accent-red);
     font-size: var(--text-sm);
     margin: var(--space-4) 0 0;
+  }
+  @media (max-width: 760px) {
+    .logit-grid {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

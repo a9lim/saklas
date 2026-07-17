@@ -61,34 +61,64 @@
   });
 </script>
 
-<div class="ribbon" bind:this={box} role="group" aria-label="Token context">
-  {#if start > 0}
-    <span class="more" aria-hidden="true">…{start}</span>
-  {/if}
-  {#each slice as { tok, i } (i)}
-    <button
-      type="button"
-      class="rtok"
-      class:current={i === index}
-      style={tint(tok)}
-      tabindex="-1"
-      aria-current={i === index}
-      title={`token ${i + 1} / ${tokens.length}`}
-      onclick={() => onjump(i)}
-    >{label(tok.text)}</button>
-  {/each}
-  {#if end < tokens.length}
-    <span class="more" aria-hidden="true">{tokens.length - end}…</span>
-  {/if}
-</div>
+<section class="context-shell" aria-label="Token context">
+  <header>
+    <span>sequence context</span>
+    <span class="position">token {index + 1} / {tokens.length}</span>
+  </header>
+  <div class="ribbon" bind:this={box} role="group" aria-label="Token context sequence">
+    {#if start > 0}
+      <span class="more" aria-hidden="true">…{start}</span>
+    {/if}
+    {#each slice as { tok, i } (i)}
+      <button
+        type="button"
+        class="rtok"
+        class:current={i === index}
+        style={tint(tok)}
+        tabindex="-1"
+        aria-current={i === index}
+        title={`token ${i + 1} / ${tokens.length}`}
+        onclick={() => onjump(i)}
+      >{label(tok.text)}</button>
+    {/each}
+    {#if end < tokens.length}
+      <span class="more" aria-hidden="true">{tokens.length - end}…</span>
+    {/if}
+  </div>
+</section>
 
 <style>
+  .context-shell {
+    margin: var(--space-2) var(--space-6) 0;
+    border-radius: var(--radius);
+    background: var(--input-well);
+    min-width: 0;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding: var(--space-2) var(--space-3) 0;
+    color: var(--fg-muted);
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+  }
+  .position {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+    text-transform: none;
+  }
   .ribbon {
     display: flex;
     align-items: baseline;
     overflow-x: auto;
     white-space: nowrap;
-    padding: var(--space-2) var(--space-6) var(--space-3);
+    padding: var(--space-2) var(--space-3) var(--space-3);
     scrollbar-color: var(--glass-strong) transparent;
     scrollbar-width: thin;
   }
