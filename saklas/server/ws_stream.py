@@ -1031,9 +1031,7 @@ async def _ws_handle_generate(
                 "sibling_count": n,
             })
 
-            # Mid-batch stop honors the plan's decision (#7 / phase 1
-            # spec): "stop_requested cancels the currently-streaming
-            # sibling. Remaining queued siblings are skipped, not
-            # started."
+            # Mid-batch stop honors the batch plan: cancel the currently
+            # streaming sibling and skip every remaining queued sibling.
             if stop_signaled:
                 break

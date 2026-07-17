@@ -77,7 +77,7 @@ _FIT_MODES_DISCOVER: frozenset[str] = frozenset({"pca", "spectral", "auto"})
 # frozen in the per-model tensor and it can never re-fit (no node corpus to
 # pool from).  Merge outputs and imported control vectors land this way — a
 # steering *direction* is the K=1 affine case (see
-# ``core/vectors.fold_directions_to_subspace``).  It is deliberately NOT a
+# ``core/capture.fold_directions_to_subspace``).  It is deliberately NOT a
 # discover mode (``is_discover`` stays False — there are no per-model coords
 # to derive).
 _FIT_MODES_BAKED: frozenset[str] = frozenset({"baked"})

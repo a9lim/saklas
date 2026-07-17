@@ -656,7 +656,7 @@ pure-tensor contract (naturalness drives a live model forward pass, which has no
 place in a geometry module): `to_hellinger`, `bhattacharyya_distance`,
 `fit_behavior_manifold`, `trajectory_naturalness`,
 `compute_node_behavior_centroid`, `compute_trajectory_distributions`,
-`_next_token_distribution`. Import sites in `cli/runners.py` and
+`_next_token_distribution`. Import sites in `cli/runners/experiment.py` and
 `tests/test_naturalness.py` point here. `compute_node_centroid` remains in
 `manifold.py` (shared primitive — activation centroid, no model).
 
@@ -905,8 +905,8 @@ affine-coord helpers, and `_woodbury_apply`. The hot path in `monitor.py` import
 
 ## instruments/
 
-The read-side instrument protocol (phase 1 of the 5.x unification — the
-read-side analogue of `SteeringComposer`). One contract over the three read
+The read-side instrument protocol—the read-side analogue of
+`SteeringComposer`. One contract over the three read
 families: geometry (Monitor subspace probes), the Jacobian-lens readout
 channel, SAE feature reads. `types.py` is the shared vocabulary:
 **`GateRef`** (structured probe-gate reference; `parse_gate_ref` is the ONE
@@ -920,9 +920,9 @@ a *supported* channel temporarily absent this step still reads inactive);
 explicit `unit` — `mean_token_probability` / `activation_over_max` /
 `raw_activation` — and a `DepthSummary` that carries its mass `basis`,
 because `depth_com` means three mathematically unrelated things across
-families; `to_probe_reading()` is the phase-1 wire bridge reproducing the
-historical synthesized-`ProbeReading` shape bit-for-bit until the phase-2
-measurement envelope lands); **`InstrumentPlan`** (declared capture demand,
+families; `to_probe_reading()` is the compatibility bridge reproducing the
+historical synthesized-`ProbeReading` shape while the versioned measurement
+envelope carries the family-native scalar reading); **`InstrumentPlan`** (declared capture demand,
 not mechanics — the session planner unions plans and picks physical
 retention; the `INCREMENTAL → set_tail_with_sink` upgrade is
 cross-instrument resource sharing and stays session-side);
@@ -1001,7 +1001,7 @@ geometry digest). The Monitor engine and the four capture modes stay
 untouched (folding them in would combine an orchestration extraction with
 an engine rewrite). `session.instruments` is the uniform registry —
 `{"geometry", "lens", "sae"}` → instrument — behind the probe-hash roster,
-gate preflight, and the server's phase-2 instrument enumeration.
+gate preflight, and the server's instrument enumeration.
 
 **Public faces (P3):** `session.instruments` is the family registry;
 `session.lens` / `session.sae` return the instrument objects themselves —
@@ -1353,9 +1353,9 @@ old `io.probes_bootstrap.bootstrap_probes`), registered under the **bare** name.
 any *already fitted* for the model and not already attached (`personas`,
 `emotions`) under the qualified `default/<name>` selector — attach-only (never
 fits; an unfitted one logs a skip), so a 107-node manifold can't block startup.
-This folds the former serve-only `_attach_default_manifold_probes` into the
-construction-time pass, so both frontends (serve / programmatic) get the
-same roster; an explicit `probes=[...]` category list skips the multi-node sweep.
+This folds the former serve-only bootstrap into the construction-time pass, so
+both frontends (serve / programmatic) get the same roster; an explicit
+`probes=[...]` category list skips the multi-node sweep.
 
 `SteeringComposer.compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
 entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins the

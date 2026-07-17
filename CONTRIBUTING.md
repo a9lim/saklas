@@ -16,8 +16,8 @@ Use `[hf]` for streamed dataset-backed J-lens/SAE fitting, `[gguf]` for GGUF
 export, `[research]` for the analysis examples, and `[notebook]` for the Plotly
 notebook helpers. SAELens, the HTTP server, and the prebuilt dashboard are part
 of the base install. `[cuda]` adds bitsandbytes and Hugging Face
-`kernels`; `[cuda-experimental]` adds flash-attn. The CUDA extras are
-Linux/CUDA-only.
+`kernels`; `[flash]` adds the stable, tested FlashAttention path. Install
+`.[cuda,flash]` for both. The CUDA and FlashAttention extras are Linux/CUDA-only.
 
 ## Running tests
 
@@ -72,6 +72,9 @@ accessor test and a real-model smoke result when possible.
 - If you're adding an architecture, include the exact model ID, device, dtype or
   quantization mode, and the commands you ran. A fit or generation using a bundled
   manifold is the most useful end-to-end proof.
+- If you change a cross-cutting runtime contract, update `ARCHITECTURE.md` and the
+  owning subtree `AGENTS.md` in the same change. Check CLI examples against live
+  `saklas <verb> --help` output rather than copying an older command list.
 - Please don't bump the version in your PR unless you want a new release; the PyPI publish workflow is triggered by a version update.
 
 ## Questions

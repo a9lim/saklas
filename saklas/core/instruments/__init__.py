@@ -1,4 +1,4 @@
-"""The read-side instrument protocol (phase 1 of the 5.x unification).
+"""The unified read-side instrument protocol.
 
 One contract over the three read families — geometry (Monitor subspace
 probes), the Jacobian-lens readout channel, SAE feature reads.  See

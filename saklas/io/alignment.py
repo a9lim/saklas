@@ -1263,8 +1263,8 @@ def load_alignment_map(
 #
 # Single-flight locking + cache-proof + retry-on-race orchestration that loads
 # or fits a complete source->target Procrustes alignment and returns the
-# identity-matched target metric.  Promoted out of ``cli/runners.py`` so it
-# lives beside the primitives it wraps (``load_alignment_map`` /
+# identity-matched target metric.  Promoted out of the CLI layer so it lives
+# beside the primitives it wraps (``load_alignment_map`` /
 # ``validate_neutral_cache_metadata`` / ``fit_alignment`` / ``save_alignment_map``).
 # Concurrency semantics (locking order, proof-checking without payload hashing,
 # roster narrowing, model-construction avoidance on cache hit, retry-on-race

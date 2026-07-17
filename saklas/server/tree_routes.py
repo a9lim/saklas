@@ -32,7 +32,7 @@ from saklas.server.tree_models import (
 
 
 def register_tree_routes(app: FastAPI) -> None:
-    """Mount the loom ``tree/*`` routes (v2.3 phase 2)."""
+    """Mount the loom ``tree/*`` routes."""
     session = app.state.session
 
     @app.get("/saklas/v1/sessions/{session_id}/tree")

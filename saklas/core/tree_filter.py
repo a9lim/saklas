@@ -1,4 +1,4 @@
-"""Filter grammar for tree pruning (v2.3 phase 5).
+"""Filter grammar for tree pruning.
 
 The grammar is **adjacent to** the steering ``@when:`` clause grammar
 but deliberately distinct — the underlying scalars are different.

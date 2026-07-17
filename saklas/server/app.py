@@ -322,8 +322,8 @@ def _render_logprobs_chat(result: GenerationResult, session: SaklasSession) -> d
     content = []
     # Inner ``top`` is now ``list[TokenAlt]`` (id/text/logprob triples
     # decoded by the engine at top-K capture time); the previous
-    # ``list[tuple[int, float]]`` pair shape was retired with the phase 1
-    # logit pass so we no longer re-tokenize the alt ids here.  The
+    # ``list[tuple[int, float]]`` pair shape is retired, so we no longer
+    # re-tokenize the alt ids here.  The
     # chosen-token text still goes through ``tok.decode`` because the
     # engine emits its id via ``result.tokens`` without the streaming
     # text representation alongside.
@@ -347,7 +347,7 @@ def _render_logprobs_completions(result: GenerationResult, session: SaklasSessio
 
     https://platform.openai.com/docs/api-reference/completions/object#completions/object-logprobs
 
-    Inner ``top`` is ``list[TokenAlt]`` post-phase-1 logit pass — alt
+    Inner ``top`` is ``list[TokenAlt]`` after the logit-alternative pass — alt
     text comes off the dataclass rather than a redundant tokenizer
     decode.
     """

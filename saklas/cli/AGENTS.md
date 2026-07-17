@@ -317,6 +317,6 @@ and acquisition.
 
 ## Error handling
 
-`@_saklas_error_exit` wraps the top-level runners (including `_run_tui`): any
+`@_saklas_error_exit` wraps the top-level verb runners: any
 escaping `SaklasError` prints `user_message()` to stderr and exits with
 `min(2, status // 100)`.

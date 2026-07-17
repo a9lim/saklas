@@ -25,7 +25,7 @@ unreplicated scalar VJPs; replicated VJPs remain an explicit reference mode.
 This is the ONLY module in saklas that runs backward passes. The fit builds
 its own autograd-enabled forward (``torch.enable_grad()`` + a grad-seeding
 output hook on the first fitted block) — the ``inference_mode`` capture machinery in
-``vectors.py`` cannot be reused, because inference tensors never re-enter
+``capture.py`` cannot be reused, because inference tensors never re-enter
 autograd. Per-layer grads come from ``torch.autograd.grad(final, sources)``
 — NOT ``backward()`` + ``retain_grad()`` (``.grad`` accumulates across the
 multi-backward loop and would corrupt the one-hot-cotangent rows) — which

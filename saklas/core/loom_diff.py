@@ -1,4 +1,4 @@
-"""Cross-branch diff for loom (v2.3 phase 5).
+"""Cross-branch diff for loom.
 
 Three primitives used by the cross-branch comparison surfaces:
 

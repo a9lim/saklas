@@ -47,8 +47,7 @@ when you work in that directory. Consult them only when editing that layer.
 ```bash
 pip install -e ".[dev]"                         # editable + pytest + SAELens
 pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
-pip install -e ".[cuda]"                        # bitsandbytes + kernels (Linux/CUDA)
-pip install -e ".[cuda-experimental]"            # + flash-attn (Linux/CUDA)
+pip install -e ".[cuda,flash]"                  # bitsandbytes + kernels + tested FlashAttention (Linux/CUDA)
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete|custom] [--system TEMPLATE] [--samples-per-prompt K] [--seed S]
@@ -954,10 +953,22 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
                                        # probe-centering mean is its per-layer X.mean(0),
                                        # the whitener covariance is built from the stack
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
-    jlens.json                         # atomic per-model Jacobian-lens pointer
-    jlens.layer-*.gen-*.safetensors    # immutable fp32 J_l layer shards (`lens fit`)
-  conversations/<name>.json            # explicit loom-tree saves (no autosave)
+    jlens/
+      active.json                      # selected local/external J-lens source
+      bindings/<provider>.json         # commit-pinned external source metadata
+      local/default/
+        manifest.json                  # atomic immutable-shard pointer
+        checkpoint.json                # present only during a resumable local fit
+        jlens*.gen-*.safetensors       # immutable fp32 J_l layer shards
+    sae/
+      active.json                      # selected local/SAELens source
+      bindings/<release>.json          # provider binding + optional feature metadata
+      local/<name>/                    # Saklas-trained weights + manifest
 ```
+
+Conversation exports are browser-downloaded JSON files or explicit
+`LoomTree.save(path)` targets; there is no `$SAKLAS_HOME/conversations` autosave
+tree.
 
 `manifold.json.files` is a sha256 map verified on load. A manifold folder can hold
 multiple fitted tensors per model, distinguished by filename suffix:

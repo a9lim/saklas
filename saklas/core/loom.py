@@ -216,7 +216,7 @@ class Recipe:
         )
 
     # ------------------------------------------------------------------
-    # Overlay / modifier helpers (v2.3 phase 5)
+    # Overlay / modifier helpers
     # ------------------------------------------------------------------
 
     def overlay(self, override: "Recipe | None") -> "Recipe":
@@ -1070,8 +1070,8 @@ class LoomTree:
 
         Doesn't bump ``rev`` or emit events — token streaming runs in the
         hot loop and we don't want to flood the WS with per-token tree-
-        mutated events.  Token deltas ride the existing ``token`` stream
-        with a ``node_id`` tag (added in phase 2).
+        mutated events.  Token deltas ride the existing ``token`` stream with
+        a ``node_id`` tag.
         """
         with self._lock:
             node = self.nodes.get(node_id)

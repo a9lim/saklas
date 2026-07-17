@@ -830,9 +830,11 @@ def _jlens_matches_loaded_model(
 class SaklasSession:
     """Unified backend for activation steering, monitoring, and generation.
 
-    Vectors are registered via steer() and applied per-generation via the
-    alphas parameter on generate()/generate_stream(). No persistent hooks
-    live on the model between generations.
+    Steering resources are registered or resolved lazily, then applied through
+    the per-call ``steering`` expression on ``generate``/``generate_stream``.
+    Eager sessions install transient steering/capture hooks for one transaction;
+    compiled sessions may retain branchless offset/capture hooks whose buffers
+    are zeroed or repopulated at generation boundaries.
     """
 
     @classmethod
@@ -1425,10 +1427,10 @@ class SaklasSession:
 
         # One unified Monitor for every probe shape — flat concept axes
         # (rank-1), flat discover fits (rank-R, e.g. ``personas``), and curved
-        # manifolds (``emotions``).  There is no batched-affine fast path: every
-        # probe — flat or curved — is read per token through one whitened
-        # per-layer geometry pass (the research-tool priority is full per-token
-        # info — nearest, coords, residual, per-layer — over throughput).
+        # manifolds (``emotions``).  Flat probes share the batched reduced-space
+        # geometry path; curved probes retain their per-probe foot-point solve.
+        # Both still emit the same full per-token reading shape (nearest,
+        # coords, residual, and per-layer detail).
         # Per-token score callbacks emit one flat-scalar dict into
         # ``TriggerContext.probe_scores`` so ``@when:`` gates fire on any probe
         # without grammar changes.
@@ -5356,7 +5358,7 @@ class SaklasSession:
     # -- Steering (vector registry) --
 
     def steer(self, name: str, profile: Profile) -> None:
-        """Register a steering vector. Applied during generate() via alphas.
+        """Register a steering vector for use by per-call expressions.
 
         Internally stored as a plain dict so the steering hook's hot path
         can read tensors without attribute lookups.
@@ -5592,8 +5594,8 @@ class SaklasSession:
           with a one-line log (fit it and it auto-loads next launch).
           Registered under the qualified ``default/<name>`` selector so a manual
           attach from the manifolds drawer matches — no duplicate rows.  This
-          folds the former serve-only ``_attach_default_manifold_probes`` into
-          the construction-time pass so every frontend gets the same roster.
+          folds the former serve-only bootstrap into the construction-time pass
+          so every frontend gets the same roster.
 
         A fit/load failure for one manifold is logged and skipped, never fatal
         to session construction.
@@ -5858,7 +5860,7 @@ class SaklasSession:
         # measures), stashes and step memos start fresh, and the lens run
         # carries the pin its prep took — every token, gate, and final
         # aggregate below consumes the same resident lens even if another
-        # process switches ``jlens.json`` mid-decode.
+        # process switches the active source/manifest mid-decode.
         self._geometry_instrument.bind(geometry_plan, geometry_prep)
         self._lens_instrument.bind(lens_plan, lens_prep)
         self._sae_instrument.bind(sae_plan, sae_prep)
@@ -6677,7 +6679,7 @@ class SaklasSession:
                 out[name] = d
         return out
 
-    # -- Cross-branch diff (v2.3 phase 5) --
+    # -- Cross-branch diff --
 
     def diff_nodes(self, a_id: str, b_id: str) -> Any:
         """Return a :class:`saklas.core.loom_diff.NodeDiff` between two nodes.
@@ -6704,7 +6706,7 @@ class SaklasSession:
             ),
         )
 
-    # -- Recipe-override regen (v2.3 phase 5) --
+    # -- Recipe-override regen --
 
     def _resolve_anchor_recipe(
         self,
@@ -8841,7 +8843,7 @@ class SaklasSession:
                 steering, sampling, thinking, raw=raw, gen_seat=gen_seat,
             )
 
-            # v2.3 phase 5: apply recipe override (auto-regen / manual mode)
+            # Apply recipe override (auto-regen / manual mode).
             # before constructing the Steering object so the overlay wins
             # over the per-call kwargs.
             if recipe_override is not None:

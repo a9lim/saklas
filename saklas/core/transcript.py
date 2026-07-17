@@ -1,4 +1,4 @@
-"""Transcript export / import for loom sessions (v2.3 phase 5).
+"""Transcript export / import for loom sessions.
 
 A **transcript** is a saved path through the loom tree: system prompt
 + every user turn + every assistant turn's :class:`Recipe` (steering,

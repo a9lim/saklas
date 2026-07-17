@@ -451,9 +451,9 @@ the complete roster remains only in the reusable durable cache.
 `load_or_fit_transfer_alignment(src_model, tgt_model, *, force, label,
 requested_layers=None) → (M, quality_per_layer, map_path, source_identity,
 target_identity, target_whitener, target_layer_means)` is the **public**
-single-flight orchestrator that wraps the primitives above (was
-`cli/runners.py::_load_or_fit_transfer_alignment`; promoted here so it lives
-beside them). `manifold transfer`'s runner is now a thin caller. The concurrency
+single-flight orchestrator that wraps the primitives above (promoted from the
+former monolithic CLI runner so it lives beside them). `manifold transfer`'s
+runner is now a thin caller. The concurrency
 semantics are load-bearing: the `alignment_fit_lock` wraps the whole directional
 transaction and the per-model `neutral_fit_lock` is taken **before** model
 construction (so concurrent cold transfers sharing a model never duplicate the

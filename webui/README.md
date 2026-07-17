@@ -38,9 +38,13 @@ The desktop shell has three permanent work areas:
 - `LoomSidebar` — conversation tree, filtering, branching, regeneration, and
   node actions.
 - `Chat` — role-plan composer, authored/generated turns, token highlights, and
-  drilldown entry points.
+  token-detail entry points.
 - `InspectorPanel` — sampling plus the subspace, manifold, SAE, and J-lens
   steering/probe instruments.
+
+The token-detail drawer has geometry, logits, SAE, and J-lens tabs over one
+conversation-walking cursor. It uses captured measurement envelopes when they
+exist and asks the replay endpoints for historical or newly attached readouts.
 
 Below 1280 px those same areas become explicit `threads`, `chat`, and
 `instruments` views. Dense tools open in a focus-trapped drawer. The command
@@ -63,6 +67,7 @@ src/
     JLensPanel.svelte        J-lens source, steer, and probe surface
     CommandPalette.svelte    global launcher
   drawers/                   authoring, analysis, admin, and export tools
+    token/                   four token-detail tabs, cursor, and shared readout UI
   lib/
     api.ts                   typed HTTP, SSE, and WebSocket clients
     types.ts                 shared wire and UI types
@@ -111,6 +116,7 @@ route inventory into this file.
 The dashboard is dark-only. Hue identifies data space: subspace/chrome is
 achromatic, manifold violet, SAE gold, J-lens and surprise blue, live/positive
 green, and error/negative red. Roles do not carry hue. Gradients encode depth or
-time only when direction is the data; glow is reserved for live state. The source
-of truth is `src/lib/style/tokens.css`, with Recursive Sans/Mono axes defined in
+time only when direction is the data; shared chrome uses depth/focus shadows, not
+decorative top-light or glow treatments. The source of truth is
+`src/lib/style/tokens.css`, with Recursive Sans/Mono axes defined in
 `src/lib/style/fonts.css`.

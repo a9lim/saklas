@@ -350,7 +350,7 @@ def detect_base_model(tokenizer: PreTrainedTokenizerBase) -> bool:
     A base (completion) model has no ``chat_template``, so there are no
     turns, roles, or system-prompt slots: input is raw text and output is
     a continuation.  ``tokenizer.chat_template is None`` is the canonical
-    check used inline across the engine (``core/vectors.py``,
+    check used inline across the engine (``core/capture.py``,
     ``build_chat_input``); this names it so frontends can branch on a
     single import and the session can expose it as a property.
     """

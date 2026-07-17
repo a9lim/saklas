@@ -40,8 +40,8 @@ Division of labor the protocol deliberately does NOT own:
 * **Authored-prefill orchestration** — token matching, the ``j-1``
   producer-position semantics, ordering, and loom persistence stay in the
   session; instruments only ``observe`` the hidden rows handed to them.
-* **The wire** — runs return readings; serialization (the phase-2
-  measurement envelope, today's compat channels) is the payload layer's
+* **The wire** — runs return readings; serialization into the versioned
+  measurement envelope and its compatibility channels is the payload layer's
   job.
 """
 

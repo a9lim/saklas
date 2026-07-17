@@ -7,9 +7,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/saklas/)
 
 Saklas is a local workbench for mechanistic interpretability on large language
-models. 
+models.
 
-It comes with a local dashboard, along with a Python API, and a server compatible 
+It comes with a local dashboard, along with a Python API, and a server compatible
 with both OpenAI and Ollama.
 
 ## Quick start
@@ -35,10 +35,10 @@ saklas serve google/gemma-3-4b-it --device cuda
 
 ### Threads
 
-Every authored or generated turn becomes a node in a branching tree. You can reroll 
+Every authored or generated turn becomes a node in a branching tree. You can reroll
 from any point and the tree lets you save and load conversations.
 
-The bottom of the panel has the standard sampling controls: temperature, top-p, 
+The bottom of the panel has the standard sampling controls: temperature, top-p,
 top-k, repetition and presence penalties, and everything else you'd expect.
 
 ### Completion modes
@@ -58,25 +58,30 @@ Raw mode exposes one raw buffer for base models.
 
 Tokens can be highlighted by probe scores or **surprise (logprob)**.
 
-Clicking on a token shows:
+Clicking on a token opens one detail drawer with four views:
 
-- the chosen token and alternatives the model considered with logprobs;
-- probe readings across layers;
-- jacobian lens readouts;
-- SAE feature activations.
+- **geometry** — attached probe readings across layers;
+- **logits** — the chosen token and captured alternatives with logprobs, plus
+  token forking;
+- **SAE** — sparse feature activations;
+- **J-lens** — the aggregate workspace and layer-by-vocabulary readout.
+
+The detail cursor can walk tokens, thinking/response segments, and turns without
+closing the drawer. Historical rows use their captured measurements when present
+and can replay the producing prefix for newly attached instrumentation.
 
 Clicking on the info icon by a probe shows a fitted concept's geometry layer by layer.
 
 ### Instruments
 
-The right side of the workbench has four tabs. 
+The right side of the workbench has four tabs.
 
 | Tab | Purpose |
 |---|---|
-| **Subspace** | Flat fitted subspaces | 
-| **Manifold** | Curved fitted surfaces | 
-| **SAE** | SAE features | 
-| **Lens** | Jacobian-lens workspace | 
+| **Subspace** | Flat fitted subspaces |
+| **Manifold** | Curved fitted surfaces |
+| **SAE** | SAE features |
+| **Lens** | Jacobian-lens workspace |
 
 ### Analysis tools
 
@@ -84,10 +89,10 @@ Press `Cmd+K` or `Ctrl+K` elsewhere to open a menu with further options:
 
 - build, fit, merge, install, and inspect manifolds;
 - author and score restricted-choice templates;
-- manage the cast and steering;
+- manage the cast and open steering workflows;
 - inspect correlations and pairwise layer geometry;
-- save, load, import, export, and inspect session state;
-- check model, device, source, and server health.
+- check model, device, source, authentication, and server health;
+- open the built-in help surface.
 
 ## Concepts, subspaces, and manifolds
 
@@ -95,7 +100,7 @@ In Saklas, you extract concepts as **manifolds** or **subspaces**.
 
 - A 1D flat subspace is just a steering vector.
 - A higher-rank flat subspace is a group of orthogonal steering vectors.
-- A curved manifold takes any arbitrary shape, and lets you steer along it.
+- A curved manifold fits a nonlinear surface and lets you steer along it.
 
 ### Bundled concepts
 
@@ -116,7 +121,7 @@ Three larger concept sets ship as well, but aren't fitted by default:
 
 ## Steering expressions
 
-Every surface uses the same expression format. The same recipe can be used 
+Every surface uses the same expression format. The same recipe can be used
 across Python, YAML, OpenAI, Ollama, or the native API.
 
 ```text
@@ -142,21 +147,24 @@ across Python, YAML, OpenAI, Ollama, or the native API.
 | `@response`, `@prompt`, `@thinking`, … | Restrict the token phase where a term applies |
 | `@when:<probe><op><value>` | Apply a term only while a live probe gate is true |
 
-Manifold coefficients use two coords: `along` and `onto`. `along` controls 
-movement within the manifold toward the target; `onto` collapses the point onto 
-the manifold itself. 
+Manifold coefficients use two coordinates: `along` and `onto`. `along` controls
+movement within the manifold toward the target; `onto` reduces the off-surface
+component inside the manifold's fitted tube.
 
 ## How Saklas works
 
 ### Extraction
 
-Saklas first has the model answer a shared set of baseline prompts as all concepts, 
-then it takes the resulting hidden states and fits them to either a curved manifold 
+Saklas first has the model answer a shared set of baseline prompts as each concept,
+then it takes the resulting hidden states and fits them to either a curved manifold
 or a flat subspace.
 
-Layer allocation uses a Mahalanobis metric estimated from neutral activations. 
-Discriminative layer selection removes any layer that fails to separate the principle 
-components for flat subspaces.
+Layer allocation uses a Mahalanobis metric estimated from neutral activations.
+Discriminative layer selection removes flat axes that fail to straddle the neutral
+baseline across the fitted nodes.
+
+The full data flow, artifact boundaries, instrument protocol, and concurrency
+invariants are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ### Monitoring
 
@@ -195,6 +203,7 @@ Optional extras add specialized workflows:
 | `gguf` | GGUF import/export support |
 | `research` | NumPy, SciPy, scikit-learn, pandas, Matplotlib, and image helpers |
 | `notebook` | Plotly, pandas, and Kaleido notebook helpers |
+| `pandas` | pandas-only dataframe export helpers |
 | `dev` | Test, lint, type-check, and build tooling |
 
 Extras can be combined:
@@ -305,7 +314,7 @@ The same `saklas serve` process exposes four surfaces on one port:
 - `/v1/*` — OpenAI-compatible models and chat completions;
 - `/api/*` — Ollama-compatible generation and chat;
 - `/saklas/v1/*` — native sessions, loom trees, probes, manifolds, templates,
-  experiments, SAE/J-LENS lifecycle, SSE, and token-plus-measurement WebSockets.
+  SAE/J-LENS lifecycle and replay, SSE, and token-plus-measurement WebSockets.
 
 Interactive OpenAPI documentation is available at
 [http://localhost:8000/docs](http://localhost:8000/docs).
@@ -427,8 +436,9 @@ FlashAttention depends on the model's Transformers attention implementation.
 
 Saklas keeps local state under `~/.saklas/`; set `$SAKLAS_HOME` to move it. The
 store contains authored manifolds, per-model fits and neutral statistics, local
-SAE/J-LENS artifacts, source bindings, templates, and explicitly saved
-conversations.
+SAE/J-LENS artifacts, source bindings, and templates. Conversation saves are
+explicit browser-downloaded JSON files (or caller-selected `LoomTree.save()`
+paths); they are not autosaved under `~/.saklas/`.
 
 Manifold packs are folders with metadata, node corpora, integrity hashes, and
 optional fitted tensors. They can be installed from a local path or distributed as

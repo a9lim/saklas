@@ -26,12 +26,14 @@ What it does:
 
 - Optional bearer auth via `--api-key` or `$SAKLAS_API_KEY`. If unset, every HTTP
   and WebSocket route is open.
-- One bounded session lock serializes generation and other model-mutating work
-  across the OpenAI, Ollama, and native protocols.
+- A bounded async session lock serializes generation-facing OpenAI, Ollama, and
+  native requests before they enter the engine; the synchronous session also
+  rejects generation re-entry.
 - Pydantic validates protocol request bodies; native request models reject unknown
   fields.
-- Installed manifold payloads and locally owned fitted artifacts are checked
-  against their declared SHA-256 digests before use.
+- Installed manifold payloads and Saklas-owned fitted artifacts are checked
+  against their declared SHA-256 digests before use; external J-lens/SAE sources
+  are commit- or release-pinned through local bindings.
 
 What it does not do:
 

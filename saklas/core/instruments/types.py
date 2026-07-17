@@ -17,11 +17,10 @@ Design (2026-07-15 instrument unification):
   (it inverts the key family ``Monitor.flat_scalars`` emits).
 * **ScalarReading** is the honest reading shape for the single-channel
   families (lens strength, SAE feature activation).  The geometry family
-  keeps the full :class:`~saklas.core.results.ProbeReading`.  Until the
-  wire flips (phase 2), ``ScalarReading.to_probe_reading()`` reproduces
-  the historical synthesized-``ProbeReading`` shape bit-for-bit, so the
-  current wire is unchanged while the type system stops pretending a
-  feature activation has a ``fraction``.
+  keeps the full :class:`~saklas.core.results.ProbeReading`.
+  ``ScalarReading.to_probe_reading()`` preserves the compatibility channel
+  consumed by older callers while the versioned measurement envelope carries
+  the family-native scalar shape.
 * **DepthSummary carries its basis** because ``depth_com`` means three
   mathematically unrelated things across families (share-weighted
   coordinate mass / readout probability mass / a single-layer constant);
@@ -247,11 +246,12 @@ class ScalarReading:
     meta: dict[str, Any] = field(default_factory=dict)
 
     def to_probe_reading(self) -> "ProbeReading":
-        """The phase-1 wire bridge: the exact synthesized-``ProbeReading``
-        shape the lens/SAE families emitted historically (geometry fields
+        """Return the exact synthesized-``ProbeReading`` compatibility shape
+        the lens/SAE families emitted historically (geometry fields
         defaulted — ``fraction``/``residual`` 0, ``nearest``/``assignment``
-        empty, ``membership`` 1.0), so the current wire and gate surfaces
-        are unchanged until the measurement envelope lands in phase 2."""
+        empty, ``membership`` 1.0).  This is the compatibility projection;
+        the versioned measurement envelope carries the native scalar reading.
+        """
         from saklas.core.results import ProbeReading
 
         return ProbeReading(
