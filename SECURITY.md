@@ -7,34 +7,59 @@ If you've found a security issue in saklas, please report it privately rather th
 - **Email:** mx@a9l.im
 - **GitHub:** use [private security advisories](https://github.com/a9lim/saklas/security/advisories/new)
 
-Please include a description, steps to reproduce, and the version you are on. I'll respond within a few days and aim to have a fix as soon as possible.
+Please include a description, reproduction steps, affected version, model ID, and
+whether the server was reachable beyond localhost. Do not include API keys,
+private prompts, or credentials in the report.
 
 ## Supported versions
 
-Only the latest minor version on PyPI receives security fixes. If you're on an older version, the fix is to upgrade.
+Only the latest release on PyPI receives security fixes. Upgrade before reporting
+an issue that may already be fixed.
 
 ## Threat model for `saklas serve`
 
-The HTTP server (`saklas serve`) is meant to be used on a trusted network, like a local machine or a lab VPN. It's not meant to be used on the public internet. Please use caution.
+The HTTP server (`saklas serve`) is designed for a single trusted user on a local
+machine or trusted lab network. It is not a hardened multi-tenant service and
+should not be exposed directly to the public internet.
 
 What it does:
 
-- Optional bearer auth via `--api-key` or `$SAKLAS_API_KEY`. If unset, the server is open.
-- Per-request serialization through a single `asyncio.Lock`, so one slow generation doesn't interleave with another.
-- Request validation via pydantic for all sampling parameters.
+- Optional bearer auth via `--api-key` or `$SAKLAS_API_KEY`. If unset, every HTTP
+  and WebSocket route is open.
+- A bounded async session lock serializes generation-facing OpenAI, Ollama, and
+  native requests before they enter the engine; the synchronous session also
+  rejects generation re-entry.
+- Pydantic validates protocol request bodies; native request models reject unknown
+  fields.
+- Installed manifold payloads and Saklas-owned fitted artifacts are checked
+  against their declared SHA-256 digests before use; external J-lens/SAE sources
+  are commit- or release-pinned through local bindings.
 
 What it does not do:
 
-- Rate limit
-- User quotas or isolation
-- Protection against adversarial inputs (`logit_bias`, `stop`, `max_tokens` designed to slow generation)
-- TLS (please run it behind a reverse proxy if you need HTTPS)
-- Sandboxing for the loaded model
+- Rate limiting, quotas, per-user isolation, or audit logging
+- Resource isolation from deliberately expensive prompts, sampling options,
+  fitting jobs, or repeated downloads
+- TLS; use a correctly configured reverse proxy if HTTPS is required
+- Sandboxing for model code, tokenizers, checkpoints, or downloaded artifacts
+- Protection against a bearer token appearing in browser WebSocket query strings
+  and intermediary logs (the bundled dashboard uses `?token=` because browser
+  WebSocket APIs cannot set an `Authorization` header)
 
-If you need to expose saklas to callers you don't trust, please use a reverse proxy.
+If untrusted callers need access, add authentication, TLS, request/body limits,
+rate limits, and process-level isolation outside Saklas. A reverse proxy alone is
+not a complete isolation boundary.
 
 ## Model and checkpoint trust
 
-Saklas loads HuggingFace checkpoints via `transformers`, which executes code from the checkpoint repo in some cases. Saklas does not set `trust_remote_code=True` by default, but if you pass a model that requires it, please be aware that you are executing arbitrary code from that repo, so only load models from publishers you trust.
+Saklas resolves Hugging Face configuration and tokenizer metadata with remote-code
+support enabled, then avoids custom model code when the architecture is supported
+natively by Transformers. Repositories that are not natively supported may execute
+their model implementation as well. Treat every model repository as executable
+code and load only revisions and publishers you trust.
 
-Steering vector packs pulled from HuggingFace (`saklas pack install <owner>/<name>`) are verified against the `files` sha256 map in `pack.json`, so on-disk tampering after download is detected. Please only install packs from publishers you trust.
+`saklas pack install <owner>/<name>` verifies files declared by the manifold's
+`manifold.json` integrity map, but integrity is not authorship or safety. Manifold
+metadata and corpora remain untrusted input; install only from publishers you
+trust. Provider-owned J-lens and SAE payloads remain in their provider cache and
+are pinned through local bindings.

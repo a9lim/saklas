@@ -1,4 +1,4 @@
-"""Filter grammar for tree pruning (v2.3 phase 5).
+"""Filter grammar for tree pruning.
 
 The grammar is **adjacent to** the steering ``@when:`` clause grammar
 but deliberately distinct — the underlying scalars are different.
@@ -6,7 +6,7 @@ but deliberately distinct — the underlying scalars are different.
 probe readings during generation; this module gates on *per-node*
 aggregates that the monitor stamped on each assistant node when the gen
 finalized.  Reusing one grammar would silently change semantics across
-contexts (decision 18 in ``docs/plans/loom.md``).
+contexts.
 
 Grammar::
 

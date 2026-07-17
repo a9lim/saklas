@@ -107,7 +107,7 @@ share/subspace metrics, fit_mode, hyperparams, diagnostics, and
 `node_spread_per_layer` — the whitened between-node spread `{str(L): tr(G_L)}`,
 a diagnostic concept-signal-by-layer profile measured before DLS, whose keys are
 the evaluated-layer roster and may strictly contain `fitted_layers` when DLS
-drops a layer); the tensor save/load itself lives in `core/manifold.py`; its
+drops a layer); the tensor save/load itself lives in `manifold_tensors.py`; its
 tensor-derived layer roster must equal the sidecar's `fitted_layers`. Merge component provenance always
 carries a manifest-proven lowercase sha256. `hash_manifold_files` reuses
 `packs.hash_file` for the per-file sha256 integrity manifest. After the first
@@ -159,10 +159,10 @@ become anisotropic, and transforms `origin` into the target frame), then writes 
 `_from-<safe_src>` variant + patches the transfer-provenance sidecar. The core
 function raises a plain `ValueError` when the alignment covers no fitted layer; this
 function surfaces it as `ManifoldFormatError` (the `WhitenerError`, a `ValueError`
-subclass, propagates verbatim via a `SaklasError`-first `except`). The lazy core
-imports are now just `load_manifold` / `save_manifold` /
-`transfer_manifold_subspaces` — no `LayerSubspace` / `eval_rbf` / `subspace_share` /
-`mahalanobis.WhitenerError`. `manifold_summary(folder)` is the session-independent
+subclass, propagates verbatim via a `SaklasError`-first `except`). The lazy imports
+are now just `load_manifold` / `save_manifold` (sibling `manifold_tensors.py`) +
+`core.manifold.transfer_manifold_subspaces` — no `LayerSubspace` / `eval_rbf` /
+`subspace_share` / `mahalanobis.WhitenerError`. `manifold_summary(folder)` is the session-independent
 serializer shared by `pack show -j` + the HTTP summary route.
 `clear` / `rm` garbage-collect shared format-v4 per-layer capture shards only
 after the last fitted-sidecar owner disappears, under the same capture-stem lock
@@ -225,6 +225,28 @@ source of truth; the corpus is its materialization. There is **no embedded
 `template` block** — the pre-migration `{slot, values, pairs}` block, `expand_template`,
 `_validate_template_block`, and `create_templated_manifold_folder` are gone.
 
+## manifold_tensors.py
+
+The fitted per-model **tensor codec** plus the curved-fit activation-row spool —
+lifted out of `core/manifold.py` to restore that module's pure-tensor, no-IO
+contract (io importing core's `Manifold`/`LayerSubspace`/`ManifoldDomain`
+dataclasses is the correct layering arrow; the codec only lived in core because it
+needs those types). `save_manifold(manifold, path, metadata)` /
+`load_manifold(path, *, verify_manifest=True)` round-trip the safetensors payload
+(per-layer mean/basis[/affine_map] or the curved RBF/σ triple + shared
+`node_coords` + optional `origin`) and its lean JSON sidecar under the folder pair
+lock, staging both through same-directory tempfiles with fsync + `os.replace`
+(`_replace_manifold_file` is the atomic-replace seam the publication
+failure-injection tests monkeypatch; `_load_manifold_locked` is the pair-locked
+read half, reused by `core/extraction.py`'s cache-hit fast path). Re-exported
+through the `manifolds.py` barrel for a coherent public io surface. `ActivationRowStore`
+is the temporary layer-major mmap row spool a curved fit uses after the
+centroid-derived basis exists (one `torch.from_file` shared-memory tensor per
+layer, `persist`/`load`/`load_shards`/`combine_disjoint` for the v4 sharded
+capture cache); `core.manifold.compute_manifold_node_stats` produces it,
+`compute_store_reduced_covariances` consumes it, both lazy-importing it back from
+here.
+
 ## templates.py
 
 The standalone templated-completion artifact — `~/.saklas/templates/<ns>/<name>/
@@ -286,7 +308,7 @@ slug. Every bipolar pole is itself a node label, so a bare pole resolves through
 tier 1 as an affine `%` push. The retired `resolve_pole` folded into
 **`canonicalize_atom(raw) → (canonical, variant)`** (the pure slug + variant peel —
 no `match`/`sign` slots, since the bipolar sign-flip is gone); the external
-canonicalizer consumers (`SteeringComposer.resolve_pole_aliases`, `tui/app`, `cli/runners`)
+canonicalizer consumers (`SteeringComposer.resolve_pole_aliases`, `cli/runners`)
 call it directly. The underlying tier steps stay public:
 `resolve_manifold_label(label, *, namespace=)` finds a node by label across
 installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-node
@@ -304,7 +326,7 @@ Both gutted to the surface that survives the collapse.
 
 `cache_ops.py` is now just GGUF export: `export_gguf_manifold(ns, name, *,
 model_scope, output, model_hint)` folds a fitted 2-node `pca` manifold to a single
-direction (`folded_vector_directions`) and writes a llama.cpp control-vector GGUF
+direction (`folded_directions`) and writes a llama.cpp control-vector GGUF
 (one `.gguf` per model; refuses in-place export for bundled manifolds);
 `_resolve_model_hint` derives `controlvector.model_hint` from the base model's
 `AutoConfig.model_type`. The old pack data layer
@@ -368,12 +390,12 @@ pays one neutral-corpus forward loop, not two). The old `bootstrap_probes` is go
 sources bundled probe directions by folding fitted 2-node manifolds
 (`session._bootstrap_manifold_probes`).
 
-## merge.py
+## bake.py
 
 Offline direction merging into a corpus-less `fit_mode="baked"` manifold.
 `merge_into_manifold(name, expression, model, *, force, strict)` resolves each
 component to a per-layer direction by folding a fitted 2-node `pca` manifold
-(`folded_vector_directions`), linearly combines the directions (`linear_sum`,
+(`folded_directions`), linearly combines the directions (`linear_sum`,
 over the union of their layer coverage), folds the result to a one-pole ray
 (`fold_directions_to_subspace`), and writes a baked manifold to
 `manifolds/local/<name>/` — one fitted tensor per shared model
@@ -422,9 +444,29 @@ model. Existing factor pointers are carried forward and only missing requested
 layers are fitted/written; `-f` recomputes alignment/transfer output but does not
 recapture an exact neutral cache. A narrow transfer therefore does not digest,
 materialize, fit, or whiten unrelated layers. When a cold cache fill necessarily
-captures a full roster before requested coverage is known, the transfer runner
+captures a full roster before requested coverage is known, the orchestration
 immediately narrows both seed mappings and releases unrequested tensor owners;
 the complete roster remains only in the reusable durable cache.
+
+`load_or_fit_transfer_alignment(src_model, tgt_model, *, force, label,
+requested_layers=None) → (M, quality_per_layer, map_path, source_identity,
+target_identity, target_whitener, target_layer_means)` is the **public**
+single-flight orchestrator that wraps the primitives above (promoted from the
+former monolithic CLI runner so it lives beside them). `manifold transfer`'s
+runner is now a thin caller. The concurrency
+semantics are load-bearing: the `alignment_fit_lock` wraps the whole directional
+transaction and the per-model `neutral_fit_lock` is taken **before** model
+construction (so concurrent cold transfers sharing a model never duplicate the
+load); cache/source identity is proven by `validate_neutral_cache_metadata(...,
+verify_payload=False)` + `neutral_cache_identity` **without hashing any tensor
+payload**; a complete cached-map hit drops the source seed rows and never builds
+the source model; the roster is narrowed to `requested_layers ∩ available`; and a
+cache writer racing the metadata preflight is handled by restarting the
+directional transaction (`_load_or_fit_transfer_alignment_locked` recursion) under
+the already-held outer lock. It calls `sys.exit(1)` (with the caller's `label`
+prefix) on no-shared-layers / `AlignmentError`, exactly as the former CLI helper
+did.
+
 `fit_alignment(src, tgt, *, min_shared_layers=10, requested_layers=...,
 available_shared_layers=...) → {layer: LayerAlignment}`
 (row-space orthogonal Procrustes for matched dim, rectangular minimum-norm

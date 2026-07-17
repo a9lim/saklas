@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from types import SimpleNamespace
 
 import pytest
@@ -13,9 +13,8 @@ from saklas.cli import runners as cli_runners
 @pytest.mark.parametrize(
     "argv",
     [
-        ["tui", "model", "--top-k-alts", "-1"],
+        ["serve", "model", "--top-k-alts", "-1"],
         ["serve", "model", "--top-k-alts", "257"],
-        ["tui", "model", "--max-tokens", "0"],
         ["serve", "model", "--port", "70000"],
         ["manifold", "fit", "m", "--max-dim", "0"],
         ["manifold", "fit", "m", "--k-nn", "-2"],
@@ -36,7 +35,8 @@ def test_parse_zero_args_prints_help_and_exits_zero(capsys: pytest.CaptureFixtur
         cli.parse_args([])
     assert ex.value.code == 0
     out = capsys.readouterr().out
-    assert "tui" in out and "serve" in out and "pack" in out and "manifold" in out and "config" in out
+    assert "tui" not in out
+    assert "serve" in out and "pack" in out and "manifold" in out and "config" in out
 
 
 def test_parse_bare_unknown_model_id_errors():
@@ -45,18 +45,9 @@ def test_parse_bare_unknown_model_id_errors():
         cli.parse_args(["google/gemma-2-2b-it"])
 
 
-def test_parse_tui_subcommand():
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it"])
-    assert args.command == "tui"
-    assert args.model == "google/gemma-2-2b-it"
-
-
-def test_parse_tui_with_config_only():
-    # tui model positional is optional — YAML may supply it via -c.
-    args = cli.parse_args(["tui", "-c", "/nowhere.yaml"])
-    assert args.command == "tui"
-    assert args.model is None
-    assert args.config == ["/nowhere.yaml"]
+def test_retired_tui_subcommand_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.parse_args(["tui", "google/gemma-2-2b-it"])
 
 
 # ---------------------------------------------------------------------------
@@ -179,14 +170,6 @@ def test_config_validate_local_vector_missing(monkeypatch: pytest.MonkeyPatch, t
 # interactive workloads make compile a deliberate choice, not a default)
 # ---------------------------------------------------------------------------
 
-def test_tui_compile_flag_parses():
-    """``--compile`` is the opt-in for CUDA torch.compile.  Off by default."""
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it"])
-    assert getattr(args, "compile", False) is False
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it", "--compile"])
-    assert args.compile is True
-
-
 def test_serve_compile_flag_parses():
     args = cli.parse_args(["serve", "google/gemma-2-2b-it"])
     assert getattr(args, "compile", False) is False
@@ -200,7 +183,7 @@ def test_yaml_compile_true_folds_onto_args(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "on.yaml"
     p.write_text("model: google/gemma-2-2b-it\ncompile: true\n")
-    args = cli.parse_args(["tui", "-c", str(p)])
+    args = cli.parse_args(["serve", "-c", str(p)])
     # Pre-effective: argparse default is False.
     assert getattr(args, "compile", False) is False
     cli_runners._load_effective_config(args)
@@ -214,7 +197,7 @@ def test_yaml_compile_false_is_noop(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "off.yaml"
     p.write_text("model: google/gemma-2-2b-it\ncompile: false\n")
-    args = cli.parse_args(["tui", "-c", str(p)])
+    args = cli.parse_args(["serve", "-c", str(p)])
     cli_runners._load_effective_config(args)
     assert getattr(args, "compile", False) is False
 
@@ -225,7 +208,7 @@ def test_cli_compile_overrides_yaml_compile_false(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "off.yaml"
     p.write_text("model: google/gemma-2-2b-it\ncompile: false\n")
-    args = cli.parse_args(["tui", "-c", str(p), "--compile"])
+    args = cli.parse_args(["serve", "-c", str(p), "--compile"])
     cli_runners._load_effective_config(args)
     assert args.compile is True
 
@@ -411,15 +394,15 @@ def test_serve_attaches_best_sae_and_enables_live(
         model_id = "google/gemma-3-4b-it"
         sae_info = None
         loaded: str | None = None
-        live_top_k: int | None = None
+        live_enabled = False
 
         def load_sae(self, release: str) -> dict[str, Any]:
             self.loaded = release
             return {"release": release, "layer": 22, "width": 16_384}
 
-        def enable_live_sae(self, *, top_k: int) -> dict[str, int]:
-            self.live_top_k = top_k
-            return {"layer": 22, "top_k": top_k}
+        def enable_live_sae(self) -> dict[str, int]:
+            self.live_enabled = True
+            return {"layer": 22}
 
     monkeypatch.setattr(
         "saklas.io.sae.list_sae_sources",
@@ -437,7 +420,7 @@ def test_serve_attaches_best_sae_and_enables_live(
     session = _Session()
     assert cli_runners._enable_serve_live_sae_if_available(session)
     assert session.loaded == "gemma-scope-2-4b-it-res"
-    assert session.live_top_k == 12
+    assert session.live_enabled
 
 
 def test_serve_prefers_cached_sae_over_registry_default(
@@ -452,8 +435,8 @@ def test_serve_prefers_cached_sae_over_registry_default(
             self.loaded = release
             return {"release": release, "layer": 22, "width": 16_384}
 
-        def enable_live_sae(self, *, top_k: int) -> dict[str, int]:
-            return {"layer": 22, "top_k": top_k}
+        def enable_live_sae(self) -> dict[str, int]:
+            return {"layer": 22}
 
     monkeypatch.setattr(
         "saklas.io.sae.list_sae_sources",
@@ -472,7 +455,9 @@ def test_serve_prefers_cached_sae_over_registry_default(
     assert session.loaded == "local:cached"
 
 
-def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_config_vectors_register_on_a_model_backed_surface(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     # 4.0: a concept is a 2-node ``pca`` manifold — author ``default/happy.sad``
     # so the config reference resolves (and ``ensure_vectors_installed`` sees it
@@ -506,20 +491,11 @@ def test_run_tui_registers_config_vectors(monkeypatch: pytest.MonkeyPatch, tmp_p
         def steer(self, name: str, profile: Any, alpha: Any = None) -> None:
             registered[name] = (profile, alpha)
 
-    class FakeApp:
-        def __init__(self, session: Any) -> None:
-            self.session = session
-
-        def run(self):
-            pass
-
-    monkeypatch.setattr(cli_runners, "_make_session", lambda args: FakeSession())
-    monkeypatch.setattr(cli_runners, "_print_model_info", lambda s: None)
-
-    import saklas.tui.app as _tui_app
-    monkeypatch.setattr(_tui_app, "SaklasApp", FakeApp)
-
-    cli.main(["tui", "-c", str(p)])
+    args = cli.parse_args(["serve", "-c", str(p)])
+    cli_runners._load_effective_config(args)
+    cli_runners._setup_steering_vectors(
+        cast(Any, FakeSession()), args.config_vectors,
+    )
     assert "happy.sad" in registered
     assert extract_calls[-1] == ("happy.sad", {"namespace": "default"})
 

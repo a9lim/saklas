@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 import torch
 
 from saklas.core.joint_logprobs import (
@@ -347,9 +348,23 @@ class _MockTree:
 
 
 class _MockSession:
-    """Just enough surface for ``compute_joint_logprobs`` to run."""
+    """Just enough surface for ``compute_joint_logprobs`` to run.
+
+    Carries REAL instruments and the real ``_close_instrument_runs`` so the
+    replay's run lifecycle is exercised: ``_begin_capture`` here binds all
+    three families exactly like the real planner does, which lets the
+    lifecycle regression assert the replay's ``finally`` closes them (the
+    former no-op stubs made the bind leak invisible to this suite)."""
 
     def __init__(self):
+        from types import MethodType
+
+        from saklas.core.instruments.geometry import GeometryInstrument
+        from saklas.core.instruments.lens import LensInstrument
+        from saklas.core.instruments.sae import SaeInstrument
+        from saklas.core.instruments.types import ReadRequest
+        from saklas.core.session import SaklasSession
+
         self.tokenizer = _MockTokenizer()
         # Build a vocabulary that covers the strings we'll feed.  The
         # decode path needs every id to round-trip.
@@ -363,13 +378,74 @@ class _MockSession:
         self._steering = type("SteeringState", (), {"ctx": TriggerContext()})()
         self._monitor = type(
             "MonitorState", (),
-            {"begin_live": lambda _self: None, "end_live": lambda _self: None},
+            {
+                "begin_live": lambda _self: None,
+                "end_live": lambda _self: None,
+                "probe_names": [],
+            },
         )()
         self._compose_gen_config = lambda _sampling: self.config
-        self._begin_capture = lambda **_kwargs: None
+        self._geometry_instrument = GeometryInstrument(self)  # type: ignore[arg-type]
+        self._lens_instrument = LensInstrument(self)  # type: ignore[arg-type]
+        self._sae_instrument = SaeInstrument(self)  # type: ignore[arg-type]
+
+        def _bind_all(**_kwargs: Any) -> bool:
+            request = ReadRequest(final_aggregate=False)
+            for inst in (
+                self._geometry_instrument,
+                self._lens_instrument,
+                self._sae_instrument,
+            ):
+                prep = inst.prepare(request)
+                inst.bind(inst.plan(prep), prep)
+            return False
+
+        self._begin_capture = _bind_all
         self._end_capture = lambda: None
+        self._close_instrument_runs = MethodType(
+            SaklasSession._close_instrument_runs, self,
+        )
         self._steering_needs_probe_gating = lambda: False
         self._build_gating_score_callback = lambda: None
+
+    def assert_runs_closed(self) -> None:
+        for instrument in (
+            self._geometry_instrument,
+            self._lens_instrument,
+            self._sae_instrument,
+        ):
+            assert instrument.current_run.bound is False, instrument.family
+
+
+def test_gated_replay_passes_the_forward_step_to_the_gate_callback():
+    """The replay's gate callback receives the loop's ``forced_idx`` — the
+    same per-forward step identity the live decode loop threads.  A
+    zero-arg call TypeErrors under the step-aware contract (sol's observe
+    round-2 P1: the rest of this suite never exercises gated steering, so
+    the regression was invisible here)."""
+    from saklas.core.joint_logprobs import compute_joint_logprobs
+
+    session: Any = _MockSession()
+    steps: list[int] = []
+
+    def _gate(step_id: int) -> dict[str, float]:
+        steps.append(step_id)
+        return {}
+
+    session._steering_needs_probe_gating = lambda: True
+    session._build_gating_score_callback = lambda: _gate
+
+    result = compute_joint_logprobs(session, "a1", "a2")
+
+    assert result.a_id == "a1"
+    assert steps and steps[0] == 0
+    # Each branch's replay counts its own forwards 0, 1, 2, … — this
+    # two-branch fixture must show exactly two resets (one per branch),
+    # with no skips or repeats within a branch.
+    resets = [i for i, s in enumerate(steps) if s == 0]
+    assert len(resets) == 2
+    for start, end in zip(resets, resets[1:] + [len(steps)]):
+        assert steps[start:end] == list(range(end - start))
 
 
 def test_compute_joint_logprobs_runs_end_to_end_on_mock():
@@ -400,6 +476,44 @@ def test_compute_joint_logprobs_runs_end_to_end_on_mock():
         assert r.rank_changed is False
     # n_rank1_changed mirrors the aligned-row count where rank flipped.
     assert result.n_rank1_changed == 0
+    # The replay is a full capture transaction: every family's run must be
+    # closed on the way out (a leaked bound run pins a stale lens between
+    # generations and freezes SAE units past their generation).
+    session.assert_runs_closed()
+
+
+def test_joint_logprobs_closes_runs_on_replay_failure():
+    """A mid-replay model failure must still close every bound run — the
+    bind happens inside the replay ``try`` so even a partial-bind failure
+    reaches the teardown."""
+    from saklas.core.joint_logprobs import compute_joint_logprobs
+
+    session: Any = _MockSession()
+
+    def _boom(_input_ids: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("mid-replay model failure")
+
+    session._model = FakeLogitsModel(_boom)
+    session.model = session._model
+    with pytest.raises(RuntimeError, match="mid-replay"):
+        compute_joint_logprobs(session, "a1", "a2")
+    session.assert_runs_closed()
+
+
+def test_joint_logprobs_closes_runs_when_detach_raises():
+    """Teardown is exception-hard: a raising hook detach must not skip run
+    closure (a leaked bound run pins a stale lens between generations)."""
+    from saklas.core.joint_logprobs import compute_joint_logprobs
+
+    session: Any = _MockSession()
+
+    def _detach_boom() -> None:
+        raise RuntimeError("detach failed")
+
+    session._end_capture = _detach_boom
+    with pytest.raises(RuntimeError, match="detach failed"):
+        compute_joint_logprobs(session, "a1", "a2")
+    session.assert_runs_closed()
 
 
 def test_compute_joint_logprobs_to_dict_round_trip():

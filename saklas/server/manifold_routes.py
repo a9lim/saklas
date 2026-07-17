@@ -332,7 +332,7 @@ def _manifold_json(
     derived_coords: list[list[float]] = []
     resolved_affine: bool | None = None
     if fitted_for_session and mf.is_discover:
-        from saklas.core.manifold import load_manifold
+        from saklas.io.manifold_tensors import load_manifold
         try:
             m = load_manifold(mf.tensor_path(session_stem))
             derived_coords = [

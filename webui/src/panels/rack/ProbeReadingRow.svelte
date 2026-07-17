@@ -36,7 +36,7 @@
     align-items: center;
     gap: var(--space-2);
     min-width: 0;
-    min-height: 24px;
+    min-height: var(--control-target);
   }
   .bar,
   .middle {
@@ -44,7 +44,7 @@
   }
   .bar :global(.bar) {
     width: 100%;
-    height: 8px;
+    height: var(--data-bar-height);
     display: block;
   }
 </style>

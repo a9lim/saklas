@@ -1,24 +1,19 @@
 """Batched generation: ``session.generate_batch`` / ``generate_sweep``.
 
 Tests cover the serial wrapper contract plus compatible stateless fast paths:
-ordering, sweep grid shape, ``applied_steering`` round-trip, and the experiment
-fan endpoint.
+ordering, sweep grid shape, and ``applied_steering`` round-trip.
 
 CPU-only.  Mock ``_generate_core`` so we exercise the wrapper logic
 without spinning up a real model.
 """
 from __future__ import annotations
 
-import asyncio
 import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock
-
 import pytest
-from fastapi.testclient import TestClient
 
-from saklas.core.results import GenerationResult, ProbeReading, RunSet
+from saklas.core.results import GenerationResult, ProbeReading
 from saklas.core.steering_composer import SteeringComposer
 
 if TYPE_CHECKING:
@@ -528,7 +523,10 @@ class TestGenerateBatch:
             value = float(hidden[0].reshape(-1)[0])
             return {"jlens/g": ProbeReading(0.0, [], coords=(value,))}
 
-        s_any._score_lens_probes = _score_lens_probes
+        # The batch per-row aggregate routes through the lens run's
+        # ``observe_aggregate``, which consumes the INSTRUMENT's
+        # ``score_probes`` — stub that (the session forwarder is bypassed).
+        s_any._lens_instrument.score_probes = _score_lens_probes
 
         def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
             raise AssertionError("serial generation path should not run")
@@ -1050,128 +1048,3 @@ class TestGenerateSweep:
         s = self._session()
         with pytest.raises(ValueError, match="non-empty list"):
             s.generate_sweep("test", sweep={"a": []})
-
-
-# ---------------------------------------------------------------------------
-# Server: POST /saklas/v1/sessions/{id}/experiments/fan.
-# ---------------------------------------------------------------------------
-
-
-def _mock_session_for_server():
-    """Like ``test_saklas_api._mock_session`` but trimmed to what sweep needs."""
-    session = MagicMock()
-    session.model_id = "test/model"
-    session.model_info = {"model_type": "gemma2", "num_layers": 4, "hidden_dim": 16}
-    session._device = "cpu"
-    session._dtype = "torch.bfloat16"
-    session._created_ts = 1_700_000_000
-
-    session.config = MagicMock()
-    session.config.temperature = 1.0
-    session.config.top_p = 0.9
-    session.config.top_k = None
-    session.config.max_new_tokens = 64
-    session.config.system_prompt = None
-
-    session.vectors = {}
-    session.probes = {}
-    session.history = []
-    session._monitor = MagicMock()
-    session._monitor.probe_names = []
-    session._tokenizer = MagicMock()
-    session._layers = []
-    session._last_per_token_scores = None
-    session.last_per_token_scores = None
-    session.last_result = None
-    session._gen_state = MagicMock()
-    session._gen_state.finish_reason = "stop"
-    session.lock = asyncio.Lock()
-
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
-    session.register_trait_queue = lambda loop, q: session._trait_queues.append((loop, q))
-    session.unregister_trait_queue = lambda loop, q: None
-
-    session.events = MagicMock()
-    session.events.subscribe = lambda cb: (lambda: None)
-    session.events.emit = lambda event: None
-
-    return session
-
-
-@pytest.fixture
-def fan_client():
-    from saklas.server import create_app
-
-    session = _mock_session_for_server()
-
-    # Stub generate_sweep to return the standardized RunSet shape.
-    def _fake_sweep(prompt: Any, sweep: Any, *, base_steering: Any = None, sampling: Any = None,
-                   thinking: Any = None, stateless: bool = True, raw: bool = False, on_result: Any = None,
-                   parent_node_id: Any = None, **kwargs: Any) -> RunSet:
-        results: list[GenerationResult] = []
-        node_ids: list[Any] = []
-        grid: list[dict[str, float]] = []
-        idx = 0
-        # Simple linearization: walk the first concept's alphas.
-        first_name, first_alphas = next(iter(sweep.items()))
-        for alpha in first_alphas:
-            r = _make_result(f"out_{idx}", applied=f"{alpha} {first_name}")
-            results.append(r)
-            node_ids.append(f"NODE_{idx}")
-            grid.append({first_name: float(alpha)})
-            if on_result is not None:
-                on_result(idx, r, {first_name: alpha})
-            idx += 1
-        return RunSet(results, node_ids=node_ids, grid=grid, kind="fan")
-
-    session.generate_sweep = _fake_sweep
-    session.stop = MagicMock()
-
-    app = create_app(session, default_steering=None)
-    return session, TestClient(app)
-
-
-class TestExperimentFanEndpoint:
-    def test_fan_returns_rows_and_node_ids(self, fan_client: Any) -> None:
-        _session, client = fan_client
-
-        body = {
-            "prompt": "describe a sunset",
-            "grid": {"happy.sad": [-0.4, 0.0, 0.4]},
-        }
-        r = client.post(
-            "/saklas/v1/sessions/default/experiments/fan",
-            json=body,
-        )
-        assert r.status_code == 200
-        payload = r.json()
-        assert payload["kind"] == "fan"
-        assert payload["total"] == 3
-        assert payload["node_ids"] == ["NODE_0", "NODE_1", "NODE_2"]
-
-        rows = payload["rows"]
-        for i in range(3):
-            row = rows[i]
-            assert row["idx"] == i
-            assert "happy.sad" in row["alpha_values"]
-            assert row["node_id"] == f"NODE_{i}"
-            assert "applied_steering" in row["result"]
-
-    def test_fan_empty_grid_returns_400(self, fan_client: Any) -> None:
-        _session, client = fan_client
-        body = {"prompt": "x", "grid": {}}
-        r = client.post("/saklas/v1/sessions/default/experiments/fan", json=body)
-        assert r.status_code == 400
-
-    def test_fan_empty_alpha_list_returns_400(self, fan_client: Any) -> None:
-        _session, client = fan_client
-        body = {"prompt": "x", "grid": {"a": []}}
-        r = client.post("/saklas/v1/sessions/default/experiments/fan", json=body)
-        assert r.status_code == 400
-
-    def test_fan_unknown_session_returns_404(self, fan_client: Any) -> None:
-        _session, client = fan_client
-        body = {"prompt": "x", "grid": {"a": [0.0]}}
-        r = client.post("/saklas/v1/sessions/missing/experiments/fan", json=body)
-        assert r.status_code == 404

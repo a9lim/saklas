@@ -49,7 +49,7 @@ export interface SessionInfo {
   dtype: string;
   created: number;
   config: SamplingFields;
-  vectors: string[];
+  profiles: string[];
   probes: string[];
   history_length: number;
   supports_thinking: boolean;
@@ -67,8 +67,8 @@ export interface SessionInfo {
    *  (a server-side path check, not a load).  Gates the token
    *  drilldown's j-lens tab. */
   jlens_fitted: boolean;
-  /** Live workspace-readout state (``POST .../lens/live``): the resolved
-   *  layer list while the live lens is enabled, ``null`` while off.
+  /** Live workspace-readout state (``POST .../instruments/lens/live``): the
+   *  resolved layer list while the live lens is enabled, ``null`` while off.
    *  Rehydrates the WORKSPACE panel toggle across page reloads. */
   live_lens_layers: number[] | null;
   /** Resident SAE runtime capability and identity. */
@@ -85,9 +85,9 @@ export interface SessionInfo {
   } | null;
   /** True while per-token SAE discovery readout is enabled. */
   live_sae: boolean;
-  /** CAA live toggle state (``POST .../probes/live``): whether per-token
-   *  monitor scoring feeds live consumers.  Off ⇒ probes report only the
-   *  end-of-gen aggregate (gates still force what they need). */
+  /** CAA live toggle state (``POST .../instruments/geometry/live``): whether
+   *  per-token monitor scoring feeds live consumers.  Off ⇒ probes report only
+   *  the end-of-gen aggregate (gates still force what they need). */
   live_probe_scores: boolean;
   /** True iff the loaded model family supports assistant-role
    *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
@@ -118,8 +118,8 @@ export interface SessionInfo {
 
 // -------------------------------------------------- jacobian lens --
 
-/** ``POST /sessions/{id}/lens/token/validate`` — a read-only check that a
- *  J-lens word resolves to exactly one vocabulary token. */
+/** ``POST /sessions/{id}/instruments/lens/token/validate`` — a read-only
+ *  check that a J-lens word resolves to exactly one vocabulary token. */
 export interface LensTokenValidationJSON {
   word: string;
   token_id: number;
@@ -151,9 +151,10 @@ export interface LensAggregateTokenJSON {
   spread: number;
 }
 
-/** ``GET /sessions/{id}/lens/token-readout`` — the J-lens
- *  readout at one decode step of a loom node (the forward that produced
- *  the clicked token). */
+/** The J-lens readout at one decode step of a loom node (the forward that
+ *  produced the clicked token) — the drilldown's render shape.  Built from
+ *  the ``GET .../instruments/lens/token-readout`` measurements-replay
+ *  envelope (``instruments.lens.readout`` + ``binding``). */
 export interface LensTokenReadoutJSON {
   node_id: string;
   raw_index: number;
@@ -169,24 +170,40 @@ export interface LensTokenReadoutJSON {
   layers: LensReadoutLayerJSON[];
 }
 
-/** ``POST/GET /sessions/{id}/lens/fit`` — the background lens fit's
- *  polled status.  ``running`` false + ``finished_at`` set + no
- *  ``error`` = the fit landed (refresh session info for
- *  ``jlens_fitted``). */
-export interface LensFitStatusJSON {
-  running: boolean;
-  prompts_done: number;
-  prompts_total: number;
+/** The instrument-preparation operation a POST launches / a GET/DELETE
+ *  reports. */
+export type PreparationOp = "fetch" | "fit" | "load" | "train";
+
+/** Unified status of a background instrument preparation
+ *  (``POST/GET/DELETE .../instruments/{family}/preparations``).  One shape
+ *  over lens ``fetch``/``fit`` and sae ``load``/``train`` — ``state`` is the
+ *  discriminator, ``progress.unit`` carries ``"prompts"`` vs ``"tokens"`` for
+ *  the label, and the op-specific extras (``live_layers`` / ``release`` /
+ *  ``name`` / ``info``) ride alongside.  ``state === "done"`` (finished, no
+ *  error) means the preparation landed — refresh session info. */
+export interface PreparationStatusJSON {
+  state: "idle" | "running" | "done" | "error";
+  operation: PreparationOp | null;
+  progress: { current: number; total: number; unit: string } | null;
   message: string | null;
   error: string | null;
   started_at: number | null;
   finished_at: number | null;
-  /** Layers the post-fit auto-enable turned live, when it ran. */
-  live_layers: number[] | null;
+  cancellable: boolean;
+  /** fetch/fit: layers the post-preparation auto-enable turned live. */
+  live_layers?: number[] | null;
+  /** fetch: the artifact source being fetched. */
+  source?: string | null;
+  /** load: the resident release. */
+  release?: string | null;
+  /** train: the local SAE name. */
+  name?: string | null;
+  /** load/train: resident SAE identity once the preparation lands. */
+  info?: SessionInfo["sae_info"];
 }
 
 /** One usable artifact source. The ``source`` string is deliberately the
- * same identifier accepted by the sibling ``use`` action. */
+ * same identifier accepted by the sibling source-switch action. */
 export interface InstrumentSourceJSON {
   source: string;
   kind: "local" | "huggingface" | "saelens";
@@ -199,16 +216,6 @@ export interface InstrumentSourceJSON {
   checkpoint?: string;
   layer?: number;
   features?: number;
-}
-
-export interface LensFetchStatusJSON {
-  running: boolean;
-  source: string | null;
-  message: string | null;
-  error: string | null;
-  started_at: number | null;
-  finished_at: number | null;
-  live_layers: number[] | null;
 }
 
 // ------------------------------------------------ sparse autoencoder --
@@ -224,33 +231,11 @@ export interface SaeFeatureJSON {
   max_act?: number | null;
 }
 
-/** ``POST .../sae/features/metadata`` — the discovery backfill.  Fetches
- *  and caches Neuronpedia metadata for up to 64 feature ids; ids without
- *  metadata after the fetch are absent from the response. */
+/** ``POST .../instruments/sae/features/metadata`` — the discovery backfill.
+ *  Fetches and caches Neuronpedia metadata for up to 64 feature ids; ids
+ *  without metadata after the fetch are absent from the response. */
 export interface SaeFeatureMetaResponse {
   features: Record<string, { label: string | null; max_act: number | null }>;
-}
-
-export interface SaeLoadStatusJSON {
-  running: boolean;
-  release: string | null;
-  message: string | null;
-  error: string | null;
-  started_at: number | null;
-  finished_at: number | null;
-  info: SessionInfo["sae_info"];
-}
-
-export interface SaeTrainStatusJSON {
-  running: boolean;
-  name: string | null;
-  tokens_done: number;
-  tokens_total: number;
-  message: string | null;
-  error: string | null;
-  started_at: number | null;
-  finished_at: number | null;
-  info: SessionInfo["sae_info"];
 }
 
 export interface SaeTokenReadoutJSON {
@@ -263,43 +248,83 @@ export interface SaeTokenReadoutJSON {
   features: SaeFeatureJSON[];
 }
 
-// --------------------------------------- loom-owned token captures --
+// --------------------------------- 5.x measurement envelope (token wire) --
+//
+// The single JSON-safe read-side record — the same object on the WS ``token``
+// frame, the loom token row (``measurements`` key), and the token-readout
+// replay endpoint (wrapped in ``{measurements}``).  It replaces the former
+// ``captured`` record and the six top-level per-token aliases (``scores`` /
+// ``per_layer_scores`` / ``probe_readings`` / ``lens_readout`` /
+// ``lens_aggregate`` / ``sae_readout``); see saklas.core.measurements.
 
 export type TokenReadoutProvenance = "captured" | "replayed";
 
-/** Probe measurements recorded by the generation that authored the token. */
-export interface CapturedProbeReadoutJSON {
-  provenance: TokenReadoutProvenance;
-  scores?: Record<string, number>;
-  per_layer_scores?: Record<string, Record<string, number>>;
-  readings?: Record<string, ProbeReadingJSON>;
-}
-
-/** J-LENS measurements recorded at the original decode step.  ``layers``
- * deliberately matches the token-readout endpoint shape, so historical UI
- * surfaces do not need a second cache-only representation. */
-export interface CapturedLensReadoutJSON {
-  provenance: TokenReadoutProvenance;
+/** What a family was measuring: source identity + recipe steering (+ resident
+ *  layer for sae), so historical rows stay interpretable after a source
+ *  switch. */
+export interface MeasurementBindingJSON {
   source: string | null;
   steering: string | null;
+  /** sae only — the resident hook layer. */
+  layer?: number | null;
+}
+
+/** Geometry (Monitor subspace) family — attached-probe readings.  Live
+ *  token/aggregate envelopes carry readings only (the recipe lives on the
+ *  loom node); the token-readout replay envelope additionally records what
+ *  it applied as a binding (source always null — no source lifecycle). */
+export interface GeometryInstrumentJSON {
+  readings: Record<string, ProbeReadingJSON>;
+  binding?: MeasurementBindingJSON;
+}
+
+/** The J-lens native discovery readout: per-layer top-k matrix +
+ *  layer-aggregated chip list. */
+export interface LensReadoutBlockJSON {
   layers: LensReadoutLayerJSON[];
   aggregate: LensAggregateTokenJSON[];
 }
 
-/** SAE measurements recorded at the original decode step. */
-export interface CapturedSaeReadoutJSON {
-  provenance: TokenReadoutProvenance;
-  source: string | null;
-  steering: string | null;
-  layer: number | null;
+/** J-lens family — attached ``jlens/<word>`` probe ``readings`` plus the
+ *  native ``readout`` discovery surface, with a ``binding``. */
+export interface LensInstrumentJSON {
+  binding: MeasurementBindingJSON;
+  readings?: Record<string, ProbeReadingJSON>;
+  readout?: LensReadoutBlockJSON;
+}
+
+/** The SAE native discovery readout: per-step top-k feature activations. */
+export interface SaeReadoutBlockJSON {
   features: SaeFeatureJSON[];
 }
 
-/** Canonical rich measurement record owned by a loom token row. */
-export interface TokenCapturedJSON {
-  probes?: CapturedProbeReadoutJSON;
-  lens?: CapturedLensReadoutJSON;
-  sae?: CapturedSaeReadoutJSON;
+/** SAE family — attached ``sae/<id>`` probe ``readings`` plus the native
+ *  ``readout`` discovery surface, with a ``binding``. */
+export interface SaeInstrumentJSON {
+  binding: MeasurementBindingJSON;
+  readings?: Record<string, ProbeReadingJSON>;
+  readout?: SaeReadoutBlockJSON;
+}
+
+export interface MeasurementInstrumentsJSON {
+  geometry?: GeometryInstrumentJSON;
+  lens?: LensInstrumentJSON;
+  sae?: SaeInstrumentJSON;
+}
+
+/** The one measurement envelope — versioned, scoped, per-family
+ *  ``instruments`` plus the flat cross-family ``scores`` /
+ *  ``per_layer_scores`` views (their consumers key probes across families by
+ *  name — transcript tinting, the loom heatmap). */
+export interface MeasurementsEnvelopeJSON {
+  version: number;
+  scope: "token" | "aggregate" | "replay";
+  provenance: TokenReadoutProvenance;
+  /** Flat cross-family axis-0 view (highlight tinting). */
+  scores?: Record<string, number>;
+  /** Optional per-layer × per-probe heatmap view. */
+  per_layer_scores?: Record<string, Record<string, number>>;
+  instruments: MeasurementInstrumentsJSON;
 }
 
 // ----------------------------------------------------- manifolds --
@@ -685,21 +710,14 @@ export interface FitManifoldRequest {
 
 // ----------------------------------------------------- vectors --
 
-export interface VectorTopLayer {
-  layer: number;
-  magnitude: number;
-}
-
 export interface VectorInfo {
   name: string;
   layers: number[];
-  top_layers: VectorTopLayer[];
-  per_layer_norms: Record<string, number>;
   metadata: Record<string, unknown>;
 }
 
-export interface VectorListResponse {
-  vectors: VectorInfo[];
+export interface ProfileListResponse {
+  profiles: VectorInfo[];
 }
 
 export interface ExtractRequest {
@@ -732,35 +750,6 @@ export interface ExtractResponse {
   progress: string[];
 }
 
-
-/** Output of GET /sessions/{id}/vectors/{name}/diagnostics — per-layer
- * ``||baked||`` magnitudes + bucket histogram + (optional) probe-quality
- * diagnostics from ``saklas vector why``.  Resolves either steering
- * vectors or active probes — the server falls back to monitor profiles
- * on miss. */
-export interface VectorDiagnosticsResponse {
-  name: string;
-  model: string;
-  total_layers: number;
-  /** Bucket histogram for the WHY view.  ``buckets`` is the bucket count
-   * (HIST_BUCKETS, 16 by default); ``data`` is the per-bucket entries. */
-  histogram: {
-    buckets: number;
-    data: { lo: number; hi: number; mean_norm: number }[];
-  };
-  /** Full per-layer ``||baked||`` magnitudes — one entry per retained
-   * model layer, sorted ascending.  Drives the layer-norms overlay. */
-  layers: { layer: number; magnitude: number }[];
-  /** Probe-quality diagnostics when the profile carries them (v1.6+). */
-  diagnostics_by_layer?: Record<string, Record<string, number>>;
-  diagnostics_summary?: {
-    evr: number | null;
-    intra_pair_variance_mean: number | null;
-    inter_pair_alignment: number | null;
-    diff_principal_projection: number | null;
-    stoplight: "solid" | "shaky" | "poor" | "unknown";
-  };
-}
 
 // ----------------------------------------------------- probes --
 
@@ -834,8 +823,9 @@ export interface ProbeRequest {
  *  ``saklas.core.results.ProbeReading.to_dict()``.  ``coords`` is the
  *  domain-frame position (signed pole-normalized axis-0 at rank-1);
  *  ``residual`` is ``0`` for a flat (subspace) fit and the normalized
- *  off-surface distance for a curved (manifold) fit.  Per-layer maps are
- *  string-keyed by layer index. */
+ *  off-surface distance for a curved (manifold) fit. ``assignment`` is the
+ *  soft node posterior and ``membership`` the learned-tube density. Per-layer
+ *  maps are string-keyed by layer index. */
 export interface ProbeReadingJSON {
   fraction: number;
   nearest: [string, number][];
@@ -844,6 +834,8 @@ export interface ProbeReadingJSON {
   fraction_per_layer: Record<string, number>;
   coords_per_layer: Record<string, number[]>;
   residual_per_layer: Record<string, number>;
+  assignment?: [string, number][];
+  membership?: number;
   /** Per-axis depth center of mass (+ std) of the per-layer coordinate
    *  trace — where in the layer stack the probe reads, in normalized
    *  depth (0 = first block, 1 = last).  Mass per layer is
@@ -1090,15 +1082,6 @@ export interface WSTokenEvent {
   text: string;
   thinking: boolean;
   token_id: number | null;
-  /** Magnitude-weighted aggregate probe score per probe, populated only
-   * when probes are loaded.  Same value the TUI tints live tokens with;
-   * the webui's inline highlight reads this so live highlighting matches
-   * the post-generation pass. */
-  scores?: Record<string, number>;
-  /** Per-layer × per-probe map populated only when probes are loaded.
-   * Keys: layer-index strings → probe names → cosine-sim score.  Drives
-   * the token drilldown heatmap, not the inline tint. */
-  per_layer_scores?: Record<string, Record<string, number>>;
   /** Logit-pass: chosen-token logprob under the post-sampler distribution.
    *  Populated whenever the engine's log_softmax ran (any ``on_token``
    *  consumer or an explicit ``logprobs``/``return_top_k`` request).
@@ -1120,31 +1103,12 @@ export interface WSTokenEvent {
   /** Loom: node id this token belongs to.  Routes the token to the right
    * sibling render during n-way regen.  Optional. */
   node_id: string | null;
-  /** Canonical rich measurement record. The identical object is persisted on
-   * the loom token row; legacy scalar/readout fields below remain temporary
-   * compatibility aliases. */
-  captured?: TokenCapturedJSON;
-  /** Per-attached-probe reading for this token — every probe shape (a
-   *  2-node concept axis is the rank-1 case).  Keys are probe names; values
-   *  are the full ``ProbeReadingJSON``.  Omitted entirely when no probe is
-   *  attached, so clients read it defensively.  Distinct from ``scores``
-   *  (the magnitude-weighted axis-0 scalar the highlight tint still uses). */
-  probe_readings?: Record<string, ProbeReadingJSON>;
-  /** Live J-lens readout for this decode step — present only
-   *  while the session's live lens is enabled (``POST .../lens/live``).
-   *  Keys are layer-index strings (same convention as
-   *  ``per_layer_scores``); values the top-k ``[token, score]`` pairs,
-   *  descending by per-layer softmax probability. Feeds the WORKSPACE panel. */
-  lens_readout?: Record<string, [string, number][]>;
-  /** Layer-aggregated view of the same step's lens readout —
-   *  ``[token, strength, com, spread]`` 4-arrays, strength-descending
-   *  (mean fitted-layer probability + probability-mass-weighted depth center of
-   *  mass).  Present under the same conditions as ``lens_readout``. */
-  lens_aggregate?: [string, number, number, number][];
-  /** Resident SAE top-k feature activations for this decode step.  Rows
-   *  carry the raw activation plus the cached ``max_act`` strength unit
-   *  (see :type:`SaeFeatureJSON`). */
-  sae_readout?: SaeFeatureJSON[];
+  /** The 5.x measurement envelope — the single read-side record carrying the
+   *  per-family ``instruments`` (geometry / lens / sae ``readings`` +
+   *  ``readout``) plus the flat ``scores`` / ``per_layer_scores`` views.  The
+   *  identical object is persisted on the loom token row.  Omitted when
+   *  nothing was measured, so clients read it defensively. */
+  measurements?: MeasurementsEnvelopeJSON;
 }
 
 export interface WSDoneResult {
@@ -1212,9 +1176,10 @@ export interface LoomTokenRowJSON {
    *  keyed by stringified layer index.  Drives the token-drilldown
    *  drawer's heatmap on rehydrated turns. */
   per_layer_scores?: Record<string, Record<string, number>>;
-  /** Rich channels captured by the original generation. This survives tree
-   * rehydration and explicit loom save/load without replaying the model. */
-  captured?: TokenCapturedJSON;
+  /** The 5.x measurement envelope captured by the original generation. This
+   * survives tree rehydration and explicit loom save/load without replaying
+   * the model. Replaces the pre-5.x ``captured`` record. */
+  measurements?: MeasurementsEnvelopeJSON;
 }
 
 export interface LoomNodeJSON {
@@ -1392,40 +1357,6 @@ export interface TranscriptLoadResponseJSON {
   guards: string[];
 }
 
-// ----------------------------------------------------- experiments --
-
-export interface ExperimentFanRequest {
-  prompt: unknown;
-  /** concept name -> alpha grid */
-  grid: Record<string, number[]>;
-  base_steering?: string | null;
-  sampling?: WSSampling | null;
-  thinking?: boolean | null;
-  raw?: boolean;
-}
-
-export interface ExperimentFanRow {
-  idx: number;
-  alpha_values: Record<string, number>;
-  node_id: string | null;
-  result: {
-    text: string;
-    token_count: number;
-    tok_per_sec: number;
-    elapsed: number;
-    finish_reason: string;
-    applied_steering: string | null;
-    readings: Record<string, number>;
-  };
-}
-
-export interface ExperimentFanResponse {
-  kind: "fan" | string;
-  total: number;
-  node_ids: Array<string | null>;
-  rows: ExperimentFanRow[];
-}
-
 /** Per-op delta sent on every tree mutation.  Clients apply in-place
  * keyed by ``rev`` continuity; full re-fetch on gap.
  *
@@ -1505,8 +1436,8 @@ export interface TokenScore {
    *  transcript-imported nodes (engine pre-dates raw-id capture),
    *  in which case the token can't be forked. */
   rawIndex?: number | null;
-  /** Loom-owned rich measurements from the original decode step. */
-  captured?: TokenCapturedJSON;
+  /** Loom-owned 5.x measurement envelope from the original decode step. */
+  measurements?: MeasurementsEnvelopeJSON;
 }
 
 export interface ChatTurn {
@@ -1782,7 +1713,7 @@ export type DrawerName =
   | "subspace"
   /** Shared rack browser, manifold (curved) family — curved fits only
    *  (``fit_mode`` spectral / authored), e.g. ``emotions``.  Purple
-   *  ``--accent-purple``.  Same layout as the subspace half, with a
+   *  ``--pillar-manifold``.  Same layout as the subspace half, with a
    *  "+ build manifold" launcher.  ``RackDrawer`` with
    *  ``family: "manifold"``. */
   | "manifolds"
@@ -1791,13 +1722,10 @@ export type DrawerName =
   | "manifold_builder"
   /** Discover-mode node-union merge.  Unions the node corpora of two or
    *  more discover-mode manifolds into a fresh discover folder; restricted
-   *  to discover sources by design.  Reached from the workspace rail's
-   *  "manifolds → merge manifolds…" entry. */
+   *  to discover sources by design. Reached from the command palette. */
   | "manifold_merge"
-  /** Manifold-side counterpart to ``PackDrawer``.  Two tabs: local
-   *  catalog, plus HF search/install for ``saklas-manifold``-tagged
-   *  repos.  Reached from the workspace rail's "manifolds → packs…"
-   *  entry, parallel to "vectors → packs…". */
+  /** Local manifold catalog plus HF search/install for
+   *  ``saklas-manifold``-tagged repositories. */
   | "manifold_pack"
   | "save_conversation"
   | "load_conversation"
@@ -1805,15 +1733,11 @@ export type DrawerName =
   | "system_prompt"
   | "token_drilldown"
   | "correlation"
-  | "layer_norms"
   /** Per-probe inspector — subsumes the layer-norms view for probes and
    *  adds a rank-aware whitened geometry plot (line / 2D scatter / 3D PCA
    *  scatter) with a layer scrubber and a fading live trajectory trail.
    *  Opened from a probe card's ⓘ button.  ``params: { name }``. */
   | "probe_inspector"
-  | "experiment_lab"
-  | "activation_atlas"
-  | "recipe_builder"
   | "advanced_sampling"
   | "health"
   | "session_admin"

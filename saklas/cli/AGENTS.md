@@ -1,7 +1,7 @@
 # cli/
 
-Nine-verb root parser
-(`tui`/`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`/`sae`).
+Eight-verb root parser
+(`serve`/`manifold`/`pack`/`experiment`/`config`/`template`/`lens`/`sae`).
 `manifold` is the
 unified compute surface (extract/generate/from-template/fit/bake/merge/transfer/
 compare/why); `pack` is the lifecycle/distribution verb (ls/show/install/search/
@@ -13,7 +13,24 @@ fetch/ls/show/use/rm), with lens retaining top/decompose. There is no
 — install via `pack install` and export via `pack export gguf`. Split across:
 - `cli/main.py` — entry point, `parse_args`, `main`, `_COMMAND_RUNNERS` dispatch
 - `cli/parsers.py` — `_build_root_parser` + every `_build_X_parser`, the verb tables
-- `cli/runners.py` — every `_run_X` plus the shared helpers below
+- `cli/runners/` — every `_run_X`, one module per verb group, re-exported from
+  the package `__init__`:
+  - `runners/shared.py` — the cross-group helpers below (`_make_session`,
+    `_load_effective_config`, `_print_startup` / `_print_model_info`,
+    `_setup_steering_vectors` / `_warmup_session`, `_resolve_probes`, and the
+    `_resolve_manifold_ns_name` / `_resolve_manifold_folder` /
+    `_split_manifold_ns_name` / `_iter_manifold_folders` name resolvers)
+  - `runners/{serve,manifold,pack,template,config,lens,sae,experiment}.py` — the
+    `_run_*` runners for each verb group plus that group's dispatch dict
+    (`_MANIFOLD_RUNNERS` / `_PACK_RUNNERS` / …), kept next to their runners
+  - `runners/__init__.py` re-exports every runner + helper, so the historical
+    `saklas.cli.runners.<name>` import/patch surface is unchanged. The
+    session/config helpers the test-suite swaps at the package level
+    (`_make_session`, `_print_startup`, `_print_model_info`,
+    `_load_effective_config`, the `_fold_*` folders,
+    `_load_or_fit_transfer_alignment`) are invoked by the submodule runners
+    *through* the package object (`import saklas.cli.runners as _pkg`), so a
+    `monkeypatch.setattr("saklas.cli.runners.<name>", …)` still lands.
 - `cli/config_file.py` — `ConfigFile` dataclass + `compose` / `apply_flag_overrides`
   / `ensure_vectors_installed`
 
@@ -23,7 +40,8 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
 ## Verb nesting
 
 - `manifold` = the unified compute surface
-  (`extract`/`generate`/`fit`/`bake`/`merge`/`transfer`/`compare`/`why`),
+  (`extract`/`generate`/`from-template`/`fit`/`bake`/`merge`/`transfer`/
+  `compare`/`why`),
   hand-dispatched by `_run_manifold` (table `_MANIFOLD_VERBS`). `fit` absorbs the
   former `discover` verb: its positional is a name-or-folder, `_run_manifold_fit`
   resolves it and reads `fit_mode`, and the discover hyperparams
@@ -80,8 +98,8 @@ with no subverb) prints help and exits 0, not argparse's exit 2.
 
 ## Config loading
 
-`_load_effective_config(args)` (in `runners.py`) is the shared entry point every
-`-c`-taking subcommand calls. It composes `~/.saklas/config.yaml` + explicit `-c`
+`_load_effective_config(args)` (in `runners/shared.py`) is the shared entry point
+every `-c`-taking subcommand calls. It composes `~/.saklas/config.yaml` + explicit `-c`
 files via `ConfigFile.effective(extras, include_default=True)`, runs
 `apply_flag_overrides` for CLI-supplied values, then stamps in place: `args.model`
 (if YAML supplied it), `args.temperature`, `args.top_p`, `args.thinking`,
@@ -110,8 +128,8 @@ ones; `strict=True` raises on any unresolvable reference.
 Mahalanobis-only), no injection-mode resolution, and no `--legacy` conflict check.
 `_warmup_session`
 runs a 32-token stateless `session.generate(...)` so dynamo's shape promotion fires
-on a realistic prefill before the user's first request; called from `tui` and
-`serve` after `_setup_steering_vectors`. There is no serve-side probe-attach step:
+on a realistic prefill before the user's first request; called from `serve` after
+`_setup_steering_vectors`. There is no serve-side probe-attach step:
 the default probe roster — tagged concept axes plus every fitted bundled multi-node
 manifold (`personas`, `emotions`) — is attached at session construction
 (`_bootstrap_manifold_probes`, `core/session.py`) in every frontend, so the
@@ -126,12 +144,12 @@ and acquisition.
 
 ## Flags
 
-`tui`/`serve` share model-loading args (`model`, `-q/--quantize`, `-d/--device`,
+`serve` carries the model-loading args (`model`, `-q/--quantize`, `-d/--device`,
 `-p/--probes`), the injection block (`_add_injection_args`), the logit block
 (`_add_logit_args`), and config args (`_add_config_args`: `-c/--config` repeatable,
 `-s/--strict`).
 
-- **Injection block** (`_add_injection_args`, on `tui`/`serve`/`experiment fan`/
+- **Injection block** (`_add_injection_args`, on `serve`/`experiment fan`/
   `transcript run`/`naturalness`): `--no-dls`, `--compile`, `--cuda-graphs`. All
   argparse-default to `None`/`False`; YAML fills unset values, session defaults
   (DLS on / compile + cuda-graphs **off**) win otherwise. `~`/`|` projection is
@@ -139,8 +157,6 @@ and acquisition.
   `--theta-max`/`--legacy`.
 - **Logit block** (`_add_logit_args`): `--top-k-alts N` (→ session
   `SamplingConfig.return_top_k`). Both CLI and YAML enforce `[0,256]`.
-- `tui`: `model` optional (a `-c` config with `model:` can supply it); `--max-tokens`
-  default 1024.
 - `serve`: `-H/--host` (default `0.0.0.0`), `-P/--port` (8000), `-S/--steer EXPR`,
   `-C/--cors ORIGIN` (repeatable), `-k/--api-key` (falls back to `$SAKLAS_API_KEY`),
   `--no-web`.
@@ -206,7 +222,10 @@ and acquisition.
 - `manifold transfer`: `name`, `--from SRC` / `--to TGT` (required), `-f`, `-j`.
   Fits/loads a Procrustes alignment and writes the target's `from-<safe_src>`
   **manifold** tensor via `transfer_manifold` — one transfer path (the old
-  vector-side transfer bridge is gone). The runner materializes the target's
+  vector-side transfer bridge is gone). `_run_manifold_transfer` is now a thin
+  caller: the single-flight locking / cache-proof / retry-on-race orchestration
+  lives in `io.alignment.load_or_fit_transfer_alignment` (see io/AGENTS.md).
+  That orchestration materializes the target's
   proven neutral cache only for source-tensor layers and builds the whitener from
   those resident rows. A cached alignment loads no model; if requested map layers
   are missing and both
@@ -298,6 +317,6 @@ and acquisition.
 
 ## Error handling
 
-`@_saklas_error_exit` wraps the top-level runners (including `_run_tui`): any
+`@_saklas_error_exit` wraps the top-level verb runners: any
 escaping `SaklasError` prints `user_message()` to stderr and exits with
 `min(2, status // 100)`.

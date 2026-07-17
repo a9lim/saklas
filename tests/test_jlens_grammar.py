@@ -185,14 +185,15 @@ def test_gated_lens_probe_keys_and_gate_scalars() -> None:
         {l: torch.randn(d_model, generator=torch.Generator().manual_seed(l))
          for l in layers}
     )
-    scalars = session._score_lens_gate_scalars()
+    scalars = session._score_lens_gate_scalars(step_id=7)
     assert "jlens/g" in scalars
     assert "jlens/g[0]" in scalars
     assert "jlens/g[1]" not in scalars  # one channel — strength only
     assert scalars["jlens/g"] == scalars["jlens/g[0]"]
-    # The stash is armed for the display step to reuse this forward's logits.
+    # The stash is armed for the display step to reuse this forward's logits —
+    # keyed by the forward's step id (step identity replaced ``fresh``).
     assert session._lens_step_stash is not None
-    assert session._lens_step_stash["fresh"] is True
+    assert session._lens_step_stash["step"] == 7
     assert session._lens_step_stash["layers"] == tuple(layers)
 
     # Composer-side detection: a gate on the pinned lens probe is recognized

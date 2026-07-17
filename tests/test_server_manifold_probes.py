@@ -117,7 +117,7 @@ def _mock_session():
     session.config.max_new_tokens = 1024
     session.config.system_prompt = None
 
-    session.vectors = {}
+    session.profiles = {}
     session.probes = {}
     session.manifolds = {}
     session.tree = MagicMock()
@@ -700,12 +700,12 @@ class TestOllamaProbeExtension:
 
 
 class TestWebSocketProbeReadings:
-    """The native ``/saklas/v1/sessions/{id}/stream`` WS must carry
-    ``probe_readings`` on every ``token`` frame when probes are attached,
-    and the final ``done`` event still carries the aggregate.  Manifold
-    readings are supplied by the session token tap via
-    ``session.token_probe_payload``; the WS token-frame builder only
-    serializes that payload.
+    """The native ``/saklas/v1/sessions/{id}/stream`` WS must carry the 5.x
+    ``measurements`` envelope on every ``token`` frame when probes are attached,
+    and the final ``done`` event still carries the aggregate ``probe_readings``
+    (plus its own aggregate-scope ``measurements`` envelope).  Manifold readings
+    are supplied by the session token tap via ``session.token_probe_payload``;
+    the WS token-frame builder only forwards that payload's envelope.
 
     Regression for the Phase 3c bug where the webui mini-map cursor
     stayed stuck at ``awaiting first token...`` because the WS ``token``
@@ -753,11 +753,18 @@ class TestWebSocketProbeReadings:
             raw: bool = False, thinking: Any = None, on_token: Callable[..., Any] | None = None,
             parent_node_id: Any = None, n: int = 1, recipe_override: Any = None,
         ) -> RunSet:
+            from saklas.core.measurements import build_measurements
+
             for i, tok in enumerate(tokens):
                 if on_token is not None:
                     if getattr(session.monitor, "probe_names", None):
                         session.token_probe_payload = {
-                            "probe_readings": session.monitor.score_single_token({}),
+                            "measurements": build_measurements(
+                                scope="token",
+                                geometry_readings=(
+                                    session.monitor.score_single_token({})
+                                ),
+                            ),
                         }
                     else:
                         session.token_probe_payload = {}
@@ -804,14 +811,15 @@ class TestWebSocketProbeReadings:
 
         assert len(token_frames) == 3
         for frame in token_frames:
-            mf = frame.get("probe_readings")
-            assert mf is not None, (
-                "per-token probe_readings missing on WS token frame — "
+            envelope = frame.get("measurements")
+            assert envelope is not None, (
+                "per-token measurements missing on WS token frame — "
                 "regression of the Phase 3c stall bug"
             )
-            assert "circumplex" in mf
-            assert mf["circumplex"]["fraction"] == pytest.approx(0.51)
-            assert mf["circumplex"]["nearest"] == [
+            geometry = envelope["instruments"]["geometry"]["readings"]
+            assert "circumplex" in geometry
+            assert geometry["circumplex"]["fraction"] == pytest.approx(0.51)
+            assert geometry["circumplex"]["nearest"] == [
                 ["happy", 0.18], ["calm", 0.31],
             ]
         assert done is not None
@@ -853,6 +861,14 @@ class TestWebSocketProbeReadings:
         assert agg_blob["circumplex"]["coords"] == [
             pytest.approx(0.61), pytest.approx(0.42),
         ]
+        # 5.x: the done frame additionally carries the aggregate-scope
+        # measurement envelope, split by family (geometry here).
+        agg_env = done["result"].get("measurements")
+        assert agg_env is not None
+        assert agg_env["scope"] == "aggregate"
+        geo = agg_env["instruments"]["geometry"]["readings"]["circumplex"]
+        assert geo["fraction"] == pytest.approx(0.42)
+        assert geo["coords"] == [pytest.approx(0.61), pytest.approx(0.42)]
 
     def test_token_frame_omits_field_when_no_probes(
         self, session_and_client: Any,
@@ -877,6 +893,7 @@ class TestWebSocketProbeReadings:
                 if msg["type"] == "token":
                     saw_token = True
                     assert "probe_readings" not in msg
+                    assert "measurements" not in msg
                 elif msg["type"] == "done":
                     break
         assert saw_token

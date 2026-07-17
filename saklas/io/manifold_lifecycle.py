@@ -748,11 +748,8 @@ def _transfer_manifold_locked(
     fitted layer, :class:`FileExistsError` when a transferred tensor
     already exists and ``force`` is ``False``.
     """
-    from saklas.core.manifold import (
-        load_manifold,
-        save_manifold,
-        transfer_manifold_subspaces,
-    )
+    from saklas.core.manifold import transfer_manifold_subspaces
+    from saklas.io.manifold_tensors import load_manifold, save_manifold
 
     folder = Path(folder)
     (

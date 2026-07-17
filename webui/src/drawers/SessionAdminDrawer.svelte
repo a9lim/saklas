@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   import { apiSessions, getApiKey, setApiKey } from "../lib/api";
   import type { SessionInfo } from "../lib/types";
   import { closeDrawer, refreshSession, sessionState } from "../lib/stores.svelte";
@@ -41,7 +42,7 @@
     <div>
       <span class="title">session & auth</span>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}>✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -78,7 +79,7 @@
             <article class:active={sessionState.info?.id === s.id}>
               <strong>{s.id}</strong>
               <code>{s.model_id}</code>
-              <span>{s.device}/{s.dtype} · {s.vectors.length} vectors · {s.probes.length} probes</span>
+              <span>{s.device}/{s.dtype} · {s.profiles.length} profiles · {s.probes.length} probes</span>
             </article>
           {/each}
         {/if}
@@ -90,37 +91,14 @@
 
 <style>
   .drawer-shell { display: flex; flex-direction: column; min-height: 0; background: transparent; }
-  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-6); background: var(--surface); }
+  .header { display: flex; justify-content: space-between; gap: var(--space-6); padding: var(--space-5) var(--space-6); background: transparent; }
   .title { color: var(--accent); letter-spacing: 0; font-size: var(--text-md); font-weight: var(--weight-medium); }
   .hint, .panel p { margin: var(--space-1) 0 0; color: var(--fg-muted); line-height: 1.45; }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover:not(:disabled) {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body { display: grid; gap: var(--space-5); padding: var(--space-6); overflow: auto; }
   .panel {
     border-radius: var(--radius);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow: var(--shadow-well);
     padding: var(--space-6);
   }
   h3 { margin: 0 0 var(--space-4); color: var(--fg); font-size: var(--text-sm); letter-spacing: 0; }

@@ -29,7 +29,7 @@ The user authors ``manifold.json`` (each node carries a ``label`` and its
 authoring ``coords``) and the ``nodes/*.json`` corpus files by hand;
 ``saklas manifold fit`` produces the per-model tensors and
 back-fills the ``files`` integrity manifest.  Tensor save/load itself
-lives in :mod:`saklas.core.manifold` (``save_manifold`` / ``load_manifold``);
+lives in :mod:`saklas.io.manifold_tensors` (``save_manifold`` / ``load_manifold``);
 this module owns folder discovery, the node corpus, and integrity.
 """
 from __future__ import annotations
@@ -77,7 +77,7 @@ _FIT_MODES_DISCOVER: frozenset[str] = frozenset({"pca", "spectral", "auto"})
 # frozen in the per-model tensor and it can never re-fit (no node corpus to
 # pool from).  Merge outputs and imported control vectors land this way — a
 # steering *direction* is the K=1 affine case (see
-# ``core/vectors.fold_directions_to_subspace``).  It is deliberately NOT a
+# ``core/capture.fold_directions_to_subspace``).  It is deliberately NOT a
 # discover mode (``is_discover`` stays False — there are no per-model coords
 # to derive).
 _FIT_MODES_BAKED: frozenset[str] = frozenset({"baked"})
@@ -798,7 +798,7 @@ class ManifoldSidecar:
     node_spread_per_layer: dict[str, Any] = field(default_factory=dict)
     # Merge provenance on a ``fit_mode="baked"`` manifold — the
     # ``{coord: {alpha, tensor_sha256}}`` map written by
-    # :func:`saklas.io.merge.merge_into_manifold`.  ``None`` on every fit that
+    # :func:`saklas.io.bake.merge_into_manifold`.  ``None`` on every fit that
     # isn't a merge (the common case).  Informational only — a baked
     # manifold never re-fits, so nothing branches on it.
     components: Optional[dict[str, Any]] = None
@@ -946,7 +946,7 @@ class ManifoldFolder:
     """A manifold artifact folder on disk.
 
     Discovery + corpus + integrity only — the fitted RBF tensors are
-    loaded through :func:`saklas.core.manifold.load_manifold`.
+    loaded through :func:`saklas.io.manifold_tensors.load_manifold`.
 
     Two folder shapes share this class via the ``fit_mode`` field:
 

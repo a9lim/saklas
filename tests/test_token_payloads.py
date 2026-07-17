@@ -39,14 +39,26 @@ def test_build_token_probe_payload_scores_once_and_shapes_channels() -> None:
     )
 
     assert payload.scores == {"toy": pytest.approx(0.25)}
-    assert payload.probe_readings == {"toy": reading}
+    # Monitor readings land in the geometry family slot; ``all_readings`` is the
+    # cross-family union.
+    assert payload.geometry_readings == {"toy": reading}
+    assert payload.all_readings == {"toy": reading}
     assert payload.per_layer_scores == {"3": {"toy": pytest.approx(0.25)}}
-    assert payload.to_token_payload(lens={"3": [("tok", 1.0)]})["lens"] == {
-        "3": [("tok", 1.0)]
-    }
+
+    envelope = payload.to_token_payload(lens={"3": [("tok", 1.0)]})["measurements"]
+    assert envelope["scope"] == "token"
+    assert envelope["instruments"]["geometry"]["readings"]["toy"] == (
+        reading.to_dict()
+    )
+    assert envelope["instruments"]["lens"]["readout"]["layers"] == [
+        {
+            "layer": 3,
+            "tokens": [{"token": "tok", "id": -1, "logprob": pytest.approx(0.0)}],
+        },
+    ]
 
 
-def test_token_payload_builds_endpoint_shaped_captured_record() -> None:
+def test_token_payload_builds_measurement_envelope() -> None:
     reading = ProbeReading(
         fraction=0.5,
         nearest=[("happy", 0.1)],
@@ -76,40 +88,73 @@ def test_token_payload_builds_endpoint_shaped_captured_record() -> None:
         steering="0.3 calm",
     )
 
-    captured = payload["captured"]
-    assert captured["probes"]["provenance"] == "captured"
-    assert captured["probes"]["readings"]["toy"] == reading.to_dict()
-    assert captured["lens"] == {
-        "provenance": "captured",
-        "source": "local:default",
-        "steering": "0.3 calm",
-        "layers": [{
-            "layer": 3,
-            "tokens": [{
-                "token": " tok",
-                "id": 42,
-                "logprob": pytest.approx(math.log(0.25)),
+    envelope = payload["measurements"]
+    assert envelope["version"] == 1
+    assert envelope["scope"] == "token"
+    assert envelope["provenance"] == "captured"
+    assert envelope["scores"] == {"toy": pytest.approx(0.25)}
+
+    instruments = envelope["instruments"]
+    assert instruments["geometry"]["readings"]["toy"] == reading.to_dict()
+    assert instruments["lens"] == {
+        "readout": {
+            "layers": [{
+                "layer": 3,
+                "tokens": [{
+                    "token": " tok",
+                    "id": 42,
+                    "logprob": pytest.approx(math.log(0.25)),
+                }],
             }],
-        }],
-        "aggregate": [{
-            "token": " tok",
-            "strength": 0.2,
-            "com": 0.6,
-            "spread": 0.1,
-        }],
+            "aggregate": [{
+                "token": " tok",
+                "strength": 0.2,
+                "com": 0.6,
+                "spread": 0.1,
+            }],
+        },
+        "binding": {"source": "local:default", "steering": "0.3 calm"},
     }
-    assert captured["sae"] == {
-        "provenance": "captured",
-        "source": "saelens:release",
-        "steering": "0.3 calm",
-        "layer": 3,
-        "features": [{
-            "id": 7,
-            "activation": 3.5,
-            "label": "feature seven",
-            "max_act": 5.0,
-        }],
+    assert instruments["sae"] == {
+        "readout": {
+            "features": [{
+                "id": 7,
+                "activation": 3.5,
+                "label": "feature seven",
+                "max_act": 5.0,
+            }],
+        },
+        "binding": {
+            "source": "saelens:release",
+            "steering": "0.3 calm",
+            "layer": 3,
+        },
     }
+
+
+def test_merge_readings_routes_to_named_family_slot() -> None:
+    from saklas.core.token_payloads import TokenProbePayload
+
+    geo = ProbeReading(0.0, [], coords=(0.1,))
+    lens = ProbeReading(0.0, [], coords=(0.2,))
+    sae = ProbeReading(0.0, [], coords=(0.3,))
+
+    payload = TokenProbePayload()
+    payload.merge_readings({"toy": geo}, family="geometry")
+    payload.merge_readings({"jlens/yes": lens}, family="lens")
+    payload.merge_readings({"sae/7": sae}, family="sae")
+
+    assert payload.geometry_readings == {"toy": geo}
+    assert payload.lens_readings == {"jlens/yes": lens}
+    assert payload.sae_readings == {"sae/7": sae}
+    assert payload.all_readings == {"toy": geo, "jlens/yes": lens, "sae/7": sae}
+    assert payload.scores == {
+        "toy": pytest.approx(0.1),
+        "jlens/yes": pytest.approx(0.2),
+        "sae/7": pytest.approx(0.3),
+    }
+    with pytest.raises(ValueError, match="unknown reading family"):
+        payload.merge_readings({"x": geo}, family="bogus")
 
 
 def test_build_token_probe_payload_reuses_incremental_reading() -> None:
@@ -133,4 +178,4 @@ def test_build_token_probe_payload_reuses_incremental_reading() -> None:
     )
 
     assert payload.scores == {"toy": pytest.approx(0.75)}
-    assert payload.probe_readings == {"toy": reading}
+    assert payload.geometry_readings == {"toy": reading}

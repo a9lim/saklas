@@ -16,15 +16,14 @@
 
   interface Props {
     /** CSS custom-property *name* for the family accent — e.g. ``"--accent"``
-     *  for a subspace (flat) card, ``"--accent-purple"`` for a manifold
+     *  for a subspace (flat) card, ``"--pillar-manifold"`` for a manifold
      *  (curved) card.  Exposed to the slotted content as ``--card-accent``. */
     accent?: string;
     /** Dim + de-emphasise the card (a disabled steer term).  Probe cards
      *  pass ``false`` — a probe is always "on". */
     disabled?: boolean;
-    /** Alive right now — hue ring + faint glow (the highlight-selected
-     *  probe, a gate that just fired).  Glow marks what is alive; the
-     *  resting card stays calm. */
+    /** Active selection uses a hue ring (the highlight-selected probe or a
+     *  gate that just fired). */
     active?: boolean;
     /** Top identity line: marker glyph · name · status chips · actions.
      *  One row; the card owns its glyph + chips. */
@@ -56,8 +55,7 @@
 
 <style>
   /* The dense variant of the v2 glass material (lib/ui/GlassCard is the
-   * roomy one) — translucent fill lit from above. Borderless: the fill +
-   * top-light carry the card, the family accent lives in the glyph/text,
+   * roomy one). Borderless: the fill carries the card, the family accent lives in the glyph/text,
    * and the border slot exists only for the active ring (state, not
    * chrome). Hover lifts the fill instead of drawing a line. No backdrop
    * blur: rack cards sit on the opaque panel, so blur would cost
@@ -72,7 +70,7 @@
     border: 1px solid transparent;
     border-radius: var(--radius-lg);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    box-shadow: var(--shadow-rack);
     font-size: var(--text-sm);
     transition:
       border-color var(--dur) var(--ease-out),
@@ -85,10 +83,7 @@
   }
   .card.active {
     border-color: color-mix(in srgb, var(--card-accent) 40%, transparent);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.04),
-      0 0 0 1px color-mix(in srgb, var(--card-accent) 18%, transparent),
-      0 0 18px color-mix(in srgb, var(--card-accent) 7%, transparent);
+    box-shadow: var(--shadow-rack-active);
   }
   .card.disabled {
     /* Off is a reversible state, not unavailable content. Keep labels and
@@ -104,7 +99,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-3);
-    min-height: 24px;
+    min-height: var(--control-target);
     min-width: 0;
   }
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Correlation overlay — N×N magnitude-weighted cosine matrix across
   // every registered steering vector AND every active probe.  Replaces
   // the v1.7 inline ReferenceCollapsibles' correlation section with a
@@ -92,9 +93,7 @@
         disabled={loading}
         title="refresh"
       >{loading ? "…" : "refresh"}</Button>
-      <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
-        ✕
-      </button>
+      <DrawerCloseButton onclick={onClose} />
     </div>
   </header>
 
@@ -197,29 +196,6 @@
     align-items: center;
     flex: none;
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
 
   .body {
     flex: 1 1 auto;
@@ -234,7 +210,7 @@
     max-width: 62ch;
   }
   .empty.err {
-    color: var(--accent-error);
+    color: var(--accent-red);
   }
 
   /* Data well — recessed matrix.  Every column/row label here IS an
@@ -272,7 +248,7 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-sticky-inline);
     white-space: nowrap;
   }
   .grid .corner {
@@ -284,7 +260,7 @@
     font-size: var(--text-xs);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-sticky), var(--shadow-sticky-inline);
   }
   .grid .col-label {
     color: var(--fg-dim);

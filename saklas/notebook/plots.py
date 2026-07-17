@@ -261,8 +261,8 @@ def plot_layer_norms(
     """Per-layer ``||baked||`` bar chart.
 
     Full resolution — one bar per retained layer.  This is the
-    notebook-side counterpart to the TUI's 16-bucket histogram footer
-    and the ``saklas manifold why`` output, surfaced here without bucketing
+    notebook-side counterpart to the ``saklas manifold why`` output, surfaced
+    here without bucketing
     so users can see the exact distribution.
     """
     go = _require_plotly()

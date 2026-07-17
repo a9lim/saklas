@@ -20,6 +20,7 @@ from saklas.core.jlens import (
     MultiTokenWordError,
     aggregate_readout,
     aggregate_readout_from_probabilities,
+    aggregate_readout_tensors_from_probabilities,
     fit_jacobian_lens,
     lens_logits,
     readout_probabilities,
@@ -840,6 +841,53 @@ def test_aggregate_readout_reuses_calibrated_probabilities_exactly() -> None:
         readout_probabilities(logits), depths, top_k=4,
     )
     assert got == expected
+
+
+def test_aggregate_readout_tensor_surface_matches_list_surface() -> None:
+    logits = torch.randn(5, _VOCAB)
+    probabilities = readout_probabilities(logits)
+    depths = [0.41, 0.52, 0.63, 0.74, 0.85]
+    expected = aggregate_readout_from_probabilities(
+        probabilities, depths, top_k=4,
+    )
+
+    ids, stats = aggregate_readout_tensors_from_probabilities(
+        probabilities, depths, top_k=4,
+    )
+    got = [
+        (
+            int(ids[j]),
+            float(stats[0, j]),
+            float(stats[1, j]),
+            float(stats[2, j]),
+        )
+        for j in range(int(ids.numel()))
+    ]
+
+    assert got == expected
+
+
+def test_aggregate_readout_avoids_float64_for_mps_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_to = torch.Tensor.to
+
+    def reject_float64(
+        self: torch.Tensor, *args: Any, **kwargs: Any,
+    ) -> torch.Tensor:
+        dtype = kwargs.get("dtype")
+        if args and isinstance(args[0], torch.dtype):
+            dtype = args[0]
+        if dtype is torch.float64:
+            raise AssertionError("device-side float64 is unsupported on MPS")
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", reject_float64)
+    probabilities = readout_probabilities(torch.randn(5, _VOCAB))
+    rows = aggregate_readout_from_probabilities(
+        probabilities, [0.41, 0.52, 0.63, 0.74, 0.85], top_k=4,
+    )
+    assert len(rows) == 4
 
 
 def test_token_readout_stats_uses_exact_columns_without_full_probabilities(

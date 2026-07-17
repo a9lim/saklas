@@ -1,5 +1,6 @@
 <script lang="ts">
-  // ManifoldPacksDrawer — manifold-side counterpart to PackDrawer.
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
+  // ManifoldPacksDrawer — local manifold catalog and HF search/install.
   //
   // Two tabs at the top: "Installed" lists what saklas knows locally
   // (proxied through GET /saklas/v1/manifolds); "Search HF" hits
@@ -7,14 +8,9 @@
   // an Install button per row that POSTs the install request and
   // refreshes the local list on success.
   //
-  // Pair-drawer with ManifoldDrawer: that one is the *workspace* surface
-  // (per-row steer / probe / fit / delete on the active session); this
-  // one is the *catalog* surface (list local, browse HF, install).
-  // Mirrors how VectorsDrawer and PackDrawer split the same concerns
-  // for steering vectors.
-  //
-  // Reachable from the workspace rail's "manifolds → packs…" entry,
-  // parallel to "vectors → packs…".
+  // The rack browser is the active-session surface (steer, probe, fit,
+  // delete); this drawer is the catalog surface (list local, browse HF,
+  // install). It is reachable from the command palette.
 
   import { onMount } from "svelte";
   import { ApiError, apiManifolds } from "../lib/api";
@@ -40,8 +36,7 @@
   let searchError: string | null = $state(null);
   let installing: string | null = $state(null);
 
-  // Debounce: redo searches 300ms after the user stops typing — mirrors
-  // PackDrawer's cadence so the two feel identical.
+  // Redo searches 300ms after the user stops typing.
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   function scheduleSearch(): void {
     if (debounceTimer) clearTimeout(debounceTimer);
@@ -140,12 +135,7 @@
 <div class="drawer-shell">
   <header class="header">
     <span class="title">packs</span>
-    <button
-      type="button"
-      class="close"
-      aria-label="Close"
-      onclick={closeDrawer}
-    >✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="tabs" role="tablist">
@@ -260,11 +250,8 @@
 </div>
 
 <style>
-  /* Two-tab layout mirrors PackDrawer pixel-for-pixel so the two
-   * pack browsers feel like one family — same tabs, same row look,
-   * same colour rhythm.  Only the install action's accent goes
-   * purple (the manifold family colour); the steering-vector side
-   * keeps its blue. */
+  /* Shared installed/search layout: compact tabs, catalog rows, and a
+   * purple install accent for the manifold family. */
   .drawer-shell {
     display: flex;
     flex-direction: column;
@@ -285,29 +272,6 @@
     letter-spacing: 0;
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
-  }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
   }
 
   .tabs {
@@ -374,7 +338,7 @@
     font-size: var(--text-sm);
   }
   .search input[type="search"]:focus-visible {
-    outline: 1px solid var(--accent-purple);
+    outline: 1px solid var(--pillar-manifold);
     outline-offset: -1px;
   }
 
@@ -391,7 +355,7 @@
   }
   .error {
     margin: 0;
-    color: var(--accent-error);
+    color: var(--accent-red);
     font-size: var(--text-sm);
     word-break: break-word;
   }
@@ -415,7 +379,7 @@
     padding: var(--space-3) var(--space-4);
     transition: background var(--dur) var(--ease-out);
   }
-  .row:hover { background: color-mix(in srgb, var(--accent-purple) 8%, var(--bg-deep)); }
+  .row:hover { background: color-mix(in srgb, var(--pillar-manifold) 8%, var(--bg-deep)); }
   .meta {
     display: flex;
     flex-direction: column;
@@ -443,8 +407,8 @@
     font-size: var(--text-2xs);
     letter-spacing: 0.04em;
     border: 1px solid transparent;
-    color: var(--accent-purple);
-    background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
+    color: var(--pillar-manifold);
+    background: color-mix(in srgb, var(--pillar-manifold) 12%, transparent);
   }
   .fit-spectral {
     color: var(--accent);
@@ -473,7 +437,7 @@
   }
   .act {
     background: var(--glass);
-    color: var(--accent-purple);
+    color: var(--pillar-manifold);
     border: 1px solid transparent;
     border-radius: var(--radius);
     padding: var(--space-2) var(--space-3);
@@ -486,7 +450,7 @@
       color var(--dur) var(--ease-out);
   }
   .act:hover:not(:disabled) {
-    background: rgba(167, 139, 250, 0.12);
+    background: color-mix(in srgb, var(--pillar-manifold) 12%, transparent);
   }
   .act:disabled {
     opacity: 0.45;

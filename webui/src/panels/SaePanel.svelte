@@ -27,7 +27,7 @@
   import SaeSteerCard from "./rack/SaeSteerCard.svelte";
   import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
-  import { apiSae } from "../lib/api";
+  import { apiInstruments } from "../lib/api";
   import {
     activeProbeNames,
     addSaeToRack,
@@ -158,8 +158,8 @@
 
   $effect(() => {
     if (releases.length > 0) return;
-    void apiSae.releases().then((result) => {
-      releases = result.releases.filter((row) => row.source !== "local");
+    void apiInstruments.sources("sae").then((result) => {
+      releases = (result.releases ?? []).filter((row) => row.source !== "local");
       if (!selectedSource && releases.length > 0) {
         selectedSource = `saelens:${releases[0].release}`;
       }
@@ -352,7 +352,7 @@
       pushToast("feature id must be a non-negative integer", { kind: "error" });
       return null;
     }
-    const validated = await apiSae.validateFeature(id);
+    const validated = await apiInstruments.validateSaeFeature(id);
     return validated.id;
   }
 
@@ -377,7 +377,7 @@
     if (featureBusy || probeRack.active.includes(`sae/${id}`)) return;
     featureBusy = true;
     try {
-      await apiSae.validateFeature(id);
+      await apiInstruments.validateSaeFeature(id);
       const live = discoveryBase.find((row) => row.id === id);
       const meta = saeState.meta.get(id);
       const preAttachMaxAct = live?.max_act ?? meta?.max_act ?? null;
@@ -789,10 +789,10 @@
   .add-input:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
   }
   .add-btn {
-    min-height: 24px;
+    min-height: var(--control-target);
     /* Family-tinted fill — the gold sibling of the racks' launchers. */
     background: color-mix(in srgb, var(--pillar-sae) 10%, transparent);
     color: var(--pillar-sae);

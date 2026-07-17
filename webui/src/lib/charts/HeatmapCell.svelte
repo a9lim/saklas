@@ -103,13 +103,13 @@
     color: var(--fg);
     box-sizing: border-box;
     border: 0;
-    border-radius: 2px;
+    border-radius: var(--data-mark-radius);
   }
   .cell.active {
     box-shadow: 0 0 0 2px var(--focus-ring);
   }
   .t {
     font-variant-numeric: tabular-nums;
-    text-shadow: 0 0 2px rgba(0, 0, 0, 0.6);
+    text-shadow: var(--shadow-data-label);
   }
 </style>

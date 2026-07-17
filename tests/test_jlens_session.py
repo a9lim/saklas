@@ -95,8 +95,33 @@ class _StubSession:
     _score_lens_probes = SaklasSession._score_lens_probes
     _score_lens_gate_scalars = SaklasSession._score_lens_gate_scalars
     _effective_return_top_k = SaklasSession._effective_return_top_k
+    _active_jlens_source_label = SaklasSession._active_jlens_source_label
+    _select_tensor_rows = staticmethod(SaklasSession._select_tensor_rows)
+    # Lens state lives on the LensInstrument (constructed in __init__);
+    # borrow the session's delegating property objects so the plain
+    # attribute assignments below route into the instrument exactly as the
+    # real session's do.
+    _lens_probes = SaklasSession._lens_probes
+    _live_lens = SaklasSession._live_lens
+    _lens_step_stash = SaklasSession._lens_step_stash
+    _last_lens_step_readings = SaklasSession._last_lens_step_readings
+    _live_lens_active_for_generation = (
+        SaklasSession._live_lens_active_for_generation
+    )
+    _generation_jlens = SaklasSession._generation_jlens
+    _generation_jlens_active = SaklasSession._generation_jlens_active
+    _close_instrument_runs = SaklasSession._close_instrument_runs
 
     def __init__(self, *, n_layers: int = 3) -> None:
+        from saklas.core.instruments.geometry import GeometryInstrument
+        from saklas.core.instruments.lens import LensInstrument
+        from saklas.core.instruments.sae import SaeInstrument
+
+        self._lens_instrument = LensInstrument(self)  # type: ignore[arg-type]
+        # ``_begin_capture`` consumes every family's ``plan()`` demand, so
+        # the stub carries all three real instruments like the session.
+        self._geometry_instrument = GeometryInstrument(self)  # type: ignore[arg-type]
+        self._sae_instrument = SaeInstrument(self)  # type: ignore[arg-type]
         model = frozen_toy(n_layers=n_layers)
         self._model = model
         self._tokenizer = CharTokenizer()
@@ -105,21 +130,21 @@ class _StubSession:
         self._profiles: dict[str, Any] = {}
         self._jlens: Any = None
         self._jlens_identity: Any = None
-        self._generation_jlens: Any = None
+        self._generation_jlens = None
         self._generation_jlens_active = False
-        self._live_lens: Any = None
+        self._live_lens = None
         self._capture: Any = None
         self._capture_buffers: dict[int, torch.Tensor] = {}
         self._compiled_clean_eligible = False
         self._steering_uses_compiled_offsets = False
         self._steering: Any = None
-        self._lens_probes: dict[str, Any] = {}
+        self._lens_probes = {}
         self._live_lens_active_for_generation = True
         self._live_sae: Any = None
         self._sae_probes: dict[str, Any] = {}
         self._probe_hash_cache: dict[str, str] = {}
-        self._lens_step_stash: Any = None
-        self._last_lens_step_readings: Any = None
+        self._lens_step_stash = None
+        self._last_lens_step_readings = None
         self._jlens_readout_module_cache: Any = None
         self._jlens_device_cache: dict[Any, Any] = {}
         self._jlens_depths_cache: dict[Any, list[float]] = {}
@@ -222,7 +247,9 @@ def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS, source_layers=[0])
     s.enable_live_lens(layers=[0])
-    old_stack = s._live_lens["J_stack"]
+    live = s._live_lens
+    assert live is not None
+    old_stack = live["J_stack"]
     s._profiles["jlens/a"] = {0: torch.ones(4)}
     s._lens_probes["jlens/a"] = {
         "word": "a", "token_id": 1, "layers": [0],
@@ -231,9 +258,11 @@ def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
     fitted = s.fit_jlens(_PROMPTS, source_layers=[1], force=True)
 
     assert fitted.source_layers == [1]
-    assert s._live_lens["layers"] == [1]
-    assert s._live_lens["uses_all_layers"] is True
-    assert s._live_lens["J_stack"] is not old_stack
+    live = s._live_lens
+    assert live is not None
+    assert live["layers"] == [1]
+    assert live["uses_all_layers"] is True
+    assert live["J_stack"] is not old_stack
     assert s._lens_probes["jlens/a"]["layers"] == [1]
     assert "jlens/a" not in s._profiles
 
@@ -560,6 +589,479 @@ def test_generation_boundary_refreshes_external_lens_once() -> None:
     assert session_a._lens_probes["jlens/example"]["layers"] == []
 
 
+def test_external_lens_replacement_plans_and_freezes_refreshed_layers() -> None:
+    """The refresh-then-plan boundary (sol's slice-B finding 2): an external
+    replacement lens on a DISJOINT layer set must be adopted before the
+    capture plan and the frozen binding are taken — pairing the new lens
+    with stale layers KeyErrors in the transport stack."""
+    session_a = _StubSession()
+    session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+
+    # Another process replaces the artifact with a disjoint-layer fit.
+    corpus_b = [
+        f"replacement disjoint prompt {i} with enough content" for i in range(4)
+    ]
+    disk_b = _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
+    assert list(disk_b.source_layers) == [1]
+
+    attached_layers: list[int] = []
+
+    class _Capture:
+        def clear(self) -> None:
+            pass
+
+        def attach(self, _layers: Any, indices: list[int]) -> None:
+            attached_layers.extend(indices)
+
+        def set_aggregate_tail(self, _depth: int) -> None:
+            pass
+
+    session_a._capture = _Capture()
+    session_a._capture_buffers = {}
+    session_a._compiled_clean_eligible = False
+    session_a._steering_uses_compiled_offsets = False
+    session_a._steering = SimpleNamespace(all_fast_path=lambda: True)
+    session_a._monitor = SimpleNamespace(
+        probe_names=[],
+        enable_curved_warm=lambda _enabled: None,
+    )
+    session_a._live_sae = None
+    session_a._sae_probes = {}
+
+    ok = SaklasSession._begin_capture(
+        cast(Any, session_a), final_probe_aggregate=True,
+    )
+
+    assert ok is True
+    # The adoption rewrote the live registry BEFORE planning/freezing:
+    # the capture plan, the frozen binding, and the pinned lens all agree
+    # on the replacement's layer set.
+    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+    assert attached_layers == [1]
+    run = session_a._lens_instrument.current_run
+    assert run.pinned is True
+    assert run.lens is not None
+    assert list(run.binding.specs["jlens/example"]["layers"]) == [1]
+    assert list(run.lens.source_layers) == [1]
+    # And the pinned lens can actually score the frozen band — the stale
+    # pairing raised KeyError(0) out of the transport stack.
+    hidden_dim = int(session_a._model.lm_head.weight.shape[1])
+    hidden = {1: torch.randn(hidden_dim)}
+    readings = session_a._lens_instrument.score_probes(hidden)
+    assert "jlens/example" in readings
+
+
+def test_prepare_is_the_refresh_site_and_supplies_the_pin() -> None:
+    """The refresh/pin protocol step: a bare ``prepare()`` — no session
+    special-casing around it — adopts an external replacement lens
+    (rewriting the live probe layer lists before any plan is taken) and
+    returns the ``LensPrep`` snapshot that ``plan``/``bind`` consume."""
+    from saklas.core.instruments.types import LensPrep, ReadRequest
+
+    session_a = _StubSession()
+    session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    assert session_a.jlens is not None  # resident before the swap
+
+    corpus_b = [
+        f"replacement disjoint prompt {i} with enough content" for i in range(4)
+    ]
+    _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
+
+    inst = session_a._lens_instrument
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    assert isinstance(prep, LensPrep)
+    assert prep.pinned is True
+    assert prep.lens is not None and list(prep.lens.source_layers) == [1]
+    # The adoption rewrote the live registry inside prepare, and the prep's
+    # spec snapshot carries the layers derived from the prepared identity.
+    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+    assert list(prep.specs["jlens/example"]["layers"]) == [1]
+    run = inst.bind(inst.plan(prep), prep)
+    assert run.pinned is True and run.lens is prep.lens
+    assert list(run.binding.specs["jlens/example"]["layers"]) == [1]
+    session_a._close_instrument_runs()
+
+
+def test_interleaved_adoption_cannot_desync_plan_from_pin() -> None:
+    """sol's round-3 P1: prepare pins lens A; before plan/bind, the
+    un-locked ``has_compatible_jlens`` (the session-info route runs it
+    without the generation lock) observes a replacement lens B and adopts
+    it, rewriting the live probe layer lists.  Because plan and bind
+    consume the prep's snapshot — never the live registry — the run still
+    measures A's layers with A pinned; the old registry reread paired A
+    with B's layers and KeyErrored in the transport stack."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session_a = _StubSession()
+    session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    inst = session_a._lens_instrument
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    assert prep.lens is not None and list(prep.lens.source_layers) == [0]
+
+    # Another process swaps the artifact; the un-locked path adopts it
+    # INSIDE the prepare->bind window.
+    corpus_b = [
+        f"replacement disjoint prompt {i} with enough content" for i in range(4)
+    ]
+    _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
+    assert session_a.has_compatible_jlens() is True  # adopts B
+    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+
+    plan = inst.plan(prep)
+    run = inst.bind(plan, prep)
+    # Plan layers, frozen binding, and the pinned lens all agree on A.
+    assert set(plan.latest_layers) == {0}
+    assert list(run.binding.specs["jlens/example"]["layers"]) == [0]
+    assert run.lens is prep.lens
+    hidden_dim = int(session_a._model.lm_head.weight.shape[1])
+    readings = inst.score_probes({0: torch.randn(hidden_dim)})
+    assert "jlens/example" in readings
+    session_a._close_instrument_runs()
+
+
+def test_bound_run_reads_prepare_time_live_state() -> None:
+    """The live-readout runtime dict is part of the prep snapshot: an
+    interleaved adoption rebuilds the instrument-level ``live`` against
+    the NEW lens, and a bound run must keep reading the state that
+    matches its pin.  Idle runs pass through to the live config."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _StubSession()
+    inst = session._lens_instrument
+    state_a = {"layers": [0]}
+    inst.live = state_a
+    prep = inst.prepare(ReadRequest(final_aggregate=False, live=True))
+    assert prep.live_state is state_a
+
+    inst.live = {"layers": [1]}  # the adoption rebuild lands in the window
+    inst.bind(inst.plan(prep), prep)
+    assert inst._measurement_live() is state_a
+    session._close_instrument_runs()
+    assert inst._measurement_live() is inst.live
+    inst.live = None
+
+
+def test_lens_state_lock_serializes_getter_against_snapshot() -> None:
+    """The one lens-state boundary (sol's round-4 P1): the getter's
+    refresh/adopt/evict transaction and ``prepare``'s snapshot hold the
+    same reentrant lock, so an un-locked read (the session-info route)
+    cannot land inside a generation boundary's snapshot — it blocks
+    until the snapshot completes."""
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS, force=True)
+    inst = session._lens_instrument
+
+    entered = threading.Event()
+    seen: list[Any] = []
+
+    def _getter_read() -> None:
+        entered.set()
+        seen.append(session.jlens)
+
+    with inst.state_lock:
+        reader = threading.Thread(target=_getter_read)
+        reader.start()
+        assert entered.wait(timeout=5.0)
+        reader.join(timeout=0.2)
+        assert reader.is_alive()  # blocked on the lens-state lock
+    reader.join(timeout=5.0)
+    assert not reader.is_alive()
+    assert seen and seen[0] is not None
+
+
+def test_lens_state_lock_serializes_detach_and_reads() -> None:
+    """round-5 P1/P2: the session's ``remove_probe`` lens branch (the
+    HTTP DELETE path) and the coherent read surfaces (``specs``) hold
+    the lens-state lock — a detach can no longer land inside a
+    ``prepare`` snapshot or tear a concurrent registry iteration."""
+    session = _StubSession()
+    session._probe_hash_cache = {}
+    session._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    inst = session._lens_instrument
+
+    detach_entered = threading.Event()
+    read_entered = threading.Event()
+    read_out: list[Any] = []
+
+    def _detach() -> None:
+        detach_entered.set()
+        SaklasSession.remove_probe(cast(Any, session), "jlens/example")
+
+    def _read_specs() -> None:
+        read_entered.set()
+        read_out.append(inst.specs())
+
+    with inst.state_lock:
+        detacher = threading.Thread(target=_detach)
+        reader = threading.Thread(target=_read_specs)
+        detacher.start()
+        reader.start()
+        assert detach_entered.wait(timeout=5.0)
+        assert read_entered.wait(timeout=5.0)
+        detacher.join(timeout=0.2)
+        reader.join(timeout=0.2)
+        assert detacher.is_alive()  # both blocked on the lens-state lock
+        assert reader.is_alive()
+        assert "jlens/example" in inst.probes  # nothing mutated mid-hold
+    detacher.join(timeout=5.0)
+    reader.join(timeout=5.0)
+    assert not detacher.is_alive() and not reader.is_alive()
+    assert "jlens/example" not in inst.probes
+    assert read_out and isinstance(read_out[0], dict)
+
+
+def test_idle_measurement_state_is_coherent() -> None:
+    """round-6 P1: the idle-passthrough read pairs the lens and the spec
+    snapshot in ONE state-lock hold — ``_measurement_specs`` handing out
+    the live registry while the lens resolved separately let an idle
+    read pair lens A with a concurrently adopted B's rewritten layers.
+    The helper's getter read also refreshes, so the pair reflects the
+    replacement consistently."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session_a = _StubSession()
+    session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
+    session_a._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    corpus_b = [
+        f"replacement idle prompt {i} with enough content" for i in range(4)
+    ]
+    _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
+
+    inst = session_a._lens_instrument
+    lens, specs = inst._measurement_state()
+    # One hold: the refreshed lens and the copied specs agree on B.
+    assert lens is not None and list(lens.source_layers) == [1]
+    assert list(specs["jlens/example"]["layers"]) == [1]
+    # The copy is per-call: a later registry mutation can't reach it.
+    del inst.probes["jlens/example"]
+    assert "jlens/example" in specs
+
+    # And the idle read blocks while the lens-state lock is held.
+    entered = threading.Event()
+    out: list[Any] = []
+
+    def _idle_read() -> None:
+        entered.set()
+        out.append(inst._measurement_state())
+
+    with inst.state_lock:
+        reader = threading.Thread(target=_idle_read)
+        reader.start()
+        assert entered.wait(timeout=5.0)
+        reader.join(timeout=0.2)
+        assert reader.is_alive()
+    reader.join(timeout=5.0)
+    assert not reader.is_alive() and out
+
+    # A bound run stays lock-free frozen state (prep pin + binding).
+    inst.probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [1],
+    }
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    inst.bind(inst.plan(prep), prep)
+    lens_bound, specs_bound = inst._measurement_state()
+    assert prep.pinned and lens_bound is prep.lens
+    assert specs_bound is inst.current_run.binding.specs
+    session_a._close_instrument_runs()
+
+
+def test_prepare_pin_demand_formula() -> None:
+    """Pin demand = a live readout, or attached probes with a final
+    aggregate or a lens gate — the one formula both generation
+    boundaries (``_begin_capture`` and the batch preamble) reduce to."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _StubSession()
+    session.fit_jlens(_PROMPTS, force=True)
+    inst = session._lens_instrument
+
+    # No probes, no live consumer -> unpinned, no disk read taken.
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    assert prep.pinned is False and prep.lens is None
+
+    # Probes + final aggregate (also the batch shape) -> pinned.
+    session._lens_probes["jlens/example"] = {
+        "word": "example", "token_id": 1, "layers": [0],
+    }
+    prep = inst.prepare(ReadRequest(final_aggregate=True, batch=True))
+    assert prep.pinned is True and prep.lens is not None
+
+    # Final readings disabled: dormant probes do not pin — a lens gate does.
+    prep = inst.prepare(ReadRequest(final_aggregate=False))
+    assert prep.pinned is False
+    prep = inst.prepare(ReadRequest(
+        final_aggregate=False,
+        gate_keys=frozenset({"jlens/example"}),
+    ))
+    assert prep.pinned is True
+
+    # A live-readout consumer pins with an empty probe registry.
+    del session._lens_probes["jlens/example"]
+    inst.live = {"layers": [0]}
+    prep = inst.prepare(ReadRequest(final_aggregate=False, live=True))
+    assert prep.pinned is True and prep.request.live is True
+    inst.live = None
+
+
+def test_prepare_on_a_bound_run_raises() -> None:
+    """The jlens getter short-circuits on a bound run's pin flag, so a
+    prepare taken without closing the prior run would silently skip the
+    refresh — every family rejects it instead."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _StubSession()
+    session._monitor = SimpleNamespace(probe_names=[])
+    request = ReadRequest(final_aggregate=False)
+    instruments = (
+        session._lens_instrument,
+        session._sae_instrument,
+        session._geometry_instrument,
+    )
+    for inst in instruments:
+        prep = inst.prepare(request)
+        inst.bind(inst.plan(prep), prep)
+        with pytest.raises(RuntimeError, match="bound run"):
+            inst.prepare(request)
+    session._close_instrument_runs()
+    for inst in instruments:
+        inst.prepare(request)  # idle runs again — every prepare passes
+
+
+def test_bind_and_plan_reject_foreign_or_missing_preps() -> None:
+    """The transaction contract is enforced, not advisory: a bare
+    ``bind(plan)`` is a TypeError, a wrong-family prep (including a
+    wrong-family ``LensPrep``) is rejected by every family, and plans are
+    validated for family provenance too."""
+    from saklas.core.instruments.types import (
+        InstrumentPlan,
+        InstrumentPrep,
+        LensPrep,
+        ReadRequest,
+    )
+
+    session = _StubSession()
+    session._monitor = SimpleNamespace(probe_names=[])
+    request = ReadRequest(final_aggregate=False)
+
+    lens = session._lens_instrument
+    lens_prep = lens.prepare(request)
+    with pytest.raises(TypeError):
+        lens.bind(InstrumentPlan(family="lens"))  # type: ignore[call-arg]  # bare bind: prep required
+    with pytest.raises(TypeError, match="LensPrep"):
+        lens.bind(InstrumentPlan(family="lens"), InstrumentPrep(family="lens"))
+    with pytest.raises(TypeError, match="LensPrep"):
+        lens.bind(
+            InstrumentPlan(family="lens"), LensPrep(family="sae"),
+        )
+    with pytest.raises(TypeError, match="LensPrep"):
+        lens.plan(InstrumentPrep(family="lens"))
+    with pytest.raises(ValueError, match="plan family"):
+        lens.bind(InstrumentPlan(family="sae"), lens_prep)
+    assert lens.current_run.bound is False
+
+    sae = session._sae_instrument
+    sae_prep = sae.prepare(request)
+    with pytest.raises(TypeError):
+        sae.bind(InstrumentPlan(family="sae"))  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="family"):
+        sae.bind(InstrumentPlan(family="sae"), InstrumentPrep(family="lens"))
+    with pytest.raises(TypeError, match="family"):
+        sae.plan(InstrumentPrep(family="geometry"))
+    with pytest.raises(ValueError, match="plan family"):
+        sae.bind(InstrumentPlan(family="lens"), sae_prep)
+    assert sae.current_run.bound is False
+
+    geometry = session._geometry_instrument
+    geometry_prep = geometry.prepare(request)
+    with pytest.raises(TypeError):
+        geometry.bind(InstrumentPlan(family="geometry"))  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="family"):
+        geometry.bind(
+            InstrumentPlan(family="geometry"), InstrumentPrep(family="sae"),
+        )
+    with pytest.raises(TypeError, match="family"):
+        geometry.plan(InstrumentPrep(family="lens"))
+    with pytest.raises(ValueError, match="plan family"):
+        geometry.bind(InstrumentPlan(family="lens"), geometry_prep)
+    assert geometry.current_run.bound is False
+
+
+def test_bind_rejects_same_family_plan_prep_crossing() -> None:
+    """sol's round-4 P2: a plan derived from prep A must not bind with
+    prep B of the same family — the session's capture union would retain
+    A's layers while the run measures B.  The per-preparation token the
+    plan echoes is compared at bind, in every family (a hand-built plan,
+    which carries no token, is rejected the same way)."""
+    from saklas.core.instruments.types import InstrumentPlan, ReadRequest
+
+    session = _StubSession()
+    session._monitor = SimpleNamespace(probe_names=[])
+    request = ReadRequest(final_aggregate=False)
+    for inst in (
+        session._lens_instrument,
+        session._sae_instrument,
+        session._geometry_instrument,
+    ):
+        prep_a = inst.prepare(request)
+        prep_b = inst.prepare(request)
+        plan_a = inst.plan(prep_a)
+        assert plan_a.prep_token == prep_a.token != prep_b.token
+        with pytest.raises(ValueError, match="prep_token"):
+            inst.bind(plan_a, prep_b)
+        with pytest.raises(ValueError, match="prep_token"):
+            inst.bind(InstrumentPlan(family=inst.family), prep_a)
+        assert inst.current_run.bound is False
+        inst.bind(plan_a, prep_a)  # the matched pair binds
+        session._close_instrument_runs()
+
+    # Cross-INSTANCE crossing (round-5): tokens are one process-wide
+    # sequence, so a plan from another instrument instance of the same
+    # family can't bind here either (per-instance counters both started
+    # at 1 and collided).
+    other = _StubSession()
+    other._monitor = SimpleNamespace(probe_names=[])
+    prep_other = other._lens_instrument.prepare(request)
+    plan_other = other._lens_instrument.plan(prep_other)
+    prep_local = session._lens_instrument.prepare(request)
+    assert prep_other.token != prep_local.token
+    with pytest.raises(ValueError, match="prep_token"):
+        session._lens_instrument.bind(plan_other, prep_local)
+
+
+def test_prepare_rejects_a_layerless_pin_demanded_lens() -> None:
+    """A pin-demanded lens without ``source_layers`` is structurally
+    broken (layers align captures, specs, and Jacobians) — it fails at
+    the prepare boundary, not as a mid-generation KeyError."""
+    from saklas.core.instruments.types import ReadRequest
+
+    class _BrokenLensStub(_StubSession):
+        _broken_lens: Any
+
+        @property
+        def jlens(self) -> Any:
+            return self._broken_lens
+
+    session = _BrokenLensStub()
+    session._broken_lens = object()  # no source_layers
+    inst = session._lens_instrument
+    inst.live = {"layers": [0]}
+    with pytest.raises(RuntimeError, match="source_layers"):
+        inst.prepare(ReadRequest(final_aggregate=False, live=True))
+
+
 def test_generation_lens_snapshot_avoids_per_token_disk_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -572,9 +1074,9 @@ def test_generation_lens_snapshot_avoids_per_token_disk_validation(
     session._lens_probes["jlens/a"] = {
         "word": "a", "token_id": 1, "layers": layers,
     }
-    session._generation_jlens = lens
-    session._generation_jlens_active = True
-    session._live_lens_active_for_generation = False
+    session._lens_instrument.generation_lens = lens
+    session._lens_instrument.generation_lens_active = True
+    session._lens_instrument.active_for_generation = False
 
     monkeypatch.setattr(
         lens_io,
@@ -1225,7 +1727,7 @@ def test_subset_resume_releases_unrequested_resident_matrices(
     assert session._jlens_device_cache
     old_live_stack = torch.zeros(64)
     live_stack_ref = weakref.ref(old_live_stack)
-    session._live_lens = {
+    session._lens_instrument.live = {
         "layers": [0], "top_k": 3, "J_stack": old_live_stack,
     }
     del old_live_stack
@@ -1354,7 +1856,7 @@ def test_jlens_readout_shape_and_default_position() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
     seen_pool: list[int | None] = []
-    import saklas.core.vectors as _vectors
+    import saklas.core.capture as _vectors
 
     real_capture = _vectors._capture_all_hidden_states
 
@@ -1572,6 +2074,31 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         assert spread >= 0.0
 
 
+def test_live_lens_readout_step_avoids_float64_for_mps_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_to = torch.Tensor.to
+
+    def reject_float64(
+        self: torch.Tensor, *args: Any, **kwargs: Any,
+    ) -> torch.Tensor:
+        dtype = kwargs.get("dtype")
+        if args and isinstance(args[0], torch.dtype):
+            dtype = args[0]
+        if dtype is torch.float64:
+            raise AssertionError("device-side float64 is unsupported on MPS")
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", reject_float64)
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s.enable_live_lens(layers=[0, 1])
+    s._capture = _FakeCapture({0: torch.randn(6), 1: torch.randn(6)})
+
+    step = s._live_lens_readout_step(top_k=3)
+    assert step is not None
+
+
 def test_jlens_row_selector_avoids_copy_for_identity_and_contiguous_rows() -> None:
     tensor = torch.arange(24, dtype=torch.float32).reshape(4, 6)
 
@@ -1627,10 +2154,11 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     )
 
     # A gated pinned probe calibrates before the token tap and stashes the
-    # matrix. Cards, pinned readings, and aggregate must all reuse it.
-    scalars = s._score_lens_gate_scalars()
+    # matrix, keyed by this forward's step id. Cards, pinned readings, and
+    # aggregate must all reuse it — the display passes the SAME step.
+    scalars = s._score_lens_gate_scalars(step_id=4)
     assert scalars
-    assert s._live_lens_readout_step(top_k=3) is not None
+    assert s._live_lens_readout_step(top_k=3, step_id=4) is not None
     assert calls == 1
     assert stat_calls == 1
     assert s._last_lens_step_readings is not None
@@ -1684,17 +2212,23 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
     import saklas.core.jlens as jlens_module
 
     probabilities = jlens_module.readout_probabilities(logits)
-    s._lens_step_stash = {
-        "fresh": True,
+    s._lens_instrument.step_stash = {
+        "step": 5,
         "layers": (1,),
         "logits": logits,
         "probabilities": probabilities,
     }
 
-    step = s._live_lens_readout_step(top_k=3)
+    step = s._live_lens_readout_step(top_k=3, step_id=5)
 
     assert step is not None
-    assert s._lens_step_stash["fresh"] is False
+    # Step-keyed reuse is idempotent — a second same-step consumer also
+    # rides the stash (the old ``fresh`` flag was consume-once); a
+    # different step never matches, so staleness is structural.
+    assert s._live_lens_readout_step(top_k=3, step_id=5) is not None
+    stash = s._lens_step_stash
+    assert stash is not None
+    assert stash["step"] == 5
 
 
 def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
@@ -1708,7 +2242,7 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
         1: torch.randn(6, generator=torch.Generator().manual_seed(1)),
     })
 
-    assert s._score_lens_gate_scalars({"jlens/g"})
+    assert s._score_lens_gate_scalars({"jlens/g"}, step_id=3)
     assert s._lens_step_stash is not None
     assert s._lens_step_stash["layers"] == (1,)
     # Poison the live transport row for the gated layer after the gate callback.
@@ -1718,7 +2252,7 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     row = s._live_lens["layer_rows"][1]
     s._live_lens["J_stack"][row].fill_(float("nan"))
 
-    step = s._live_lens_readout_step(top_k=3)
+    step = s._live_lens_readout_step(top_k=3, step_id=3)
 
     assert step is not None
     per_layer, aggregate, token_ids = step
@@ -1726,6 +2260,84 @@ def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     assert set(token_ids) == {0, 1}
     assert all(torch.isfinite(torch.tensor(score)) for _tok, score in per_layer[1])
     assert all(torch.isfinite(torch.tensor(row[1])) for row in aggregate)
+
+
+def test_lens_full_roster_gate_read_primes_bound_observe_memo() -> None:
+    """A bound generation's gate callback computing FULL-roster readings
+    (the live-display superset path) primes the run's observe memo — a
+    same-step ``observe`` is a hit; the memo is exactly the stashed
+    readings object."""
+    from saklas.core.instruments.types import ReadRequest
+
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s.enable_live_lens(layers=[0, 1])
+    s._add_lens_probe("jlens/g", as_name=None)
+    s._capture = _FakeCapture({
+        0: torch.randn(6, generator=torch.Generator().manual_seed(30)),
+        1: torch.randn(6, generator=torch.Generator().manual_seed(31)),
+    })
+    inst = s._lens_instrument
+    prep = inst.prepare(ReadRequest(live=True, final_aggregate=True))
+    run = inst.bind(inst.plan(prep), prep)
+
+    scalars = s._score_lens_gate_scalars({"jlens/g"}, step_id=7)
+
+    assert scalars
+    assert run._memo_step == 7
+    # Memo hit — no recompute (empty hidden would otherwise score empty).
+    assert run.observe(7, {}) is run.last_step_readings
+    inst.close_run()
+
+
+def test_lens_gate_keys_none_vs_empty_contract() -> None:
+    """``gate_keys=None`` scores the full roster; an explicit ``set()``
+    scores nothing (the worker's old ``if gate_keys:`` treated both as
+    full-roster — sol's round-3 P2).  The lens member of the three-family
+    contract pin."""
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s._add_lens_probe("jlens/g", as_name=None)
+    layers = [int(layer) for layer in s.jlens.source_layers]
+    d_model = next(iter(s.jlens.jacobians.values())).shape[0]
+    s._capture = _FakeCapture({
+        layer: torch.randn(
+            d_model, generator=torch.Generator().manual_seed(layer),
+        )
+        for layer in layers
+    })
+    inst = s._lens_instrument
+    full = inst.gate_scalars(None, step_id=0)
+    assert "jlens/g" in full
+    assert inst.gate_scalars(set(), step_id=0) == {}
+
+
+def test_lens_negative_step_observe_never_caches() -> None:
+    """``step_id < 0`` (the no-identity sentinel) never populates the lens
+    run's observe memo — repeated negative observations rescore (sol's
+    round-2 coverage gap: the geometry test alone didn't pin the shared
+    fix on this family)."""
+    from saklas.core.instruments.types import ReadRequest
+
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s._add_lens_probe("jlens/g", as_name=None)
+    inst = s._lens_instrument
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    run = inst.bind(inst.plan(prep), prep)
+
+    calls: list[int] = []
+
+    def _fresh_probes(_hidden: Any, **_kw: Any) -> dict[str, Any]:
+        calls.append(1)
+        return {"jlens/g": object()}
+
+    inst.score_probes = _fresh_probes  # type: ignore[method-assign]
+    first = run.observe(-1, {})
+    second = run.observe(-1, {})
+    assert len(calls) == 2 and first is not second
+    assert run._memo_step is None
+    inst.close_run()
 
 
 def test_live_lens_readout_step_none_when_off() -> None:
@@ -1799,7 +2411,7 @@ def test_jlens_token_readout_shape_and_position() -> None:
     node_id = _tree_with_assistant(s, raw_ids)
 
     seen_lens: list[tuple[int, int | None]] = []
-    import saklas.core.vectors as _vectors
+    import saklas.core.capture as _vectors
 
     real_capture = _vectors._capture_all_hidden_states
 
@@ -1851,7 +2463,7 @@ def test_jlens_token_readout_index_zero_reads_prompt_only() -> None:
     node_id = _tree_with_assistant(s, s._tokenizer.encode("abc"))
 
     seen_lens: list[tuple[int, int | None]] = []
-    import saklas.core.vectors as _vectors
+    import saklas.core.capture as _vectors
 
     real_capture = _vectors._capture_all_hidden_states
 

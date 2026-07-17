@@ -200,7 +200,7 @@
     border-radius: var(--radius);
   }
   .grid {
-    stroke: var(--border);
+    stroke: var(--glass-line);
     stroke-width: 1;
   }
   .trajectory {

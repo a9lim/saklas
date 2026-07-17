@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from saklas.core.errors import SaklasError
+from saklas.core.naming import canonical_concept_name
 from saklas.io.packs import NAME_REGEX
 from saklas.io.paths import VARIANT_SUFFIX_RE, manifolds_dir
 
@@ -233,9 +234,6 @@ def canonicalize_atom(raw: str) -> tuple[str, str]:
             raw = name_part
         else:
             raise SelectorError(f"unknown variant '{maybe_variant}' in '{raw}'")
-
-    # Lazy import to avoid a cycle: session.py imports this module.
-    from saklas.core.session import canonical_concept_name
 
     slug = canonical_concept_name(raw)
     return slug, variant

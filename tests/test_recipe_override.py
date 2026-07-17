@@ -139,9 +139,8 @@ def test_compose_unknown_raises():
 def test_compose_custom_recipe_passthrough():
     """``compose_modifier`` with a Recipe arg returns it unchanged.
 
-    The custom-mode path: callers (TUI's ``/auto-regen custom: <expr>``)
-    parse the partial-recipe expression themselves and hand the Recipe
-    in; ``compose_modifier`` shouldn't try to interpret it as a string.
+    The custom-mode path: callers parse the partial-recipe expression themselves
+    and hand the Recipe in; ``compose_modifier`` shouldn't interpret it as a string.
     """
     partial = Recipe(steering="0.5 calm", sampling=SamplingConfig(temperature=0.4))
     out = Recipe(steering="0.3 honest", seed=42).compose_modifier(partial)
@@ -162,8 +161,8 @@ def test_compose_custom_via_overlay():
 def test_compose_modifier_routes_through_overlay_in_regen_with_modifier():
     """End-to-end: regen_with_modifier accepts a Recipe partial as ``mode``.
 
-    Verifies the full custom-mode wiring: TUI parses ``custom: <expr>``
-    into a Recipe, hands it to ``session.regen_with_modifier(... mode=<Recipe>)``,
+    Verifies the full custom-mode wiring: a caller parses ``custom: <expr>`` into
+    a Recipe and passes it to ``session.regen_with_modifier(... mode=<Recipe>)``,
     which routes through ``compose_modifier(Recipe) -> Recipe`` and overlays
     onto the parent recipe.  No model load — uses _resolve_recipe_override
     which is the pure-Python overlay path.

@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "5.0.0"
+__version__ = "5.1.0"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "SaklasSession": ("saklas.core.session", "SaklasSession"),
@@ -19,7 +19,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "Steering": ("saklas.core.steering", "Steering"),
     "Trigger": ("saklas.core.triggers", "Trigger"),
     "EventBus": ("saklas.core.events", "EventBus"),
-    "VectorExtracted": ("saklas.core.events", "VectorExtracted"),
+    "ManifoldExtracted": ("saklas.core.events", "ManifoldExtracted"),
     "SteeringApplied": ("saklas.core.events", "SteeringApplied"),
     "SteeringCleared": ("saklas.core.events", "SteeringCleared"),
     "ProbeScored": ("saklas.core.events", "ProbeScored"),
@@ -72,8 +72,12 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "SelectorError": ("saklas.io.selectors", "SelectorError"),
     "AmbiguousSelectorError": ("saklas.io.selectors", "AmbiguousSelectorError"),
     "ManifoldNotRegisteredError": ("saklas.core.session", "ManifoldNotRegisteredError"),
-    "VectorNotRegisteredError": ("saklas.core.session", "VectorNotRegisteredError"),
+    "ProfileNotRegisteredError": ("saklas.core.session", "ProfileNotRegisteredError"),
     # Jacobian lens (the verbalizable-workspace readout)
+    "GeometryInstrument": ("saklas.core.instruments.geometry", "GeometryInstrument"),
+    "LensInstrument": ("saklas.core.instruments.lens", "LensInstrument"),
+    "SaeInstrument": ("saklas.core.instruments.sae", "SaeInstrument"),
+    "UnsupportedProbeChannelError": ("saklas.core.errors", "UnsupportedProbeChannelError"),
     "JacobianLens": ("saklas.core.jlens", "JacobianLens"),
     "JSpaceDecomposition": ("saklas.core.jlens", "JSpaceDecomposition"),
     "JacobianLensError": ("saklas.core.jlens", "JacobianLensError"),
@@ -93,7 +97,7 @@ __all__ = [
     "Steering",
     "Trigger",
     "EventBus",
-    "VectorExtracted",
+    "ManifoldExtracted",
     "SteeringApplied",
     "SteeringCleared",
     "ProbeScored",
@@ -146,8 +150,12 @@ __all__ = [
     "SelectorError",
     "AmbiguousSelectorError",
     "ManifoldNotRegisteredError",
-    "VectorNotRegisteredError",
+    "ProfileNotRegisteredError",
     # Jacobian lens (the verbalizable-workspace readout)
+    "GeometryInstrument",
+    "LensInstrument",
+    "SaeInstrument",
+    "UnsupportedProbeChannelError",
     "JacobianLens",
     "JSpaceDecomposition",
     "JacobianLensError",
@@ -179,7 +187,7 @@ if TYPE_CHECKING:
         ProbeScored as ProbeScored,
         SteeringApplied as SteeringApplied,
         SteeringCleared as SteeringCleared,
-        VectorExtracted as VectorExtracted,
+        ManifoldExtracted as ManifoldExtracted,
     )
     from saklas.core.loom import (
         CastMember as CastMember,
@@ -248,7 +256,7 @@ if TYPE_CHECKING:
     )
     from saklas.core.session import (
         ManifoldNotRegisteredError as ManifoldNotRegisteredError,
-        VectorNotRegisteredError as VectorNotRegisteredError,
+        ProfileNotRegisteredError as ProfileNotRegisteredError,
     )
     from saklas.core.jlens import (
         JacobianLens as JacobianLens,
@@ -256,4 +264,16 @@ if TYPE_CHECKING:
         JSpaceDecomposition as JSpaceDecomposition,
         LensNotFittedError as LensNotFittedError,
         MultiTokenWordError as MultiTokenWordError,
+    )
+    from saklas.core.errors import (
+        UnsupportedProbeChannelError as UnsupportedProbeChannelError,
+    )
+    from saklas.core.instruments.geometry import (
+        GeometryInstrument as GeometryInstrument,
+    )
+    from saklas.core.instruments.lens import (
+        LensInstrument as LensInstrument,
+    )
+    from saklas.core.instruments.sae import (
+        SaeInstrument as SaeInstrument,
     )

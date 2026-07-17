@@ -51,6 +51,62 @@ def probe_reading_aggregate(
     }
 
 
+def probe_measurements_aggregate(
+    session: "SaklasSession", result: "GenerationResult | None",
+) -> dict[str, Any] | None:
+    """Aggregate-scope measurement envelope for the native WS ``done`` frame.
+
+    Splits ``result.probe_readings`` by family — geometry (Monitor probes),
+    lens (``session.lens_probe_names``), SAE (``session.sae_probe_names``) — and
+    builds one ``scope="aggregate"`` envelope
+    (:func:`saklas.core.measurements.build_measurements`).  ``None`` when no
+    probe is attached / no result recorded.  The compat ``probe_readings``
+    aggregate still rides the done frame separately (see
+    :func:`probe_reading_aggregate`); this is the additional 5.x envelope.
+
+    Source / layer binding fields come from the live lens / SAE configs when a
+    family actually contributed readings; otherwise ``None`` (so a historical
+    row stays interpretable after a source switch).
+    """
+    from saklas.core.measurements import build_measurements
+
+    if result is None:
+        return None
+    readings = result.probe_readings or {}
+    if not readings:
+        return None
+
+    geometry_names = set(session.monitor.probe_names)
+    lens_names = set(getattr(session, "lens_probe_names", []) or [])
+    sae_names = set(getattr(session, "sae_probe_names", []) or [])
+    geometry = {n: r for n, r in readings.items() if n in geometry_names} or None
+    lens = {n: r for n, r in readings.items() if n in lens_names} or None
+    sae = {n: r for n, r in readings.items() if n in sae_names} or None
+
+    live_lens = getattr(session, "_live_lens", None)
+    live_sae = getattr(session, "_live_sae", None)
+    lens_source = (
+        live_lens.get("source") if lens and isinstance(live_lens, dict) else None
+    )
+    sae_source = (
+        live_sae.get("source") if sae and isinstance(live_sae, dict) else None
+    )
+    sae_layer = (
+        live_sae.get("layer") if sae and isinstance(live_sae, dict) else None
+    )
+
+    return build_measurements(
+        scope="aggregate",
+        geometry_readings=geometry,
+        lens_readings=lens,
+        sae_readings=sae,
+        lens_source=lens_source,
+        sae_source=sae_source,
+        sae_layer=sae_layer,
+        steering=getattr(result, "applied_steering", None),
+    )
+
+
 def _usage_dict(result: "GenerationResult") -> dict[str, int]:
     pt = result.prompt_tokens
     ct = result.token_count

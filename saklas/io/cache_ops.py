@@ -61,7 +61,7 @@ def export_gguf_manifold(
     """Export a fitted 2-node ``pca`` manifold to GGUF by folding it to a vector.
 
     Sources each per-model profile by folding the manifold
-    (:func:`~saklas.core.vectors.folded_vector_directions`), then writes a
+    (:func:`~saklas.core.capture.folded_directions`), then writes a
     llama.cpp control-vector GGUF.  ``model_scope`` restricts to one base model;
     without it, every fitted ``raw`` tensor is exported (one ``.gguf`` per
     model).  ``output`` policy mirrors the old vector export:
@@ -76,8 +76,8 @@ def export_gguf_manifold(
     from saklas.io.paths import (
         manifold_dir, parse_tensor_filename, tensor_filename,
     )
-    from saklas.core.manifold import load_manifold
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.io.manifold_tensors import load_manifold
+    from saklas.core.capture import folded_directions
 
     mdir = manifold_dir(ns, name)
     # Preflight needs folder identity/source and fitted filenames only.  Each
@@ -125,7 +125,7 @@ def export_gguf_manifold(
             )
         )
         try:
-            profile = folded_vector_directions(manifold)
+            profile = folded_directions(manifold)
         except Exception as e:
             raise RuntimeError(
                 f"{ns}/{name}: manifold does not fold to a single steering "

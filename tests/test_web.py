@@ -4,7 +4,6 @@ Covers:
 * ``saklas.web.register_web_routes`` mounts the SPA bundle at ``/`` with
   a fallback to index.html for client-side routes.
 * GET /saklas/v1/sessions/{id}/correlation returns the right matrix shape.
-* GET /saklas/v1/sessions/{id}/vectors/{name} carries per_layer_norms.
 * The WS token event surfaces per_layer_scores when probes are loaded.
 
 CPU-only.  No npm build runs here — the committed dist/ bundle is the
@@ -65,7 +64,11 @@ def _mock_session_with_vectors(vectors: dict[str, Profile]):
     session.config.system_prompt = None
     session.config.thinking = None
 
-    session.vectors = vectors
+    # The profile registry stores raw per-layer tensor dicts; the route wraps
+    # each in a Profile for the wire.  Analytics still read Profiles below.
+    session.profiles = {
+        name: dict(prof.items()) for name, prof in vectors.items()
+    }
     session.probes = {}
     session.history = []
     session.monitor = MagicMock()
@@ -207,7 +210,7 @@ class TestWebMount:
 
 
 # ---------------------------------------------------------------------------
-# Protocol additions: correlation + per_layer_norms.
+# Protocol additions: correlation.
 # ---------------------------------------------------------------------------
 
 
@@ -253,19 +256,25 @@ class TestCorrelationEndpoint:
         assert sorted(session.whitener.apply_calls) == [0, 0, 5, 5]
 
 
-class TestVectorPerLayerNorms:
-    def test_get_vector_returns_per_layer_norms(self, web_client: Any) -> None:
+class TestRemovedDashboardSurfaces:
+    def test_vector_profile_omits_layer_norm_payload(self, web_client: Any) -> None:
         _session, client = web_client
-        r = client.get("/saklas/v1/sessions/default/vectors/honest")
+        r = client.get("/saklas/v1/sessions/default/profiles/honest")
         assert r.status_code == 200
         data = r.json()
-        assert "per_layer_norms" in data
-        norms = data["per_layer_norms"]
-        # Layers from the fixture profile: {0, 5}.
-        assert set(norms.keys()) == {"0", "5"}
-        # Layer 0 is the unit vector along axis 0; norm = 1.0.
-        assert norms["0"] == pytest.approx(1.0)
-        assert norms["5"] == pytest.approx(1.0)
+        assert set(data) == {"name", "layers", "metadata"}
+
+    def test_removed_native_and_styleguide_routes_are_not_spa_fallbacks(
+        self, web_client: Any,
+    ) -> None:
+        _session, client = web_client
+        for path in (
+            "/saklas/v1/sessions/default/profiles/honest/diagnostics",
+            "/saklas/v1/sessions/default/experiments/fan",
+            "/styleguide",
+            "/styleguide/anything",
+        ):
+            assert client.get(path).status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +287,7 @@ class TestScoreSingleTokenPerLayer:
         # Build a real TraitMonitor, register two probes that share
         # layer 0, score against a hidden state.  No torch model needed.
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
         means = {0: torch.zeros(4)}
@@ -311,7 +320,7 @@ class TestScoreSingleTokenPerLayer:
 
     def test_empty_input_returns_empty(self) -> None:
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from tests._whitener import isotropic_whitener
 
         means = {0: torch.zeros(4)}
@@ -325,7 +334,7 @@ class TestScoreSingleTokenPerLayer:
 
     def test_layers_outside_probe_cache_omitted(self) -> None:
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from tests._whitener import isotropic_whitener
 
         means = {0: torch.zeros(4)}

@@ -18,9 +18,10 @@ Caller responsibilities:
 - Call :func:`is_cuda_graphs_supported` during construction; it caches by
   underlying module id (through ``torch.compile``'s ``_orig_mod`` wrapper),
   device, and dtype, then the session stores the boolean result.
-- On supported sessions, build a fresh StaticCache via
-  :func:`make_static_cache` per generation, sized to
-  ``prompt_len + max_new_tokens + cache_position_offset``.
+- On supported sessions, keep an identity-stable StaticCache built via
+  :func:`make_static_cache`, reset it between generations, and grow it only when
+  the requested ``prompt_len + max_new_tokens + cache_position_offset`` exceeds
+  its capacity.
 - On unsupported sessions, fall back transparently to DynamicCache —
   the eager loop is unchanged.
 
@@ -219,6 +220,66 @@ def make_static_cache(
         device=device,
         dtype=dtype,
     )
+    # Transformers 5.x otherwise initializes every cache layer on its first
+    # ``update`` *inside* the compiled prefill.  Besides allocating the K/V
+    # buffers in the graph, that moves ``cumulative_length`` from CPU to CUDA
+    # there, so inductor rejects CUDA-graph capture (one CPU input plus three
+    # unmarked mutations per layer) and recompiles every fresh cache until the
+    # recompile limit falls back to eager.  Initialize from the text config
+    # before the compiled call so transformers can mark the stable K/V tensor
+    # addresses and the advertised CUDA-graph path actually captures.
+    #
+    # Keep a lazy fallback for unusual custom architectures whose cache
+    # geometry cannot be described by the standard GQA fields.  StaticCache is
+    # still correct for those models; it merely retains the older fusion-only
+    # behavior instead of turning an optimization attempt into a generation
+    # failure.
+    early_init = getattr(cache, "early_initialization", None)
+    if early_init is not None:
+        config = getattr(model, "config", None)
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config):
+            try:
+                config = get_text_config()
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                log.debug(
+                    "Could not resolve text config for StaticCache early "
+                    "initialization; retaining lazy initialization",
+                    exc_info=True,
+                )
+        attention_heads = getattr(config, "num_attention_heads", None)
+        kv_heads = getattr(config, "num_key_value_heads", None)
+        if kv_heads is None:
+            kv_heads = attention_heads
+        head_dim = getattr(config, "head_dim", None)
+        hidden_size = getattr(config, "hidden_size", None)
+        if (
+            head_dim is None
+            and isinstance(hidden_size, int)
+            and isinstance(attention_heads, int)
+            and attention_heads > 0
+        ):
+            head_dim = hidden_size // attention_heads
+        if (
+            isinstance(kv_heads, int)
+            and kv_heads > 0
+            and isinstance(head_dim, int)
+            and head_dim > 0
+        ):
+            try:
+                early_init(
+                    batch_size=1,
+                    num_heads=kv_heads,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                    device=torch.device(device),
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                log.debug(
+                    "StaticCache early initialization failed; retaining lazy "
+                    "initialization",
+                    exc_info=True,
+                )
     # Flag each sliding layer that can't slide for this generation (the whole
     # ``max_cache_len`` context fits its static buffer) so the patched
     # ``get_mask_sizes`` returns the guard-free constant and the hybrid-cache

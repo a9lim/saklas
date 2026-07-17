@@ -247,8 +247,8 @@ from avenue #2 above — the two parked threads converge.
 Practical notes for the eventual run: near the final layers J_l converges to
 the raw unembedding row, so J-lens ≈ logit lens exactly where Vogel saw the
 suppression — the informative delta is the 46–62 hills, i.e. the late-band
-region. Fit the lens through the late layers (the per-layer readout covers any
-fitted layer; only the aggregate is band-restricted 40–90%). "yes"/"no" are
+region. Fit the lens through the late layers: both the per-layer readout and
+the aggregate cover every requested fitted layer. "yes"/"no" are
 single tokens, so `jlens/yes`-style readout probes apply directly, and gate
 scalars already ride the readout channel. Open question for the harness: vgel's
 injection is KV-cache-persistent (steer turn 1, ask unsteered in turn 2) —

@@ -32,7 +32,7 @@
 <style>
   .sk-validation {
     border-left: 2px solid var(--accent-yellow);
-    background: rgba(153, 135, 0, 0.06);
+    background: var(--warn-bg);
     padding: var(--space-3) var(--space-4);
     border-radius: var(--radius);
     color: var(--fg-strong);

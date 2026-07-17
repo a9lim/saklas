@@ -1,55 +1,75 @@
 <script lang="ts">
-  // Per-token drilldown drawer — opens when a chat token is clicked.
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
+  // Per-token drilldown drawer — opens when a chat / raw-buffer token is
+  // clicked.
   //
-  // Replaces the v1.6 always-on inspector (which forced every user to look
-  // at a per-token × per-layer × per-probe heatmap whether they wanted it
-  // or not) with an on-demand surface keyed to a specific token.  Drawer
-  // params come in via openDrawer("token_drilldown", { turnIdx, tokenIdx,
-  // isThinking? }).  Click data flows through chatLog.turns[turnIdx] —
-  // either turn.tokens[tokenIdx] (response stream, default) or
-  // turn.thinkingTokens[tokenIdx] when isThinking is true.
+  // The drawer is a shell over four family tabs (drawers/token/):
+  // geometry (Monitor readings), logits (top-K alts + fork), sae (gold),
+  // j-lens (blue) — each speaking one shared grammar: the shell's
+  // identity header (token text + id / raw / logprob chips), the context
+  // ribbon, then a per-tab InstrumentHeader (provenance · source ·
+  // steering · apply-recipe toggle) over the body.  The selected tab is
+  // STICKY for the page session (drilldown.svelte.ts); j-lens is the
+  // default.
   //
-  // Layout: header with the token text + coordinates + position scrubber,
-  // a toolbar with the view tabs (probes / logits / j-lens; only the lens
-  // carries a hue dot — it is the one pillar-owned surface here) and the
-  // steered/unsteered branch toggle, then the per-tab body.  Heatmap cells
-  // tint via tokens.scoreToRgb so highlight saturation matches the chat
-  // tokens themselves; the j-lens matrix tints in the lens family blue.
+  // Navigation is a conversation-walking cursor (drawers/token/cursor.ts):
+  // ←/→ step tokens and ROLL ACROSS segment + turn boundaries (thinking →
+  // response → next turn), so chat mode walks the same flat stream the
+  // raw buffer shows; ↑/↓ jump turns, Home/End jump segment bounds, and
+  // a fresh token click snaps the cursor back to its anchor.  Drawer
+  // params still come in via openDrawer("token_drilldown", { turnIdx,
+  // tokenIdx, isThinking? }) and index chatLog.turns.
 
   import {
     drawerState,
     closeDrawer,
     chatLog,
     loomTree,
-    sendFork,
     samplingState,
     sessionState,
     effectiveRawMode,
-    probeAxisScale,
+    probeRack,
     lensSourceState,
     saeSourceState,
   } from "../lib/stores.svelte";
-  import { ApiError, apiLens, apiSae } from "../lib/api";
   import type {
     ChatTurn,
     LensTokenReadoutJSON,
+    ProbeReadingJSON,
     SaeTokenReadoutJSON,
     TokenScore,
   } from "../lib/types";
-  import HeatmapCell from "../lib/charts/HeatmapCell.svelte";
   import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
-  import Button from "../lib/ui/Button.svelte";
+  import {
+    clampCursor,
+    jumpTurn,
+    segmentTokens,
+    segmentsOf,
+    stepCursor,
+    type SegmentKind,
+    type TokenCursor,
+  } from "./token/cursor";
+  import {
+    ReplayReadout,
+    type GeometryTokenReadout,
+  } from "./token/readout.svelte";
+  import { drilldownUi, type DrilldownTab } from "./token/drilldown.svelte";
+  import TokenRibbon from "./token/TokenRibbon.svelte";
+  import GeometryTab from "./token/GeometryTab.svelte";
+  import LogitsTab from "./token/LogitsTab.svelte";
+  import SaeTab from "./token/SaeTab.svelte";
+  import LensTab from "./token/LensTab.svelte";
+  import { resolveReadoutTopK } from "../lib/readouts";
 
   interface DrawerParams {
     turnIdx: number;
     tokenIdx: number;
     /** When true the click came from the thinking-collapsible body, so
-     * the source list is ``turn.thinkingTokens`` instead of
-     * ``turn.tokens``.  Defaults to false (response stream). */
+     * the anchor segment is ``turn.thinkingTokens``. */
     isThinking?: boolean;
   }
 
-  // ---- params + branch selection ---------------------------------------
+  // ---- params → anchor cursor -------------------------------------------
 
   // Drawer host forwards { params } — but we read off the store via
   // $derived below since drawerState.params is the source of truth.
@@ -57,501 +77,513 @@
   $effect(() => { void _drawerProps.params; });
 
   const params = $derived(drawerState.params as DrawerParams | null);
-  const turnIdx = $derived(params?.turnIdx ?? -1);
-  /** The token index the user actually CLICKED — the drawer's anchor.
-   *  Tab / branch resets key off this, never the scrubbed position, so
-   *  walking the scrubber doesn't kick the user off their tab. */
-  const paramTokenIdx = $derived(params?.tokenIdx ?? -1);
-  const isThinking = $derived(params?.isThinking === true);
 
-  /** Scrubber override — walks the inspected position along the turn's
-   *  token list without re-opening the drawer.  ``null`` means "at the
-   *  clicked token"; any fresh click (params object identity changes)
-   *  snaps back to it. */
-  let scrubTokenIdx = $state<number | null>(null);
-  $effect(() => {
-    void params;
-    scrubTokenIdx = null;
+  /** The position the user actually CLICKED — the drawer's anchor.  A
+   *  fresh click (params object identity changes) snaps the cursor back
+   *  here; the ↩ action does the same. */
+  const anchor = $derived.by<TokenCursor | null>(() => {
+    if (!params) return null;
+    return {
+      turnIdx: params.turnIdx,
+      seg: params.isThinking ? "thinking" : "response",
+      tokenIdx: params.tokenIdx,
+    };
   });
 
-  /** The effective inspected token index — every view (probes heatmap,
-   *  logits table, j-lens matrix, fork actions) reads this one. */
-  const tokenIdx = $derived(scrubTokenIdx ?? paramTokenIdx);
+  /** The walking cursor — every view reads the clamped ``effCursor``
+   *  below; mutations write here. */
+  let cursor = $state<TokenCursor | null>(null);
 
   /** Which branch we're inspecting — "primary" is the steered turn,
-   * "shadow" is the unsteered abPair when available.  Local UI state
-   * because the drawer toggles between them without changing the click
-   * target.  The explicit ``$state<...>`` widens the rune's literal-
-   * inferred type so reassignment to ``"shadow"`` later doesn't trip
-   * a "comparison has no overlap" narrowing error. */
+   * "shadow" the unsteered abPair when available.  Applies to the
+   * cursor's current turn; walking into a different turn resets it. */
   type Branch = "primary" | "shadow";
   let branch: Branch = $state<Branch>("primary");
-  let branchingRank: number | null = $state(null);
-  let branchError: string | null = $state(null);
 
   const BRANCH_ITEMS: Array<{ value: Branch; label: string; title: string }> = [
     { value: "primary", label: "steered", title: "The steered (primary) turn" },
     { value: "shadow", label: "unsteered", title: "The unsteered A/B shadow turn" },
   ];
 
-  /** Reset the branch when the click target changes — opening the drawer
-   * on a new token should always start on the primary side. */
   $effect(() => {
-    void turnIdx;
-    void paramTokenIdx;
+    const a = anchor;
+    cursor = a ? { ...a } : null;
     branch = "primary";
   });
 
+  // ---- cursor resolution --------------------------------------------------
+
+  /** The conversation with the shadow turn swapped in at the cursor's
+   *  turn when the unsteered branch is selected. */
+  const turnsView = $derived<ChatTurn[]>(
+    chatLog.turns.map((t, i) =>
+      i === (cursor?.turnIdx ?? -1) && branch === "shadow" && t.abPair
+        ? t.abPair
+        : t,
+    ),
+  );
+
+  const segments = $derived(segmentsOf(turnsView));
+
+  /** The effective inspected position — the cursor clamped onto the
+   *  current segment list (token lists change while streaming). */
+  const effCursor = $derived(cursor ? clampCursor(segments, cursor) : null);
+
+  /** Reset the branch when the cursor crosses turns — the shadow pair is
+   *  a per-turn artifact. */
+  let lastBranchTurn = -1;
+  $effect(() => {
+    const t = effCursor?.turnIdx ?? -1;
+    if (t !== lastBranchTurn) {
+      lastBranchTurn = t;
+      if (branch !== "primary") branch = "primary";
+    }
+  });
+
+  /** The primary turn at the cursor (for abPair detection). */
   const turn = $derived<ChatTurn | null>(
-    turnIdx >= 0 && turnIdx < chatLog.turns.length
-      ? chatLog.turns[turnIdx]
+    effCursor != null &&
+      effCursor.turnIdx >= 0 &&
+      effCursor.turnIdx < chatLog.turns.length
+      ? chatLog.turns[effCursor.turnIdx]
       : null,
   );
 
-  /** The actual ChatTurn whose tokens we're inspecting — primary or the
-   * abPair when ``branch === "shadow"``.  Null when the indices are
-   * stale (e.g. the user cleared the chat after opening the drawer). */
+  /** The turn actually inspected (shadow-swapped when selected). */
   const inspected = $derived<ChatTurn | null>(
-    branch === "shadow" ? (turn?.abPair ?? null) : turn,
+    effCursor ? (turnsView[effCursor.turnIdx] ?? null) : null,
   );
 
   const tokenList = $derived<TokenScore[]>(
-    (isThinking ? inspected?.thinkingTokens : inspected?.tokens) ?? [],
+    effCursor ? segmentTokens(inspected, effCursor.seg) : [],
   );
 
   const token = $derived<TokenScore | null>(
-    tokenIdx >= 0 && tokenIdx < tokenList.length ? tokenList[tokenIdx] : null,
+    effCursor != null &&
+      effCursor.tokenIdx >= 0 &&
+      effCursor.tokenIdx < tokenList.length
+      ? tokenList[effCursor.tokenIdx]
+      : null,
   );
 
   const loomNodeId = $derived.by(() => {
+    if (!effCursor) return null;
     if (branch === "shadow") {
       return inspected?.nodeId ?? null;
     }
     if (turn?.nodeId) return turn.nodeId;
-    if (turnIdx < 0 || loomTree.activePath.length === 0) return null;
+    if (effCursor.turnIdx < 0 || loomTree.activePath.length === 0) return null;
     const visible = loomTree.activePath
       .map((id) => loomTree.nodes.get(id))
       .filter(Boolean)
       .filter((n) => !(n!.parent_id === null && n!.role === "system" && !n!.text));
-    return visible[turnIdx]?.id ?? null;
+    return visible[effCursor.turnIdx]?.id ?? null;
   });
 
-  // ---- per-layer × per-probe grid --------------------------------------
-
-  /** Layer indices sorted ascending.  Numeric sort over the string-keyed
-   * layer map — TypeScript leaves Object.keys typed as string[] but the
-   * server emits zero-padded integers, so a Number() cast is safe. */
-  const layerKeys = $derived<string[]>(
-    token?.perLayerScores
-      ? Object.keys(token.perLayerScores).sort(
-          (a, b) => Number(a) - Number(b),
-        )
-      : [],
+  const hasReplayContext = $derived(
+    loomNodeId != null && token?.rawIndex != null,
   );
 
-  /** Probe names sorted alphabetically (case-insensitive).  Source the
-   * union over every layer's probe row so a probe with sparse coverage
-   * still gets a column.  Most layers carry the same set in practice
-   * but we don't enforce it. */
-  const probeKeys = $derived.by<string[]>(() => {
-    const pls = token?.perLayerScores;
-    if (!pls) return [];
-    const seen = new Set<string>();
-    for (const layer of Object.keys(pls)) {
-      for (const probe of Object.keys(pls[layer] ?? {})) {
-        seen.add(probe);
-      }
-    }
-    return [...seen].sort((a, b) =>
-      a.localeCompare(b, undefined, { sensitivity: "base" }),
-    );
+  /** The durable generation record behind the inspected token. The
+   *  detail view keeps this recipe beside the token rather than making
+   *  users reconstruct it from the global controls. */
+  const loomNode = $derived(
+    loomNodeId ? (loomTree.nodes.get(loomNodeId) ?? null) : null,
+  );
+  const recipeSampling = $derived(loomNode?.recipe?.sampling ?? null);
+  const recipeSteering = $derived(
+    loomNode?.recipe?.steering ?? inspected?.appliedSteering ?? null,
+  );
+  const turnPerplexity = $derived.by<number | null>(() => {
+    if (inspected?.perplexity != null) return inspected.perplexity;
+    const mean = inspected?.meanLogprob ?? loomNode?.mean_logprob;
+    return mean != null && Number.isFinite(mean) ? Math.exp(-mean) : null;
   });
-
-  function cellValue(layer: string, probe: string): number | null {
-    const pls = token?.perLayerScores;
-    if (!pls) return null;
-    const row = pls[layer];
-    if (!row) return null;
-    const v = row[probe];
-    return typeof v === "number" && Number.isFinite(v) ? v : null;
-  }
-
-  function cellTooltip(layer: string, probe: string): string {
-    const v = cellValue(layer, probe);
-    if (v === null) return `L${layer} · ${probe} · —`;
-    const sign = v >= 0 ? "+" : "";
-    return `L${layer} · ${probe} · ${sign}${v.toFixed(3)}`;
-  }
-
-  // ---- cell sizing (responsive-ish) -----------------------------------
-
-  /** Cell pixel size.  Capped on the high end so wide grids don't push
-   * the drawer beyond reasonable widths; floored on the low end so the
-   * tints remain visible.  ~22px reads cleanly with the optional value
-   * label off; we keep value labels off because the cell count gets
-   * large enough that text becomes noise. */
-  const CELL_SIZE = 22;
-
-  // ---- logits tab (logit-pass) -----------------------------------------
-  //
-  // Layout: ranked table of ``top_alts`` with rank / token / logprob /
-  // probability / Δ-from-rank-1.  The chosen token gets a ``*`` glyph
-  // and a background tint when present in the alts.  Empty state
-  // routes the user to the SamplingStrip ``alts`` toggle when capture
-  // wasn't on.
-
-  type Tab = "probes" | "logits" | "lens" | "sae";
-  let tab: Tab = $state<Tab>("probes");
-
-  const TAB_ITEMS: Array<{ value: Tab; label: string; color?: string; title: string }> = [
-    { value: "probes", label: "probes", title: "Per-layer × per-probe readings" },
-    { value: "logits", label: "logits", title: "Ranked top-K alternatives at this position" },
-    {
-      value: "sae",
-      label: "sae",
-      color: "var(--pillar-sae)",
-      title: "Sparse feature activations at the resident SAE hook layer",
-    },
-    {
-      value: "lens",
-      label: "j-lens",
-      color: "var(--pillar-lens)",
-      title: "Workspace readout — what each layer was disposed to say",
-    },
-  ];
-
-  /** Reset to probes tab when the CLICK target changes (scrubbing keeps
-   *  the tab).  Drilldown stays on whatever tab the user had open within
-   *  a single token view, but a fresh open should always show the
-   *  default surface. */
-  $effect(() => {
-    void turnIdx;
-    void paramTokenIdx;
-    tab = "probes";
-  });
-
-  interface RankRow {
-    rank: number;
-    id: number;
-    text: string;
-    logprob: number;
-    /** ``exp(logprob)`` — the post-sampler probability. */
-    p: number;
-    /** ``logprob - logprob_rank1`` — zero for rank 1. */
-    delta: number;
-    /** True iff this row's ``id`` matches the chosen token id. */
-    chosen: boolean;
-  }
-
-  /** Build ranked rows from the token's ``top_alts``.  Server emits the
-   *  list in descending-logprob order, so ``index + 1`` is the rank.
-   *  Chosen-row identification uses the token id carried by the current wire. */
-  const rankRows = $derived.by<RankRow[]>(() => {
-    const alts = token?.topAlts;
-    if (!alts || alts.length === 0) return [];
-    const lp0 = alts[0]?.logprob ?? 0;
-    return alts.map((a, i) => ({
-      rank: i + 1,
-      id: a.id,
-      text: a.text,
-      logprob: a.logprob,
-      p: Math.exp(a.logprob),
-      delta: a.logprob - lp0,
-      chosen: token?.tokenId != null && a.id === token.tokenId,
-    }));
-  });
-
-  /** Rank of the chosen token within the captured alts, or null when the
-   *  chosen token didn't make the top-K cut (rare unless K is very small
-   *  or the distribution is very flat). */
-  const chosenRank = $derived<number | null>(
-    rankRows.find((r) => r.chosen)?.rank ?? null,
+  const finishReason = $derived(
+    inspected?.finishReason ?? loomNode?.finish_reason ?? null,
   );
 
-  /** Format a logprob for the column.  Always-sign so positive vs
-   *  negative is unambiguous; "—" for null/NaN. */
-  function fmtLogprob(v: number | null | undefined): string {
-    if (v == null || !Number.isFinite(v)) return "—";
-    return v.toFixed(3);
-  }
-  function fmtProb(p: number): string {
-    if (!Number.isFinite(p)) return "—";
-    if (p >= 0.001) return p.toFixed(4);
-    return p.toExponential(2);
-  }
-  function fmtDelta(d: number, rank: number): string {
-    if (rank === 1) return "—";
-    if (!Number.isFinite(d)) return "—";
-    return d.toFixed(3);
+  function fmtSetting(value: number | null | undefined): string {
+    if (value == null || !Number.isFinite(value)) return "—";
+    return Number.isInteger(value) ? String(value) : value.toFixed(2);
   }
 
-  /** Flip the SamplingStrip's alts toggle from the empty state.  Sets
-   *  ``return_top_k`` to the canonical 8 (Decision 1); takes effect on
-   *  the next generation.  Doesn't backfill — the current token's alts
-   *  weren't captured and there's no way to recover them. */
-  function enableAlts(): void {
-    if (samplingState.return_top_k === 0) {
-      samplingState.return_top_k = 8;
-    }
+  const recipeChips = $derived.by<string[]>(() => {
+    const sampling = recipeSampling;
+    const recipe = loomNode?.recipe;
+    if (!sampling && !recipe) return [];
+    const chips = [
+      `T ${fmtSetting(sampling?.temperature)}`,
+      `top-p ${fmtSetting(sampling?.top_p)}`,
+      `top-k ${fmtSetting(sampling?.top_k)}`,
+      `max ${fmtSetting(sampling?.max_tokens)}`,
+    ];
+    const seed = recipe?.seed ?? sampling?.seed;
+    if (seed != null) chips.push(`seed ${seed}`);
+    if (sampling?.presence_penalty) chips.push(`presence ${fmtSetting(sampling.presence_penalty)}`);
+    if (sampling?.frequency_penalty) chips.push(`frequency ${fmtSetting(sampling.frequency_penalty)}`);
+    if (sampling?.return_top_k != null) chips.push(`alts ${sampling.return_top_k}`);
+    if (recipe?.thinking != null) chips.push(recipe.thinking ? "thinking on" : "thinking off");
+    if ((recipe?.probes.length ?? 0) > 0) chips.push(`${recipe!.probes.length} recipe probes`);
+    return chips;
+  });
+
+  // ---- navigation ---------------------------------------------------------
+
+  function moveTo(next: TokenCursor | null): void {
+    if (next) cursor = next;
   }
 
-  /** Logit fork — regenerate this node as a sibling with the clicked
-   *  token swapped for ``row``'s alternative.  Unlike the old branch
-   *  (which spliced a single token into otherwise-stale text), this
-   *  replays the node's raw decode prefix and *resamples* the
-   *  continuation conditioned on the swapped token, so everything
-   *  downstream of the fork is coherent.  Works for thinking tokens
-   *  too — the engine forces the thinking prefix and lets the model
-   *  close the channel itself. */
-  async function branchFromAlt(row: RankRow): Promise<void> {
-    branchError = null;
-    const nodeId = loomNodeId;
-    if (!nodeId) {
-      branchError = "no generated loom node is available for this token";
-      return;
-    }
-    if (token == null || token.rawIndex == null) {
-      branchError =
-        "this token has no raw-decode index; forking needs a node " +
-        "generated with raw-decode capture in this session";
-      return;
-    }
-    branchingRank = row.rank;
-    try {
-      await sendFork(nodeId, token.rawIndex, row.id);
-      closeDrawer();
-    } catch (e) {
-      branchError = e instanceof Error ? e.message : String(e);
-    } finally {
-      branchingRank = null;
-    }
+  const canStepBack = $derived(
+    effCursor != null && stepCursor(segments, effCursor, -1) !== null,
+  );
+  const canStepFwd = $derived(
+    effCursor != null && stepCursor(segments, effCursor, 1) !== null,
+  );
+  const canPrevTurn = $derived(
+    effCursor != null && jumpTurn(segments, effCursor, -1) !== null,
+  );
+  const canNextTurn = $derived(
+    effCursor != null && jumpTurn(segments, effCursor, 1) !== null,
+  );
+
+  function step(delta: 1 | -1): void {
+    if (effCursor) moveTo(stepCursor(segments, effCursor, delta));
   }
-
-  // ---- j-lens + SAE historical channels ---------------------------------
-  //
-  // The token's loom-owned ``captured`` record is authoritative.  Replay is
-  // reserved for old/missing channels and the explicit unsteered J-LENS
-  // counterfactual; replayed responses are kept only as the drawer's current
-  // view, never cached or written back as original data.
-
-  // Share the logit-alternative width. Zero means the ordinary logit capture
-  // is off, so retain the canonical 8-wide J-lens view in that state.
-  const lensTopK = $derived(samplingState.return_top_k || 8);
-
-  let lensData = $state<LensTokenReadoutJSON | null>(null);
-  let lensLoading = $state(false);
-  let lensError = $state<string | null>(null);
-  /** Replay under the node's recipe steering (server default).  Flipping
-   *  it off reads the unsteered counterfactual workspace of the same
-   *  token stream.  Sticky across tokens within one drawer life. */
-  let lensSteered = $state(true);
-  type ReadoutOrigin = "captured" | "replayed" | null;
-  let lensOrigin = $state<ReadoutOrigin>(null);
-  let lensSource = $state<string | null>(null);
-  let lensRequestSeq = 0;
-
-  const jlensFitted = $derived(sessionState.info?.jlens_fitted === true);
-  const saeLoaded = $derived(sessionState.info?.sae_loaded === true);
-  let saeData = $state<SaeTokenReadoutJSON | null>(null);
-  let saeLoading = $state(false);
-  let saeError = $state<string | null>(null);
-  let saeOrigin = $state<ReadoutOrigin>(null);
-  let saeSource = $state<string | null>(null);
-  let saeRequestSeq = 0;
-
-  const capturedLensData = $derived.by<LensTokenReadoutJSON | null>(() => {
-    const captured = token?.captured?.lens;
-    if (!captured || !token) return null;
-    return {
-      node_id: loomNodeId ?? "",
-      raw_index: token.rawIndex ?? -1,
-      token_id: token.tokenId ?? -1,
-      token_text: token.text,
-      steering: captured.steering,
-      aggregate: captured.aggregate,
-      layers: captured.layers,
+  function turnHop(delta: 1 | -1): void {
+    if (effCursor) moveTo(jumpTurn(segments, effCursor, delta));
+  }
+  function segEdge(where: "home" | "end"): void {
+    if (!effCursor) return;
+    cursor = {
+      ...effCursor,
+      tokenIdx: where === "home" ? 0 : Math.max(0, tokenList.length - 1),
     };
-  });
+  }
 
-  const capturedSaeData = $derived.by<SaeTokenReadoutJSON | null>(() => {
-    const captured = token?.captured?.sae;
-    if (!captured || !token) return null;
-    return {
-      node_id: loomNodeId ?? "",
-      raw_index: token.rawIndex ?? -1,
-      token_id: token.tokenId ?? -1,
-      token_text: token.text,
-      steering: captured.steering,
-      layer: captured.layer ?? -1,
-      features: captured.features,
-    };
-  });
-
-  $effect(() => {
-    if (tab !== "sae") return;
-    const request = ++saeRequestSeq;
-    const captured = capturedSaeData;
-    if (captured) {
-      saeData = captured;
-      saeOrigin = "captured";
-      saeSource = token?.captured?.sae?.source ?? null;
-      saeLoading = false;
-      saeError = null;
-      return;
-    }
-    saeData = null;
-    saeOrigin = null;
-    saeSource = null;
-    saeError = null;
-    if (!saeLoaded) return;
-    const nodeId = loomNodeId;
-    const rawIndex = token?.rawIndex;
-    if (!nodeId || rawIndex == null) return;
-    saeLoading = true; saeError = null; saeData = null;
-    apiSae.tokenReadout(nodeId, rawIndex, { raw: effectiveRawMode() })
-      .then((data) => {
-        if (request !== saeRequestSeq) return;
-        saeData = data;
-        saeOrigin = "replayed";
-        saeSource =
-          saeSourceState.sources.find((source) => source.active)?.source ??
-          sessionState.info?.sae_info?.release ?? null;
-      })
-      .catch((error) => {
-        if (request !== saeRequestSeq) return;
-        saeError = error instanceof Error ? error.message : String(error);
-      })
-      .finally(() => {
-        if (request === saeRequestSeq) saeLoading = false;
-      });
-  });
-
-  $effect(() => {
-    if (tab !== "lens") return;
-    const request = ++lensRequestSeq;
-    const captured = capturedLensData;
-    if (lensSteered && captured) {
-      lensData = captured;
-      lensOrigin = "captured";
-      lensSource = token?.captured?.lens?.source ?? null;
-      lensLoading = false;
-      lensError = null;
-      return;
-    }
-    lensData = null;
-    lensOrigin = null;
-    lensSource = null;
-    lensError = null;
-    if (!jlensFitted) return;
-    const nodeId = loomNodeId;
-    const rawIndex = token?.rawIndex;
-    if (!nodeId || rawIndex == null) return;
-    lensLoading = true;
-    lensError = null;
-    lensData = null;
-    apiLens
-      .tokenReadout(nodeId, rawIndex, {
-        topK: lensTopK,
-        steered: lensSteered,
-        raw: effectiveRawMode(),
-        layers: "all",
-      })
-      .then((d) => {
-        if (request !== lensRequestSeq) return;
-        lensData = d;
-        lensOrigin = "replayed";
-        lensSource =
-          lensSourceState.sources.find((source) => source.active)?.source ?? null;
-      })
-      .catch((e) => {
-        if (request !== lensRequestSeq) return;
-        const detail =
-          e instanceof ApiError &&
-          typeof (e.body as { detail?: unknown } | null)?.detail === "string"
-            ? (e.body as { detail: string }).detail
-            : null;
-        lensError = detail ?? (e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
-        if (request === lensRequestSeq) lensLoading = false;
-      });
-  });
-
-  /** Whether to offer the steered/unsteered toggle: the node actually has
-   *  recipe steering (the steered fetch reported an expression), or the
-   *  user already flipped to unsteered and needs the way back. */
-  const lensHasSteering = $derived(
-    (lensData?.steering ?? null) !== null || !lensSteered,
-  );
-  const lensColumnCount = $derived(
-    Math.max(0, ...(lensData?.layers.map((row) => row.tokens.length) ?? [])),
+  const atAnchor = $derived(
+    effCursor != null &&
+      anchor != null &&
+      effCursor.turnIdx === anchor.turnIdx &&
+      effCursor.seg === anchor.seg &&
+      effCursor.tokenIdx === anchor.tokenIdx,
   );
 
-  function lensCellStyle(logprob: number): string {
-    const p = Math.min(1, Math.exp(logprob));
-    const pct = Math.round(p * 60);
-    return `background: color-mix(in srgb, var(--pillar-lens) ${pct}%, transparent);`;
+  function resetToAnchor(): void {
+    if (anchor) cursor = { ...anchor };
   }
 
-  function lensCellTitle(layer: number, t: { token: string; logprob: number }): string {
-    const p = Math.exp(t.logprob);
-    const pTxt = p >= 0.001 ? p.toFixed(4) : p.toExponential(2);
-    return `L${layer} · ${JSON.stringify(t.token)} · p=${pTxt} · logprob=${t.logprob.toFixed(3)}`;
+  /** The counterpart segment of the current turn, when it exists —
+   *  clicking the segment badge jumps to its start. */
+  const otherSeg = $derived.by<SegmentKind | null>(() => {
+    if (!effCursor) return null;
+    const other: SegmentKind =
+      effCursor.seg === "thinking" ? "response" : "thinking";
+    return segments.some(
+      (s) => s.turnIdx === effCursor.turnIdx && s.seg === other,
+    )
+      ? other
+      : null;
+  });
+
+  function toggleSeg(): void {
+    if (!effCursor || !otherSeg) return;
+    cursor = { turnIdx: effCursor.turnIdx, seg: otherSeg, tokenIdx: 0 };
   }
-
-  function lensCellText(t: { token: string }): string {
-    const trimmed = t.token.trim();
-    return trimmed.length > 0 ? trimmed : JSON.stringify(t.token);
-  }
-
-  // ---- drawer chrome ---------------------------------------------------
-
-  function onClose(): void {
-    closeDrawer();
-  }
-
-  // ---- token scrubber ----------------------------------------------------
-  //
-  // ◀ ▶ in the header (or ←/→ anywhere in the drawer) walk the inspected
-  // position along the turn's token list.  Every tab follows — the probes
-  // heatmap and logits table read stream-captured data (instant), the
-  // j-lens tab refetches per position (cached per (node, raw_index,
-  // steered), so a revisit is instant).  A fresh token click snaps back.
-
-  function scrubTo(i: number): void {
-    if (i < 0 || i >= tokenList.length) return;
-    scrubTokenIdx = i === paramTokenIdx ? null : i;
-  }
-
-  const canScrubBack = $derived(tokenIdx > 0);
-  const canScrubFwd = $derived(tokenIdx < tokenList.length - 1);
 
   function onKeydown(ev: KeyboardEvent): void {
     if (ev.key === "Escape") {
       ev.preventDefault();
-      onClose();
+      closeDrawer();
       return;
     }
-    // Arrow scrubbing — but never steal arrows from a focusable field
-    // (the chat input lives outside the drawer and must keep caret keys).
+    // Never steal keys from a focusable field or the layer-strip
+    // scrubbers (role="slider" owns its own arrow keys).
     const t = ev.target as HTMLElement | null;
     if (
       t &&
-      (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)
+      (t.tagName === "INPUT" ||
+        t.tagName === "TEXTAREA" ||
+        t.tagName === "SELECT" ||
+        t.isContentEditable ||
+        t.closest('[role="slider"]'))
     ) {
       return;
     }
-    if (ev.key === "ArrowLeft" && canScrubBack) {
-      ev.preventDefault();
-      scrubTo(tokenIdx - 1);
-    } else if (ev.key === "ArrowRight" && canScrubFwd) {
-      ev.preventDefault();
-      scrubTo(tokenIdx + 1);
+    switch (ev.key) {
+      case "ArrowLeft":
+        step(-1);
+        break;
+      case "ArrowRight":
+        step(1);
+        break;
+      case "ArrowUp":
+        turnHop(-1);
+        break;
+      case "ArrowDown":
+        turnHop(1);
+        break;
+      case "Home":
+        segEdge("home");
+        break;
+      case "End":
+        segEdge("end");
+        break;
+      default:
+        return;
     }
+    ev.preventDefault();
   }
 
+  // ---- identity chips -------------------------------------------------
+
+  const roleLabel = $derived(
+    inspected ? (inspected.roleLabel ?? inspected.role) : "",
+  );
+
+  /** Rank of the chosen token within its captured alts, when present. */
+  const chosenRank = $derived.by<number | null>(() => {
+    const alts = token?.topAlts;
+    if (!alts || alts.length === 0 || token?.tokenId == null) return null;
+    const i = alts.findIndex((a) => a.id === token.tokenId);
+    return i >= 0 ? i + 1 : null;
+  });
+
+  function fmtP(p: number): string {
+    if (!Number.isFinite(p)) return "—";
+    if (p >= 0.001) return p.toFixed(3);
+    return p.toExponential(1);
+  }
+
+  // ---- tabs ----------------------------------------------------------
+
+  const tabItems = $derived<Array<{
+    value: DrilldownTab;
+    label: string;
+    meta: string;
+    color?: string;
+    title: string;
+  }>>([
+    {
+      value: "geometry",
+      label: "geometry",
+      meta: String(Object.keys(token?.measurements?.instruments.geometry?.readings ?? {}).length),
+      color: "var(--fg-dim)",
+      title: "Activation geometry",
+    },
+    {
+      value: "logits",
+      label: "logits",
+      meta: String(token?.topAlts?.length ?? 0),
+      title: "Sampling alternatives",
+    },
+    {
+      value: "sae",
+      label: "sae",
+      meta: String(token?.measurements?.instruments.sae?.readout?.features.length ?? 0),
+      color: "var(--pillar-sae)",
+      title: "Sparse feature field",
+    },
+    {
+      value: "lens",
+      label: "j-lens",
+      meta: String(token?.measurements?.instruments.lens?.readout?.layers.length ?? 0),
+      color: "var(--pillar-lens)",
+      title: "J-lens workspace",
+    },
+  ]);
+
   const hasAbPair = $derived(turn?.abPair != null);
-  const isEmpty = $derived(layerKeys.length === 0 || probeKeys.length === 0);
+
+  // ---- instrument readouts (captured-or-replay) ------------------------
+  //
+  // The token's loom-owned ``measurements`` envelope is authoritative;
+  // replay covers old/missing channels and the explicit unsteered
+  // counterfactual.  One ReplayReadout per family — the shell owns them
+  // (and the steered flags) so tab switches don't lose state; the tabs
+  // are presentational.
+
+  const jlensFitted = $derived(sessionState.info?.jlens_fitted === true);
+  const saeLoaded = $derived(sessionState.info?.sae_loaded === true);
+
+  // Share the logit-alternative width. Zero means the ordinary logit
+  // capture is off, so retain the canonical eight-wide read-side view.
+  const readoutTopK = $derived(resolveReadoutTopK(samplingState.return_top_k));
+
+  const lensReadout = new ReplayReadout<LensTokenReadoutJSON>();
+  const saeReadout = new ReplayReadout<SaeTokenReadoutJSON>();
+  const geometryReadout = new ReplayReadout<GeometryTokenReadout>();
+  let lensSteered = $state(true);
+  let saeSteered = $state(true);
+  let geometrySteered = $state(true);
+
+  /** ≥1 attached Monitor probe (anything in the rack that isn't a lens
+   *  or SAE readout probe) — the geometry replay 400s on an empty roster. */
+  const hasGeometryProbes = $derived(
+    probeRack.active.some((name) => {
+      const info = probeRack.entries.get(name)?.info;
+      return !!info && !info.lens && !info.sae;
+    }),
+  );
+
+  const lensPinned = $derived<Record<string, ProbeReadingJSON> | null>(
+    token?.measurements?.instruments.lens?.readings ?? null,
+  );
+  const saePinned = $derived<Record<string, ProbeReadingJSON> | null>(
+    token?.measurements?.instruments.sae?.readings ?? null,
+  );
+
+  const capturedLensData = $derived.by<LensTokenReadoutJSON | null>(() => {
+    const lens = token?.measurements?.instruments.lens;
+    if (!lens?.readout || !token) return null;
+    return {
+      node_id: loomNodeId ?? "",
+      raw_index: token.rawIndex ?? -1,
+      token_id: token.tokenId ?? -1,
+      token_text: token.text,
+      steering: lens.binding.steering,
+      aggregate: lens.readout.aggregate,
+      layers: lens.readout.layers,
+    };
+  });
+
+  const capturedSaeData = $derived.by<SaeTokenReadoutJSON | null>(() => {
+    const sae = token?.measurements?.instruments.sae;
+    if (!sae?.readout || !token) return null;
+    return {
+      node_id: loomNodeId ?? "",
+      raw_index: token.rawIndex ?? -1,
+      token_id: token.tokenId ?? -1,
+      token_text: token.text,
+      steering: sae.binding.steering,
+      layer: sae.binding.layer ?? -1,
+      features: sae.readout.features,
+    };
+  });
+
+  const capturedGeometryData = $derived.by<GeometryTokenReadout | null>(() => {
+    const geometry = token?.measurements?.instruments.geometry;
+    if (!geometry || Object.keys(geometry.readings ?? {}).length === 0) {
+      return null;
+    }
+    return {
+      steering: geometry.binding?.steering ?? null,
+      readings: geometry.readings,
+    };
+  });
+
+  $effect(() => {
+    if (drilldownUi.tab !== "lens") return;
+    const captured = capturedLensData;
+    if (lensSteered && captured) {
+      lensReadout.adopt(
+        captured,
+        token?.measurements?.instruments.lens?.binding.source ?? null,
+      );
+      return;
+    }
+    lensReadout.clear();
+    if (!jlensFitted) return;
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!nodeId || rawIndex == null) return;
+    lensReadout.replay(
+      "lens",
+      nodeId,
+      rawIndex,
+      { topK: readoutTopK, steered: lensSteered, raw: effectiveRawMode(), layers: "all" },
+      (m) => {
+        const lens = m.instruments.lens;
+        return {
+          data: {
+            node_id: nodeId,
+            raw_index: rawIndex,
+            token_id: token?.tokenId ?? -1,
+            token_text: token?.text ?? "",
+            steering: lens?.binding.steering ?? null,
+            aggregate: lens?.readout?.aggregate ?? [],
+            layers: lens?.readout?.layers ?? [],
+          },
+          source:
+            lens?.binding.source ??
+            lensSourceState.sources.find((source) => source.active)?.source ??
+            null,
+        };
+      },
+    );
+  });
+
+  $effect(() => {
+    if (drilldownUi.tab !== "sae") return;
+    const captured = capturedSaeData;
+    if (saeSteered && captured) {
+      saeReadout.adopt(
+        captured,
+        token?.measurements?.instruments.sae?.binding.source ?? null,
+      );
+      return;
+    }
+    saeReadout.clear();
+    if (!saeLoaded) return;
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!nodeId || rawIndex == null) return;
+    saeReadout.replay(
+      "sae",
+      nodeId,
+      rawIndex,
+      { topK: readoutTopK, steered: saeSteered, raw: effectiveRawMode() },
+      (m) => {
+        const sae = m.instruments.sae;
+        return {
+          data: {
+            node_id: nodeId,
+            raw_index: rawIndex,
+            token_id: token?.tokenId ?? -1,
+            token_text: token?.text ?? "",
+            steering: sae?.binding.steering ?? null,
+            layer: sae?.binding.layer ?? -1,
+            features: sae?.readout?.features ?? [],
+          },
+          source:
+            sae?.binding.source ??
+            saeSourceState.sources.find((source) => source.active)?.source ??
+            sessionState.info?.sae_info?.release ??
+            null,
+        };
+      },
+    );
+  });
+
+  $effect(() => {
+    if (drilldownUi.tab !== "geometry") return;
+    const captured = capturedGeometryData;
+    if (geometrySteered && captured) {
+      geometryReadout.adopt(captured, null);
+      return;
+    }
+    geometryReadout.clear();
+    if (!hasGeometryProbes) return;
+    const nodeId = loomNodeId;
+    const rawIndex = token?.rawIndex;
+    if (!nodeId || rawIndex == null) return;
+    geometryReadout.replay(
+      "geometry",
+      nodeId,
+      rawIndex,
+      { steered: geometrySteered, raw: effectiveRawMode() },
+      (m) => {
+        const geometry = m.instruments.geometry;
+        return {
+          data: {
+            steering: geometry?.binding?.steering ?? null,
+            readings: geometry?.readings ?? {},
+          },
+          source: null,
+        };
+      },
+    );
+  });
 </script>
 
 <svelte:window onkeydown={onKeydown} />
@@ -563,357 +595,215 @@
   <header class="drawer-header">
     <div class="title">
       <span class="eyebrow">token drilldown</span>
-      {#if token}
+      {#if token && effCursor}
         <div class="name-row">
-          <code class="tok-text">{JSON.stringify(token.text)}</code>
-          <span class="coord">
-            turn {turnIdx} · {isThinking ? "thinking" : "response"}
-          </span>
-          <span class="scrub" title="← / →">
+          <code class="tok-text" title={`generated token ${JSON.stringify(token.text)}`}>
+            {JSON.stringify(token.text)}
+          </code>
+          <button
+            type="button"
+            class="kv-chip seg-chip"
+            disabled={!otherSeg}
+            onclick={toggleSeg}
+            title={otherSeg
+              ? `jump to this turn's ${otherSeg} tokens`
+              : "turn segment"}
+          >
+            turn {effCursor.turnIdx} · {roleLabel} · {effCursor.seg}
+          </button>
+          {#if token.tokenId != null}
+            <span class="kv-chip" title="vocabulary id">id {token.tokenId}</span>
+          {/if}
+          {#if token.rawIndex != null}
+            <span class="kv-chip" title="raw decode-step index — the fork / replay join key">
+              raw {token.rawIndex}
+            </span>
+          {:else}
+            <span
+              class="kv-chip warn"
+              title="no raw decode record — logit forks and instrument replay are unavailable for this token"
+            >
+              no replay
+            </span>
+          {/if}
+          {#if token.logprob != null}
+            <span
+              class="kv-chip"
+              title="chosen-token probability under the post-temperature / post-top-p / post-top-k distribution the sampler drew from"
+            >
+              p {fmtP(Math.exp(token.logprob))} · logp {token.logprob.toFixed(3)}{chosenRank !== null
+                ? ` · rank ${chosenRank}/${token.topAlts?.length ?? 0}`
+                : ""}
+            </span>
+          {/if}
+        </div>
+        <div class="nav-row">
+          <span class="scrub" title="Walk token sequence">
             <button
               type="button"
               class="scrub-btn"
-              disabled={!canScrubBack}
-              onclick={() => scrubTo(tokenIdx - 1)}
+              disabled={!canStepBack}
+              onclick={() => step(-1)}
               aria-label="Previous token"
             >◀</button>
-            <span class="scrub-pos">{tokenIdx + 1} / {tokenList.length}</span>
+            <span class="scrub-pos">{effCursor.tokenIdx + 1} / {tokenList.length}</span>
             <button
               type="button"
               class="scrub-btn"
-              disabled={!canScrubFwd}
-              onclick={() => scrubTo(tokenIdx + 1)}
+              disabled={!canStepFwd}
+              onclick={() => step(1)}
               aria-label="Next token"
             >▶</button>
-            {#if scrubTokenIdx !== null}
-              <button
-                type="button"
-                class="scrub-btn scrub-home"
-                onclick={() => (scrubTokenIdx = null)}
-                title="reset"
-              >↩</button>
-            {/if}
           </span>
+          <span class="scrub" title="Jump turns">
+            <button
+              type="button"
+              class="scrub-btn"
+              disabled={!canPrevTurn}
+              onclick={() => turnHop(-1)}
+              aria-label="Previous turn"
+            >▲</button>
+            <span class="scrub-pos">turn {effCursor.turnIdx}</span>
+            <button
+              type="button"
+              class="scrub-btn"
+              disabled={!canNextTurn}
+              onclick={() => turnHop(1)}
+              aria-label="Next turn"
+            >▼</button>
+          </span>
+          {#if !atAnchor}
+            <button
+              type="button"
+              class="scrub-btn scrub-home"
+              onclick={resetToAnchor}
+              title="back to the clicked token"
+            >↩</button>
+          {/if}
+        </div>
+        <div class="generation-context">
+          <dl class="context-facts">
+            <div>
+              <dt>model</dt>
+              <dd title={sessionState.info?.model_id ?? undefined}>
+                <code>{sessionState.info?.model_id ?? "unknown"}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>loom node</dt>
+              <dd title={loomNodeId ?? undefined}><code>{loomNodeId?.slice(0, 10) ?? "—"}</code></dd>
+            </div>
+            <div>
+              <dt>turn perplexity</dt>
+              <dd><code>{turnPerplexity == null ? "—" : turnPerplexity.toFixed(3)}</code></dd>
+            </div>
+            <div>
+              <dt>finish</dt>
+              <dd><code>{finishReason ?? "streaming"}</code></dd>
+            </div>
+            {#if inspected?.tokPerSec != null}
+              <div>
+                <dt>throughput</dt>
+                <dd><code>{inspected.tokPerSec.toFixed(1)} tok/s</code></dd>
+              </div>
+            {/if}
+          </dl>
+          <div class="recipe">
+            <span class="recipe-label">generation recipe</span>
+            <code class="recipe-steering" title={recipeSteering ?? "no steering"}>
+              {recipeSteering ?? "unsteered"}
+            </code>
+            {#each recipeChips as chip (chip)}
+              <span>{chip}</span>
+            {/each}
+          </div>
         </div>
       {:else}
         <div class="name-row">
-          <span class="coord">no token at ({turnIdx}, {tokenIdx})</span>
+          <span class="coord">
+            no token at (turn {params?.turnIdx ?? "?"}, {params?.tokenIdx ?? "?"})
+          </span>
         </div>
       {/if}
     </div>
-    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">
-      ✕
-    </button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
-  <!-- View tabs (probes / logits / j-lens) + the steered/unsteered branch
-       toggle when this turn has an A/B pair.  Tabs always render so users
-       see the other views exist even when their capture is off. -->
+  {#if token && effCursor}
+    <TokenRibbon
+      tokens={tokenList}
+      index={effCursor.tokenIdx}
+      onjump={(i) => {
+        if (effCursor) cursor = { ...effCursor, tokenIdx: i };
+      }}
+    />
+  {/if}
+
+  <!-- View tabs + the steered/unsteered branch toggle when this turn has
+       an A/B pair.  Tabs always render so users see the other views
+       exist even when their capture is off. -->
   <div class="toolbar">
-    <SegmentedTabs items={TAB_ITEMS} bind:value={tab} ariaLabel="Token detail view" />
+    <SegmentedTabs items={tabItems} bind:value={drilldownUi.tab} ariaLabel="Token detail view" />
     {#if hasAbPair}
       <SegmentedTabs items={BRANCH_ITEMS} bind:value={branch} ariaLabel="Token branch" />
     {/if}
   </div>
 
   <div class="body">
-    {#if !token}
-      <div class="empty">
-        token unavailable
-      </div>
-    {:else if tab === "probes"}
-      {#if isEmpty}
-        <div class="empty">
-          no probe scores
-        </div>
-      {:else}
-        <div class="grid-scroll probe-grid">
-          <table class="grid" style="--cell: {CELL_SIZE}px;">
-            <thead>
-              <tr>
-                <th class="corner" scope="col">L \ probe</th>
-                {#each probeKeys as probe (probe)}
-                  <th class="col-label" scope="col" title={probe}>
-                    <span>{probe}</span>
-                  </th>
-                {/each}
-              </tr>
-            </thead>
-            <tbody>
-              {#each layerKeys as layer (layer)}
-                <tr>
-                  <th class="row-label" scope="row" title={`Layer ${layer}`}>
-                    L{layer}
-                  </th>
-                  {#each probeKeys as probe (probe)}
-                    {@const v = cellValue(layer, probe)}
-                    <td class="cell-td">
-                      <HeatmapCell
-                        value={v}
-                        scale={probeAxisScale(probe)}
-                        size={CELL_SIZE}
-                        title={cellTooltip(layer, probe)}
-                      />
-                    </td>
-                  {/each}
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {/if}
-    {:else if tab === "logits"}
-      <!-- Logits tab.  Three states: ranked rows present, alts captured
-           but empty (degenerate / stop token), nothing captured at all. -->
-      {#if rankRows.length > 0}
-        <div class="tab-summary">
-          <div>
-            chosen: <code class="tok-inline">{JSON.stringify(token.text)}</code>
-            <span class="kv">
-              logprob = <strong>{fmtLogprob(token.logprob)}</strong>
-            </span>
-            <span class="kv">
-              {#if chosenRank !== null}
-                (rank {chosenRank} of {rankRows.length})
-              {:else}
-                (chosen token not in top-{rankRows.length})
-              {/if}
-            </span>
-          </div>
-        </div>
-        <div class="grid-scroll">
-          <table class="logits-table">
-            <thead>
-              <tr>
-                <th class="num">rank</th>
-                <th class="tok">token</th>
-                <th class="num">logprob</th>
-                <th class="num">p</th>
-                <th class="num">Δ top</th>
-                <th class="num">branch</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each rankRows as row (row.rank)}
-                <tr class:chosen={row.chosen}>
-                  <td class="num">
-                    {row.chosen ? "* " : ""}{row.rank}
-                  </td>
-                  <td class="tok">
-                    <code>{JSON.stringify(row.text)}</code>
-                  </td>
-                  <td class="num">{fmtLogprob(row.logprob)}</td>
-                  <td class="num">{fmtProb(row.p)}</td>
-                  <td class="num">{fmtDelta(row.delta, row.rank)}</td>
-                  <td class="num">
-                    <Button
-                      size="sm"
-                      disabled={row.chosen || branchingRank !== null}
-                      onclick={() => branchFromAlt(row)}
-                      title="fork with token"
-                    >
-                      {branchingRank === row.rank ? "…" : "fork"}
-                    </Button>
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-        {#if branchError}
-          <p class="branch-error">{branchError}</p>
-        {/if}
-      {:else if token.logprob != null}
-        <div class="empty">
-          <p>logprob {fmtLogprob(token.logprob)} · no alternatives</p>
-          <p>
-            <Button
-              onclick={enableAlts}
-              disabled={samplingState.return_top_k > 0}
-            >
-              {samplingState.return_top_k > 0
-                ? "alts on next run"
-                : "enable alts"}
-            </Button>
-          </p>
-        </div>
-      {:else}
-        <div class="empty">
-          <p>no logprob data</p>
-          <p>
-            <Button
-              onclick={enableAlts}
-              disabled={samplingState.return_top_k > 0}
-            >
-              {samplingState.return_top_k > 0
-                ? "alts on next run"
-                : "enable alts"}
-            </Button>
-          </p>
-        </div>
-      {/if}
-    {:else if tab === "lens"}
-      <!-- J-lens tab. The readout matrix rows are all fitted lens layers,
-           ascending; cells are the
-           top-K vocabulary tokens each layer's residual was disposed to
-           say at the forward that produced this token. Original capture is
-           shown when present; replay is the fallback/counterfactual path. -->
-      {#if lensLoading}
-        <div class="empty">
-          computing…
-        </div>
-      {:else if lensError}
-        <div class="empty">
-          <p>readout: {lensError}</p>
-        </div>
-      {:else if lensData}
-        <div class="tab-summary">
-          <div>
-            produced: <code class="tok-inline">{JSON.stringify(lensData.token_text)}</code>
-            {#if lensOrigin}
-              <span class="kv">
-                {lensOrigin}{lensSource ? ` · ${lensSource}` : ""}
-              </span>
-            {/if}
-            {#if lensData.steering !== null}
-              <span class="kv steer-chip" title="recipe applied">
-                steered: <code>{lensData.steering}</code>
-              </span>
-            {:else if !lensSteered}
-              <span class="kv">unsteered</span>
-            {/if}
-            {#if lensHasSteering}
-              <label class="kv steer-toggle" title="apply recipe">
-                <input type="checkbox" bind:checked={lensSteered} />
-                apply recipe steering
-              </label>
-            {/if}
-          </div>
-        </div>
-        {#if (lensData.aggregate ?? []).length > 0}
-          <!-- Layer-aggregated view of the same logits across all layers:
-               strength = mean probability, com = probability-mass-
-               weighted depth center of mass (0 = first block, 1 = last). -->
-          <div class="lens-agg" role="list" aria-label="Aggregate lens tokens">
-            <span class="lens-agg-label">aggregate</span>
-            {#each lensData.aggregate ?? [] as chip, i (i)}
-              <span
-                class="lens-agg-chip"
-                role="listitem"
-                title={`"${chip.token}" — strength ${chip.strength.toFixed(3)} · com ${chip.com.toFixed(2)} ±${chip.spread.toFixed(2)}`}
-              >
-                <span class="lens-agg-tok">{chip.token.trim() || JSON.stringify(chip.token)}</span>
-                <span class="lens-agg-com">@{chip.com.toFixed(2)}</span>
-              </span>
-            {/each}
-          </div>
-        {/if}
-        <div class="grid-scroll">
-          <table class="lens-table">
-            <thead>
-              <tr>
-                <th class="corner">L \ rank</th>
-                {#each { length: lensColumnCount } as _, i (i)}
-                  <th class="num">{i + 1}</th>
-                {/each}
-              </tr>
-            </thead>
-            <tbody>
-              {#each lensData.layers as row (row.layer)}
-                <tr>
-                  <th
-                    class="row-label"
-                    title={`Layer ${row.layer}`}
-                  >
-                    L{row.layer}
-                  </th>
-                  {#each row.tokens as cell (cell.id)}
-                    <td
-                      class="lens-cell"
-                      class:hit={cell.id === lensData.token_id}
-                      style={lensCellStyle(cell.logprob)}
-                      title={lensCellTitle(row.layer, cell)}
-                    >
-                      {lensCellText(cell)}
-                    </td>
-                  {/each}
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {:else if !jlensFitted}
-        <div class="empty">
-          <p>no J-LENS fit</p>
-          <p><code>saklas lens fit {sessionState.info?.model_id ?? "<model>"}</code></p>
-        </div>
-      {:else if token.rawIndex == null}
-        <div class="empty">
-          no raw decode index
-        </div>
-      {:else if !loomNodeId}
-        <div class="empty">
-          no loom node
-        </div>
-      {/if}
+    {#if !token || !effCursor}
+      <div class="empty">token unavailable</div>
+    {:else if drilldownUi.tab === "geometry"}
+      <GeometryTab
+        readout={geometryReadout}
+        bind:steered={geometrySteered}
+        {hasGeometryProbes}
+        {hasReplayContext}
+      />
+    {:else if drilldownUi.tab === "logits"}
+      <LogitsTab {token} nodeId={loomNodeId} />
+    {:else if drilldownUi.tab === "sae"}
+      <SaeTab
+        readout={saeReadout}
+        bind:steered={saeSteered}
+        {saeLoaded}
+        {hasReplayContext}
+        pinned={saePinned}
+      />
     {:else}
-      {#if saeLoading}
-        <div class="empty">computing…</div>
-      {:else if saeError}
-        <div class="empty">readout: {saeError}</div>
-      {:else if saeData}
-        <div class="tab-summary">
-          {saeOrigin ?? "readout"}{saeSource ? ` · ${saeSource}` : ""}
-          · L{saeData.layer >= 0 ? saeData.layer : "?"}
-          · produced <code>{JSON.stringify(saeData.token_text)}</code>
-        </div>
-        <div class="grid-scroll">
-          <table class="logits-table">
-            <!-- strength = activation / Neuronpedia maxActApprox — the
-                 normalized 0..1 unit the probe cards + gates read; "—"
-                 when no metadata is cached for the feature. -->
-            <thead><tr><th class="num">rank</th><th class="tok">feature</th><th class="tok">label</th><th class="num">strength</th><th class="num">activation</th></tr></thead>
-            <tbody>
-              {#each saeData.features as feature, index (feature.id)}
-                <tr>
-                  <td class="num">{index + 1}</td>
-                  <td class="tok"><code>sae/{feature.id}</code></td>
-                  <td class="tok">{feature.label ?? "—"}</td>
-                  <td class="num">{feature.max_act != null && feature.max_act > 0 ? (feature.activation / feature.max_act).toFixed(2) : "—"}</td>
-                  <td class="num">{feature.activation.toFixed(3)}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {:else if !saeLoaded}
-        <div class="empty">no SAE loaded</div>
-      {:else if token.rawIndex == null || !loomNodeId}
-        <div class="empty">no raw decode record</div>
-      {/if}
+      <LensTab
+        readout={lensReadout}
+        bind:steered={lensSteered}
+        {jlensFitted}
+        {hasReplayContext}
+        pinned={lensPinned}
+        modelId={sessionState.info?.model_id ?? null}
+      />
     {/if}
   </div>
 
   <footer class="drawer-footer">
     <span class="hint">
-      {#if tab === "probes"}
-        Tints map each probe's coordinate to its node extent (full color at
-        the most extreme node), clamped to ±1. Green = +pole, red = −pole,
-        transparent ≈ 0.
-      {:else if tab === "logits"}
+      {#if drilldownUi.tab === "geometry"}
+        Full whitened Monitor readings at the forward that produced this
+        token: coords are domain-frame subspace coordinates, fraction the
+        in-subspace share, nearest the whitened node distances. Replay
+        scores the current roster post-hoc, so aggregate-only generations
+        and probes attached after the fact still read.
+      {:else if drilldownUi.tab === "logits"}
         Logprob is the chosen-token natural-log probability under the
         post-temperature / post-top-p / post-top-k distribution the sampler
-        drew from.
-      {:else if tab === "lens"}
+        drew from. Bars show absolute probability.
+      {:else if drilldownUi.tab === "sae"}
+        Post-nonlinearity sparse-feature activations from the resident SAE's
+        hook layer. Strength is activation / Neuronpedia maxActApprox — the
+        absolute 0..1 unit gates read; features without metadata show raw
+        activation on this readout's own scale.
+      {:else}
         Each row ranks softmax(W_U · norm(J_l·h)) at the forward that
         produced this token — what that layer's residual was disposed to
         make the model say. Cell tint = probability; highlighted cells match
-        the produced token. All fitted layers are shown because the informative
-        depth range is model-dependent.
-      {:else}
-        Post-nonlinearity sparse-feature activations from the resident SAE's
-        hook layer. Values are comparable across tokens for one feature, not
-        calibrated across different features.
+        the produced token. All fitted layers are shown because the
+        informative depth range is model-dependent.
       {/if}
     </span>
   </footer>
@@ -939,13 +829,14 @@
     align-items: flex-start;
     justify-content: space-between;
     gap: var(--space-5);
-    padding: var(--space-5) var(--space-6);
+    padding: var(--space-5) var(--space-6) var(--space-3);
   }
   .title {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--space-3);
     min-width: 0;
+    flex: 1 1 auto;
   }
   .eyebrow {
     color: var(--fg-muted);
@@ -957,7 +848,7 @@
   .name-row {
     display: flex;
     align-items: center;
-    gap: var(--space-4);
+    gap: var(--space-3);
     min-width: 0;
     flex-wrap: wrap;
   }
@@ -978,6 +869,47 @@
     color: var(--fg-subtle);
     font-size: var(--text-sm);
     white-space: nowrap;
+  }
+
+  /* Identity chips — quiet mono capsules; the segment chip doubles as
+   * the thinking/response jump when the turn has both. */
+  .kv-chip {
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
+    background: var(--glass);
+    border: 1px solid transparent;
+    border-radius: var(--radius-pill);
+    padding: var(--space-1) var(--space-3);
+    white-space: nowrap;
+  }
+  .kv-chip.warn {
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+  button.seg-chip {
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    cursor: pointer;
+    transition:
+      color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  button.seg-chip:hover:not(:disabled) {
+    color: var(--fg);
+    background: var(--glass-strong);
+  }
+  button.seg-chip:disabled {
+    cursor: default;
+  }
+
+  .nav-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+    flex-wrap: wrap;
   }
   .scrub {
     display: inline-flex;
@@ -1018,28 +950,74 @@
     color: var(--accent);
     font-size: var(--text-xs);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
+
+  .generation-context {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(280px, 1fr);
+    gap: var(--space-3);
+    min-width: 0;
   }
-  .close:hover {
+  .context-facts,
+  .recipe {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+    min-width: 0;
+    margin: 0;
+    padding: var(--space-3);
+    border-radius: var(--radius);
+    background: var(--input-well);
+  }
+  .context-facts > div {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .context-facts dt,
+  .recipe-label {
+    color: var(--fg-muted);
+    font-size: var(--text-2xs);
+    font-weight: var(--weight-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+  }
+  .context-facts dd {
+    min-width: 0;
+    margin: 0;
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+  }
+  .context-facts code,
+  .recipe code {
+    background: transparent;
+    font-family: var(--font-mono);
+  }
+  .context-facts dd code {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 28ch;
+  }
+  .recipe {
+    gap: var(--space-2) var(--space-3);
+  }
+  .recipe > span:not(.recipe-label),
+  .recipe-steering {
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .recipe-steering {
     color: var(--fg);
-    background: var(--glass-strong);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 30ch;
   }
 
   /* Toolbar — view tabs left, branch toggle right (when A/B). */
@@ -1053,6 +1031,9 @@
 
   .body {
     flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
     overflow: auto;
     min-height: 0;
     padding: var(--space-5) var(--space-6);
@@ -1063,279 +1044,6 @@
     line-height: 1.5;
     max-width: 62ch;
   }
-  .empty code {
-    font-family: var(--font-mono);
-    color: var(--fg-dim);
-  }
-
-  /* Data wells — tables recess into a deeper glass window.  Sticky
-   * label cells must stay OPAQUE (they occlude scrolled cells), so they
-   * paint the well tone rather than glass. */
-  .grid-scroll {
-    overflow: auto;
-    max-height: 100%;
-    border-radius: var(--radius);
-    background: var(--bg);
-  }
-  /* A narrow probe roster should not paint a full-drawer black well around
-     a five-column heatmap. Hug the matrix and center it; once the roster is
-     wider than the drawer, the same wrapper becomes the horizontal scroller. */
-  .probe-grid {
-    width: max-content;
-    max-width: 100%;
-    margin-inline: auto;
-  }
-  .grid {
-    border-collapse: separate;
-    border-spacing: 1px;
-    font-family: var(--font-mono);
-    font-variant-numeric: tabular-nums;
-  }
-  .grid th,
-  .grid td {
-    padding: 0;
-    margin: 0;
-    background: var(--bg);
-  }
-  /* Sticky row + column labels so orientation survives long scrolls. */
-  .grid thead th {
-    position: sticky;
-    top: 0;
-    z-index: 2;
-    box-shadow: var(--shadow-sticky);
-  }
-  .grid .row-label {
-    position: sticky;
-    left: 0;
-    z-index: 1;
-    text-align: right;
-    padding: 0 var(--space-3) 0 var(--space-2);
-    color: var(--fg-dim);
-    font-size: var(--text-xs);
-    font-weight: var(--weight-normal);
-    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
-    white-space: nowrap;
-  }
-  .grid .corner {
-    position: sticky;
-    top: 0;
-    left: 0;
-    z-index: 3;
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-weight: var(--weight-normal);
-    text-align: left;
-    padding: var(--space-1) var(--space-3);
-    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
-  }
-  .grid .col-label {
-    color: var(--fg-dim);
-    font-size: var(--text-xs);
-    font-weight: var(--weight-normal);
-    padding: 0;
-    /* Rotate compact column labels so they fit narrow cells.  Wrap the
-     * inner span so the rotation pivots around the cell box, not the
-     * letterform. */
-    height: 6em;
-    vertical-align: bottom;
-    width: var(--cell);
-    min-width: var(--cell);
-    max-width: var(--cell);
-  }
-  .grid .col-label > span {
-    display: inline-block;
-    transform: rotate(-60deg);
-    transform-origin: left bottom;
-    white-space: nowrap;
-    padding-bottom: var(--space-2);
-  }
-  .grid .cell-td {
-    line-height: 0; /* HeatmapCell brings its own box; remove text leading. */
-  }
-
-  /* Logits tab — chosen-row summary line and the ranked alts table. */
-  .tab-summary {
-    padding: 0 0 var(--space-4) 0;
-    color: var(--fg);
-    font-size: var(--text-sm);
-    line-height: 1.6;
-  }
-  .tab-summary .kv {
-    color: var(--fg-dim);
-    margin-left: var(--space-4);
-  }
-  .tab-summary strong {
-    color: var(--fg-strong);
-    font-family: var(--font-mono);
-  }
-  .tok-inline {
-    color: var(--fg);
-    font-family: var(--font-mono);
-    background: var(--glass-strong);
-    border-radius: var(--radius-sm);
-    padding: 0 var(--space-2);
-  }
-  .logits-table {
-    width: 100%;
-    border-collapse: separate;
-    border-spacing: 0;
-    font-variant-numeric: tabular-nums;
-    font-size: var(--text-sm);
-  }
-  .logits-table th,
-  .logits-table td {
-    padding: var(--space-2) var(--space-4);
-    text-align: left;
-    background: var(--bg);
-  }
-  .logits-table thead th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    color: var(--fg-muted);
-    font-family: var(--font-ui);
-    font-weight: var(--weight-medium);
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    box-shadow: var(--shadow-sticky);
-  }
-  .logits-table td {
-    font-family: var(--font-mono);
-  }
-  .logits-table td.num,
-  .logits-table th.num {
-    text-align: right;
-    width: 1%;
-    white-space: nowrap;
-  }
-  .logits-table td.tok code {
-    color: var(--fg-strong);
-    background: transparent;
-    word-break: break-all;
-  }
-  .logits-table tbody tr:hover td {
-    background: color-mix(in srgb, var(--bg-hover) 60%, var(--bg));
-  }
-  /* Chosen row gets a soft accent wash + a heavier color so it reads at
-     a glance. */
-  .logits-table tr.chosen td,
-  .logits-table tbody tr.chosen:hover td {
-    background: var(--accent-subtle);
-    color: var(--fg-strong);
-  }
-  /* J-lens tab — the layer-aggregated chip row above the matrix. */
-  .lens-agg {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: var(--space-2);
-    margin-bottom: var(--space-4);
-  }
-  .lens-agg-label {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-weight: var(--weight-medium);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin-right: var(--space-2);
-  }
-  .lens-agg-chip {
-    display: inline-flex;
-    align-items: baseline;
-    gap: var(--space-2);
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    background: color-mix(in srgb, var(--pillar-lens) 16%, var(--glass));
-    border: 1px solid transparent;
-    border-radius: var(--radius-pill);
-    padding: 1px var(--space-4);
-  }
-  .lens-agg-tok {
-    color: var(--pillar-lens);
-  }
-  .lens-agg-com {
-    color: var(--fg-muted);
-    font-size: var(--text-2xs);
-    font-variant-numeric: tabular-nums;
-  }
-  /* J-lens tab — the all-layer readout matrix. Same well chrome as the
-     logits table; cells carry an inline probability tint in the lens
-     family blue, so the static styles stay layout-only. */
-  .lens-table {
-    border-collapse: separate;
-    border-spacing: 0;
-    font-variant-numeric: tabular-nums;
-    font-size: var(--text-sm);
-  }
-  .lens-table th,
-  .lens-table td {
-    padding: var(--space-1) var(--space-3);
-    text-align: left;
-    background: var(--bg);
-  }
-  .lens-table thead th {
-    position: sticky;
-    top: 0;
-    z-index: 2;
-    color: var(--fg-muted);
-    font-family: var(--font-ui);
-    font-weight: var(--weight-medium);
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    box-shadow: var(--shadow-sticky);
-  }
-  .lens-table .corner {
-    position: sticky;
-    left: 0;
-    z-index: 3;
-    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
-  }
-  .lens-table .row-label {
-    position: sticky;
-    left: 0;
-    z-index: 1;
-    text-align: right;
-    color: var(--fg-dim);
-    font-family: var(--font-mono);
-    font-weight: var(--weight-normal);
-    font-size: var(--text-xs);
-    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
-    white-space: nowrap;
-  }
-  .lens-cell {
-    font-family: var(--font-mono);
-    color: var(--fg-strong);
-    white-space: nowrap;
-    max-width: 12ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .lens-cell.hit {
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
-  }
-  .steer-chip code {
-    color: var(--fg-strong);
-    background: transparent;
-    font-family: var(--font-mono);
-  }
-  .steer-toggle {
-    cursor: pointer;
-    user-select: none;
-  }
-  .steer-toggle input {
-    accent-color: var(--accent);
-    vertical-align: middle;
-    margin-right: var(--space-1);
-  }
-
-  .branch-error {
-    color: var(--accent-error);
-    font-size: var(--text-sm);
-    margin: var(--space-4) 0 0;
-  }
 
   .drawer-footer {
     padding: var(--space-3) var(--space-6);
@@ -1344,5 +1052,15 @@
   }
   .hint {
     line-height: 1.5;
+  }
+
+  @media (max-width: 820px) {
+    .generation-context {
+      grid-template-columns: 1fr;
+    }
+    .toolbar {
+      align-items: flex-start;
+      flex-direction: column;
+    }
   }
 </style>

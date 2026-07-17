@@ -4,10 +4,8 @@
   // label tag + truncated text + an X button that cancels just that
   // item via the per-id ``cancelPendingAction`` store helper.
   //
-  // Drains automatically on every WS ``done``; this component is
-  // display + cancel only — no submit logic.  Mirrors the TUI's
-  // PendingStrip widget (saklas/tui/chat_panel.py) at the same
-  // visual layer.
+  // Drains automatically on every WS ``done``; this component is display +
+  // cancel only, with no submit logic.
 
   import {
     pendingActions,
@@ -81,7 +79,7 @@
   .bubble.editing {
     background: var(--glass-strong);
     border-style: solid;
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
     color: var(--fg);
   }
   .edit-marker {

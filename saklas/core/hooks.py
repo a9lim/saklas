@@ -72,9 +72,14 @@ class HiddenCapture:
         # Incremental-mode state. ``_incremental`` flips the per-layer
         # hook from append to overwrite; ``_step_sink`` is invoked once
         # per forward after the highest hooked layer (``_max_layer``)
-        # stores this step's slice. All reset on attach/clear.
+        # stores this step's slice. All reset on attach/clear.  The sink
+        # receives ``(step_id, latest_per_layer)`` — the decode loop's
+        # forward index rides along so per-token scorers can prime the
+        # instrument runs' step-keyed observe memos.
         self._incremental: bool = False
-        self._step_sink: Callable[[dict[int, torch.Tensor]], None] | None = None
+        self._step_sink: (
+            Callable[[int, dict[int, torch.Tensor]], None] | None
+        ) = None
         self._max_layer: int | None = None
         # Bounded-tail (aggregate-only) state: when ``_tail_depth > 1`` the
         # incremental hook keeps the last ``_tail_depth`` slices per layer (a
@@ -241,14 +246,15 @@ class HiddenCapture:
             )
 
     def set_incremental(
-        self, step_sink: Callable[[dict[int, torch.Tensor]], None],
+        self, step_sink: Callable[[int, dict[int, torch.Tensor]], None],
     ) -> None:
         """Enable incremental mode: overwrite buckets + per-step scoring.
 
         Must be called after :meth:`attach`. Flips the per-layer hook from
         append to length-1 overwrite and records the highest hooked layer
         as the per-forward counter trigger. ``step_sink`` receives
-        :meth:`latest_per_layer` once per forward via :meth:`fire_step_sink`,
+        ``(step_id, latest_per_layer)`` once per forward via
+        :meth:`fire_step_sink`,
         which ``generate_steered`` invokes **post-forward** (FIX F1) — not from
         inside the capture hook — so the score read doesn't drain the device
         pipeline mid-forward.
@@ -278,7 +284,7 @@ class HiddenCapture:
     def set_tail_with_sink(
         self,
         depth: int,
-        step_sink: Callable[[dict[int, torch.Tensor]], None],
+        step_sink: Callable[[int, dict[int, torch.Tensor]], None],
         *,
         tail_layers: set[int] | frozenset[int] | None = None,
     ) -> None:
@@ -333,7 +339,7 @@ class HiddenCapture:
             idx: buffers[idx] for idx in layer_indices if idx in buffers
         }
 
-    def ingest_persistent(self) -> None:
+    def ingest_persistent(self, step_id: int) -> None:
         """Post-forward accumulation from the persistent buffers (compiled path).
 
         The compile-clean mirror of the in-hook accumulation: for each captured
@@ -381,7 +387,7 @@ class HiddenCapture:
                 bucket.append(src.clone())
         self._forward_count += 1
         if self._step_sink is not None:
-            self._step_sink(self.latest_per_layer())
+            self._step_sink(step_id, self.latest_per_layer())
 
     def detach(self) -> None:
         for h in self._handles:
@@ -519,7 +525,7 @@ class HiddenCapture:
         """
         return bool(self._handles)
 
-    def fire_step_sink(self) -> None:
+    def fire_step_sink(self, step_id: int) -> None:
         """Run the per-token step sink once, **after** the model forward (FIX F1).
 
         Invoked by ``generate_steered`` post-``model()`` rather than from inside
@@ -530,10 +536,11 @@ class HiddenCapture:
         layer.  No-op when no sink is installed (aggregate-only / full-retention /
         no-probe captures).  Reads the latest per-layer slice the forward just
         stored — valid until the next forward overwrites the length-1 buffer (or
-        rotates the tail ring).
+        rotates the tail ring).  ``step_id`` is the loop's forward index,
+        forwarded to the sink for step-keyed memo priming.
         """
         if self._step_sink is not None:
-            self._step_sink(self.latest_per_layer())
+            self._step_sink(step_id, self.latest_per_layer())
 
 
 class SteeringHook:
@@ -1096,23 +1103,17 @@ _SUBSPACE_GAIN = 16.0
 # extrapolation, so a curved fit doesn't detonate the way the affine path would —
 # instead, *past* ``eff_along ≈ 1`` the foot keeps translating past the node.
 #
-# Live-calibrated on a CLEAN gemma-4-12b ``months_loop%january`` α-sweep
-# (stateless=True — earlier sweeps were confounded by conversation accumulation;
-# see ``scripts/curved_gain_calibrate.py`` / ``months_low_gain.py``).  ``along=1.0``
+# Live-calibrated on a clean, stateless gemma-4-12b
+# ``months_loop%january`` α-sweep. ``along=1.0``
 # at gain ``4`` (``eff_along ≈ 4``) lands the vivid coherent winter sweet spot
 # ("skeletal trees heavy with frost", consistent across seeds); gain ``2`` is milder
 # but clearly cold; the prior ``1.5`` was too weak (only a "cool prickle").
 #
-# CAVEAT — non-monotonic above the sweet spot on PERIODIC fits (a9 will revisit).
-# ``months_loop`` is a period-12 ring; ``translate_foot`` wraps, and ``eff_along`` is
-# share-weighted (per-layer ``share ∈ [0.19, 1.47]``), so past ``~1`` each layer
-# orbits the loop at its own rate and the layers land on *different* months → the
-# seasonal signal washes out / scatters rather than intensifying (foot-ring
-# geometry: ``scripts/months_foot_ring.py``).  ``4`` rides a coincidentally-coherent
-# part of the wrap; it is NOT a "stronger = more january" magnitude.  The principled
-# fix (deferred) is to clamp the curved ``eff_along`` to ``[0,1]`` and stop
-# share-weighting it on periodic domains so ``along=1`` lands every layer exactly on
-# the node.  Prototype, like its affine sibling.
+# Periodic ``BoxDomain`` fits are a distinct case: the runtime drops
+# share-weighting and clamps ``eff_along = along * gain`` to ``[0,1]`` uniformly
+# across layers. This prevents each layer from wrapping around the domain at a
+# different rate; ``along=1`` therefore lands every layer on the target node.
+# Non-periodic curved fits retain the share-weighted, unclamped translation.
 _MANIFOLD_ALONG_GAIN = 4.0
 
 # Max |cosine| between two *curved* manifold subspaces sharing a layer before
@@ -1228,7 +1229,7 @@ class SteeringManager:
         # manifolds.
         self.subspaces: dict[str, dict[str, Any]] = {}
         self.ctx: TriggerContext = TriggerContext()
-        # Persistent compile-clean steering path (MPS torch.compile).  A single
+        # Persistent compile-clean steering path (CUDA/MPS torch.compile). A single
         # branchless ``hidden.add_(offset)`` hook per layer, attached ONCE before
         # compile (so it is traced into the captured graph) and never
         # re-registered — the per-gen steering is pushed by updating the
@@ -1589,7 +1590,7 @@ class SteeringManager:
         self.manifolds.clear()
         self.subspaces.clear()
 
-    # -- Persistent compile-clean offset path (MPS torch.compile) --------------
+    # -- Persistent compile-clean offset path (CUDA/MPS torch.compile) ---------
 
     def adopt_compiled_offsets(
         self, buffers: dict[int, torch.Tensor], handles: list[Any],

@@ -1,10 +1,8 @@
 <script lang="ts">
-  // Hand-rolled horizontal bar.  Positive = green, negative = red,
-  // mirroring the TUI build_bar shape but in pixel-width SVG.
+  // Hand-rolled horizontal bar. Positive = green, negative = red.
   //
   // ``value`` and ``max`` are unitless; ``width`` is the rendered max
-  // width in pixels (defaults to BAR_WIDTH * 6 ≈ the TUI's 24-glyph
-  // bar at typical web character cell width).
+  // width in pixels.
   //
   // ``bipolar`` flips the bar to a center-zero shape: fills rightward
   // from the midline for positive values, leftward for negative, with a
@@ -92,7 +90,7 @@
       x2={width / 2}
       y1="0"
       y2={height}
-      stroke="var(--border)"
+      stroke="var(--glass-line)"
       stroke-width="1"
     />
   {/if}
@@ -102,7 +100,7 @@
       x2={width}
       y1={height}
       y2={height}
-      stroke="var(--border)"
+      stroke="var(--glass-line)"
       stroke-width="0.5"
     />
   {/if}
@@ -123,7 +121,7 @@
     vertical-align: middle;
     /* Rounded ends via CSS clip on the element box — an SVG rect ``rx``
      * would distort under preserveAspectRatio="none", this doesn't. */
-    border-radius: 2px;
+    border-radius: var(--data-mark-radius);
     overflow: hidden;
   }
   .track {

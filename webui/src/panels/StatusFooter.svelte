@@ -1,10 +1,9 @@
 <script lang="ts">
-  // Single-line generation footer.  Mirrors the TUI's status footer:
+  // Single-line generation footer:
   //   ● gen 47/512 [████░░░░░░] · 23 t/s · 2.1s · ppl 8.3
   //
-  // Idle state collapses to "○ idle" before the first generation lands —
-  // matches the TUI behavior of hiding stats until they have something
-  // real to report.
+  // Idle state collapses to "○ idle" before the first generation lands,
+  // hiding stats until they have something real to report.
 
   import Bar from "../lib/charts/Bar.svelte";
   import {
@@ -130,19 +129,7 @@
   .dot.live {
     color: var(--live);
     border-radius: 50%;
-    animation: dot-pulse 1.6s var(--ease-in-out) infinite;
-  }
-  /* Reduced-motion is handled by the global kill switch in global.css. */
-  @keyframes dot-pulse {
-    0% {
-      box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 40%, transparent);
-    }
-    70% {
-      box-shadow: 0 0 0 6px transparent;
-    }
-    100% {
-      box-shadow: 0 0 0 0 transparent;
-    }
+    animation: none;
   }
   .dot.done {
     color: var(--fg-muted);

@@ -633,9 +633,9 @@ def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
     """
     import torch
     from saklas.core.manifold import (
-        BoxAxis, BoxDomain, Manifold, fit_layer_subspace, load_manifold,
-        save_manifold,
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace,
     )
+    from saklas.io.manifold_tensors import load_manifold, save_manifold
 
     g = torch.Generator().manual_seed(0)
     domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
@@ -2113,9 +2113,10 @@ def test_rectangular_affine_transfer_preserves_points_frame_and_steering(
 ) -> None:
     import torch
     from saklas.core.manifold import (
-        CustomDomain, LayerSubspace, Manifold, load_manifold, save_manifold,
+        CustomDomain, LayerSubspace, Manifold,
         transfer_manifold_subspaces,
     )
+    from saklas.io.manifold_tensors import load_manifold, save_manifold
     from saklas.io.alignment import LayerAlignment
 
     basis = torch.tensor([
@@ -2331,8 +2332,9 @@ def _fit_real_manifold(folder: Path, model_id: str, *, dim: int = 6, seed: int =
     from dataclasses import replace
     from saklas.core.manifold import (
         MANIFOLD_FIT_POLICY_VERSION, BoxAxis, BoxDomain, Manifold,
-        fit_layer_subspace, fit_rbf_interpolant, save_manifold,
+        fit_layer_subspace, fit_rbf_interpolant,
     )
+    from saklas.io.manifold_tensors import save_manifold
 
     g = torch.Generator().manual_seed(seed)
     domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
@@ -2497,7 +2499,7 @@ def test_transfer_preflight_rejects_future_manifest_before_payload_hash(
 
 
 def test_strict_fitted_load_rejects_non_object_manifest(tmp_path: Path) -> None:
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
 
     folder = _author_manifold(tmp_path)
     source = _fit_real_manifold(folder, "src/model", dim=4)
@@ -2513,7 +2515,7 @@ def test_strict_fitted_load_rejects_non_object_manifest(tmp_path: Path) -> None:
 def test_strict_fitted_load_normalizes_trusted_corrupt_sidecar(
     tmp_path: Path, payload: str, message: str,
 ) -> None:
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.io.packs import hash_file
 
     folder = _author_manifold(tmp_path)
@@ -2532,7 +2534,7 @@ def test_strict_fitted_load_normalizes_trusted_corrupt_sidecar(
 def test_strict_fitted_load_rejects_invalid_digest_before_hashing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
 
     folder = _author_manifold(tmp_path)
     source = _fit_real_manifold(folder, "src/model", dim=4)
@@ -2557,7 +2559,7 @@ def test_transfer_manifold_identity_alignment_preserves_geometry(
     """An identity alignment leaves the per-layer subspace unchanged and
     writes the transferred tensor at the ``_from-<safe_src>`` filename."""
     import torch
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -2615,7 +2617,7 @@ def test_transfer_manifold_rebakes_share_in_target_space(
     ``share_metric == "mahalanobis"``."""
     import torch
     from saklas.core.mahalanobis import LayerWhitener
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -2661,7 +2663,7 @@ def test_transfer_manifold_rotation_maps_subspace(
     transferred world-space activation at a node equals Q applied to the
     source activation."""
     import torch
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -2700,7 +2702,7 @@ def test_transfer_manifold_drops_uncovered_layers(
 ):
     """Layers the alignment doesn't cover are dropped from the transfer."""
     import torch
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -2789,7 +2791,7 @@ def test_transfer_manifold_refuses_overwrite_without_force(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     import torch
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -2835,7 +2837,7 @@ def test_transfer_retries_pair_committed_before_manifest_update(
 ) -> None:
     """An unproven transferred pair is repaired without requiring force."""
     import torch
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.io.paths import tensor_filename
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
@@ -2949,7 +2951,7 @@ def test_manifold_summary_reports_transfer_variant(
 ):
     """A transferred tensor surfaces under tensor_variants as ``from-...``."""
     import torch
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     domain = {"type": "box", "axes": [
@@ -3427,7 +3429,7 @@ def test_bundled_manifold_names_skips_incomplete_package_data(
 
 def _baked_manifold(name: str = "merged", n_layers: int = 3):
     """Build an affine R=1 Manifold (the merge/import shape) via the fold."""
-    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.core.capture import fold_directions_to_subspace
 
     directions = {i: torch.randn(8) for i in range(n_layers)}
     whitener = _target_whitener(dim=8, layers=tuple(range(n_layers)))
@@ -3442,8 +3444,8 @@ def _baked_manifold(name: str = "merged", n_layers: int = 3):
 
 def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.core.manifold import load_manifold
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.io.manifold_tensors import load_manifold
+    from saklas.core.capture import folded_directions
 
     manifold, directions = _baked_manifold("merged")
     folder, mf = create_baked_manifold_folder(
@@ -3465,7 +3467,7 @@ def test_baked_manifold_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     # The tensor folds back to the per-layer directions it was baked from.
     (tensor,) = list(folder.glob("*.safetensors"))
-    folded = folded_vector_directions(load_manifold(tensor))
+    folded = folded_directions(load_manifold(tensor))
     assert set(folded) == set(directions)
 
 

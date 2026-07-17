@@ -162,17 +162,16 @@
   }
   .node.streaming {
     background: color-mix(in srgb, var(--live) 8%, transparent);
-    box-shadow: var(--glow-live);
   }
   /* No stripes at all (cast model: roles carry no hue — identity is the
      glyph letter alone; the active path reads from the glass fill +
-     weight, and the streaming node from its live glow). */
+     weight, and streaming state from its green fill). */
   .glyph {
     font-weight: var(--weight-bold);
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.09);
+    background: var(--glass-bright);
     color: var(--fg);
     display: inline-flex;
     align-items: center;
@@ -210,7 +209,7 @@
     white-space: nowrap;
   }
   .note-mark {
-    color: var(--accent-purple);
+    color: var(--pillar-manifold);
     font-size: var(--text-2xs);
     line-height: 1;
   }

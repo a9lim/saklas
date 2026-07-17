@@ -31,7 +31,10 @@ from saklas.core.steering import Steering
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 from saklas.server.native_common import SINGLE_SESSION_ID
 from saklas.server.request_helpers import merge_steering, parse_request_steering
-from saklas.server.streaming import probe_reading_aggregate
+from saklas.server.streaming import (
+    probe_measurements_aggregate,
+    probe_reading_aggregate,
+)
 from saklas.server.tree_models import cast_json, node_json
 from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
@@ -993,6 +996,12 @@ async def _ws_handle_generate(
             mf_readings = probe_reading_aggregate(session, result)
             if mf_readings:
                 result_json["probe_readings"] = mf_readings
+            # 5.x: the aggregate measurement envelope rides the done frame
+            # alongside the compat ``probe_readings`` block (geometry / lens /
+            # SAE instruments split by family).
+            mf_measurements = probe_measurements_aggregate(session, result)
+            if mf_measurements:
+                result_json["measurements"] = mf_measurements
             # Phase 1 logit pass: stamp the per-turn logprob rollup on the
             # ``done`` event so subscribers (loom sidebar's sort-by-surprise,
             # webui chat-header summary) don't need to re-fetch the node.
@@ -1022,9 +1031,7 @@ async def _ws_handle_generate(
                 "sibling_count": n,
             })
 
-            # Mid-batch stop honors the plan's decision (#7 / phase 1
-            # spec): "stop_requested cancels the currently-streaming
-            # sibling. Remaining queued siblings are skipped, not
-            # started."
+            # Mid-batch stop honors the batch plan: cancel the currently
+            # streaming sibling and skip every remaining queued sibling.
             if stop_signaled:
                 break

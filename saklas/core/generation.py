@@ -13,7 +13,7 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from saklas.core.results import TokenAlt
-from saklas.core.token_callback import TokenCallback
+from saklas.core.token_callback import StepTokenCallback
 from saklas.core.scene import (
     SceneRenderError,
     SceneTurn,
@@ -350,7 +350,7 @@ def detect_base_model(tokenizer: PreTrainedTokenizerBase) -> bool:
     A base (completion) model has no ``chat_template``, so there are no
     turns, roles, or system-prompt slots: input is raw text and output is
     a continuation.  ``tokenizer.chat_template is None`` is the canonical
-    check used inline across the engine (``core/vectors.py``,
+    check used inline across the engine (``core/capture.py``,
     ``build_chat_input``); this names it so frontends can branch on a
     single import and the session can expose it as a property.
     """
@@ -543,7 +543,7 @@ def _advance_no_cache_input(
 
 
 class GenerationState:
-    """Shared mutable state for controlling generation from the TUI."""
+    """Shared mutable state for controlling and streaming generation."""
 
     def __init__(self):
         self.stop_requested = threading.Event()
@@ -552,9 +552,8 @@ class GenerationState:
         self.finish_reason: str = "stop"
         # For each on_token emission, the index in generated_ids of the
         # token that triggered it (last buffered ID for multi-byte emits),
-        # plus whether the emit was thinking.  Used by the TUI to map
-        # per-token probe scores (which are in generated_ids space) back
-        # to the emitted token stream.
+        # plus whether the emit was thinking. Used to map per-token probe
+        # scores (which are in generated_ids space) back to the emitted stream.
         self.emit_map: list[tuple[int, bool]] = []
         # Exact non-thinking text accepted by a stop-sequence streaming path.
         # Populated only when a stop sequence actually matches, because normal
@@ -851,7 +850,7 @@ def generate_steered(
     input_ids: torch.Tensor,
     config: GenerationConfig,
     state: GenerationState,
-    on_token: TokenCallback | None = None,
+    on_token: StepTokenCallback | None = None,
     thinking: bool = False,
     seed: int | None = None,
     stop: list[str] | None = None,
@@ -862,8 +861,8 @@ def generate_steered(
     trigger_ctx: TriggerContext | None = None,
     past_key_values: Any = None,
     cache_position_offset: int = 0,
-    score_callback: Callable[[], dict[str, float]] | None = None,
-    step_callback: Callable[[], None] | None = None,
+    score_callback: Callable[[int], dict[str, float]] | None = None,
+    step_callback: Callable[[int], None] | None = None,
     use_static_cache: bool = False,
     forced_prefix: list[int] | None = None,
     steering_active: bool = True,
@@ -873,13 +872,21 @@ def generate_steered(
     """
     Runs in a worker thread (not the async event loop).
 
-    *on_token(text, is_thinking, token_id, logprob, top_alts, perplexity)*
-    is called for each emitted token. ``perplexity`` is ``exp`` of the
+    *on_token(text, is_thinking, token_id, logprob, top_alts, perplexity,
+    step_id)* is called for each emitted token — the **internal** 7-argument
+    step-aware tap contract (the session's public ``TokenCallback`` stays
+    6-argument; ``SaklasSession._token_tap`` absorbs ``step_id``).
+    ``perplexity`` is ``exp`` of the
     Shannon entropy of the configured sampler distribution after
     temperature, top-k, and top-p renormalization (≈1 when the sampler is
     near-certain). For multi-token UTF-8 sequences (buffered partials),
     *token_id* is ``-1`` and logprob is None; ``perplexity`` carries the
-    flushing step's value.
+    flushing step's value.  ``step_id`` is the forward index that flushed
+    the emit (``len(generated_ids)`` before that forward) — every emit in
+    one flush group shares it, and it matches the ``step_id`` the same
+    forward's ``step_callback``/``score_callback`` received, which is what
+    lets instrument-run step memos pair the gate and display reads of one
+    forward.
 
     ``logprobs`` is None (disabled) or the number of top alternatives to
     include per token (0 = only the chosen token's logprob).  When
@@ -914,10 +921,10 @@ def generate_steered(
     change as the cache grows.  Caller must guarantee CUDA + a
     StaticCache-compatible architecture (see
     :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported`); we
-    don't re-probe here.  When ``past_key_values`` is non-None
-    (prefix-cache hit), it's expected to *already* be a StaticCache
-    sized to fit the upcoming decode; we don't re-allocate.  When
-    ``past_key_values is None``, we build a fresh StaticCache sized
+    don't re-probe here.  When ``past_key_values`` is non-None (a prefix-cache
+    hit or a reset session-resident cache), it's expected to *already* be a
+    StaticCache sized to fit the upcoming decode; we don't re-allocate.  When
+    ``past_key_values is None``, we build a fresh fallback StaticCache sized
     to ``input_ids.shape[1] + cache_position_offset +
     config.max_new_tokens``.
 
@@ -986,12 +993,11 @@ def generate_steered(
     # ---- StaticCache ---------------------------------------------------
     # Caller flips ``use_static_cache`` after probing
     # :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported` at session
-    # construction time.  We allocate the static buffer here, sized to
-    # cover the entire upcoming generation, so the decode loop sees no
-    # allocator activity per step.  When the caller hands us a
-    # pre-prefilled ``past_key_values`` (prefix-cache hit), it's expected
-    # to already be a StaticCache with enough headroom — we only build a
-    # fresh one when ``past_key_values is None``.
+    # construction time.  When the caller supplies ``past_key_values`` (a
+    # prefix-cache hit or reset session-resident cache), it's expected to have
+    # enough headroom.  Otherwise we allocate a fresh fallback covering the
+    # upcoming generation, so the decode loop sees no allocator activity per
+    # step.
     cache_position: torch.Tensor | None = None
     # Tracked as a Python int so the per-step advance never crosses
     # CPU↔GPU — we ``fill_`` the GPU buffer rather than read its value
@@ -1106,6 +1112,11 @@ def generate_steered(
     # Survives loop iterations so post-loop partial-flush can reuse it;
     # None when max_new_tokens=0 (degenerate, no forward ever ran).
     current_perplexity: float | None = None
+    # The last forward's step index (see the loop-top comment) — survives
+    # the loop for the post-loop partial-UTF-8 flush; None when no forward
+    # ever ran (max_new_tokens=0 / immediate stop), in which case there is
+    # nothing pending to flush.
+    last_forward_step: int | None = None
     response_chunks: list[str] | None = [] if (on_token is not None and stop_list) else None
     response_char_len = 0
     state.response_text = None
@@ -1128,13 +1139,16 @@ def generate_steered(
 
     def _emit_token(text: str, is_thinking: bool, token_id: int,
                     logprob: float | None, top_alts: list[TokenAlt] | None,
-                    perplexity: float | None) -> None:
+                    perplexity: float | None, step_id: int) -> None:
         nonlocal response_char_len
         if not is_thinking and response_chunks is not None:
             response_chunks.append(text)
             response_char_len += len(text)
         if on_token is not None:
-            on_token(text, is_thinking, token_id, logprob, top_alts, perplexity)
+            on_token(
+                text, is_thinking, token_id, logprob, top_alts, perplexity,
+                step_id,
+            )
 
     def _response_prefix(chars: int) -> str:
         if response_chunks is None or chars <= 0:
@@ -1201,9 +1215,9 @@ def generate_steered(
                     # decode the unfinished thoughts as the response text.
                     # Without this, ``response_ids = generated_ids[0:]``
                     # would land the entire thinking dump on the loom
-                    # node's ``text`` field — the TUI's live view hides
-                    # the bug (it builds the response from ``on_token``
-                    # directly), but the webui re-renders ``node.text``
+                    # node's ``text`` field. A live stream can hide the bug by
+                    # building the response from ``on_token`` directly, but the
+                    # web UI re-renders ``node.text``
                     # after ``tree_mutated finalize_assistant`` arrives.
                     if tstate in (
                         _ThinkState.PREAMBLE,
@@ -1212,6 +1226,20 @@ def generate_steered(
                     ):
                         state.thinking_end_idx = len(generated_ids)
                     break
+
+                # The loop-owned forward index: the raw token position the
+                # upcoming forward will produce.  Set after every pre-forward
+                # break so it identifies a forward that actually runs; it is
+                # the ONE step identity the sink (``step_callback``), the gate
+                # callback (``score_callback``), and the token tap
+                # (``on_token``'s ``step_id``) all receive for this forward —
+                # what lets the instrument runs' step-keyed memos pair one
+                # forward's gate and display reads.  ``last_forward_step``
+                # survives the loop for the post-loop partial-UTF-8 flush
+                # (never reuse a loop variable an iteration might not have
+                # assigned).
+                forward_step = len(generated_ids)
+                last_forward_step = forward_step
 
                 # Update the shared TriggerContext read by steering hooks.
                 # ``prefill`` is the per-iter flag cleared after the first
@@ -1223,7 +1251,7 @@ def generate_steered(
                 if trigger_ctx is not None:
                     trigger_ctx.is_prefill = prefill
                     trigger_ctx.thinking = (tstate == _ThinkState.THINKING)
-                    trigger_ctx.gen_step = len(generated_ids)
+                    trigger_ctx.gen_step = forward_step
 
                 # Static-cache path passes ``cache_position`` explicitly so
                 # the model knows where to write into the pre-allocated
@@ -1289,7 +1317,7 @@ def generate_steered(
                 # sync no longer stalls the tail of the forward.  Runs before
                 # ``score_callback`` so a probe gate reads the freshly-scored row.
                 if step_callback is not None:
-                    step_callback()
+                    step_callback(forward_step)
 
                 # Probe-gate scoring: after the forward (so
                 # ``HiddenCapture`` is freshly populated), refresh
@@ -1300,7 +1328,7 @@ def generate_steered(
                 # ``Trigger``.  Cost on the no-gate path: zero (the
                 # branch is a single ``is None`` check per step).
                 if score_callback is not None and trigger_ctx is not None:
-                    trigger_ctx.probe_scores = score_callback()
+                    trigger_ctx.probe_scores = score_callback(forward_step)
 
                 # StaticCache mutates in place — the model returns the
                 # same object and re-assigning here would clobber our
@@ -1459,14 +1487,14 @@ def generate_steered(
                         if on_token and pending_ids:
                             _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                         pending_thinking, -1, None, None,
-                                        current_perplexity)
+                                        current_perplexity, forward_step)
                             pending_ids.clear()
                         tstate = _ThinkState.RESPONSE_PREAMBLE
                     elif tstate == _ThinkState.PREAMBLE:
                         if on_token and pending_ids:
                             _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                         pending_thinking, -1, None, None,
-                                        current_perplexity)
+                                        current_perplexity, forward_step)
                             pending_ids.clear()
                         tstate = _ThinkState.IDLE
                         state.thinking_end_idx = len(generated_ids)
@@ -1515,7 +1543,7 @@ def generate_steered(
                     if on_token and pending_ids:
                         _emit_token(cast(str, tokenizer.decode(pending_ids)),
                                     pending_thinking, -1, None, None,
-                                    current_perplexity)
+                                    current_perplexity, forward_step)
                         pending_ids.clear()
                     if response_start_id is not None:
                         tstate = _ThinkState.RESPONSE_PREAMBLE
@@ -1579,7 +1607,7 @@ def generate_steered(
                                     state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                                     _emit_token(trimmed, emit_thinking, emit_id,
                                                 chosen_logprob, top_alts,
-                                                current_perplexity)
+                                                current_perplexity, forward_step)
                                 state.response_text = _response_prefix(keep_chars)
                                 state.response_aggregate_index = _last_response_emit_index()
                                 state.finish_reason = "stop_sequence"
@@ -1590,17 +1618,20 @@ def generate_steered(
                         state.emit_map.append((len(generated_ids) - 1, emit_thinking))
                         _emit_token(emit_text, emit_thinking, emit_id,
                                     chosen_logprob, top_alts,
-                                    current_perplexity)
+                                    current_perplexity, forward_step)
 
         # Flush any remaining buffered partial tokens.  No fresh forward
         # pass has run since the last loop iteration, so reuse that
         # iteration's perplexity — ``current_perplexity`` is seeded None
-        # pre-loop for the max_new_tokens=0 degenerate case.
+        # pre-loop for the max_new_tokens=0 degenerate case — and its
+        # ``last_forward_step`` (pending content implies a forward ran, so
+        # the None fallback is defensive only).
         if on_token and pending_ids:
             state.emit_map.append((len(generated_ids) - 1, pending_thinking))
             _emit_token(
                 cast(str, tokenizer.decode(pending_ids)), pending_thinking, -1, None, None,
                 current_perplexity,
+                0 if last_forward_step is None else last_forward_step,
             )
 
     finally:

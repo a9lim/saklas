@@ -1,8 +1,6 @@
 /* Design tokens v2 — the Observatory+ system.
  *
- * Spec: the locked direction board (2026-07-10) + docs/plans/webui-overhaul.md
- * UX principles (dark-only, density stays visible). Supersedes the a9l.im
- * mirror palette.
+ * Dark-only, high-density visual system. Supersedes the a9l.im mirror palette.
  *
  * The rules:
  *   - HUE ANSWERS "WHICH SPACE AM I LOOKING AT?" — chrome is achromatic;
@@ -10,15 +8,13 @@
  *       subspace = white · manifold = violet · sae = gold · lens/surprise =
  *       blue (logit-space family) · live/probe+ = green · error/probe− = red.
  *     Warm hue belongs to SAE alone. Roles carry no hue (the cast model).
- *   - Gradients are MATERIAL, not data: surfaces/washes/rings may glow;
- *     data marks gradient across the encoding axis, never along it
+ *   - Gradients belong to data marks only, and run across the encoding axis
  *     (along-axis only where the gradient IS the data: depth, time).
- *   - Glow is reserved for what is alive right now (streaming, moving
- *     probes, firing gates) — the room stays calm.
-   *   - Elevation = translucency + light (inset top-light, shadow), no longer
-   *     shade steps alone.
+ *   - Live state is communicated by hue and motion, never a halo.
+ *   - Elevation comes from spacing, fill contrast, and only where needed a
+ *     neutral shadow — not a decorative edge highlight.
  *   - BORDERLESS BY DEFAULT (Phase 6): separation comes from space, then
- *     fill contrast (the surface ladder), then light (top-light, shadow,
+ *     fill contrast (the surface ladder), then a shadow where elevation
  *     scroll-shadow) — a hairline is the LAST resort, reserved for
  *     meaning: focus rings, active/selected state rings, the outer edge
  *     of a floating surface (sheet / palette / popover / toast), and
@@ -35,24 +31,36 @@
   --radius-lg: 12px;        /* cards, sheets, panels */
   --radius-pill: 999px;
 
+  /* Shared control/data geometry. Component-specific optical sizes stay
+   * local; repeated interaction targets and data marks do not. */
+  --control-target: 24px;
+  --control-compact: 26px;
+  --control-field: 32px;
+  --data-mark-radius: 2px;
+  --data-bar-height: 8px;
+
   /* ---- Surfaces -----------------------------------------------------
    * Ground carries a faint blue-violet ambient (set in global.css).
-   * Glass tier = the card material (translucent + blur + top-light). */
+   * Glass tier = the card material (translucent fill + blur). */
   /* Borderless leans on this ladder — the steps are a touch wider than
    * v2.0 so fill contrast alone separates tiers on mediocre panels. */
   --bg-deep: #04050a;       /* rail — the floor; also the well tone */
   --bg: #07080e;            /* app canvas */
   --bg-alt: #10121c;        /* panel tier (opaque composite of glass-on-bg) */
-  --surface: #10121c;       /* alias of --bg-alt */
   --bg-elev: #1a1d2b;       /* elevated */
   --surface-hi: #222639;    /* highest: modals, popovers, menus */
 
   --glass: rgba(255, 255, 255, 0.045);        /* v2 card fill */
   --glass-strong: rgba(255, 255, 255, 0.075); /* v2 raised fill / wells */
+  --glass-bright: rgba(255, 255, 255, 0.09);  /* selected compact chrome */
   --glass-line: rgba(233, 236, 248, 0.085);   /* hairline — floating edges + state rings ONLY */
   --blur-glass: 6px;
   /* Recessed input fill — "type here" reads as a well, not an outline. */
   --input-well: rgba(2, 3, 8, 0.45);
+  /* Overlays are one material family, not per-surface black guesses. */
+  --scrim-soft: rgba(2, 3, 8, 0.38);
+  --scrim: rgba(2, 3, 8, 0.5);
+  --scrim-strong: rgba(2, 3, 8, 0.55);
 
   /* Translucent wash laid over any surface tier on hover. */
   --bg-hover: rgba(237, 239, 247, 0.05);
@@ -66,9 +74,6 @@
   --fg-subtle: #8a90a6;     /* tertiary */
   --fg-muted: #858ba3;      /* labels/hints: >=4.9:1 on elevated cards */
   --text-on-accent: #07080e;/* dark canvas — sits on white --accent */
-
-  /* ---- The one border --------------------------------------------- */
-  --border: rgba(233, 236, 248, 0.09);
 
   /* ---- Pillar hues --------------------------------------------------
    * The four instruments. Subspace shares
@@ -89,19 +94,15 @@
    * their consumers get rebuilt treatments in later phases. */
   --accent: #edeff7;
   --accent-light: #ffffff;
-  --accent-blue: var(--pillar-lens);
-  --accent-purple: var(--pillar-manifold);
   --accent-green: #34d399;
   --accent-red: #e5544f;
-  --accent-error: #e5544f;
   --accent-amber: #b08b52;   /* demoted: pending/edit chrome, anchor rings */
   --accent-yellow: #c2a44f;  /* demoted: warn chips */
   --accent-subtle: rgba(237, 239, 247, 0.08);  /* accent fill wash */
-  --accent-glow: rgba(237, 239, 247, 0.18);    /* focus ring + accent hover */
+  --accent-strong: rgba(237, 239, 247, 0.18);  /* accent hover */
   --focus-ring: #a3a8bd;                       /* visible keyboard focus */
 
   --live: var(--accent-green);
-  --glow-live: 0 0 12px rgba(52, 211, 153, 0.4);
 
   /* ---- Highlight ramps ----------------------------------------------
    * Runtime mapping lives in tokens.ts. Constant-hue alpha ramps:
@@ -109,10 +110,6 @@
    * Probe ramp poles are OKLCH-matched (green ↔ red); surprise reads
    * in logit-space blue (it is a vocabulary-distribution quantity —
    * same family as the lens). */
-  --highlight-pos: #34d399;
-  --highlight-neg: #e5544f;
-  --highlight-surprise: #6ba6f8;
-
   /* Layer heatmaps are solid data marks, not translucent token washes.
    * A visible neutral zero keeps weak readings legible; empty is distinct
    * without falling all the way to black. Cells themselves stay borderless. */
@@ -121,21 +118,27 @@
    * black grid the shared LayerStrip removed. */
   --data-track: #616a82;
   --data-track-fill: #343a50;
-  --layer-cell-neutral: #616a82;
-  --layer-cell-empty: #343a50;
+  --layer-cell-neutral: var(--data-track);
+  --layer-cell-empty: var(--data-track-fill);
   --layer-cell-positive: #6ee7b7;
   --layer-cell-negative: #ffb1ad;
   --layer-cell-lens: #aed3ff;
 
   /* ---- Elevation ----------------------------------------------------
-   * Cards are lit from above (inset top-light) and cast down. Overlay
-   * shadow is for sheets/modals/popovers/toasts. --shadow-sticky is the
-   * borderless replacement for a sticky table header's bottom rule —
-   * elevation that only reads once content scrolls underneath. */
-  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.05),
-    0 8px 24px rgba(0, 0, 0, 0.35);
+   * Cards and wells stay flat. Overlay shadows establish modality; sticky
+   * headers use a neutral depth cue only once content scrolls beneath them. */
+  --shadow-well: none;
+  --shadow-rack: none;
+  --shadow-card: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-rack-active: 0 0 0 1px color-mix(in srgb, var(--card-accent) 18%, transparent);
+  --shadow-card-active:
+    0 0 0 1px color-mix(in srgb, var(--card-accent) 20%, transparent),
+    0 8px 28px rgba(0, 0, 0, 0.4);
   --shadow-overlay: 0 12px 40px rgba(0, 0, 0, 0.5);
+  --shadow-sheet: var(--shadow-overlay);
   --shadow-sticky: 0 2px 8px rgba(0, 0, 0, 0.45);
+  --shadow-sticky-inline: 2px 0 8px rgba(0, 0, 0, 0.45);
+  --shadow-data-label: 0 0 2px rgba(0, 0, 0, 0.6);
 
   /* ---- Type scale — px, base 13.5px --------------------------------- */
   --text-2xs: 10px;         /* layer ticks, micro-labels */
@@ -169,6 +172,9 @@
   --dur-fast: 0.12s;
   --dur: 0.2s;
   --dur-slow: 0.3s;
+  --dur-spin: 0.7s;
+  --dur-draw: 0.9s;
+  --dur-pulse: 1.6s;
 
   /* ---- Fonts ---------------------------------------------------------
    * One variable file, two families (axes pinned in fonts.css):
@@ -179,12 +185,16 @@
   --font-mono: "Recursive Mono", ui-monospace, "SF Mono", Menlo, Consolas,
     monospace;
 
-  /* ---- TUI-ported geometry knobs — 24 mirrors BAR_WIDTH ------------ */
-
   /* ---- Z-layers ---------------------------------------------------- */
   --z-drawer: 50;
   --z-modal: 100;
 
   /* Loom conflict/error surface. */
   --err-bg: rgba(229, 84, 79, 0.08);
+  --warn-bg: rgba(194, 164, 79, 0.06);
+
+  /* Page-wide material effects live here so components never invent
+   * almost-matching scrims or selection fills. */
+  --selection-bg: rgba(237, 239, 247, 0.22);
+  --ambient-canvas: var(--bg);
 }

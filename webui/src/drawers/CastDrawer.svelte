@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Cast manager (phase 3 of the cast model) — the tree's roster of
   // named labels, each with a standing steering recipe.  A member's
   // recipe is the *weakest* tier at generation: it fills only fields
@@ -167,9 +168,7 @@
 <section class="drawer-shell" aria-label="Cast manager drawer">
   <header class="header">
     <span class="title">cast</span>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button
-    >
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -317,29 +316,6 @@
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -407,7 +383,7 @@
     width: 22px;
     height: 22px;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.09);
+    background: var(--glass-bright);
     color: var(--fg-strong);
     display: inline-flex;
     align-items: center;

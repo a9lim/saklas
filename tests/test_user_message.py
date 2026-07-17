@@ -1,7 +1,7 @@
 """Tests for ``SaklasError.user_message()`` centralization (Phase 4).
 
-Each subclass returns an HTTP-style ``(status, msg)`` tuple; the three
-user-facing surfaces (server, CLI, TUI) consume the value to translate
+Each subclass returns an HTTP-style ``(status, msg)`` tuple; the server and CLI
+consume the value to translate
 exceptions consistently.  Tests pin the contract so subclasses can't
 silently lose their override.
 """
@@ -24,13 +24,13 @@ from saklas.core.errors import (
 from saklas.core.profile import ProfileError
 from saklas.core.session import (
     ConcurrentGenerationError,
-    VectorNotRegisteredError,
+    ProfileNotRegisteredError,
 )
 from saklas.core.steering_expr import SteeringExprError
 from saklas.io.hf_manifolds import ManifoldInstallConflict
 from saklas.io.gguf_io import GGUFNotInstalled
 from saklas.io.hf import HFError
-from saklas.io.merge import MergeError
+from saklas.io.bake import MergeError
 
 
 def test_base_default_status_and_message():
@@ -56,7 +56,7 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (UnknownVariantError, 404),
     # core/session.py
     (ConcurrentGenerationError, 409),
-    (VectorNotRegisteredError, 404),
+    (ProfileNotRegisteredError, 404),
     # core/profile.py
     (ProfileError, 400),
     # core/steering_expr.py
@@ -72,7 +72,7 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (ManifoldInstallConflict, 409),
     # io/gguf_io.py
     (GGUFNotInstalled, 400),
-    # io/merge.py
+    # io/bake.py
     (MergeError, 400),
 ]
 
@@ -91,7 +91,7 @@ def test_subclass_message_round_trips(cls: type[SaklasError], _status: int):
     """The message string is non-empty and contains the original payload.
 
     KeyError-derived subclasses (``UnknownVariantError``,
-    ``VectorNotRegisteredError``) reach into ``args[0]`` to avoid
+    ``ProfileNotRegisteredError``) reach into ``args[0]`` to avoid
     KeyError's repr-quoted ``str()`` shape; we just check the original
     payload is in the surfaced message.
     """
@@ -163,7 +163,7 @@ def test_server_routes_user_message_status_codes():
         s.config.top_p = 0.9
         s.config.max_new_tokens = 1024
         s.config.system_prompt = None
-        s.vectors = {}
+        s.profiles = {}
         s.probes = {}
         s.history = []
         gs = MagicMock()

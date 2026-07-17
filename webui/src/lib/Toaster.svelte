@@ -65,8 +65,8 @@
     -webkit-backdrop-filter: blur(var(--blur-glass));
     backdrop-filter: blur(var(--blur-glass));
     color: var(--fg);
-    border: 1px solid var(--border);
-    border-left: 2px solid var(--accent-blue);
+    border: 1px solid var(--glass-line);
+    border-left: 2px solid var(--pillar-lens);
     border-radius: var(--radius-lg);
     padding: var(--space-4) var(--space-5);
     font-family: var(--font-mono);

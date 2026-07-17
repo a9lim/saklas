@@ -26,7 +26,7 @@ from typing import Any
 
 from saklas.core.manifold import Manifold
 from saklas.core.monitor import Monitor
-from saklas.core.vectors import fold_directions_to_subspace
+from saklas.core.capture import fold_directions_to_subspace
 from tests._whitener import synthetic_means, synthetic_whitener
 
 # A probe along axis 0, layer 0, dim 4 — easy to reason about.  The fold
@@ -149,17 +149,6 @@ def test_score_stack_uneven_T_raises_value_error():
     }
     with pytest.raises(ValueError, match="expected"):
         m.score_stack(bad, accumulate=False)
-
-
-def test_score_stack_accumulate_false_leaves_pending_flag_clear():
-    """The researcher-facing path must not signal pending-per-token when
-    the caller explicitly opted out of accumulation."""
-    m = _monitor_with_probe()
-    assert m.has_pending_per_token() is False
-    m.score_stack(
-        {0: torch.tensor([[1.0, 0.0, 0.0, 0.0]])}, accumulate=False,
-    )
-    assert m.has_pending_per_token() is False
 
 
 def test_score_probes_without_whitener_raises():

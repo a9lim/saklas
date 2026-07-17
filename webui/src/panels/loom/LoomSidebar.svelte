@@ -181,7 +181,7 @@
   // ----------------------------------------- ring decoration --------
 
   /** Per-node ring fill keyed off the currently-selected highlight
-   *  probe (Decision 10 in docs/plans/loom.md).  Returns the node's
+   *  probe. Returns the node's
    *  aggregate reading for ``highlightState.target`` in [-1, 1], or
    *  ``null`` when no probe is selected, the node has no aggregate
    *  readings yet, or the selected probe is missing from this node's
@@ -1475,11 +1475,11 @@
   /* Multi-select highlight for cross-branch compare. */
   .tree-row.selected :global(.node) {
     box-shadow: inset 0 0 0 1px var(--accent-yellow);
-    background: rgba(210, 153, 34, 0.10);
+    background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
   }
   /* Pin marker — purple-ish ring keys off the comparison-pane glyph. */
   .tree-row.pinned :global(.node) {
-    box-shadow: inset 0 0 0 1px var(--accent-purple);
+    box-shadow: inset 0 0 0 1px var(--pillar-manifold);
   }
 
   .empty {
@@ -1516,7 +1516,7 @@
     color: var(--accent-red);
     font-size: var(--text-sm);
     margin-top: var(--space-3);
-    background: var(--err-bg, rgba(216, 59, 59, 0.08));
+    background: var(--err-bg);
     border-left: 2px solid var(--accent-red);
     padding: var(--space-3) var(--space-4);
     font-family: var(--font-mono);
@@ -1526,7 +1526,7 @@
     position: fixed;
     z-index: var(--z-modal);
     background: var(--bg-alt);
-    border: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     padding: var(--space-2) 0;
     box-shadow: var(--shadow-overlay);
@@ -1554,7 +1554,7 @@
     color: var(--accent-red);
   }
   .loom-menu button.danger:hover {
-    background: rgba(248, 81, 73, 0.12);
+    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
   }
   .loom-menu button:disabled {
     color: var(--fg-muted);
@@ -1562,14 +1562,14 @@
   }
   .loom-menu hr {
     border: 0;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--glass-line);
     margin: var(--space-1) 0;
   }
 
   .loom-modal-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(1, 4, 9, 0.55);
+    background: var(--scrim-strong);
     z-index: var(--z-modal);
     border: 0;
     cursor: pointer;
@@ -1581,7 +1581,7 @@
     transform: translate(-50%, -50%);
     z-index: calc(var(--z-modal) + 1);
     background: var(--bg-alt);
-    border: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     box-shadow: var(--shadow-overlay);
     min-width: 420px;

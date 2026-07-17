@@ -1,4 +1,4 @@
-"""Cross-branch joint logprobs (Phase 5 of docs/plans/logit-pass.md).
+"""Cross-branch joint logprobs for generated loom siblings.
 
 Given two assistant LoomNodes A and B that share a parent, replay each
 branch token-by-token under the recipe stamped on that node and report,
@@ -17,11 +17,11 @@ for each aligned assistant-token position pair:
   argmax" signal.
 * ``approx_kl`` — top-K-truncated KL(P_A || P_B), summed over the union
   of each side's top-K tokens.  The tail is unobserved, so this is
-  documented as approximate signal not measurement (per Decision 5).
+  documented as an approximate signal, not a full-distribution measurement.
 
-The route is fired lazily on NodeCompareDrawer open per Decision 9;
-results cache on the session keyed by sorted ``(a_id, b_id)`` for the
-session lifetime.  Tree mutations that rename / delete the involved
+The route is called lazily when the comparison UI opens; results cache on the
+session keyed by sorted ``(a_id, b_id)`` for the session lifetime. Tree
+mutations that rename or delete the involved
 nodes invalidate the entries (see ``SaklasSession`` cache wiring).
 """
 
@@ -516,9 +516,11 @@ def _replay_branch_logprobs(
 
     with steering_cm:
         ctx.reset()
-        session._begin_capture(widen=False)
-        session._monitor.begin_live()
         try:
+            # Inside the try: ``_begin_capture`` binds every family's
+            # per-generation run, so a partial-bind failure must still
+            # reach the teardown below.
+            session._begin_capture(widen=False)
             needs_gating = session._steering_needs_probe_gating()
             gating_callback = (
                 session._build_gating_score_callback() if needs_gating else None
@@ -577,7 +579,11 @@ def _replay_branch_logprobs(
                     prefill = False
 
                     if gating_callback is not None:
-                        ctx.probe_scores = gating_callback()
+                        # The replay's forward index IS the step identity the
+                        # loop already stamps on ``ctx.gen_step`` — the same
+                        # per-forward value the live decode loop threads
+                        # (sol's round-2 P1: a zero-arg call TypeErrors now).
+                        ctx.probe_scores = gating_callback(forced_idx)
 
                     if not no_cache_mode:
                         past_key_values = getattr(outputs, "past_key_values", None)
@@ -614,8 +620,15 @@ def _replay_branch_logprobs(
                     next_token = forced_tensor[:, forced_idx:forced_idx + 1]
                     _advance_current_input(next_token)
         finally:
-            session._end_capture()
-            session._monitor.end_live()
+            # The replay is a full capture transaction: bound runs must not
+            # leak past the request (a stale lens pin suppresses disk
+            # refresh between generations; a stale SAE binding keeps
+            # serving frozen units to idle reads) — even when the hook
+            # detach itself raises, hence the nested finally.
+            try:
+                session._end_capture()
+            finally:
+                session._close_instrument_runs()
 
     return row_logps if vocab_size is not None else {}
 

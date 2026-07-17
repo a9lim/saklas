@@ -17,17 +17,17 @@
 import { SvelteMap, SvelteSet } from "svelte/reactivity";
 import {
   apiSessions,
-  apiVectors,
+  apiProfiles,
   apiProbes,
   apiManifolds,
-  apiLens,
-  apiSae,
+  apiInstruments,
   apiTree,
   ApiError,
   connectWs,
 } from "./api";
 import type {
   CorrelationData,
+  InstrumentFamily,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
@@ -38,11 +38,13 @@ import type {
 } from "./api";
 import type {
   CastMemberJSON,
-  CapturedLensReadoutJSON,
   ChatTurn,
   GenStatus,
   InstrumentSourceJSON,
   JLensSteerEntry,
+  LensReadoutBlockJSON,
+  MeasurementsEnvelopeJSON,
+  PreparationStatusJSON,
   SaeFeatureJSON,
   SaeSteerEntry,
   ManifoldSteerEntry,
@@ -60,6 +62,7 @@ import type {
   WSSampling,
 } from "./types";
 import { serializeExpression } from "./expression";
+import { resolveReadoutTopK } from "./readouts";
 import {
   SURPRISE_TARGET,
   HIGHLIGHT_SAT,
@@ -176,7 +179,7 @@ export async function refreshLensSources(): Promise<void> {
   if (lensSourceState.loading) return;
   lensSourceState.loading = true;
   try {
-    lensSourceState.sources = (await apiLens.sources()).sources;
+    lensSourceState.sources = (await apiInstruments.sources("lens")).sources;
     lensSourceState.error = null;
   } catch (e) {
     lensSourceState.error = e instanceof Error ? e.message : String(e);
@@ -189,7 +192,7 @@ export async function useLensSource(source: string): Promise<void> {
   if (lensSourceState.busy || !source) return;
   lensSourceState.busy = true;
   try {
-    const out = await apiLens.use(source);
+    const out = await apiInstruments.setLensSource(source);
     lensState.layers = out.live_layers;
     await refreshSession();
     await refreshLensSources();
@@ -299,13 +302,20 @@ function _hoverTokenKey(nodeId: string, rawIndex: number, raw: boolean): string 
   return `${modelKey}:${nodeId}:${rawIndex}:${raw ? 1 : 0}`;
 }
 
-function _lensHoverSnapshot(captured: CapturedLensReadoutJSON): LensHoverSnapshot {
+/** The lens native readout block → the display shape the workspace cards and
+ *  hover consume: per-layer ``[token, probability]`` (the wire carries
+ *  logprob — ``exp()`` restores the displayed per-layer softmax probability)
+ *  plus the ``[token, strength, com, spread]`` aggregate chips. */
+function _lensReadoutSnapshot(
+  block: LensReadoutBlockJSON | undefined,
+): LensHoverSnapshot | null {
+  if (!block) return null;
   return {
-    readout: Object.fromEntries(captured.layers.map((row) => [
+    readout: Object.fromEntries(block.layers.map((row) => [
       String(row.layer),
       row.tokens.map((token) => [token.token, Math.exp(token.logprob)]),
     ])),
-    aggregate: captured.aggregate.map((token) => [
+    aggregate: block.aggregate.map((token) => [
       token.token,
       token.strength,
       token.com,
@@ -314,30 +324,31 @@ function _lensHoverSnapshot(captured: CapturedLensReadoutJSON): LensHoverSnapsho
   };
 }
 
+/** Merge the three families' attached-probe ``readings`` from a measurement
+ *  envelope — the probe rack keys by name across families, so one dict drives
+ *  every probe strip. */
+function _mergedReadings(
+  m: MeasurementsEnvelopeJSON | undefined | null,
+): Record<string, ProbeReadingJSON> | undefined {
+  if (!m) return undefined;
+  const g = m.instruments.geometry?.readings;
+  const l = m.instruments.lens?.readings;
+  const s = m.instruments.sae?.readings;
+  if (!g && !l && !s) return undefined;
+  return { ...(g ?? {}), ...(l ?? {}), ...(s ?? {}) };
+}
+
 function _fetchLensHover(
   nodeId: string,
   rawIndex: number,
   raw: boolean,
-): Promise<LensHoverSnapshot> {
-  return apiLens.tokenReadout(nodeId, rawIndex, {
-    topK: Math.max(samplingState.return_top_k, 12),
+): Promise<LensHoverSnapshot | null> {
+  return apiInstruments.tokenReadout("lens", nodeId, rawIndex, {
+    topK: resolveReadoutTopK(samplingState.return_top_k),
     steered: true,
     raw,
     layers: "all",
-  }).then((data) => {
-    return {
-      readout: Object.fromEntries(data.layers.map((row) => [
-        String(row.layer),
-        row.tokens.map((token) => [token.token, Math.exp(token.logprob)]),
-      ])),
-      aggregate: (data.aggregate ?? []).map((token) => [
-        token.token,
-        token.strength,
-        token.com,
-        token.spread,
-      ]),
-    };
-  });
+  }).then((res) => _lensReadoutSnapshot(res.measurements.instruments.lens?.readout));
 }
 
 function _fetchSaeHover(
@@ -345,11 +356,11 @@ function _fetchSaeHover(
   rawIndex: number,
   raw: boolean,
 ): Promise<SaeFeatureJSON[]> {
-  return apiSae.tokenReadout(nodeId, rawIndex, {
-    topK: 12,
+  return apiInstruments.tokenReadout("sae", nodeId, rawIndex, {
+    topK: resolveReadoutTopK(samplingState.return_top_k),
     steered: true,
     raw,
-  }).then((data) => data.features);
+  }).then((res) => res.measurements.instruments.sae?.readout?.features ?? []);
 }
 
 /** Begin showing one transcript token in the inspector. Loom-owned captures
@@ -371,27 +382,27 @@ export function beginTokenHover(
   const key = nodeId && rawIndex !== null
     ? _hoverTokenKey(nodeId, rawIndex, raw)
     : `live:${modelKey}:${nodeId ?? "none"}:${rawIndex ?? "none"}:${token.tokenId ?? "none"}`;
-  const capturedProbes = token.captured?.probes;
-  const capturedLens = token.captured?.lens;
-  const capturedSae = token.captured?.sae;
+  const m = token.measurements;
+  const capturedLens = m?.instruments.lens?.readout;
+  const capturedSae = m?.instruments.sae?.readout;
   tokenHoverState.active = true;
   tokenHoverState.key = key;
   tokenHoverState.tokenText = token.text;
-  tokenHoverState.probeReadings = capturedProbes?.readings ?? null;
-  tokenHoverState.probes = capturedProbes?.scores ?? token.probes ?? null;
+  tokenHoverState.probeReadings = _mergedReadings(m) ?? null;
+  tokenHoverState.probes = m?.scores ?? token.probes ?? null;
   tokenHoverState.coordsByProbe = token.coordsByProbe ?? null;
   tokenHoverState.perLayerScores =
-    capturedProbes?.per_layer_scores ?? token.perLayerScores ?? null;
+    m?.per_layer_scores ?? token.perLayerScores ?? null;
   tokenHoverState.lensReadout = null;
   tokenHoverState.lensAggregate = null;
   tokenHoverState.saeReadout = capturedSae?.features ?? null;
   tokenHoverState.lensLoading = false;
   tokenHoverState.saeLoading = false;
 
-  if (capturedLens) {
-    const snapshot = _lensHoverSnapshot(capturedLens);
-    tokenHoverState.lensReadout = snapshot.readout;
-    tokenHoverState.lensAggregate = snapshot.aggregate;
+  const lensSnapshot = _lensReadoutSnapshot(capturedLens);
+  if (lensSnapshot) {
+    tokenHoverState.lensReadout = lensSnapshot.readout;
+    tokenHoverState.lensAggregate = lensSnapshot.aggregate;
   }
 
   if (!nodeId || rawIndex === null) return;
@@ -409,6 +420,7 @@ export function beginTokenHover(
       void _fetchLensHover(nodeId, rawIndex, raw)
         .then((snapshot) => {
           if (!tokenHoverState.active || tokenHoverState.key !== key) return;
+          if (!snapshot) return;
           tokenHoverState.lensReadout = snapshot.readout;
           tokenHoverState.lensAggregate = snapshot.aggregate;
         })
@@ -473,7 +485,7 @@ export async function refreshSaeSources(): Promise<void> {
   if (saeSourceState.loading) return;
   saeSourceState.loading = true;
   try {
-    saeSourceState.sources = (await apiSae.sources()).sources;
+    saeSourceState.sources = (await apiInstruments.sources("sae")).sources;
     saeSourceState.error = null;
   } catch (e) {
     saeSourceState.error = e instanceof Error ? e.message : String(e);
@@ -509,7 +521,7 @@ export async function backfillSaeMeta(): Promise<void> {
   if (wanted.length === 0) return;
   for (const id of wanted) _saeMetaRequested.add(id);
   try {
-    const out = await apiSae.featuresMetadata(wanted);
+    const out = await apiInstruments.saeFeaturesMetadata(wanted);
     for (const [key, entry] of Object.entries(out.features)) {
       saeState.meta.set(Number(key), {
         label: entry.label ?? null,
@@ -526,7 +538,7 @@ export async function setLiveSae(enabled: boolean): Promise<void> {
   if (saeState.busy) return;
   saeState.busy = true;
   try {
-    const out = await apiSae.setLive({ enabled, top_k: 12 });
+    const out = await apiInstruments.setLive("sae", { enabled });
     saeState.live = out.enabled;
     if (!out.enabled) {
       saeState.readout = [];
@@ -543,23 +555,43 @@ export async function setLiveSae(enabled: boolean): Promise<void> {
   }
 }
 
-async function pollSaeLoad(): Promise<void> {
+/** Generic poll loop over a family's unified ``/instruments/{family}/
+ *  preparations`` resource.  The four background jobs (lens fetch/fit, sae
+ *  load/train) share one status shape, so each wrapper supplies only its
+ *  state adapter (``apply``, every tick) + completion handler (``onSettled``,
+ *  once the job leaves ``running``) and this drives the interval. */
+async function pollPreparationJob(
+  family: InstrumentFamily,
+  apply: (st: PreparationStatusJSON) => void,
+  onSettled: (st: PreparationStatusJSON) => void | Promise<void>,
+  intervalMs: number,
+): Promise<void> {
   for (;;) {
-    const status = await apiSae.loadStatus();
-    saeState.loading = status.running;
-    saeState.loadMessage = status.message;
-    saeState.loadError = status.error;
-    if (!status.running) {
-      await refreshSession();
-      await refreshSaeSources();
-      await refreshProbeList();
-      if (!status.error && status.finished_at !== null) {
-        pushToast("SAE loaded", { kind: "info" });
-      }
+    const st = await apiInstruments.preparationStatus(family);
+    apply(st);
+    if (st.state !== "running") {
+      await onSettled(st);
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
+}
+
+function _applySaeLoadStatus(st: PreparationStatusJSON): void {
+  saeState.loading = st.state === "running";
+  saeState.loadMessage = st.message;
+  saeState.loadError = st.error;
+}
+
+async function pollSaeLoad(): Promise<void> {
+  await pollPreparationJob("sae", _applySaeLoadStatus, async (st) => {
+    await refreshSession();
+    await refreshSaeSources();
+    await refreshProbeList();
+    if (!st.error && st.finished_at !== null) {
+      pushToast("SAE loaded", { kind: "info" });
+    }
+  }, 1000);
 }
 
 export async function loadSae(
@@ -568,10 +600,13 @@ export async function loadSae(
 ): Promise<void> {
   if (saeState.loading || !release.trim()) return;
   try {
-    const status = await apiSae.load({ release: release.trim(), layer });
-    saeState.loading = status.running;
-    saeState.loadMessage = status.message;
-    saeState.loadError = status.error;
+    _applySaeLoadStatus(
+      await apiInstruments.startPreparation("sae", {
+        operation: "load",
+        release: release.trim(),
+        layer,
+      }),
+    );
     await pollSaeLoad();
   } catch (e) {
     saeState.loading = false;
@@ -600,46 +635,34 @@ export const saeTrainState: SaeTrainState = $state({
   cancelling: false,
 });
 
-function _applySaeTrainStatus(st: {
-  running: boolean;
-  tokens_done: number;
-  tokens_total: number;
-  message: string | null;
-  error: string | null;
-}): void {
-  saeTrainState.running = st.running;
-  saeTrainState.tokensDone = st.tokens_done;
-  saeTrainState.tokensTotal = st.tokens_total;
+function _applySaeTrainStatus(st: PreparationStatusJSON): void {
+  saeTrainState.running = st.state === "running";
+  saeTrainState.tokensDone = st.progress?.current ?? 0;
+  saeTrainState.tokensTotal = st.progress?.total ?? 0;
   saeTrainState.message = st.message;
   saeTrainState.error = st.error;
-  if (!st.running) saeTrainState.cancelling = false;
+  if (st.state !== "running") saeTrainState.cancelling = false;
 }
 
 export async function pollSaeTrain(): Promise<void> {
   if (saeTrainState.polling) return;
   saeTrainState.polling = true;
   try {
-    for (;;) {
-      const st = await apiSae.trainStatus();
-      _applySaeTrainStatus(st);
-      if (!st.running) {
-        await refreshSession();
-        await refreshSaeSources();
-        await refreshProbeList();
-        if (st.finished_at !== null) {
-          if (st.message === "cancelled") {
-            pushToast("SAE train cancelled", { kind: "info" });
-          } else {
-            pushToast(
-              st.error ? `SAE train: ${st.error}` : "SAE trained · live",
-              { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
-            );
-          }
+    await pollPreparationJob("sae", _applySaeTrainStatus, async (st) => {
+      await refreshSession();
+      await refreshSaeSources();
+      await refreshProbeList();
+      if (st.finished_at !== null) {
+        if (st.message === "cancelled") {
+          pushToast("SAE train cancelled", { kind: "info" });
+        } else {
+          pushToast(
+            st.error ? `SAE train: ${st.error}` : "SAE trained · live",
+            { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
+          );
         }
-        return;
       }
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-    }
+    }, 1500);
   } catch (e) {
     saeTrainState.error = e instanceof Error ? e.message : String(e);
   } finally {
@@ -655,7 +678,9 @@ export async function startSaeTrain(body: {
 }): Promise<void> {
   if (saeTrainState.running || saeTrainState.polling) return;
   try {
-    _applySaeTrainStatus(await apiSae.train(body));
+    _applySaeTrainStatus(
+      await apiInstruments.startPreparation("sae", { operation: "train", ...body }),
+    );
     void pollSaeTrain();
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
@@ -668,7 +693,7 @@ export async function cancelSaeTrain(): Promise<void> {
   if (!saeTrainState.running || saeTrainState.cancelling) return;
   saeTrainState.cancelling = true;
   try {
-    _applySaeTrainStatus(await apiSae.cancelTrain());
+    _applySaeTrainStatus(await apiInstruments.cancelPreparation("sae"));
   } catch (e) {
     saeTrainState.cancelling = false;
     pushToast(
@@ -681,9 +706,13 @@ export async function cancelSaeTrain(): Promise<void> {
 export async function checkSaeTrain(): Promise<void> {
   if (saeTrainState.polling) return;
   try {
-    const st = await apiSae.trainStatus();
-    _applySaeTrainStatus(st);
-    if (st.running) void pollSaeTrain();
+    // The SAE family shares one preparations resource across load + train,
+    // so only reflect it when the running-or-last job is actually a train.
+    const st = await apiInstruments.preparationStatus("sae");
+    if (st.operation === "train") {
+      _applySaeTrainStatus(st);
+      if (st.state === "running") void pollSaeTrain();
+    }
   } catch {
     // Source setup remains usable when no background status is available.
   }
@@ -705,7 +734,7 @@ export async function setLiveProbes(enabled: boolean): Promise<void> {
   if (probesLiveState.busy) return;
   probesLiveState.busy = true;
   try {
-    const out = await apiProbes.setLive({ enabled });
+    const out = await apiInstruments.setLive("geometry", { enabled });
     probesLiveState.enabled = out.enabled;
   } catch (e) {
     pushToast(
@@ -735,13 +764,13 @@ export function setInspectorTab(tab: InspectorTab): void {
   inspectorState.tab = tab;
 }
 
-/** Toggle the live J-lens readout server-side. Its token width follows the
+/** Toggle the live J-lens readout server-side. J-lens and SAE both follow the
  * same per-generation ``return_top_k`` value as the logit alternatives. */
 export async function setLiveLens(enabled: boolean): Promise<void> {
   if (lensState.busy) return;
   lensState.busy = true;
   try {
-    const out = await apiLens.setLive({ enabled });
+    const out = await apiInstruments.setLive("lens", { enabled });
     lensState.layers = out.enabled ? (out.layers ?? []) : null;
     if (!out.enabled) {
       lensState.readout = null;
@@ -773,12 +802,8 @@ export const lensFetchState: LensFetchState = $state({
   polling: false,
 });
 
-function _applyLensFetchStatus(st: {
-  running: boolean;
-  message: string | null;
-  error: string | null;
-}): void {
-  lensFetchState.running = st.running;
+function _applyLensFetchStatus(st: PreparationStatusJSON): void {
+  lensFetchState.running = st.state === "running";
   lensFetchState.message = st.message;
   lensFetchState.error = st.error;
 }
@@ -787,22 +812,16 @@ export async function pollLensFetch(): Promise<void> {
   if (lensFetchState.polling) return;
   lensFetchState.polling = true;
   try {
-    for (;;) {
-      const st = await apiLens.fetchStatus();
-      _applyLensFetchStatus(st);
-      if (!st.running) {
-        await refreshSession();
-        await refreshLensSources();
-        if (st.finished_at !== null) {
-          pushToast(
-            st.error ? `J-lens fetch: ${st.error}` : "J-lens active · live",
-            { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
-          );
-        }
-        return;
+    await pollPreparationJob("lens", _applyLensFetchStatus, async (st) => {
+      await refreshSession();
+      await refreshLensSources();
+      if (st.finished_at !== null) {
+        pushToast(
+          st.error ? `J-lens fetch: ${st.error}` : "J-lens active · live",
+          { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
+        );
       }
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
+    }, 1000);
   } catch (e) {
     lensFetchState.error = e instanceof Error ? e.message : String(e);
   } finally {
@@ -815,7 +834,9 @@ export async function startLensFetch(
 ): Promise<void> {
   if (lensFetchState.running || lensFetchState.polling) return;
   try {
-    _applyLensFetchStatus(await apiLens.fetch({ source }));
+    _applyLensFetchStatus(
+      await apiInstruments.startPreparation("lens", { operation: "fetch", source }),
+    );
     void pollLensFetch();
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
@@ -827,9 +848,13 @@ export async function startLensFetch(
 export async function checkLensFetch(): Promise<void> {
   if (lensFetchState.polling) return;
   try {
-    const st = await apiLens.fetchStatus();
-    _applyLensFetchStatus(st);
-    if (st.running) void pollLensFetch();
+    // The lens family shares one preparations resource across fetch + fit,
+    // so only reflect it when the running-or-last job is actually a fetch.
+    const st = await apiInstruments.preparationStatus("lens");
+    if (st.operation === "fetch") {
+      _applyLensFetchStatus(st);
+      if (st.state === "running") void pollLensFetch();
+    }
   } catch {
     // A fetch status is optional setup state; leave the rest of the panel live.
   }
@@ -861,20 +886,13 @@ export const lensFitState: LensFitState = $state({
 
 const LENS_FIT_POLL_MS = 3000;
 
-function _applyFitStatus(st: {
-  running: boolean;
-  prompts_done: number;
-  prompts_total: number;
-  message: string | null;
-  error: string | null;
-  finished_at: number | null;
-}): void {
-  lensFitState.running = st.running;
-  lensFitState.promptsDone = st.prompts_done;
-  lensFitState.promptsTotal = st.prompts_total;
+function _applyFitStatus(st: PreparationStatusJSON): void {
+  lensFitState.running = st.state === "running";
+  lensFitState.promptsDone = st.progress?.current ?? 0;
+  lensFitState.promptsTotal = st.progress?.total ?? 0;
   lensFitState.message = st.message;
   lensFitState.error = st.error;
-  if (!st.running) lensFitState.cancelling = false;
+  if (st.state !== "running") lensFitState.cancelling = false;
 }
 
 /** Poll the background lens fit until it settles.  On completion the
@@ -885,28 +903,22 @@ export async function pollLensFit(): Promise<void> {
   if (lensFitState.polling) return;
   lensFitState.polling = true;
   try {
-    for (;;) {
-      const st = await apiLens.fitStatus();
-      _applyFitStatus(st);
-      if (!st.running) {
-        if (st.finished_at !== null) {
-          if (st.message === "cancelled") {
-            pushToast("J-lens fit cancelled", { kind: "info" });
-          } else if (st.error) {
-            pushToast(`J-lens fit: ${st.error}`, {
-              kind: "error",
-              ttlMs: null,
-            });
-          } else {
-            pushToast("J-lens fitted · live", { kind: "info" });
-          }
-          await refreshSession();
-          await refreshLensSources();
+    await pollPreparationJob("lens", _applyFitStatus, async (st) => {
+      if (st.finished_at !== null) {
+        if (st.message === "cancelled") {
+          pushToast("J-lens fit cancelled", { kind: "info" });
+        } else if (st.error) {
+          pushToast(`J-lens fit: ${st.error}`, {
+            kind: "error",
+            ttlMs: null,
+          });
+        } else {
+          pushToast("J-lens fitted · live", { kind: "info" });
         }
-        return;
+        await refreshSession();
+        await refreshLensSources();
       }
-      await new Promise((r) => setTimeout(r, LENS_FIT_POLL_MS));
-    }
+    }, LENS_FIT_POLL_MS);
   } catch (e) {
     lensFitState.error = e instanceof Error ? e.message : String(e);
   } finally {
@@ -922,7 +934,10 @@ export async function startLensFit(
 ): Promise<void> {
   if (lensFitState.running || lensFitState.polling) return;
   try {
-    const st = await apiLens.fit(body);
+    const st = await apiInstruments.startPreparation("lens", {
+      operation: "fit",
+      ...body,
+    });
     _applyFitStatus(st);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -938,7 +953,7 @@ export async function cancelLensFit(): Promise<void> {
   if (!lensFitState.running || lensFitState.cancelling) return;
   lensFitState.cancelling = true;
   try {
-    const st = await apiLens.cancelFit();
+    const st = await apiInstruments.cancelPreparation("lens");
     _applyFitStatus(st);
     pushToast("J-lens cancelling…", { kind: "info" });
   } catch (e) {
@@ -953,9 +968,13 @@ export async function cancelLensFit(): Promise<void> {
 export async function checkLensFit(): Promise<void> {
   if (lensFitState.polling) return;
   try {
-    const st = await apiLens.fitStatus();
-    _applyFitStatus(st);
-    if (st.running) void pollLensFit();
+    // The lens family shares one preparations resource across fetch + fit,
+    // so only reflect it when the running-or-last job is actually a fit.
+    const st = await apiInstruments.preparationStatus("lens");
+    if (st.operation === "fit") {
+      _applyFitStatus(st);
+      if (st.state === "running") void pollLensFit();
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     pushToast(`J-lens status: ${msg}`, { kind: "error" });
@@ -1134,7 +1153,7 @@ export interface SteerRack {
    *  slide).  Unclamped (a high-share layer is meant to overshoot; the engine
    *  bounds it via ``norm_cap``).  Defaults to the ~0.5 coherent sweet spot. */
   subspaceAlong: number;
-  /** Per-vector profile metadata fetched from GET /vectors/{name}.
+  /** Per-profile metadata fetched from GET /profiles/{name}.
    * Populated lazily; absent until the user opens a strip's expander. */
   profiles: Map<string, VectorInfo>;
   /** Cosine matrix from GET /correlation; refreshed after each generation. */
@@ -1162,22 +1181,22 @@ export const steerRack: SteerRack = $state({
 });
 
 /** Server-derived list of registered vectors — names only.  Mirrors
- * sessionState.info?.vectors but kept as its own slice so panels that
+ * sessionState.info?.profiles but kept as its own slice so panels that
  * only care about the list don't re-render when other session fields
  * change. */
 export const vectorsState: { names: string[] } = $state({ names: [] });
 
 export async function refreshVectorList(): Promise<void> {
-  const r = await apiVectors.list();
-  vectorsState.names = r.vectors.map((v) => v.name);
+  const r = await apiProfiles.list();
+  vectorsState.names = r.profiles.map((v) => v.name);
   // Cache profile metadata — cheap, server already serialized.
-  for (const v of r.vectors) {
+  for (const v of r.profiles) {
     steerRack.profiles.set(v.name, v);
   }
 }
 
 export async function refreshVector(name: string): Promise<VectorInfo> {
-  const info = await apiVectors.get(name);
+  const info = await apiProfiles.get(name);
   steerRack.profiles.set(name, info);
   return info;
 }
@@ -1186,7 +1205,7 @@ export async function refreshCorrelation(
   names?: string[] | null,
 ): Promise<void> {
   try {
-    const data = await apiVectors.correlation(names);
+    const data = await apiProfiles.correlation(names);
     steerRack.correlation = data;
   } catch {
     steerRack.correlation = null;
@@ -1411,7 +1430,7 @@ function mutateJLens(
 
 /** Add a J-lens token steering chip (``α jlens/<word>``).  Accepts a bare
  *  word or a full ``jlens/…`` atom; the rack key is the full atom.
- *  Dashboard callers validate through ``apiLens.validateToken`` before this
+ *  Dashboard callers validate through ``apiInstruments.validateLensToken`` before this
  *  local mutation; the engine revalidates when it resolves the atom. */
 export function addJLensToRack(word: string): void {
   const bare = word.trim().replace(/^jlens\//, "");
@@ -1587,8 +1606,7 @@ export interface ProbeRackState {
 
 export const probeRack: ProbeRackState = $state({
   entries: new SvelteMap(),
-  // Alphabetical by default — matches the TUI's initial state.  Sort by
-  // value / change is a dropdown opt-in.
+  // Alphabetical by default; value/change sorting is a dropdown opt-in.
   sortMode: "name",
   active: [],
   loading: false,
@@ -1879,8 +1897,7 @@ export async function attachProbe(
   if (!probeRack.active.includes(info.name)) {
     probeRack.active = [...probeRack.active, info.name];
   }
-  // Seed the highlight target when a probe is attached through the rack —
-  // matches the TUI pointing highlight at a fresh probe.
+  // Seed the highlight target when a probe is attached through the rack.
   if (highlightState.target === null) {
     highlightState.target = info.name;
   }
@@ -2142,7 +2159,7 @@ function recomputeActivePath(): void {
  *  are bit-identical to the live-streamed shape so the highlight / click
  *  / fork affordances behave the same way. */
 function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): TokenScore {
-  const capturedProbes = row.captured?.probes;
+  const m = row.measurements;
   const out: TokenScore = {
     text: row.text,
     thinking: false,
@@ -2151,15 +2168,12 @@ function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): Toke
   if (row.logprob !== undefined) out.logprob = row.logprob;
   if (row.top_alts) out.topAlts = row.top_alts;
   if (row.raw_index !== undefined) out.rawIndex = row.raw_index;
-  if (capturedProbes?.scores ?? row.probes) {
-    out.probes = capturedProbes?.scores ?? row.probes;
-  }
-  if (capturedProbes?.per_layer_scores ?? row.per_layer_scores) {
-    out.perLayerScores =
-      capturedProbes?.per_layer_scores ?? row.per_layer_scores;
-  }
-  if (row.captured) out.captured = row.captured;
-  const readings = capturedProbes?.readings;
+  const scores = m?.scores ?? row.probes;
+  if (scores) out.probes = scores;
+  const perLayer = m?.per_layer_scores ?? row.per_layer_scores;
+  if (perLayer) out.perLayerScores = perLayer;
+  if (m) out.measurements = m;
+  const readings = _mergedReadings(m);
   if (readings) {
     const byProbe: Record<string, number[]> = {};
     for (const [name, reading] of Object.entries(readings)) {
@@ -2653,10 +2667,8 @@ export interface HighlightState {
 }
 
 export const highlightState: HighlightState = $state({
-  // Surprise mode by default — the logit-pass tint works without any
-  // probes loaded, so it's the one mode that's meaningful out of the
-  // box.  Mirrors the TUI's ``_highlight_probe = SURPRISE_PROBE`` +
-  // ``_highlighting = True`` init.  ``localStorage`` overrides per
+  // Surprise mode by default — the logit-pass tint works without any probes
+  // loaded, so it is meaningful out of the box. ``localStorage`` overrides per
   // model on hydrate, so a user who flipped to a probe + reloaded
   // still sees their last choice.
   target: SURPRISE_TARGET,
@@ -2703,7 +2715,7 @@ export const genStatus: GenStatus = $state({
 });
 
 /** Geometric-mean perplexity assembled from per-token TokenEvent.perplexity
- * values (mirrors the TUI's ``exp(sum(log(ppl)) / count)`` formula).  Pure
+ * values using ``exp(sum(log(ppl)) / count)``. Pure
  * function — caller passes the slice so it can also be used on ad-hoc
  * accumulators (e.g. an A/B side's separate perplexity buffer). */
 export function geometricMeanPpl(state: GenStatus): number | null {
@@ -2734,7 +2746,7 @@ export interface SamplingState {
    *  event carries ``top_alts`` and the drilldown's logits tab + the
    *  inline ``surprise`` highlight mode populate.  Flipped via the
    *  "show alts" toggle in ``SamplingStrip``; the canonical "on" value
-   *  is ``8`` per Decision 1 of ``docs/plans/logit-pass.md``. */
+   *  is ``8``. */
   return_top_k: number;
   /** Active chat-template labels for the structural user/assistant roles. Sticky
    *  client state like ``seed`` — whatever's in the boxes rides the next
@@ -2764,8 +2776,7 @@ export const samplingState: SamplingState = $state({
   thinking: false,
   // Logit-pass: top-K alternatives on by default — the drilldown logits
   // tab and the inline surprise highlight want them.  The SamplingStrip's
-  // "alts" toggle flips this between 0 and 8 (Decision 1 in
-  // docs/plans/logit-pass.md).
+  // "alts" toggle flips this between 0 and 8.
   return_top_k: 8,
 });
 
@@ -3071,9 +3082,8 @@ function enqueueOrApply(label: string, apply: () => void): void {
   });
 }
 
-/** Are we busy enough that fresh submissions should queue instead of
- *  fire?  Mirrors the TUI's ``_is_busy`` — gen running OR earlier
- *  items waiting their turn.  Used by every submission helper below. */
+/** Are we busy enough that fresh submissions should queue instead of fire?
+ *  Busy means a generation is running or earlier items await their turn. */
 export function isPendingBusy(): boolean {
   return genStatus.active || pendingActions.queue.length > 0;
 }
@@ -3381,30 +3391,27 @@ function handleWsMessage(msg: WSServerMessage): void {
         const elapsed = (performance.now() - genStatus.startedAt) / 1000;
         if (elapsed > 0) genStatus.tokPerSec = genStatus.tokensSoFar / elapsed;
       }
-      const capturedProbes = msg.captured?.probes;
-      const capturedReadings =
-        capturedProbes?.readings ?? msg.probe_readings;
-      const capturedScores = capturedProbes?.scores ?? msg.scores;
-      const capturedPerLayer =
-        capturedProbes?.per_layer_scores ?? msg.per_layer_scores;
-      const capturedLens = msg.captured?.lens;
-      const lensSnapshot = capturedLens
-        ? _lensHoverSnapshot(capturedLens)
-        : null;
-      const liveLensReadout = lensSnapshot?.readout ?? msg.lens_readout;
-      const liveLensAggregate = lensSnapshot?.aggregate ?? msg.lens_aggregate;
-      const liveSaeReadout = msg.captured?.sae?.features ?? msg.sae_readout;
+      // The 5.x measurement envelope is the single read-side record.  Probe
+      // readings merge the three families (the rack keys by name); ``scores``
+      // is the flat cross-family axis-0 view (highlight tint);
+      // ``per_layer_scores`` the heatmap; the native lens/sae ``readout``
+      // blocks feed the workspace/discovery cards.
+      const m = msg.measurements;
+      const mergedReadings = _mergedReadings(m);
+      const scores = m?.scores;
+      const lensSnapshot = _lensReadoutSnapshot(m?.instruments.lens?.readout);
+      const liveLensReadout = lensSnapshot?.readout;
+      const liveLensAggregate = lensSnapshot?.aggregate;
+      const liveSaeReadout = m?.instruments.sae?.readout?.features;
       const tokenScore: TokenScore = {
         text: msg.text,
         thinking: msg.thinking,
         tokenId: msg.token_id,
-        perLayerScores: capturedPerLayer,
-        // ``msg.scores`` is the magnitude-weighted aggregate probe row —
-        // the value the TUI tints live tokens with.  Using it (rather
-        // than a single deepest-layer slice) makes the webui's live
-        // highlight match both the TUI and the post-generation projected
-        // pass.  Absent when no probes are loaded.
-        probes: capturedScores,
+        perLayerScores: m?.per_layer_scores,
+        // ``scores`` is the magnitude-weighted aggregate probe row. Using
+        // it instead of a deepest-layer slice makes live highlighting match the
+        // post-generation projected pass. Absent when no probes are loaded.
+        probes: scores,
         // Logit-pass: pipe chosen-token logprob + top-K alternatives onto
         // the per-token row.  Both ride the WS ``token`` event directly
         // from Phase 1's engine capture; absent when ``return_top_k == 0``
@@ -3414,23 +3421,23 @@ function handleWsMessage(msg: WSServerMessage): void {
         // Raw decode-step index — the join key the logit fork slices
         // ``raw_token_ids`` on.  Rides the WS ``token`` event directly.
         rawIndex: msg.raw_index ?? null,
-        captured: msg.captured,
+        measurements: m,
       };
       // Seed the single-probe ``score`` for the selected highlight so the
       // inline tint paints immediately as the token streams in.  The
       // canonical projected scores overwrite this on ``done``.
-      if (capturedScores && highlightState.target) {
-        const s = capturedScores[highlightState.target];
+      if (scores && highlightState.target) {
+        const s = scores[highlightState.target];
         if (typeof s === "number") tokenScore.score = s;
       }
       // Per-PC token highlighting: stash the full per-axis domain coords off
-      // the rich ``probe_readings`` channel so axis targets (``personas[3]``)
-      // can tint live.  Only multi-axis probes need it — axis 0 already rides
-      // ``msg.scores`` — and the row keeps it through ``done`` (the per-token
+      // the merged family readings so axis targets (``personas[3]``) can tint
+      // live.  Only multi-axis probes need it — axis 0 already rides
+      // ``scores`` — and the row keeps it through ``done`` (the per-token
       // settle pass is axis-0 only and never clobbers this field).
-      if (capturedReadings) {
+      if (mergedReadings) {
         const byProbe: Record<string, number[]> = {};
-        for (const [pname, r] of Object.entries(capturedReadings)) {
+        for (const [pname, r] of Object.entries(mergedReadings)) {
           const coords = (r as ProbeReadingJSON).coords;
           if (Array.isArray(coords) && coords.length > 1) byProbe[pname] = coords;
         }
@@ -3454,14 +3461,14 @@ function handleWsMessage(msg: WSServerMessage): void {
           }
         }
       }
-      // Probe rack — unified per-token readings.  Every probe shape rides
-      // the one ``probe_readings`` channel (a 2-node concept axis is the
-      // rank-1 case); the field is omitted when no probe is attached, so the
-      // helper no-ops on undefined.  Skip shadow runs so the rack stays
-      // anchored to the steered branch.  ``msg.scores`` / ``per_layer_scores``
+      // Probe rack — unified per-token readings.  Every probe shape rides the
+      // three families' ``readings`` (a 2-node concept axis is the rank-1
+      // case), merged by name; the field is omitted when no probe is attached,
+      // so the helper no-ops on undefined.  Skip shadow runs so the rack stays
+      // anchored to the steered branch.  ``scores`` / ``per_layer_scores``
       // above still feed highlight tinting + the token-drilldown heatmap.
       if (!abState.processingAb) {
-        updateProbesFromReadings(capturedReadings);
+        updateProbesFromReadings(mergedReadings);
         // J-LENS tab — the live all-layer readout. Present only while
         // the session's live lens is enabled; shadow runs skipped like
         // the probe rack so the matrix tracks the steered branch.

@@ -174,20 +174,20 @@
     border: 0; outline: 0; background: transparent; color: var(--fg); font: inherit;
     font-family: var(--font-mono); font-size: var(--text-sm); }
   input:disabled, input:disabled + .caret { opacity: .5; cursor: not-allowed; }
-  .caret { position: absolute; right: 0; display: grid; place-items: center; width: 26px;
+  .caret { position: absolute; right: 0; display: grid; place-items: center; width: var(--control-compact);
     height: 100%; padding: 0; border: 0; background: transparent; color: var(--fg-muted);
     cursor: pointer; transition: color var(--dur-fast) var(--ease-out),
       transform var(--dur-fast) var(--ease-out); }
   .is-open .caret { color: var(--accent); transform: rotate(180deg); }
   .popover { position: fixed; inset: auto; z-index: var(--z-modal); box-sizing: border-box;
     overflow-y: auto; margin: 0; padding: var(--space-1) 0; list-style: none;
-    border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-hi);
+    border: 1px solid var(--glass-line); border-radius: var(--radius); background: var(--surface-hi);
     box-shadow: var(--shadow-overlay); }
-  li { min-height: 24px; padding: var(--space-2) var(--space-3); overflow: hidden;
+  li { min-height: var(--control-target); padding: var(--space-2) var(--space-3); overflow: hidden;
     color: var(--fg-strong); font-size: var(--text-sm); line-height: 1.3;
     text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
   li.highlight { background: var(--bg-hover); color: var(--fg); }
   li.active { background: var(--accent-subtle); }
-  li.active.highlight { background: var(--accent-glow); }
+  li.active.highlight { background: var(--accent-strong); }
   li.empty { color: var(--fg-muted); cursor: default; }
 </style>

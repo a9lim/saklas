@@ -18,7 +18,7 @@ import pytest
 from saklas.io import selectors as _sel
 from saklas.core.events import EventBus, SteeringApplied, SteeringCleared
 from saklas.core.session import (
-    ConcurrentExtractionError, SaklasSession, VectorNotRegisteredError,
+    ConcurrentExtractionError, SaklasSession, ProfileNotRegisteredError,
 )
 from saklas.core.steering import Steering
 from saklas.core.steering_composer import SteeringComposer
@@ -75,7 +75,7 @@ class _Stub(SaklasSession):
         flat = self._steering_composer.flatten_stack()
         for name in flat:
             if name not in self._profiles:
-                raise VectorNotRegisteredError(f"No vector registered for '{name}'")
+                raise ProfileNotRegisteredError(f"No profile registered for '{name}'")
         self._rebuild_entries.append(dict(flat))
         # The stub only registers plain (alpha, Trigger) entries; cast away the
         # union so pyright does not flag AblationTerm / ManifoldTerm as non-iterable.
@@ -167,7 +167,7 @@ def test_steering_accepts_steering_instance():
 
 def test_unknown_vector_raises_on_enter():
     s = _Stub({"known": None})
-    with pytest.raises(VectorNotRegisteredError):
+    with pytest.raises(ProfileNotRegisteredError):
         with s.steering("0.5 unknown"):
             pass
     # _push_steering rolls its entry back on rebuild failure, so the stack
@@ -177,7 +177,7 @@ def test_unknown_vector_raises_on_enter():
     events = []
     s2 = _Stub({"known": None})
     s2.events.subscribe(events.append)
-    with pytest.raises(VectorNotRegisteredError):
+    with pytest.raises(ProfileNotRegisteredError):
         with s2.steering("0.5 unknown"):
             pass
     assert s2._steering_composer._stack == []
@@ -188,7 +188,7 @@ def test_failed_enter_under_outer_scope_preserves_outer():
     """An inner failed enter must not pop the outer scope's entry."""
     s = _Stub({"a": None})
     with s.steering("0.3 a"):
-        with pytest.raises(VectorNotRegisteredError):
+        with pytest.raises(ProfileNotRegisteredError):
             with s.steering("0.5 unknown"):
                 pass
         assert s._steering_composer._stack == [{"a": (0.3, Trigger.BOTH)}]

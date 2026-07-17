@@ -118,6 +118,7 @@ class TestTokenEvent:
         assert event.finish_reason is None
         assert event.probe_readings is None
         assert event.perplexity is None
+        assert event.measurements is None
 
     def test_logprobs_carried_through(self):
         """Populated logprob + top_alts (phase 1 logit pass) land on the
@@ -317,7 +318,7 @@ class TestTraitMonitorScoring:
     @classmethod
     def _make_monitor(cls):
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from tests._whitener import synthetic_whitener
         probe_vec = torch.zeros(cls._DIM)
         probe_vec[0] = 1.0  # unit vector along dim 0
@@ -367,11 +368,3 @@ class TestTraitMonitorScoring:
             monitor.history["test_probe"][0][0]
             > monitor.history["test_probe"][1][0]
         )
-
-    def test_sparkline_grows_with_history(self):
-        monitor = self._make_monitor()
-        for _ in range(4):
-            h = torch.randn(16)
-            monitor.measure_from_hidden({0: h})
-        sparkline = monitor.get_sparkline("test_probe")
-        assert len(sparkline) == 4

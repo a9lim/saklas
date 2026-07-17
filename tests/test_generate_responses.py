@@ -11,9 +11,9 @@ from typing import Any
 
 import pytest
 
-from saklas.core import vectors as V
+from saklas.core import capture as V
 from saklas.core.session import SaklasSession, _role_for, _system_for
-from saklas.core.vectors import _LENGTH_DIRECTIVE
+from saklas.core.capture import _LENGTH_DIRECTIVE
 
 
 class _FakeSession(SaklasSession):

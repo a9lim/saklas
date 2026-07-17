@@ -78,16 +78,38 @@ class _CurrentSessionStub(SaklasSession):
 
 
 def _complete_capture_session(session: Any) -> None:
-    """Install the current capture collaborator roster on a narrow stub."""
+    """Install the current capture collaborator roster on a narrow stub.
+
+    The stub lens is real-shaped (``source_layers`` = the fixture's
+    declared live + probe layer union): a pin-demanded lens without its
+    fitted layer set is a hard ``prepare()`` failure now, and production
+    keeps every probe's registry list identical to ``source_layers``
+    anyway (attach records the full fitted set; adoption rewrites every
+    probe), so an ``object()`` lens only modeled an impossible state.
+    """
     if not hasattr(session, "_lens_probes"):
         session._lens_probes = {}
     if not hasattr(session, "_sae_probes"):
         session._sae_probes = {}
     if not hasattr(session, "_live_sae"):
         session._live_sae = None
-    session._jlens = (
-        object() if session._live_lens is not None or session._lens_probes else None
+    live_layers = (
+        (session._live_lens or {}).get("layers") or []
+        if session._live_lens is not None else []
     )
+    probe_layers = {
+        int(layer)
+        for spec in session._lens_probes.values()
+        for layer in spec.get("layers", [])
+    }
+    if session._live_lens is not None or session._lens_probes:
+        session._jlens = SimpleNamespace(
+            source_layers=sorted(
+                {int(layer) for layer in live_layers} | probe_layers
+            ),
+        )
+    else:
+        session._jlens = None
     session._jlens_identity = None
 
 
@@ -204,16 +226,26 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
     )
     session._live_lens = {"source": "local:default"}
     session._live_sae = {"source": "saelens:test", "layer": 0}
-    session._authored_lens_capture = lambda _hidden, *, top_k: (
-        {0: [("yes", 0.8)]},
-        [("yes", 0.8, 0.5, 0.1)],
-        {0: [9]},
-        {"jlens/yes": _reading(0.8)},
-    )
-    session._authored_sae_capture = lambda _hidden: (
-        [(12, 1.5, "feature", 3.0)],
-        {"sae/12": _reading(0.5)},
-    )
+    seen_top_k: dict[str, int] = {}
+
+    def _lens_capture(_hidden: Any, *, top_k: int) -> Any:
+        seen_top_k["lens"] = top_k
+        return (
+            {0: [("yes", 0.8)]},
+            [("yes", 0.8, 0.5, 0.1)],
+            {0: [9]},
+            {"jlens/yes": _reading(0.8)},
+        )
+
+    def _sae_capture(_hidden: Any, *, top_k: int) -> Any:
+        seen_top_k["sae"] = top_k
+        return (
+            [(12, 1.5, "feature", 3.0)],
+            {"sae/12": _reading(0.5)},
+        )
+
+    session._authored_lens_capture = _lens_capture
+    session._authored_sae_capture = _sae_capture
     match = _AuthoredPromptMatch(
         _AuthoredPromptTarget(user_id, False, (120,), ("x",)),
         (1,),
@@ -226,7 +258,7 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
         monitor_active=True,
         lens_active=True,
         sae_active=True,
-        lens_top_k=8,
+        readout_top_k=8,
         persist_per_layer_scores=True,
         steering="0.2 formal",
     )
@@ -240,9 +272,12 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
         "jlens/yes": 0.8,
         "sae/12": 0.5,
     }
-    assert set(row["captured"]) == {"probes", "lens", "sae"}
-    assert row["captured"]["lens"]["layers"][0]["tokens"][0]["id"] == 9
-    assert row["captured"]["sae"]["features"][0]["id"] == 12
+    instruments = row["measurements"]["instruments"]
+    assert set(instruments) == {"geometry", "lens", "sae"}
+    assert instruments["geometry"]["readings"]["formal"]["coords"] == [0.25]
+    assert instruments["lens"]["readout"]["layers"][0]["tokens"][0]["id"] == 9
+    assert instruments["sae"]["readout"]["features"][0]["id"] == 12
+    assert seen_top_k == {"lens": 8, "sae": 8}
 
 
 def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,7 +304,7 @@ def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.Mo
     assert use_thinking is True
 
 
-def test_jlens_top_k_shares_logit_alternative_width() -> None:
+def test_readout_top_k_shares_logit_alternative_width() -> None:
     session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
     session._default_return_top_k = 6
 
@@ -281,6 +316,14 @@ def test_jlens_top_k_shares_logit_alternative_width() -> None:
     assert SaklasSession._effective_return_top_k(
         session, SamplingConfig(return_top_k=0),
     ) == 6
+    assert SaklasSession._effective_readout_top_k(
+        session, SamplingConfig(return_top_k=13),
+    ) == 13
+
+    # Read-side discovery remains useful when alts are disabled.
+    session._default_return_top_k = 0
+    assert SaklasSession._effective_readout_top_k(session, None) == 8
+
 
 def test_prepare_input_raw_feeds_flat_active_path():
     """raw=True walks the loom tree as flat text — no chat template, no
@@ -403,6 +446,127 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
         stateless=True,
     )
     assert result.text == "Hello"
+
+
+def test_decode_loop_hands_one_step_id_to_sink_gate_and_tap():
+    """The loop-owned forward index: the capture sink (``step_callback``),
+    the gate callback (``score_callback``), and the token tap
+    (``on_token``'s trailing ``step_id``) all receive the SAME value for
+    one forward, and the value is ``len(generated_ids)`` before that
+    forward — what lets the instrument runs' step-keyed memos pair one
+    forward's gate and display reads."""
+    from saklas.core.triggers import TriggerContext
+
+    model: Any = _StopModel()
+    tokenizer: Any = _StopTokenizer()
+    state = GenerationState()
+    sink_steps: list[int] = []
+    gate_steps: list[int] = []
+    tap_steps: list[int] = []
+
+    def _gate(step: int) -> dict[str, float]:
+        gate_steps.append(step)
+        return {}
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=3, temperature=0.0),
+        state,
+        on_token=lambda _t, _th, _tid, _lp, _alts, _ppl, step: (
+            tap_steps.append(step)
+        ),
+        trigger_ctx=TriggerContext(),
+        score_callback=_gate,
+        step_callback=sink_steps.append,
+    )
+
+    assert generated_ids == [0, 1, 2]
+    assert sink_steps == [0, 1, 2]
+    assert gate_steps == [0, 1, 2]
+    assert tap_steps == [0, 1, 2]
+
+
+class _Utf8SplitTokenizer(_StopTokenizer):
+    """ids 1 and 2 are partial UTF-8 pieces that only decode as a group."""
+
+    name_or_path = "utf8-split-tokenizer"
+    vocab_size = 5
+    eos_token_id = 4
+    all_special_ids = [4]
+    _pieces = {0: "A", 1: "�", 2: "�", 3: "B", 4: ""}
+
+    def decode(self, ids: Any, skip_special_tokens: bool = False) -> str:
+        ids = [int(t) for t in ids]
+        if ids == [1, 2]:
+            return "é"
+        if ids == [1, 2, 3]:
+            return "éB"
+        return super().decode(ids, skip_special_tokens)
+
+
+class _Utf8SplitModel(_StopModel):
+    config = SimpleNamespace(vocab_size=5)
+    generation_config = SimpleNamespace(eos_token_id=4)
+
+    def __init__(self, tokens: list[int]):
+        self._tokens = tokens
+        self._idx = 0
+
+
+def test_buffered_utf8_group_emits_carry_the_flush_forwards_step():
+    """Partial-UTF-8 tokens buffer in ``pending_ids`` and flush as a group
+    — every emit in the group carries the FLUSHING forward's step (the
+    group's readings semantics: they all read that forward's captures)."""
+    model: Any = _Utf8SplitModel([0, 1, 2, 3])
+    tokenizer: Any = _Utf8SplitTokenizer()
+    state = GenerationState()
+    emits: list[tuple[str, int]] = []
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=4, temperature=0.0),
+        state,
+        on_token=lambda text, _th, _tid, _lp, _alts, _ppl, step: (
+            emits.append((text, step))
+        ),
+        cache_token_text=False,
+    )
+
+    assert generated_ids == [0, 1, 2, 3]
+    # "A" emitted by forward 0; tokens 1+2 buffer (partial pieces); the
+    # completing token 3 flushes the group at forward 3.
+    assert emits == [("A", 0), ("éB", 3)]
+
+
+def test_post_loop_utf8_flush_uses_the_last_forwards_step():
+    """A generation ending with a still-buffered partial flushes post-loop
+    with ``last_forward_step`` (no fresh forward ran since)."""
+    model: Any = _Utf8SplitModel([0, 1])
+    tokenizer: Any = _Utf8SplitTokenizer()
+    state = GenerationState()
+    emits: list[tuple[str, int]] = []
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=2, temperature=0.0),
+        state,
+        on_token=lambda text, _th, _tid, _lp, _alts, _ppl, step: (
+            emits.append((text, step))
+        ),
+        cache_token_text=False,
+    )
+
+    assert generated_ids == [0, 1]
+    assert emits[0] == ("A", 0)
+    # The trailing lone partial flushed after the loop with the last
+    # forward's step (1), not a stale or synthetic index.
+    assert emits[1][1] == 1
 
 
 def test_stop_sequence_split_across_tokens_trims_final_text():
@@ -610,6 +774,13 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     )
     reading = ProbeReading(0.0, [], coords=(0.7,))
     flags: dict[str, bool] = {}
+    # The readout-suppression mechanism now lives at the tap: ``live_readouts``
+    # gates the consumer's ``lens_readout`` / ``sae_readout`` compute flags, so
+    # the tap never builds lens/SAE readout instruments.  The measurement
+    # envelope the tap produced forwards verbatim onto ``TokenEvent.measurements``
+    # (here the tap is faked, so the envelope carries only what the fake set),
+    # and ``probe_readings`` still rides the compat channel under ``live_scores``.
+    envelope = {"version": 1, "scope": "token", "instruments": {}}
 
     session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
 
@@ -617,12 +788,8 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
         on_token = kwargs["on_token"]
         flags["lens"] = on_token.options.lens_readout
         flags["sae"] = on_token.options.sae_readout
-        session._last_token_probe_payload = {
-                "probe_readings": {"sae/0": reading},
-            "lens": {1: [("tok", 0.5)]},
-            "lens_aggregate": [("tok", 0.5, 0.5, 0.0)],
-            "sae": [(0, 1.0, None, None)],
-        }
+        session._last_token_probe_readings = {"sae/0": reading}
+        session._last_token_probe_payload = {"measurements": envelope}
         on_token("ok", False, 7, None, None, None)
         return result
 
@@ -631,8 +798,10 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
         probe_names=[],
         update_live=lambda _readings: None,
     )
+    session._lens_probes = {}
     session._sae_probes = {"sae/0": {"feature_id": 0}}
     session._last_token_probe_payload = {}
+    session._last_token_probe_readings = None
     session._generate_core = _fake_generate_core
 
     events = list(session.generate_stream(
@@ -641,9 +810,7 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
 
     assert flags == {"lens": False, "sae": False}
     assert events[0].probe_readings == {"sae/0": reading}
-    assert events[0].lens_readout is None
-    assert events[0].lens_aggregate is None
-    assert events[0].sae_readout is None
+    assert events[0].measurements is envelope
 
 
 def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
@@ -720,11 +887,11 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
     session._incremental_readings = []
     session._incremental_gate_scores = []
     session._live_lens = {"layers": [0]}
-    session._live_sae = {"layer": 0, "top_k": 3}
+    session._live_sae = {"layer": 0}
     session._live_lens_readout_step = lambda **_kwargs: (
         (_ for _ in ()).throw(AssertionError("lens readout not consumed"))
     )
-    session._live_sae_readout_step = lambda: (
+    session._live_sae_readout_step = lambda **_kwargs: (
         (_ for _ in ()).throw(AssertionError("sae readout not consumed"))
     )
     session._last_lens_step_readings = None
@@ -1177,11 +1344,16 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
         _lens_probes={},
         _sae_probes={},
         _profiles={},
+        # A memo-less run: the incremental branch's ``observe`` read falls
+        # back to the sink's appended row, which is what this test pins.
+        _geometry_instrument=SimpleNamespace(
+            current_run=SimpleNamespace(observe=lambda _step, _hidden: {}),
+        ),
     )
 
     callback = SteeringComposer(session).build_gating_score_callback()
-    scores = callback()
-    scores_again = callback()
+    scores = callback(0)
+    scores_again = callback(1)
 
     assert scores == {"toy@nearest": -0.1, "toy@hidden": -2.0}
     assert scores_again == scores
@@ -1242,19 +1414,25 @@ def test_readout_only_gates_skip_monitor_probe_scoring(
         _incremental_gate_scores=[],
         _lens_probes={},
         _sae_probes={},
+        _geometry_instrument=SimpleNamespace(
+            current_run=SimpleNamespace(observe=lambda _step, _hidden: {}),
+        ),
+    )
+    setattr(
+        session, score_attr,
+        lambda _keys, *, step_id=-1: dict(expected),
     )
     setattr(session, registry_attr, {next(iter(expected)): {}})
-    setattr(session, score_attr, lambda _keys: dict(expected))
     other_score_attr = (
         "_score_sae_gate_scalars"
         if score_attr == "_score_lens_gate_scalars"
         else "_score_lens_gate_scalars"
     )
-    setattr(session, other_score_attr, lambda _keys: {})
+    setattr(session, other_score_attr, lambda _keys, *, step_id=-1: {})
     composer = SteeringComposer(session)
     composer._stack.append(cast(Any, dict(parse_expr(expr).alphas)))
 
-    assert composer.build_gating_score_callback()() == expected
+    assert composer.build_gating_score_callback()(0) == expected
 
 
 def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
@@ -1301,8 +1479,13 @@ def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
         _incremental_gate_scores=[],
         _lens_probes={"jlens/g": {}},
         _sae_probes={},
-        _score_lens_gate_scalars=lambda _keys: {"jlens/g": 0.7},
-        _score_sae_gate_scalars=lambda _keys: {},
+        _score_lens_gate_scalars=(
+            lambda _keys, *, step_id=-1: {"jlens/g": 0.7}
+        ),
+        _score_sae_gate_scalars=lambda _keys, *, step_id=-1: {},
+        _geometry_instrument=SimpleNamespace(
+            current_run=SimpleNamespace(observe=lambda _step, _hidden: {}),
+        ),
     )
     composer = SteeringComposer(session)
     steering = parse_expr(
@@ -1310,7 +1493,7 @@ def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
     )
     composer._stack.append(cast(Any, dict(steering.alphas)))
 
-    scores = composer.build_gating_score_callback()()
+    scores = composer.build_gating_score_callback()(0)
 
     assert scores == {"toy": 0.2, "jlens/g": 0.7}
     assert monitor.requested == {"toy"}
@@ -1538,7 +1721,13 @@ def test_lens_gate_without_final_aggregate_attaches_gated_probe_layers() -> None
     )
 
     assert attached is True
-    assert capture.attached == [3]
+    # The gated probes' band.  Production bands are uniform (every probe's
+    # registry list equals the resident lens's source_layers — attach
+    # records the full fitted set, adoption rewrites every probe), so the
+    # prepared snapshot stamps the fixture's [3, 6] union onto both probes;
+    # the FIX-#4 observable is gate-keeps-the-band-alive vs the dormant
+    # roster attaching nothing (the sibling test above).
+    assert capture.attached == [3, 6]
     assert capture.aggregate_depth == 1
 
 
@@ -1576,7 +1765,7 @@ def test_sae_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
     session._steering_uses_compiled_offsets = False
     session._live_lens = None
     session._lens_probes = {}
-    session._live_sae = {"layer": 5, "top_k": 8}
+    session._live_sae = {"layer": 5}
     session._sae_probes = {}
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
@@ -1943,7 +2132,7 @@ def test_gate_only_capture_reuses_preplanned_gate_scalars() -> None:
 
     assert monitor.plan_calls == [({"gate"}, {"gate"})]
     assert capture.sink is not None
-    capture.sink({2: torch.ones(4)})
+    capture.sink(0, {2: torch.ones(4)})
     assert monitor.score_plans == [(plan,)]
     assert session._incremental_gate_scores == [{"gate": 0.25}]
 

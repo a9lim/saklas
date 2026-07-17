@@ -1,6 +1,6 @@
 <script lang="ts">
   // saklas workbench shell.  The primary frame is a desktop research
-  // cockpit: rail navigation, the threads (loom) column, central
+  // cockpit: the threads (loom) column, central
   // chat/canvas, right-side inspector, and a wide drawer host for deep
   // tools.
 
@@ -35,7 +35,7 @@
   import type { DrawerName } from "./lib/types";
 
   // Content-driven drawer sizing — forms and pickers get a narrow panel,
-  // analysis views keep the wide one (docs/plans/webui-overhaul.md §8).
+  // while analysis views keep the wide one.
   const NARROW_DRAWERS: ReadonlySet<DrawerName> = new Set<DrawerName>([
     "subspace",
     "manifolds",
@@ -113,8 +113,8 @@
     void runBootstrap();
   });
 
-  // Global keyboard accelerators.  Esc → stop (matches TUI).  Cmd/Ctrl-
-  // Enter is left for the chat input to handle locally.
+  // Global keyboard accelerators. Esc stops generation; Cmd/Ctrl-Enter is
+  // left for the chat input to handle locally.
   //
   // Loom (phase 3): Ctrl/Cmd+R/E/B/N/D fire the corresponding tree op
   // via the sidebar's modal flow.  Browser Ctrl+B (bold) is suppressed
@@ -340,16 +340,8 @@
             <Drawers.TokenDrilldown params={drawerState.params} />
           {:else if drawerState.open === "correlation"}
             <Drawers.Correlation params={drawerState.params} />
-          {:else if drawerState.open === "layer_norms"}
-            <Drawers.LayerNorms params={drawerState.params} />
           {:else if drawerState.open === "probe_inspector"}
             <Drawers.ProbeInspector params={drawerState.params} />
-          {:else if drawerState.open === "experiment_lab"}
-            <Drawers.ExperimentLab params={drawerState.params} />
-          {:else if drawerState.open === "activation_atlas"}
-            <Drawers.ActivationAtlas params={drawerState.params} />
-          {:else if drawerState.open === "recipe_builder"}
-            <Drawers.RecipeBuilder params={drawerState.params} />
           {:else if drawerState.open === "advanced_sampling"}
             <Drawers.AdvancedSampling params={drawerState.params} />
           {:else if drawerState.open === "health"}
@@ -427,7 +419,7 @@
     font-size: var(--text-sm);
     letter-spacing: 0.04em;
     text-transform: lowercase;
-    background: rgba(2, 3, 8, 0.38);
+    background: var(--scrim-soft);
     backdrop-filter: blur(1px);
     pointer-events: none;
   }
@@ -437,7 +429,7 @@
     border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     border-top-color: var(--accent);
     border-radius: 50%;
-    animation: boot-spin 0.7s linear infinite;
+    animation: boot-spin var(--dur-spin) linear infinite;
   }
   @keyframes boot-spin {
     to { transform: rotate(360deg); }
@@ -480,11 +472,10 @@
     flex-direction: column;
     padding: var(--space-5);
   }
-  /* Two-row grid: steering rack and probe rack.  Reference views
-   * (correlation N×N, per-name layer norms) live in drawer overlays
-   * launched from the workspace rail — keeping them out of the rack
-   * zone gives both racks the full vertical budget.  Each rack handles
-   * its own internal scroll so its actions row stays anchored. */
+  /* Two-row grid: steering rack and probe rack. The correlation drawer
+   * stays out of the rack zone, so both racks retain their full vertical
+   * budget. Each rack handles its own internal scroll so its actions row
+   * stays anchored. */
   .rack-zone {
     min-height: 0;
     overflow: hidden;
@@ -558,7 +549,7 @@
   .drawer-backdrop {
     position: absolute;
     inset: 0;
-    background: rgba(2, 3, 8, 0.5);
+    background: var(--scrim);
     backdrop-filter: blur(2px);
     z-index: var(--z-drawer);
     border: 0;
@@ -576,9 +567,7 @@
     z-index: calc(var(--z-drawer) + 1);
     display: flex;
     flex-direction: column;
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.04),
-      var(--shadow-overlay);
+    box-shadow: var(--shadow-sheet);
     overflow: hidden;
     animation: drawer-in var(--dur-slow) var(--ease-out);
   }

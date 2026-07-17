@@ -7,8 +7,8 @@ defaults (``max_new_tokens``, ``temperature``, ``top_p``, ``top_k``,
 ``system_prompt``) and ``_generate_core`` composes the two at entry without
 mutating ``session.config``.
 
-Pre-restructure this lives at the top level; cluster 8 will move it under
-``saklas.core.sampling``.
+Keeping these values separate from session configuration lets one session serve
+many concurrent requests without request-local overrides leaking across calls.
 """
 
 from __future__ import annotations

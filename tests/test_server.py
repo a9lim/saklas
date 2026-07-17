@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult, RunSet, TokenEvent
 from tests._generation_stream import TestGenerationStream
-from saklas.core.session import ConcurrentGenerationError, VectorNotRegisteredError
+from saklas.core.session import ConcurrentGenerationError, ProfileNotRegisteredError
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ def _mock_session():
     session.config.system_prompt = None
     session.config.thinking = None
 
-    session.vectors = {}
+    session.profiles = {}
     session.probes = {}
     session.tree = MagicMock()
     session.tree.messages_for.return_value = []
@@ -129,147 +129,6 @@ class TestModels:
         assert resp.status_code == 404
 
 
-class TestSaeRoutes:
-    def test_sources_lists_prepared_local_and_provider_artifacts(
-        self, session_and_client: Any, monkeypatch: Any,
-    ) -> None:
-        _, client = session_and_client
-        monkeypatch.setattr(
-            "saklas.io.sae.list_sae_sources",
-            lambda _model: [{
-                "source": "local:mine", "kind": "local", "name": "mine",
-                "active": True, "path": "/tmp/manifest.json", "layer": 14,
-                "features": 4096,
-            }],
-        )
-        resp = client.get("/saklas/v1/sessions/default/sae/sources")
-        assert resp.status_code == 200
-        assert resp.json()["sources"][0]["source"] == "local:mine"
-
-    def test_load_accepts_harmonized_saelens_source(
-        self, session_and_client: Any,
-    ) -> None:
-        import time
-
-        session, client = session_and_client
-        session.load_sae.return_value = {"layer": 14, "width": 4096}
-        resp = client.post(
-            "/saklas/v1/sessions/default/sae/load",
-            json={"release": "saelens:scope"},
-        )
-        assert resp.status_code == 202
-        assert resp.json()["release"] == "saelens:scope"
-        status: dict[str, Any] = {}
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            status = client.get("/saklas/v1/sessions/default/sae/load").json()
-            if not status["running"]:
-                break
-            time.sleep(0.01)
-        assert status
-        assert status["running"] is False
-        assert status["error"] is None
-        session.load_sae.assert_called_once_with("scope", layer=None)
-        session.enable_live_sae.assert_called_once_with(top_k=12)
-
-    def test_train_cancel_requires_running_job_and_sets_event(
-        self, session_and_client: Any,
-    ) -> None:
-        import threading
-
-        _, client = session_and_client
-        resp = client.delete("/saklas/v1/sessions/default/sae/train")
-        assert resp.status_code == 409
-        event = threading.Event()
-        client.app.state.sae_train["running"] = True
-        client.app.state.sae_train_cancel = event
-        resp = client.delete("/saklas/v1/sessions/default/sae/train")
-        assert resp.status_code == 202
-        assert event.is_set()
-        assert resp.json()["message"] == "cancelling…"
-
-    def test_session_info_carries_sae_runtime(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.sae_info = {
-            "release": "scope", "layer": 14, "width": 16_384,
-        }
-        session.live_sae = True
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.status_code == 200
-        assert resp.json()["sae_loaded"] is True
-        assert resp.json()["sae_info"]["layer"] == 14
-        assert resp.json()["live_sae"] is True
-
-    def test_feature_validation(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.validate_sae_feature.return_value = {
-            "id": 42, "label": "fruit", "layer": 14,
-        }
-        resp = client.post(
-            "/saklas/v1/sessions/default/sae/feature/validate",
-            json={"id": 42},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {"id": 42, "label": "fruit", "layer": 14}
-        session.validate_sae_feature.assert_called_once_with(42)
-
-    def test_live_toggle(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.enable_live_sae.return_value = {"layer": 14, "top_k": 12}
-        resp = client.post(
-            "/saklas/v1/sessions/default/sae/live",
-            json={"enabled": True, "top_k": 12},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {
-            "enabled": True, "layer": 14, "top_k": 12,
-        }
-        session.enable_live_sae.assert_called_once_with(top_k=12)
-
-    def test_features_metadata_backfill(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.fetch_sae_feature_meta.return_value = {
-            "42": {"label": "fruit", "max_act": 121.11},
-        }
-        resp = client.post(
-            "/saklas/v1/sessions/default/sae/features/metadata",
-            json={"ids": [42, 42, 7]},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {
-            "features": {"42": {"label": "fruit", "max_act": 121.11}},
-        }
-        session.fetch_sae_feature_meta.assert_called_once_with([42, 42, 7])
-
-    def test_features_metadata_rejects_oversized_batch(
-        self, session_and_client: Any,
-    ) -> None:
-        _session_obj, client = session_and_client
-        resp = client.post(
-            "/saklas/v1/sessions/default/sae/features/metadata",
-            json={"ids": list(range(65))},
-        )
-        # RequestValidationError maps to 400 app-wide (the OpenAI shape).
-        assert resp.status_code == 400
-
-    def test_token_readout(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.sae_token_readout.return_value = {
-            "node_id": "n1", "raw_index": 2, "token_id": 7,
-            "token_text": "x", "steering": None, "layer": 14,
-            "features": [{
-                "id": 42, "activation": 3.5, "label": "fruit",
-                "max_act": 121.11,
-            }],
-        }
-        resp = client.get(
-            "/saklas/v1/sessions/default/sae/token-readout",
-            params={"node_id": "n1", "raw_index": 2},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["features"][0]["id"] == 42
-
-
 # ---------------------------------------------------------------------------
 # Chat completions
 # ---------------------------------------------------------------------------
@@ -354,7 +213,7 @@ class TestChatCompletions:
 
         session.generate_stream.return_value = TestGenerationStream(
             [], None,
-            error=VectorNotRegisteredError("No vector registered for 'missing'"),
+            error=ProfileNotRegisteredError("No profile registered for 'missing'"),
         )
 
         resp = client.post("/v1/chat/completions", json={
@@ -373,7 +232,7 @@ class TestChatCompletions:
         err = next(c["error"] for c in chunks if "error" in c)
         assert err["code"] == 404
         assert err["type"] == "invalid_request_error"
-        assert "No vector registered for 'missing'" in err["message"]
+        assert "No profile registered for 'missing'" in err["message"]
 
     def test_conflict_on_concurrent_generation(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -459,12 +318,6 @@ class TestCompletions:
 # ---------------------------------------------------------------------------
 
 class TestCLIParsing:
-    def test_tui_default(self):
-        from saklas.cli import parse_args
-        args = parse_args(["tui", "google/gemma-2-2b-it"])
-        assert args.command == "tui"
-        assert args.model == "google/gemma-2-2b-it"
-
     def test_serve_subcommand(self):
         from saklas.cli import parse_args
         args = parse_args(["serve", "google/gemma-2-2b-it", "--port", "9000"])
@@ -730,7 +583,7 @@ class TestOllamaApi:
 
         session.generate_stream.return_value = TestGenerationStream(
             [], None,
-            error=VectorNotRegisteredError("No vector registered for 'missing'"),
+            error=ProfileNotRegisteredError("No profile registered for 'missing'"),
         )
 
         resp = client.post("/api/chat", json={
@@ -747,7 +600,7 @@ class TestOllamaApi:
             {
                 "model": "test/model",
                 "created_at": lines[0]["created_at"],
-                "error": "No vector registered for 'missing'",
+                "error": "No profile registered for 'missing'",
             },
             {
                 "model": "test/model",
@@ -1130,442 +983,55 @@ class TestSessionLockBackpressure:
 
 
 # ---------------------------------------------------------------------------
-# Jacobian-lens token readout
+# Session-info state reads for the instrument families
 # ---------------------------------------------------------------------------
 
 
-class TestLensTokenValidation:
-    """Read-only single-token check used by both J-lens menu add forms."""
+class TestSessionInfoInstrumentFields:
+    """The routes that toggle these moved to /instruments; the *state reads*
+    stay on session info (session_routes is unchanged)."""
 
-    def test_single_token_returns_vocab_id_without_applying(
-        self, session_and_client: Any,
-    ) -> None:
-        session, client = session_and_client
-        session.tokenizer.encode.return_value = [42]
-        session.tokenizer.decode.side_effect = None
-        session.tokenizer.decode.return_value = " magic"
-
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/token/validate",
-            json={"word": "  magic  "},
-        )
-
-        assert resp.status_code == 200
-        assert resp.json() == {"word": "magic", "token_id": 42}
-        session.add_probe.assert_not_called()
-        session.register_jlens_direction.assert_not_called()
-
-    def test_multi_token_word_is_rejected_without_applying(
-        self, session_and_client: Any,
-    ) -> None:
-        session, client = session_and_client
-        session.tokenizer.encode.return_value = [3, 4]
-        session.tokenizer.decode.side_effect = lambda ids: {
-            3: "anti", 4: "disestablishment",
-        }[ids[0]]
-
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/token/validate",
-            json={"word": "antidisestablishment"},
-        )
-
-        assert resp.status_code == 400
-        assert "not a single token" in resp.json()["detail"]
-        session.add_probe.assert_not_called()
-        session.register_jlens_direction.assert_not_called()
-
-    def test_empty_word_is_rejected(self, session_and_client: Any) -> None:
-        _, client = session_and_client
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/token/validate",
-            json={"word": "   "},
-        )
-        assert resp.status_code == 400
-        assert resp.json()["detail"] == "word must not be empty"
-
-    def test_wrong_session_is_rejected(self, session_and_client: Any) -> None:
-        _, client = session_and_client
-        resp = client.post(
-            "/saklas/v1/sessions/elsewhere/lens/token/validate",
-            json={"word": "magic"},
-        )
-        assert resp.status_code == 404
-
-
-class TestLensTokenReadout:
-    """Route contract for ``GET /saklas/v1/sessions/{id}/lens/token-readout``."""
-
-    _SESSION_OUT = {
-        "node_id": "n1",
-        "raw_index": 3,
-        "token_id": 42,
-        "token_text": " magic",
-        "steering": "0.3 formal.casual",
-        "readout": {
-            18: [(" b", -0.51234, 7), (" c", -1.2, 9)],
-            12: [(" a", -0.25, 5), (" d", -2.0, 3)],
-        },
-        "aggregate": [
-            (" a", 0.4123456, 0.31234, 0.05678),
-            (" b", 0.2, 0.8, 0.1),
-        ],
-    }
-
-    def test_happy_path_wire_shape(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.jlens_token_readout.return_value = dict(self._SESSION_OUT)
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={"node_id": "n1", "raw_index": 3, "top_k": 2},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["node_id"] == "n1"
-        assert data["token_id"] == 42
-        assert data["steering"] == "0.3 formal.casual"
-        # rows sorted ascending by layer
-        assert [row["layer"] for row in data["layers"]] == [12, 18]
-        assert data["layers"][1]["tokens"][0] == {
-            "token": " b", "id": 7, "logprob": -0.5123,
-        }
-        # aggregate block passes through as keyed objects, rounded
-        assert data["aggregate"][0] == {
-            "token": " a", "strength": 0.412346, "com": 0.3123,
-            "spread": 0.0568,
-        }
-        assert len(data["aggregate"]) == 2
-        kwargs = session.jlens_token_readout.call_args.kwargs
-        assert kwargs["apply_steering"] is True
-        assert kwargs["raw"] is False
-        assert kwargs["layers"] == "all"
-        assert kwargs["top_k"] == 2
-
-    def test_aggregate_absent_from_session_is_empty_list(
-        self, session_and_client: Any,
-    ) -> None:
-        session, client = session_and_client
-        out = dict(self._SESSION_OUT)
-        out.pop("aggregate")
-        session.jlens_token_readout.return_value = out
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={"node_id": "n1", "raw_index": 3},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["aggregate"] == []
-
-    def test_steered_and_layers_params_thread_through(
-        self, session_and_client: Any,
-    ) -> None:
-        session, client = session_and_client
-        session.jlens_token_readout.return_value = dict(self._SESSION_OUT)
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={
-                "node_id": "n1", "raw_index": 3,
-                "steered": "false", "raw": "true", "layers": "12,18",
-            },
-        )
-        assert resp.status_code == 200
-        kwargs = session.jlens_token_readout.call_args.kwargs
-        assert kwargs["apply_steering"] is False
-        assert kwargs["raw"] is True
-        assert kwargs["layers"] == [12, 18]
-
-    def test_layer_mode_params_thread_through(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.jlens_token_readout.return_value = dict(self._SESSION_OUT)
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={"node_id": "n1", "raw_index": 3, "layers": "all"},
-        )
-        assert resp.status_code == 200
-        assert session.jlens_token_readout.call_args.kwargs["layers"] == "all"
-
-    def test_lens_not_fitted_404(self, session_and_client: Any) -> None:
-        from saklas.core.jlens import LensNotFittedError
-
-        session, client = session_and_client
-        session.jlens_token_readout.side_effect = LensNotFittedError(
-            "no Jacobian lens fitted"
-        )
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={"node_id": "n1", "raw_index": 0},
-        )
-        assert resp.status_code == 404
-        assert "lens" in resp.json()["detail"]
-
-    def test_unknown_node_404(self, session_and_client: Any) -> None:
-        from saklas.core.loom import UnknownNodeError
-
-        session, client = session_and_client
-        session.jlens_token_readout.side_effect = UnknownNodeError("nope")
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={"node_id": "nope", "raw_index": 0},
-        )
-        assert resp.status_code == 404
-
-    def test_invalid_node_operation_400(self, session_and_client: Any) -> None:
-        from saklas.core.loom import InvalidNodeOperationError
-
-        session, client = session_and_client
-        session.jlens_token_readout.side_effect = InvalidNodeOperationError(
-            "raw_index 9 out of range"
-        )
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={"node_id": "n1", "raw_index": 9},
-        )
-        assert resp.status_code == 400
-
-    def test_malformed_layers_400(self, session_and_client: Any) -> None:
-        _, client = session_and_client
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={"node_id": "n1", "raw_index": 0, "layers": "12,x"},
-        )
-        assert resp.status_code == 400
-
-    def test_top_k_bounds_400(self, session_and_client: Any) -> None:
-        _, client = session_and_client
-        resp = client.get(
-            "/saklas/v1/sessions/default/lens/token-readout",
-            params={"node_id": "n1", "raw_index": 0, "top_k": 0},
-        )
-        assert resp.status_code == 400
-
-    def test_wrong_session_404(self, session_and_client: Any) -> None:
-        _, client = session_and_client
-        resp = client.get(
-            "/saklas/v1/sessions/elsewhere/lens/token-readout",
-            params={"node_id": "n1", "raw_index": 0},
-        )
-        assert resp.status_code == 404
-
-    def test_session_info_carries_jlens_fitted(
-        self, session_and_client: Any,
-    ) -> None:
-        """``jlens_fitted`` comes from the live session compatibility check."""
+    def test_jlens_fitted(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
         assert resp.json()["jlens_fitted"] is False
-
         session.has_compatible_jlens.return_value = True
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.json()["jlens_fitted"] is True
+        got = client.get("/saklas/v1/sessions/default").json()
+        assert got["jlens_fitted"] is True
 
-# ---------------------------------------------------------------------------
-# Background J-lens fit lifecycle
-# ---------------------------------------------------------------------------
-
-
-class TestLensFitLifecycle:
-    def test_source_list_and_use(
-        self, session_and_client: Any, monkeypatch: Any,
-    ) -> None:
-        session, client = session_and_client
-        monkeypatch.setattr(
-            "saklas.io.lens_sources.list_lens_sources",
-            lambda _model: [{
-                "source": "neuronpedia", "kind": "huggingface",
-                "name": "neuronpedia", "active": True,
-                "path": "/tmp/binding.json",
-            }],
-        )
-        session.enable_live_lens.return_value = [10, 11]
-
-        resp = client.get("/saklas/v1/sessions/default/lens/sources")
-        assert resp.status_code == 200
-        assert resp.json()["sources"][0]["source"] == "neuronpedia"
-
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/use",
-            json={"source": "neuronpedia"},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {
-            "source": "neuronpedia", "live_layers": [10, 11],
-        }
-        session.disable_live_lens.assert_called_once()
-        session.select_jlens_source.assert_called_once_with("neuronpedia")
-
-    def test_start_returns_202_and_rejects_second_fit(
-        self, session_and_client: Any, monkeypatch: Any,
-    ) -> None:
-        import threading
-
-        session, client = session_and_client
-        fit_started = threading.Event()
-        release_fit = threading.Event()
-
-        def blocking_fit(*_args: Any, **_kwargs: Any) -> None:
-            fit_started.set()
-            assert release_fit.wait(timeout=2.0)
-
-        session.fit_jlens.side_effect = blocking_fit
-        monkeypatch.setattr(
-            "saklas.io.lens.stream_default_lens_corpus",
-            lambda _n, *, cancel_event=None: (
-                ["a prompt that is long enough."], "test"
-            ),
-        )
-        response = client.post(
-            "/saklas/v1/sessions/default/lens/fit",
-            json={"prompts": 1, "layers": "workspace"},
-        )
-        assert response.status_code == 202
-
-        assert fit_started.wait(timeout=2.0)
-        try:
-            response = client.post(
-                "/saklas/v1/sessions/default/lens/fit",
-                json={"prompts": 1},
-            )
-            assert response.status_code == 409
-        finally:
-            release_fit.set()
-
-    def test_cancel_sets_event_and_requires_running_fit(
-        self, session_and_client: Any,
-    ) -> None:
-        import threading
-
-        _, client = session_and_client
-        response = client.delete("/saklas/v1/sessions/default/lens/fit")
-        assert response.status_code == 409
-
-        event = threading.Event()
-        client.app.state.lens_fit["running"] = True
-        client.app.state.lens_fit_cancel = event
-        response = client.delete("/saklas/v1/sessions/default/lens/fit")
-        assert response.status_code == 202
-        assert event.is_set()
-        assert response.json()["message"] == "cancelling…"
-
-    def test_shutdown_requests_cancel_and_awaits_worker(
-        self, session_and_client: Any,
-    ) -> None:
-        import asyncio
-        import threading
-
-        _, client = session_and_client
-        stop = next(
-            handler
-            for handler in client.app.router.on_shutdown
-            if getattr(handler, "__name__", "") == "_stop_lens_fit"
-        )
-
-        async def _scenario() -> None:
-            event = threading.Event()
-            finished: list[bool] = []
-
-            async def _worker() -> None:
-                while not event.is_set():
-                    await asyncio.sleep(0)
-                finished.append(True)
-
-            task = asyncio.create_task(_worker())
-            client.app.state.lens_fit_cancel = event
-            client.app.state.lens_fit_task = task
-            await stop()
-            assert event.is_set()
-            assert task.done()
-            assert finished == [True]
-
-        asyncio.run(_scenario())
-
-
-# ---------------------------------------------------------------------------
-# Live workspace readout (lens/live toggle + WS token frame)
-# ---------------------------------------------------------------------------
-
-
-class TestLensLiveToggle:
-    """Route contract for ``POST /saklas/v1/sessions/{id}/lens/live``."""
-
-    def test_enable_returns_resolved_layers(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.enable_live_lens.return_value = [10, 14, 18]
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/live",
-            json={"enabled": True},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {"enabled": True, "layers": [10, 14, 18]}
-        kwargs = session.enable_live_lens.call_args.kwargs
-        assert kwargs["layers"] is None  # session selects every fitted layer
-
-    def test_enable_threads_layers(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.enable_live_lens.return_value = [12, 18]
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/live",
-            json={"enabled": True, "layers": [12, 18]},
-        )
-        assert resp.status_code == 200
-        kwargs = session.enable_live_lens.call_args.kwargs
-        assert kwargs["layers"] == [12, 18]
-
-    def test_disable(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/live",
-            json={"enabled": False},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {"enabled": False, "layers": None}
-        session.disable_live_lens.assert_called_once()
-        session.enable_live_lens.assert_not_called()
-
-    def test_not_fitted_404(self, session_and_client: Any) -> None:
-        from saklas.core.jlens import LensNotFittedError
-
-        session, client = session_and_client
-        session.enable_live_lens.side_effect = LensNotFittedError("no lens")
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/live",
-            json={"enabled": True},
-        )
-        assert resp.status_code == 404
-
-    def test_bad_layers_400(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.enable_live_lens.side_effect = ValueError(
-            "layers [99] not in the fitted lens"
-        )
-        resp = client.post(
-            "/saklas/v1/sessions/default/lens/live",
-            json={"enabled": True, "layers": [99]},
-        )
-        assert resp.status_code == 400
-
-    def test_wrong_session_404(self, session_and_client: Any) -> None:
-        _, client = session_and_client
-        resp = client.post(
-            "/saklas/v1/sessions/elsewhere/lens/live",
-            json={"enabled": True},
-        )
-        assert resp.status_code == 404
-
-    def test_session_info_carries_live_lens_layers(
-        self, session_and_client: Any,
-    ) -> None:
-        """Info reports the live session's resolved layers while enabled."""
+    def test_live_lens_layers(self, session_and_client: Any) -> None:
         session, client = session_and_client
         resp = client.get("/saklas/v1/sessions/default")
         assert resp.status_code == 200
         assert resp.json()["live_lens_layers"] is None
-
         session.live_lens_layers = [10, 14, 18]
+        got = client.get("/saklas/v1/sessions/default").json()
+        assert got["live_lens_layers"] == [10, 14, 18]
+
+    def test_live_probe_scores(self, session_and_client: Any) -> None:
+        session, client = session_and_client
         resp = client.get("/saklas/v1/sessions/default")
-        assert resp.json()["live_lens_layers"] == [10, 14, 18]
+        assert resp.status_code == 200
+        assert resp.json()["live_probe_scores"] is True
+        session.live_probe_scores = False
+        got = client.get("/saklas/v1/sessions/default").json()
+        assert got["live_probe_scores"] is False
+
+    def test_sae_runtime(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        session.sae_info = {"release": "scope", "layer": 14, "width": 16_384}
+        session.live_sae = True
+        resp = client.get("/saklas/v1/sessions/default")
+        assert resp.status_code == 200
+        assert resp.json()["sae_loaded"] is True
+        assert resp.json()["sae_info"]["layer"] == 14
+        assert resp.json()["live_sae"] is True
 
 
 class TestWSTokenEventLens:
-    """``build_token_event`` copies the token tap's lens slot onto the frame."""
+    """``build_token_event`` forwards the token tap's 5.x ``measurements``
+    envelope verbatim onto the frame and carries no legacy per-token aliases."""
 
     @staticmethod
     def _event(payload: Any) -> dict[str, Any]:
@@ -1588,41 +1054,53 @@ class TestWSTokenEventLens:
             top_alts=None,
         )
 
-    def test_scores_prefer_token_payload_without_tree_lookup(self) -> None:
-        from types import SimpleNamespace
-
-        from saklas.server.ws_events import build_token_event
-
-        class ExplodingTree:
-            @property
-            def active_node_id(self) -> str:
-                raise AssertionError("payload path should not read active node")
-
-            @property
-            def nodes(self) -> Any:
-                raise AssertionError("payload path should not read tree rows")
-
-        session = SimpleNamespace(
-            token_probe_payload={
-                "scores": {"calm": 0.4242429},
-                "per_layer_scores": {"5": {"calm": 0.38}},
+    def test_measurements_ride_token_frame_verbatim(self) -> None:
+        """The envelope forwards by identity — the token tap is the single
+        authority; event shaping never rebuilds or reshapes channels."""
+        measurements = {
+            "version": 1,
+            "scope": "token",
+            "provenance": "captured",
+            "scores": {"calm": 0.424243},
+            "per_layer_scores": {"5": {"calm": 0.38}},
+            "instruments": {
+                "geometry": {"readings": {"calm": {"coords": [0.424243]}}},
+                "lens": {
+                    "readout": {
+                        "layers": [{
+                            "layer": 12,
+                            "tokens": [
+                                {"token": " a", "id": 7, "logprob": -0.25},
+                            ],
+                        }],
+                        "aggregate": [
+                            {"token": " a", "strength": 0.41,
+                             "com": 0.31, "spread": 0.05},
+                        ],
+                    },
+                    "binding": {"source": "local:default", "steering": None},
+                },
+                "sae": {
+                    "readout": {
+                        "features": [
+                            {"id": 362, "activation": 3216.0,
+                             "label": "code blocks", "max_act": 4000.0},
+                        ],
+                    },
+                    "binding": {
+                        "source": "saelens:x", "steering": None, "layer": 12,
+                    },
+                },
             },
-            tree=ExplodingTree(),
-            generation_state=SimpleNamespace(emit_map=[]),
-        )
-
-        event = build_token_event(
-            cast(Any, session),
-            ["node-1"],
-            text=" x",
-            is_thinking=False,
-            tid=5,
-            lp=None,
-            top_alts=None,
-        )
-
-        assert event["scores"] == {"calm": 0.424243}
-        assert event["per_layer_scores"] == {"5": {"calm": 0.38}}
+        }
+        event = self._event({"measurements": measurements})
+        assert event["measurements"] is measurements
+        # The six legacy per-token aliases are gone from the frame.
+        for dead in (
+            "scores", "per_layer_scores", "probe_readings",
+            "lens_readout", "lens_aggregate", "sae_readout", "captured",
+        ):
+            assert dead not in event
 
     def test_perplexity_rides_token_frame(self) -> None:
         from types import SimpleNamespace
@@ -1647,13 +1125,23 @@ class TestWSTokenEventLens:
 
         assert event["perplexity"] == 2.75
 
-    def test_scores_are_not_reconstructed_from_tree_rows(self) -> None:
+    def test_measurements_not_reconstructed_from_tree_rows(self) -> None:
         from types import SimpleNamespace
 
         from saklas.server.ws_events import build_token_event
 
+        class ExplodingTree:
+            @property
+            def active_node_id(self) -> str:
+                raise AssertionError("payload path should not read active node")
+
+            @property
+            def nodes(self) -> Any:
+                raise AssertionError("payload path should not read tree rows")
+
         session = SimpleNamespace(
             token_probe_payload={},
+            tree=ExplodingTree(),
             generation_state=SimpleNamespace(emit_map=[]),
         )
 
@@ -1667,142 +1155,15 @@ class TestWSTokenEventLens:
             top_alts=None,
         )
 
-        assert "scores" not in event
-        assert "per_layer_scores" not in event
+        assert "measurements" not in event
 
-    def test_lens_readout_rides_token_frame(self) -> None:
-        event = self._event(
-            {
-                "readings": None,
-                "lens": {12: [(" a", 0.5), (" b", -1.0)], 18: [(" c", 2.0)]},
-            }
-        )
-        # String layer keys (the ``per_layer_scores`` wire convention);
-        # pairs serialize as 2-arrays.
-        assert event["lens_readout"] == {
-            "12": [[" a", 0.5], [" b", -1.0]],
-            "18": [[" c", 2.0]],
-        }
-
-    def test_canonical_capture_rides_token_frame_verbatim(self) -> None:
-        captured = {
-            "lens": {
-                "provenance": "captured",
-                "source": "local:default",
-                "steering": None,
-                "layers": [{
-                    "layer": 12,
-                    "tokens": [{"token": " a", "id": 7, "logprob": -0.25}],
-                }],
-                "aggregate": [],
-            },
-        }
-        event = self._event({"captured": captured})
-
-        assert event["captured"] is captured
-
-    def test_absent_when_lens_off(self) -> None:
-        event = self._event({"readings": None, "lens": None})
-        assert "lens_readout" not in event
+    def test_absent_when_no_measurements(self) -> None:
+        event = self._event({"measurements": None})
+        assert "measurements" not in event
 
     def test_absent_when_no_payload(self) -> None:
         event = self._event(None)
-        assert "lens_readout" not in event
-
-    def test_lens_aggregate_rides_token_frame(self) -> None:
-        event = self._event(
-            {
-                "readings": None,
-                "lens": {12: [(" a", 0.5)]},
-                "lens_aggregate": [
-                    (" a", 0.41, 0.31, 0.05),
-                    (" b", 0.2, 0.8, 0.1),
-                ],
-            }
-        )
-        # 4-arrays: [token, strength, com, spread], strength-descending.
-        assert event["lens_aggregate"] == [
-            [" a", 0.41, 0.31, 0.05],
-            [" b", 0.2, 0.8, 0.1],
-        ]
-
-    def test_lens_aggregate_absent_when_off(self) -> None:
-        event = self._event(
-            {"readings": None, "lens": None, "lens_aggregate": None}
-        )
-        assert "lens_aggregate" not in event
-
-    def test_sae_readout_rides_token_frame(self) -> None:
-        event = self._event(
-            {
-                "readings": None,
-                "lens": None,
-                "sae": [
-                    (362, 3216.0, "code blocks", 4000.0),
-                    (148, 1832.0, None, None),
-                ],
-            }
-        )
-        # Rows carry the raw activation AND the cached maxActApprox (the
-        # strength unit) — clients render activation / max_act as the
-        # normalized 0..1 strength; null until the metadata backfill lands.
-        assert event["sae_readout"] == [
-            {
-                "id": 362, "activation": 3216.0, "label": "code blocks",
-                "max_act": 4000.0,
-            },
-            {"id": 148, "activation": 1832.0, "label": None, "max_act": None},
-        ]
-
-    def test_sae_readout_absent_when_off(self) -> None:
-        event = self._event({"readings": None, "lens": None, "sae": None})
-        assert "sae_readout" not in event
-
-
-class TestProbesLiveToggle:
-    """Route contract for ``POST /saklas/v1/sessions/{id}/probes/live``
-    (the CAA live toggle) + its session-info rehydration field."""
-
-    def test_disable_and_enable(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        session.set_live_probe_scores.return_value = False
-        resp = client.post(
-            "/saklas/v1/sessions/default/probes/live",
-            json={"enabled": False},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {"enabled": False}
-        session.set_live_probe_scores.assert_called_once_with(False)
-
-        session.set_live_probe_scores.return_value = True
-        resp = client.post(
-            "/saklas/v1/sessions/default/probes/live",
-            json={"enabled": True},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {"enabled": True}
-
-    def test_wrong_session_404(self, session_and_client: Any) -> None:
-        _session, client = session_and_client
-        resp = client.post(
-            "/saklas/v1/sessions/nope/probes/live", json={"enabled": False},
-        )
-        assert resp.status_code == 404
-
-    def test_session_info_carries_live_probe_scores(
-        self, session_and_client: Any,
-    ) -> None:
-        """Info reports the toggle state — and coerces a stub session
-        (bare MagicMock attribute) to the default-on."""
-        session, client = session_and_client
-        # Bare mock attribute (not a real bool) → reads as on.
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.status_code == 200
-        assert resp.json()["live_probe_scores"] is True
-
-        session.live_probe_scores = False
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.json()["live_probe_scores"] is False
+        assert "measurements" not in event
 
 
 class TestLensProbeRoutes:

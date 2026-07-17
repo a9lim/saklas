@@ -214,7 +214,7 @@
   .sk-number-input:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
   }
   .sk-number-input:disabled {
     opacity: 0.5;
@@ -257,7 +257,7 @@
     color: var(--accent);
   }
   .sk-number-step:active {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
 
   .sk-number.is-disabled {

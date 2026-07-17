@@ -6,584 +6,508 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/saklas/)
 
-Saklas is a library for activation steering and trait monitoring on local HuggingFace models. You give it a concept, from "formal" to "a pirate" to "happy", and it generates contrastive examples, extracts a direction from the model's hidden states, and then steers along that direction when it's time to generate text. The model itself is never modified, so the steering strength is just a number you change per call.
+Saklas is a local workbench for mechanistic interpretability on large language
+models.
 
-Every steering signal in saklas is one artifact: the **manifold**, a set of labelled nodes fit to a per-layer subspace. A plain steering vector is the two-node case. A 107-persona fan and a 20-mood affect surface are the many-node case. The same `%` operator that picks a pole picks a point anywhere on a fitted surface, so you can blend between personas or slide along an emotional gradient with the same grammar you use for a single vector.
-
-Saklas is built on Representation Engineering ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)), the same paper [repeng](https://github.com/vgel/repeng) implements. There are three frontends over one engine:
-
-- **`saklas serve <model>`**: a web dashboard at `http://localhost:8000/`. The same port also speaks OpenAI `/v1/*` and Ollama `/api/*`, plus a native `/saklas/v1/*` API. Pass `--no-web` for API-only mode.
-- **`saklas tui <model>`**: a terminal UI.
-- **`SaklasSession`**: a Python API for scripted experiments.
-
-It runs on both CUDA and Apple Silicon MPS, and it runs comfortably on a MacBook. Tested on Qwen, Gemma, Ministral, gpt-oss, Llama, GLM, and Talkie, with a lot more architectures experimentally wired up.
-
----
+It comes with a local dashboard, along with a Python API, and a server compatible
+with both OpenAI and Ollama.
 
 ## Quick start
 
 ```bash
 pip install saklas
-saklas serve google/gemma-4-31b-it
+saklas serve google/gemma-3-4b-it
 ```
 
-Once it loads, open `http://localhost:8000/`. The first run downloads the model and fits the 17 bundled concept probes, which can take a few minutes.
+Open [http://localhost:8000](http://localhost:8000).
 
-The same port speaks the OpenAI API format:
+The first launch downloads the model and fits the 17 bundled concept probes. This
+can take a while; they get stored in `~/.saklas/` for future launches.
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-client.chat.completions.create(
-    model="google/gemma-4-31b-it",
-    messages=[{"role": "user", "content": "Hello!"}],
-    extra_body={"steering": "0.4 warm"},
-)
-```
-
-If you prefer a terminal:
+For NVIDIA CUDA:
 
 ```bash
-saklas tui google/gemma-4-31b-it
+pip install "saklas[cuda,flash]"
+saklas serve google/gemma-3-4b-it --device cuda
 ```
 
-Or directly from Python:
+## WebUI
 
-```python
-from saklas import SaklasSession
+### Threads
 
-with SaklasSession.from_pretrained("google/gemma-4-31b-it") as s:
-    name, profile = s.extract("formal.casual")       # a bundled bipolar concept
-    print(s.generate("What makes a good day?", steering=f"0.3 {name}").first.text)
+Every authored or generated turn becomes a node in a branching tree. You can reroll
+from any point and the tree lets you save and load conversations.
+
+The bottom of the panel has the standard sampling controls: temperature, top-p,
+top-k, repetition and presence penalties, and everything else you'd expect.
+
+### Completion modes
+
+Chat mode renders the model's template as turns with collapsible thinking. 
+Roles are handled dynamically:
+
+- **you write** selects the role the text you write will be appended as;
+- **model writes** selects the role the model continues as (or `none` to just append);
+- the cast button lets you assign steering to specific roles.
+
+It supports arbitrary roles beyond 'user' and 'assistant' too.
+
+Raw mode exposes one raw buffer for base models.
+
+### Token-level inspection
+
+Tokens can be highlighted by probe scores or **surprise (logprob)**.
+
+Clicking on a token opens one detail drawer with four views:
+
+- **geometry** — attached probe readings across layers;
+- **logits** — the chosen token and captured alternatives with logprobs, plus
+  token forking;
+- **SAE** — sparse feature activations;
+- **J-lens** — the aggregate workspace and layer-by-vocabulary readout.
+
+The detail cursor can walk tokens, thinking/response segments, and turns without
+closing the drawer. Historical rows use their captured measurements when present
+and can replay the producing prefix for newly attached instrumentation.
+
+Clicking on the info icon by a probe shows a fitted concept's geometry layer by layer.
+
+### Instruments
+
+The right side of the workbench has four tabs.
+
+| Tab | Purpose |
+|---|---|
+| **Subspace** | Flat fitted subspaces |
+| **Manifold** | Curved fitted surfaces |
+| **SAE** | SAE features |
+| **Lens** | Jacobian-lens workspace |
+
+### Analysis tools
+
+Press `Cmd+K` or `Ctrl+K` elsewhere to open a menu with further options:
+
+- build, fit, merge, install, and inspect manifolds;
+- author and score restricted-choice templates;
+- manage the cast and open steering workflows;
+- inspect correlations and pairwise layer geometry;
+- check model, device, source, authentication, and server health;
+- open the built-in help surface.
+
+## Concepts, subspaces, and manifolds
+
+In Saklas, you extract concepts as **manifolds** or **subspaces**.
+
+- A 1D flat subspace is just a steering vector.
+- A higher-rank flat subspace is a group of orthogonal steering vectors.
+- A curved manifold fits a nonlinear surface and lets you steer along it.
+
+### Bundled concepts
+
+Saklas comes with 17 concept pairs that are attached as probes by default:
+
+| Category | Concepts |
+|---|---|
+| **Epistemic** | `confident.uncertain`, `honest.deceptive`, `curious.disinterested` |
+| **Alignment** | `refusing.compliant`, `sycophantic.blunt`, `sincere.manipulative` |
+| **Register** | `formal.casual`, `direct.indirect`, `verbose.concise`, `creative.conventional`, `humorous.serious`, `warm.clinical`, `technical.accessible` |
+| **Cultural** | `masculine.feminine`, `individualist.collectivist`, `traditional.progressive`, `religious.secular` |
+
+Three larger concept sets ship as well, but aren't fitted by default:
+
+- **`personas`** — 107 personas;
+- **`emotions`** — 20 emotional states;
+- **`months`** — 12 months.
+
+## Steering expressions
+
+Every surface uses the same expression format. The same recipe can be used
+across Python, YAML, OpenAI, Ollama, or the native API.
+
+```text
+0.3 honest + 0.4 warm
+0.5 formal - 0.2 verbose
+0.3 honest|sycophantic
+0.3 honest~confident
+!sycophantic
+0.5 personas%pirate
+0.7,0.4 months%january@response
+0.4 warm@when:confident.uncertain>0.4
+0.3 jlens/orange + 0.2 sae/9143
 ```
 
----
+| Syntax | Meaning |
+|---|---|
+| `+`, `-` | Add or subtract terms |
+| leading number | Steering coefficient; omitted terms default to `0.5` |
+| `~` | Keep the component shared with another direction |
+| `\|` | Remove the component shared with another direction |
+| `!` | Mean-ablate a direction |
+| `%label` or `%x,y,…` | Choose a named node or coordinates on a manifold |
+| `@response`, `@prompt`, `@thinking`, … | Restrict the token phase where a term applies |
+| `@when:<probe><op><value>` | Apply a term only while a live probe gate is true |
 
-## Reporting issues
+Manifold coefficients use two coordinates: `along` and `onto`. `along` controls
+movement within the manifold toward the target; `onto` reduces the off-surface
+component inside the manifold's fitted tube.
 
-If you hit an error, please update to the most recent version first. If it still happens, please open an issue. This project is a work in progress and I am actively finding and fixing bugs.
+## How Saklas works
 
----
+### Extraction
 
-## Credits
+Saklas first has the model answer a shared set of baseline prompts as each concept,
+then it takes the resulting hidden states and fits them to either a curved manifold
+or a flat subspace.
 
-The contrastive-pair approach comes from the Representation Engineering paper ([Zou et al., 2023](https://arxiv.org/abs/2310.01405)). [repeng](https://github.com/vgel/repeng) by Theia Vogel is the well-known implementation in this space. Saklas takes the same idea from a different angle: repeng is lean and more of a library, saklas is a full workbench with monitoring, branching chat, and a server built in. Both are worth your time!
+Layer allocation uses a Mahalanobis metric estimated from neutral activations.
+Discriminative layer selection removes flat axes that fail to straddle the neutral
+baseline across the fitted nodes.
 
-Extraction is difference-of-means per [Im & Li, 2025](https://arxiv.org/abs/2502.02716), which at two poles is exactly the leading principal component. The per-layer strength allocation runs in the Mahalanobis metric (whitened against per-model activation covariance) so the channels that dominate raw activation norms don't swamp the signal. Manifold steering follows [Goodfire's work](https://arxiv.org/abs/2605.05115).
+The full data flow, artifact boundaries, instrument protocol, and concurrency
+invariants are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
----
+### Monitoring
 
-## Install
+A reading includes coordinates in the fitted frame, the fraction of activation 
+inside the full subspace, the nearest node, and for curved manifolds, the off-manifold 
+residual.
+
+### Jacobian lens
+
+The Jacobian lens implementation follows Gurnee et al.'s
+[work](https://transformer-circuits.pub/2026/workspace/index.html).
+Saklas lets you use one of the published J-lens artifacts, or fit your own.
+
+### Sparse autoencoders
+
+Saklas can either use a published SAELens release or train a local SAE. 
+
+## Installation
+
+Saklas requires Python 3.11 or newer and PyTorch 2.2 or newer. CUDA or Apple
+Silicon MPS is strongly recommended for interactive use; CPU is supported for
+smaller models and non-GPU workflows.
 
 ```bash
-pip install saklas                  # everything needed to run it, including SAELens
-pip install saklas[gguf]            # adds the gguf package for llama.cpp interchange
-pip install saklas[research]        # adds datasets and pandas for dataset loading and DataFrames
-pip install saklas[notebook]        # adds plotly, pandas, and kaleido for Jupyter figure helpers
-pip install saklas[cuda]            # adds bitsandbytes and HF kernels for CUDA acceleration
-pip install saklas[cuda-experimental]  # the above plus flash-attn
+pip install saklas
 ```
 
-This needs Python 3.11+ and PyTorch. It should run on Linux, macOS, and Windows. CUDA or Apple Silicon MPS is recommended for anything interactive.
+The base package includes the HTTP server, the prebuilt Svelte WebUI, and SAELens.
+Optional extras add specialized workflows:
+
+| Extra | Adds |
+|---|---|
+| `flash` | FlashAttention 2 for supported NVIDIA CUDA models; stable and tested |
+| `cuda` | `bitsandbytes` quantization and Hugging Face `kernels` acceleration |
+| `hf` | `datasets` for streamed J-LENS and SAE corpora |
+| `gguf` | GGUF import/export support |
+| `research` | NumPy, SciPy, scikit-learn, pandas, Matplotlib, and image helpers |
+| `notebook` | Plotly, pandas, and Kaleido notebook helpers |
+| `pandas` | pandas-only dataframe export helpers |
+| `dev` | Test, lint, type-check, and build tooling |
+
+Extras can be combined:
+
+```bash
+pip install "saklas[cuda,flash]"       # full tested NVIDIA path
+pip install "saklas[hf,research]"      # dataset-backed research workflows
+pip install "saklas[notebook]"         # interactive figures
+```
+
+`cuda` and `flash` are Linux/NVIDIA CUDA extras. FlashAttention is selected
+automatically when installed; there is no runtime flag to enable it.
 
 From source:
 
 ```bash
 git clone https://github.com/a9lim/saklas
 cd saklas
-pip install -e ".[dev]"             # plus pytest
+pip install -e ".[dev]"
 ```
 
----
-
-## How it works
-
-### Steering vectors
-
-Saklas takes a concept and generates contrastive examples. For a bipolar concept like `formal.casual`, it has the model answer a fixed set of baseline prompts in character as each pole. It runs those through the model, pools the hidden state at the last content token of every layer, and subtracts the two poles. That difference-of-means direction, which is the leading principal component when there are exactly two poles, is the steering vector. The per-layer strength is allocated in a whitened (Mahalanobis) metric. When it's time to generate, saklas hooks each layer and slides the hidden state's component inside the concept's subspace toward the concept, leaving the rest of the hidden state alone. The coefficient is per-call, and the model itself is never touched.
-
-### The manifold
-
-A steering vector is the two-node case of a manifold: two labelled nodes (the poles) fit to a per-layer subspace. Add more nodes and you get a surface you can place a generation anywhere on. The `%` operator does the placing. `0.5 formal` slides toward the `formal` pole; `0.5 personas%pirate` slides toward the pirate node of the 107-persona fan; `emotions%0.3,0.8,0.0` places the generation at a point in the pleasure-arousal-dominance affect space. Everything lowers to the same per-layer subspace injection at generation time, so a vector and several manifolds compose with no cross-talk.
-
-### Bundled concepts
-
-There are 17 bundled bipolar concepts across 4 categories, plus two many-node manifolds.
-
-| Category | Concepts |
-|---|---|
-| **Epistemic** | confident.uncertain, honest.deceptive, curious.disinterested |
-| **Alignment** | refusing.compliant, sycophantic.blunt, sincere.manipulative |
-| **Register** | formal.casual, direct.indirect, verbose.concise, creative.conventional, humorous.serious, warm.clinical, technical.accessible |
-| **Cultural** | masculine.feminine, individualist.collectivist, traditional.progressive, religious.secular |
-
-Each bipolar concept has two poles, and either pole is a name you can steer toward. `0.5 formal` is `formal.casual` at +0.5, `0.5 casual` is the same concept at −0.5. This works for any installed bipolar concept.
-
-The two many-node manifolds are **`personas`** (107 archetype nodes from `assistant` to `vandal`, from Anthropic's [Assistant Axis paper](https://arxiv.org/abs/2601.10387)) and **`emotions`** (20 mood nodes over pleasure-arousal-dominance affect space). These ship without per-model tensors because they are heavy to fit, so they attach as probes only once you have fit them for your model.
-
-### The steering grammar
-
-Every live steering surface (Python, YAML, HTTP, the TUI) speaks the same grammar.
-`manifold bake` accepts its namespace-qualified additive scalar subset.
-
-```python
-session.generate("...", steering="0.3 honest + 0.4 warm")   # add two concepts
-session.generate("...", steering="0.5 formal - 0.2 verbose") # subtract one
-session.generate("...", steering="0.3 honest|sycophantic")   # honest with sycophancy projected out
-session.generate("...", steering="0.3 honest~confident")     # keep only the shared component
-session.generate("...", steering="!sycophantic")             # ablate sycophancy
-session.generate("...", steering="0.5 personas%pirate")      # place on a manifold node
-```
-
-`+` and `-` combine terms, a leading number is the coefficient (default 0.5), `~` projects onto a direction, `|` projects orthogonal to it, `!` ablates a concept by replacing its component with the baseline mean, and `%` places a generation at a point on a manifold.
-
-### Triggers
-
-By default steering fires on every token. The `@trigger` token attaches a per-term override:
-
-```python
-# Steer only the response, never the prompt or the thinking section
-session.generate("...", steering="0.4 warm@after")
-
-# Mix regimes per concept
-session.generate("...", steering="0.3 honest + 0.4 warm@after")
-```
-
-`@both`, `@response`, `@before`, `@after`, `@thinking`, `@prompt`, and `@generated` choose when steering applies. A probe gate fires steering only on the tokens where a live reading crosses a threshold: `0.4 warm@when:confident.uncertain>0.4` steers warmth only while the confidence probe reads above 0.4.
-
-### Manifold steering
-
-A straight line between two states cuts through regions of activation space the model never actually visits, so the intermediate generations come out garbled or collapse to sameness. When you want to steer through a sequence of related states, like an emotional gradient or a blend between two personas, manifold steering fits a smooth surface through the activation centroids of the labelled nodes and steers along it instead.
-
-```python
-# Slide toward the pirate persona at strength 0.5
-session.generate("Describe a forest.", steering="0.5 personas%pirate")
-
-# A point in pleasure-arousal-dominance affect space, response only
-session.generate("How was your day?", steering="0.7 emotions%0.3,0.8,0.0@response")
-```
-
-The `%` coefficient slot is `along[,onto]`: `along` is how far to slide toward the position, and `onto` (curved surfaces only) collapses the off-surface component toward the learned tube. `saklas experiment naturalness` scores how far a steered run drifts off the model's natural behavior, so you can check a manifold run against a plain linear one.
-
-### SAE-backed extraction (experimental)
-
-> **Experimental.** This path is less tested than raw extraction.
-
-Pass `--sae <source>` to `manifold extract` or `manifold fit` to run extraction in feature space. `saelens:<release>` uses a published SAELens release; `local:<name>` uses an SAE trained by Saklas. The fitted subspace is always model-space, so the generation hook never touches the SAE.
-
-### Cross-model transfer
-
-Manifolds are fit per (model, concept). To use one fit on one model with a different model, run `saklas manifold transfer <name> --from SRC --to TGT`, which Procrustes-aligns the source fit into the target's activation space. Transferred fits coexist with native ones: address the transferred variant explicitly with the `:from-<safe_src>` suffix if both exist.
-
----
-
-## Web UI
+## Running the server
 
 ```bash
-saklas serve google/gemma-4-31b-it
+saklas serve MODEL [options]
 ```
 
-Open `http://localhost:8000/`.
+Common options:
 
-The chat is a branching loom tree, so any turn can fork into siblings. The composer is selection-agnostic: normally, Enter commits the draft in the **human** seat and generates the **model** seat; **swap seats** reverses both. With an empty draft, Enter simply continues the generated seat. Holding Ctrl, Cmd, or Option affects non-empty drafts only and commits without generating. Prefill remains an explicit loom action rather than an implicit composer mode. Submissions during generation get queued.
+| Option | Default | Purpose |
+|---|---:|---|
+| `-d`, `--device` | `auto` | `cuda`, `mps`, `cpu`, or automatic selection |
+| `-q`, `--quantize` | none | `4bit` or `8bit` bitsandbytes quantization on CUDA |
+| `-p`, `--probes` | `all` | Bundled probe categories, `all`, or `none` |
+| `-H`, `--host` | `0.0.0.0` | Bind address |
+| `-P`, `--port` | `8000` | Bind port |
+| `-S`, `--steer` | none | Default steering expression |
+| `--top-k-alts` | `0` | Alternative tokens captured at each decode step |
+| `--compile` | off | Opt into `torch.compile` after Saklas probes the path |
+| `--cuda-graphs` | off | Pair static cache and CUDA graph capture with `--compile` |
+| `-k`, `--api-key` | none | Require bearer authentication; also reads `$SAKLAS_API_KEY` |
+| `--no-web` | off | Run the APIs without mounting the dashboard |
 
-You can select a probe (or `surprise (logprob)`) to color tokens by score live, and you can compare two probes at once. Every generated token is clickable, and clicking shows all probe scores at all layers for that token, plus the top alternatives the model considered. The probe inspector renders each probe's geometry in the whitened metric, and the activation atlas extends the per-token view across the whole conversation.
+`serve` and every subcommand that accepts `-c/--config` read
+`~/.saklas/config.yaml` first and then compose any explicit `-c PATH` files on top.
+For example:
 
----
+```yaml
+model: google/gemma-3-4b-it
+vectors: "0.3 honest + 0.2 warm"
+temperature: 0.8
+top_p: 0.9
+max_tokens: 512
+return_top_k: 8
+```
 
-## Terminal UI
+Inspect the resolved configuration with `saklas config show` and validate a file
+with `saklas config validate path.yaml`.
+
+## Command-line artifact workflows
+
+The CLI has eight top-level verbs. The WebUI covers the interactive versions of
+most workflows; the CLI is useful for reproducible preparation, distribution, and
+batch work.
+
+| Verb | Role |
+|---|---|
+| `serve` | Launch the WebUI and the three HTTP protocol surfaces |
+| `manifold` | Extract, generate, fit, bake, merge, transfer, compare, or diagnose manifolds |
+| `pack` | List, inspect, install, search, push, clear, refresh, remove, or export manifold packs |
+| `experiment` | Run alpha fans, replay transcripts, and evaluate naturalness |
+| `config` | Show or validate composed configuration |
+| `template` | Create and score restricted-choice completion templates |
+| `lens` | Fit, fetch, select, read, decompose, or remove Jacobian lenses |
+| `sae` | Train, fetch, select, inspect, or remove SAE sources |
+
+Representative commands:
 
 ```bash
-saklas tui google/gemma-2-9b-it
-saklas tui mistralai/Mistral-7B-Instruct-v0.3 -q 4bit
-saklas tui meta-llama/Llama-3.1-8B-Instruct -p epistemic register
+# Extract and fit a two-pole concept for one model
+saklas manifold extract patient impatient -m google/gemma-3-4b-it
+
+# Fit a bundled many-node manifold
+saklas manifold fit personas -m google/gemma-3-4b-it
+
+# Install or publish manifold packs through Hugging Face
+saklas pack search creativity
+saklas pack install OWNER/REPO
+saklas pack push local/patient.impatient -a OWNER/REPO -m google/gemma-3-4b-it
+
+# Fetch an official J-LENS or fit one locally
+saklas lens fetch google/gemma-3-4b-it
+saklas lens fit org/model --prompts 100
+
+# Fetch an SAE or train a local source
+saklas sae fetch google/gemma-3-4b-it saelens:gemma-scope-2-4b-it-res
+saklas sae train org/model my-sae --layer 20 --tokens 1000000
 ```
 
-### Flags
+Run `saklas <verb> -h` and `saklas <verb> <subcommand> -h` for the complete flag
+surface.
 
-| Flag | Description |
-|---|---|
-| `model` | HuggingFace ID or local path (optional if supplied by `-c`) |
-| `-q`, `--quantize` | `4bit` or `8bit` (CUDA only) |
-| `-d`, `--device` | `auto` (default), `cuda`, `mps`, `cpu` |
-| `-p`, `--probes` | Categories: `all`, `none`, `epistemic`, `alignment`, `register`, `cultural` |
-| `--max-tokens` | Default max generation tokens (default 1024) |
-| `--no-dls` | Disable discriminative layer selection at extraction time |
-| `-c`, `--config` | Load setup YAML (repeatable, later overrides earlier) |
-| `-s`, `--strict` | With `-c`: fail on missing concepts |
+## HTTP APIs
 
-### Keybindings
+The same `saklas serve` process exposes four surfaces on one port:
 
-| Key | Action |
-|---|---|
-| `Tab` / `Shift+Tab` | Cycle panel focus |
-| `Left` / `Right` | Adjust alpha finely |
-| `Shift+Left` / `Shift+Right` | Adjust alpha coarsely |
-| `Up` / `Down` | Navigate vectors or probes |
-| `Enter` | Toggle vector on or off |
-| `Backspace` / `Delete` | Remove selected vector or probe |
-| `Ctrl+T` | Toggle thinking mode |
-| `Ctrl+A` | Toggle auto-regen side-by-side comparison |
-| `Ctrl+R` | Regenerate last response |
-| `Ctrl+S` | Cycle trait sort mode |
-| `Ctrl+Y` / `Ctrl+Shift+Y` | Cycle per-token highlight: off, probe, surprise |
-| `Ctrl+O` | Toggle chat and raw render mode |
-| `Ctrl+L` | Open the loom tree screen |
-| `Ctrl+E` / `Ctrl+B` | Edit or branch the active loom node |
-| `Ctrl+N` / `Ctrl+D` | Navigate by prefix or request guarded subtree delete |
-| `Ctrl+Enter` / `Alt+Enter` | Commit without generating |
-| `[` / `]` | Adjust temperature |
-| `{` / `}` | Adjust top-p |
-| `Escape` | Stop generation |
-| `Ctrl+Q` | Quit |
+- `/` — the Saklas WebUI;
+- `/v1/*` — OpenAI-compatible models and chat completions;
+- `/api/*` — Ollama-compatible generation and chat;
+- `/saklas/v1/*` — native sessions, loom trees, probes, manifolds, templates,
+  SAE/J-LENS lifecycle and replay, SSE, and token-plus-measurement WebSockets.
 
-### Chat commands
+Interactive OpenAPI documentation is available at
+[http://localhost:8000/docs](http://localhost:8000/docs).
 
-| Command | Description |
-|---|---|
-| `/steer <expression>` | Apply a steering expression (`0.5 honest + 0.3 warm@after`, `0.5 personas%pirate`, `0.5 honest:sae`, …) |
-| `/alpha <val> <name>` | Adjust an already-registered vector's alpha |
-| `/unsteer <name>` | Remove a registered vector |
-| `/probe <name>` | Extract and attach a concept probe |
-| `/probe <pos> . <neg>` | Same, bipolar form |
-| `/unprobe <name>` | Detach a probe |
-| `/manifold-probe <selector>` | Attach a many-node manifold as a probe (`emotions`, `personas`, `ns/name`) |
-| `/manifold fit <folder>` | Fit an authored manifold pack |
-| `/extract <name>` / `/extract <pos> . <neg>` | Extract to disk without attaching (`--role <slug>` for a persona-baselined fit) |
-| `/pairs <name>` | Extract from hand-written `positive \| negative` pairs |
-| `/compare <a> [b]` | Cosine similarity (1-arg: ranked vs all; 2-arg: pairwise) |
-| `/regen [N] [mode]` | Regenerate the last assistant turn, optionally as N siblings or with a recipe override |
-| `/fan <vector> <alphas>` | Generate an alpha grid as loom siblings |
-| `/auto-regen [mode]` | Configure the side-by-side comparison modifier |
-| `/tree` | Open the loom tree screen |
-| `/edit <text>` / `/branch [text]` | Mutate or branch the active loom node |
-| `/nav <prefix>` / `/del [yes]` | Navigate by node prefix or delete the active subtree after confirmation |
-| `/star` / `/note <text>` / `/path` | Mark, annotate, or print the active node's path |
-| `/prune <filter-expr>` | Dim nonmatching loom nodes by aggregate probe readings |
-| `/diff <id1> <id2> [--full]` / `/diff --siblings` | Compare branch text and reading deltas |
-| `/commit <text>` | Commit a turn without generating |
-| `/clear` / `/rewind` | Clear history or undo the last exchange |
-| `/sys <prompt>` | Set system prompt |
-| `/temp <v>` / `/top-p <v>` / `/max <n>` / `/seed [n\|clear]` | Sampling defaults |
-| `/save <name>` / `/load <name>` | Save or restore the full loom conversation tree |
-| `/export <path>` | JSONL with per-token probe readings |
-| `/model` / `/help` | Model and device state, or list commands and keybindings |
-
-To extract a concept from two poles, use `/extract a dog . a pair of cats`. The TUI parses around the space-period-space delimiter, so `dog.cat` stays a single name.
-
----
-
-## Python API
-
-```python
-from saklas import SaklasSession, SamplingConfig, Steering, Profile, ResultCollector
-
-with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as session:
-    name, profile = session.extract("honest.deceptive")   # returns (canonical_name, Profile)
-
-    result = session.generate(
-        "What makes a good day?",
-        steering=f"0.3 {name}",
-        sampling=SamplingConfig(temperature=0.7, max_tokens=256, seed=42),
-    ).first
-    print(result.text)
-    print(result.readings)                          # live probe readings
-    print(result.applied_steering)                  # canonical expression receipt
-
-    # Scoped steering with pole and manifold-label resolution
-    with session.steering("0.4 casual"):            # bare pole resolves to formal.casual at -0.4
-        print(session.generate("Describe a rainy afternoon.").first.text)
-    with session.steering("0.5 pirate"):            # bare label resolves to personas%pirate
-        print(session.generate("Describe a forest.").first.text)
-
-    # Compare concepts
-    other_name, other_profile = session.extract("warm.clinical")
-    print(profile.cosine_similarity(other_profile))                  # aggregate
-    print(profile.cosine_similarity(other_profile, per_layer=True))  # per-layer
-
-    # Alpha sweep
-    results = session.generate_sweep("Describe a sunset.", sweep={name: [-0.3, 0.0, 0.3]})
-    results.to_collector().to_csv("sweep.csv")
-```
-
-Steering is per-call. `session.generate(prompt, steering="0.5 name")` applies it for that one generation; without `steering` you get a clean baseline. If you want to register a profile and toggle it across calls, `session.steer(name, profile)` stores it and `session.unsteer(name)` removes it.
-
-`generate`, `generate_stream`, and `session.steering()` accept `str | Steering | None` only. A string is a steering expression; a dict raises. You can compose concepts with `+`, `-`, `@trigger`, `|`, `~`, `!`, and `%`. Nested `with session.steering(...)` blocks compose, and the inner scope wins on a key collision.
-
-Sampling is per-call via `SamplingConfig`: `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `logprobs`, `return_hidden`.
-
-Thinking mode auto-detects for models that support it (Qwen 3.5, Gemma 4, gpt-oss, and others). The delimiters come from the chat template.
-
-`session.events` is a synchronous `EventBus`. Subscribe to `VectorExtracted`, `SteeringApplied`, `SteeringCleared`, `ProbeScored`, `GenerationStarted`, and `GenerationFinished`.
-
-### SaklasSession reference
-
-```python
-session = SaklasSession.from_pretrained(
-    model_id, device="auto", quantize=None, probes=None,
-    system_prompt=None, max_tokens=1024,
-)
-
-# Extraction
-name, profile = session.extract("curiosity")                  # monopolar, against the neutral mean
-name, profile = session.extract("honest.deceptive")           # bundled bipolar
-name, profile = session.extract("warm", baseline="clinical")  # explicit poles
-name, profile = session.extract_vector_from_corpora(positives, negatives)  # hand-written corpora
-
-# Manifold fitting
-manifold = session.fit("manifolds/local/mood")   # fit a multi-node manifold, returns a Manifold
-
-# Registry (optional; steering is usually per-call)
-session.steer("name", profile)
-session.unsteer("name")
-
-# Generation
-result = session.generate("prompt", steering="0.5 name",
-                          sampling=SamplingConfig(temperature=0.8))
-for tok in session.generate_stream("prompt", steering="0.5 name"):
-    print(tok.text, end="", flush=True)
-
-# Probes
-session.add_probe("honest.deceptive")
-session.add_probe("emotions")            # a many-node manifold attaches whole
-session.remove_probe("honest.deceptive")
-
-# Restricted-choice scoring (the logit read, steering-aware)
-scores = session.score_choices(messages, ["Monday", "Tuesday"], steering="0.5 confident")
-
-# State
-session.history; session.last_result; session.last_per_token_scores
-session.stop(); session.rewind(); session.clear_history()
-```
-
-### GenerationResult
-
-```python
-result.text              # decoded output (thinking is separate)
-result.tokens            # token IDs
-result.token_count; result.tok_per_sec; result.elapsed
-result.finish_reason     # "stop" | "length" | "stop_sequence"
-result.readings          # {"probe_name": ProbeReadings}
-result.applied_steering  # canonical expression receipt
-result.to_dict()
-```
-
----
-
-## Notebook helpers
-
-```bash
-pip install saklas[notebook]
-```
-
-```python
-from saklas import SaklasSession
-from saklas.notebook import plot_alpha_sweep, plot_probe_correlation, plot_layer_norms, plot_trait_history
-
-with SaklasSession.from_pretrained("google/gemma-3-4b-it") as s:
-    results = s.generate_sweep("Describe a sunset.", sweep={"warm.clinical": [-0.4, 0.0, 0.4]})
-    plot_alpha_sweep(results.to_collector()).show()
-```
-
-There are four plotly figure builders: `plot_alpha_sweep`, `plot_probe_correlation`, `plot_layer_norms`, and `plot_trait_history`. Each takes the structured types saklas already returns and gives back a plotly `Figure` you can render inline, export to HTML with `.write_html()`, or save as PNG with `.write_image()`. The `to_dataframe(...)` helper coerces results into pandas DataFrames for ad-hoc analysis.
-
----
-
-## Batched generation
-
-```python
-results = session.generate_batch(["What's a good day?", "Describe a sunset.", "Tell me a joke."], steering="0.4 warm")
-sweep = session.generate_sweep("Describe a rainy day.", sweep={"warm.clinical": [-0.4, 0.0, 0.4]})
-```
-
-Both return a `RunSet`: an ordered, list-like result set with `node_ids`, `grid`, `.first`, `.to_collector()`, and `.to_dataframe()`. The native HTTP route for the same shape is `POST /saklas/v1/sessions/{id}/experiments/fan`, with body `{prompt, grid, base_steering?, sampling?, thinking?, raw?}`.
-
----
-
-## API server
-
-`saklas serve` speaks OpenAI `/v1/*` and Ollama `/api/*` on the same port. It should work with the OpenAI Python and JS SDKs, LangChain, Open WebUI, Enchanted, Msty, `ollama-python`, and anything else that talks either wire format.
-
-```bash
-saklas serve google/gemma-2-9b-it --steer "0.2 warm" --port 8000
-```
-
-### OpenAI SDK
+### OpenAI client
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
-resp = client.chat.completions.create(
-    model="google/gemma-2-9b-it",
-    messages=[{"role": "user", "content": "Hello!"}],
-    extra_body={"steering": "0.4 warm"},       # per-request expression
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+response = client.chat.completions.create(
+    model="google/gemma-3-4b-it",
+    messages=[{"role": "user", "content": "Describe a rainy afternoon."}],
+    extra_body={"steering": "0.3 warm + 0.2 concise"},
 )
+print(response.choices[0].message.content)
 ```
 
-### Ollama
-
-Point any Ollama client at `http://localhost:8000` and it should work. Steering goes through the `steer` field in `options`:
+### Ollama client
 
 ```bash
 curl -N http://localhost:8000/api/chat -d '{
-  "model": "gemma2",
-  "messages": [{"role": "user", "content": "Write me a haiku."}],
+  "model": "gemma3",
+  "messages": [{"role": "user", "content": "Write a short haiku."}],
   "options": {"steer": "0.3 warm - 0.2 formal.casual"}
 }'
 ```
 
-### Saklas-native routes
+Saklas targets a trusted local machine or lab network. It is not a hardened
+multi-tenant inference service. If you bind it beyond a trusted host, read
+[SECURITY.md](SECURITY.md), set an API key, and add TLS, rate limits, request
+limits, and isolation outside Saklas.
 
-`/saklas/v1/*` is a resource tree with sessions, steering and probe management, manifold install and browse, restricted-choice scoring, a bidirectional WebSocket for token-plus-probe co-streaming, and a live traits SSE endpoint (`GET /saklas/v1/sessions/{id}/traits/stream`) that streams per-token probe scores during any active generation. Interactive docs at `http://localhost:8000/docs`.
+## Python API
 
-### Flags
+```python
+from saklas import SaklasSession, SamplingConfig
 
-| Flag | Default | Description |
-|---|---|---|
-| `model` | required | HuggingFace ID or local path |
-| `-H`, `--host` | `0.0.0.0` | Bind address |
-| `-P`, `--port` | `8000` | Bind port |
-| `-S`, `--steer` | None | Default steering expression, e.g. `"0.2 warm"` |
-| `-C`, `--cors` | None | CORS origin, repeatable |
-| `-k`, `--api-key` | None | Bearer auth; falls back to `$SAKLAS_API_KEY` |
-| `--no-web` | off | Skip the dashboard mount, API-only mode |
+with SaklasSession.from_pretrained(
+    "google/gemma-3-4b-it",
+    device="auto",
+    return_top_k=8,
+) as session:
+    name, profile = session.extract("patient", baseline="impatient")
+    session.add_probe(name)
 
-It does not do tool calling, strict JSON mode, or embeddings. The server is meant for trusted networks. Please see [SECURITY.md](SECURITY.md).
+    result = session.generate(
+        "How should I learn a difficult skill?",
+        steering=f"0.3 {name} + 0.2 concise",
+        sampling=SamplingConfig(
+            temperature=0.8,
+            top_p=0.9,
+            max_tokens=256,
+            seed=42,
+        ),
+    ).first
 
----
-
-## Concept packs
-
-All state lives under `~/.saklas/` (override with `$SAKLAS_HOME`). Each manifold is a folder under `~/.saklas/manifolds/<ns>/<name>/` with a `manifold.json`, per-node corpus files, and per-model fitted tensors. Packs are distributed as HuggingFace model repos.
-
-Packless install handles repos with no manifest, so repeng-style GGUF-only control-vector repos install cleanly:
-
-```bash
-saklas pack install jukofyork/creative-writing-control-vectors-v3.0
+    print(result.text)
+    print(result.applied_steering)
+    print(result.probe_readings[name].coords)
 ```
 
-### Pack lifecycle and distribution
+`generate` and `generate_stream` accept the same steering expression as the WebUI.
+Generation returns a list-like `RunSet`; `.first` is convenient for a single
+completion. `GenerationResult` carries text, token IDs, throughput and timing,
+finish reason, the canonical applied expression, captured log probabilities, and
+aggregate probe readings.
 
-```bash
-saklas pack ls [-v|-j]                                   # list installed manifolds
-saklas pack show <name> [-j]                             # inspect one
-saklas pack install <target> [-a NS/NAME] [-f]          # HF coord or local folder
-saklas pack search <query> [-j|-v]                       # search HF for saklas-manifold repos
-saklas pack push <name> [-a OWNER/NAME] [-m MODEL] [--variant raw|sae|all]
-saklas pack refresh <name> [-m MODEL]                    # re-pull or re-fit
-saklas pack clear <name> [-m MODEL] [--variant raw|sae|all]   # delete fitted tensors
-saklas pack rm <name> [-y]                               # remove the folder
-saklas pack export gguf <name> [-m MODEL] [-o PATH] [--model-hint HINT]
+Batch and sweep helpers return the same result shape:
+
+```python
+batch = session.generate_batch(
+    ["Describe a sunset.", "Describe a storm."],
+    steering="0.3 warm",
+)
+
+sweep = session.generate_sweep(
+    "Describe a forest.",
+    sweep={"warm.clinical": [-0.4, 0.0, 0.4]},
+)
 ```
 
-### Manifold operations
+Restricted-choice scoring evaluates a candidate distribution directly under the
+model, optionally with steering:
 
-```bash
-saklas manifold extract <concept> | <pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [-f]
-saklas manifold generate <name> --concepts C... [--kind abstract|concrete]
-saklas manifold from-template <template> [--name MANIFOLD] [--fit-mode auto|pca|spectral]
-saklas manifold fit <name> | <folder> [-m MODEL] [--sae REL] [--method pca|spectral|auto]
-saklas manifold bake <name> <expression> [-m MODEL]
-saklas manifold merge <name> <src...> [-f]
-saklas manifold transfer <name> --from SRC --to TGT [-f]
-saklas manifold compare <concepts...> -m MODEL
-saklas manifold why <concept> -m MODEL [-j]
+```python
+scores = session.score_choices(
+    [{"role": "user", "content": "The first weekday is"}],
+    ["Monday", "Tuesday", "Wednesday"],
+    steering="0.3 confident",
+)
 ```
 
-`manifold extract` writes a 2-node concept; `manifold bake` lands a corpus-less manifold from namespace-qualified additive/subtractive scalar terms, for example `saklas manifold bake balanced "0.8 default/honest.deceptive - 0.2 default/sycophantic.blunt"`. Dynamic terms and `~`/`|` projection are rejected offline because live projection is Mahalanobis-only and requires the loaded model's whitener.
+Notebook helpers are available from `saklas.notebook` after installing
+`saklas[notebook]`: `plot_alpha_sweep`, `plot_probe_correlation`,
+`plot_layer_norms`, `plot_trait_history`, and `to_dataframe`.
 
-Selectors are shared across surfaces: `<name>`, `<ns>/<name>`, `tag:<tag>`, `namespace:<ns>`, `model:<m>`, `default`, `all`, optionally suffixed with a variant (`:raw`, `:sae`, `:sae-<release>`, `:from-<safe_src>`, `:role-<slug>`). Bare names resolve across namespaces and error if ambiguous.
+## Model support
 
----
+Saklas has end-to-end tested paths for:
 
-## Jacobian lens
+- Qwen 2, Qwen 3, and Qwen 3.5, including supported text and MoE variants;
+- Gemma 2, Gemma 3, and Gemma 4, including text-only extraction from supported
+  multimodal checkpoints;
+- Mistral 3 and Ministral 3;
+- Llama, GLM, gpt-oss, and Talkie.
 
-The Jacobian lens ([Gurnee et al. 2026](https://transformer-circuits.pub/2026/workspace/index.html)) reads out what an intermediate activation is disposed to make the model *say*: a per-layer matrix transports the residual into the final-layer basis, and the model's own unembedding decodes it into ranked vocabulary tokens. The paper shows these verbalizable directions form the model's global workspace — the small subspace its flexible reasoning routes through.
+Additional architectures are wired through the generic residual-layer interface,
+including Mixtral, Phi, Cohere, DeepSeek, OLMo, Granite, Nemotron, GPT-2-family,
+Falcon, MPT, DBRX, OPT, and others. Saklas emits a warning when an architecture is
+wired but has not been exercised end to end.
 
-Fetch an official Neuronpedia lens when the model is supported, or fit one
-locally, then read, steer, gate, and decompose:
+CUDA and Apple Silicon MPS both have real-model smoke coverage. Model-specific
+features still depend on the checkpoint: chat/role experiments require a compatible
+chat template, official SAE and J-LENS sources cover only some models, and
+FlashAttention depends on the model's Transformers attention implementation.
 
-```bash
-saklas lens fetch google/gemma-3-4b-it                    # provider payload stays in HF cache
-# unsupported model:
-saklas lens fit org/model --prompts 100                   # local/default; resumes if interrupted
-saklas lens ls google/gemma-3-4b-it
-saklas lens use google/gemma-3-4b-it neuronpedia
-saklas lens top google/gemma-3-4b-it "Fact: the currency used in the country shaped like a boot is"
-saklas lens decompose confident.uncertain -m google/gemma-3-4b-it   # how verbalizable is a concept vector?
-saklas serve google/gemma-3-4b-it -S "!jlens/fake"        # ablate a lens direction
-```
+## State and distribution
 
-`jlens/<word>` works anywhere a concept does: `0.3 jlens/orange` steers toward a token's lens direction, `!jlens/fake` ablates it, and `@when:jlens/fake > 0.4` gates another term on it. Lens directions run hotter than concept vectors — start around 0.3 rather than 0.5. In the TUI, `/lens` streams the top workspace tokens per layer live while the model generates. The fit needs a web-text corpus — pass `--corpus FILE` or `pip install 'saklas[hf]'` to stream a default sample.
+Saklas keeps local state under `~/.saklas/`; set `$SAKLAS_HOME` to move it. The
+store contains authored manifolds, per-model fits and neutral statistics, local
+SAE/J-LENS artifacts, source bindings, and templates. Conversation saves are
+explicit browser-downloaded JSON files (or caller-selected `LoomTree.save()`
+paths); they are not autosaved under `~/.saklas/`.
 
----
+Manifold packs are folders with metadata, node corpora, integrity hashes, and
+optional fitted tensors. They can be installed from a local path or distributed as
+Hugging Face model repositories. A fitted two-node PCA manifold can also be
+exported as a llama.cpp control-vector GGUF with `saklas pack export gguf`.
 
-## Sparse autoencoders
+Treat model repositories and downloaded artifacts as executable or otherwise
+untrusted input. Saklas verifies declared artifact hashes, but integrity is not
+authorship.
 
-Use a published SAELens release, or train a local residual-post SAE when the
-model has no compatible release:
-
-```bash
-saklas sae fetch google/gemma-3-4b-it saelens:gemma-scope-2-4b-it-res
-
-# Unsupported model: train on FineWeb-Edu, or pass --corpus FILE.
-pip install 'saklas[hf]'
-saklas sae train org/model my-sae --layer 20 --tokens 1000000
-saklas sae use org/model local:my-sae
-saklas sae ls org/model
-saklas serve org/model
-```
-
-Saklas owns artifacts it computes: local lenses and SAEs live below
-`$SAKLAS_HOME/models/<model>/jlens/local/` and `sae/local/`. External lens and
-SAE weights remain in Hugging Face/SAELens caches; Saklas stores only a pinned
-binding and the active-source selection. `lens rm` / `sae rm` therefore delete
-local payloads or forget bindings, but never purge provider caches.
-
-The dashboard's SAE and J-LENS tabs share one source lifecycle: select an
-already prepared source, fetch provider-owned weights into their normal cache,
-or start a Saklas-owned local train/fit with polled progress and cancellation.
-Successful preparation activates the source and turns its live readout on.
-The SAE tab then streams top feature activations and pins features as probes;
-the J-LENS tab exposes the symmetric token workspace. `0.3 sae/9143` steers on
-decoder row 9143; `!sae/9143` uses saklas's ordinary directional
-mean-ablation; `@when:sae/9143 > 3` gates on the raw post-nonlinearity encoder
-activation. V1 keeps one deterministic hook layer resident (nearest 65% depth,
-workspace band preferred); pass `--layer` to `sae fetch` or `sae train` to select a different
-covered layer. Feature labels are fetched lazily from Neuronpedia when the
-selected SAELens registry entry provides an id, and reads remain offline-first.
-
----
-
-## Supported architectures
-
-**Tested**: Qwen, Gemma, Ministral, gpt-oss, Llama, GLM, Talkie.
-
-**Wired up but untested**: Mistral, Mixtral, Phi 1 to 3, PhiMoE, Cohere 1 and 2, DeepSeek V2 and V3, StarCoder2, OLMo 1 to 3 plus OLMoE, Granite plus GraniteMoE, Nemotron, StableLM, GPT-2, GPT-Neo, GPT-J, GPT-BigCode, GPT-NeoX, Bloom, Falcon, Falcon-H1, MPT, DBRX, OPT, Recurrent Gemma.
-
-Please see [CONTRIBUTING.md](CONTRIBUTING.md) for adding an architecture; it's usually a single accessor entry.
-
----
-
-## Tests
+## Development
 
 ```bash
-pytest tests/                      # everything
-pytest tests/test_server.py        # CPU-only
-pytest tests/test_smoke.py         # GPU required
+pip install -e ".[dev]"
+
+ruff check .
+pyright
+pytest -q -m "not gpu"
+pytest -q tests/
+python -m build
 ```
 
-GPU tests download `google/gemma-3-4b-it` (~8 GB) on first run. Works on CUDA and Apple Silicon MPS.
+GPU smoke tests may download model weights:
 
----
+```bash
+pytest -q tests/test_smoke.py
+```
 
-## Contributing and security
+The WebUI is a Svelte 5 + Vite application in `webui/`. Its compiled bundle under
+`saklas/web/dist/` is committed package data and ships in the wheel.
 
-Please see [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup. For security, please see [SECURITY.md](SECURITY.md).
+```bash
+cd webui
+npm ci
+npm run check
+npm run build
+git diff --exit-code ../saklas/web/dist
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions and adding a
+model architecture.
+
+## Research lineage and credits
+
+Saklas builds on Representation Engineering
+([Zou et al., 2023](https://arxiv.org/abs/2310.01405)).
+[repeng](https://github.com/vgel/repeng) by Theia Vogel is the best-known compact
+implementation of that approach; Saklas takes the workbench route, adding live
+monitoring, manifold geometry, branching experiments, and server protocols.
+
+Two-pole extraction uses difference-of-means following
+[Im & Li, 2025](https://arxiv.org/abs/2502.02716). Manifold steering follows
+[Goodfire's manifold work](https://arxiv.org/abs/2605.05115). The `personas`
+source is derived from the framing in Anthropic's
+[Assistant Axis paper](https://arxiv.org/abs/2601.10387). J-LENS support implements
+the verbalizable-workspace method of
+[Gurnee et al., 2026](https://transformer-circuits.pub/2026/workspace/index.html).
+
+If you use Saklas in published research, please cite the relevant upstream methods
+alongside the Saklas version and exact model checkpoint you used.
+
+## Issues and security
+
+Please update to the latest Saklas release before filing a bug. Include the model
+ID, device, dtype or quantization mode, Saklas version, and a minimal reproduction
+in [GitHub Issues](https://github.com/a9lim/saklas/issues).
+
+Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
 
 ## License
 
-AGPL-3.0-or-later. See [LICENSE](LICENSE).
-
-If you use saklas in published research, please also cite the Representation Engineering paper (Zou et al., 2023) and [repeng](https://github.com/vgel/repeng).
+Saklas is licensed under AGPL-3.0-or-later. See [LICENSE](LICENSE).

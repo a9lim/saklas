@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Per-probe inspector — subsumes the layer-norms view for probes and adds a
   // rank-aware geometry plot in the whitened (Mahalanobis) frame:
   //
@@ -236,7 +237,7 @@
         {/if}
       </div>
     </div>
-    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">✕</button>
+    <DrawerCloseButton onclick={onClose} />
   </header>
 
   {#if !probeName}
@@ -300,7 +301,7 @@
   <footer class="drawer-footer">
     <span class="hint">
       Whitened-frame geometry — node centroids, neutral anchor, and the manifold
-      overlay in the same Mahalanobis metric the reads use.  The glowing dot is
+      overlay in the same Mahalanobis metric the reads use.  The live dot is
       the current hidden state; the fading trail is the last tokens.
     </span>
   </footer>
@@ -351,7 +352,6 @@
     height: 7px;
     border-radius: 50%;
     background: var(--family);
-    box-shadow: 0 0 6px color-mix(in srgb, var(--family) 45%, transparent);
     flex: none;
   }
   .name {
@@ -371,29 +371,6 @@
   .warn {
     color: var(--accent-yellow);
     font-size: var(--text-xs);
-  }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
   }
 
   .body {
@@ -423,24 +400,17 @@
     padding: var(--space-6) 0;
   }
   .empty.err {
-    color: var(--accent-error);
+    color: var(--accent-red);
   }
 
-  /* The plot well — a deep glass window with a faint family-tinted
-   * ambient (material, not data) so the geometry reads as suspended. */
+  /* The plot well stays quiet so its geometry carries the information. */
   .plot-wrap {
     position: relative;
     flex: 1 1 auto;
     min-height: 0;
     border-radius: var(--radius-lg);
-    background:
-      radial-gradient(
-        90% 75% at 50% 42%,
-        color-mix(in srgb, var(--family) 8%, transparent),
-        transparent 72%
-      ),
-      var(--bg-deep);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    background: var(--bg-deep);
+    box-shadow: var(--shadow-rack);
     overflow: hidden;
     /* Palette hooks read by the canvas renderer (hue ontology). */
     --geom-node: var(--family);

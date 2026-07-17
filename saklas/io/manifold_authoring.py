@@ -556,7 +556,7 @@ def create_baked_manifold_folder(
     The single producer for corpus-less directions — ``merge`` outputs and
     imported control vectors.  ``manifold`` is an already-fitted
     :class:`saklas.core.manifold.Manifold` (typically the affine ``R = 1`` ray
-    from :func:`saklas.core.vectors.fold_directions_to_subspace`); its geometry
+    from :func:`saklas.core.capture.fold_directions_to_subspace`); its geometry
     is frozen into the per-model ``<safe_model>.safetensors`` tensor, the folder
     carries no ``nodes/`` corpus, and it can never re-fit.
 
@@ -677,7 +677,7 @@ def _recoverable_baked_first_publication(
         return False  # a complete, trusted artifact preserves exists semantics
     # Do not adopt an interrupted skeleton that also carries some other model's
     # fitted pair; that is a multi-model merge concern with stronger provenance
-    # checks in ``io.merge``.
+    # checks in ``io.bake``.
     for filename in files:
         candidate = (
             Path(filename).with_suffix(".safetensors").name
@@ -708,7 +708,7 @@ def save_baked_manifold_tensor(
     an interruption between them is repaired by overwriting/adopting the target
     on the next producer retry.  Returns the tensor path.
     """
-    from saklas.core.manifold import save_manifold
+    from saklas.io.manifold_tensors import save_manifold
     from saklas.io.paths import tensor_filename
 
     # ``nodes_sha256`` is provenance-only for baked (never re-fits), computed
@@ -1163,7 +1163,7 @@ def merge_discover_manifolds(
 ) -> Path:
     """Union N discover-mode manifolds' nodes into one fresh discover folder.
 
-    The vector-side counterpart is :func:`saklas.io.merge.merge_into_manifold`,
+    The vector-side counterpart is :func:`saklas.io.bake.merge_into_manifold`,
     but the manifold semantics are different: vector merge composes a
     new direction from a steering expression; manifold merge unions
     *node corpora* and lets the next fit derive coords from the

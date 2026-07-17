@@ -1,24 +1,20 @@
 // Per-token highlighting helpers.
 //
-// Mirrors saklas/tui/chat_panel.py:_build_highlight_markup — same
-// saturation knob, same RGB mapping, same compose-with-zero behavior.
-// The TUI builds Rich markup; this module emits CSS color strings the
-// Chat panel attaches as inline ``background-color`` styles per token.
+// Shared saturation knob and RGB mapping for per-token probe highlighting.
+// This module emits CSS color strings the Chat panel attaches as inline
+// ``background-color`` styles per token.
 //
-// The two-stripe variant is a web-only affordance — the TUI's chord-key
-// model can only show one probe at a time; the dashboard can render two
-// probes simultaneously by splitting each token's background vertically.
+// The two-stripe variant renders two probes simultaneously by splitting each
+// token's background vertically.
 
 /** Saturation cutoff — score / HIGHLIGHT_SAT clamps to [-1, 1] before
- * mapping to RGB.  Matches the TUI constant exactly so highlight tints
- * align across surfaces. */
+ * mapping to RGB. */
 export const HIGHLIGHT_SAT = 0.5;
 
 /** Sentinel ``highlightState.target`` value that selects the inline
  *  surprise mode (logit-pass).  Picked to be unmistakably distinct from
  *  any real probe name (probes are slugged ``[a-z0-9._-]``); ``__``-bracketed
- *  reserves the namespace without colliding.  Imported by both
- *  ``Chat.svelte`` and any future TUI parity pass. */
+ *  reserves the namespace without colliding. */
 export const SURPRISE_TARGET = "__surprise__";
 
 /** Split a highlight target into its base probe name and coordinate axis.
@@ -82,18 +78,18 @@ export function surpriseScore(
 export type TintHue = "signed" | "surprise" | "sae";
 
 /* Ramp poles (tokens.css: --highlight-pos / --highlight-neg /
- * --highlight-surprise) as rgb triplets, and the alpha ceiling.  v2
+ * CSS variables as the single palette source, and the alpha ceiling.  v2
  * tints are constant-hue ALPHA ramps: tint strength = opacity, hue =
  * meaning, so text contrast stays put and the poles are OKLCH-matched
  * in perceived lightness (the old ramp swept luminance through opaque
- * rgb(0,255·t,0), which wobbled legibility with the score). */
-const TINT_POS = "52, 211, 153"; /* #34d399 */
-const TINT_NEG = "229, 84, 79"; /* #e5544f */
-const TINT_SURPRISE = "107, 166, 248"; /* #6ba6f8 */
-const TINT_SAE = "242, 201, 76"; /* #f2c94c */
+ * green, which wobbled legibility with the score). */
+const TINT_POS = "var(--accent-green)";
+const TINT_NEG = "var(--accent-red)";
+const TINT_SURPRISE = "var(--pillar-lens)";
+const TINT_SAE = "var(--pillar-sae)";
 const TINT_MAX_ALPHA = 0.62;
 
-/** Map a probe score to a CSS rgba() background (stronger score =
+/** Map a probe score to a CSS color background (stronger score =
  * more opaque tint of a constant hue).  Returns ``"transparent"`` when
  * score is effectively zero or null/undefined.
  *
@@ -120,10 +116,16 @@ export function scoreToRgb(
   const s = Number.isFinite(scale) && scale > 1e-6 ? scale : HIGHLIGHT_SAT;
   const t = Math.max(-1, Math.min(1, score / s));
   if (t === 0) return "transparent";
-  const a = (Math.abs(t) * TINT_MAX_ALPHA).toFixed(3);
-  if (hue === "surprise") return `rgba(${TINT_SURPRISE}, ${a})`;
-  if (hue === "sae") return `rgba(${TINT_SAE}, ${a})`;
-  return t > 0 ? `rgba(${TINT_POS}, ${a})` : `rgba(${TINT_NEG}, ${a})`;
+  const amount = (Math.abs(t) * TINT_MAX_ALPHA * 100).toFixed(1);
+  const color =
+    hue === "surprise"
+      ? TINT_SURPRISE
+      : hue === "sae"
+        ? TINT_SAE
+        : t > 0
+          ? TINT_POS
+          : TINT_NEG;
+  return `color-mix(in srgb, ${color} ${amount}%, transparent)`;
 }
 
 /** Color family for a selected transcript-highlight channel. */

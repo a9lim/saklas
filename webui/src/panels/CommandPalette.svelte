@@ -71,9 +71,6 @@
       case "tab":
         setInspectorTab(cmd.action.tab);
         break;
-      case "styleguide":
-        window.open("/styleguide", "_blank");
-        break;
     }
   }
 
@@ -210,7 +207,7 @@
   .backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(2, 3, 8, 0.55);
+    background: var(--scrim-strong);
     backdrop-filter: blur(2px);
     z-index: calc(var(--z-modal) + 10);
     border: 0;
@@ -231,9 +228,7 @@
     backdrop-filter: blur(12px);
     border: 1px solid var(--glass-line);
     border-radius: var(--radius-lg);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.06),
-      var(--shadow-overlay);
+    box-shadow: var(--shadow-overlay);
     overflow: hidden;
     animation: palette-in var(--dur) var(--ease-out);
   }
@@ -279,7 +274,7 @@
     font-family: var(--font-mono);
     font-size: var(--text-2xs);
     color: var(--fg-muted);
-    border: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
     border-radius: var(--radius-sm);
     padding: 2px 6px;
   }

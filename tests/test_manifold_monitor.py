@@ -154,11 +154,11 @@ def test_add_probe_registers_and_precaches():
     assert sum(p.share_weights.values()) == pytest.approx(1.0, abs=1e-5)
 
 
-def test_attached_layers_is_union():
+def test_probe_layers_is_union():
     m = _toy_manifold(n_layers=3)
     mon = _iso_monitor(m)
     mon.add_probe("toy", m)
-    assert mon.attached_layers() == {0, 1, 2}
+    assert mon.probe_layers() == {0, 1, 2}
 
 
 def test_remove_probe():
@@ -167,7 +167,7 @@ def test_remove_probe():
     mon.add_probe("toy", m)
     mon.remove_probe("toy")
     assert mon.probe_names == []
-    assert mon.attached_layers() == set()
+    assert mon.probe_layers() == set()
 
 
 def test_add_probe_top_n_default():
@@ -817,18 +817,6 @@ def test_empty_inputs_return_empty():
     assert mon.score_aggregate({}) == {}
 
 
-def test_pending_per_token_flag():
-    m = _toy_manifold()
-    mon = _iso_monitor(m)
-    mon.add_probe("toy", m)
-    assert not mon.has_pending_per_token()
-    hidden = {layer_idx: sub.mean for layer_idx, sub in m.layers.items()}
-    mon.score_single_token(hidden)
-    assert mon.has_pending_per_token()
-    mon.consume_pending_per_token()
-    assert not mon.has_pending_per_token()
-
-
 # ============================================== affine (flat) batched path ===
 #
 # The curved tests above exercise the per-probe foot-solve path.  These build
@@ -1222,7 +1210,7 @@ def test_tail_with_sink_can_keep_deep_tail_on_selected_layers_only():
     cap.attach(layers, [0, 1, 2])
     cap.set_tail_with_sink(
         3,
-        lambda latest: rows.append({
+        lambda _step, latest: rows.append({
             layer: row.clone() for layer, row in latest.items()
         }),
         tail_layers={2},
@@ -1232,7 +1220,7 @@ def test_tail_with_sink_can_keep_deep_tail_on_selected_layers_only():
         for layer in range(3):
             value = torch.full((1, 1, 4), float(layer * 100 + step))
             layers[layer](value)
-        cap.fire_step_sink()
+        cap.fire_step_sink(step)
 
     assert [len(cap._per_layer[layer]) for layer in range(3)] == [1, 1, 3]
     assert set(cap.latest_per_layer()) == {0, 1, 2}

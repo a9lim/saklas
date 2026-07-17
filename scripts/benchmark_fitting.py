@@ -94,7 +94,7 @@ def _staged_authoring_folder(source: Path):
         for path in staged.glob("*.gguf"):
             path.unlink()
         for path in staged.glob("*.json"):
-            if path.name not in {"manifold.json", "scenarios.json"}:
+            if path.name != "manifold.json":
                 path.unlink()
         manifest = json.loads((staged / "manifold.json").read_text())
         manifest["files"] = {}

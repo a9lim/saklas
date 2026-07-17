@@ -34,7 +34,7 @@ def _mock_session():
 
     session.config = GenerationConfig()
 
-    session.vectors = {}
+    session.profiles = {}
     session.probes = {}
     session.tree = MagicMock()
     session.tree.messages_for.return_value = []
@@ -352,21 +352,21 @@ class TestSessions:
 # ---- vectors -------------------------------------------------------------
 
 
-class TestVectors:
+class TestProfiles:
     def test_list_empty(self, session_and_client: Any) -> None:
         _, client = session_and_client
-        resp = client.get("/saklas/v1/sessions/default/vectors")
+        resp = client.get("/saklas/v1/sessions/default/profiles")
         assert resp.status_code == 200
-        assert resp.json()["vectors"] == []
+        assert resp.json()["profiles"] == []
 
     def test_get_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
-        resp = client.get("/saklas/v1/sessions/default/vectors/missing")
+        resp = client.get("/saklas/v1/sessions/default/profiles/missing")
         assert resp.status_code == 404
 
     def test_delete_not_found(self, session_and_client: Any) -> None:
         _, client = session_and_client
-        resp = client.delete("/saklas/v1/sessions/default/vectors/missing")
+        resp = client.delete("/saklas/v1/sessions/default/profiles/missing")
         assert resp.status_code == 404
 
 
@@ -394,7 +394,7 @@ class TestProbes:
         from types import SimpleNamespace
         import torch
 
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from tests._whitener import isotropic_whitener
 
         session, client = session_and_client
@@ -582,7 +582,7 @@ class TestExtract:
     ) -> None:
         session, client = session_and_client
         resp = client.post(
-            "/saklas/v1/sessions/default/vectors",
+            "/saklas/v1/sessions/default/profiles",
             json={"name": "custom", "source_path": "/tmp/profile.pt"},
         )
         assert resp.status_code == 405
@@ -1094,7 +1094,7 @@ class TestScoreSingleToken:
         import torch
         from saklas.core.monitor import Monitor
         from saklas.core.results import ProbeReading
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
         dim = 16
@@ -1120,7 +1120,7 @@ class TestScoreSingleToken:
     def test_consistent_with_measure_from_hidden(self):
         import torch
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         from tests._whitener import isotropic_whitener
         dim = 16
@@ -1485,7 +1485,7 @@ class TestRoleSampling:
 
 
 class TestPairwiseMetric:
-    """``GET /vectors/pairwise`` is Mahalanobis-only (no Euclidean path)."""
+    """``GET /profiles/pairwise`` is Mahalanobis-only (no Euclidean path)."""
 
     def _setup(self, session_and_client: Any) -> tuple[Any, TestClient]:
         import torch
@@ -1493,7 +1493,7 @@ class TestPairwiseMetric:
         session, client = session_and_client
         # Two dim-4 vectors over layers {0, 1}.
         torch.manual_seed(1)
-        session.vectors = {
+        session.profiles = {
             "x": Profile({0: torch.randn(4), 1: torch.randn(4)}),
             "y": Profile({0: torch.randn(4), 1: torch.randn(4)}),
         }
@@ -1508,14 +1508,14 @@ class TestPairwiseMetric:
         means = {L: torch.zeros(4) for L in (0, 1)}
         w = LayerWhitener.from_neutral_activations(acts, means)
         session.whitener = w
-        r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y")
+        r = client.get("/saklas/v1/sessions/default/profiles/pairwise?a=x&b=y")
         assert r.status_code == 200
         body = r.json()
         assert body["metric"] == "mahalanobis"
         for i, la in enumerate(body["layers_a"]):
             for j, lb in enumerate(body["layers_b"]):
                 # Each cell is whitened in the row layer's frame.
-                vx, vy = session.vectors["x"][la], session.vectors["y"][lb]
+                vx, vy = session.profiles["x"][la], session.profiles["y"][lb]
                 ref = w.mahalanobis_cosine(la, vx, vy)
                 assert body["matrix"][i][j] == pytest.approx(ref, abs=1e-5)
 
@@ -1524,14 +1524,14 @@ class TestPairwiseMetric:
         there is no Euclidean fallback."""
         session, client = self._setup(session_and_client)
         session.whitener = None
-        r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=x&b=y")
+        r = client.get("/saklas/v1/sessions/default/profiles/pairwise?a=x&b=y")
         assert r.status_code == 409
 
 
 class TestAnalyticsMultiNodeProbe:
     """A multi-node / curved probe (the ``personas`` rank-R fan) has no single
     steering direction, so the direction-cosine analytics must *exclude* it —
-    not 500 on ``folded_vector_directions`` (regression: a rank-8 probe attached
+    not 500 on ``folded_directions`` (regression: a rank-8 probe attached
     while the web UI polled ``/correlation`` aborted the request)."""
 
     def _wire(self, session_and_client: Any) -> tuple[Any, TestClient]:
@@ -1544,7 +1544,7 @@ class TestAnalyticsMultiNodeProbe:
             CustomDomain, LayerSubspace, Manifold,
         )
         from saklas.core.session import SaklasSession
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         session, client = session_and_client
         torch.manual_seed(3)
@@ -1587,6 +1587,13 @@ class TestAnalyticsMultiNodeProbe:
         session._monitor.manifolds = {"vp": vp, "fan": fan}
         session.gen_lock = threading.Lock()
         session._analytics_cpu_cache = {}
+        # ``analytics_names`` reads the roster through the geometry
+        # instrument's LOCKED ``manifolds()`` snapshot now — a bare MagicMock
+        # instrument silently yields an empty roster, so wire the real one
+        # (it reads the same ``session._monitor.manifolds`` stub above).
+        from saklas.core.instruments.geometry import GeometryInstrument
+
+        session._geometry_instrument = GeometryInstrument(session)
         # Bind the real analytics methods onto the mock so the endpoint
         # exercises the production fold path, not a vacuous MagicMock.
         session.analytics_names = lambda: SaklasSession.analytics_names(session)
@@ -1623,5 +1630,5 @@ class TestAnalyticsMultiNodeProbe:
 
     def test_pairwise_multinode_404(self, session_and_client: Any) -> None:
         _, client = self._wire(session_and_client)
-        r = client.get("/saklas/v1/sessions/default/vectors/pairwise?a=fan&b=vx")
+        r = client.get("/saklas/v1/sessions/default/profiles/pairwise?a=fan&b=vx")
         assert r.status_code == 404

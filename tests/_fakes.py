@@ -63,7 +63,7 @@ def make_mock_session(**overrides: Any) -> Any:
     session.config.max_new_tokens = 1024
     session.config.system_prompt = None
 
-    session.vectors = {}
+    session.profiles = {}
     session.probes = {}
     session.history = []
 

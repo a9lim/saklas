@@ -124,6 +124,18 @@ def _stub_session() -> SaklasSession:
     session._lens_probes = {}
     session._live_sae = None
     session._sae_probes = {}
+    # All three families route through real instruments now: geometry for
+    # the add_probe flow (exclusive section + whitener touch + resolve +
+    # monitor.add_probe), lens/SAE because ``_begin_capture`` consumes
+    # their ``plan()`` demand — a MagicMock plan would poison the capture
+    # layer union.  Lens/SAE state (live config, probe registry) lives ON
+    # the instruments; tests set ``session._lens_instrument.live`` etc.
+    from saklas.core.instruments.geometry import GeometryInstrument
+    from saklas.core.instruments.lens import LensInstrument
+    from saklas.core.instruments.sae import SaeInstrument
+    session._geometry_instrument = GeometryInstrument(session)
+    session._lens_instrument = LensInstrument(session)
+    session._sae_instrument = SaeInstrument(session)
     session._lens_step_stash = None
     session._live_lens_active_for_generation = True
     session._incremental_readings = []
@@ -261,7 +273,9 @@ def test_begin_capture_live_lens_uses_persistent_capture_when_available():
     """Live J-lens layers ride compile-clean persistent capture buffers."""
     session = _stub_session()
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
-    session._live_lens = {"layers": [1, 3]}
+    # Live-lens state lives on the instrument; ``_begin_capture`` reads it
+    # through the lens family's declared plan.
+    session._lens_instrument.live = {"layers": [1, 3]}
     session._compiled_clean_eligible = True
     session._steering_uses_compiled_offsets = False
     session._capture_buffers = {
@@ -301,7 +315,7 @@ def test_begin_capture_live_lens_ignored_without_consumer():
     that cannot surface ``TokenEvent.lens_readout``."""
     session = _stub_session()
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]
-    session._live_lens = {"layers": [1, 3]}
+    session._lens_instrument.live = {"layers": [1, 3]}
     session._capture.attach = lambda *args, **kw: None
     session._capture.clear = lambda: None
     session._incremental_readings = []
@@ -311,6 +325,625 @@ def test_begin_capture_live_lens_ignored_without_consumer():
     )
 
     assert ok is False
+
+
+def test_geometry_detach_rejects_while_generation_holds_the_lock():
+    """Geometry has no per-generation roster snapshot (Monitor scoring
+    walks the live dict), so a detach racing a generation must reject with
+    retry-shortly semantics instead of mutating the roster mid-flight —
+    the same exclusive section ``attach`` takes."""
+    import threading as _threading
+
+    from saklas.core.session import ConcurrentExtractionError
+
+    session = _stub_session()
+    # The MagicMock default no-ops the exclusive section; this test is
+    # about exactly that guard, so bind the real one (it needs only
+    # ``_gen_lock``, which the fixture provides).
+    session._model_exclusive = types.MethodType(
+        SaklasSession._model_exclusive, session,
+    )
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m}
+    )
+    session.add_probe("toy")
+    assert "toy" in session._monitor.probe_names
+
+    # Simulate an in-flight generation: another thread holds the gen lock.
+    held = _threading.Event()
+    release = _threading.Event()
+
+    def _hold() -> None:
+        with session._gen_lock:
+            held.set()
+            release.wait(timeout=5)
+
+    holder = _threading.Thread(target=_hold)
+    holder.start()
+    try:
+        assert held.wait(timeout=5)
+        with pytest.raises(ConcurrentExtractionError, match="retry shortly"):
+            session.remove_probe("toy")
+        # The roster is untouched — the reject protected the in-flight read.
+        assert "toy" in session._monitor.probe_names
+    finally:
+        release.set()
+        holder.join(timeout=5)
+
+    # Idle again: the detach applies normally.
+    session.remove_probe("toy")
+    assert "toy" not in session._monitor.probe_names
+
+
+# ================================================== geometry state lock ===
+
+def test_geometry_state_lock_serializes_detach_and_reads():
+    """The geometry-state boundary (the Monitor sibling of the lens
+    round-5 fix): the session's ``remove_probe`` geometry branch and the
+    coherent read surfaces (``specs``) hold the instrument's state lock —
+    an idle detach can no longer land inside a concurrent registry
+    iteration or tear it."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    inst = session._geometry_instrument
+
+    detach_entered = threading.Event()
+    read_entered = threading.Event()
+    read_out: list[Any] = []
+
+    def _detach() -> None:
+        detach_entered.set()
+        session.remove_probe("toy")
+
+    def _read_specs() -> None:
+        read_entered.set()
+        read_out.append(inst.specs())
+
+    with inst.state_lock:
+        detacher = threading.Thread(target=_detach)
+        reader = threading.Thread(target=_read_specs)
+        detacher.start()
+        reader.start()
+        assert detach_entered.wait(timeout=5.0)
+        assert read_entered.wait(timeout=5.0)
+        detacher.join(timeout=0.2)
+        reader.join(timeout=0.2)
+        assert detacher.is_alive()  # both blocked on the geometry-state lock
+        assert reader.is_alive()
+        assert "toy" in session._monitor.probe_names  # nothing mutated mid-hold
+    detacher.join(timeout=5.0)
+    reader.join(timeout=5.0)
+    assert not detacher.is_alive() and not reader.is_alive()
+    assert "toy" not in session._monitor.probe_names
+    assert read_out and isinstance(read_out[0], dict)
+
+
+def test_geometry_idle_run_reads_hold_the_state_lock():
+    """Idle-passthrough reads (an unbound ``GeometryRun.observe``) pair
+    with the roster under the state lock — the round-6 idle-coherence
+    contract, geometry edition.  The bound per-token path stays
+    lock-free (mid-generation mutation is excluded by the detach
+    reject contract, not by this lock)."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    inst = session._geometry_instrument
+    assert inst.current_run.bound is False
+    hidden = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+
+    entered = threading.Event()
+    out: list[Any] = []
+
+    def _idle_read() -> None:
+        entered.set()
+        out.append(inst.current_run.observe(0, hidden))
+
+    with inst.state_lock:
+        reader = threading.Thread(target=_idle_read)
+        reader.start()
+        assert entered.wait(timeout=5.0)
+        reader.join(timeout=0.2)
+        assert reader.is_alive()  # blocked on the geometry-state lock
+    reader.join(timeout=5.0)
+    assert not reader.is_alive()
+    assert out and "toy" in out[0]
+
+
+def test_geometry_roster_reads_do_not_tear_under_concurrent_detach():
+    """The tear repro: ``plan()``'s roster walk (``probe_names`` +
+    ``probe_layers``) iterates live ``Monitor._probes`` state and raised
+    ``RuntimeError: dictionary changed size during iteration`` under a
+    concurrent idle attach/detach before the state lock existed (the
+    exact class the lens round-5 fix closed).  Hammer both sides; any
+    exception on either thread fails."""
+    import time as _time
+
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _stub_session()
+    manifolds = {f"toy{i}": _toy_manifold() for i in range(6)}
+
+    def _load(key: str) -> None:
+        session._manifolds.update({key: manifolds[key]})
+
+    session.ensure_manifold_loaded = _load
+    for name in manifolds:
+        session.add_probe(name)
+    inst = session._geometry_instrument
+
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def _mutate() -> None:
+        try:
+            i = 0
+            while not stop.is_set():
+                name = f"toy{i % 6}"
+                session.remove_probe(name)
+                session.add_probe(name)
+                i += 1
+        except BaseException as exc:  # noqa: BLE001 — the assertion payload
+            errors.append(exc)
+
+    def _read() -> None:
+        try:
+            while not stop.is_set():
+                prep = inst.prepare(ReadRequest(final_aggregate=True))
+                inst.plan(prep)
+                inst.specs()
+                inst.manifolds()
+                _ = inst.names
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_mutate),
+        threading.Thread(target=_read),
+    ]
+    for t in threads:
+        t.start()
+    _time.sleep(0.5)
+    stop.set()
+    for t in threads:
+        t.join(timeout=10.0)
+    assert not any(t.is_alive() for t in threads)
+    assert not errors, errors
+
+
+class _RecordingLock:
+    """RLock shim recording hold depth (every production use is ``with``)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.held = 0
+
+    def __enter__(self) -> "_RecordingLock":
+        self._lock.acquire()
+        self.held += 1
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        self.held -= 1
+        self._lock.release()
+        return False
+
+
+def _record_roster_mutations(
+    session: Any, shim: _RecordingLock,
+) -> list[tuple[str, bool]]:
+    """Wrap the stub monitor's roster mutators to record whether the
+    geometry-state shim was held at each call."""
+    monitor = session._monitor
+    real_remove, real_add = monitor.remove_probe, monitor.add_probe
+    held_at_call: list[tuple[str, bool]] = []
+
+    def _rec_remove(name: str) -> None:
+        held_at_call.append(("remove", shim.held > 0))
+        real_remove(name)
+
+    def _rec_add(name: str, manifold: Any, *, top_n: int = 3) -> None:
+        held_at_call.append(("add", shim.held > 0))
+        real_add(name, manifold, top_n=top_n)
+
+    monitor.remove_probe = _rec_remove
+    monitor.add_probe = _rec_add
+    return held_at_call
+
+
+def test_manifold_promotion_walk_holds_geometry_state_lock():
+    """``_adopt_fitted_manifold``'s probe-promotion walk mutates the
+    Monitor roster outside the instrument's attach/detach — the
+    remove+add pair must land under the geometry-state lock so a
+    coherent reader can't observe a half-applied promotion."""
+    session = _stub_session()
+    m_old = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m_old},
+    )
+    session.add_probe("toy")
+    session._manifolds = {"toy": m_old}
+    session._device = torch.device("cpu")
+    session._profiles = {}
+    inst = session._geometry_instrument
+    shim = _RecordingLock()
+    inst.state_lock = shim  # type: ignore[assignment]
+    held_at_call = _record_roster_mutations(session, shim)
+
+    m_new = _toy_manifold()
+    SaklasSession._adopt_fitted_manifold(session, "default/toy", m_new)
+
+    assert ("remove", True) in held_at_call
+    assert ("add", True) in held_at_call
+    assert all(held for _op, held in held_at_call)
+
+
+def test_failed_override_eviction_holds_geometry_state_lock():
+    """``_evict_failed_manifold_override``'s probe eviction is the same
+    out-of-instrument roster mutation — it must hold the geometry-state
+    lock too."""
+    session = _stub_session()
+    m_old = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m_old},
+    )
+    session.add_probe("toy")
+    session._manifolds = {"toy": m_old}
+    session._profiles = {}
+    inst = session._geometry_instrument
+    shim = _RecordingLock()
+    inst.state_lock = shim  # type: ignore[assignment]
+    held_at_call = _record_roster_mutations(session, shim)
+
+    SaklasSession._evict_failed_manifold_override(
+        session, "default/toy", sae=None,
+    )
+
+    assert ("remove", True) in held_at_call
+    assert "toy" not in session._monitor.probe_names
+
+
+# ============================================= observe memo priming ===
+
+def test_geometry_run_prime_observation_contract():
+    """``prime_observation`` fills the bound run's step memo so a later
+    ``observe(step_id, …)`` for the same forward returns the primed
+    readings without rescoring; a different step recomputes; an idle run
+    never primes (it persists indefinitely)."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    inst = session._geometry_instrument
+
+    # Idle run: priming is a no-op.
+    idle = inst.current_run
+    assert idle.bound is False
+    idle.prime_observation(5, {"toy": object()})
+    assert idle._memo_step is None
+
+    from saklas.core.instruments.types import ReadRequest
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    run = inst.bind(inst.plan(prep), prep)
+
+    primed = {"toy": object()}
+    run.prime_observation(5, primed)
+    # Memo hit: same step returns the primed dict without touching the
+    # monitor (empty hidden would otherwise score to an empty dict).
+    assert run.observe(5, {}) is primed
+    # A different step rescores from the given hidden states.
+    latest = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+    fresh = run.observe(6, latest)
+    assert fresh is not primed and "toy" in fresh
+    inst.close_run()
+
+
+def _wire_begin_capture(session: Any) -> dict[str, Any]:
+    """Minimal extra wiring so the real ``_begin_capture`` runs on the
+    fixture stub, capturing whichever step sink the mode branch installs."""
+    holder: dict[str, Any] = {}
+    session._layers = [None] * 4
+    # The capture transaction closes ALL THREE families' runs up front —
+    # bind the real method (the MagicMock default no-ops it, leaving the
+    # lens/SAE runs bound and poisoning a second transaction).
+    session._close_instrument_runs = types.MethodType(
+        SaklasSession._close_instrument_runs, session,
+    )
+    session._capture.attach = lambda *_a, **_k: None
+    session._capture.clear = lambda: None
+    session._capture.set_incremental = (
+        lambda sink: holder.__setitem__("sink", sink)
+    )
+    session._capture.set_tail_with_sink = (
+        lambda _depth, sink, **_kw: holder.__setitem__("sink", sink)
+    )
+    session._incremental_readings = []
+    session._incremental_gate_scores = []
+    return holder
+
+
+def test_full_incremental_sink_primes_geometry_observe_memo():
+    """The FULL-incremental sink's rows ARE complete per-probe readings,
+    so it primes the geometry run's observe memo — the gate callback and
+    the token tap consult ``observe(step)`` for the same forward and hit
+    it instead of rescoring."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    holder = _wire_begin_capture(session)
+
+    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    assert ok is True
+    assert session._capture_state.mode is CaptureMode.INCREMENTAL
+    run = session._geometry_instrument.current_run
+    assert run.bound is True
+
+    latest = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+    holder["sink"](3, latest)
+
+    assert session._incremental_readings and (
+        "toy" in session._incremental_readings[-1]
+    )
+    # The memo holds the sink's exact rows for step 3 — observe() is a hit
+    # (identity, not a rescore).
+    assert run.observe(3, {}) is session._incremental_readings[-1]
+    session._geometry_instrument.close_run()
+
+
+def test_lean_and_gating_sinks_never_prime_observe_memo():
+    """LEAN rows are ``coords_only`` (no nearest / assignment / per-layer
+    trace) and gating rows are scalar subsets — priming either as the full
+    ``observe`` reading is the completeness trap, so neither sink primes."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    holder = _wire_begin_capture(session)
+
+    ok = SaklasSession._begin_capture(
+        session, widen=False, need_per_token=True, lean_per_token=True,
+    )
+    assert ok is True
+    assert session._capture_state.mode is CaptureMode.LEAN_INCREMENTAL
+    run = session._geometry_instrument.current_run
+
+    latest = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+    holder["sink"](2, latest)
+    assert session._incremental_readings  # the lean row landed
+    assert run._memo_step is None  # …but never primed the memo
+    session._geometry_instrument.close_run()
+
+    # Gating-subset sink: same contract.
+    session._incremental_readings = []
+    session._incremental_gate_scores = []
+    ok = SaklasSession._begin_capture(
+        session,
+        widen=False,
+        need_per_token=True,
+        gating_only_probes={"toy"},
+        gating_probe_keys={"toy"},
+        final_probe_aggregate=False,
+    )
+    assert ok is True
+    assert session._capture_state.mode is CaptureMode.GATING_SUBSET
+    run = session._geometry_instrument.current_run
+    holder["sink"](7, latest)
+    assert session._incremental_gate_scores  # the scalar row landed
+    assert run._memo_step is None
+    session._geometry_instrument.close_run()
+
+
+def test_negative_step_never_caches_or_primes():
+    """``step_id < 0`` is the no-identity sentinel: repeated negative
+    observations rescore every time (a -1 memo would serve one stale read
+    to every later sentinel call — sol's round-1 P2), and a negative
+    prime is a no-op."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    inst = session._geometry_instrument
+    from saklas.core.instruments.types import ReadRequest
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
+    run = inst.bind(inst.plan(prep), prep)
+
+    run.prime_observation(-1, {"toy": object()})
+    assert run._memo_step is None  # negative prime is a no-op
+
+    latest = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+    first = run.observe(-1, latest)
+    assert run._memo_step is None  # negative observe never caches
+    second = run.observe(-1, {})
+    # A fresh scoring, not the first result served stale.
+    assert second is not first and second == {}
+    inst.close_run()
+
+
+def test_gate_callback_consumes_the_full_incremental_memo():
+    """The composer's FULL-incremental branch reads this forward's row
+    through ``run.observe(step, {})`` — a memo hit on the sink's exact
+    object, no rescore (the monitor is poisoned after the sink to prove
+    it)."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    holder = _wire_begin_capture(session)
+    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    assert ok is True
+
+    latest = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+    holder["sink"](0, latest)
+
+    def _poisoned(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise AssertionError(
+            "the gate callback must consume the primed memo, not rescore"
+        )
+
+    session._monitor.score_single_token = _poisoned  # type: ignore[method-assign]
+    cb = session._steering_composer.build_gating_score_callback()
+    flat = cb(0)
+    assert "toy" in flat and "toy:fraction" in flat
+    session._geometry_instrument.close_run()
+
+
+def test_token_payload_consumes_the_full_incremental_memo():
+    """``build_token_probe_payload``'s FULL-incremental branch is a memo
+    hit too — the payload's geometry readings ARE the sink's row."""
+    from saklas.core.token_payloads import build_token_probe_payload
+
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    holder = _wire_begin_capture(session)
+    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    assert ok is True
+
+    latest = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+    holder["sink"](1, latest)
+
+    def _poisoned(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise AssertionError(
+            "the token payload must consume the primed memo, not rescore"
+        )
+
+    session._monitor.score_single_token = _poisoned  # type: ignore[method-assign]
+    payload = build_token_probe_payload(
+        monitor=session._monitor,
+        capture=session._capture,
+        capture_state=session._capture_state,
+        incremental_readings=session._incremental_readings,
+        geometry_run=session._geometry_instrument.current_run,
+        step_id=1,
+        needs_scores=True,
+        persists_layer_scores=False,
+        assistant_node_id=None,
+    )
+    assert payload.geometry_readings is session._incremental_readings[-1]
+    session._geometry_instrument.close_run()
+
+
+def test_geometry_gate_keys_none_vs_empty_contract():
+    """The protocol's sentinel semantics: ``gate_keys=None`` scores the
+    full roster, an explicit ``set()`` means "no gated probes" and scores
+    nothing.  The geometry member of the three-family contract pin."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    run = session._geometry_instrument.current_run
+    hidden = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+    full = run.gate_scalars(0, hidden, None)
+    assert "toy" in full and "toy:fraction" in full
+    assert run.gate_scalars(0, hidden, set()) == {}
+
+
+def test_batch_geometry_aggregate_routes_through_the_run():
+    """``_batch_probe_aggregate_for_row`` reaches the roster through
+    ``current_run.observe_aggregate`` — this exact site was the round-2
+    bypass, so a run spy pins the route."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    session._empty_readings = types.MethodType(
+        SaklasSession._empty_readings, session,
+    )
+    pooled = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+    run = session._geometry_instrument.current_run
+    seen: list[Any] = []
+    orig = run.observe_aggregate
+
+    def _spy(p: Any) -> Any:
+        seen.append(p)
+        return orig(p)
+
+    run.observe_aggregate = _spy  # type: ignore[method-assign]
+    out = SaklasSession._batch_probe_aggregate_for_row(
+        session, 0, [1, 2, 3], ["toy"], pooled=pooled,
+    )
+    assert seen and seen[0] is pooled
+    assert "toy" in out
+
+
+def test_geometry_run_observe_aggregate_matches_live_read():
+    """The finalize aggregate routed through ``GeometryRun.observe_
+    aggregate`` is bit-identical to a live ``score_single_token`` read at
+    the pooled slice — the protocol claim, pinned on a CURVED probe (the
+    foot-solve path, the hard case)."""
+    session = _stub_session()
+    m = _toy_manifold()
+    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
+        {key: m},
+    )
+    session.add_probe("toy")
+    pooled = {
+        layer_idx: sub.mean + sub.basis[0]
+        for layer_idx, sub in m.layers.items()
+    }
+
+    via_run = session._geometry_instrument.current_run.observe_aggregate(
+        pooled,
+    )
+    live = session._monitor.score_single_token(pooled)
+
+    assert set(via_run) == set(live) == {"toy"}
+    assert via_run["toy"].coords == live["toy"].coords
+    assert via_run["toy"].fraction == live["toy"].fraction
+    assert via_run["toy"].residual == live["toy"].residual
+    assert via_run["toy"].nearest == live["toy"].nearest
 
 
 # ===================================================== gating callback ===
@@ -344,7 +977,7 @@ def test_gating_callback_emits_probe_scalars():
     }
 
     cb = session._steering_composer.build_gating_score_callback()
-    flat = cb()
+    flat = cb(0)
     # Manifold keys are present: fraction + per-node distance + coord axis 0.
     assert "toy:fraction" in flat
     # Per-node distance channels emit; the activation sits near the frame
@@ -366,7 +999,7 @@ def test_gating_callback_empty_capture_returns_empty():
     session._capture.latest_per_layer = lambda: {}
 
     cb = session._steering_composer.build_gating_score_callback()
-    assert cb() == {}
+    assert cb(0) == {}
 
 
 # ============================================================ aggregate ===

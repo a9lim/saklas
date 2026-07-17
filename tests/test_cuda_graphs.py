@@ -1,4 +1,4 @@
-"""StaticCache + CUDA-graphs detection (Phase B, v2.2).
+"""StaticCache + CUDA-graph detection and session-cache reuse.
 
 The actual graph-capture path needs CUDA hardware to exercise; these
 tests pin the *gating* behavior — what makes
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -217,6 +217,126 @@ def test_support_probe_cache_survives_compile_wrapper(monkeypatch: pytest.Monkey
     assert len(calls) == 1
 
 
+def test_make_static_cache_early_initializes_standard_gqa_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh caches must allocate and mark K/V tensors before Dynamo tracing.
+
+    Transformers 5.x lazy initialization inside the compiled prefill leaves a
+    CPU ``cumulative_length`` input and unmarked mutated K/V tensors, which
+    disables CUDA graphs and recompiles for each new cache.
+    """
+    import transformers
+
+    calls: list[dict[str, Any]] = []
+
+    class _CacheLayer:
+        is_sliding = False
+
+    class _EarlyCache:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.layers = [_CacheLayer(), _CacheLayer()]
+
+        def early_initialization(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    text_config = SimpleNamespace(
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=64,
+        hidden_size=512,
+    )
+    model: Any = SimpleNamespace(
+        config=SimpleNamespace(get_text_config=lambda: text_config),
+    )
+    monkeypatch.setattr(transformers, "StaticCache", _EarlyCache, raising=False)
+
+    cache = cg.make_static_cache(
+        model,
+        max_cache_len=256,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    assert isinstance(cache, _EarlyCache)
+    assert calls == [{
+        "batch_size": 1,
+        "num_heads": 2,
+        "head_dim": 64,
+        "dtype": torch.bfloat16,
+        "device": torch.device("cuda"),
+    }]
+
+
+def test_session_reuses_and_resets_generation_static_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from saklas.core.session import SaklasSession
+
+    class _Cache:
+        def __init__(self, capacity: int) -> None:
+            self.capacity = capacity
+            self.resets = 0
+
+        def reset(self) -> None:
+            self.resets += 1
+
+    class _Model:
+        def __init__(self) -> None:
+            self.param = torch.zeros(1, dtype=torch.float16)
+
+        def parameters(self):
+            return iter([self.param])
+
+    made: list[_Cache] = []
+
+    def _make_static_cache(
+        model: Any,
+        *,
+        max_cache_len: int,
+        device: Any,
+        dtype: Any,
+    ) -> _Cache:
+        del model, device, dtype
+        cache = _Cache(max_cache_len)
+        made.append(cache)
+        return cache
+
+    monkeypatch.setattr(
+        "saklas.core.cuda_graphs.make_static_cache",
+        _make_static_cache,
+    )
+    session = SaklasSession.__new__(SaklasSession)
+    session._device = torch.device("cpu")
+    session._generation_static_cache = None
+    session._generation_static_cache_len = 0
+    model = _Model()
+
+    first = cast(
+        _Cache,
+        session._acquire_generation_static_cache(
+            cast(Any, model), max_cache_len=512,
+        ),
+    )
+    reused = cast(
+        _Cache,
+        session._acquire_generation_static_cache(
+            cast(Any, model), max_cache_len=256,
+        ),
+    )
+    grown = cast(
+        _Cache,
+        session._acquire_generation_static_cache(
+            cast(Any, model), max_cache_len=768,
+        ),
+    )
+
+    assert reused is first
+    assert first.resets == 1
+    assert grown is not first
+    assert [cache.capacity for cache in made] == [512, 768]
+
+
 # ---------------------------------------------------------------------------
 # CLI + YAML opt-in plumbing.
 # ---------------------------------------------------------------------------
@@ -224,9 +344,9 @@ def test_support_probe_cache_survives_compile_wrapper(monkeypatch: pytest.Monkey
 
 def test_cuda_graphs_flag_parses():
     from saklas import cli
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it"])
+    args = cli.parse_args(["serve", "google/gemma-2-2b-it"])
     assert getattr(args, "cuda_graphs", False) is False
-    args = cli.parse_args(["tui", "google/gemma-2-2b-it", "--cuda-graphs"])
+    args = cli.parse_args(["serve", "google/gemma-2-2b-it", "--cuda-graphs"])
     assert args.cuda_graphs is True
 
 
@@ -236,7 +356,7 @@ def test_yaml_cuda_graphs_true_folds_onto_args(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     p = tmp_path / "on.yaml"
     p.write_text("model: google/gemma-2-2b-it\ncuda_graphs: true\n")
-    args = cli.parse_args(["tui", "-c", str(p)])
+    args = cli.parse_args(["serve", "-c", str(p)])
     assert getattr(args, "cuda_graphs", False) is False
     cli_runners._load_effective_config(args)
     assert args.cuda_graphs is True
@@ -261,7 +381,7 @@ def test_yaml_compile_and_cuda_graphs_compose(monkeypatch: pytest.MonkeyPatch, t
     p.write_text(
         "model: google/gemma-2-2b-it\ncompile: true\ncuda_graphs: true\n"
     )
-    args = cli.parse_args(["tui", "-c", str(p)])
+    args = cli.parse_args(["serve", "-c", str(p)])
     cli_runners._load_effective_config(args)
     assert args.compile is True
     assert args.cuda_graphs is True

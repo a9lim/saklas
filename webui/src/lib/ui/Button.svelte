@@ -80,21 +80,18 @@
   .md {
     font-size: var(--text-sm);
     padding: 7px 14px;
+    min-height: var(--control-field);
   }
   .sm {
-    min-height: 24px;
+    min-height: var(--control-target);
     font-size: var(--text-xs);
     padding: 4px 10px;
     border-radius: var(--radius-sm);
   }
 
-  /* solid — lit from above: a faint white top-light over the accent so
-   * the fill reads as material (gradient across, never along, a data
-   * axis — buttons carry no data axis, so this is pure material). */
+  /* Solid buttons use one quiet, legible accent fill. */
   .solid {
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 55%),
-      var(--btn-accent);
+    background: var(--btn-accent);
     color: var(--text-on-accent);
     border-color: transparent;
   }

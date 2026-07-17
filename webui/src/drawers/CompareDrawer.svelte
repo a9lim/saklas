@@ -1,15 +1,16 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Pairwise compare drawer — cross-layer cosine matrix between two
   // named steering vectors / probes.  Two dropdowns pick the pair (same
   // pool the layer-norms drawer uses: registered vectors ∪ active
   // probes); the body renders an L_A × L_B heatmap structurally akin to
   // the correlation matrix, but indexed by layer rather than by name.
   //
-  // Data: GET /vectors/pairwise?a=&b= — the server falls back to monitor
+  // Data: GET /profiles/pairwise?a=&b= — the server falls back to monitor
   // profiles when a name isn't a registered steering vector, so probe
   // names resolve cleanly without a new endpoint.
 
-  import { apiVectors, ApiError } from "../lib/api";
+  import { apiProfiles, ApiError } from "../lib/api";
   import {
     closeDrawer,
     probeRack,
@@ -83,7 +84,7 @@
     loading = true;
     error = null;
     try {
-      data = await apiVectors.pairwise(a, b);
+      data = await apiProfiles.pairwise(a, b);
     } catch (e) {
       if (e instanceof ApiError) {
         const detail =
@@ -148,7 +149,7 @@
         {/if}
       </div>
     </div>
-    <button type="button" class="close" onclick={onClose} aria-label="Close drawer">✕</button>
+    <DrawerCloseButton onclick={onClose} />
   </header>
 
   <div class="picker-row">
@@ -283,29 +284,6 @@
     font-size: var(--text-sm);
     white-space: nowrap;
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
 
   .picker-row {
     display: flex;
@@ -340,7 +318,7 @@
     max-width: 62ch;
   }
   .empty.err {
-    color: var(--accent-error);
+    color: var(--accent-red);
   }
 
   /* Data well — sticky label cells stay OPAQUE (they occlude scrolled
@@ -377,7 +355,7 @@
     padding: 0 var(--space-3) 0 var(--space-2);
     color: var(--fg-dim);
     font-size: var(--text-xs);
-    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-sticky-inline);
     white-space: nowrap;
   }
   .grid .corner {
@@ -389,7 +367,7 @@
     font-size: var(--text-xs);
     text-align: left;
     padding: var(--space-1) var(--space-3);
-    box-shadow: var(--shadow-sticky), 2px 0 8px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-sticky), var(--shadow-sticky-inline);
     white-space: nowrap;
   }
   .corner .axis-a,

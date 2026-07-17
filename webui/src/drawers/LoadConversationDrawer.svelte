@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Load-conversation drawer — restore from a previously-saved JSON blob.
   // Mirrors SaveConversationDrawer's v5 whole-tree wire shape exactly.
   // Older active-path-only files are rejected rather than pretending to
@@ -93,7 +94,7 @@
     | SaeSteerRow;
 
   interface SnapshotShape {
-    version: 5;
+    version: 6;
     savedAt: string;
     model_id: string;
     session_id: string;
@@ -123,7 +124,7 @@
   function isSnapshotShape(v: unknown): v is SnapshotShape {
     if (!v || typeof v !== "object") return false;
     const obj = v as Record<string, unknown>;
-    if (obj.version !== 5 || typeof obj.savedAt !== "string") return false;
+    if (obj.version !== 6 || typeof obj.savedAt !== "string") return false;
     if (typeof obj.model_id !== "string" || typeof obj.session_id !== "string") return false;
     if (!obj.tree || typeof obj.tree !== "object" || !Array.isArray(obj.steerRack)) return false;
     const tree = obj.tree as Record<string, unknown>;
@@ -207,7 +208,7 @@
     }
     if (!isSnapshotShape(json)) {
       parseError =
-        "unsupported conversation file: expected the complete saklas conversation schema version 5";
+        "unsupported conversation file: expected the complete saklas conversation schema version 6";
       return;
     }
     parsed = json;
@@ -344,9 +345,7 @@
 <section class="drawer-shell" aria-label="Load conversation drawer">
   <header class="header">
     <span class="title">load conversation</span>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button
-    >
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -431,29 +430,6 @@
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -485,7 +461,7 @@
     font-family: var(--font-mono);
   }
   .error {
-    color: var(--accent-error);
+    color: var(--accent-red);
     font-size: var(--text-sm);
     margin: 0;
     word-break: break-word;

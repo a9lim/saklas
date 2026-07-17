@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Shared rack drawer — one component, two reskins split by geometry
   // family.  Subsumes the former VectorsDrawer + ManifoldDrawer: same
   // layout, same actions, same chrome, differing only by accent colour,
@@ -7,7 +8,7 @@
   //   * subspace (white ``--accent``) — every flat affine fit
   //     (``fit_mode`` ``pca`` or ``baked``): 2-node concept axes AND
   //     higher-rank flats like ``personas``.
-  //   * manifold (purple ``--accent-purple``) — curved fits only
+  //   * manifold (purple ``--pillar-manifold``) — curved fits only
   //     (``fit_mode`` ``spectral`` or ``authored``), e.g. ``emotions``.
   //
   // Within the family filter the existing fitted / unfitted split
@@ -77,7 +78,7 @@
   // accents, stripes, hovers) reads one variable — white for subspace,
   // purple for manifold.
   const familyAccent = $derived(
-    family === "manifold" ? "var(--accent-purple)" : "var(--accent)",
+    family === "manifold" ? "var(--pillar-manifold)" : "var(--accent)",
   );
   const title = $derived(family === "manifold" ? "manifold" : "subspace");
   // Authoring always routes to the manifold builder now — a flat (2-node /
@@ -494,8 +495,7 @@
 >
   <header class="header">
     <span class="title">{title}</span>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -843,29 +843,6 @@
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -876,7 +853,7 @@
     min-height: 0;
   }
   .error {
-    color: var(--accent-error);
+    color: var(--accent-red);
     font-size: var(--text-sm);
     margin: 0;
     word-break: break-word;
@@ -897,7 +874,7 @@
     text-align: left;
     background: var(--bg-alt);
     color: var(--fg-strong);
-    border: 1px dashed var(--border);
+    border: 1px dashed var(--glass-line);
     border-radius: var(--radius);
     padding: var(--space-3) var(--space-4);
     font: inherit;
@@ -1039,7 +1016,7 @@
     padding-top: var(--space-2);
   }
   .inspect-body .error {
-    color: var(--accent-error);
+    color: var(--accent-red);
     font-size: var(--text-xs);
     margin: 0;
   }

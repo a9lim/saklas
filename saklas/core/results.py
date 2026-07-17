@@ -89,8 +89,9 @@ class ProbeReading:
     ``residual``):
 
     * ``assignment`` — a soft node-assignment posterior: ``(label, prob)`` over
-      the candidate nodes (+ the neutral anchor), ``softmax(−d²_M / 2τ²)`` with a
-      per-node bandwidth ``τ`` (a curved fit's within-node σ-field mapped into the
+      the candidate nodes (+ the neutral anchor),
+      ``softmax(−d²_M / 2τ² − R·log(τ))`` with a per-node bandwidth ``τ`` and
+      Gaussian log-volume correction (a curved fit's within-node σ-field mapped into the
       whitened metric, a flat fit's local layout scale).  The *distributional*
       counterpart to the argmax ``nearest`` — ships the shape instead of the
       winner.  Top-N by probability, descending; sums to ≤ 1 (the reported
@@ -317,25 +318,19 @@ class TokenEvent:
     # Bounded above by sampler support size; a confident prediction
     # approaches 1. Consumers take ``log`` to recover entropy-nats.
     perplexity: float | None = None
-    # Live J-lens readout for this step: ``{layer: [(token,
-    # score), ...]}`` — the top-k lens tokens at each selected layer. The
-    # loom-owned ``captured`` wire record separately carries endpoint-shaped
-    # token ids + logprobs without changing this library/TUI compatibility view.
-    # ``None`` when ``session.enable_live_lens`` is off.
-    lens_readout: dict[int, list[tuple[str, float]]] | None = None
-    # Layer-aggregated view of the same step's lens readout: ``[(token,
-    # strength, com, spread), ...]`` — per-layer softmax → mean-probability
-    # strength over all live layers, plus the
-    # probability-mass-weighted depth center of mass (0 = first block, 1 = last)
-    # and its std (:func:`saklas.core.jlens.aggregate_readout`). ``None``
-    # when the live lens is off.
-    lens_aggregate: list[tuple[str, float, float, float]] | None = None
-    # Live SAE top-k at the resident hook layer: feature id, raw
-    # post-nonlinearity activation, optional cached display label, and the
-    # optional cached Neuronpedia ``maxActApprox`` (the strength unit —
-    # ``activation / max_act`` is the normalized 0..1 readout; ``None``
-    # until metadata is fetched).
-    sae_readout: list[tuple[int, float, str | None, float | None]] | None = None
+    # The 5.x measurement envelope for this step (scope ``"token"``) — the one
+    # wire record carrying every read-side channel: geometry / lens / SAE
+    # ``instruments`` plus the flat ``scores`` / ``per_layer_scores`` views
+    # (:func:`saklas.core.measurements.build_measurements`).  It replaces the
+    # former ``lens_readout`` / ``lens_aggregate`` / ``sae_readout`` fields and
+    # the loom-owned ``captured`` record.  ``None`` when nothing was measured
+    # this step (no probes, live readouts off).  ``probe_readings`` above stays
+    # a separate typed field: it feeds the OpenAI/Ollama
+    # ``x-saklas-probe-readings`` vendor extension and the traits SSE stream
+    # (compat protocols), carrying the merged per-probe readings from all
+    # families as :class:`ProbeReading` objects rather than the serialized
+    # envelope shape.
+    measurements: dict[str, Any] | None = None
 
 class ResultCollector:
     """Accumulates GenerationResults with tags for batch export."""

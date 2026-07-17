@@ -1,7 +1,7 @@
 """ManifoldExtractionPipeline tests — CPU only, synthetic encoder.
 
 Mirrors the stub-encoder pattern in :mod:`tests.test_dim_extraction`:
-monkeypatch :func:`saklas.core.vectors._encode_and_capture_all` so no
+monkeypatch :func:`saklas.core.capture._encode_and_capture_all` so no
 real model is needed.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from saklas.core import vectors as V
+from saklas.core import capture as V
 from saklas.core.events import EventBus, ManifoldExtracted
 from saklas.core.extraction import ManifoldExtractionPipeline
 from saklas.core.sae import MockSaeBackend
@@ -328,7 +328,7 @@ def test_full_capture_cache_serves_subset_without_forward(
     pipe.fit(folder)
 
     import saklas.core.extraction as extraction_module
-    from saklas.core.manifold import ActivationRowStore
+    from saklas.io.manifold_tensors import ActivationRowStore
 
     loaded_scopes: list[list[int] | None] = []
     loaded_centroid_shards: list[str] = []
@@ -588,7 +588,7 @@ def test_reader_stays_available_and_authoring_cas_rejects_stale_fit(
 ) -> None:
     import saklas.core.manifold as manifold_module
     from saklas.core.extraction import ManifoldAuthoringChangedError
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.io.paths import tensor_filename
 
     folder = _author_manifold(tmp_path)
@@ -633,7 +633,7 @@ def test_reader_stays_available_and_authoring_cas_rejects_stale_fit(
 def test_interrupted_pair_publish_is_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.manifold as manifold_module
+    import saklas.io.manifold_tensors as manifold_module
 
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
@@ -666,8 +666,8 @@ def test_interrupted_pair_publish_is_retryable(
 def test_interrupted_existing_pair_replacement_self_repairs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.manifold as manifold_module
-    from saklas.core.manifold import load_manifold
+    import saklas.io.manifold_tensors as manifold_module
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.io.paths import tensor_filename
 
     folder = _author_manifold(tmp_path)
@@ -698,7 +698,7 @@ def test_interrupted_existing_pair_replacement_self_repairs(
 def test_pair_committed_before_manifest_failure_self_repairs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.io.paths import tensor_filename
 
     folder = _author_manifold(tmp_path)
@@ -1063,7 +1063,7 @@ def test_concurrent_deferred_row_topups_merge_latest_pointer(
     tmp_path: Path,
 ) -> None:
     from saklas.core.extraction import _publish_deferred_row_shards
-    from saklas.core.manifold import ActivationRowStore
+    from saklas.io.manifold_tensors import ActivationRowStore
 
     stem = "c" * 64
     meta_path = tmp_path / f"{stem}.json"
@@ -1191,7 +1191,7 @@ def test_deferred_row_publication_traverses_each_payload_once(
 ) -> None:
     from safetensors.torch import load_file
     from saklas.core import extraction as extraction_module
-    from saklas.core.manifold import ActivationRowStore
+    from saklas.io.manifold_tensors import ActivationRowStore
 
     stem = "d" * 64
     meta_path = tmp_path / f"{stem}.json"
@@ -1329,7 +1329,7 @@ def test_capture_does_not_retry_a_known_bad_batch_width(
 
 def test_fit_returns_node_roles_without_reload(tmp_path: Path) -> None:
     from types import SimpleNamespace
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.io.paths import tensor_filename
 
     folder = _author_manifold(tmp_path)
@@ -2328,7 +2328,8 @@ def test_discover_cache_invalidates_on_fit_mode_change(tmp_path: Path) -> None:
 
 def test_discover_round_trip_through_load_manifold(tmp_path: Path) -> None:
     """A fitted discover manifold loads back with the same domain + coords."""
-    from saklas.core.manifold import CustomDomain, load_manifold
+    from saklas.core.manifold import CustomDomain
+    from saklas.io.manifold_tensors import load_manifold
     folder = _discover_folder(
         tmp_path, fit_mode="pca", hyperparams={"max_dim": 4},
     )
@@ -2659,7 +2660,7 @@ def test_auto_curved_partial_topup_reuses_durable_rows_without_recapture(
 
 
 def _fold_test_direction(name: str, direction: torch.Tensor):
-    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.core.capture import fold_directions_to_subspace
 
     whitener = synthetic_whitener([0], int(direction.numel()))
     return fold_directions_to_subspace(
@@ -2719,10 +2720,10 @@ def test_adopt_fitted_manifold_rebinds_loaded_probe_profile_and_prefix(
     attached = session._monitor.probes["mood-probe"]
     assert attached.manifold is live
     assert attached.top_n == 4
-    from saklas.core.vectors import folded_vector_directions
+    from saklas.core.capture import folded_directions
 
     assert torch.allclose(
-        session._profiles["local/mood"][0], folded_vector_directions(new)[0],
+        session._profiles["local/mood"][0], folded_directions(new)[0],
     )
     assert session._prefix_cache is None
     assert session._analytics_cpu_cache == {}

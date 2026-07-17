@@ -100,7 +100,7 @@
   }
 </script>
 
-<RackCard accent="--accent-blue" disabled={false} active={isHighlight}>
+<RackCard accent="--pillar-lens" disabled={false} active={isHighlight}>
   {#snippet statline()}
     <ProbePinButton
       shape="square"

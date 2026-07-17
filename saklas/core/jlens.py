@@ -25,7 +25,7 @@ unreplicated scalar VJPs; replicated VJPs remain an explicit reference mode.
 This is the ONLY module in saklas that runs backward passes. The fit builds
 its own autograd-enabled forward (``torch.enable_grad()`` + a grad-seeding
 output hook on the first fitted block) — the ``inference_mode`` capture machinery in
-``vectors.py`` cannot be reused, because inference tensors never re-enter
+``capture.py`` cannot be reused, because inference tensors never re-enter
 autograd. Per-layer grads come from ``torch.autograd.grad(final, sources)``
 — NOT ``backward()`` + ``retain_grad()`` (``.grad`` accumulates across the
 multi-backward loop and would corrupt the one-hot-cotangent rows) — which
@@ -411,6 +411,17 @@ def readout_probabilities(logits: torch.Tensor) -> torch.Tensor:
     return logits.float().softmax(dim=-1)
 
 
+def pack_readout_rows_to_host(*rows: torch.Tensor) -> torch.Tensor:
+    """Pack selected readout rows for one accelerator-to-host transfer.
+
+    The packed payload stays fp32 on the accelerator because MPS does not
+    support float64.  fp32 still represents every practical vocabulary id
+    exactly (up to 2**24), so integer token-id rows can share the transfer with
+    probability/statistic rows without changing the public values.
+    """
+    return torch.cat([row.float() for row in rows], dim=0).detach().cpu()
+
+
 def aggregate_readout_from_probabilities(
     probabilities: torch.Tensor,
     depths: "Sequence[float]",
@@ -435,8 +446,51 @@ def aggregate_readout_from_probabilities(
             "aggregate_readout_from_probabilities: "
             f"{probabilities.shape[0]} probability rows but {len(depths)} depths"
         )
+    idxs, stats = aggregate_readout_tensors_from_probabilities(
+        probabilities,
+        depths,
+        top_k=top_k,
+        depth_tensor=depth_tensor,
+    )
+    host = pack_readout_rows_to_host(stats, idxs.reshape(1, -1))
+    return [
+        (
+            int(host[3, j]),
+            float(host[0, j]),
+            float(host[1, j]),
+            float(host[2, j]),
+        )
+        for j in range(int(idxs.numel()))
+    ]
+
+
+def aggregate_readout_tensors_from_probabilities(
+    probabilities: torch.Tensor,
+    depths: "Sequence[float]",
+    *,
+    top_k: int = 8,
+    depth_tensor: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device-resident aggregate selection and statistics.
+
+    Returns ``(token_ids[K], stats[3,K])`` where the statistic rows are
+    strength, depth center-of-mass, and depth spread. Keeping this tensor form
+    separate from the public list conversion lets the live readout combine its
+    per-layer and aggregate payloads into one GPU-to-host synchronization per
+    token.
+    """
+    if probabilities.ndim != 2 or probabilities.shape[0] == 0:
+        raise ValueError(
+            "aggregate_readout_tensors_from_probabilities expects "
+            f"[layers, vocab] probabilities, got shape {tuple(probabilities.shape)}"
+        )
+    if len(depths) != probabilities.shape[0]:
+        raise ValueError(
+            "aggregate_readout_tensors_from_probabilities: "
+            f"{probabilities.shape[0]} probability rows but {len(depths)} depths"
+        )
     strength = probabilities.mean(dim=0)                       # [V]
-    k = min(int(top_k), int(strength.shape[-1]))
+    k = min(max(int(top_k), 0), int(strength.shape[-1]))
     vals, idxs = strength.topk(k)
     p = probabilities.index_select(-1, idxs)                   # [L, K]
     d = _depth_column(
@@ -449,18 +503,7 @@ def aggregate_readout_from_probabilities(
     com = (p * d).sum(dim=0) / mass                             # [K]
     var = (p * (d - com.unsqueeze(0)) ** 2).sum(dim=0) / mass
     spread = var.clamp_min(0.0).sqrt()
-    # one batched host transfer for the whole readout
-    stats = torch.stack([vals, com, spread]).cpu()
-    idx_cpu = idxs.cpu()
-    return [
-        (
-            int(idx_cpu[j]),
-            float(stats[0, j]),
-            float(stats[1, j]),
-            float(stats[2, j]),
-        )
-        for j in range(k)
-    ]
+    return idxs, torch.stack([vals, com, spread])
 
 
 def aggregate_readout(

@@ -2,8 +2,8 @@
 
 ## What this is
 
-`saklas` is a Python library + Textual TUI + dual-protocol HTTP server for
-activation steering and trait monitoring on HuggingFace causal LMs. It runs
+`saklas` is a Python library + dual-protocol HTTP server for activation steering
+and trait monitoring on HuggingFace causal LMs. It runs
 OpenAI `/v1/*` and Ollama `/api/*` on one port, plus a native `/saklas/v1/*` API
 and a Svelte dashboard at `/`. Steering signal comes from representation
 engineering, unified under a single artifact family — the **manifold**: labeled
@@ -13,8 +13,8 @@ is a 20-node affect manifold over PAD. Every steering term — vectors, poles, `
 `!` ablations, and `%` manifold positions — lowers at generation time to one
 unified per-layer injection (the along/onto subspace kernel,
 `core/manifold.py::subspace_inject`). Per-call coefficients, no model mutation.
-Three frontends over one engine: `SaklasSession` (programmatic), `saklas serve`
-(HTTP), `saklas tui` (TUI).
+Two frontends over one engine: `SaklasSession` (programmatic) and `saklas serve`
+(HTTP APIs plus the web dashboard).
 
 Version lives in `saklas/__init__.py` as `__version__`.
 `pyproject.toml` reads it via `version = {attr = "saklas.__version__"}`, so there
@@ -38,9 +38,8 @@ when you work in that directory. Consult them only when editing that layer.
   monitor, session, generation loop, loom tree
 - `saklas/io/AGENTS.md` — manifold format, HF distribution, GGUF, merge,
   alignment, paths/selectors
-- `saklas/cli/AGENTS.md` — seven-verb dispatch, config loading, flags
+- `saklas/cli/AGENTS.md` — eight-verb dispatch, config loading, flags
 - `saklas/server/AGENTS.md` — OpenAI / Ollama / native routes
-- `saklas/tui/AGENTS.md` — slash commands, panels, loom screen
 - `saklas/web/AGENTS.md` — dashboard mount, wire protocol, Svelte source layout
 
 ## Commands
@@ -48,9 +47,7 @@ when you work in that directory. Consult them only when editing that layer.
 ```bash
 pip install -e ".[dev]"                         # editable + pytest + SAELens
 pip install -e ".[gguf]"                        # llama.cpp GGUF I/O
-pip install -e ".[cuda]"                        # bitsandbytes + kernels (Linux/CUDA)
-pip install -e ".[cuda-experimental]"            # + flash-attn (Linux/CUDA)
-saklas tui <model_id> [--no-dls]
+pip install -e ".[cuda,flash]"                  # bitsandbytes + kernels + tested FlashAttention (Linux/CUDA)
 saklas serve <model_id> [--no-web] [--steer/-S EXPR]
 saklas manifold extract <concept>|<pos> <neg> [-m MODEL] [--sae RELEASE] [--role SLUG] [--namespace NS] [-f]
 saklas manifold generate <name> --concepts C... [--kind abstract|concrete|custom] [--system TEMPLATE] [--samples-per-prompt K] [--seed S]
@@ -86,8 +83,8 @@ saklas config validate <file>
 pytest tests/                                   # all; GPU tests gated on CUDA/MPS
 ```
 
-The root parser has exactly nine verbs: `tui`, `serve`, `manifold`, `pack`,
-`experiment`, `config`, `template`, `lens`, `sae`. There is no `vector` alias. `manifold`
+The root parser has exactly eight verbs: `serve`, `manifold`, `pack`, `experiment`,
+`config`, `template`, `lens`, `sae`. There is no `vector` alias. `manifold`
 is the unified compute surface
 (extract/generate/from-template/fit/bake/merge/transfer/compare/why); `pack` owns
 lifecycle and distribution (ls/show/install/search/push/rm/clear/refresh/export
@@ -98,8 +95,8 @@ and a `manifold from-template` fit); `lens` owns local fitting plus source-aware
 lifecycle/readout (fit/fetch/ls/show/use/top/decompose/rm — see "Jacobian lens"
 below); `sae` owns the parallel local/external lifecycle
 (train/fetch/ls/show/use/rm). Both keep provider-owned payloads in provider
-caches and store only pinned bindings locally. No `argv[0]`
-peeking, no bare-TUI fallback —
+caches and store only pinned bindings locally. No `argv[0]` peeking or bare-model
+fallback —
 `saklas google/gemma-2-2b-it` is an argparse error. Bare `saklas` / `saklas
 manifold` / `saklas pack` / `saklas experiment` / `saklas config` / `saklas
 template` / `saklas lens` / `saklas sae` print help and exit 0.
@@ -133,7 +130,7 @@ raising on cross-tier collision. A steering expression composing role-augmented 
 role; plain `:raw` terms compose with role terms but emit a one-time
 `RoleBaselineMismatchWarning`.
 
-Canonical naming: `canonical_concept_name` (module-level in `core/session.py`)
+Canonical naming: `canonical_concept_name` (module-level in `core/naming.py`)
 slugs poles via `[^a-z0-9]+ → _` and joins bipolar poles with `BIPOLAR_SEP = "."`,
 so `/steer formal . casual` and `/steer formal.casual` resolve to the same manifold.
 `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$`; `@` is forbidden (HF revision separator),
@@ -141,7 +138,7 @@ and `.` is used over `~` because HF repo names reject `~`.
 
 ## Steering expression grammar
 
-Every live steering surface — Python, YAML, HTTP, and TUI — speaks the grammar
+Every live steering surface — Python, YAML, HTTP, and CLI — speaks the grammar
 in `saklas.core.steering_expr`. `manifold bake` parses the same syntax but accepts
 only namespace-qualified additive/subtractive scalar terms: dynamic `!`/`%`,
 triggers, multi-coefficients, and Mahalanobis `~`/`|` projections require a live
@@ -160,8 +157,8 @@ preset      := before | after | both | thinking | response | prompt | generated
 gate        := "when" ":" probe_atom op NUM        # op ∈ > >= < <=
 probe_atom  := [ns "/"] NAME ["." NAME] ["[" INT "]"]  # vector probe (e.g. confident.uncertain,
                                                    # jlens/fake); optional coord axis (personas[3])
-             | [ns "/"] NAME ":" "fraction"        # manifold subspace fraction
-             | [ns "/"] NAME "@" NAME              # manifold label similarity
+             | [ns "/"] NAME ":" ("fraction" | "membership")
+             | [ns "/"] NAME ("@" | "~") NAME      # distance / assignment
              | "sae" "/" INT                       # resident SAE feature strength (activation /
                                                    # Neuronpedia maxActApprox when cached; raw otherwise)
 ```
@@ -200,8 +197,10 @@ per-probe constant, so `nearest` still ranks by raw distance (literally nearest,
 distinct from the density-aware `~<label>`). Two
 **fuzzy-manifold** channels join them (additive — the `@<label>` distance gate is
 untouched): the soft-assignment probability `~<label>` (`@when:personas~hacker >
-0.5`) — a normalized, in-`[0,1]` `softmax(−d²/2τ²)` membership over the nodes,
-the distributional counterpart to argmax `nearest` — and the tube-fit density
+0.5`) — a normalized, in-`[0,1]`
+`softmax(−d²/(2τ²) − R·log(τ))` posterior over the nodes (including the
+Gaussian log-volume correction), the distributional counterpart to argmax
+`nearest` — and the tube-fit density
 `:membership` (`@when:emotions:membership > 0.6`) — `exp(−residual²/2σ²)` under the
 fitted within-node thickness `σ(z)`, high when the activation sits inside the
 manifold's learned tube (distinguishes off-surface from on-surface-but-diffuse,
@@ -214,7 +213,15 @@ not a stored node. It competes in the nearest-node ranking, so the channel is
 present whenever neutral lands in a probe's top-N; suppressed only when a manifold
 already carries a real node named `neutral`. Every shape flows through one
 `ProbeGate` (full namespaced string stored verbatim, matching the keys
-`Monitor.flat_scalars` emits) and round-trips byte-for-byte.
+`Monitor.flat_scalars` emits) and round-trips byte-for-byte. At generation
+preflight the composer channel-validates every gate through `parse_gate_ref`
+against the attached instrument's supported channels (`validate_gate_channels`):
+a gate on a channel the family can never produce — e.g. `@when:sae/123:membership`
+(SAE has only the strength channel) — raises `UnsupportedProbeChannelError` (400)
+instead of sitting silently inactive. The 5.x SAE clean break dropped the former
+fake gate channels: an SAE probe now emits **only** its real normalized-strength
+channel (`sae/<id>` / `sae/<id>[0]`), not the constant `:fraction = 0.0` /
+`:membership = 1.0` values that masqueraded as geometry reads.
 
 `%` is the manifold operator: `<manifold> % <position>` places a generation at a
 point of a fitted manifold. `<position>` is `<coord_list>` (a comma-separated list
@@ -344,18 +351,22 @@ Three read surfaces over either source, plus local fit and external fetch:
   per-layer cards, and this aggregate. The aggregate and per-layer matrix both
   cover every requested fitted layer. `session.enable_live_lens()` streams the
   same top-k width as the generation's logit-alternative readout per
-  selected layer plus the aggregate chip list every decode step
-  (`TokenEvent.lens_readout` / `TokenEvent.lens_aggregate`, TUI `/lens` →
-  WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's
+  selected layer plus the aggregate chip list every decode step; live SAE
+  discovery, hover, captured prefill, and token replay use that same shared
+  width (falling back to 8 when alternatives are disabled)
+  (`TokenEvent.measurements` — the 5.x envelope's `instruments.lens.readout`
+  per-layer matrix + aggregate block, displayed in the
+  dashboard WORKSPACE section with a `Σ` aggregate row); the reader consumes the capture's
   latest slices post-forward at the token tap — no new forward hooks, so steering
   fast-path/compile eligibility is untouched. The default live layer set is
   **every fitted layer**, and `saklas serve` auto-enables the
-  live lens at startup when the artifact exists (serve-side policy; library +
-  TUI stay opt-in). The dashboard's **J-LENS tab** is
-  the server sibling. Its SOURCE section lists `local:default` and fetched
+  live lens at startup when the artifact exists (serve-side policy; the library
+  stays opt-in). The dashboard's **J-LENS tab** is the server frontend. Its
+  SOURCE section lists `local:default` and fetched
   `neuronpedia` bindings, switches an existing source, fetches the official
   artifact into the Hugging Face cache, or drives the background local fit
-  route `POST /saklas/v1/sessions/{id}/lens/fit` (all layers, polled,
+  preparation `POST /saklas/v1/sessions/{id}/instruments/lens/preparations`
+  (`{operation:"fit"}`, all layers, polled,
   cancellable); either successful preparation activates the source and turns
   the live readout on. The SAE tab has the same SOURCE/STEER/PROBE shape:
   prepared `local:<name>` / `saelens:<release>` sources, provider fetch/load,
@@ -363,9 +374,10 @@ Three read surfaces over either source, plus local fit and external fetch:
   dashboard is served, Saklas restores an explicitly active SAE or attaches the
   best compatible official provider release, then enables its live readout by
   default; `--no-web` does not acquire or download an SAE implicitly.
-  `POST /saklas/v1/sessions/{id}/lens/live` toggles the live
-  lens, the native WS `token` frame carries the per-step matrix as
-  `lens_readout` + the chip list as `lens_aggregate`, and session info's
+  `POST /saklas/v1/sessions/{id}/instruments/lens/live` toggles the live
+  lens, the native WS `token` frame carries the per-step matrix + chip list
+  inside its `measurements` envelope (`instruments.lens.readout`), and session
+  info's
   `live_lens_layers` rehydrates the toggle across reloads. The tab's STEER
   section authors `α jlens/<word>` cards into the shared steering expression;
   its **PROBE section is the merged workspace readout** — pinned
@@ -376,15 +388,23 @@ Three read surfaces over either source, plus local fit and external fetch:
   add form, with the live-lens toggle in
   the section header (live off ⇒ no per-step lens compute; pinned probes
   settle to the end-of-gen aggregate). The CAA tab's PROBE section carries
-  the symmetric **live toggle** (`POST /saklas/v1/sessions/{id}/probes/live`
+  the symmetric **live toggle** (`POST /saklas/v1/sessions/{id}/instruments/geometry/live`
   → `session.set_live_probe_scores`, rehydrated via session info's
   `live_probe_scores`): off ⇒ per-token monitor scoring is disabled for
   UI/trait/loom consumers (aggregate-only capture; gates still force the
   subset they need), so a compute-constrained session can run with neither
-  family live.
+  family live. The post-hoc complement is `session.geometry_token_readout`
+  (`GET .../instruments/geometry/token-readout`, a `scope=replay`
+  measurements envelope) — the Monitor-roster sibling of the lens/SAE
+  token replays: rebuild the node's prompt render + decode prefix, one
+  capture forward under the recipe steering, score the full roster at the
+  clicked token's producing position, so aggregate-only generations and
+  probes attached after the fact still drill down (the dashboard token
+  drilldown's **geometry tab**; `steered=false` reads the unsteered
+  counterfactual).
   `session.jlens_token_readout(node_id, raw_index)` is the loom-anchored variant
   behind the dashboard token drilldown's **j-lens tab** (`GET /saklas/v1/
-  sessions/{id}/lens/token-readout`): rebuild the node's prompt render + raw
+  sessions/{id}/instruments/lens/token-readout`): rebuild the node's prompt render + raw
   decode prefix, one capture forward under the node's recipe steering (exact for
   always-active affine terms — the slide is position-independent; phase/gated
   terms don't reproduce on a bare forward), and read the full fitted-layer top-k
@@ -457,7 +477,7 @@ pole, node 1 the negative — and fits it via
 `{positive, negative}` / `statements.json` / baked-DiM artifact; the corpus lives
 as the manifold's two node groups. `extract()` returns `(canonical_name, Profile)`
 where the `Profile` is the **folded** per-layer direction view of the fitted 2-node
-manifold (`core/vectors.py::folded_vector_directions`) — the in-memory
+manifold (`core/capture.py::folded_directions`) — the in-memory
 steering-vector shape callers expect, with the manifold the single on-disk
 artifact. A tensor cache hit (sidecar `nodes_sha256` matches the folder)
 short-circuits the forward passes.
@@ -498,7 +518,7 @@ each layer's `LayerSubspace` (mean, basis, real `node_coords`): the activation-s
 magnitude lives in the neutral-anchored real coords (`coord_pos − coord_neg =
 ‖δ_L‖`), and a separate per-layer Mahalanobis `share` carries the cross-layer
 budget. The in-memory steering vector is the folded view `δ̂_L · share_L`
-(`folded_vector_directions`); for GGUF export llama.cpp's uniform control-vector
+(`folded_directions`); for GGUF export llama.cpp's uniform control-vector
 scalar reproduces the relative per-layer weighting from those magnitudes.
 
 Discriminative Layer Selection (Selective Steering, Dang & Ngo 2026 Eq. 9): a
@@ -581,15 +601,16 @@ across targets (a tight pole sits ~0.3 from neutral, a far persona centroid ~17)
 so one `along` gain couldn't calibrate both — `0.5 formal%formal` did nothing
 while `0.5 personas%caveman` slammed the output. `along` is now a scale-stable
 strength knob across ranks/targets; per-target *coherence* variance (~2-3×, §10)
-remains. There is **no lever / N correction** and **no `[0,1]`
-clamp / water-fill on `along`** (a high-signal layer is meant to overshoot the
-target; the de-rogued whitened coords keep it controlled and `norm_cap` bounds
-it). `onto` stays clamped `[0,1]`. (`_SUBSPACE_GAIN` is tagged a prototype —
-calibrated so `≈0.5 <concept>` lands at the coherent sweet spot; the whitened
-normalization changes the absolute scale, so this constant is **due for
-recalibration** against live output.) A steered layer always runs the slow (ctx-consulting) hook, so per-step
-triggers and probe gates work uniformly; `torch.compile`/StaticCache graph capture
-stays available only for unsteered generation.
+remains. There is **no lever / N correction** and, except for periodic domains,
+**no `[0,1]` clamp / water-fill on `along`** (a high-signal layer is meant to
+overshoot the target; the de-rogued whitened coords keep it controlled, with
+`norm_cap` guarding the non-periodic curved path while the affine path relies on
+the bounded target). `onto` stays clamped `[0,1]`. `_SUBSPACE_GAIN` is
+live-calibrated so `≈0.5 <concept>` lands at the coherent sweet spot but remains
+tagged as a prototype. The dominant always-active affine case
+uses `SteeringHook._single_affine_fast`, a fixed tensor-op sequence eligible for
+StaticCache and `torch.compile`. Curved, phased, or gated steering uses the
+ctx-consulting general path so per-step triggers and probe gates remain dynamic.
 
 ## Manifold steering
 
@@ -836,7 +857,7 @@ with SaklasSession.from_pretrained("google/gemma-3-4b-it", device="auto") as ses
 Key contracts:
 - `generate` / `generate_stream` / `session.steering()` accept `str | Steering |
   None` only — dicts raise `TypeError`. A string is a steering expression.
-- **Cast model** (`core/scene.py`, `docs/plans/dynamic-roles.md`): rendering
+- **Cast model** (`core/scene.py`): rendering
   goes through the per-session **scene grammar** (template autopsy +
   byte-exact round-trip validation; `session.scene_grammar`, None = legacy
   fallback). `generate(..., gen_seat="user")` has the model speak the user
@@ -872,7 +893,7 @@ Key contracts:
   carrying `node_ids`/`grid`, with `.first` (the underlying `GenerationResult`) and
   common attributes delegating to it. `session.last_result` is the `GenerationResult`.
 - `extract()` returns `(name, Profile)`; the `Profile` is the folded view of the
-  2-node manifold. `extract_vector_from_corpora` is the corpus-in sibling;
+  2-node manifold. `extract_from_corpora` is the corpus-in sibling;
   `fit(folder)` fits a multi-node manifold and returns a `Manifold`;
   `bake(name, expression)` lands a corpus-less baked manifold from qualified
   additive scalar terms (the mirror of `manifold bake`). `Profile` wraps `dict[int, Tensor]`
@@ -900,9 +921,11 @@ Key contracts:
   `ChoiceScores`/`ChoiceScore`; `parse_expr`/`format_expr`; term types
   `ManifoldTerm`/`ProjectedTerm`/`AblationTerm`; selector errors
   `SelectorError`/`AmbiguousSelectorError`;
-  `ManifoldNotRegisteredError`/`VectorNotRegisteredError`; and the Jacobian-lens
+  `ManifoldNotRegisteredError`/`ProfileNotRegisteredError`; the Jacobian-lens
   suite `JacobianLens`/`JSpaceDecomposition` with errors
-  `JacobianLensError`/`LensNotFittedError`/`MultiTokenWordError`). `from saklas
+  `JacobianLensError`/`LensNotFittedError`/`MultiTokenWordError`; and the read-side
+  instrument facades `GeometryInstrument`/`LensInstrument`/`SaeInstrument` with
+  `UnsupportedProbeChannelError`). `from saklas
   import X` is stable; private submodule paths are not.
 
 ## Cache layout
@@ -930,10 +953,22 @@ All state under `~/.saklas/` (override via `$SAKLAS_HOME`):
                                        # probe-centering mean is its per-layer X.mean(0),
                                        # the whitener covariance is built from the stack
     alignments/<safe_src>.{safetensors,json} # optional cross-model Procrustes map
-    jlens.json                         # atomic per-model Jacobian-lens pointer
-    jlens.layer-*.gen-*.safetensors    # immutable fp32 J_l layer shards (`lens fit`)
-  conversations/<name>.json            # explicit loom-tree saves (no autosave)
+    jlens/
+      active.json                      # selected local/external J-lens source
+      bindings/<provider>.json         # commit-pinned external source metadata
+      local/default/
+        manifest.json                  # atomic immutable-shard pointer
+        checkpoint.json                # present only during a resumable local fit
+        jlens*.gen-*.safetensors       # immutable fp32 J_l layer shards
+    sae/
+      active.json                      # selected local/SAELens source
+      bindings/<release>.json          # provider binding + optional feature metadata
+      local/<name>/                    # Saklas-trained weights + manifest
 ```
+
+Conversation exports are browser-downloaded JSON files or explicit
+`LoomTree.save(path)` targets; there is no `$SAKLAS_HOME/conversations` autosave
+tree.
 
 `manifold.json.files` is a sha256 map verified on load. A manifold folder can hold
 multiple fitted tensors per model, distinguished by filename suffix:
@@ -1086,8 +1121,8 @@ independently of the per-node `--samples-per-prompt`).
 
 ## Package layout
 
-`saklas/{core,io,cli,server,tui,web}/`. `core` is the engine, `io` is persistence
-+ distribution, `cli`/`server`/`tui`/`web` are the four frontends. The Svelte
+`saklas/{core,io,cli,server,web}/`. `core` is the engine, `io` is persistence +
+distribution, and `cli`/`server`/`web` are the interface layers. The Svelte
 dashboard source lives at the repo's `webui/` directory (peer of `saklas/`); its
 build artifact is committed under `saklas/web/dist/`.
 
@@ -1100,6 +1135,5 @@ owns the throughput regression.
 
 **CPU-only**: the bulk of the suite — core dataclasses, steering-context
 semantics, manifold format integrity + staleness, selector grammar, mocked HF
-wrappers, GGUF round-trip, config loading, monitor scoring, seven-verb CLI dispatch,
-OpenAI/Ollama/native servers, TUI slash-command dispatch, loom tree/diff/filter/
-transcript.
+wrappers, GGUF round-trip, config loading, monitor scoring, eight-verb CLI
+dispatch, OpenAI/Ollama/native servers, and loom tree/diff/filter/transcript.

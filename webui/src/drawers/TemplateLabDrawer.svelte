@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // TemplateLabDrawer — the standalone templated-completion artifact.
   //
   // Two tabs:
@@ -9,8 +10,8 @@
   //     more multi-turn contexts (history turns + the slotted final assistant
   //     turn). The slot lives only in the assistant turn.
   //
-  // Reached from the workspace rail's "manifolds → templates…" entry. Templates
-  // also feed a manifold fit (`saklas manifold from-template`).
+  // Reached from the command palette. Templates also feed a manifold fit
+  // (`saklas manifold from-template`).
 
   import { onMount } from "svelte";
   import { ApiError, apiTemplates } from "../lib/api";
@@ -218,7 +219,7 @@
     <div class="title">
       <span class="eyebrow">templates</span>
     </div>
-    <button type="button" class="close" aria-label="Close drawer" onclick={closeDrawer}>✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="toolbar">
@@ -410,29 +411,6 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
 
   .toolbar {
     padding: var(--space-3) var(--space-6);
@@ -523,7 +501,7 @@
   .contexts {
     border-radius: var(--radius);
     background: var(--glass);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow: var(--shadow-well);
     padding: var(--space-4);
     margin: 0;
   }

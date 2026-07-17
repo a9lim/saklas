@@ -21,10 +21,9 @@ def _write_fitted_manifold(
 ) -> Path:
     import torch
 
-    from saklas.core.manifold import (
-        MANIFOLD_FIT_POLICY_VERSION, save_manifold,
-    )
-    from saklas.core.vectors import fold_directions_to_subspace
+    from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
+    from saklas.io.manifold_tensors import save_manifold
+    from saklas.core.capture import fold_directions_to_subspace
     from saklas.io.manifolds import ManifoldFolder
     from saklas.io.paths import tensor_filename
     from tests._whitener import isotropic_whitener
@@ -526,7 +525,7 @@ def test_local_as_install_rewrites_identity_and_resolves_destination(
     home = tmp_path / "home"
     monkeypatch.setenv("SAKLAS_HOME", str(home))
     from saklas.io import hf_manifolds as hfm
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.io.manifolds import ManifoldFolder
     from saklas.io.paths import manifold_dir, tensor_filename
     from saklas.io.selectors import invalidate, parse, resolve
@@ -554,7 +553,7 @@ def test_hf_as_install_rewrites_identity_and_resolves_destination(
     home = tmp_path / "home"
     monkeypatch.setenv("SAKLAS_HOME", str(home))
     from saklas.io import hf_manifolds as hfm
-    from saklas.core.manifold import load_manifold
+    from saklas.io.manifold_tensors import load_manifold
     from saklas.io.manifolds import ManifoldFolder
     from saklas.io.paths import manifold_dir, tensor_filename
     from saklas.io.selectors import invalidate, parse, resolve

@@ -37,12 +37,6 @@ class ProbeRequest(NativeRequest):
     top_n: int | None = None
 
 
-class LiveProbesRequest(NativeRequest):
-    """Body for ``POST /saklas/v1/sessions/{id}/probes/live``."""
-
-    enabled: bool
-
-
 def _probe_info(name: str, probe: AttachedManifoldProbe) -> dict[str, Any]:
     """Serialize one attached probe (any rank) to JSON for the wire."""
     manifold = probe.manifold
@@ -150,25 +144,6 @@ def register_probe_routes(app: FastAPI) -> None:
             for name, spec in _sae_probe_specs(session).items()
         )
         return {"probes": rows}
-
-    @app.post("/saklas/v1/sessions/{session_id}/probes/live")
-    async def live_probes_toggle(session_id: str, body: LiveProbesRequest):
-        """Toggle live per-token monitor scoring (the CAA live toggle).
-
-        When off, generations run aggregate-only capture: probes still
-        report the end-of-gen aggregate, but no per-token stream / loom
-        token rows / trait events are produced.  Probe gates are
-        unaffected — a gate forces the per-token subset it needs.  Waits
-        on the session lock so it never races an in-flight stream.
-        """
-        from saklas.server.app import acquire_session_lock
-
-        resolve_session_id(session_id)
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            enabled = bool(session.set_live_probe_scores(body.enabled))
-        return {"enabled": enabled}
 
     @app.get("/saklas/v1/sessions/{session_id}/probes/defaults")
     def list_default_probes(session_id: str):

@@ -1,5 +1,4 @@
-// Command-palette state — a tiny slice so both the App shell (⌘K) and
-// the workspace rail's search button can drive the one palette.
+// Command-palette state shared by the app shell and launcher hint.
 
 export const paletteState: { open: boolean } = $state({ open: false });
 

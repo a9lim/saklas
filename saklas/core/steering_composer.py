@@ -22,7 +22,6 @@ narrow context/generation forwarders where the session boundary is meaningful.
 """
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -35,13 +34,14 @@ from saklas.core.session import (
     ManifoldNotRegisteredError,
     SteeringStackEntry,
     Trigger,
-    VectorNotRegisteredError,
+    ProfileNotRegisteredError,
     _PROFILE_ABSENT,
     _affine_manifold_push,
 )
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 
 if TYPE_CHECKING:
+    from saklas.core.instruments.types import GateRef
     from saklas.core.session import SaklasSession
     from saklas.core.steering import Steering
 
@@ -73,7 +73,7 @@ class SteeringComposer:
 
         Ensures the ``base`` and ``onto`` profiles are loaded (invoking
         the autoload path when needed), runs
-        :func:`saklas.core.vectors.project_profile` to build the derived
+        :func:`saklas.core.capture.project_profile` to build the derived
         tensor dict, and registers it under the synthetic key
         ``"<base><op><onto>"``.  The synthetic key matches what the parser
         used for the ``Steering.alphas`` key, so downstream pole
@@ -99,7 +99,7 @@ class SteeringComposer:
         shared across all active scopes.
         """
         from saklas.core.steering_expr import ProjectedTerm
-        from saklas.core.vectors import project_profile
+        from saklas.core.capture import project_profile
 
         profiles = self._session._profiles
 
@@ -152,7 +152,7 @@ class SteeringComposer:
         manifolds = self._session._manifolds
         if key in manifolds:
             return
-        from saklas.core.manifold import load_manifold
+        from saklas.io.manifold_tensors import load_manifold
         from saklas.io.paths import manifold_dir, manifolds_dir, tensor_filename
 
         model_id = self._session.model_id
@@ -404,10 +404,10 @@ class SteeringComposer:
            derivations) — returned verbatim;
         2. a fitted 2-node ``pca`` manifold on disk — loaded via
            :meth:`ensure_manifold_loaded`
-           and folded by :func:`~saklas.core.vectors.folded_vector_directions`,
+           and folded by :func:`~saklas.core.capture.folded_directions`,
            then memoized in ``_profiles``;
 
-        Raises :class:`VectorNotRegisteredError` when nothing resolves.
+        Raises :class:`ProfileNotRegisteredError` when nothing resolves.
         """
         profiles = self._session._profiles
         existing = profiles.get(name)
@@ -444,8 +444,8 @@ class SteeringComposer:
             profiles[name] = folded
             return folded
 
-        raise VectorNotRegisteredError(
-            f"No vector registered for {role} '{name}'"
+        raise ProfileNotRegisteredError(
+            f"No profile registered for {role} '{name}'"
         )
 
     def try_fold_manifold(
@@ -462,11 +462,11 @@ class SteeringComposer:
             self.ensure_manifold_loaded(name)
         except Exception:
             return None
-        from saklas.core.vectors import folded_vector_directions
+        from saklas.core.capture import folded_directions
         try:
-            return folded_vector_directions(self._session._manifolds[name])
+            return folded_directions(self._session._manifolds[name])
         except Exception as e:
-            raise VectorNotRegisteredError(
+            raise ProfileNotRegisteredError(
                 f"'{name}' is a manifold that does not fold to a single "
                 f"steering direction (not a 2-node affine subspace): {e}"
             ) from e
@@ -480,7 +480,7 @@ class SteeringComposer:
         """Push an entries dict onto the steering stack and rebuild hooks.
 
         If ``rebuild_hooks`` raises (e.g. an unknown vector
-        name hits ``VectorNotRegisteredError``) the just-pushed entry is
+        name hits ``ProfileNotRegisteredError``) the just-pushed entry is
         rolled back before the exception propagates, so the stack is
         never left with stale half-committed state.
 
@@ -489,7 +489,7 @@ class SteeringComposer:
         whole forward+sample loop, so concurrent ``session.steering()
         .__enter__()`` from a different thread waits until the active
         generation finishes rather than mutating hook tensors mid-step.
-        Single-threaded users (TUI, CLI) pay an uncontended acquire;
+        Single-threaded users pay an uncontended acquire;
         the server's per-session asyncio lock serializes requests
         upstream so the contention path is exercised mostly by
         ad-hoc multi-threaded callers.
@@ -630,22 +630,18 @@ class SteeringComposer:
                 return True
         return False
 
-    def gated_probe_names(self) -> set[str]:
-        """Registered probe names referenced by active probe gates.
-
-        Walks the flattened steering stack, pulls each trigger's
-        :class:`~saklas.core.triggers.ProbeGate`, and maps the gate's scalar
-        ``probe`` key back to the registered monitor probe NAME — the prefix
-        before the first of ``[`` / ``:`` / ``@`` / ``~`` (e.g.
-        ``"personas[3]"`` → ``"personas"``, ``"emotions:fraction"`` →
-        ``"emotions"``, ``"confident.uncertain"`` → itself).  Only names that
-        are actually attached probes are kept, so a stale / non-probe gate key
-        doesn't shrink an otherwise-empty subset to "score nothing".  Used by
-        :meth:`_begin_capture` to scope the per-token step sink to just the
-        gated probes when gating is the sole per-token consumer (FIX #4).
+    def _gated_refs(self) -> "list[tuple[str, GateRef]]":
+        """Every active probe-gate reference, parsed once into its
+        structured form (:func:`parse_gate_ref` — the ONE place the
+        scalar-key discrimination lives).  Walks the flattened steering
+        stack exactly like the historical per-family key walks, which this
+        replaces.  Note the structured parse also fixes the old
+        ``re.split("[\\[:@~]")`` truncation of variant-suffixed probe names
+        (``pirate:role-x`` no longer truncates at ``:role-x``).
         """
-        attached = set(self._session._monitor.probe_names)
-        out: set[str] = set()
+        from saklas.core.instruments.types import parse_gate_ref
+
+        refs = []
         for entry in self.flatten_stack().values():
             if isinstance(entry, (AblationTerm, ManifoldTerm)):
                 trig = entry.trigger
@@ -654,73 +650,71 @@ class SteeringComposer:
             gate = trig.gate
             if gate is None:
                 continue
-            # Split off the channel suffix: the probe name is everything up to
-            # the first axis/fraction/label/assignment marker.
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(name)
-        return out
+            refs.append((gate.probe, parse_gate_ref(gate.probe)))
+        return refs
+
+    def gated_probe_names(self) -> set[str]:
+        """Registered monitor probe names referenced by active probe gates.
+
+        Only names that are actually attached probes are kept, so a stale /
+        non-probe gate key doesn't shrink an otherwise-empty subset to
+        "score nothing".  Used by ``_begin_capture`` to scope the per-token
+        step sink to just the gated probes when gating is the sole
+        per-token consumer (FIX #4).
+        """
+        attached = set(self._session._monitor.probe_names)
+        return {
+            ref.probe for _key, ref in self._gated_refs()
+            if ref.probe in attached
+        }
 
     def gated_probe_keys(self) -> set[str]:
         """Exact monitor scalar keys referenced by active probe gates."""
         attached = set(self._session._monitor.probe_names)
-        out: set[str] = set()
-        for entry in self.flatten_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            gate = trig.gate
-            if gate is None:
-                continue
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(gate.probe)
-        return out
+        return {
+            key for key, ref in self._gated_refs()
+            if ref.probe in attached
+        }
 
     def gated_lens_probe_keys(self) -> set[str]:
         """Exact gate scalar keys referencing attached J-lens token probes.
 
-        The lens siblings of :meth:`gated_probe_keys`: lens probes live in the
-        session lens-probe registry (readout channel), not the Monitor, and
-        their gate scalars come from ``session._score_lens_gate_scalars`` in
-        the gating score callback.  Only keys whose base name is an attached
-        lens probe count, mirroring the monitor filter.
+        The lens sibling of :meth:`gated_probe_keys`: lens probes live in
+        the session lens instrument (readout channel), not the Monitor.
+        A key whose base name is an attached lens probe is also
+        **channel-validated** here — the lens family produces only the
+        strength axis, so ``@when:jlens/word:membership`` raises
+        ``UnsupportedProbeChannelError`` at generation preflight instead of
+        sitting silently inactive.
         """
         attached = set(self._session._lens_probes)
         if not attached:
             return set()
+        # Historical name for the attachment check (duck-typed stubs supply
+        # a plain dict); the instrument, when present, channel-validates.
+        instrument = getattr(self._session, "_lens_instrument", None)
         out: set[str] = set()
-        for entry in self.flatten_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            gate = trig.gate
-            if gate is None:
-                continue
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(gate.probe)
+        for key, ref in self._gated_refs():
+            if ref.probe in attached:
+                if instrument is not None:
+                    instrument.validate_gate(ref)
+                out.add(key)
         return out
 
     def gated_sae_probe_keys(self) -> set[str]:
-        """Exact gate scalar keys referencing attached SAE feature probes."""
+        """Exact gate scalar keys referencing attached SAE feature probes,
+        channel-validated like the lens sibling (the SAE family produces
+        only the strength axis)."""
         attached = set(self._session._sae_probes)
         if not attached:
             return set()
+        instrument = getattr(self._session, "_sae_instrument", None)
         out: set[str] = set()
-        for entry in self.flatten_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:
-                _alpha, trig = entry
-            gate = trig.gate
-            if gate is None:
-                continue
-            name = re.split(r"[\[:@~]", gate.probe, maxsplit=1)[0]
-            if name in attached:
-                out.add(gate.probe)
+        for key, ref in self._gated_refs():
+            if ref.probe in attached:
+                if instrument is not None:
+                    instrument.validate_gate(ref)
+                out.add(key)
         return out
 
     def steering_active_in_prefill(self) -> bool:
@@ -809,6 +803,11 @@ class SteeringComposer:
         session = self._session
         capture = session._capture
         monitor = session._monitor
+        # The bound geometry run (the callback is built after the capture
+        # transaction's bind) — the full-roster reads below consult its
+        # step-keyed observe memo, sharing the FULL-incremental sink's
+        # per-forward scoring pass.
+        geometry_run = session._geometry_instrument.current_run
         # J-lens token probes referenced by active gates score on the lens
         # path (readout-channel strength), not through the Monitor —
         # detected once per generation here, merged into every return below.
@@ -849,7 +848,7 @@ class SteeringComposer:
                 if plan else {}
             )
 
-        def _monitor_scalars() -> dict[str, float]:
+        def _monitor_scalars(step_id: int) -> dict[str, float]:
             incremental_readings = session._incremental_readings
             incremental_gate_scores = session._incremental_gate_scores
             # The step sink already scored this token's readings — reuse them so
@@ -868,7 +867,16 @@ class SteeringComposer:
             if gating_subset and incremental_gate_scores:
                 return incremental_gate_scores[-1]
             if state.incremental and incremental_readings:
-                scalars = monitor.flat_scalars(incremental_readings[-1])
+                # FULL-incremental: the sink primed the run's observe memo
+                # for this forward — a hit returns the sink's exact row.
+                # A miss falls back to the sink's appended row (rows align
+                # 1:1 with forwards, so ``[-1]`` IS this forward's — the
+                # miss cases are an empty-capture row, which never primes,
+                # and a narrow test stub's idle run).
+                scalars = monitor.flat_scalars(
+                    geometry_run.observe(step_id, {})
+                    or incremental_readings[-1]
+                )
                 if gate_keys:
                     missing = gate_keys - set(scalars)
                     if missing:
@@ -897,21 +905,34 @@ class SteeringComposer:
             # (``name`` aliases axis 0, ``name[i]`` per axis, ``name:fraction``,
             # ``name@label`` for curved nearest).  Scope to the gated subset
             # when the per-token path is gating-only (avoids the full roster).
-            agg = monitor.score_single_token(
-                latest, only=gating_subset if gating_subset else None,
-            )
+            # The full-roster read goes through the geometry run's step-keyed
+            # ``observe`` — same scope as the token tap's read of this
+            # forward, so whichever runs first primes the memo and the other
+            # hits it (subset reads stay on the planned direct path above:
+            # widening them to the full roster would regress large-K).
+            if gating_subset:
+                agg = monitor.score_single_token(latest, only=gating_subset)
+            else:
+                agg = session._geometry_instrument.current_run.observe(
+                    step_id, latest,
+                )
             return monitor.flat_scalars(agg)
 
-        def _score() -> dict[str, float]:
-            out = _monitor_scalars()
+        def _score(step_id: int) -> dict[str, float]:
+            out = _monitor_scalars(step_id)
             if has_lens_gates:
                 # Once per forward: band lens logits → strength
-                # scalars (also stashed for the display step to reuse).
-                lens_scalars = session._score_lens_gate_scalars(lens_gate_keys)
+                # scalars (also stashed step-keyed for the display step to
+                # reuse — step identity replaced the freshness handshake).
+                lens_scalars = session._score_lens_gate_scalars(
+                    lens_gate_keys, step_id=step_id,
+                )
                 if lens_scalars:
                     out = {**out, **lens_scalars}
             if has_sae_gates:
-                sae_scalars = session._score_sae_gate_scalars(sae_gate_keys)
+                sae_scalars = session._score_sae_gate_scalars(
+                    sae_gate_keys, step_id=step_id,
+                )
                 if sae_scalars:
                     out = {**out, **sae_scalars}
             return out
@@ -972,7 +993,7 @@ class SteeringComposer:
         def _bucket(trigger: Trigger) -> dict[str, list[Any]]:
             return grouped.setdefault(trigger, {"push": [], "ablate": []})
 
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
 
         for name, entry in entries.items():
             if isinstance(entry, AblationTerm):
@@ -1046,7 +1067,7 @@ class SteeringComposer:
     def install_composed_steering(self) -> None:
         """Attach the currently-composed steering entries to model layers.
 
-        Compiled fast path (MPS): a static-affine pure-push steering lowers to
+        Compiled accelerator fast path: a static-affine pure-push steering lowers to
         the persistent branchless offset buffers (traced into the compiled
         graph) instead of transient ctx-consulting hooks — the latter would
         force a per-gen ``torch.compile`` recompile and graph-break at every
@@ -1063,7 +1084,7 @@ class SteeringComposer:
         session._steering_uses_compiled_offsets = False
         if (
             session._compiled
-            and session._device.type == "mps"
+            and session._device.type in {"cuda", "mps"}
             and steering.has_compiled_offsets()
             and (
                 not session._monitor.probe_names

@@ -410,7 +410,7 @@
     padding: var(--space-1) 0;
     list-style: none;
     background: var(--surface-hi);
-    border: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
     border-radius: var(--radius);
     box-shadow: var(--shadow-overlay);
     box-sizing: border-box;
@@ -421,7 +421,7 @@
   .sk-select-opt {
     display: flex;
     align-items: center;
-    min-height: 24px;
+    min-height: var(--control-target);
     padding: var(--space-2) var(--space-3);
     color: var(--fg-strong);
     cursor: pointer;
@@ -440,7 +440,7 @@
     color: var(--fg);
   }
   .sk-select-opt.is-active.is-highlight {
-    background: var(--accent-glow);
+    background: var(--accent-strong);
   }
   .sk-select-opt.is-disabled {
     color: var(--fg-muted);

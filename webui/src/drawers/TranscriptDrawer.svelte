@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Transcript export / import drawer — phase 5.  Two tabs:
   //
   //   * export — render the path ending at the chosen node as
@@ -194,8 +195,7 @@
         onclick={() => (tab = "import")}
       >import</button>
     </div>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button>
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -367,29 +367,6 @@
     border-color: var(--accent);
     background: var(--accent-subtle);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -463,7 +440,7 @@
     margin: 0;
   }
   .banner {
-    background: rgba(210, 153, 34, 0.12);
+    background: color-mix(in srgb, var(--accent-amber) 14%, transparent);
     border: 1px solid transparent;
     padding: var(--space-4) var(--space-4);
     color: var(--accent-yellow);

@@ -85,8 +85,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
+    width: var(--control-target);
+    height: var(--control-target);
     padding: 0;
     background: transparent;
     border: 0;
@@ -103,13 +103,13 @@
     height: 14px;
     box-sizing: border-box;
     background: var(--bg-elev);
-    border: 1px solid var(--border);
+    border: 1px solid var(--glass-line);
     border-radius: 50%;
     transition: background var(--dur-fast) var(--ease-out),
       border-color var(--dur-fast) var(--ease-out);
   }
   .sk-radio:hover:not(.is-disabled) .sk-radio-box {
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
   }
   .sk-radio:focus-visible {
     outline: 2px solid var(--focus-ring);

@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 
 class _FakeModel:
-    def __init__(self) -> None:
+    def __init__(self, device: str = "mps") -> None:
         self.config = SimpleNamespace(hidden_size=4)
         self._param = SimpleNamespace(
-            device=torch.device("mps"),
+            device=torch.device(device),
             dtype=torch.float32,
         )
 
@@ -28,10 +30,12 @@ class _FakeCompiled(_FakeModel):
         self._param = base._param
 
 
+@pytest.mark.parametrize("device", ["mps", "cuda"])
 def test_compiled_explicit_no_probes_skips_persistent_capture_hooks(
+    device: str,
     monkeypatch: Any, tmp_path: Any,
 ) -> None:
-    """``probes=[]`` should take the no-capture compiled mode."""
+    """``probes=[]`` should take the no-capture compiled accelerator mode."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
     from saklas.core import cuda_graphs
@@ -41,7 +45,7 @@ def test_compiled_explicit_no_probes_skips_persistent_capture_hooks(
     from saklas.core.steering_composer import SteeringComposer
 
     calls: dict[str, int] = {"offset": 0, "capture": 0}
-    base_model = _FakeModel()
+    base_model = _FakeModel(device)
     fake_tokenizer = SimpleNamespace()
     fake_layers = [object(), object()]
 
@@ -64,7 +68,7 @@ def test_compiled_explicit_no_probes_skips_persistent_capture_hooks(
         "get_model_info",
         lambda _model, _tok: {
             "model_id": "fake/model",
-            "device": "mps",
+            "device": device,
             "dtype": "float32",
         },
     )
@@ -89,9 +93,27 @@ def test_compiled_explicit_no_probes_skips_persistent_capture_hooks(
     )
 
     session = SaklasSession.from_pretrained(
-        "fake/model", device="mps", compile=True, probes=[],
+        "fake/model", device=device, compile=True, probes=[],
     )
 
     assert isinstance(session._steering_composer, SteeringComposer)
     assert calls == {"offset": 1, "capture": 0}
     assert session._capture_buffers == {}
+
+
+def test_cuda_graph_compile_owner_is_thread_local() -> None:
+    from saklas.core.session import SaklasSession
+
+    session = SaklasSession.__new__(SaklasSession)
+    session._cuda_graphs_active = True
+    session._compile_owner_thread = threading.get_ident()
+    assert session._compiled_graph_thread_safe() is True
+
+    observed: list[bool] = []
+    worker = threading.Thread(
+        target=lambda: observed.append(session._compiled_graph_thread_safe())
+    )
+    worker.start()
+    worker.join()
+
+    assert observed == [False]

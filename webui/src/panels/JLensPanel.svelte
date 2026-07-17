@@ -34,7 +34,7 @@
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
   import JLensSteerCard from "./rack/JLensSteerCard.svelte";
   import JLensTokenCard from "./rack/JLensTokenCard.svelte";
-  import { ApiError, apiLens } from "../lib/api";
+  import { ApiError, apiInstruments } from "../lib/api";
   import {
     addJLensToRack,
     activeProbeNames,
@@ -166,7 +166,7 @@
     if (!word || steerBusy) return;
     steerBusy = true;
     try {
-      const validated = await apiLens.validateToken(word);
+      const validated = await apiInstruments.validateLensToken(word);
       addJLensToRack(validated.word);
       if (steerInput === submitted) steerInput = "";
     } catch (e) {
@@ -324,7 +324,7 @@
     if (probeRack.active.includes(selector)) return true;
     probeBusy = true;
     try {
-      const validated = await apiLens.validateToken(bare);
+      const validated = await apiInstruments.validateLensToken(bare);
       const validatedSelector = `jlens/${validated.word}`;
       const live = lensState.aggregate?.find(
         ([token]) => token.trim() === validated.word,
@@ -395,7 +395,7 @@
     sources={lensSourceState.sources}
     bind:value={selectedSource}
     busy={sourceBusy}
-    accent="var(--accent-blue)"
+    accent="var(--pillar-lens)"
     sourceError={lensSourceState.error}
     working={lensFetchState.running || lensFitState.running}
     onuse={(source) => void useLensSource(source)}
@@ -465,7 +465,7 @@
               max={Math.max(lensFitState.promptsTotal, 1)}
               width={160}
               height={8}
-              color="var(--accent-blue)"
+              color="var(--pillar-lens)"
             />
           </div>
           <p class="hint">
@@ -732,7 +732,7 @@
   }
   .fit-bar :global(.bar) {
     width: 100%;
-    height: 8px;
+    height: var(--data-bar-height);
     display: block;
   }
 
@@ -764,12 +764,12 @@
   .add-input:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
-    border-color: var(--accent-glow);
+    border-color: var(--accent-strong);
   }
   .add-btn {
-    min-height: 24px;
-    background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
-    color: var(--accent-blue);
+    min-height: var(--control-target);
+    background: color-mix(in srgb, var(--pillar-lens) 10%, transparent);
+    color: var(--pillar-lens);
     border: 1px solid transparent;
     border-radius: var(--radius);
     font-size: var(--text-sm);
@@ -778,7 +778,7 @@
     flex: 0 0 auto;
   }
   .add-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
+    background: color-mix(in srgb, var(--pillar-lens) 18%, transparent);
   }
   .add-btn:disabled {
     opacity: 0.5;

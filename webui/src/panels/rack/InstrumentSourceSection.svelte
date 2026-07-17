@@ -234,7 +234,7 @@
     align-items: flex-end;
   }
   .setup-action :global(button) {
-    height: 26px;
+    height: var(--control-compact);
   }
   .setup-controls :global(input),
   .setup-controls :global(.source-field) {
@@ -267,7 +267,7 @@
   }
   .setup-controls :global(.setup-field input) {
     box-sizing: border-box;
-    min-height: 26px;
+    min-height: var(--control-compact);
     width: 100%;
   }
   .source-error {

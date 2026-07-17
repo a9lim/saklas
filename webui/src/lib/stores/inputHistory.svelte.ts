@@ -13,8 +13,7 @@ export interface InputHistoryState {
   /** Draft text captured when recall begins. */
   stash: string;
   /** Slot index into ``pendingActions.queue`` while a pending item
-   * is pulled into the input for edit.  ``null`` = no pull in flight.
-   * The TUI uses the same pattern in ``SaklasApp._pulled_slot``. */
+   * is pulled into the input for edit. ``null`` = no pull in flight. */
   pulledSlot: number | null;
 }
 
@@ -153,8 +152,7 @@ function currentCursorPos(editablePending: typeof pendingActions.queue): number 
  *  * pulled slot > 0 → decrement so the user keeps tracking the same
  *    item.  Returns ``null`` (no input change).
  *  * not pulled → no-op, returns ``null``.
- *
- *  Mirrors the TUI's ``_drain_next_pending``'s pulled-slot fixup. */
+ */
 export function onPendingQueueShift(): string | null {
   const slot = inputHistory.pulledSlot;
   if (slot === null) return null;

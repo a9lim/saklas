@@ -1,12 +1,11 @@
 """CLI entry point for saklas.
 
-Nine top-level verbs.  ``manifold`` is the steering-vector / manifold *compute*
+Eight top-level verbs. ``manifold`` is the steering-vector / manifold *compute*
 surface (a steering vector is the K=2 case of a flat manifold); ``pack`` is the
 manifold *lifecycle* surface (install / share / inspect / remove); ``template``
 owns the standalone templated-completion artifact; ``lens`` owns the per-model
 Jacobian-lens artifact (residual→output transport + vocabulary readout):
 
-    saklas tui <model> [...]
     saklas serve <model> [...]
     saklas manifold {extract,generate,from-template,fit,bake,merge,transfer,compare,why} ...
     saklas pack {ls,show,install,search,push,rm,clear,refresh,export} ...
@@ -16,7 +15,7 @@ Jacobian-lens artifact (residual→output transport + vocabulary readout):
     saklas lens {fit,fetch,ls,show,use,top,decompose,rm} ...
     saklas sae {train,fetch,ls,show,use,rm} ...
 
-There is no bare-TUI mode. ``saklas`` with no arguments prints help.
+``saklas`` with no arguments prints help.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not argv:
         parser.print_help()
         print()
-        print("try 'saklas tui <model_id>' or 'saklas --help'")
+        print("try 'saklas serve <model_id>' or 'saklas --help'")
         sys.exit(0)
     return parser.parse_args(argv)
 

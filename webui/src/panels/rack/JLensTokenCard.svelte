@@ -88,7 +88,7 @@
   );
 </script>
 
-<RackCard accent="--accent-blue" disabled={false}>
+<RackCard accent="--pillar-lens" disabled={false}>
   {#snippet statline()}
     <ProbePinButton
       shape="square"

@@ -7,8 +7,8 @@ so callers (and the HTTP server) can catch the whole family with a single
 ``except ValueError`` sites catch the relevant subclasses too.
 
 Every subclass returns an HTTP-style status code through
-:meth:`SaklasError.user_message`, which the three user-facing surfaces
-(server, CLI, TUI) consume to translate exceptions consistently.  The
+:meth:`SaklasError.user_message`, which the server and CLI consume to translate
+exceptions consistently. The
 default ``(500, str(self))`` matches today's behaviour for any subclass
 that doesn't override; subclasses lift the status (and optionally rewrite
 the message) by overriding the method.
@@ -22,8 +22,7 @@ class SaklasError(Exception):
     status code (``400`` bad input, ``404`` not found, ``409`` conflict,
     ``422`` semantic-but-syntactically-valid, ``500`` server error,
     ``502`` upstream).  The CLI maps the status to an exit code via
-    ``min(2, code // 100)``; the TUI ignores the status and only uses
-    the message; the HTTP server passes it through.
+    ``min(2, code // 100)``; the HTTP server passes it through.
     """
 
     def user_message(self) -> tuple[int, str]:
@@ -77,6 +76,18 @@ class SaeNotLoadedError(RuntimeError, SaklasError):
 
 class SaeFeatureError(ValueError, SaklasError):
     """Raised when an SAE feature id is malformed or outside the resident width."""
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
+
+class UnsupportedProbeChannelError(ValueError, SaklasError):
+    """Raised at steering-composition preflight when a probe gate references
+    a channel its instrument family can never produce (e.g.
+    ``@when:sae/123:membership`` — SAE readings carry only the activation
+    axis).  Distinct from a *supported* channel that is temporarily absent
+    this step (prefill, capture unavailable), which stays quietly inactive.
+    """
 
     def user_message(self) -> tuple[int, str]:
         return (400, str(self) or self.__class__.__name__)
@@ -139,14 +150,13 @@ class ManifoldArityError(SteeringExprError):
 
 
 class OverlappingManifoldError(SteeringExprError):
-    """Raised when two manifold terms target the same layer.
+    """Raised when curved manifold terms overlap at a shared layer.
 
-    Only one manifold may steer a given layer — composing two manifolds at
-    the same layer is the deferred frontier (see
-    ``docs/plans/manifold-composition.md``).  Subclasses
-    ``SteeringExprError`` so existing ``except SteeringExprError`` sites
-    still catch it; the dedicated type lets callers discriminate the
-    overlap failure from a generic parse error.
+    Multiple curved terms may share a layer when their fitted spans are
+    near-orthogonal; the affine merged subspace is orthogonalized against
+    those spans.  This error identifies the unsupported case where two curved
+    spans exceed the overlap tolerance.  It subclasses ``SteeringExprError``
+    so existing expression-error handlers still catch it.
     """
 
 

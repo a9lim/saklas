@@ -31,7 +31,7 @@
 
 <style>
   .highlight-action {
-    min-height: 24px;
+    min-height: var(--control-target);
     padding: var(--space-1) var(--space-3);
     color: var(--fg-muted);
     background: var(--glass);

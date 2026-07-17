@@ -20,7 +20,15 @@ HF causal LM loading. `_LAYER_ACCESSORS` maps `model_type` → layer-list access
 eager), dtype, device. `_compile_with_probe` wraps `torch.compile` with a 2-token
 prefill+decode warmup so inductor/Triton failures surface at load as a caught
 warning + eager fallback (`use_static_cuda_launcher` forced off — Gemma-4 + torch
-2.12 kernel-arg-mismatch bug). `_load_text_from_multimodal` extracts text-only
+2.12 kernel-arg-mismatch bug). StaticCache is early-initialized before a
+compiled prefill so Transformers marks its K/V addresses outside Dynamo;
+leaving its lazy init inside the graph disables CUDA graphs and recompiles once
+per fresh cache. Ordinary generations reuse one reset-in-place StaticCache per
+session so its K/V identities stay graph-stable. Persistent offset and capture
+hooks are shared by CUDA and MPS compiled sessions; dynamic/curved/gated hook
+topologies route to the eager original. CUDA graph trees are thread-local, so a
+stream worker routes to eager while same-thread generation may replay the graph.
+`_load_text_from_multimodal` extracts text-only
 sub-models (Ministral-as-Mistral3), strips `language_model.` prefixes,
 dequantizes FP8. `patch_torch_for_mps()` installs two lazy MPS-only workarounds
 (`torch.histc` integer→float for MoE routing; `torch.ldexp` MXFP4 round-trip
@@ -157,7 +165,7 @@ re-solve as a tiny projected-gradient NNLS per step — returning
 `JSpaceDecomposition(layer, share, tokens)`. Errors: `JacobianLensError` (422),
 `LensNotFittedError` (404), `MultiTokenWordError` (400), all `SaklasError`s.
 
-## vectors.py
+## capture.py
 
 Low-level capture, pooling, DLS, the vector⇄subspace fold, and profile I/O. **No
 `extract_difference_of_means`** — extraction authors a 2-node `pca` manifold now
@@ -221,7 +229,7 @@ per-layer direction (a `merge` linear-combination, a `~`/`|` projection, or a
 folded bundled concept) into a neutral-anchored affine `R=1` `Manifold` — a
 one-pole ray (the live 2-node-vector read goes through extraction's whitened
 `fit_affine_subspace`; the legacy bipolar-centroid fold was retired in the
-Mahalanobis-only collapse). `folded_vector_directions(manifold)` is the **reverse view**:
+Mahalanobis-only collapse). `folded_directions(manifold)` is the **reverse view**:
 `{L: δ̂_L · share_L}`, the baked-direction view of a 2-node affine manifold, used
 to back the `Profile`-returning surface (`extract()`, `manifold compare`/`why`,
 GGUF export) without a second stored representation. It raises on a curved or
@@ -450,6 +458,13 @@ into the unified `Monitor` via `set_whitener`.
 
 Pure-tensor (fp32, no session/IO) subspace + manifold math. Goodfire "Manifold
 Steering" (arXiv 2605.05115), generalized to arbitrary intrinsic dim/topology.
+The on-disk **tensor codec** (`save_manifold`/`load_manifold`) and the disk-backed
+`ActivationRowStore` row spool live in the io layer now
+(`io/manifold_tensors.py`) — that persistence lived here only because the codec
+needs these dataclasses, and io importing core's types is the correct layering
+arrow. Fit-capture math (`compute_manifold_node_stats` etc.) still produces the
+spool, so it lazy-imports `ActivationRowStore` from io (the established core→io
+reference pattern).
 
 Domains: `ManifoldDomain` ABC + `BoxDomain` (open/periodic axes), `SphereDomain`
 (Sⁿ chordal), `CustomDomain` (explicit immersion; also the identity carrier for
@@ -521,7 +536,8 @@ for MPS). Hook-time gain compensation keeps `along·κ` equal to the user α.
 `norm_cap = 3·‖h‖` is the only norm guard. `invert_parameterization` is the cold/eval-only damped-LM nearest-
 point projection.
 
-`save_manifold`/`load_manifold` round-trip the per-model tensor (`layer_<L>.{mean,
+`save_manifold`/`load_manifold` (the codec — **moved to `io/manifold_tensors.py`**)
+round-trip the per-model tensor (`layer_<L>.{mean,
 basis[,affine_map][,node_params,rbf_weights,poly_coeffs,coord_offset,coord_scale]}` + shared
 `node_coords` + optional `origin`) + sidecar (`mahalanobis_share_per_layer`,
 `origin_per_layer`, `share_metric`, `subspace_metric` — no
@@ -595,7 +611,7 @@ systematically undershoots (one dominant Fiedler mode picks k=1), and without th
 floor a curved manifold linearly embedded in a `k_flat`-plane reads flat (the flat
 affine fit reconstructs the in-plane curve, the under-dimensioned curved fit
 can't, losing reconstruction it would win at matched dim — the flat-bias the
-`scripts/experiments/concept_geometry/geometry_stress.py` harness surfaced);
+the topology regression suite surfaced);
 **(b) periodic axes** — Vietoris–Rips H1
 *persistent homology* (`_rips_h1_persistence` boundary-matrix reduction →
 `_count_persistent_loops`, essential loops at `eps_max=2ε_c`) counts the loops
@@ -625,7 +641,7 @@ fan). Both regimes also require **graded** growth (`d(sep=2)/d(sep=1) ≥ 1.08`)
 1-D-ness at the looser clustered bound (degree ≤ 4 — a tight clump reaches 4),
 returning a uniform `2π·rank/K` `S¹` coordinate in the recovered cyclic *order*
 (exact spacing dropped — topology, not metric, is what the periodic domain needs).
-Gated `7 ≤ K ≤ 128`. Validated (`geometry_stress.py periodic`) for specificity
+Gated `7 ≤ K ≤ 128`. Validated by the periodic-topology regression tests for specificity
 (~0% false-positive on random Gaussian heaps K≥9, and on grids/fans/arcs/blobs/
 lines) and clustered-ring sensitivity (100% recall for tight-to-moderate clumps);
 the bimodality guard trades two documented false-negatives — a very-loose cluster
@@ -640,7 +656,7 @@ pure-tensor contract (naturalness drives a live model forward pass, which has no
 place in a geometry module): `to_hellinger`, `bhattacharyya_distance`,
 `fit_behavior_manifold`, `trajectory_naturalness`,
 `compute_node_behavior_centroid`, `compute_trajectory_distributions`,
-`_next_token_distribution`. Import sites in `cli/runners.py` and
+`_next_token_distribution`. Import sites in `cli/runners/experiment.py` and
 `tests/test_naturalness.py` point here. `compute_node_centroid` remains in
 `manifold.py` (shared primitive — activation centroid, no model).
 
@@ -827,9 +843,7 @@ to the live read at that token. `add_probe(name, manifold, *, top_n)` /
 `_build_whitened_factors` (per-layer `_LayerWhiten` build), `_attach_manifold_probe`
 (node cache + per-layer Mahalanobis-share read weights), and `_layer_geometry`. `__init__`'s `layer_means` is
 vestigial on the hot path — the readout centers on each fit's own
-`LayerSubspace.mean`. `probe_layers` is the capture-widening union
-(`attached_layers` is a back-compat alias for the surfaces that consumed the former
-`ManifoldMonitor`).
+`LayerSubspace.mean`. `probe_layers` is the capture-widening union.
 
 `flat_scalars` (one staticmethod) writes the gate channels from a readings dict:
 `"<name>"` (= coords axis 0) + `"<name>[i]"` per axis, `"<name>:fraction"`,
@@ -872,7 +886,7 @@ transfer in both `_score_probe_full` and the batched `_score_flat_batched`).
 stream)`), `score_single_token{,_per_layer}` (`_per_layer` is a view over the
 reading's `coords_per_layer` backing the loom heatmap), `measure_from_hidden`,
 `score_stack`, live-mean `begin/update/end_live`. History/stats are
-per-coordinate-axis (`axis_stats`); the TUI-facing scalar helpers report axis 0.
+per-coordinate-axis (`axis_stats`); the scalar compatibility helpers report axis 0.
 The bundled roster is the fitted 2-node `Manifold`s themselves
 (`_bootstrap_manifold_probes` — no fold). The one-shot re-render text scorer
 (`measure`) is gone — every read source is live hooks scoring captured hidden
@@ -888,6 +902,284 @@ affine-coord helpers, and `_woodbury_apply`. The hot path in `monitor.py` import
 `_layer_geometry`, `AttachedManifoldProbe`, `_build_whitened_factors`, and
 `_attach_manifold_probe` back from this module (no circular dependency —
 `monitor_attach` imports only `mahalanobis` and `manifold`).
+
+## instruments/
+
+The read-side instrument protocol—the read-side analogue of
+`SteeringComposer`. One contract over the three read
+families: geometry (Monitor subspace probes), the Jacobian-lens readout
+channel, SAE feature reads. `types.py` is the shared vocabulary:
+**`GateRef`** (structured probe-gate reference; `parse_gate_ref` is the ONE
+place the scalar-key discrimination lives — it inverts the key family
+`Monitor.flat_scalars` emits; the hot-path runtime lookup stays the verbatim
+string) + `validate_gate_channels` (composition-preflight rejection of
+channels a family can never produce — `@when:sae/123:membership` raises
+`UnsupportedProbeChannelError` (400) instead of sitting silently inactive;
+a *supported* channel temporarily absent this step still reads inactive);
+**`ScalarReading`** (the honest one-channel reading for lens/SAE, with an
+explicit `unit` — `mean_token_probability` / `activation_over_max` /
+`raw_activation` — and a `DepthSummary` that carries its mass `basis`,
+because `depth_com` means three mathematically unrelated things across
+families; `to_probe_reading()` is the compatibility bridge reproducing the
+historical synthesized-`ProbeReading` shape while the versioned measurement
+envelope carries the family-native scalar reading); **`InstrumentPlan`** (declared capture demand,
+not mechanics — the session planner unions plans and picks physical
+retention; the `INCREMENTAL → set_tail_with_sink` upgrade is
+cross-instrument resource sharing and stays session-side);
+**`InstrumentPrep`** / **`LensPrep`** (the generation-boundary source
+snapshot, produced by `prepare` and consumed by `plan` + `bind` — every
+prep carries a per-preparation `token` the derived plan echoes and bind
+compares; the lens prep additionally carries the disk refresh + pin,
+the authoritative spec/live snapshot derived from the prepared
+identity, and the sidecar fingerprint the binding stamps);
+**`InstrumentBinding`** (immutable per-generation source/spec snapshot, so
+un-locked mutations like the SAE metadata backfill can't change what a
+running generation measures); per-family `LiveConfig` dataclasses (user
+intent, discriminated — deliberately NOT unified with runtime residency:
+lens "enabled" is not device residency, SAE residency precedes its toggle).
+`protocol.py` holds the `Instrument` / `InstrumentRun` contracts —
+`InstrumentRun.observe` memoizes by `step_id` while bound (the production
+gate→display reuse is the workers' stash mechanism, run-scoped by
+construction; see the post-review hardening notes below), `observe_many`
+covers batch generation, and authored-prefill orchestration (token matching,
+`j-1` producer semantics, loom persistence) deliberately stays session-side.
+Family implementations land incrementally: lens + SAE instruments extract
+their session.py regions; geometry stays a thin adapter over `Monitor` (the
+four capture modes are session/HiddenCapture state, not Monitor internals).
+
+`lens.py` — **`LensInstrument`**, the extracted J-lens family (the former
+~675-line session region): owns the probe registry (`probes`), the
+live-readout runtime dict (`live` — device-resident `J_stack` + unembed/norm
+modules), the per-forward stash (`step_stash` + `last_step_readings`), the
+per-generation flags (`active_for_generation`) and disk-identity pin
+(`generation_lens`/`generation_lens_active`), and the read surfaces:
+`attach`/`detach`/`specs`/`probe_layers`, `score_probes` (readout-channel
+`ProbeReading` synthesis), `gate_scalars` (once-per-forward band logits +
+stash for display reuse), `score_aggregate` (tail-ring pooled last content
+token), `live_readout_step` (token-tap display; gate-stash row reuse),
+`authored_capture` (per-row computation only — token matching and loom
+persistence stay session-side), `enable_live`/`disable_live`/`live_layers`,
+`probe_hash` (the `jlens-readout-v2` identity digest), and `validate_gate`
+(strength axis only). Shared J-lens *primitives* (`_jlens_logits_rows`,
+depth/decode caches, the transport stack, the `jlens` disk-identity
+property) stay on the session — the instrument reaches them through the
+session back-ref exactly like `SteeringComposer`. The session re-exposes the
+instrument's state under the historical private names
+(`_lens_probes`/`_live_lens`/`_lens_step_stash`/`_last_lens_step_readings`/
+`_live_lens_active_for_generation`/`_generation_jlens{,_active}`) via
+delegating properties, and `_lens_instrument` itself is a lazy property
+(first touch constructs it — ctor only stores the session ref) so narrow
+test stubs that skip `__init__` self-heal.
+
+`sae.py` — **`SaeInstrument`**, the extracted SAE family (the former
+~560-line session region), same shape: probe registry, live-discovery
+config (`live` — `{layer, source}`), per-forward stash (one encode
+shared by gates, pinned probes, and the live display on a step),
+per-generation flag, and the read surfaces (`attach`/`detach`/`specs`,
+`score_probes`/`probe_values`, `gate_scalars`, `score_aggregate`,
+`live_readout_step`, `authored_capture`, `enable_live`/`disable_live`/
+`is_live`, `probe_hash` — the `sae-readout-v2` unit-carrying digest,
+`validate_gate` — strength axis only). Backend *residency*
+(`_sae_backend`/`_sae_layer`/`_sae_width`, `_require_sae`,
+`_encode_sae_hidden`), the Neuronpedia metadata cache/fetchers, the
+train/load/unload lifecycle, and the offline `sae_token_readout` stay
+session-side (residency is runtime state shared with steering atoms, not
+probe intent). Session re-exposes state via the same delegating-property +
+lazy-instrument pattern. **Deliberate 5.x semantics change:** SAE gate
+scalars no longer emit the fake `:fraction = 0.0` / `:membership = 1.0`
+constants — only the real strength channel (`<name>`/`<name>[0]`); a gate
+on a channel the family can never produce is a composition-preflight error
+(`validate_gate` → `UnsupportedProbeChannelError`), wired at the composer
+in the plan/run slice.
+
+`geometry.py` — **`GeometryInstrument`**, the thin adapter giving the
+Monitor family the same face as its siblings: `attach` (the exclusive-GPU
+whitener-touch + resolve + `monitor.add_probe` flow), `detach`, `specs`,
+`names`, `validate_gate` (every channel — axes, fraction, membership,
+distance, assignment), and `probe_hash` (the baked-tensor / subspace-
+geometry digest). The Monitor engine and the four capture modes stay
+untouched (folding them in would combine an orchestration extraction with
+an engine rewrite). `session.instruments` is the uniform registry —
+`{"geometry", "lens", "sae"}` → instrument — behind the probe-hash roster,
+gate preflight, and the server's instrument enumeration.
+
+**Public faces (P3):** `session.instruments` is the family registry;
+`session.lens` / `session.sae` return the instrument objects themselves —
+the typed public API for probe attach/detach, live toggles, and scoring.
+Artifact/source lifecycle (`fit_jlens`, `select_jlens_source`,
+`jlens_readout`, token replay; `train_sae`/`load_sae`/`unload_sae`/
+`sae_info`) stays on the session: source management is not measurement.
+The flat `session._score_*`/`enable_live_*` delegates remain as internal
+forwarders for the server/CLI call sites. `LensInstrument`/`SaeInstrument`/
+`GeometryInstrument`/`UnsupportedProbeChannelError` are exported from
+`saklas/__init__.py`.
+
+The composer's four gate-key walks collapsed onto one structured
+`_gated_refs()` pass (`parse_gate_ref`), which also **channel-validates**
+lens/SAE-attached gate references at generation preflight
+(`UnsupportedProbeChannelError`, 400) and fixes the old
+`re.split("[\\[:@~]")` truncation of variant-suffixed probe names.
+
+Both formerly deferred slices are landed. **Plan-driven capture:** every
+family implements `plan(prep) -> InstrumentPlan` and
+`_begin_capture` (plus the batch preamble) unions the declared
+`latest_layers`/`tail_layers` instead of hand-rolled per-family branches;
+retention-mode selection stays session-side (the
+`INCREMENTAL → set_tail_with_sink` upgrade is cross-instrument resource
+sharing). **Source prep:** `prepare(ReadRequest) -> InstrumentPrep` is
+the generation-boundary source step, run after `close_run` — the lens
+family reads the disk-refreshing `session.jlens`
+getter under pin demand there (the one formula both boundaries reduce
+to: a live readout, or attached probes with a final aggregate or a lens
+gate) and returns the `LensPrep` carrying the pin **and the
+authoritative spec/live/fingerprint snapshot** (spec layers derived from
+the prepared lens identity — a pin-demanded lens without
+`source_layers` is a hard prepare failure, and narrow test stubs use
+real-shaped `SimpleNamespace(source_layers=…)` lenses; the live runtime
+dict by reference; the sidecar identity for the binding); geometry/SAE
+preps carry the request forward. The whole lens snapshot is ONE atomic
+transaction under `LensInstrument.state_lock` — a reentrant leaf lock
+(outer locks like `_gen_lock`/`_model_exclusive` are always taken
+first) that also serializes the getter's refresh/adopt/evict,
+`has_compatible_jlens`, `_adopt_fitted_jlens`/`_evict_resident_jlens`,
+probe attach/detach — the session's `remove_probe` routes lens removals
+through the instrument's atomic `try_detach` (a bare membership check +
+direct registry delete bypassed the boundary; round-5) — the live
+toggles, `fit_jlens`'s restore→adopt transitions (the `_live_lens`
+restore primes the adoption's rebuild; both land as one transaction),
+and the coherent read surfaces
+(`specs`/`names`/`probe_layers`/`probe_hash`/`live_layers` — an
+un-locked `specs()` iteration could RuntimeError under a concurrent
+detach) — so the snapshot cannot tear
+mid-`prepare` (sol's round-4 P1: without it, an adoption landing
+between the refresh and the live-state read paired lens A's specs with
+lens B's live device stack). `plan` and `bind` consume the prep only
+— never the live registry — so an interleaved adoption inside the
+prepare→bind window (the un-locked `has_compatible_jlens` on the
+session-info route can trigger one from another thread) cannot pair the
+prep's pinned lens with the replacement's rewritten layers (sol's
+round-3 P1; regression tests pin both interleavings). Every family's
+`prepare` raises on a still-bound run (a stale pin would short-circuit
+the very refresh the step exists for). **Formal runs:** `bind(plan,
+prep)` — prep mandatory, family provenance validated on BOTH plan and
+prep (a bare `bind(plan)`, a wrong-family prep, or a wrong-family
+`LensPrep` all raise), and the plan must echo the prep's
+per-preparation `token` (`InstrumentPlan.prep_token` — same-family
+plan/prep crossing from different prepare() calls raises, sol's round-4
+P2; tokens draw from ONE process-wide sequence, `types.next_prep_token`
+— per-instance counters collided across instrument instances, round-5)
+— freezes an `InstrumentBinding` from the prep's
+specs and the prep's `fingerprint` (a bind-time live identity read
+could stamp a concurrently adopted replacement onto a run pinned to the
+older lens; the SAE binding resolves `max_act` at bind, so the un-locked
+Neuronpedia backfill can no longer change a running generation's
+strength unit — sol's race), installs the prep's pin/live decisions, and
+returns the family's
+run (`LensRun`/`SaeRun`/`GeometryRun`), which owns the instrument-side
+generation-scoped state: step stashes, display readings, active flags,
+the lens disk-identity pin, the prepare-time live-state snapshot, and
+the `observe` step-memo (memoized only
+while bound — the idle run persists indefinitely, so it never memoizes).
+Geometry's curved warm feet stay in the Monitor engine and the four
+capture modes stay session/HiddenCapture wiring. Instruments keep the
+historical state names as delegating properties over `current_run` (an
+idle passthrough run backs out-of-generation reads — measurement specs
+come from `_measurement_specs()`: the frozen binding when bound; when
+idle, the lens pairs lens + specs in ONE `_measurement_state()`
+state-lock hold (refresh the getter, copy the registry — separately
+resolved, an idle read could pair lens A with a concurrently adopted
+B's rewritten layers; round-6 P1) and the SAE returns a per-call
+coherent snapshot under its own registry lock (the live dict tore
+mid-iteration under the un-locked detach; round-6 P2). The
+live-readout state symmetrically from
+`_measurement_live()`: the run's prepare-time snapshot when bound, so a
+bound run keeps reading the live stack that matches its pin even after
+an adoption rebuilds the instrument-level `live`. The SAE family
+carries its own `state_lock` mirroring the lens boundary — registry
+mutation (attach/detach/`try_detach` — the session's `remove_probe`
+SAE branch routes through it — the metadata backfill's whole-dict spec
+replacement, load/unload probe eviction) and the coherent snapshots all
+hold it; never on per-token paths.)
+
+Post-review hardening (sol, gaslamp thread `instrument-protocol`):
+
+- **Ordering contract** — a capture transaction is the uniform protocol
+  sequence `close_run → prepare → plan → bind` at both generation
+  boundaries (`_begin_capture` and the batch preamble): the defensive
+  `_close_instrument_runs()` first, then `prepare` takes the lens disk
+  refresh + pin (`session.jlens`, whose adoption path REWRITES live
+  probe layer lists) and snapshots specs/live against that identity, and
+  `plan`/`bind` consume the snapshot — a plan or freeze read off the
+  live registry can pair the prep's lens with a concurrently adopted
+  replacement's layers and KeyError in the transport stack. Pin demand
+  is the registry boolean, not plan
+  emptiness (probes whose lens vanished still pin the validated-missing
+  state). Formerly the refresh/pin dance was session special-casing
+  around `bind(lens=, pinned=)` kwargs; it is protocol shape now
+  (`LensInstrument.prepare`), and the ordering is enforced, not
+  advisory: prep-less or foreign-family plan/bind calls raise.
+- **Every capture transaction closes its runs, exception-hard** — the
+  generation finallys, the batch finally, and the joint-logprob replay
+  all reach `_close_instrument_runs()` through nested finallys, so a
+  raising hook detach cannot skip run closure, and the gen-lock release
+  sits behind the outermost finally (an earlier teardown exception must
+  not wedge the session).  `close_run` is protocol surface (the
+  bind/close asymmetry is what let the replay leak bound runs, pinning a
+  stale lens between generations).
+- **Mutations apply next generation — lens/SAE only.** Their measurement
+  guards (score/aggregate/live/authored/batch-row) consult
+  `_measurement_specs()`, so an un-locked mid-generation detach (the
+  synchronous DELETE route) cannot change a bound generation's roster.
+  Geometry has **no roster snapshot yet** (Monitor scoring walks the live
+  `_probes` dict), so `GeometryInstrument.detach` takes
+  `_model_exclusive` like `attach` and a served detach during a running
+  generation **rejects with retry-shortly semantics** instead of racing;
+  `session.remove_probe` routes geometry removals through the instrument.
+  A true Monitor roster snapshot (extending the next-generation contract
+  to geometry) is deferred — it is engine surgery, not guard cleanup.
+- **Geometry carries its own `state_lock`** — the same reentrant leaf-lock
+  boundary as lens/SAE, covering roster mutation (attach/detach, the
+  session's fit-promotion and failed-override walks in
+  `_adopt_fitted_manifold`/`_evict_failed_manifold_override`, the lazy
+  `set_whitener` factor rebuild) against the coherent read surfaces
+  (`names`/`specs()`/`manifolds()`/`probe_hash`, the `plan`/`bind` roster
+  reads) and the idle-passthrough run reads (`GeometryRun.observe`/
+  `gate_scalars`/`observe_aggregate` when unbound).  An un-locked reader
+  iterating the roster (`Monitor.probe_layers` walks a live generator;
+  `Monitor.manifolds` is a comprehension) RuntimeErrors under a concurrent
+  idle detach — the lens round-5 tear class, closed the same way.
+  `session.probes`, `probe_hashes`, the analytics roster, and
+  `score_hidden`'s dim preflight consume the locked `manifolds()`/`names`
+  snapshots.  NEVER taken on the bound per-token scoring path —
+  mid-generation mutation stays excluded by the reject contract above,
+  not by this lock.
+
+**Step identity (the observe wiring).** The decode loop owns ONE
+`step_id` per forward — `len(generated_ids)` before that forward, set
+after every pre-forward break (`last_forward_step` survives the loop
+for the post-loop partial-UTF-8 flush) — and hands the SAME value to
+the capture sink (`step_callback(step)`), the gate callback
+(`score_callback(step)`), and the token tap (the internal 7-argument
+`StepTokenCallback`; the session-facing `TokenCallback` stays
+6-argument — `_token_tap` absorbs the step and invokes user callbacks
+with the public shape).  Buffered partial-UTF-8 emits all carry the
+*flushing* forward's step, matching their reading semantics.  The
+workers' per-forward stashes are step-keyed (`stash["step"] ==
+step_id` replaced the `fresh`/`readings_fresh` consume-once flags:
+staleness is structural, reuse is idempotent, `step_id < 0` never
+matches); the matrix-granular gate→display reuse (band logits, partial
+row overlap, the shared SAE encode) survives verbatim beneath that
+predicate.  Full-roster reads prime the runs' `observe` memos
+(`prime_observation` — the FULL-incremental sink, the lens/SAE display
+readings, the lens gate's live-display superset), so one forward's
+gate and payload reads share a single scoring pass; partial reads
+(gating scalar subsets, `coords_only` lean rows, `only=` restrictions)
+NEVER prime — a partial reading served as the full `observe` result is
+the completeness trap.  Geometry's finalize aggregate and the batch
+per-row lens/SAE aggregates route through `observe_aggregate`; the
+composer's planned-gate subset path is deliberately untouched (its
+plan cache and narrow scope are the large-K guard — routing it through
+`observe` would widen a gated subset to the full roster).
 
 ## triggers.py
 
@@ -912,7 +1204,7 @@ logs the fallback reason.
 
 ## scene.py
 
-The cast-model turn stitcher (`docs/plans/dynamic-roles.md`): **template
+The cast-model turn stitcher: **template
 autopsy** renders sentinel-content probes through the live chat template and
 slices out a `TurnGrammar` — prelude, per-seat `SeatWrapper`s (open/label
 site/close), system shape (real turn vs gemma-style fold, or unsupported —
@@ -1011,7 +1303,7 @@ frame, pooled in standard-assistant space)) author each node's corpus.
 `extract(concept, baseline, *, kind="abstract", ...)` authors a 2-node
 discover-`pca` manifold (`create_discover_manifold_folder`,
 `hyperparams={"max_dim": 1}`) and fits it via `ManifoldExtractionPipeline`,
-returning `(canonical_name, folded_vector_directions(manifold))`. The corpus is
+returning `(canonical_name, folded_directions(manifold))`. The corpus is
 generated conversationally — `generate_responses(concepts, kinds, *, roles=None,
 custom_system=None, samples_per_prompt=1, …)` has each pole answer the shared baseline prompts *in
 character*, the concept riding both the system prompt (`_system_for`) and the
@@ -1024,11 +1316,11 @@ authors a 2-node folder and generates both poles. **Monopolar** (`baseline=None`
 authors a genuinely **1-node** folder (only the concept pole is generated); the
 pipeline folds `concept − ν` into a 1-node neutral-anchored ray (see
 `extraction.py`), neutral implicit via `layer_means`. `generate_neutral_responses`
-is the neutral-corpus sibling (no system, standard label). `extract_vector_from_corpora(..., kind=...)` is the corpus-in sibling
+is the neutral-corpus sibling (no system, standard label). `extract_from_corpora(..., kind=...)` is the corpus-in sibling
 (hand-authored pairs skip generation; corpora pooled conversationally, each length
 a multiple of the baseline prompt set); `fit(folder)` is the multi-node delegate
 that returns a `Manifold`. All gate against `GenState.IDLE`
-(fitting runs forward passes). `_fit_vector_manifold` is the shared tail. (The
+(fitting runs forward passes). `_fit_concept_manifold` is the shared tail. (The
 training-free `clone_from_corpus` / `io.cloning` path is removed in 4.0.)
 
 `generate` / `generate_stream` are keyword-only and accept `steering: str |
@@ -1050,7 +1342,7 @@ resolves a direction from, in order: (1) an in-memory baked direction already in
 fitted Jacobian lens (raising `LensNotFittedError`/`MultiTokenWordError`, never
 falling through to extraction); (2) a fitted
 2-node `pca` manifold on disk — `try_fold_manifold` → `ensure_manifold_loaded`
-(load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_vector_directions`,
+(load `[ns/]name[:variant]`, raw or `sae-<release>`) + `folded_directions`,
 memoized into `_profiles`. `_bootstrap_manifold_probes(categories, *, include_fitted_defaults)` is the
 probe-roster bootstrap — one pass, two tiers. **Tagged concept axes**: for each
 `default/` manifold tagged in a requested category, fit-or-load the 2-node
@@ -1061,9 +1353,9 @@ old `io.probes_bootstrap.bootstrap_probes`), registered under the **bare** name.
 any *already fitted* for the model and not already attached (`personas`,
 `emotions`) under the qualified `default/<name>` selector — attach-only (never
 fits; an unfitted one logs a skip), so a 107-node manifold can't block startup.
-This folds the former serve-only `_attach_default_manifold_probes` into the
-construction-time pass, so every frontend (TUI / serve / programmatic) gets the
-same roster; an explicit `probes=[...]` category list skips the multi-node sweep.
+This folds the former serve-only bootstrap into the construction-time pass, so
+both frontends (serve / programmatic) get the same roster; an explicit
+`probes=[...]` category list skips the multi-node sweep.
 
 `SteeringComposer.compose_steering_entries` is the dispatch (`ARCHITECTURE.md` §4): classify each
 entry — `AblationTerm` → ablation fragment; `ManifoldTerm` → affine `%` joins the
@@ -1086,7 +1378,16 @@ readout channel, see "Lens probes" below), else resolves via
 `_resolve_probe_manifold`
 (a 2-node `pca` concept folds to a rank-1 probe via `_fold_profile_probe`; a
 multi-node manifold attaches whole) and registers on the unified `_monitor`;
-`remove_probe(name)` detaches either kind. `_begin_capture` widens to `_monitor.probe_layers()`
+`remove_probe(name)` detaches either kind. `geometry_token_readout(node_id,
+raw_index, *, apply_steering=, raw=)` is the geometry family's token replay —
+the loom-anchored sibling of `jlens_token_readout`/`sae_token_readout` (same
+prompt rebuild + one capture forward at the roster's layer union + the same
+steering-scope-outside-`_model_exclusive` ordering), scored through
+`Monitor.score_single_token` at the position that produced the clicked token
+(curved warm-start forced off — a one-shot read must not seed from a prior
+generation's foot). Post-hoc by construction: it reads aggregate-only
+generations and probes attached after the fact; no attached probe raises
+`ValueError`. `_begin_capture` widens to `_monitor.probe_layers()`
 and picks the `CaptureMode` from `need_per_token` (gate ∨ loom row ∨ trait stream ∨
 live scores ∨ per-layer persist — see hooks.py `HiddenCapture`), storing it on the
 `CaptureState` dataclass (`mode` + `persistent` + the GATING_SUBSET subset/keys —
@@ -1111,7 +1412,7 @@ push/pop invalidation (a prefill-inactive scope preserves the cache, so a
 per row). The alpha *sweep* steers the prompt at varying strength by construction
 (`BOTH` terms), so it can't share a prefill — that's expected, not a gap. Hot-path
 events: `GenerationStarted`/`SteeringApplied`/
-`SteeringCleared`/`ProbeScored`/`GenerationFinished` + `VectorExtracted`/
+`SteeringCleared`/`ProbeScored`/`GenerationFinished` +
 `ManifoldExtracted`; threaded subscribers hop via `loop.call_soon_threadsafe`.
 
 **Jacobian-lens surface.** `session.jlens` validates v6 sidecar/live-weight
@@ -1161,7 +1462,8 @@ session lens-probe registry (`_lens_probes: name -> {word, token_id, layers}`,
 all fitted layers; `_add_lens_probe` validates the artifact + single-token word
 and pre-warms the device transport stack) — **never** the Monitor, never a
 direction fold, no whitener. The reading is the readout-channel synthesis of
-`ProbeReading` (`_score_lens_probes` over `jlens.token_readout_stats`):
+`ProbeReading` (`_score_lens_probes`, now a thin delegating forwarder to
+`LensInstrument.score_probes`, over `jlens.token_readout_stats`):
 `coords = (strength,)` — the ONE channel, mean fitted-layer probability
 `mean_l p_l(v)` (the gate channel `@when:jlens/<word>` and the workspace
 card's `strength`) — `coords_per_layer[l] = (p_l,)`, probability-mass-weighted
@@ -1188,14 +1490,14 @@ not force per-token *monitor* scoring — `need_per_token` keys on
 monitor-attached gate keys (`gated_probe_keys`), while
 `SteeringComposer.gated_lens_probe_keys` detects lens gates for the callback
 merge. `probe_hashes`/`_probe_hash` stamp lens probes with a deterministic
-identity digest (`jlens-readout-v1`, model, word, token id, layers).
+identity digest (`jlens-readout-v2`, model, word, token id, layers).
 
 **CAA live toggle.** `live_probe_scores` / `set_live_probe_scores(bool)` —
 when off, `_generate_core` masks every per-token monitor consumer at the
 source (trait stream, loom probe rows, live token scores, per-layer persist,
 subspace-coords persist, the tap's `needs_scores`), so generations run
 aggregate-only capture; probe gates still force the subset they need.
-Surfaced as `POST .../probes/live` + session info `live_probe_scores`.
+Surfaced as `POST .../instruments/geometry/live` + session info `live_probe_scores`.
 
 **Live lens** (`enable_live_lens`/`disable_live_lens`/
 `live_lens_layers`): the selected layers' `J_l` go device-resident, join the
@@ -1203,29 +1505,39 @@ capture-widen union in `_begin_capture` (which also forces transient — not
 persistent — capture routing, and arms a bounded tail ring when no probes are
 attached), and `_live_lens_readout_step` runs at the token tap post-forward —
 no new forward hooks, `static_steerable` untouched — returning `(per_layer,
-aggregate, token_ids)` and landing the compatibility pair view on
-`TokenEvent.lens_readout` /
-`TokenEvent.lens_aggregate` and the `_last_token_probe_payload["lens"]` /
-`["lens_aggregate"]` slots. `token_ids` are the ids already selected by the
-same top-k; `TokenProbePayload.to_token_payload` combines them with those
-probabilities into the endpoint-shaped, JSON-safe `captured.lens` record
-without another softmax. The aggregate covers every live layer, and its
+aggregate, token_ids)`. The tap passes those into
+`TokenProbePayload.to_token_payload` (`lens=`/`lens_aggregate=`/`lens_token_ids=`),
+which folds them — with the same probabilities, no second softmax — into the
+5.x measurement envelope's `instruments.lens.readout` block (`build_measurements`);
+`generate_stream` forwards that envelope onto `TokenEvent.measurements`. The
+aggregate covers every live layer, and its
 top-k width follows the generation's resolved logit-alternative
 `return_top_k` (8 only when alternatives are disabled). The default layer set
 is **every fitted layer**; pass an explicit `layers` list to trade coverage for
 device memory. `saklas serve`
 auto-enables the live lens at startup when the artifact exists (serve-side
-policy; library + TUI stay opt-in).
+policy; the library stays opt-in).
+
+**Live SAE** uses that same per-generation resolved top-k at the token tap and
+for authored-prefill capture. The live SAE config therefore stores only its
+resident `{layer, source}`; it has no independent width. Hover and token replay
+receive the same resolved alts width from the client.
 
 ## loom.py
 
-Visible token rows own the canonical `captured` measurement record. The decode
-tap creates it for generated tokens; selective prefill capture creates the same
-shape for authored tokens from the producer rows that were already forward
-passed. Both stamp instrument source plus recipe steering and live directly on
-the loom node. Because token rows already ride the compressed token sidecar,
-explicit loom save/load preserves these rich historical channels without a
-separate cache or schema path. `set_authored_token_scores` installs one authored
+Visible token rows own the canonical `measurements` envelope (5.x — the record
+that replaced the `captured` key and the six per-token scalar aliases). The
+decode tap creates it for generated tokens; selective prefill capture creates
+the same shape for authored tokens from the producer rows that were already
+forward passed. Both stamp instrument source plus recipe steering inside the
+envelope's per-family `binding` and live directly on the loom node. The
+`TokenScoreDict` rows are stored opaquely (the sidecar reader validates only the
+node-level `tokens`/`thinking_tokens`/`raw_token_ids` fields, not the inner
+`measurements` shape), so the `TOKEN_SIDECAR_FORMAT_VERSION` did not change; a
+pre-5.x row still carrying a `captured` key loads fine but reads empty in a
+`measurements`-aware client (clean break — no migration). Because token rows
+already ride the compressed token sidecar, explicit loom save/load preserves
+these rich historical channels without a separate cache or schema path. `set_authored_token_scores` installs one authored
 channel atomically and emits `LoomMutated(op="capture_authored")`; unlike the
 hot-loop `append_token`, it advances the tree revision so clients receive the
 updated authored node.
@@ -1320,10 +1632,12 @@ context. Surfaced as `session.score_choices` / `session.score_template`.
 `ProbeReading`, `ResultCollector`. `RunSet` is the
 list-like multi-run shape (`node_ids`/`grid`/`.first`/`.to_collector()`/
 `.to_dataframe()`). `TokenEvent` carries `thinking`, `logprob`, `top_alts`,
-`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s), and
-— while the live lens is on —
-`lens_readout` (per-layer top-k) + `lens_aggregate` (the layer-aggregated
-`[(token, strength, com, spread)]` chip list). `GenerationResult`
+`finish_reason`, `perplexity`, `probe_readings` (per-probe `ProbeReading`s — the
+compat channel feeding the OpenAI/Ollama `x-saklas-probe-readings` vendor
+extension and the traits SSE, merged across families), and `measurements` (the
+5.x envelope — geometry/lens/sae `instruments` + flat `scores`/`per_layer_scores`
+views, `build_measurements`; replaced the former `lens_readout`/`lens_aggregate`/
+`sae_readout` fields). `GenerationResult`
 carries `prompt_tokens`, `finish_reason`, optional `logprobs`,
 `probe_readings`, and `applied_steering` (the
 canonical expression, round-trips through `parse_expr`). `ProbeReading`
@@ -1347,7 +1661,7 @@ generation result. `to_dict()` omits `hidden_states`.
 ## histogram.py
 
 `HIST_BUCKETS = 16`; `bucketize(norms, buckets)` collapses sorted per-layer norms
-into evenly-sized groups. Used by the TUI WHY footer + CLI `manifold why`.
+into evenly-sized groups. Used by CLI `manifold why` and notebook plots.
 
 ## sampling.py / steering.py / steering_expr.py / events.py / errors.py / profile.py
 
@@ -1374,7 +1688,9 @@ checks). Term markers: `ProjectedTerm(coeff, trigger, operator, base, onto)`
 default coeff 1.0, doesn't compose with `~`/`|` — lowered through
 `synthesize_subspace`'s ablation path at dispatch), `ManifoldTerm` (`along`,
 `onto`, position; `_expand_along_onto_coeffs` yields a 1- or 2-tuple). Probe gates
-(`@when:<probe><op><threshold>`) accept three identifier shapes — vector
-(`confident.uncertain`), manifold fraction (`emotions:fraction`), manifold label
-(`emotions@happy`) — all stored verbatim in `ProbeGate.probe` so the runtime gate is
+(`@when:<probe><op><threshold>`) accept coordinate axes
+(`confident.uncertain`, `personas[3]`), manifold fraction
+(`emotions:fraction`), label distance (`emotions@happy`), soft assignment
+(`personas~hacker`), tube membership (`emotions:membership`), and SAE/J-lens
+channels — all stored verbatim in `ProbeGate.probe` so the runtime gate is
 identical; the parser is the only place the discrimination lives.

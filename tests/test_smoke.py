@@ -58,13 +58,13 @@ def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> A
     centroids, take their per-layer difference ``δ = pos − neg``, and fold that
     direction into a one-pole affine ray via the production
     ``fold_directions_to_subspace``, then read its baked-direction view
-    (``folded_vector_directions``).  Same centroid-difference direction the old
+    (``folded_directions``).  Same centroid-difference direction the old
     DiM extractor produced, through the surviving fold primitive.
     """
-    from saklas.core.vectors import (
+    from saklas.core.capture import (
         _encode_and_capture_all,
         fold_directions_to_subspace,
-        folded_vector_directions,
+        folded_directions,
     )
 
     device = next(model.parameters()).device
@@ -82,7 +82,7 @@ def _extract_profile(model: Any, tokenizer: Any, concept: str, layers: Any) -> A
         concept, directions, neutral_means,
         whitener=isotropic_whitener(directions, dim), label="p",
     )
-    return folded_vector_directions(mfld)
+    return folded_directions(mfld)
 
 
 @pytest.fixture(scope="module")
@@ -90,7 +90,7 @@ def layer_means(model_and_tokenizer: Any, layers: Any) -> Any:
     # The probe-centering mean is the per-layer mean of the neutral activation
     # stack (X.mean(0)) — same corpus, same pooling — so there is no separate
     # compute_layer_means pass.
-    from saklas.core.vectors import compute_neutral_activations
+    from saklas.core.capture import compute_neutral_activations
     model, tokenizer = model_and_tokenizer
     acts = compute_neutral_activations(model, tokenizer, layers)
     return {idx: X.mean(dim=0) for idx, X in acts.items()}
@@ -263,7 +263,7 @@ class TestTraitMonitor:
     def test_monitor_records_history(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         from saklas.core.hooks import SteeringManager
         from saklas.core.monitor import Monitor
-        from saklas.core.vectors import fold_directions_to_subspace
+        from saklas.core.capture import fold_directions_to_subspace
         from saklas.core.generation import GenerationConfig, GenerationState, generate_steered
         from tests._whitener import isotropic_whitener
 
@@ -307,7 +307,7 @@ class TestTraitMonitor:
 
         # Measure on generated text via the surviving hidden-state scoring API.
         text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        from saklas.core.vectors import _encode_and_capture_all
+        from saklas.core.capture import _encode_and_capture_all
 
         hidden = _encode_and_capture_all(
             model, tokenizer, "How are you feeling?", text, layers, device,
@@ -330,10 +330,6 @@ class TestTraitMonitor:
         for hist in (happy_hist, sad_hist):
             v = hist[0][0]
             assert math.isfinite(v)
-
-        # Sparkline should be non-empty
-        sparkline = monitor.get_sparkline("happy")
-        assert len(sparkline) > 0
 
     def test_throughput_regression(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         """Steered generation should be at least 85% of vanilla throughput."""
@@ -499,7 +495,7 @@ class TestDiscoverManifoldEndToEnd:
         session = SaklasSession(model, tokenizer, probes=[])
         try:
             # ---- 1. generate per-concept corpora (A2 conversational) ----
-            from saklas.core.vectors import _load_baseline_prompts
+            from saklas.core.capture import _load_baseline_prompts
             n_prompts = len(_load_baseline_prompts())
             t0 = time.perf_counter()
             corpora = session.generate_responses(

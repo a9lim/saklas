@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // System-prompt drawer — edit the session's default system prompt.
   // Saves via PATCH /sessions/{id} (``patchSessionDefaults``); cancel
   // closes without writing.
@@ -45,9 +46,7 @@
 <section class="drawer-shell" aria-label="System prompt drawer">
   <header class="header">
     <span class="title">system prompt</span>
-    <button type="button" class="close" aria-label="Close" onclick={closeDrawer}
-      >✕</button
-    >
+    <DrawerCloseButton onclick={closeDrawer} />
   </header>
 
   <div class="body">
@@ -114,29 +113,6 @@
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
   }
-  .close {
-    background: var(--glass);
-    color: var(--fg-muted);
-    border: 1px solid transparent;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font: inherit;
-    font-size: var(--text-md);
-    line-height: 1;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color var(--dur-fast) var(--ease-out),
-      background var(--dur-fast) var(--ease-out);
-  }
-  .close:hover {
-    color: var(--fg);
-    background: var(--glass-strong);
-  }
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -185,7 +161,7 @@
     align-self: flex-end;
   }
   .error {
-    color: var(--accent-error);
+    color: var(--accent-red);
     margin: 0;
     font-size: var(--text-sm);
     word-break: break-word;

@@ -412,9 +412,7 @@ def test_select_grid_not_spuriously_periodic() -> None:
 # near-perfectly while the under-dimensioned curved fit can't match it, losing on
 # reconstruction it would *win* at matched dim.  ``select_topology`` now floors
 # the curved candidate to the flat dim (``min_dim=k_flat``).  These guard that
-# fix and that it does NOT spuriously flip genuinely flat shapes.  (Mechanism +
-# the production evidence -- personas flat-8 vs spectral-2, emotions flat-3 vs
-# spectral-1 -- live in scripts/experiments/concept_geometry/geometry_stress.py.)
+# fix and ensure it does not spuriously flip genuinely flat shapes.
 
 
 def _curve_in_plane(k: int, c: float) -> torch.Tensor:
@@ -590,7 +588,7 @@ def test_select_torus_t2_coarseness_floor() -> None:
 
     Below ~7 the loops' holes fill inside the ``eps_max=2*eps_c`` window and read
     flat; side-7 is the validated floor (T3 and coarser tori are out of the
-    practical envelope -- see geometry_stress.py).
+    practical envelope covered by the current topology selector).
     """
     choice = _choose(_torus_t2(7))
     assert choice.winner_name == "torus-T2"
