@@ -17,7 +17,7 @@
   import type { ProbeReadingJSON } from "../../lib/types";
   import type { GeometryTokenReadout, ReplayReadout } from "./readout.svelte";
   import EmptyState from "./EmptyState.svelte";
-  import DetailSummary from "./DetailSummary.svelte";
+  import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
 
   let {
@@ -48,71 +48,6 @@
   function affineOf(name: string, reading: ProbeReadingJSON): boolean {
     return probeRack.entries.get(name)?.info?.is_affine ?? reading.residual === 0;
   }
-
-  const affineCount = $derived(
-    rows.filter(([name, reading]) => affineOf(name, reading)).length,
-  );
-  const curvedCount = $derived(rows.length - affineCount);
-  const meanFraction = $derived(
-    rows.length > 0
-      ? rows.reduce((sum, [, reading]) => sum + reading.fraction, 0) / rows.length
-      : 0,
-  );
-
-  const strongest = $derived.by<{
-    name: string;
-    axis: number;
-    value: number;
-  } | null>(() => {
-    let best: { name: string; axis: number; value: number } | null = null;
-    for (const [name, reading] of rows) {
-      reading.coords.forEach((value, axis) => {
-        if (!best || Math.abs(value) > Math.abs(best.value)) {
-          best = { name, axis, value };
-        }
-      });
-    }
-    return best;
-  });
-
-  const closest = $derived.by<{
-    probe: string;
-    label: string;
-    distance: number;
-  } | null>(() => {
-    let best: { probe: string; label: string; distance: number } | null = null;
-    for (const [probe, reading] of rows) {
-      for (const [label, distance] of reading.nearest ?? []) {
-        if (!best || distance < best.distance) best = { probe, label, distance };
-      }
-    }
-    return best;
-  });
-
-  const summaryMetrics = $derived([
-    {
-      label: "probes",
-      value: String(rows.length),
-      detail: `${affineCount} subspace · ${curvedCount} manifold`,
-    },
-    {
-      label: "strongest coordinate",
-      value: strongest
-        ? `${strongest.value >= 0 ? "+" : ""}${strongest.value.toFixed(2)}`
-        : "—",
-      detail: strongest ? `${strongest.name} · c${strongest.axis}` : "no coordinate data",
-    },
-    {
-      label: "mean subspace share",
-      value: `${(meanFraction * 100).toFixed(1)}%`,
-      detail: "across the attached roster",
-    },
-    {
-      label: "nearest node",
-      value: closest?.label ?? "—",
-      detail: closest ? `${closest.probe} · d=${closest.distance.toFixed(2)}` : "no node distances",
-    },
-  ]);
 
   /** Axis label: the positive pole for a rank-1 two-node concept axis
    *  (coords axis 0 is pole-normalized, +1 at node 0), ``c<i>`` otherwise. */
@@ -167,17 +102,13 @@
 {:else if readout.error}
   <EmptyState title={`readout: ${readout.error}`} />
 {:else if readout.data && rows.length > 0}
-  <DetailSummary
-    accent="var(--pillar-subspace)"
-    eyebrow="geometry"
-    title="Activation geometry"
-    description="Where this token-producing residual sits inside every attached concept axis and fitted manifold."
-    metrics={summaryMetrics}
+  <InstrumentHeader
     origin={readout.origin}
     source={readout.source}
     steering={readout.data.steering}
     bind:steered
     {showToggle}
+    accent="var(--pillar-subspace)"
   />
   <DetailSection
     title="PROBE READINGS"
@@ -302,8 +233,8 @@
 
 <style>
   .geo-list {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
   }
   .geo-name {
@@ -392,5 +323,11 @@
   .geo-chip-val {
     color: var(--fg-dim);
     font-variant-numeric: tabular-nums;
+  }
+
+  @media (max-width: 820px) {
+    .geo-list {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

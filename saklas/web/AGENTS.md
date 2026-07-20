@@ -469,6 +469,12 @@ three replay families share one `ReplayReadout` resource
 provenance row — origin · source · steering chip · `apply recipe steering`
 toggle, so the sae tab now has the unsteered counterfactual too. Captured rows
 show their provenance and source even if that instrument is no longer active.
+The tabs intentionally start with this compact provenance row rather than a
+hero summary / metric grid; the evidence cards already carry the useful values.
+The drawer header likewise keeps the generation recipe but omits the redundant
+model / loom-node / perplexity / finish facts. Geometry probe cards use the same
+responsive two-column desktop grid as the other card-based drilldown views
+(collapsing to one column below 820 px).
 The header carries the token's identity chips (turn · role · segment — the
 segment chip jumps thinking ⇄ response — vocabulary `id`, `raw` decode index
 or a `no replay` marker, and the chosen `p / logp / rank` when captured) over a

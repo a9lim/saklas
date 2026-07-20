@@ -17,7 +17,7 @@
   import type { ReplayReadout } from "./readout.svelte";
   import EmptyState from "./EmptyState.svelte";
   import PinnedReadings from "./PinnedReadings.svelte";
-  import DetailSummary from "./DetailSummary.svelte";
+  import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
 
   let {
@@ -47,44 +47,6 @@
   );
 
   const layerCount = $derived(readout.data?.layers.length ?? 0);
-  const aggregate = $derived(readout.data?.aggregate ?? []);
-  const leadingAggregate = $derived(aggregate[0] ?? null);
-  const producedRanks = $derived.by<number[]>(() => {
-    const tokenId = readout.data?.token_id;
-    if (tokenId == null) return [];
-    const ranks: number[] = [];
-    for (const row of readout.data?.layers ?? []) {
-      const rank = row.tokens.findIndex((token) => token.id === tokenId);
-      if (rank >= 0) ranks.push(rank + 1);
-    }
-    return ranks;
-  });
-  const bestProducedRank = $derived(
-    producedRanks.length > 0 ? Math.min(...producedRanks) : null,
-  );
-
-  const summaryMetrics = $derived([
-    {
-      label: "fitted layers",
-      value: String(layerCount),
-      detail: "all requested lens layers",
-    },
-    {
-      label: "rank width",
-      value: String(columnCount),
-      detail: "vocabulary candidates per layer",
-    },
-    {
-      label: "aggregate leader",
-      value: leadingAggregate ? displayToken(leadingAggregate.token) : "—",
-      detail: leadingAggregate ? `mean p ${leadingAggregate.strength.toFixed(3)}` : "no aggregate readout",
-    },
-    {
-      label: "generated token hits",
-      value: `${producedRanks.length}/${layerCount}`,
-      detail: bestProducedRank == null ? "below retained ranks" : `best rank #${bestProducedRank}`,
-    },
-  ]);
 
   function cellStyle(logprob: number): string {
     const p = Math.min(1, Math.exp(logprob));
@@ -143,17 +105,13 @@
 {:else if readout.error}
   <EmptyState title={`readout: ${readout.error}`} />
 {:else if readout.data}
-  <DetailSummary
-    accent="var(--pillar-lens)"
-    eyebrow="j-lens"
-    title="Workspace trajectory"
-    description="What each fitted layer was disposed to say at the forward that produced this token, from early syntax to late lexical commitment."
-    metrics={summaryMetrics}
+  <InstrumentHeader
     origin={readout.origin}
     source={readout.source}
     steering={readout.data.steering}
     bind:steered
     {showToggle}
+    accent="var(--pillar-lens)"
   />
   {#if pinned && Object.keys(pinned).length > 0}
     <PinnedReadings readings={pinned} accent="--pillar-lens" shape="square" />

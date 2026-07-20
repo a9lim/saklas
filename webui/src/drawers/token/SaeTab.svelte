@@ -18,7 +18,7 @@
   import type { ReplayReadout } from "./readout.svelte";
   import EmptyState from "./EmptyState.svelte";
   import PinnedReadings from "./PinnedReadings.svelte";
-  import DetailSummary from "./DetailSummary.svelte";
+  import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
 
   let {
@@ -66,51 +66,6 @@
     return parts.join(" · ");
   }
 
-  const features = $derived(readout.data?.features ?? []);
-  const labeledCount = $derived(features.filter((feature) => !!feature.label).length);
-  const normalizedFeatures = $derived(
-    features
-      .map((feature) => ({ feature, strength: strengthOf(feature) }))
-      .filter((entry): entry is { feature: SaeFeatureJSON; strength: number } =>
-        entry.strength != null,
-      ),
-  );
-  const strongestNormalized = $derived(
-    normalizedFeatures.reduce<(typeof normalizedFeatures)[number] | null>(
-      (best, entry) => !best || entry.strength > best.strength ? entry : best,
-      null,
-    ),
-  );
-  const peakRaw = $derived(
-    features.reduce<SaeFeatureJSON | null>(
-      (best, feature) => !best || feature.activation > best.activation ? feature : best,
-      null,
-    ),
-  );
-  const summaryMetrics = $derived([
-    {
-      label: "active features",
-      value: String(features.length),
-      detail: "top features at this position",
-    },
-    {
-      label: "hook layer",
-      value: readout.data?.layer != null && readout.data.layer >= 0
-        ? `L${readout.data.layer}`
-        : "—",
-      detail: "resident SAE measurement point",
-    },
-    {
-      label: "strongest normalized",
-      value: strongestNormalized ? strongestNormalized.strength.toFixed(3) : "—",
-      detail: strongestNormalized ? `sae/${strongestNormalized.feature.id}` : "metadata unavailable",
-    },
-    {
-      label: "metadata coverage",
-      value: features.length > 0 ? `${labeledCount}/${features.length}` : "—",
-      detail: peakRaw ? `peak raw sae/${peakRaw.id} · ${peakRaw.activation.toFixed(1)}` : "no activations",
-    },
-  ]);
 </script>
 
 {#if readout.loading}
@@ -118,18 +73,14 @@
 {:else if readout.error}
   <EmptyState title={`readout: ${readout.error}`} />
 {:else if readout.data}
-  <DetailSummary
-    accent="var(--pillar-sae)"
-    eyebrow="sae"
-    title="Sparse feature field"
-    description="Which learned sparse features fired at the resident hook layer while the model produced this token."
-    metrics={summaryMetrics}
+  <InstrumentHeader
     origin={readout.origin}
     source={readout.source}
     layer={readout.data.layer}
     steering={readout.data.steering}
     bind:steered
     {showToggle}
+    accent="var(--pillar-sae)"
   />
   {#if pinned && Object.keys(pinned).length > 0}
     <PinnedReadings readings={pinned} accent="--pillar-sae" shape="triangle" />

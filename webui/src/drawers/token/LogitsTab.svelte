@@ -11,7 +11,7 @@
   import { samplingState, sendFork, closeDrawer } from "../../lib/stores.svelte";
   import type { TokenScore } from "../../lib/types";
   import EmptyState from "./EmptyState.svelte";
-  import DetailSummary from "./DetailSummary.svelte";
+  import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
 
   let {
@@ -51,47 +51,6 @@
       chosen: token.tokenId != null && a.id === token.tokenId,
     }));
   });
-
-  const chosenRow = $derived(rankRows.find((row) => row.chosen) ?? null);
-  const tokenProbability = $derived(
-    token.logprob != null && Number.isFinite(token.logprob)
-      ? Math.exp(token.logprob)
-      : null,
-  );
-  const capturedMass = $derived(rankRows.reduce((sum, row) => sum + row.p, 0));
-  const probabilityMargin = $derived(
-    rankRows.length > 1 ? rankRows[0].p - rankRows[1].p : null,
-  );
-  const tokenPerplexity = $derived(
-    token.logprob != null && Number.isFinite(token.logprob)
-      ? Math.exp(-token.logprob)
-      : null,
-  );
-
-  const summaryMetrics = $derived([
-    {
-      label: "chosen probability",
-      value: tokenProbability == null ? "—" : fmtProb(tokenProbability),
-      detail: token.logprob == null ? "not captured" : `logp ${fmtLogprob(token.logprob)}`,
-    },
-    {
-      label: "chosen rank",
-      value: chosenRow ? `#${chosenRow.rank}` : "—",
-      detail: rankRows.length > 0 ? `of ${rankRows.length} retained` : "no alternatives retained",
-    },
-    {
-      label: "captured mass",
-      value: rankRows.length > 0 ? `${(capturedMass * 100).toFixed(1)}%` : "—",
-      detail: "sum of retained probabilities",
-    },
-    {
-      label: probabilityMargin == null ? "token perplexity" : "top-two margin",
-      value: probabilityMargin == null
-        ? (tokenPerplexity == null ? "—" : tokenPerplexity.toFixed(2))
-        : probabilityMargin.toFixed(4),
-      detail: probabilityMargin == null ? "exp(-logp)" : "absolute probability gap",
-    },
-  ]);
 
   let branchingRank = $state<number | null>(null);
   let branchError = $state<string | null>(null);
@@ -146,17 +105,13 @@
   }
 </script>
 
-<DetailSummary
-  accent="var(--pillar-lens)"
-  eyebrow="logits"
-  title="Sampling decision"
-  description="The exact post-temperature, post-top-p, post-top-k distribution from which this token was selected."
-  metrics={summaryMetrics}
+<InstrumentHeader
   origin="captured"
   source="sampler"
   steering={null}
   steered={true}
   showToggle={false}
+  accent="var(--pillar-lens)"
 />
 
 <DetailSection
