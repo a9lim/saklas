@@ -865,25 +865,15 @@ class SaklasSession:
         provably erases linearly-decodable information along ``onto`` from
         ``base``); there is no Euclidean path and no metric knob.
 
-        ``dls`` toggles the discriminative-layer-selection mask at
-        extraction time (v2.1+).  When ``True`` (default), centered DLS
-        per Dang & Ngo (2026) Eq. 9 drops layers where pos- and
-        neg-class means project to the same side of the neutral
-        baseline along ``d̂``.  Replaces the v2.0–v2.1 ``edge_drop``
-        heuristic (gone in v2.1); pass ``dls=False`` (CLI ``--no-dls``)
-        to opt out.
+        ``dls`` controls centered discriminative layer selection at
+        extraction time. When enabled, layers whose fitted poles do not
+        straddle the neutral baseline are omitted.
 
         ``compile`` (default ``False``) opts in to ``torch.compile`` on
-        CUDA — kernel fusion via inductor, typically 1.2–3× decode
-        tok/s on small models when it succeeds.  Off by default: torch
-        2.12's inductor has known codegen bugs on newer architectures
-        (Gemma-4, Qwen3.5 hit ``TypeError: Pointer argument must be
-        either uint64`` in the static_cuda_launcher / regular Triton
-        launcher); the loader's probe catches these but still costs
-        ~25–100s upfront, which rarely amortizes on interactive
-        workloads.  Pass ``True`` for sustained workloads (long-running
-        serve, batch eval) where the per-token win pays back the
-        compile cost.  Auto-skipped on MPS/CPU.
+        CUDA or MPS. Persistent offset and capture hooks keep unsteered and
+        static-affine generations, including live probes, on the compiled
+        path; dynamic or transient-hook work falls back to eager. CPU skips
+        compilation.
 
         ``cuda_graphs`` (default ``False``) opts in to
         ``transformers.StaticCache`` + ``torch.compile(mode=

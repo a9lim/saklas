@@ -753,11 +753,6 @@ def _canonical_json(obj: Any) -> bytes:
 class ManifoldSidecar:
     """JSON sidecar beside a fitted per-model manifold tensor.
 
-    Lean by design — the concept-extraction fields on
-    :class:`saklas.io.packs.Sidecar` (``statements_sha256``,
-    ``diagnostics_by_layer`` ...) are meaningless for a manifold, so this
-    is a separate type rather than a reuse.
-
     Discover-mode fits (``fit_mode != "authored"``) additionally carry
     the derived ``coords``, the hyperparameters used, and the per-method
     diagnostics block (PCA variance bars or spectral spectrum) so the
@@ -979,7 +974,7 @@ class ManifoldFolder:
     files: dict[str, str]
     fit_mode: str = "authored"
     hyperparams: dict[str, Any] = field(default_factory=dict)
-    # Provenance tier, mirroring :attr:`saklas.io.packs.PackMetadata.source`.
+    # Provenance tier.
     # ``"local"`` (default) — hand-authored / generated under ``local/``;
     # ``"bundled"`` — shipped under ``saklas/data/manifolds/`` and
     # materialized into ``default/`` (set by namespace at refresh time,
@@ -1000,8 +995,7 @@ class ManifoldFolder:
     # unspecified.  Generation-time only (system template + elicitation role
     # label); never consumed by the fit.
     node_kinds: list[str | None] = field(default_factory=list)
-    # Category tags, mirroring :attr:`saklas.io.packs.PackMetadata.tags`.
-    # Carried so category-grouped probe bootstrap
+    # Category tags carried so category-grouped probe bootstrap
     # (``load_default_manifolds`` -> ``_bootstrap_manifold_probes``) keeps
     # working once a steering vector lives as a 2-node ``pca`` manifold.
     # Always explicit in the manifest; empty means uncategorized.
@@ -1363,8 +1357,7 @@ class ManifoldFolder:
 
         for t in sorted(folder.glob("*.safetensors")):
             sc_path = t.with_suffix(".json")
-            # Every fitted tensor must carry its ``.json`` sidecar, the
-            # same invariant ``ConceptFolder.load`` enforces.  ``fit``
+            # Every fitted tensor must carry its ``.json`` sidecar. ``fit``
             # always writes one via ``save_manifold``, so a missing
             # sidecar means a genuinely-corrupt folder, not a legitimate
             # shape — refuse rather than silently accept a sidecar-less

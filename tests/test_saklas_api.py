@@ -1138,18 +1138,6 @@ class TestScoreSingleToken:
 
         assert single["p1"].coords[0] == pytest.approx(no_acc["p1"].coords[0])
 
-
-# NOTE: the ``test_autoload_*`` tests and the three ``test_steering_*``
-# variant/sign-flip tests were deleted in 4.0.  ``SaklasSession.
-# _try_autoload_vector`` (the ``vectors/``-pack safetensors scan) was
-# removed; profile resolution goes through ``ensure_profile_registered``
-# (fold a fitted manifold / port a legacy folder).  ``resolve_pole`` no
-# longer canonicalizes against disk or flips a bipolar-pole sign, so the
-# ``honest`` → ``honest.deceptive`` canonicalization and the ``wolf`` →
-# ``deer.wolf @ -1`` sign flip those tests pinned are gone (now the
-# manifold tier's job, covered in test_steering_expr / test_manifold_role).
-
-
 # ---- manifold routes ----------------------------------------------------
 
 

@@ -103,7 +103,8 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
         print(f"extract failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    final_path = pathlib.Path(manifold_dir(ns, name)) / tensor_name
+    bare_name, _variant = _split_variant_suffix(name)
+    final_path = pathlib.Path(manifold_dir(ns, bare_name)) / tensor_name
     print(f"extracted {name} -> {final_path}")
 
 
@@ -114,8 +115,8 @@ _VARIANT_SUFFIX_RE = VARIANT_SUFFIX_RE
 def _split_variant_suffix(raw: str) -> tuple[str, str | None]:
     """Peel a trailing ``:<variant>`` off a selector string.
 
-    Returns ``(name_part, variant_or_None)``. ``variant`` is one of the
-    tensor suffixes understood by :func:`saklas.io.packs.enumerate_variants`.
+    Returns ``(name_part, variant_or_None)``. ``variant`` follows the suffix
+    grammar owned by :data:`saklas.io.paths.VARIANT_SUFFIX_RE`.
     Non-variant colon usage (``tag:``, ``namespace:``, ``model:``) passes
     through unchanged with ``variant=None`` — those prefixes are caught by
     ``sel.parse`` later.

@@ -107,12 +107,11 @@ _materialized_home: Path | None = None
 
 # ====================================================== bundled materialization ===
 #
-# Parallel to ``saklas.io.packs.materialize_bundled`` but for the
-# manifold artifact kind.  Bundled manifolds live under
+# Bundled manifolds live under
 # ``saklas/data/manifolds/<name>/`` in the wheel and materialize into
 # ``~/.saklas/manifolds/default/<name>/`` on session startup.  JSON-only
 # on the shipped side — per-model ``.safetensors`` fits are produced on
-# the user's machine via ``saklas manifold discover``.
+# the user's machine via ``saklas manifold fit``.
 
 
 def _bundled_manifest_node_filenames(pkg_root: Any) -> set[str] | None:
@@ -349,9 +348,8 @@ def materialize_bundled_manifolds() -> None:
     """Copy bundled manifolds into ``~/.saklas/manifolds/default/``.
 
     For each complete ``saklas/data/manifolds/<name>/`` in the wheel, ensure
-    ``~/.saklas/manifolds/default/<name>/`` is current.  Mirrors
-    :func:`saklas.io.packs.materialize_bundled` for the manifold artifact
-    kind; only touches ``manifold.json`` and ``nodes/*.json`` since
+    ``~/.saklas/manifolds/default/<name>/`` is current. It only touches
+    ``manifold.json`` and ``nodes/*.json`` since
     bundled manifolds ship JSON-only (no per-model ``.safetensors`` —
     those are user-side fits). Non-JSON filesystem metadata is ignored.
 

@@ -50,7 +50,7 @@ Roles are handled dynamically:
 - **model writes** selects the role the model continues as (or `none` to just append);
 - the cast button lets you assign steering to specific roles.
 
-It supports arbitrary roles beyond 'user' and 'assistant' too.
+Compatible chat templates support arbitrary role labels beyond `user` and `assistant`.
 
 Raw mode exposes one raw buffer for base models.
 
@@ -168,9 +168,8 @@ invariants are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ### Monitoring
 
-A reading includes coordinates in the fitted frame, the fraction of activation 
-inside the full subspace, the nearest node, and for curved manifolds, the off-manifold 
-residual.
+A reading includes fitted coordinates, the centered activation's subspace share,
+nearest nodes, and, for curved manifolds, residual and tube membership.
 
 ### Jacobian lens
 
@@ -180,7 +179,7 @@ Saklas lets you use one of the published J-lens artifacts, or fit your own.
 
 ### Sparse autoencoders
 
-Saklas can either use a published SAELens release or train a local SAE. 
+Saklas can either use a published SAELens release or train a local SAE.
 
 ## Installation
 

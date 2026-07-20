@@ -424,10 +424,3 @@ def test_bare_atom_cross_manifold_label_collision_raises(
     sel.invalidate()
     with pytest.raises(sel.AmbiguousSelectorError):
         sel.resolve_bare_atom("pirate")
-
-
-# NOTE: ``test_materialize_then_invalidate_makes_bundled_visible`` was deleted
-# in 4.0 — it pinned the now-removed ``packs.bundled_concept_names()`` /
-# ``packs.materialize_bundled()`` ``vectors/``-pack visibility contract.
-# Bundled concepts ship as manifolds now
-# (``saklas.io.manifolds.materialize_bundled_manifolds``).

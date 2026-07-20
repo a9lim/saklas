@@ -31,7 +31,7 @@ PROFILE_FORMAT_VERSION = 5
 def hash_file(path: Path) -> str:
     """Return hex sha256 of a file's contents.
 
-    Shared by the pack and manifold integrity manifests
+    Shared by artifact integrity manifests
     (:func:`saklas.io.manifolds.hash_manifold_files` imports this).
     """
     h = hashlib.sha256()
