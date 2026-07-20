@@ -62,11 +62,3 @@ def test_profile_save_roundtrip_uses_format_version(tmp_path: Path):
     # Round-trip the Profile.load path too.
     back = Profile.load(path)
     assert back.layers == [0, 1]
-
-
-# NOTE: the three ``test_pack_metadata_*`` tests were deleted in 4.0 —
-# ``saklas.io.packs.PackMetadata`` (the ``vectors/`` ``pack.json`` dataclass
-# and its ``format_version`` load gate) was removed.  Concepts ship as
-# manifolds now; the manifold-side ``format_version`` gate is covered by the
-# ``MANIFOLD_FORMAT_VERSION`` tests in ``test_manifold_format.py``.  The
-# ``save_profile`` / ``Profile`` sidecar ``format_version`` checks above stay.

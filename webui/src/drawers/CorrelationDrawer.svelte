@@ -1,14 +1,11 @@
 <script lang="ts">
   import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Correlation overlay — N×N magnitude-weighted cosine matrix across
-  // every registered steering vector AND every active probe.  Replaces
-  // the v1.7 inline ReferenceCollapsibles' correlation section with a
-  // drawer-style overlay so the rack zone reclaims that vertical space
-  // and so the matrix has room to breathe at larger N.
+  // every registered steering profile and every active probe.
   //
-  // Data: GET /correlation with no ``names=`` filter — the server-side
-  // pool unions session.vectors and monitor.probe_names so probes that
-  // were never registered as steering vectors still show up.
+  // Data: GET /saklas/v1/sessions/{id}/correlation with no ``names=`` filter —
+  // the server-side pool unions registered profiles and monitor probes, so
+  // probe-only names still show up.
   //
   // Layout mirrors TokenDrilldownDrawer: header (title + ✕) · sticky-
   // header table body · footer hint.  Cells reuse <HeatmapCell showValue>

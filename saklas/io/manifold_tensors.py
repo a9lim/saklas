@@ -460,8 +460,7 @@ def save_manifold(
         # carried on a ``fit_mode="baked"`` manifold produced by
         # :func:`saklas.io.bake.merge_into_manifold`.  Informational only — a
         # baked manifold never re-fits, so nothing branches on it; surfaced
-        # by the inspector the way the legacy pack sidecar's ``components``
-        # was.  Absent on every non-merge fit.
+        # by the inspector. Absent on every non-merge fit.
         "components", "bake_policy",
         # Cross-model transfer provenance. Persisted in the initial sidecar so
         # pair publication has no post-save patch crash window.
@@ -725,4 +724,3 @@ def _load_manifold_locked(
     )
     manifold.validate_runtime_geometry()
     return manifold
-

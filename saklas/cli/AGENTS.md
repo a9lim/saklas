@@ -139,8 +139,8 @@ category list through verbatim (tagged concepts only, no multi-node sweep).
 Serve then enables a compatible J-lens when present. For a web-enabled serve it
 also restores the active SAE or chooses the strongest compatible official,
 Neuronpedia-backed provider release (canonical/curated variants first), loads it,
-and enables the 12-card live SAE readout; `--no-web` skips implicit SAE discovery
-and acquisition.
+and enables its live readout at the generation-resolved alternatives width
+(fallback 8); `--no-web` skips implicit SAE discovery and acquisition.
 
 ## Flags
 
@@ -251,7 +251,7 @@ and acquisition.
   histogram (16 buckets) + sidecar diagnostics.
 - `pack`: lifecycle + inspection. `ls [--namespace NS] [-v|-j]`, `show <name> [-j]`,
   `install <target> [-a NS/N] [-f]` (pulls an HF manifold or copies a local folder,
-  salvaging a legacy saklas-pack repo), `search [query] [-v|-j]`,
+  validating the current manifold format), `search [query] [-v|-j]`,
   `push <selector> [-a OWNER/N] [-m] [-p/--private] [-d/--dry-run]
   [--variant raw|sae|all]` (HF upload, CLI-only), `rm <selector> [-y]`,
   `clear <selector> [-m] [--variant raw|sae|all]` (drop per-model fitted tensors;
@@ -278,7 +278,7 @@ and acquisition.
   `--checkpoint-every N` (25,
   writes a self-contained checkpoint directly from the live accumulator; the
   full artifact is written durably once at finalization),
-  `--layers L1,L2,...|workspace` (restrict source layers — skips
+  `--layers L1,L2,...|workspace|all` (restrict source layers — skips
   all forward-graph and backward work below the lowest one, the one real
   wall-time lever; `sample` is rejected for fitting because it still includes
   layer 0 and is artifact-size/debug only), `-f/--force` (restart from zero

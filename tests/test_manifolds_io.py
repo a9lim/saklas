@@ -212,8 +212,7 @@ def test_stale_format_version_raises(tmp_path: Path):
 
 
 def test_newer_format_version_raises(tmp_path: Path):
-    # Symmetric ceiling, mirroring PackMetadata.load — a manifold authored
-    # by a future saklas (format_version > local) must not load silently.
+    # A manifold authored by a future Saklas must not load silently.
     folder = _author_manifold(tmp_path)
     meta = json.loads((folder / "manifold.json").read_text())
     meta["format_version"] = MANIFOLD_FORMAT_VERSION + 1
@@ -352,8 +351,7 @@ def test_integrity_check_catches_tampering(tmp_path: Path):
 
 
 def test_missing_sidecar_raises(tmp_path: Path):
-    # A fitted .safetensors without its .json sidecar is a corrupt folder —
-    # the same invariant ConceptFolder.load enforces for packs.
+    # A fitted .safetensors without its .json sidecar is a corrupt folder.
     folder = _author_manifold(tmp_path)
     _add_dummy_tensor(folder)
     (folder / "stub-model.json").unlink()

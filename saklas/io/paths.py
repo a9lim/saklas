@@ -113,7 +113,7 @@ def ensure_within(root: Path, *parts: str) -> Path:
     Path-traversal barrier for user-supplied path components — namespaces,
     concept / manifold names, model ids, and manifest-relative filenames all
     reach the filesystem layer from HTTP request bodies, CLI args, and
-    downloaded ``pack.json`` / ``manifold.json`` manifests. A ``..`` segment
+    downloaded artifact manifests. A ``..`` segment
     or an absolute component must not be allowed to escape the ``~/.saklas/``
     subtree.
 

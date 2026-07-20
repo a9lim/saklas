@@ -17,8 +17,9 @@
   import type { ReplayReadout } from "./readout.svelte";
   import EmptyState from "./EmptyState.svelte";
   import PinnedReadings from "./PinnedReadings.svelte";
-  import DetailSummary from "./DetailSummary.svelte";
+  import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
+  import DetailCardHeader from "./DetailCardHeader.svelte";
 
   let {
     readout,
@@ -47,44 +48,6 @@
   );
 
   const layerCount = $derived(readout.data?.layers.length ?? 0);
-  const aggregate = $derived(readout.data?.aggregate ?? []);
-  const leadingAggregate = $derived(aggregate[0] ?? null);
-  const producedRanks = $derived.by<number[]>(() => {
-    const tokenId = readout.data?.token_id;
-    if (tokenId == null) return [];
-    const ranks: number[] = [];
-    for (const row of readout.data?.layers ?? []) {
-      const rank = row.tokens.findIndex((token) => token.id === tokenId);
-      if (rank >= 0) ranks.push(rank + 1);
-    }
-    return ranks;
-  });
-  const bestProducedRank = $derived(
-    producedRanks.length > 0 ? Math.min(...producedRanks) : null,
-  );
-
-  const summaryMetrics = $derived([
-    {
-      label: "fitted layers",
-      value: String(layerCount),
-      detail: "all requested lens layers",
-    },
-    {
-      label: "rank width",
-      value: String(columnCount),
-      detail: "vocabulary candidates per layer",
-    },
-    {
-      label: "aggregate leader",
-      value: leadingAggregate ? displayToken(leadingAggregate.token) : "—",
-      detail: leadingAggregate ? `mean p ${leadingAggregate.strength.toFixed(3)}` : "no aggregate readout",
-    },
-    {
-      label: "generated token hits",
-      value: `${producedRanks.length}/${layerCount}`,
-      detail: bestProducedRank == null ? "below retained ranks" : `best rank #${bestProducedRank}`,
-    },
-  ]);
 
   function cellStyle(logprob: number): string {
     const p = Math.min(1, Math.exp(logprob));
@@ -143,17 +106,13 @@
 {:else if readout.error}
   <EmptyState title={`readout: ${readout.error}`} />
 {:else if readout.data}
-  <DetailSummary
-    accent="var(--pillar-lens)"
-    eyebrow="j-lens"
-    title="Workspace trajectory"
-    description="What each fitted layer was disposed to say at the forward that produced this token, from early syntax to late lexical commitment."
-    metrics={summaryMetrics}
+  <InstrumentHeader
     origin={readout.origin}
     source={readout.source}
     steering={readout.data.steering}
     bind:steered
     {showToggle}
+    accent="var(--pillar-lens)"
   />
   {#if pinned && Object.keys(pinned).length > 0}
     <PinnedReadings readings={pinned} accent="--pillar-lens" shape="square" />
@@ -176,14 +135,14 @@
               active={chip.token.trim() === readout.data.token_text.trim()}
             >
               {#snippet statline()}
-                <span class="agg-rank">#{i + 1}</span>
-                <code class="agg-token">{displayToken(chip.token)}</code>
-                <span class="agg-depth">@{chip.com.toFixed(2)} ±{chip.spread.toFixed(2)}</span>
-                {#if chip.token.trim() === readout.data?.token_text.trim()}
-                  <span class="generated">generated</span>
-                {/if}
-                <span class="spacer"></span>
-                <span class="agg-strength">{chip.strength.toFixed(3)}</span>
+                <DetailCardHeader
+                  primary={displayToken(chip.token)}
+                  meta={`@${chip.com.toFixed(2)} ±${chip.spread.toFixed(2)}`}
+                  metaTitle="depth center of mass ± spread"
+                  badge={chip.token.trim() === readout.data?.token_text.trim() ? "generated" : null}
+                >
+                  {#snippet lead()}<span>#{i + 1}</span>{/snippet}
+                </DetailCardHeader>
               {/snippet}
               {#snippet body()}
                 <ProbeReadingRow ariaLabel={`Strength ${chip.strength.toFixed(3)}`}>
@@ -265,39 +224,6 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
   }
-  .agg-rank,
-  .agg-depth,
-  .agg-strength,
-  .generated {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .agg-rank,
-  .agg-strength {
-    color: var(--pillar-lens);
-    font-family: var(--font-mono);
-  }
-  .agg-token {
-    color: var(--fg);
-    background: transparent;
-    font-size: var(--text-sm);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .generated {
-    color: var(--fg);
-    background: color-mix(in srgb, var(--pillar-lens) 12%, transparent);
-    border-radius: var(--radius-sm);
-    padding: 1px var(--space-2);
-  }
-  .spacer {
-    flex: 1 1 auto;
-    min-width: 0;
-  }
   .row-label,
   .row-context,
   .row-value {
@@ -310,10 +236,11 @@
   .row-value {
     text-align: right;
   }
+  .row-value {
+    color: var(--pillar-lens);
+  }
 
   .grid-scroll {
-    overflow: auto;
-    max-height: 520px;
     border-radius: var(--radius-lg);
     background: var(--bg);
     box-shadow: var(--shadow-rack);

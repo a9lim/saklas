@@ -63,16 +63,6 @@ def test_temp_path_same_directory(tmp_path: Path):
     p = tmp_path / "subdir" / "x.json"
     assert _temp_path(p).parent == p.parent
 
-
-# NOTE: the ``vectors/``-pack crash-recovery + ``format_version`` + materialize
-# tests were deleted in 4.0 — ``saklas.io.packs.ConceptFolder`` /
-# ``PackMetadata`` / ``materialize_bundled`` were removed.  The orphan-``.tmp``
-# recovery and future-/stale-``format_version`` gate now live on the manifold
-# artifact (``ManifoldFolder.load`` / ``MANIFOLD_FORMAT_VERSION``,
-# ``materialize_bundled_manifolds``), covered by the manifold-format tests.
-# The atomic-write primitive tests above are frontend-agnostic and stay.
-
-
 def test_atomic_overwrite_preserves_prior_on_simulated_crash(tmp_path: Path):
     """If the .tmp file is written but the ``os.replace`` step never lands
     (the canonical crash window), the original file is byte-identical to
@@ -151,11 +141,3 @@ def test_windows_access_denied_process_is_treated_as_live(
 
     monkeypatch.setattr(ctypes, "windll", _Windll(), raising=False)
     assert atomic._windows_process_exists(42)
-
-
-# NOTE: ``test_pack_metadata_future_format_version_*`` and the two
-# ``test_materialize_*_statements`` tests were deleted in 4.0 along with the
-# ``vectors/``-pack machinery they exercised (``ConceptFolder`` /
-# ``PackMetadata.load`` future-version gate; ``materialize_bundled``'s
-# user-edited-``statements.json`` preservation).  The manifold analogues live
-# in the manifold-format / materialize tests.

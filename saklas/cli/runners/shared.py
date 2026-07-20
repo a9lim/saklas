@@ -63,14 +63,9 @@ def _make_session(args: argparse.Namespace, *, load_probes: bool = True):
     # ``--no-dls`` opts out of the discriminative-layer mask.  The flag and
     # YAML are already merged onto ``args`` by ``_load_effective_config``.
     dls = not bool(getattr(args, "no_dls", False))
-    # ``--compile`` and ``--cuda-graphs`` opt *in* to the CUDA-side
-    # perf path.  Defaults are off — compile's per-token speedup is
-    # variable (~1.2–3× when it works, ~equal otherwise), the
-    # ~25–50s upfront cost rarely pays off on interactive workloads,
-    # and torch 2.12's inductor has known codegen bugs on newer
-    # architectures (Gemma-4, Qwen3.5).  YAML ``compile: true`` /
-    # ``cuda_graphs: true`` are folded onto ``args.compile`` /
-    # ``args.cuda_graphs`` in ``_load_effective_config``.
+    # ``--compile`` opts into CUDA/MPS compilation; ``--cuda-graphs`` adds
+    # the CUDA-only StaticCache/graph path. YAML values are folded onto these
+    # argparse fields by ``_load_effective_config``.
     compile_enabled = bool(getattr(args, "compile", False))
     cuda_graphs_enabled = bool(getattr(args, "cuda_graphs", False))
     # Phase 1 logit pass: session-level default for top-K alternatives

@@ -272,6 +272,8 @@ webui/src/
       readout.svelte.ts       # ReplayReadout — one captured-or-replay resource per family
       drilldown.svelte.ts     # page-session sticky tab state (default: lens)
       InstrumentHeader.svelte # shared provenance · source · steering · apply-recipe row
+      DetailCardHeader.svelte # fixed lead slot + shared primary/meta/tail statline type scale
+      EvidenceChips.svelte    # shared quiet pills for geometry + SAE supporting facts
       TokenRibbon.svelte      # windowed clickable context strip (highlight-probe tinted)
       PinnedReadings.svelte   # instruments.<family>.readings rows for the lens/sae tabs
       EmptyState.svelte       # standardized reason + action empty state
@@ -469,6 +471,27 @@ three replay families share one `ReplayReadout` resource
 provenance row — origin · source · steering chip · `apply recipe steering`
 toggle, so the sae tab now has the unsteered counterfactual too. Captured rows
 show their provenance and source even if that instrument is no longer active.
+The tabs intentionally start with this compact provenance row rather than a
+hero summary / metric grid; the evidence cards already carry the useful values.
+The drawer header likewise keeps the generation recipe but omits the redundant
+model / loom-node / perplexity / finish facts. Geometry probe cards use the same
+responsive two-column desktop grid as the other card-based drilldown views
+(collapsing to one column below 820 px); their statline does not repeat the
+subspace percentage, and the fraction row keeps only the nearest label while
+the detailed distances remain in the chips below. Every evidence-card statline
+now goes through `DetailCardHeader`: a fixed 24 px leading slot puts ranks and
+family markers on one x-origin, while the primary identifier is uniformly
+`--text-sm` with one line-height and baseline across geometry, logits, SAE,
+J-lens aggregate, and pinned cards. `EvidenceChips` likewise gives geometry
+distances / tube facts and SAE activation / maxActApprox metadata one compact
+supporting-fact grammar; SAE does not repeat the already-explicit `unit
+strength` label. Logit and J-lens aggregate statlines likewise omit the
+probability / strength value already present beside the canonical meter (pinned
+probe cards follow the same rule); that meter value carries the pillar hue
+instead (blue for logits / lens, gold for SAE). The J-lens layer × vocabulary
+matrix has no fixed height or nested
+vertical scroller: it expands to its full table height and the drawer body owns
+the scroll, with the matrix header staying sticky in that outer flow.
 The header carries the token's identity chips (turn · role · segment — the
 segment chip jumps thinking ⇄ response — vocabulary `id`, `raw` decode index
 or a `no replay` marker, and the chosen `p / logp / rank` when captured) over a

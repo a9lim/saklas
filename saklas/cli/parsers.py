@@ -154,30 +154,17 @@ def _add_injection_args(p: argparse.ArgumentParser) -> None:
     """
     p.add_argument(
         "--no-dls", dest="no_dls", action="store_true",
-        help="Disable the discriminative-layer-selection mask at "
-             "extraction time.  v2.1 introduced centered DLS (Dang & "
-             "Ngo 2026, Eq. 9) as the default: layers where pos- and "
-             "neg-class means project to the same side of the neutral "
-             "baseline along ``d̂`` are dropped — they encode concept "
-             "intensity rather than concept polarity.  Pass ``--no-dls`` "
-             "to keep every layer.",
+        help="Keep every extracted layer instead of dropping layers whose "
+             "fitted poles do not straddle the neutral baseline.",
     )
     p.add_argument(
         "--compile", dest="compile", action="store_true",
-        help="Enable ``torch.compile`` on CUDA or MPS.  Off by default — the "
-             "compile path is intermittently broken on torch 2.12 for "
-             "newer architectures (Gemma-4, Qwen3.5 hit inductor "
-             "codegen bugs), and on interactive workloads the ~25–50s "
-             "compile cost rarely pays off against the per-token speedup "
-             "it delivers when it works (~1.4–1.7× on MPS, 1.2–3× on "
-             "CUDA).  Pass this for sustained workloads (long-running "
-             "serve, batch eval) where the upfront cost amortizes.  On "
-             "MPS the fused fast path engages for unsteered AND "
-             "static-affine *steered* generation (the steering lowers to "
-             "persistent compile-clean offset hooks); only *probed* gens "
-             "(a live per-token monitor roster) still fall back to eager "
-             "for now — no regression, just no speedup there yet.  CPU is "
-             "still a no-op.  YAML equivalent: ``compile: true``.",
+        help="Enable ``torch.compile`` on CUDA or MPS. Off by default because "
+             "of its upfront cost and architecture-specific compiler failures. "
+             "Unsteered and static-affine generations, including live probes, "
+             "use the persistent compiled path; dynamic or transient-hook "
+             "work falls back to eager. CPU is a no-op. YAML equivalent: "
+             "``compile: true``.",
     )
     p.add_argument(
         "--cuda-graphs", dest="cuda_graphs", action="store_true",
@@ -254,9 +241,8 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "chat template whose assistant-role label is replaced by SLUG "
              "(e.g. 'pirate'), so the fit lives in role-baselined activation "
              "space. The role bakes into the generated node corpora and the "
-             "fit writes the canonical tensor (there is no separate "
-             "canonical tensor, and cross-session ``:role-<slug>`` "
-             "selection isn't wired up yet). Slug must match ``[a-z0-9._-]+``. "
+             "fit writes the canonical tensor and returns its "
+             "``:role-<slug>`` selector. Slug must match ``[a-z0-9._-]+``. "
              "Mutually exclusive with ``--sae``. Mistral-3 families don't "
              "carry a substitutable role label and raise at runtime.",
     )
@@ -915,13 +901,13 @@ def _build_lens_fit(p: argparse.ArgumentParser) -> None:
              "at finalization.",
     )
     p.add_argument(
-        "--layers", default=None, metavar="L1,L2,...|workspace",
+        "--layers", default=None, metavar="L1,L2,...|workspace|all",
         help="Fit only these source layers (default: every layer below the "
              "final one). Restricting to the workspace band — roughly the "
              "40-90%% depth the jlens/<word> atoms use — skips the backward "
              "work below the lowest requested layer and shrinks the artifact; "
              "readout surfaces then cover only the fitted layers. Pass "
-             "`workspace` as shorthand for that band.",
+             "`workspace` as shorthand for that band or `all` explicitly.",
     )
     p.add_argument(
         "-f", "--force", action="store_true",
@@ -1203,11 +1189,7 @@ def _build_experiment_fan(p: argparse.ArgumentParser) -> None:
 
 
 def _build_experiment_transcript_parser(parser: argparse.ArgumentParser) -> None:
-    """``saklas experiment transcript`` — replay saved tree paths.
-
-    Phase 5 ships ``run`` only; future verbs (``ls``, ``diff``) compose
-    on top of the same schema.
-    """
+    """``saklas experiment transcript`` — replay saved tree paths."""
     sub = parser.add_subparsers(dest="transcript_cmd", required=False, metavar="VERB")
 
     run = sub.add_parser(

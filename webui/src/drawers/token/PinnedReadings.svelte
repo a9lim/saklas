@@ -17,6 +17,7 @@
   } from "../../panels/rack/RackMarker.svelte";
   import type { ProbeReadingJSON } from "../../lib/types";
   import DetailSection from "./DetailSection.svelte";
+  import DetailCardHeader from "./DetailCardHeader.svelte";
 
   let {
     readings,
@@ -79,18 +80,16 @@
         {@const cells = stripCells(reading)}
         <RackCard {accent} disabled={false}>
           {#snippet statline()}
-            <RackMarker {shape} filled />
-            <code class="pinned-name" title={`probe ${name}`}>{name}</code>
-            {#if reading.depth_com && reading.depth_com[0] != null}
-              <span
-                class="pinned-com"
-                title={`depth center of mass ±${(reading.depth_spread?.[0] ?? 0).toFixed(2)} (0 = first block, 1 = last)`}
-              >
-                @{reading.depth_com[0].toFixed(2)} ±{(reading.depth_spread?.[0] ?? 0).toFixed(2)}
-              </span>
-            {/if}
-            <span class="spacer"></span>
-            <span class="pinned-value">{(reading.coords[0] ?? 0).toFixed(3)}</span>
+            <DetailCardHeader
+              primary={name}
+              primaryTitle={`probe ${name}`}
+              meta={reading.depth_com && reading.depth_com[0] != null
+                ? `@${reading.depth_com[0].toFixed(2)} ±${(reading.depth_spread?.[0] ?? 0).toFixed(2)}`
+                : null}
+              metaTitle="depth center of mass ± spread (0 = first block, 1 = last)"
+            >
+              {#snippet lead()}<RackMarker {shape} filled />{/snippet}
+            </DetailCardHeader>
           {/snippet}
           {#snippet body()}
             <ProbeReadingRow ariaLabel={`Pinned probe ${name}`}>
@@ -128,31 +127,12 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
   }
-  .pinned-name {
-    color: var(--fg);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .pinned-com {
-    color: var(--fg-dim);
-    font-family: var(--font-mono);
-    font-size: var(--text-2xs);
-    font-variant-numeric: tabular-nums;
-  }
   .pinned-value {
-    color: var(--fg);
+    color: var(--card-accent);
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     text-align: right;
-  }
-  .spacer {
-    flex: 1 1 auto;
-    min-width: 0;
   }
   .row-label {
     color: var(--fg-muted);
