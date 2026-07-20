@@ -19,6 +19,7 @@
   import PinnedReadings from "./PinnedReadings.svelte";
   import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
+  import DetailCardHeader from "./DetailCardHeader.svelte";
 
   let {
     readout,
@@ -134,14 +135,14 @@
               active={chip.token.trim() === readout.data.token_text.trim()}
             >
               {#snippet statline()}
-                <span class="agg-rank">#{i + 1}</span>
-                <code class="agg-token">{displayToken(chip.token)}</code>
-                <span class="agg-depth">@{chip.com.toFixed(2)} ±{chip.spread.toFixed(2)}</span>
-                {#if chip.token.trim() === readout.data?.token_text.trim()}
-                  <span class="generated">generated</span>
-                {/if}
-                <span class="spacer"></span>
-                <span class="agg-strength">{chip.strength.toFixed(3)}</span>
+                <DetailCardHeader
+                  primary={displayToken(chip.token)}
+                  meta={`@${chip.com.toFixed(2)} ±${chip.spread.toFixed(2)}`}
+                  metaTitle="depth center of mass ± spread"
+                  badge={chip.token.trim() === readout.data?.token_text.trim() ? "generated" : null}
+                >
+                  {#snippet lead()}<span>#{i + 1}</span>{/snippet}
+                </DetailCardHeader>
               {/snippet}
               {#snippet body()}
                 <ProbeReadingRow ariaLabel={`Strength ${chip.strength.toFixed(3)}`}>
@@ -223,39 +224,6 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
   }
-  .agg-rank,
-  .agg-depth,
-  .agg-strength,
-  .generated {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .agg-rank,
-  .agg-strength {
-    color: var(--pillar-lens);
-    font-family: var(--font-mono);
-  }
-  .agg-token {
-    color: var(--fg);
-    background: transparent;
-    font-size: var(--text-sm);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .generated {
-    color: var(--fg);
-    background: color-mix(in srgb, var(--pillar-lens) 12%, transparent);
-    border-radius: var(--radius-sm);
-    padding: 1px var(--space-2);
-  }
-  .spacer {
-    flex: 1 1 auto;
-    min-width: 0;
-  }
   .row-label,
   .row-context,
   .row-value {
@@ -268,10 +236,11 @@
   .row-value {
     text-align: right;
   }
+  .row-value {
+    color: var(--pillar-lens);
+  }
 
   .grid-scroll {
-    overflow: auto;
-    max-height: 520px;
     border-radius: var(--radius-lg);
     background: var(--bg);
     box-shadow: var(--shadow-rack);

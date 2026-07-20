@@ -19,6 +19,8 @@
   import EmptyState from "./EmptyState.svelte";
   import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
+  import DetailCardHeader from "./DetailCardHeader.svelte";
+  import EvidenceChips from "./EvidenceChips.svelte";
 
   let {
     readout,
@@ -95,6 +97,36 @@
     if (curved) return 1; // fraction strip is already in [0, 1]
     return probeAxisScale(name, 0);
   }
+
+  function geometryEvidence(reading: ProbeReadingJSON) {
+    return [
+      ...(reading.nearest ?? []).map(([label, dist]) => ({
+        label,
+        value: `d=${dist.toFixed(2)}`,
+        title: `whitened distance ${dist.toFixed(3)}`,
+      })),
+      ...(reading.assignment ?? []).map(([label, prob]) => ({
+        label: `~${label}`,
+        value: `${(prob * 100).toFixed(0)}%`,
+        title: `soft-assignment posterior ${(prob * 100).toFixed(1)}%`,
+        soft: true,
+      })),
+      ...(reading.residual !== 0
+        ? [{
+            label: "residual",
+            value: reading.residual.toFixed(3),
+            title: "normalized off-surface distance",
+          }]
+        : []),
+      ...(reading.membership != null
+        ? [{
+            label: "membership",
+            value: reading.membership.toFixed(3),
+            title: "tube-fit density",
+          }]
+        : []),
+    ];
+  }
 </script>
 
 {#if readout.loading}
@@ -121,18 +153,23 @@
         {@const cells = stripCells(name, reading)}
         {@const affine = affineOf(name, reading)}
         {@const cardAccent = affine ? "--pillar-subspace" : "--pillar-manifold"}
+        {@const evidence = geometryEvidence(reading)}
         <RackCard accent={cardAccent} disabled={false}>
           {#snippet statline()}
-            <RackMarker shape={affine ? "circle" : "diamond"} filled />
-            <code class="geo-name">{name}</code>
-            <span class="family">{affine ? "subspace" : "manifold"}</span>
-            {#if reading.depth_com?.[0] != null}
-              <span class="depth" title="depth center of mass ± spread">
-                @{reading.depth_com[0].toFixed(2)} ±{(reading.depth_spread?.[0] ?? 0).toFixed(2)}
-              </span>
-            {/if}
-            <span class="spacer"></span>
-            <span class="fraction-stat">{(reading.fraction * 100).toFixed(0)}% in-subspace</span>
+            <DetailCardHeader
+              primary={name}
+              primaryTitle={name}
+              secondary={affine ? "subspace" : "manifold"}
+              secondaryAccent
+              meta={reading.depth_com?.[0] != null
+                ? `@${reading.depth_com[0].toFixed(2)} ±${(reading.depth_spread?.[0] ?? 0).toFixed(2)}`
+                : null}
+              metaTitle="depth center of mass ± spread"
+            >
+              {#snippet lead()}
+                <RackMarker shape={affine ? "circle" : "diamond"} filled />
+              {/snippet}
+            </DetailCardHeader>
           {/snippet}
           {#snippet body()}
             <ProbeReadingRow ariaLabel={`Subspace fraction ${reading.fraction.toFixed(3)}`}>
@@ -143,7 +180,7 @@
               {#snippet middle()}
                 {#if (reading.nearest ?? []).length > 0}
                   <span class="nearest">
-                    {reading.nearest[0][0]} · d={reading.nearest[0][1].toFixed(2)}
+                    {reading.nearest[0][0]}
                   </span>
                 {/if}
               {/snippet}
@@ -178,15 +215,6 @@
               {/snippet}
             </ProbeReadingRow>
             {/each}
-            <div class="meta">
-              <span>fraction <b>{reading.fraction.toFixed(3)}</b></span>
-              {#if reading.residual !== 0}
-                <span title="normalized off-surface distance">residual <b>{reading.residual.toFixed(3)}</b></span>
-              {/if}
-              {#if reading.membership != null}
-                <span title="tube-fit density">membership <b>{reading.membership.toFixed(3)}</b></span>
-              {/if}
-            </div>
             {#if cells.length > 0}
               <LayerStrip
                 {cells}
@@ -195,23 +223,7 @@
                 ariaLabel={`${name} per-layer readings`}
               />
             {/if}
-            {#if (reading.nearest ?? []).length > 0 || (reading.assignment ?? []).length > 0}
-              <div class="geo-chips">
-                {#each reading.nearest ?? [] as [label, dist] (label)}
-                  <span class="geo-chip" title={`whitened distance ${dist.toFixed(3)}`}>
-                    {label} <span class="geo-chip-val">d={dist.toFixed(2)}</span>
-                  </span>
-                {/each}
-                {#each reading.assignment ?? [] as [label, prob] (label)}
-              <span
-                class="geo-chip geo-chip-soft"
-                title={`soft-assignment posterior ${(prob * 100).toFixed(1)}%`}
-              >
-                ~{label} <span class="geo-chip-val">{(prob * 100).toFixed(0)}%</span>
-              </span>
-                {/each}
-              </div>
-            {/if}
+            <EvidenceChips items={evidence} ariaLabel={`Geometry evidence for ${name}`} />
           {/snippet}
         </RackCard>
       {/each}
@@ -236,28 +248,6 @@
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
-  }
-  .geo-name {
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    color: var(--fg);
-    word-break: break-all;
-    min-width: 0;
-  }
-  .family,
-  .depth,
-  .fraction-stat {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .family {
-    color: var(--card-accent);
-  }
-  .spacer {
-    flex: 1 1 auto;
-    min-width: 0;
   }
   .geo-axis-label {
     color: var(--fg-muted);
@@ -288,43 +278,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    flex-wrap: wrap;
-    color: var(--fg-muted);
-    font-size: var(--text-2xs);
-  }
-  .meta b {
-    color: var(--fg-dim);
-    font-family: var(--font-mono);
-    font-weight: var(--weight-normal);
-    font-variant-numeric: tabular-nums;
-  }
-  .geo-chips {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-  }
-  .geo-chip {
-    color: var(--fg-muted);
-    font-family: var(--font-mono);
-    font-size: var(--text-2xs);
-    background: var(--glass);
-    border-radius: var(--radius-pill);
-    padding: var(--space-1) var(--space-3);
-    white-space: nowrap;
-  }
-  .geo-chip-soft {
-    color: var(--fg-dim);
-  }
-  .geo-chip-val {
-    color: var(--fg-dim);
-    font-variant-numeric: tabular-nums;
-  }
-
   @media (max-width: 820px) {
     .geo-list {
       grid-template-columns: 1fr;

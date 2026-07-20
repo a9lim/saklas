@@ -20,6 +20,8 @@
   import PinnedReadings from "./PinnedReadings.svelte";
   import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
+  import DetailCardHeader from "./DetailCardHeader.svelte";
+  import EvidenceChips from "./EvidenceChips.svelte";
 
   let {
     readout,
@@ -66,6 +68,22 @@
     return parts.join(" · ");
   }
 
+  function featureEvidence(f: SaeFeatureJSON) {
+    if (!(f.max_act != null && f.max_act > 0)) return [];
+    return [
+      {
+        label: "activation",
+        value: f.activation.toFixed(3),
+        title: `raw feature activation ${f.activation.toFixed(3)}`,
+      },
+      {
+        label: "maxActApprox",
+        value: f.max_act.toFixed(3),
+        title: `Neuronpedia maxActApprox ${f.max_act.toFixed(3)}`,
+      },
+    ];
+  }
+
 </script>
 
 {#if readout.loading}
@@ -97,16 +115,19 @@
       <div class="sae-list" role="list" aria-label="Top SAE features">
         {#each readout.data.features as feature, index (feature.id)}
           {@const strength = strengthOf(feature)}
+          {@const evidence = featureEvidence(feature)}
           <div role="listitem" title={rowTitle(feature)}>
             <RackCard accent="--pillar-sae" disabled={false}>
               {#snippet statline()}
-                <span class="sae-rank">#{index + 1}</span>
-                <code class="sae-id">sae/{feature.id}</code>
-                <span class="sae-label" title={feature.label ?? undefined}>
-                  {feature.label ?? "unlabeled feature"}
-                </span>
-                <span class="spacer"></span>
-                <span class="layer">L{readout.data?.layer ?? "—"}</span>
+                <DetailCardHeader
+                  primary={`sae/${feature.id}`}
+                  secondary={feature.label ?? "unlabeled feature"}
+                  secondaryTitle={feature.label ?? "unlabeled feature"}
+                  tail={`L${readout.data?.layer ?? "—"}`}
+                  tailTitle="resident SAE layer"
+                >
+                  {#snippet lead()}<span>#{index + 1}</span>{/snippet}
+                </DetailCardHeader>
               {/snippet}
               {#snippet body()}
                 <ProbeReadingRow ariaLabel={`Feature sae/${feature.id}`}>
@@ -137,11 +158,10 @@
                     </span>
                   {/snippet}
                 </ProbeReadingRow>
-                <div class="feature-meta">
-                  <span>activation <b>{feature.activation.toFixed(3)}</b></span>
-                  <span>maxActApprox <b>{feature.max_act != null ? feature.max_act.toFixed(3) : "—"}</b></span>
-                  <span>unit <b>{strength != null ? "strength" : "raw"}</b></span>
-                </div>
+                <EvidenceChips
+                  items={evidence}
+                  ariaLabel={`Metadata for feature sae/${feature.id}`}
+                />
               {/snippet}
             </RackCard>
           </div>
@@ -169,38 +189,6 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
   }
-  .sae-rank {
-    color: var(--pillar-sae);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    flex: 0 0 auto;
-  }
-  .sae-id {
-    color: var(--fg);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    white-space: nowrap;
-  }
-  .sae-label {
-    color: var(--fg-dim);
-    font-size: var(--text-xs);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    display: block;
-    min-width: 0;
-  }
-  .spacer {
-    flex: 1 1 auto;
-    min-width: 0;
-  }
-  .layer {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    flex: 0 0 auto;
-  }
   .row-label,
   .row-context {
     color: var(--fg-muted);
@@ -209,25 +197,11 @@
     text-align: right;
   }
   .sae-value {
-    color: var(--fg);
+    color: var(--pillar-sae);
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     text-align: right;
-  }
-  .feature-meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    flex-wrap: wrap;
-    color: var(--fg-muted);
-    font-size: var(--text-2xs);
-  }
-  .feature-meta b {
-    color: var(--fg-dim);
-    font-family: var(--font-mono);
-    font-weight: var(--weight-normal);
-    font-variant-numeric: tabular-nums;
   }
   @media (max-width: 760px) {
     .sae-list {

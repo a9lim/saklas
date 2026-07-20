@@ -13,6 +13,7 @@
   import EmptyState from "./EmptyState.svelte";
   import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
+  import DetailCardHeader from "./DetailCardHeader.svelte";
 
   let {
     token,
@@ -125,12 +126,13 @@
       {#each rankRows as row (row.rank)}
         <RackCard accent="--pillar-lens" disabled={false} active={row.chosen}>
           {#snippet statline()}
-            <span class="rank">#{row.rank}</span>
-            <code class="token">{JSON.stringify(row.text)}</code>
-            <span class="token-id">id {row.id}</span>
-            {#if row.chosen}<span class="chosen">generated</span>{/if}
-            <span class="spacer"></span>
-            <span class="prob">p {fmtProb(row.p)}</span>
+            <DetailCardHeader
+              primary={JSON.stringify(row.text)}
+              secondary={`id ${row.id}`}
+              badge={row.chosen ? "generated" : null}
+            >
+              {#snippet lead()}<span>#{row.rank}</span>{/snippet}
+            </DetailCardHeader>
           {/snippet}
           {#snippet body()}
             <ProbeReadingRow ariaLabel={`Probability ${fmtProb(row.p)}`}>
@@ -184,35 +186,6 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
   }
-  .rank,
-  .token-id,
-  .prob,
-  .chosen {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .rank,
-  .prob {
-    color: var(--pillar-lens);
-    font-family: var(--font-mono);
-  }
-  .token {
-    color: var(--fg);
-    background: transparent;
-    font-size: var(--text-sm);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .chosen {
-    color: var(--fg);
-    background: color-mix(in srgb, var(--pillar-lens) 12%, transparent);
-    border-radius: var(--radius-sm);
-    padding: 1px var(--space-2);
-  }
   .spacer {
     flex: 1 1 auto;
     min-width: 0;
@@ -233,6 +206,9 @@
   .row-label,
   .row-value {
     text-align: right;
+  }
+  .row-value {
+    color: var(--pillar-lens);
   }
   .row-meta {
     display: flex;
