@@ -1,14 +1,13 @@
 <script lang="ts">
   import DrawerCloseButton from "../lib/ui/DrawerCloseButton.svelte";
   // Pairwise compare drawer — cross-layer cosine matrix between two
-  // named steering vectors / probes.  Two dropdowns pick the pair (same
-  // pool the layer-norms drawer uses: registered vectors ∪ active
-  // probes); the body renders an L_A × L_B heatmap structurally akin to
+  // named steering profiles / probes. Two dropdowns pick from registered
+  // profiles and active probes; the body renders an L_A × L_B heatmap akin to
   // the correlation matrix, but indexed by layer rather than by name.
   //
-  // Data: GET /profiles/pairwise?a=&b= — the server falls back to monitor
-  // profiles when a name isn't a registered steering vector, so probe
-  // names resolve cleanly without a new endpoint.
+  // Data: GET /saklas/v1/sessions/{id}/profiles/pairwise?a=&b= — the server
+  // falls back to monitor profiles when a name isn't a registered steering
+  // profile, so probe names resolve cleanly without a new endpoint.
 
   import { apiProfiles, ApiError } from "../lib/api";
   import {

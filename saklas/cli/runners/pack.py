@@ -317,10 +317,8 @@ def _run_pack_clear(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import clear_manifold_tensors
 
     ns, name = _resolve_manifold_ns_name(args.selector)
-    # ``args.model`` is the raw model id; ``clear_manifold_tensors`` does
-    # the safe-id conversion at the io boundary, exactly as the pack
-    # ``cache_ops.delete_tensors`` path does (it passes ``args.model``
-    # straight through to ``enumerate_variants``).
+    # ``args.model`` is the raw model id; ``clear_manifold_tensors`` owns the
+    # safe-id conversion at the IO boundary.
     try:
         n = clear_manifold_tensors(ns, name, args.model, variant=args.variant)
     except FileNotFoundError as e:

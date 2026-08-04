@@ -174,8 +174,7 @@ def _pull_manifold_locked(
         except ManifoldFormatError as e:
             raise HFError(f"{coord}: staged manifold failed validation ({e})") from e
         # Record the HF coord as the manifold's source so ``refresh_manifold``
-        # can re-pull from the same place (mirrors how ``pull_pack``
-        # rewrites ``pack.json.source``).  ``write_metadata`` rebuilds the
+        # can re-pull from the same place. ``write_metadata`` rebuilds the
         # manifest from the just-loaded folder and re-hashes ``files`` —
         # so the staged manifest stays self-consistent for the re-validate
         # below.

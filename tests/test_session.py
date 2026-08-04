@@ -301,9 +301,9 @@ def test_return_hidden_round_trip(session: SaklasSession) -> None:
         assert h.device.type == "cpu"
 
     # Round-trip: re-score the captured dict and compare against the
-    # per-token scores the session computed inline. The fixture
-    # bootstraps with probes=["affect"]; if that invariant ever
-    # regresses, silent-skip would hide the real test.
+    # per-token scores the session computed inline. The fixture bootstraps
+    # with a probe roster; if that invariant ever regresses, silent-skip
+    # would hide the real test.
     assert session._monitor.probe_names, (
         "fixture must have probes loaded for round-trip coverage"
     )

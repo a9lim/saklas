@@ -6,18 +6,8 @@
   // with per-node indentation is fast enough for the trees we expect
   // (low hundreds of nodes).
   //
-  // Phase 3 scope:
-  //   * Tree render — active path bolded, dead branches dimmed.
-  //   * Click → navigate.
-  //   * Right-click → context menu (regenerate, edit, branch, navigate,
-  //     delete, star/unstar, add note).
-  //   * Keyboard within the sidebar: j/k siblings, h/l up/down,
-  //     Enter activates, s stars, n note, / fuzzy search.
-  //   * Modals for regenerate-N, edit text, branch text, delete confirm,
-  //     note text, fuzzy search.
-  //
-  // Phase-5 hooks (not wired):
-  //   * Pin to compare pane, fan-out grid, cross-branch diff.
+  // Supports navigation, editing and regeneration, search, starring and notes,
+  // compare pinning, fan-out, filtering, and cross-branch diff.
 
   import { onMount, tick } from "svelte";
   import {
@@ -361,9 +351,9 @@
     nodeId: string | null;
     text: string;
     n: number;
-    /** Phase-5: vector name for the fan-out modal. */
+    /** Steering selector for the fan-out modal. */
     vector?: string;
-    /** Phase-5: mode for the regen-with-modifier modal. */
+    /** Mode for the regen-with-modifier modal. */
     mode?: string;
     /** Inline validation error.  Non-empty means commit failed; the
      *  modal stays open with this message rendered below the input. */

@@ -11,8 +11,9 @@
   import { samplingState, sendFork, closeDrawer } from "../../lib/stores.svelte";
   import type { TokenScore } from "../../lib/types";
   import EmptyState from "./EmptyState.svelte";
-  import DetailSummary from "./DetailSummary.svelte";
+  import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
+  import DetailCardHeader from "./DetailCardHeader.svelte";
 
   let {
     token,
@@ -51,47 +52,6 @@
       chosen: token.tokenId != null && a.id === token.tokenId,
     }));
   });
-
-  const chosenRow = $derived(rankRows.find((row) => row.chosen) ?? null);
-  const tokenProbability = $derived(
-    token.logprob != null && Number.isFinite(token.logprob)
-      ? Math.exp(token.logprob)
-      : null,
-  );
-  const capturedMass = $derived(rankRows.reduce((sum, row) => sum + row.p, 0));
-  const probabilityMargin = $derived(
-    rankRows.length > 1 ? rankRows[0].p - rankRows[1].p : null,
-  );
-  const tokenPerplexity = $derived(
-    token.logprob != null && Number.isFinite(token.logprob)
-      ? Math.exp(-token.logprob)
-      : null,
-  );
-
-  const summaryMetrics = $derived([
-    {
-      label: "chosen probability",
-      value: tokenProbability == null ? "—" : fmtProb(tokenProbability),
-      detail: token.logprob == null ? "not captured" : `logp ${fmtLogprob(token.logprob)}`,
-    },
-    {
-      label: "chosen rank",
-      value: chosenRow ? `#${chosenRow.rank}` : "—",
-      detail: rankRows.length > 0 ? `of ${rankRows.length} retained` : "no alternatives retained",
-    },
-    {
-      label: "captured mass",
-      value: rankRows.length > 0 ? `${(capturedMass * 100).toFixed(1)}%` : "—",
-      detail: "sum of retained probabilities",
-    },
-    {
-      label: probabilityMargin == null ? "token perplexity" : "top-two margin",
-      value: probabilityMargin == null
-        ? (tokenPerplexity == null ? "—" : tokenPerplexity.toFixed(2))
-        : probabilityMargin.toFixed(4),
-      detail: probabilityMargin == null ? "exp(-logp)" : "absolute probability gap",
-    },
-  ]);
 
   let branchingRank = $state<number | null>(null);
   let branchError = $state<string | null>(null);
@@ -146,17 +106,13 @@
   }
 </script>
 
-<DetailSummary
-  accent="var(--pillar-lens)"
-  eyebrow="logits"
-  title="Sampling decision"
-  description="The exact post-temperature, post-top-p, post-top-k distribution from which this token was selected."
-  metrics={summaryMetrics}
+<InstrumentHeader
   origin="captured"
   source="sampler"
   steering={null}
   steered={true}
   showToggle={false}
+  accent="var(--pillar-lens)"
 />
 
 <DetailSection
@@ -170,12 +126,13 @@
       {#each rankRows as row (row.rank)}
         <RackCard accent="--pillar-lens" disabled={false} active={row.chosen}>
           {#snippet statline()}
-            <span class="rank">#{row.rank}</span>
-            <code class="token">{JSON.stringify(row.text)}</code>
-            <span class="token-id">id {row.id}</span>
-            {#if row.chosen}<span class="chosen">generated</span>{/if}
-            <span class="spacer"></span>
-            <span class="prob">p {fmtProb(row.p)}</span>
+            <DetailCardHeader
+              primary={JSON.stringify(row.text)}
+              secondary={`id ${row.id}`}
+              badge={row.chosen ? "generated" : null}
+            >
+              {#snippet lead()}<span>#{row.rank}</span>{/snippet}
+            </DetailCardHeader>
           {/snippet}
           {#snippet body()}
             <ProbeReadingRow ariaLabel={`Probability ${fmtProb(row.p)}`}>
@@ -229,35 +186,6 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
   }
-  .rank,
-  .token-id,
-  .prob,
-  .chosen {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .rank,
-  .prob {
-    color: var(--pillar-lens);
-    font-family: var(--font-mono);
-  }
-  .token {
-    color: var(--fg);
-    background: transparent;
-    font-size: var(--text-sm);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .chosen {
-    color: var(--fg);
-    background: color-mix(in srgb, var(--pillar-lens) 12%, transparent);
-    border-radius: var(--radius-sm);
-    padding: 1px var(--space-2);
-  }
   .spacer {
     flex: 1 1 auto;
     min-width: 0;
@@ -278,6 +206,9 @@
   .row-label,
   .row-value {
     text-align: right;
+  }
+  .row-value {
+    color: var(--pillar-lens);
   }
   .row-meta {
     display: flex;

@@ -17,8 +17,10 @@
   import type { ProbeReadingJSON } from "../../lib/types";
   import type { GeometryTokenReadout, ReplayReadout } from "./readout.svelte";
   import EmptyState from "./EmptyState.svelte";
-  import DetailSummary from "./DetailSummary.svelte";
+  import InstrumentHeader from "./InstrumentHeader.svelte";
   import DetailSection from "./DetailSection.svelte";
+  import DetailCardHeader from "./DetailCardHeader.svelte";
+  import EvidenceChips from "./EvidenceChips.svelte";
 
   let {
     readout,
@@ -48,71 +50,6 @@
   function affineOf(name: string, reading: ProbeReadingJSON): boolean {
     return probeRack.entries.get(name)?.info?.is_affine ?? reading.residual === 0;
   }
-
-  const affineCount = $derived(
-    rows.filter(([name, reading]) => affineOf(name, reading)).length,
-  );
-  const curvedCount = $derived(rows.length - affineCount);
-  const meanFraction = $derived(
-    rows.length > 0
-      ? rows.reduce((sum, [, reading]) => sum + reading.fraction, 0) / rows.length
-      : 0,
-  );
-
-  const strongest = $derived.by<{
-    name: string;
-    axis: number;
-    value: number;
-  } | null>(() => {
-    let best: { name: string; axis: number; value: number } | null = null;
-    for (const [name, reading] of rows) {
-      reading.coords.forEach((value, axis) => {
-        if (!best || Math.abs(value) > Math.abs(best.value)) {
-          best = { name, axis, value };
-        }
-      });
-    }
-    return best;
-  });
-
-  const closest = $derived.by<{
-    probe: string;
-    label: string;
-    distance: number;
-  } | null>(() => {
-    let best: { probe: string; label: string; distance: number } | null = null;
-    for (const [probe, reading] of rows) {
-      for (const [label, distance] of reading.nearest ?? []) {
-        if (!best || distance < best.distance) best = { probe, label, distance };
-      }
-    }
-    return best;
-  });
-
-  const summaryMetrics = $derived([
-    {
-      label: "probes",
-      value: String(rows.length),
-      detail: `${affineCount} subspace · ${curvedCount} manifold`,
-    },
-    {
-      label: "strongest coordinate",
-      value: strongest
-        ? `${strongest.value >= 0 ? "+" : ""}${strongest.value.toFixed(2)}`
-        : "—",
-      detail: strongest ? `${strongest.name} · c${strongest.axis}` : "no coordinate data",
-    },
-    {
-      label: "mean subspace share",
-      value: `${(meanFraction * 100).toFixed(1)}%`,
-      detail: "across the attached roster",
-    },
-    {
-      label: "nearest node",
-      value: closest?.label ?? "—",
-      detail: closest ? `${closest.probe} · d=${closest.distance.toFixed(2)}` : "no node distances",
-    },
-  ]);
 
   /** Axis label: the positive pole for a rank-1 two-node concept axis
    *  (coords axis 0 is pole-normalized, +1 at node 0), ``c<i>`` otherwise. */
@@ -160,6 +97,36 @@
     if (curved) return 1; // fraction strip is already in [0, 1]
     return probeAxisScale(name, 0);
   }
+
+  function geometryEvidence(reading: ProbeReadingJSON) {
+    return [
+      ...(reading.nearest ?? []).map(([label, dist]) => ({
+        label,
+        value: `d=${dist.toFixed(2)}`,
+        title: `whitened distance ${dist.toFixed(3)}`,
+      })),
+      ...(reading.assignment ?? []).map(([label, prob]) => ({
+        label: `~${label}`,
+        value: `${(prob * 100).toFixed(0)}%`,
+        title: `soft-assignment posterior ${(prob * 100).toFixed(1)}%`,
+        soft: true,
+      })),
+      ...(reading.residual !== 0
+        ? [{
+            label: "residual",
+            value: reading.residual.toFixed(3),
+            title: "normalized off-surface distance",
+          }]
+        : []),
+      ...(reading.membership != null
+        ? [{
+            label: "membership",
+            value: reading.membership.toFixed(3),
+            title: "tube-fit density",
+          }]
+        : []),
+    ];
+  }
 </script>
 
 {#if readout.loading}
@@ -167,17 +134,13 @@
 {:else if readout.error}
   <EmptyState title={`readout: ${readout.error}`} />
 {:else if readout.data && rows.length > 0}
-  <DetailSummary
-    accent="var(--pillar-subspace)"
-    eyebrow="geometry"
-    title="Activation geometry"
-    description="Where this token-producing residual sits inside every attached concept axis and fitted manifold."
-    metrics={summaryMetrics}
+  <InstrumentHeader
     origin={readout.origin}
     source={readout.source}
     steering={readout.data.steering}
     bind:steered
     {showToggle}
+    accent="var(--pillar-subspace)"
   />
   <DetailSection
     title="PROBE READINGS"
@@ -190,18 +153,23 @@
         {@const cells = stripCells(name, reading)}
         {@const affine = affineOf(name, reading)}
         {@const cardAccent = affine ? "--pillar-subspace" : "--pillar-manifold"}
+        {@const evidence = geometryEvidence(reading)}
         <RackCard accent={cardAccent} disabled={false}>
           {#snippet statline()}
-            <RackMarker shape={affine ? "circle" : "diamond"} filled />
-            <code class="geo-name">{name}</code>
-            <span class="family">{affine ? "subspace" : "manifold"}</span>
-            {#if reading.depth_com?.[0] != null}
-              <span class="depth" title="depth center of mass ± spread">
-                @{reading.depth_com[0].toFixed(2)} ±{(reading.depth_spread?.[0] ?? 0).toFixed(2)}
-              </span>
-            {/if}
-            <span class="spacer"></span>
-            <span class="fraction-stat">{(reading.fraction * 100).toFixed(0)}% in-subspace</span>
+            <DetailCardHeader
+              primary={name}
+              primaryTitle={name}
+              secondary={affine ? "subspace" : "manifold"}
+              secondaryAccent
+              meta={reading.depth_com?.[0] != null
+                ? `@${reading.depth_com[0].toFixed(2)} ±${(reading.depth_spread?.[0] ?? 0).toFixed(2)}`
+                : null}
+              metaTitle="depth center of mass ± spread"
+            >
+              {#snippet lead()}
+                <RackMarker shape={affine ? "circle" : "diamond"} filled />
+              {/snippet}
+            </DetailCardHeader>
           {/snippet}
           {#snippet body()}
             <ProbeReadingRow ariaLabel={`Subspace fraction ${reading.fraction.toFixed(3)}`}>
@@ -212,7 +180,7 @@
               {#snippet middle()}
                 {#if (reading.nearest ?? []).length > 0}
                   <span class="nearest">
-                    {reading.nearest[0][0]} · d={reading.nearest[0][1].toFixed(2)}
+                    {reading.nearest[0][0]}
                   </span>
                 {/if}
               {/snippet}
@@ -247,15 +215,6 @@
               {/snippet}
             </ProbeReadingRow>
             {/each}
-            <div class="meta">
-              <span>fraction <b>{reading.fraction.toFixed(3)}</b></span>
-              {#if reading.residual !== 0}
-                <span title="normalized off-surface distance">residual <b>{reading.residual.toFixed(3)}</b></span>
-              {/if}
-              {#if reading.membership != null}
-                <span title="tube-fit density">membership <b>{reading.membership.toFixed(3)}</b></span>
-              {/if}
-            </div>
             {#if cells.length > 0}
               <LayerStrip
                 {cells}
@@ -264,23 +223,7 @@
                 ariaLabel={`${name} per-layer readings`}
               />
             {/if}
-            {#if (reading.nearest ?? []).length > 0 || (reading.assignment ?? []).length > 0}
-              <div class="geo-chips">
-                {#each reading.nearest ?? [] as [label, dist] (label)}
-                  <span class="geo-chip" title={`whitened distance ${dist.toFixed(3)}`}>
-                    {label} <span class="geo-chip-val">d={dist.toFixed(2)}</span>
-                  </span>
-                {/each}
-                {#each reading.assignment ?? [] as [label, prob] (label)}
-              <span
-                class="geo-chip geo-chip-soft"
-                title={`soft-assignment posterior ${(prob * 100).toFixed(1)}%`}
-              >
-                ~{label} <span class="geo-chip-val">{(prob * 100).toFixed(0)}%</span>
-              </span>
-                {/each}
-              </div>
-            {/if}
+            <EvidenceChips items={evidence} ariaLabel={`Geometry evidence for ${name}`} />
           {/snippet}
         </RackCard>
       {/each}
@@ -302,31 +245,9 @@
 
 <style>
   .geo-list {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
-  }
-  .geo-name {
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    color: var(--fg);
-    word-break: break-all;
-    min-width: 0;
-  }
-  .family,
-  .depth,
-  .fraction-stat {
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .family {
-    color: var(--card-accent);
-  }
-  .spacer {
-    flex: 1 1 auto;
-    min-width: 0;
   }
   .geo-axis-label {
     color: var(--fg-muted);
@@ -357,40 +278,9 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    flex-wrap: wrap;
-    color: var(--fg-muted);
-    font-size: var(--text-2xs);
-  }
-  .meta b {
-    color: var(--fg-dim);
-    font-family: var(--font-mono);
-    font-weight: var(--weight-normal);
-    font-variant-numeric: tabular-nums;
-  }
-  .geo-chips {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-  }
-  .geo-chip {
-    color: var(--fg-muted);
-    font-family: var(--font-mono);
-    font-size: var(--text-2xs);
-    background: var(--glass);
-    border-radius: var(--radius-pill);
-    padding: var(--space-1) var(--space-3);
-    white-space: nowrap;
-  }
-  .geo-chip-soft {
-    color: var(--fg-dim);
-  }
-  .geo-chip-val {
-    color: var(--fg-dim);
-    font-variant-numeric: tabular-nums;
+  @media (max-width: 820px) {
+    .geo-list {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

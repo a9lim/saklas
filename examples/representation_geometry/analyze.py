@@ -15,19 +15,19 @@ then ``saklas manifold fit <probe> -m <model>`` first.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).parent))
 from data import PROBES  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]  # sibling script module inserted above
 
-from saklas.io.paths import safe_model_id  # noqa: E402
+from saklas.io.manifold_folder import load_manifold_sidecar_data  # noqa: E402
+from saklas.io.manifold_tensors import load_manifold  # noqa: E402
+from saklas.io.paths import manifold_dir, tensor_filename  # noqa: E402
 
 FIGROOT = Path(__file__).parent / "figures"
 
@@ -35,16 +35,16 @@ FIGROOT = Path(__file__).parent / "figures"
 # --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
-def load_fit(probe: str, model_id: str):
-    folder = Path.home() / ".saklas/manifolds/local" / probe
-    tensor = folder / f"{safe_model_id(model_id)}.safetensors"
+def load_fit(probe: str, model_id: str) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+    tensor = manifold_dir("local", probe) / tensor_filename(model_id)
     if not tensor.exists():
         sys.exit(f"no fit at {tensor}\n  run: saklas manifold fit {probe} -m {model_id}")
-    labels = json.load(open(tensor.with_suffix(".json")))["node_labels"]
-    with safe_open(str(tensor), framework="np") as f:
-        coords = f.get_tensor("node_coords").astype(np.float64)
-    sidecar = json.load(open(tensor.with_suffix(".json")))
-    return coords, labels, sidecar
+    manifold = load_manifold(tensor)
+    sidecar = load_manifold_sidecar_data(tensor.with_suffix(".json"))
+    coords = manifold.node_coords.detach().cpu().numpy().astype(
+        np.float64, copy=False,
+    )
+    return coords, list(manifold.node_labels), sidecar
 
 
 def slug(v: str) -> str:

@@ -194,15 +194,6 @@
   const recipeSteering = $derived(
     loomNode?.recipe?.steering ?? inspected?.appliedSteering ?? null,
   );
-  const turnPerplexity = $derived.by<number | null>(() => {
-    if (inspected?.perplexity != null) return inspected.perplexity;
-    const mean = inspected?.meanLogprob ?? loomNode?.mean_logprob;
-    return mean != null && Number.isFinite(mean) ? Math.exp(-mean) : null;
-  });
-  const finishReason = $derived(
-    inspected?.finishReason ?? loomNode?.finish_reason ?? null,
-  );
-
   function fmtSetting(value: number | null | undefined): string {
     if (value == null || !Number.isFinite(value)) return "—";
     return Number.isInteger(value) ? String(value) : value.toFixed(2);
@@ -682,32 +673,6 @@
           {/if}
         </div>
         <div class="generation-context">
-          <dl class="context-facts">
-            <div>
-              <dt>model</dt>
-              <dd title={sessionState.info?.model_id ?? undefined}>
-                <code>{sessionState.info?.model_id ?? "unknown"}</code>
-              </dd>
-            </div>
-            <div>
-              <dt>loom node</dt>
-              <dd title={loomNodeId ?? undefined}><code>{loomNodeId?.slice(0, 10) ?? "—"}</code></dd>
-            </div>
-            <div>
-              <dt>turn perplexity</dt>
-              <dd><code>{turnPerplexity == null ? "—" : turnPerplexity.toFixed(3)}</code></dd>
-            </div>
-            <div>
-              <dt>finish</dt>
-              <dd><code>{finishReason ?? "streaming"}</code></dd>
-            </div>
-            {#if inspected?.tokPerSec != null}
-              <div>
-                <dt>throughput</dt>
-                <dd><code>{inspected.tokPerSec.toFixed(1)} tok/s</code></dd>
-              </div>
-            {/if}
-          </dl>
           <div class="recipe">
             <span class="recipe-label">generation recipe</span>
             <code class="recipe-steering" title={recipeSteering ?? "no steering"}>
@@ -952,12 +917,8 @@
   }
 
   .generation-context {
-    display: grid;
-    grid-template-columns: minmax(0, 1.2fr) minmax(280px, 1fr);
-    gap: var(--space-3);
     min-width: 0;
   }
-  .context-facts,
   .recipe {
     display: flex;
     align-items: center;
@@ -969,13 +930,6 @@
     border-radius: var(--radius);
     background: var(--input-well);
   }
-  .context-facts > div {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-2);
-    min-width: 0;
-  }
-  .context-facts dt,
   .recipe-label {
     color: var(--fg-muted);
     font-size: var(--text-2xs);
@@ -984,23 +938,9 @@
     letter-spacing: 0.06em;
     white-space: nowrap;
   }
-  .context-facts dd {
-    min-width: 0;
-    margin: 0;
-    color: var(--fg-dim);
-    font-size: var(--text-xs);
-  }
-  .context-facts code,
   .recipe code {
     background: transparent;
     font-family: var(--font-mono);
-  }
-  .context-facts dd code {
-    display: block;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 28ch;
   }
   .recipe {
     gap: var(--space-2) var(--space-3);
@@ -1055,9 +995,6 @@
   }
 
   @media (max-width: 820px) {
-    .generation-context {
-      grid-template-columns: 1fr;
-    }
     .toolbar {
       align-items: flex-start;
       flex-direction: column;

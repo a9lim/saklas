@@ -26,5 +26,4 @@ repos:
           - transformers>=5.10
           - safetensors>=0.7.0
           - fastapi>=0.110
-          - textual>=0.50
           - pyyaml>=6.0

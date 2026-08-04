@@ -610,11 +610,8 @@ def register_manifold_routes(app: FastAPI) -> None:
     async def merge_manifold(req: MergeManifoldRequest):
         """Union N discover-mode manifolds' nodes into a fresh discover folder.
 
-        The manifold-side counterpart to ``POST /saklas/v1/vectors/bake``,
-        but operating on *node corpora* rather than steering directions:
-        pools the sources' nodes into one heap and writes an unfitted
-        discover folder.  The next ``POST .../fit`` derives coords from
-        the combined heap.
+        Pools source node corpora into one unfitted discover folder. The next
+        ``POST .../fit`` derives coordinates from the combined heap.
 
         Restricted to discover-mode sources by design — authored manifolds
         carry user-declared geometry and aren't mergeable without a

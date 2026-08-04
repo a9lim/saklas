@@ -758,8 +758,9 @@ model family). The shared baseline prompts
 hold topic common-mode across nodes (response[i] ↔ prompt[i % k]), so the
 per-concept centroids stay comparable without a per-manifold scenario set.
 `manifold fit <name>` then fits — the two steps are deliberate (a flaky
-generation leaves inspectable corpora). Cross-model Procrustes alignment for discover coords is deferred (TODO
-in `io/manifold_lifecycle.py`). The naturalness eval (`experiment naturalness`) fits a
+generation leaves inspectable corpora). `manifold transfer` maps fitted layers
+through neutral-derived Procrustes factors and re-bakes them in the target
+Mahalanobis metric. The naturalness eval (`experiment naturalness`) fits a
 behavior-space manifold over node output distributions in Hellinger space and
 reports the per-step Bhattacharyya distance of a steered trajectory to it (low =
 natural; `--compare-linear` scores a straight-chord baseline alongside).
@@ -1081,7 +1082,8 @@ genuine **1-node** fold against the neutral mean ν (see "Extraction") — a use
 bundled anymore (the former `agentic` / `manipulative` were dropped or folded
 into bipolar `sincere.manipulative`). Model-driven bundled regeneration is unified
 under `scripts/regenerate_bundled.py` — one A2 pipeline writing the bipolar axes,
-`personas`, and `emotions`; the fit is the separate `manifold fit` step. Partial
+`personas`, `emotions`, the authored `months` corpora, and the neutral baseline;
+the fit is the separate `manifold fit` step. Partial
 generation output is ignored by bundled materialization until every manifest node
 has a corpus file. A **template-derived** bundled artifact (a bundled template +
 a discover manifold that `template_ref`-erences it) would author deterministically

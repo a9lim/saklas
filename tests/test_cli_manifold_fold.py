@@ -1,16 +1,11 @@
-"""4.0 step 6c-2 — the manifold-fold fallback for the disk-side inspection verbs.
+"""Manifold folding for the disk-side inspection verbs.
 
 Bundled & user concepts ship as 2-node ``pca`` manifolds, so ``manifold
-compare`` / ``manifold why`` (the verbs that read baked tensors off disk
-without a model) fall back to folding a **fitted** manifold tensor when no
-``vectors/`` tensor resolves.  These tests synthesize a fitted 2-node manifold
-on disk (no model) and exercise the CLI runners end-to-end.
+compare`` / ``manifold why`` fold a fitted manifold tensor. These tests
+synthesize a fitted 2-node manifold on disk and exercise the runners end-to-end.
 
-The legacy bipolar-centroid fold (``_fold_centroids_to_affine_manifold``) was
-retired in the Mahalanobis-only collapse; the fitted manifold here is built via
-the production ``fit_affine_subspace`` primitive.  ``manifold compare`` is now
-Mahalanobis-only, so the fixture seeds a per-model neutral cache on disk for the
-runner's ``LayerWhitener.from_cache`` build.
+The fixture uses the production ``fit_affine_subspace`` primitive and seeds a
+per-model neutral cache for the Mahalanobis-only compare path.
 """
 from __future__ import annotations
 

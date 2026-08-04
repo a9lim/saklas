@@ -266,6 +266,35 @@ def test_run_extract_corrupt_tensor_does_not_short_circuit(monkeypatch: pytest.M
     assert "extracted happy.sad" in out
 
 
+def test_run_role_extract_reports_canonical_tensor_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from saklas.io.paths import tensor_filename
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+
+    class FakeSession:
+        def extract(self, *_args: Any, **_kwargs: Any) -> Any:
+            return "happy.sad:role-pirate", object()
+
+    monkeypatch.setattr(
+        cli_runners, "_make_session", lambda _args, **_kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(cli_runners, "_print_model_info", lambda _session: None)
+    monkeypatch.setattr(cli_runners, "_print_startup", lambda _args: None)
+
+    cli.main([
+        "manifold", "extract", "happy.sad", "-m", "fake/model",
+        "--role", "pirate",
+    ])
+    output = capsys.readouterr().out
+    assert "extracted happy.sad:role-pirate" in output
+    assert f"/local/happy.sad/{tensor_filename('fake/model')}" in output
+    assert ":role-pirate/" not in output
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -910,16 +939,6 @@ def test_split_variant_suffix_parses_sae_variants():
     assert _split_variant_suffix("model:google/gemma-3-4b-it") == (
         "model:google/gemma-3-4b-it", None,
     )
-
-
-# NOTE: ``test_resolve_variant_tensor_accepts_full_variant_family`` was deleted
-# in 4.0 — ``runners._resolve_variant_tensor`` was removed (compare/why fold
-# fitted manifolds now, no ``vectors/`` ``Profile.load`` tensor pick).
-# ``test_run_why_sae_ambiguous_errors`` was also deleted: the "multiple SAE
-# variants" error came from the removed ``enumerate_variants`` tensor scan; the
-# fold helper now simply returns ``None`` for a bare ``:sae`` (→ "no fitted
-# manifold").
-
 
 def test_run_why_accepts_sae_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     """``manifold why foo:sae-<rel>`` folds the SAE-variant manifold tensor."""

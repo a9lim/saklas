@@ -1193,8 +1193,8 @@ def merge_discover_manifolds(
     drops cross-method keys at the IO boundary.
 
     The merged folder is written *unfitted* — no per-model tensor is
-    materialized.  Run ``saklas manifold discover`` or
-    ``POST .../fit`` against the merged folder to derive coords + fit.
+    materialized. Run ``saklas manifold fit <name> -m <model>`` or
+    ``POST .../fit`` against it to derive coordinates and fit.
     """
     if len(sources) < 2:
         raise ValueError(

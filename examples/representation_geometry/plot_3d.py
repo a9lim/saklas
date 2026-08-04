@@ -10,19 +10,16 @@ are regenerated on demand — they are deliberately not committed (a few MB each
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).parent))
+from analyze import load_fit  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
 from data import PROBES  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]  # sibling script module inserted above
-
-from saklas.io.paths import safe_model_id  # noqa: E402
 
 FIGROOT = Path(__file__).parent / "figures"
 
@@ -36,13 +33,7 @@ def main() -> None:
     fig = FIGROOT / args.probe
     fig.mkdir(parents=True, exist_ok=True)
 
-    tensor = (Path.home() / ".saklas/manifolds/local" / args.probe
-              / f"{safe_model_id(args.model)}.safetensors")
-    if not tensor.exists():
-        sys.exit(f"no fit at {tensor} — author + fit {args.probe} first")
-    labels = json.load(open(tensor.with_suffix(".json")))["node_labels"]
-    with safe_open(str(tensor), framework="np") as f:
-        coords = f.get_tensor("node_coords").astype(np.float64)
+    coords, labels, _sidecar = load_fit(args.probe, args.model)
 
     import matplotlib
     matplotlib.use("Agg")

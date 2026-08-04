@@ -1,15 +1,4 @@
-"""Regression tests for the four issues Codex flagged on the post-1.5.0
-hardening sweep.  Each test pins one of:
-
-1. Phase 6 — capture cleanup never leaks hooks even when the inner
-   ``try`` is skipped due to a ``BaseException`` (KeyboardInterrupt).
-2. Phase 1 — ``pull_pack`` recovers the prior install from ``.bak``
-   when a previous pull crashed mid-swap.
-3. Phase 7 — ``session.extract`` acquires ``_gen_lock`` so it's
-   race-free against a concurrent ``generate``.
-4. Phase 2 — session-side ``_try_autoload_vector`` enforces the same
-   ``statements_sha256`` contract as ``bootstrap_probes``.
-"""
+"""Regression tests for extraction locking and capture cleanup."""
 from __future__ import annotations
 
 import threading
@@ -31,9 +20,7 @@ def _stub_session_with_lock() -> SaklasSession:
     return s
 
 
-# ---------------------------------------------------------------------------
-# Phase 7 fix — extract() must acquire _gen_lock to be race-free
-# ---------------------------------------------------------------------------
+# Extraction must acquire _gen_lock to be race-free.
 
 def test_extract_acquires_gen_lock_against_concurrent_generation():
     """If ``_gen_lock`` is already held (generation in flight), extract
@@ -68,25 +55,7 @@ def test_extract_releases_lock_on_path_through_phase_gate():
     s._gen_lock.release()
 
 
-# NOTE: the Phase 1 ``pull_pack`` crash-window regressions (recover-from-.bak
-# before a new build, drop-stale-.bak on a clean swap) moved to the generic
-# ``io/staging.py::stage_verify_swap`` primitive in the 4.0 collapse and are
-# covered directly by ``test_io_staging.py`` (``pull_pack`` itself is gone).
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 — _try_autoload_vector stale-statements contract
-# ---------------------------------------------------------------------------
-# NOTE: ``test_autoload_raises_on_stale_statements`` and
-# ``test_autoload_allow_stale_env_var_escape_hatch`` were deleted in 4.0.
-# ``SaklasSession._try_autoload_vector`` (the ``vectors/``-pack safetensors
-# scan that re-checked ``statements_sha256``) was removed; profile resolution
-# now folds a fitted manifold through ``ensure_profile_registered``.
-
-
-# ---------------------------------------------------------------------------
-# Phase 6 fix — capture cleanup is in the outer finally as a backstop
-# ---------------------------------------------------------------------------
+# Capture cleanup remains in the outer finally as a backstop.
 
 def test_outer_finally_calls_end_capture_for_idempotency():
     """After the Codex-flagged fix, ``_generate_core``'s outer finally

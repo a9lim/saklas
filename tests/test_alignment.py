@@ -636,13 +636,3 @@ class TestAlignmentCache:
         )
         assert loaded is not None and set(loaded[0]) == {0, 5}
         assert torch.equal(loaded[0][5].to_dense(), 2 * torch.eye(4))
-
-
-# ---------------------------------------------------------------------------
-# NOTE: ``TestSidecarTransferFields::test_round_trip`` was deleted in 4.0 —
-# ``saklas.io.packs.Sidecar`` (the ``vectors/`` per-tensor sidecar carrying the
-# ``source_model_id`` / ``alignment_map_hash`` / ``transfer_quality_estimate``
-# transfer fields) was removed.  Cross-model transfer is a manifold operation
-# now (``transfer_manifold`` writes a ``_from-<safe_src>`` ``ManifoldSidecar``);
-# its round-trip is covered by the manifold transfer tests.
-# ---------------------------------------------------------------------------

@@ -77,7 +77,7 @@ def register_web_routes(app: FastAPI) -> None:
         return FileResponse(str(dist / "index.html"))
 
     # Catch-all for any other top-level route the SPA needs to handle —
-    # e.g. /chat, /lab, /vectors/<name>.  Won't shadow any earlier
+    # e.g. /chat, /lab, /manifolds/<name>. Won't shadow any earlier
     # /api/*, /v1/*, /saklas/v1/* routes because FastAPI evaluates in
     # registration order; create_app mounts this last.
     dist_root = dist.resolve()

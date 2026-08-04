@@ -1,7 +1,5 @@
 <script lang="ts">
-  // Chat panel — v1.7 rewrite.  Replaces the v1.6 ChatPlaceholder/legacy
-  // shape with the full feature set: thinking-collapsible per turn
-  // turn, per-token tinted spans driven by a top-bar highlight dropdown,
+  // Chat panel: collapsible thinking per turn, per-token tinted spans,
   // optional compare-two stripe overlay, click-token drilldown, send /
   // stop, and an A/B split-view container.
   //
