@@ -40,6 +40,25 @@ def _saklas_error_exit(fn: Callable[..., _R]) -> Callable[..., _R]:
     return _wrapper
 
 
+def _print_verb_menu(group: str, verbs: "list[tuple[str, str]]") -> None:
+    """Print the bare-verb-group menu every ``saklas <group>`` shows.
+
+    ``group`` is the invocation path under ``saklas`` (``"pack"``,
+    ``"experiment transcript"``); ``verbs`` is that group's
+    ``(verb, description)`` table.  One implementation so every group's menu
+    stays identical: usage line, the width-aligned verb table, and the
+    ``-h`` next-step pointer.  Callers ``sys.exit(0)`` afterwards — a bare
+    verb group is help, not an error.
+    """
+    print(f"usage: saklas {group} <verb> [...]")
+    print()
+    width = max(len(verb) for verb, _ in verbs)
+    for verb, desc in verbs:
+        print(f"  {verb:<{width}}  {desc}")
+    print()
+    print(f"Run `saklas {group} <verb> -h` for verb-specific options.")
+
+
 def _resolve_probes(raw: list[str] | None) -> list[str] | None:
     """Resolve the ``--probes`` flag to a value for ``from_pretrained``.
 
@@ -93,12 +112,22 @@ def _print_model_info(session: SaklasSession) -> None:
     print(f"Loaded {len(session.probes)} probes")
 
 
-def _load_effective_config(args: argparse.Namespace):
+def _load_effective_config(
+    args: argparse.Namespace, *, default_max_tokens: int = 1024,
+):
     """Compose ~/.saklas/config.yaml + any -c files and stamp args in place.
 
     Returns the composed ConfigFile (poles pre-resolved). Sets:
       args.config_vectors, args.temperature, args.top_p, args.thinking,
       args.system_prompt, args.max_tokens, and args.model (if YAML supplied it).
+
+    ``max_tokens`` follows the same CLI-wins / YAML-fills-gaps precedence as
+    every other overridable field: an explicit ``--max-tokens N`` (the verbs
+    that carry the flag argparse-default it to ``None``) seeds the override
+    and survives untouched, YAML fills an unset one, and
+    ``default_max_tokens`` is the caller's own floor when neither supplied a
+    value — 1024 for ``serve`` (which has no such flag), 256/128 for the
+    ``experiment`` verbs.
     """
     from saklas.cli.config_file import (
         ConfigFile, apply_flag_overrides, ensure_vectors_installed,
@@ -110,7 +139,7 @@ def _load_effective_config(args: argparse.Namespace):
         model=getattr(args, "model", None),
         temperature=None,
         top_p=None,
-        max_tokens=None,
+        max_tokens=getattr(args, "max_tokens", None),
         system_prompt=None,
     )
     if getattr(args, "model", None) is None:
@@ -119,7 +148,10 @@ def _load_effective_config(args: argparse.Namespace):
     args.top_p = composed.top_p
     args.thinking = composed.thinking
     args.system_prompt = composed.system_prompt
-    args.max_tokens = composed.max_tokens if composed.max_tokens is not None else 1024
+    args.max_tokens = (
+        composed.max_tokens if composed.max_tokens is not None
+        else default_max_tokens
+    )
     args.config_vectors = composed.vectors
     # YAML ``compile: true`` folds onto ``args.compile`` (the CLI
     # opt-in).  YAML ``compile: false`` is the default, so it's a

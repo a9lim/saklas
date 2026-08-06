@@ -222,7 +222,7 @@ def test_parse_manifold_push():
     args = cli.parse_args([
         "pack", "push", "local/circumplex",
         "-a", "alice/circumplex", "-m", "google/gemma-3-4b-it",
-        "--variant", "sae", "-p", "-d",
+        "--variant", "sae", "--private", "--dry-run",
     ])
     assert args.pack_cmd == "push"
     assert args.selector == "local/circumplex"
@@ -231,6 +231,15 @@ def test_parse_manifold_push():
     assert args.variant == "sae"
     assert args.private is True
     assert args.dry_run is True
+
+
+@pytest.mark.parametrize("flag", ["-p", "-d"])
+def test_parse_manifold_push_rejects_short_forms(flag: str):
+    """``-p`` is ``--probes`` and ``-d`` is ``--device`` everywhere else;
+    ``pack push`` is the one publishing verb, so both are long-only."""
+    with pytest.raises(SystemExit) as ex:
+        cli.parse_args(["pack", "push", "circumplex", flag])
+    assert ex.value.code == 2
 
 
 def test_parse_manifold_push_variant_default_raw():
@@ -398,6 +407,9 @@ def test_run_manifold_install_calls_backend(monkeypatch: pytest.MonkeyPatch, cap
     cli.main(["pack", "install", "alice/circumplex", "-a", "local/mood", "-f"])
     assert calls == [("alice/circumplex", "local/mood", True)]
     out = capsys.readouterr().out
+    # Announced before the network call (hub progress bars vanish off-TTY),
+    # mirroring ``lens fetch``'s convention.
+    assert out.startswith("Installing alice/circumplex...\n")
     assert "Installed alice/circumplex" in out
 
 
@@ -416,6 +428,7 @@ def test_run_manifold_search_calls_backend(monkeypatch: pytest.MonkeyPatch, caps
     cli.main(["pack", "search", "mood"])
     assert seen == ["mood"]
     out = capsys.readouterr().out
+    assert out.startswith("Searching Hugging Face for manifolds matching 'mood'...\n")
     assert "circumplex" in out
     assert "box(2d)" in out
 
@@ -510,7 +523,7 @@ def test_run_manifold_push_calls_backend(monkeypatch: pytest.MonkeyPatch, tmp_pa
     cli.main([
         "pack", "push", "local/circumplex",
         "-a", "alice/circumplex", "-m", "google/gemma-3-4b-it",
-        "--variant", "sae", "-p",
+        "--variant", "sae", "--private",
     ])
     assert len(calls) == 1
     c = calls[0]
@@ -520,6 +533,7 @@ def test_run_manifold_push_calls_backend(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert c["private"] is True
     assert c["dry_run"] is False
     out = capsys.readouterr().out
+    assert out.startswith("Pushing local/circumplex to alice/circumplex...\n")
     assert "Pushed alice/circumplex" in out
     assert "abcdef123456" in out
 
@@ -537,7 +551,7 @@ def test_run_manifold_push_dry_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     )
     cli.main([
         "pack", "push", "local/circumplex",
-        "-a", "alice/circumplex", "-d",
+        "-a", "alice/circumplex", "--dry-run",
     ])
     out = capsys.readouterr().out
     assert "Dry-run: would push alice/circumplex" in out
@@ -563,10 +577,27 @@ def test_run_manifold_rm_calls_backend(monkeypatch: pytest.MonkeyPatch, capsys: 
                 "removed": True, "rematerializes_on_restart": False}
 
     monkeypatch.setattr("saklas.io.manifolds.remove_manifold_folder", fake_rm)
-    cli.main(["pack", "rm", "local/mood"])
+    cli.main(["pack", "rm", "local/mood", "-y"])
     assert calls == [("local", "mood")]
     out = capsys.readouterr().out
     assert "Removed local/mood" in out
+
+
+def test_run_manifold_rm_local_refuses_without_yes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+):
+    """The irrecoverable case is guarded too — a ``local/`` manifold costs
+    real extraction/fit time and never re-materializes."""
+    monkeypatch.setattr(
+        "saklas.io.manifolds.remove_manifold_folder",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call backend")),
+    )
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["pack", "rm", "local/mood"])
+    assert ex.value.code == 2
+    err = capsys.readouterr().err
+    assert "local/mood" in err
+    assert "-y/--yes" in err
 
 
 def test_run_manifold_rm_bundled_refuses_without_yes(monkeypatch: pytest.MonkeyPatch):
@@ -597,7 +628,7 @@ def test_run_manifold_rm_missing_errors(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr("saklas.io.manifolds.remove_manifold_folder", fake_rm)
     with pytest.raises(SystemExit) as ex:
-        cli.main(["pack", "rm", "local/nope"])
+        cli.main(["pack", "rm", "local/nope", "-y"])
     assert ex.value.code == 1
 
 

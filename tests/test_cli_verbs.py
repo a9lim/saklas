@@ -13,6 +13,7 @@ shape + dispatch wiring, not the backends.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Generator
 
@@ -296,3 +297,93 @@ def test_bare_lens_prints_help_exit_0(
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "saklas lens <verb>" in out
+
+
+# ---------------------------------------------------------------------------
+# Bare-verb-group menus — one shared helper, so every group reads identically
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("argv", [
+    ["manifold"], ["pack"], ["template"], ["lens"], ["sae"],
+    ["experiment"], ["experiment", "transcript"],
+])
+def test_bare_verb_group_menu_carries_help_hint(
+    argv: list[str], capsys: pytest.CaptureFixture[str],
+) -> None:
+    group = " ".join(argv)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv)
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"usage: saklas {group} <verb> [...]\n")
+    assert f"Run `saklas {group} <verb> -h` for verb-specific options." in out
+
+
+# ---------------------------------------------------------------------------
+# Short-flag hygiene
+# ---------------------------------------------------------------------------
+
+def test_sae_show_takes_json_but_rm_does_not() -> None:
+    """``sae rm`` never emitted JSON; the flag is gone rather than inert
+    (``lens rm``, its sibling, has no ``-j`` either)."""
+    show = cli.parse_args(["sae", "show", "m/x", "-j"])
+    assert show.json_output is True
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["sae", "rm", "m/x", "local:mine", "-j"])
+    assert exc.value.code == 2
+
+
+def test_sae_fetch_announces_before_the_provider_download(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mirrors ``lens fetch``: a saklas-authored status line before the
+    network call, suppressed under ``-j`` so JSON stays parseable."""
+    import saklas.core.session as session_mod
+    from saklas.cli import runners as cli_runners
+
+    class _Session:
+        def __enter__(self) -> "_Session":
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def load_sae(self, _release: str, layer: object = None) -> dict:
+            return {"layer": 14, "width": 16384}
+
+    monkeypatch.setattr(
+        session_mod.SaklasSession, "from_pretrained",
+        staticmethod(lambda *_a, **_k: _Session()),
+    )
+    monkeypatch.setattr(cli_runners, "_print_startup", lambda _a: None)
+    monkeypatch.setattr(cli_runners, "_print_model_info", lambda _s: None)
+
+    cli.main(["sae", "fetch", "m/x", "saelens:rel"])
+    out = capsys.readouterr().out
+    assert "Fetching saelens:rel into Hugging Face cache..." in out
+
+    cli.main(["sae", "fetch", "m/x", "saelens:rel", "-j"])
+    out = capsys.readouterr().out
+    assert "Fetching saelens:rel" not in out
+    assert json.loads(out)["source"] == "saelens:rel"
+
+
+def test_experiment_fan_steer_flag_and_hidden_alias(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``-S EXPR`` reads identically on every verb that takes one; the
+    historical ``--base-steering`` spelling still parses, hidden from help."""
+    args = cli.parse_args([
+        "experiment", "fan", "m/x", "p", "-g", "a=0,1", "-S", "0.5 warm",
+    ])
+    assert args.base_steering == "0.5 warm"
+    alias = cli.parse_args([
+        "experiment", "fan", "m/x", "p", "-g", "a=0,1",
+        "--base-steering", "0.5 warm",
+    ])
+    assert alias.base_steering == "0.5 warm"
+    with pytest.raises(SystemExit):
+        cli.parse_args(["experiment", "fan", "-h"])
+    out = capsys.readouterr().out
+    assert "--steer" in out
+    assert "--base-steering" not in out
