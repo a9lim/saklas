@@ -20,6 +20,7 @@
     ApiError,
     describeError,
   } from "../lib/api";
+  import { validateTemplateDraft } from "../lib/templates";
   import {
     closeDrawer,
     openDrawer,
@@ -639,41 +640,27 @@
     return templatedPairs.filter((p) => p.user.trim() || p.assistant.trim());
   }
 
+  /** This tab authors single-turn contexts — one user turn plus the
+   *  slotted assistant turn — so the shared draft shape is a one-element
+   *  ``turns`` list per pair. */
+  const templatedDraft = $derived({
+    slot: templatedSlot,
+    values: templatedValues,
+    contexts: nonEmptyTemplatedPairs().map((p) => ({
+      turns: [{ role: "user" as const, content: p.user }],
+      assistant: p.assistant,
+    })),
+  });
+
   const templatedValidation = $derived.by<{
     ok: boolean;
     messages: string[];
   }>(() => {
     const messages: string[] = [];
     if (!slug(manifoldName)) messages.push("name required");
-    const sl = templatedSlot.trim();
-    if (!sl) messages.push("slot required");
-    if (templatedValues.length < 2) {
-      messages.push(`values: ${templatedValues.length} / 2`);
-    }
-    const seen = new Set<string>();
-    for (const v of templatedValues) {
-      const s = slug(v);
-      if (!s) messages.push(`invalid value "${v}"`);
-      else if (seen.has(s)) messages.push(`duplicate value "${s}"`);
-      else seen.add(s);
-    }
-    const pairs = nonEmptyTemplatedPairs();
-    if (pairs.length === 0) messages.push("template required");
-    pairs.forEach((p, i) => {
-      if (!p.user.trim()) messages.push(`template ${i + 1}: user required`);
-      if (!p.assistant.trim()) {
-        messages.push(`template ${i + 1}: assistant required`);
-      } else if (sl && !p.assistant.includes(sl)) {
-        messages.push(
-          `template ${i + 1}: assistant needs ${sl}`,
-        );
-      }
-      if (sl && p.user.includes(sl)) {
-        messages.push(
-          `template ${i + 1}: user cannot contain ${sl}`,
-        );
-      }
-    });
+    messages.push(
+      ...validateTemplateDraft(templatedDraft, { contextLabel: "template" }),
+    );
     if (templatedMaxDim !== null && templatedMaxDim < 1) {
       messages.push("max dim ≥1");
     }
@@ -695,10 +682,7 @@
       description: description.trim(),
       slot: templatedSlot.trim(),
       values: templatedValues,
-      contexts: nonEmptyTemplatedPairs().map((p) => ({
-        turns: [{ role: "user", content: p.user }],
-        assistant: p.assistant,
-      })),
+      contexts: templatedDraft.contexts,
     };
     const manifoldReq: CreateManifoldFromTemplateRequest = {
       namespace: namespaceSlug,

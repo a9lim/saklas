@@ -15,6 +15,7 @@
 
   import { onMount } from "svelte";
   import { apiTemplates, describeError } from "../lib/api";
+  import { validateTemplateDraft } from "../lib/templates";
   import { closeDrawer } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
   import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
@@ -146,24 +147,21 @@
     bContexts = [...bContexts];
   }
 
-  const buildValidation = $derived.by(() => {
-    const errs: string[] = [];
-    if (!bName.trim()) errs.push("name required");
-    if (!bSlot.trim()) errs.push("slot required");
-    if (bValues.length < 2) errs.push("≥ 2 values");
-    const slot = bSlot.trim();
-    bContexts.forEach((c, i) => {
-      const turns = c.turns.filter((t) => t.content.trim());
-      if (!turns.length) errs.push(`context ${i + 1}: needs a history turn`);
-      else if (turns[turns.length - 1].role !== "user")
-        errs.push(`context ${i + 1}: last turn must be user`);
-      if (turns.some((t) => slot && t.content.includes(slot)))
-        errs.push(`context ${i + 1}: slot must not appear in a history turn`);
-      const n = slot ? c.assistant.split(slot).length - 1 : 0;
-      if (n !== 1) errs.push(`context ${i + 1}: slot must appear once in the assistant turn`);
-    });
-    return errs;
+  // Blank turn rows are the editor's "add a turn" affordance, not part of
+  // the draft — they're dropped here exactly as ``submitBuild`` drops them.
+  const buildDraft = $derived({
+    slot: bSlot,
+    values: bValues,
+    contexts: bContexts.map((c) => ({
+      turns: c.turns.filter((t) => t.content.trim()),
+      assistant: c.assistant,
+    })),
   });
+
+  const buildValidation = $derived([
+    ...(bName.trim() ? [] : ["name required"]),
+    ...validateTemplateDraft(buildDraft),
+  ]);
 
   async function submitBuild(ev: Event): Promise<void> {
     ev.preventDefault();
@@ -175,10 +173,7 @@
         name: bName.trim(),
         slot: bSlot.trim(),
         values: bValues,
-        contexts: bContexts.map((c) => ({
-          turns: c.turns.filter((t) => t.content.trim()),
-          assistant: c.assistant,
-        })),
+        contexts: buildDraft.contexts,
       });
       pushToast(`template ${bName.trim()} created`, { kind: "info" });
       await loadTemplates();
