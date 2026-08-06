@@ -29,7 +29,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 import torch
 from safetensors.torch import load_file, save as serialize_safetensors, save_file
@@ -40,6 +40,9 @@ from saklas.core.topology import PcaDiagnostics, SpectralDiagnostics
 from saklas.core.model import loaded_model_fingerprint, workspace_layer_indices
 from saklas.core.sae import SaeBackend
 from saklas.io.paths import model_dir, tensor_filename
+
+if TYPE_CHECKING:
+    from saklas.core.manifold import Manifold
 
 
 _CAPTURE_CACHE_FORMAT_VERSION = 4
@@ -1032,6 +1035,64 @@ def _diagnostics_to_dict(
     return out
 
 
+def _base_fit_metadata(
+    *,
+    method: str,
+    nodes_sha: str,
+    model_fingerprint: str,
+    capture_sha: str,
+    fitted_layers: list[int],
+    subspace_metric: str,
+    sae_backend: "SaeBackend | None",
+    sae_full_coverage: bool,
+    node_roles: Sequence[str | None],
+    node_kinds: Sequence[str | None],
+    any_role: bool,
+    any_kind: bool,
+) -> dict[str, Any]:
+    """The sidecar keys every fit branch writes.
+
+    Shared by the monopolar early branch and the general fit tail so a new
+    provenance key lands on both.  Their remaining divergence is exactly two
+    entries — the monopolar fold keeps the raw δ̂ basis, so it passes
+    ``subspace_metric="euclidean"`` (a basis *label*: ``concept − ν`` cancels
+    common-mode by differencing, like DiM, so no whitened-PCA selection ran)
+    and adds ``monopolar: True`` on top of this dict.  The share is always
+    Mahalanobis; the whitener gate upstream guarantees it.
+    """
+    metadata: dict[str, Any] = {
+        "method": method,
+        "nodes_sha256": nodes_sha,
+        "model_fingerprint": model_fingerprint,
+        "capture_sha256": capture_sha,
+        "fitted_layers": fitted_layers,
+        "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
+        # Provenance only (nothing branches on these at load).
+        "share_metric": "mahalanobis",
+        "subspace_metric": subspace_metric,
+    }
+    if sae_backend is not None:
+        metadata["sae_release"] = sae_backend.release
+        metadata["sae_revision"] = sae_backend.revision
+        metadata["sae_fingerprint"] = sae_backend.fingerprint
+        metadata["sae_ids_by_layer"] = dict(
+            getattr(sae_backend, "sae_ids_by_layer", {})
+        )
+        metadata["sae_full_coverage"] = sae_full_coverage
+    if any_role:
+        # Per-node roles ride into the sidecar so `manifold show` and the
+        # inspector surfaces can report "this node was pooled as <role>"
+        # without re-reading manifold.json.  The order matches
+        # ``node_labels``; a missing entry means ``None`` (standard assistant
+        # baseline).
+        metadata["node_roles"] = list(node_roles)
+    if any_kind:
+        # Per-node kind rides into the sidecar for inspector/provenance,
+        # ``node_labels`` order; absent when no node carries a kind.
+        metadata["node_kinds"] = list(node_kinds)
+    return metadata
+
+
 class ManifoldExtractionPipeline:
     """Fit an RBF-based steering manifold from an authored corpus.
 
@@ -1057,6 +1118,39 @@ class ManifoldExtractionPipeline:
         self._handle = model_handle
         self._events = events
 
+    def _publish_and_emit(
+        self,
+        folder: str | pathlib.Path,
+        *,
+        expected_revision: str,
+        manifold: "Manifold",
+        tensor_path: pathlib.Path,
+        metadata: dict[str, Any],
+        emit_event: bool,
+        progress: Callable[[str], None],
+        started: float,
+    ) -> "Manifold":
+        """The four-step fit epilogue, shared by every branch.
+
+        Compare-and-swap the fitted pair against the authoring revision, fold
+        the sidecar metadata onto the in-memory manifold, emit
+        ``ManifoldExtracted`` (unless the caller is enriching its own event),
+        and report the wall time.  Ordering is load-bearing: publication has
+        to win the CAS before anything observes the fit.
+        """
+        _publish_fit_if_current(
+            pathlib.Path(folder),
+            expected_revision=expected_revision,
+            manifold=manifold, tensor_path=tensor_path, metadata=metadata,
+        )
+        manifold.metadata.update(metadata)
+        if emit_event:
+            self._events.emit(ManifoldExtracted(
+                name=manifold.name, manifold=manifold, metadata=metadata,
+            ))
+        progress(f"Fit complete in {time.perf_counter() - started:.1f}s.")
+        return manifold
+
     def fit(
         self,
         folder: str | pathlib.Path,
@@ -1069,6 +1163,7 @@ class ManifoldExtractionPipeline:
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
         emit_event: bool = True,
+        dls: bool = True,
     ):
         """Fit against a stable authoring snapshot, publishing by revision CAS.
 
@@ -1081,6 +1176,13 @@ class ManifoldExtractionPipeline:
         emission: :meth:`SaklasSession._fit_concept_manifold` re-emits a single
         enriched event carrying the folded :class:`Profile`, so the vector path
         fires exactly one event rather than two.
+
+        ``dls=False`` disables Discriminative Layer Selection on the flat
+        (``pca``) branch: every fitted axis of every fit layer is kept instead
+        of pruned to the ones whose node projections straddle the neutral
+        baseline.  This is what a session built with ``dls=False`` (the CLI's
+        ``--no-dls``) threads down.  Curved fits have no pos/neg polarity and
+        never ran DLS, so the flag is a no-op for them.
         """
         from saklas.io.atomic import artifact_lock
         from saklas.io.manifold_folder import _locked_manifest, manifold_pair_lock
@@ -1119,6 +1221,7 @@ class ManifoldExtractionPipeline:
                 _node_groups_snapshot=groups,
                 _baseline_prompts_snapshot=baseline,
                 emit_event=emit_event,
+                dls=dls,
             )
 
     def _fit_locked(
@@ -1142,6 +1245,7 @@ class ManifoldExtractionPipeline:
         _release_capture_lock: Callable[[], None] | None = None,
         _resolved_whitener: Any | None = None,
         emit_event: bool = True,
+        dls: bool = True,
     ):
         """Fit (or load from cache) a manifold for the session's model.
 
@@ -1488,6 +1592,7 @@ class ManifoldExtractionPipeline:
                     _release_capture_lock=transaction.release,
                     _resolved_whitener=maha_whitener,
                     emit_event=emit_event,
+                    dls=dls,
                 )
             finally:
                 # The inner cache stage normally releases early. Reacquire before
@@ -1927,51 +2032,34 @@ class ManifoldExtractionPipeline:
             # fold primitive itself is role-agnostic.
             manifold.node_roles = list(node_roles)
             manifold.node_kinds = list(node_kinds)
-            metadata: dict[str, Any] = {
-                "method": (
+            metadata: dict[str, Any] = _base_fit_metadata(
+                method=(
                     "manifold_monopolar_sae" if sae_backend is not None
                     else "manifold_monopolar"
                 ),
-                "nodes_sha256": nodes_sha,
-                "model_fingerprint": model_fingerprint,
-                "capture_sha256": capture_sha,
-                "fitted_layers": list(fit_layers),
-                "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
-                "monopolar": True,
-                # The fold keeps the raw δ̂ basis (``concept − ν`` cancels
-                # common-mode like DiM by differencing), so the subspace is
-                # metric-free: ``subspace_metric`` is "euclidean" as a basis
-                # *label* (no whitened-PCA selection ran), not a fallback.
-                # The share is always whitened (the gate above guarantees it).
-                "share_metric": "mahalanobis",
-                "subspace_metric": "euclidean",
-            }
-            if sae_backend is not None:
-                metadata["sae_release"] = sae_backend.release
-                metadata["sae_revision"] = sae_backend.revision
-                metadata["sae_fingerprint"] = sae_backend.fingerprint
-                metadata["sae_ids_by_layer"] = dict(
-                    getattr(sae_backend, "sae_ids_by_layer", {})
-                )
-                metadata["sae_full_coverage"] = layer_indices is None
-            if any_role:
-                metadata["node_roles"] = list(node_roles)
-            if any_kind:
-                metadata["node_kinds"] = list(node_kinds)
-            _publish_fit_if_current(
-                pathlib.Path(folder),
+                nodes_sha=nodes_sha,
+                model_fingerprint=model_fingerprint,
+                capture_sha=capture_sha,
+                fitted_layers=list(fit_layers),
+                # The fold keeps the raw δ̂ basis, so the subspace is
+                # metric-free — see ``_base_fit_metadata`` for why that is a
+                # basis label rather than a metric fallback.
+                subspace_metric="euclidean",
+                sae_backend=sae_backend,
+                sae_full_coverage=layer_indices is None,
+                node_roles=node_roles,
+                node_kinds=node_kinds,
+                any_role=any_role,
+                any_kind=any_kind,
+            )
+            metadata["monopolar"] = True
+            return self._publish_and_emit(
+                folder,
                 expected_revision=_authoring_revision or nodes_sha,
                 manifold=manifold, tensor_path=tensor_path, metadata=metadata,
+                emit_event=emit_event, progress=_progress,
+                started=fit_started,
             )
-            manifold.metadata.update(metadata)
-            if emit_event:
-                self._events.emit(ManifoldExtracted(
-                    name=mf.name, manifold=manifold, metadata=metadata,
-                ))
-            _progress(
-                f"Fit complete in {time.perf_counter() - fit_started:.1f}s."
-            )
-            return manifold
 
         # 2. Stack per-node centroids per layer once (SAE-reconstructed when a
         #     backend is set), shared by the consensus-Gram coord derivation and
@@ -2326,10 +2414,14 @@ class ManifoldExtractionPipeline:
             del _fit_affine_layer
             # Per-axis DLS straddle over all fit layers at once (flat → DLS;
             # the global all-fail fallback matches the folded-vector path).
+            # ``dls=False`` (the session's ``--no-dls``) skips the
+            # straddle-pruning entirely: passing ``None`` for the baseline is
+            # ``compute_dls_axes``'s own "disabled" contract, so every axis of
+            # every layer is kept.
             dls_kept = compute_dls_axes(
                 {idx: stacks[idx] for idx in raw_fits},
                 {idx: raw_fits[idx][0].basis for idx in raw_fits},
-                _handle_means,
+                _handle_means if dls else None,
             )
             for idx, (sub, mu_coords) in raw_fits.items():
                 kept = sorted(dls_kept.get(idx, set()))
@@ -2600,30 +2692,33 @@ class ManifoldExtractionPipeline:
         )
 
         # 5. Persist + refresh the folder integrity manifest.
-        metadata: dict[str, Any] = {
-            "method": method,
-            "nodes_sha256": nodes_sha,
-            "model_fingerprint": model_fingerprint,
-            "capture_sha256": capture_sha,
-            # ``save_manifold`` derives ``fitted_layers`` from the actual
-            # tensor roster.  ``node_spread_per_layer`` below deliberately
-            # retains the complete evaluated roster so DLS-pruned layers are
-            # distinguishable from layers that were never fitted.
-            "fitted_layers": sorted(layer_subs),
-            "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
-            # Provenance only (nothing branches on these at load).  The
-            # whitener is mandatory for an activation-space fit, so both the
-            # per-layer share weighting and the PCA *subspace selection* are
-            # always whitened/Fisher — no Euclidean fit path survives.
-            "share_metric": "mahalanobis",
-            "subspace_metric": "mahalanobis",
-            # Diagnostic layer profile (see step 2c): the whitened between-node
-            # spread per layer, ``{str(L): tr(G_L)}``.  Not consumed by any
-            # runtime path — surfaced by `manifold show` as the concept's
-            # signal-by-layer curve.
-            "node_spread_per_layer": {
-                str(idx): node_spread_per_layer[idx] for idx in fit_layers
-            },
+        #
+        # ``save_manifold`` derives ``fitted_layers`` from the actual tensor
+        # roster.  ``node_spread_per_layer`` below deliberately retains the
+        # complete evaluated roster, so DLS-pruned layers stay distinguishable
+        # from layers that were never fitted.  The whitener is mandatory for an
+        # activation-space fit, so both the per-layer share weighting and the
+        # PCA subspace selection are whitened/Fisher.
+        metadata: dict[str, Any] = _base_fit_metadata(
+            method=method,
+            nodes_sha=nodes_sha,
+            model_fingerprint=model_fingerprint,
+            capture_sha=capture_sha,
+            fitted_layers=sorted(layer_subs),
+            subspace_metric="mahalanobis",
+            sae_backend=sae_backend,
+            sae_full_coverage=layer_indices is None,
+            node_roles=node_roles,
+            node_kinds=node_kinds,
+            any_role=any_role,
+            any_kind=any_kind,
+        )
+        # Diagnostic layer profile (see step 2c): the whitened between-node
+        # spread per layer, ``{str(L): tr(G_L)}``.  Not consumed by any runtime
+        # path — surfaced by `manifold show` as the concept's signal-by-layer
+        # curve.
+        metadata["node_spread_per_layer"] = {
+            str(idx): node_spread_per_layer[idx] for idx in fit_layers
         }
         if rbf_smoothing_per_layer:
             # Penalized-RBF provenance: the GCV-chosen λ + effective dof per
@@ -2641,36 +2736,10 @@ class ManifoldExtractionPipeline:
             metadata["sigma_field_per_layer"] = {
                 str(idx): info for idx, info in sigma_field_per_layer.items()
             }
-        if sae_backend is not None:
-            metadata["sae_release"] = sae_backend.release
-            metadata["sae_revision"] = sae_backend.revision
-            metadata["sae_fingerprint"] = sae_backend.fingerprint
-            metadata["sae_ids_by_layer"] = dict(
-                getattr(sae_backend, "sae_ids_by_layer", {})
-            )
-            metadata["sae_full_coverage"] = layer_indices is None
-        if any_role:
-            # Per-node roles ride into the sidecar so `manifold
-            # show` and the inspector surfaces can report "this node was
-            # pooled as <role>" without re-reading manifold.json.  The
-            # order matches ``node_labels``; a missing entry means
-            # ``None`` (standard assistant baseline).
-            metadata["node_roles"] = list(node_roles)
-        if any_kind:
-            # Per-node kind rides into the sidecar for inspector/provenance,
-            # ``node_labels`` order; absent when no node carries a kind.
-            metadata["node_kinds"] = list(node_kinds)
         metadata.update(discover_metadata)
-        _publish_fit_if_current(
-            pathlib.Path(folder),
+        return self._publish_and_emit(
+            folder,
             expected_revision=_authoring_revision or nodes_sha,
             manifold=manifold, tensor_path=tensor_path, metadata=metadata,
+            emit_event=emit_event, progress=_progress, started=fit_started,
         )
-        manifold.metadata.update(metadata)
-
-        if emit_event:
-            self._events.emit(ManifoldExtracted(
-                name=mf.name, manifold=manifold, metadata=metadata,
-            ))
-        _progress(f"Fit complete in {time.perf_counter() - fit_started:.1f}s.")
-        return manifold

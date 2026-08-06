@@ -2718,6 +2718,7 @@ def test_adopt_fitted_manifold_rebinds_loaded_probe_profile_and_prefix(
     }
     session._analytics_cpu_cache = {"local/mood": object()}
     session._prefix_cache = object()
+    session._dls = True
 
     session._adopt_fitted_manifold(tmp_path / "local" / "mood", new)
 
@@ -2771,6 +2772,7 @@ def test_failed_fit_override_evicts_stale_manifold_consumers(
     }
     session._analytics_cpu_cache = {"local/mood": object()}
     session._prefix_cache = object()
+    session._dls = True
 
     @contextmanager
     def _exclusive(*_args: Any, **_kwargs: Any):
@@ -2825,6 +2827,7 @@ def test_override_validation_failure_preserves_unchanged_consumers(
     session._probe_hash_cache = {}
     session._analytics_cpu_cache = {}
     session._prefix_cache = object()
+    session._dls = True
     folder = tmp_path / "local" / "mood"
     folder.mkdir(parents=True)
     (folder / "manifold.json").write_text('{"fit_mode":"authored"}')
@@ -2850,3 +2853,69 @@ def test_override_validation_failure_preserves_unchanged_consumers(
 
     assert session._manifolds == {"local/mood": old}
     assert set(session._profiles) == {"local/mood"}
+
+
+def test_dls_false_keeps_every_axis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``dls=False`` skips straddle-pruning; every fitted axis survives.
+
+    The flag was threaded from ``--no-dls`` all the way to ``self._dls`` and
+    then read by nobody: ``compute_dls_axes`` ran unconditionally with the real
+    per-model baseline, so DLS could not actually be disabled. The pipeline now
+    gates it by passing ``None`` for the baseline — ``compute_dls_axes``'s own
+    documented "disabled" contract.
+    """
+    from saklas.core import capture as C
+
+    seen: list[object] = []
+    real = C.compute_dls_axes
+
+    def _spy(node_centroids, bases, layer_means):
+        seen.append(layer_means)
+        return real(node_centroids, bases, layer_means)
+
+    monkeypatch.setattr(C, "compute_dls_axes", _spy)
+
+    handle = _Handle()
+    folder = _discover_folder(
+        tmp_path / "off", fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    manifold = ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder, dls=False,
+    )
+
+    # The gate reached the DLS core as the disabled baseline...
+    assert seen == [None]
+    # ...and nothing was pruned: every requested layer is fitted, each at the
+    # full derived layout rank.
+    layout_dim = int(manifold.node_coords.shape[1])
+    assert sorted(manifold.layers) == list(range(_N_LAYERS))
+    for sub in manifold.layers.values():
+        assert sub.rank == layout_dim
+
+
+def test_dls_true_passes_the_real_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default still runs straddle-pruning against the per-model means."""
+    from saklas.core import capture as C
+
+    seen: list[object] = []
+    real = C.compute_dls_axes
+
+    def _spy(node_centroids, bases, layer_means):
+        seen.append(layer_means)
+        return real(node_centroids, bases, layer_means)
+
+    monkeypatch.setattr(C, "compute_dls_axes", _spy)
+
+    handle = _Handle()
+    folder = _discover_folder(
+        tmp_path / "on", fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
+    assert len(seen) == 1
+    assert seen[0] is handle.layer_means
