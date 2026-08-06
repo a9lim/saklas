@@ -61,9 +61,7 @@ def _wire(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pkg_root: Path) -> No
     pkg_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(templates_mod, "_resources", _FakeResources(pkg_root))
-    monkeypatch.setattr(
-        templates_mod, "_templates_materialized_this_process", False,
-    )
+    monkeypatch.setattr(templates_mod, "_templates_materialized_home", None)
 
 
 # --------------------------------------------------------------------------- #

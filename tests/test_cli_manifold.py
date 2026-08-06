@@ -134,7 +134,7 @@ def _materialize_bundles_for_cli_test(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.setattr("saklas.io.manifolds._materialized_this_process", False)
+    monkeypatch.setattr("saklas.io.manifolds._materialized_home", None)
     from saklas.io import selectors
     from saklas.io.manifolds import materialize_bundled_manifolds
     selectors.invalidate()

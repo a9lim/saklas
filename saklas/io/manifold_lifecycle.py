@@ -7,7 +7,7 @@ cross-model Procrustes transfer, and the session-independent
 :mod:`saklas.io.manifold_folder`.
 
 Bundled materialization (``materialize_bundled_manifolds`` and the
-``_materialized_this_process`` flag) deliberately does **not** live here —
+``_materialized_home`` process guard) deliberately does **not** live here —
 it stays physically in :mod:`saklas.io.manifolds` so the process-scope
 flag is monkeypatchable by its public attribute path with zero test edits.
 ``refresh_manifold`` reaches it through a lazy import of that module.
@@ -36,6 +36,9 @@ from saklas.io.manifold_folder import (
     validate_manifold_format_version,
 )
 from saklas.io.paths import manifold_dir
+# Every lifecycle entry point that can change the installed manifold roster
+# drops the resolver's memoized walks itself — callers carry no duty.
+from saklas.io.selectors import invalidate as invalidate_selector_index
 
 
 # ============================================================ lifecycle (rm/clear/refresh) ===
@@ -225,9 +228,11 @@ def clear_manifold_tensors(
 
     folder = manifold_dir(namespace, name)
     with _locked_manifest(folder):
-        return _clear_manifold_tensors_locked(
+        cleared = _clear_manifold_tensors_locked(
             namespace, name, model_scope, variant=variant,
         )
+    invalidate_selector_index()
+    return cleared
 
 
 def _clear_manifold_tensors_locked(
@@ -361,7 +366,9 @@ def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
 
     folder = manifold_dir(namespace, name)
     with _locked_manifest(folder):
-        return _remove_manifold_folder_locked(namespace, name)
+        removed = _remove_manifold_folder_locked(namespace, name)
+    invalidate_selector_index()
+    return removed
 
 
 def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
@@ -455,9 +462,11 @@ def refresh_manifold(
 
     folder = manifold_dir(namespace, name)
     with _locked_manifest(folder):
-        return _refresh_manifold_locked(
+        tier = _refresh_manifold_locked(
             namespace, name, model_scope=model_scope, force=force,
         )
+    invalidate_selector_index()
+    return tier
 
 
 def _refresh_manifold_locked(

@@ -139,8 +139,6 @@ def _validate_runtime_payload(
 
 
 def load_sae_metadata(model_id: str, release: str) -> dict[str, Any] | None:
-    import json
-
     path = sae_metadata_path(model_id, release)
     if not path.exists():
         return None
@@ -173,8 +171,6 @@ def _validate_feature_entry(value: Any) -> dict[str, Any] | None:
 
 def load_sae_feature_meta(model_id: str, release: str) -> dict[str, dict[str, Any]]:
     """Load the current ``{feature_id: {label, max_act}}`` metadata cache."""
-    import json
-
     path = sae_features_path(model_id, release)
     if not path.exists():
         return {}

@@ -9,7 +9,7 @@ Kinds:
 
 Special alias: "default" -> namespace/default.
 
-This module lives under ``saklas.io`` because both ``io.cache_ops`` and
+This module lives under ``saklas.io`` because both the io lifecycle layer and
 ``core.session`` need the grammar; importing from ``cli`` would invert the
 layer dependency. CLI runners parse argv with :func:`parse` and pass the
 resulting :class:`Selector` instances down.
@@ -103,62 +103,89 @@ def parse(raw: str) -> Selector:
     return Selector(kind="name", value=raw)
 
 
-# Module-level cache keyed by vectors root path. Walking the tree hits the
-# filesystem for every concept folder — compound selectors like `-r tag:x -x
-# model:y` resolve multiple times per invocation, so we memoize here and rely
-# on cache_ops to call `invalidate()` after any mutation.
-_concepts_cache: dict[Path, list[ResolvedConcept]] = {}
+@dataclass(frozen=True)
+class _ManifoldIndex:
+    """The three selector views, all projected from a single tree walk.
 
-# Module-level cache keyed by manifolds root path, mirroring _concepts_cache.
-# resolve_manifold_label() walks every installed manifold from disk on every
-# call; the steering grammar invokes it on plain bare slugs, so a compound
-# expression resolves it repeatedly. We cache the full all-namespace walk once
-# (the namespace=None form) and filter in-memory, exactly as resolve() does for
-# concepts. Cleared in invalidate() so manifold install/refresh/remove drops it.
-_manifold_labels_cache: dict[Path, list["ResolvedManifoldLabel"]] = {}
+    ``concepts`` is every installed manifold as a :class:`ResolvedConcept`;
+    ``labels`` is the flattened ``(namespace, manifold, node label)`` index;
+    ``names`` is the 2-node ``pca`` subset addressable by manifold *name*.
+    """
 
-# Companion index over manifold *names* (not node labels) for the
-# vector-composite read path: a 2-node ``pca`` manifold named ``happy.sad``
-# resolves by its bare name to node 0 (the ``orient_to=0`` + pole), the way a
-# steering vector's composite name resolved before 4.0. Memoized + cleared in
-# invalidate() like the label index.
-_manifold_names_cache: dict[Path, list["ResolvedManifoldName"]] = {}
+    concepts: list[ResolvedConcept]
+    labels: list["ResolvedManifoldLabel"]
+    names: list["ResolvedManifoldName"]
+
+
+# One memoized walk keyed by the manifolds root. Walking the tree opens and
+# parses every ``manifold.json`` under ``manifolds_dir()``, and a single
+# compound steering expression hits all three views — so the walk runs once and
+# the views are built from it in memory rather than each re-walking. Cleared by
+# ``invalidate()``, which every io mutator calls for itself.
+_index_cache: dict[Path, _ManifoldIndex] = {}
+
+
+def _manifold_index() -> _ManifoldIndex:
+    """Walk ``manifolds_dir()`` once and project the three selector views."""
+    root = manifolds_dir()
+    cached = _index_cache.get(root)
+    if cached is not None:
+        return cached
+    # Lazy import — selectors.py lives under io/ and shouldn't import at
+    # module-load time from a peer that may import it back.
+    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
+
+    try:
+        folders = list(iter_manifold_folders())
+    except ManifoldFormatError:
+        # A single malformed folder shouldn't poison the whole resolve;
+        # ``iter_manifold_folders`` already skips them, but defensive.
+        folders = []
+
+    concepts: list[ResolvedConcept] = []
+    labels: list[ResolvedManifoldLabel] = []
+    names: list[ResolvedManifoldName] = []
+    for ns, mf in folders:
+        concepts.append(ResolvedConcept(
+            namespace=ns, name=mf.name, folder=mf.folder,
+            tags=list(mf.tags or []),
+        ))
+        labels.extend(
+            ResolvedManifoldLabel(namespace=ns, manifold_name=mf.name, label=label)
+            for label in mf.node_labels
+        )
+        # Only a 2-node ``pca`` fit reads as a vector composite — its name maps
+        # to node 0. Multi-node / curved / authored manifolds are addressed by
+        # ``<name>%<label>`` only and never surface in the name view.
+        if mf.fit_mode == "pca" and len(mf.node_labels) == 2:
+            names.append(ResolvedManifoldName(
+                namespace=ns, manifold_name=mf.name, pole_label=mf.node_labels[0],
+            ))
+
+    index = _ManifoldIndex(concepts=concepts, labels=labels, names=names)
+    _index_cache[root] = index
+    return index
 
 
 def invalidate() -> None:
-    """Drop cached concept + manifold-label walks. Call after install/delete/refresh."""
-    _concepts_cache.clear()
-    _manifold_labels_cache.clear()
-    _manifold_names_cache.clear()
+    """Drop the memoized manifold walk.
+
+    Every io mutator that can change the installed roster calls this itself
+    (authoring, lifecycle, install/pull, bundled materialization), so callers
+    carry no invalidation duty.
+    """
+    _index_cache.clear()
 
 
 def all_concepts() -> list[ResolvedConcept]:
     """Every installed concept — i.e. every installed manifold (4.0).
 
-    Concepts and steering manifolds are the same artifact now, so this walks
-    ``manifolds_dir()`` via :func:`~saklas.io.manifolds.iter_manifold_folders`
-    (which already skips malformed folders).  Memoized on the manifolds root and
-    cleared by :func:`invalidate`, exactly as the manifold-label index is.
+    Concepts and steering manifolds are the same artifact now, so this reads
+    the memoized ``manifolds_dir()`` walk (:func:`_manifold_index`, which goes
+    through :func:`~saklas.io.manifolds.iter_manifold_folders` and already
+    skips malformed folders).
     """
-    root = manifolds_dir()
-    cached = _concepts_cache.get(root)
-    if cached is not None:
-        return cached
-    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
-
-    out: list[ResolvedConcept] = []
-    try:
-        folders = list(iter_manifold_folders())
-    except ManifoldFormatError:
-        _concepts_cache[root] = out
-        return out
-    for ns, mf in folders:
-        out.append(ResolvedConcept(
-            namespace=ns, name=mf.name, folder=mf.folder,
-            tags=list(mf.tags or []),
-        ))
-    _concepts_cache[root] = out
-    return out
+    return _manifold_index().concepts
 
 
 def resolve(selector: Selector) -> list[ResolvedConcept]:
@@ -258,63 +285,32 @@ class ResolvedManifoldLabel:
         return f"{self.namespace}/{self.manifold_name}"
 
 
-def _all_manifold_labels() -> list[ResolvedManifoldLabel]:
-    """Flattened (namespace, manifold, label) index over every installed manifold.
-
-    Memoized on ``manifolds_dir()`` like :func:`all_concepts`; callers filter
-    in-memory by namespace + label. We cache the all-namespace walk (rather than
-    keying the cache by namespace too) so a single entry serves every lookup,
-    matching how ``resolve()`` filters the cached concept walk — bare-name
-    resolution dominates and a namespace-scoped query just narrows the same list.
-    """
-    root = manifolds_dir()
-    cached = _manifold_labels_cache.get(root)
-    if cached is not None:
-        return cached
-    # Lazy import — selectors.py lives under io/ and shouldn't import
-    # at module-load time from a peer that may import it back.
-    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
-
-    out: list[ResolvedManifoldLabel] = []
-    try:
-        manifolds = list(iter_manifold_folders())
-    except ManifoldFormatError:
-        # A single malformed folder shouldn't poison the whole resolve;
-        # ``iter_manifold_folders`` already skips them, but defensive.
-        _manifold_labels_cache[root] = out
-        return out
-    for ns, mf in manifolds:
-        out.extend(
-            ResolvedManifoldLabel(namespace=ns, manifold_name=mf.name, label=label)
-            for label in mf.node_labels
-        )
-    _manifold_labels_cache[root] = out
-    return out
-
-
 def resolve_manifold_label(
     label: str, *, namespace: Optional[str] = None,
 ) -> Optional[ResolvedManifoldLabel]:
     """Resolve a bare label to (namespace, manifold, label) — or ``None``.
 
-    Scans the memoized manifold-label index (every installed manifold, or
-    every manifold inside ``namespace`` when set) for one whose
-    ``node_labels`` contains ``label``.  Returns a
+    Tier 1 of :func:`resolve_bare_atom`.  Scans the memoized manifold-label
+    index (every installed manifold, or every manifold inside ``namespace``
+    when set) for one whose ``node_labels`` contains ``label``.  Returns a
     :class:`ResolvedManifoldLabel` on a single
     match, ``None`` when nothing matches (the caller falls through to
     other resolution tiers — e.g. a fresh concept), and raises
     :class:`AmbiguousSelectorError` when multiple manifolds carry a
-    node by the same label.  This is the manifold tier of
-    :func:`resolve_bare_atom`; the bare-pole/label collapse (a bipolar
+    node by the same label.  The bare-pole/label collapse (a bipolar
     concept *is* a 2-node manifold) lets ``persona`` (the manifold node)
-    and ``angry`` (the bipolar pole) resolve through the same surface.
+    and ``angry`` (the bipolar pole) resolve through this one surface; a hit
+    routes to a ``<manifold>%<label>``
+    :class:`~saklas.core.steering_expr.ManifoldTerm`.
 
+    The index is the all-namespace walk, narrowed in memory — bare-label
+    resolution dominates and a namespace-scoped query is just a filter.
     The lookup is a folder scan, not a fitted-tensor check — labels
     exist on the artifact regardless of whether the manifold has been
     fitted for the loaded model.  A persona manifold authored on
     disk but never fitted still surfaces here.
     """
-    index = _all_manifold_labels()
+    index = _manifold_index().labels
     matches = [
         m for m in index
         if m.label == label
@@ -331,28 +327,6 @@ def resolve_manifold_label(
             f"Specify the manifold explicitly as <ns>/<name>%{label}."
         )
     return matches[0]
-
-
-def resolve_bare_name(
-    raw: str, *, namespace: Optional[str] = None,
-) -> Optional[ResolvedManifoldLabel]:
-    """Resolve a bare name through the manifold-label tier.
-
-    Returns the :class:`ResolvedManifoldLabel` when an installed manifold
-    owns a node labeled ``raw``, else ``None``.  A bipolar concept *is* a
-    2-node ``pca`` manifold now, so the historical bipolar-pole tier
-    collapsed into the manifold tier: :func:`canonicalize_atom` no longer
-    resolves a distinct artifact (it only canonicalizes / peels the
-    ``:variant`` suffix), so there is no cross-tier pole/label collision left
-    to arbitrate here.  A cross-namespace manifold-label collision still
-    raises :class:`AmbiguousSelectorError` from
-    :func:`resolve_manifold_label`.
-
-    This is tier 1 of :func:`resolve_bare_atom`, which owns the full ladder
-    (label → composite name → pole canonicalization); a hit routes to a
-    ``<manifold>%<label>`` :class:`~saklas.core.steering_expr.ManifoldTerm`.
-    """
-    return resolve_manifold_label(raw, namespace=namespace)
 
 
 @dataclass(frozen=True)
@@ -375,36 +349,6 @@ class ResolvedManifoldName:
         return f"{self.namespace}/{self.manifold_name}"
 
 
-def _all_manifold_names() -> list[ResolvedManifoldName]:
-    """Memoized index of 2-node ``pca`` manifolds keyed for name resolution.
-
-    Only a 2-node ``pca`` fit reads as a vector composite — its name maps to
-    node 0.  Multi-node / curved / authored manifolds are addressed by
-    ``<name>%<label>`` only and never surface here.  Memoized on
-    ``manifolds_dir()`` and cleared by :func:`invalidate`, mirroring
-    :func:`_all_manifold_labels`.
-    """
-    root = manifolds_dir()
-    cached = _manifold_names_cache.get(root)
-    if cached is not None:
-        return cached
-    from saklas.io.manifolds import ManifoldFormatError, iter_manifold_folders
-
-    out: list[ResolvedManifoldName] = []
-    try:
-        manifolds = list(iter_manifold_folders())
-    except ManifoldFormatError:
-        _manifold_names_cache[root] = out
-        return out
-    for ns, mf in manifolds:
-        if mf.fit_mode == "pca" and len(mf.node_labels) == 2:
-            out.append(ResolvedManifoldName(
-                namespace=ns, manifold_name=mf.name, pole_label=mf.node_labels[0],
-            ))
-    _manifold_names_cache[root] = out
-    return out
-
-
 def resolve_manifold_name(
     name: str, *, namespace: Optional[str] = None,
 ) -> Optional[ResolvedManifoldName]:
@@ -416,7 +360,7 @@ def resolve_manifold_name(
     other tiers), and raises :class:`AmbiguousSelectorError` when the same
     name lives in two namespaces and none was specified.
     """
-    index = _all_manifold_names()
+    index = _manifold_index().names
     matches = [
         m for m in index
         if m.manifold_name == name
@@ -470,7 +414,7 @@ def resolve_bare_atom(
     grammar used to hand-sequence (`core.steering_expr`): a concept *is* a
     manifold now, so a bare reference resolves, in order:
 
-    1. **manifold-label tier** (:func:`resolve_bare_name`) — when the atom is a
+    1. **manifold-label tier** (:func:`resolve_manifold_label`) — when the atom is a
        plain bare slug (``variant == "raw"``, no user-typed namespace, no
        bipolar ``.``), a hit on a manifold's node label routes to a label-form
        ``%`` push.  Cross-*manifold* label collisions raise
@@ -507,7 +451,7 @@ def resolve_bare_atom(
         and "." not in concept
     ):
         try:
-            label_hit = resolve_bare_name(concept, namespace=namespace)
+            label_hit = resolve_manifold_label(concept, namespace=namespace)
         except AmbiguousSelectorError:
             raise
         except Exception:

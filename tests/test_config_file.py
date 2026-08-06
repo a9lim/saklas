@@ -123,7 +123,7 @@ def test_ensure_vectors_installed_all_present(monkeypatch: pytest.MonkeyPatch, t
     # against the just-dropped folder with nothing to install.  Reset the
     # process-scope materialize guard so it actually fires under this test's
     # SAKLAS_HOME (in a real CLI run, config load is the first materialize).
-    monkeypatch.setattr("saklas.io.manifolds._materialized_this_process", False)
+    monkeypatch.setattr("saklas.io.manifolds._materialized_home", None)
     c = cfg.ConfigFile(vectors="0.5 default/confident.uncertain")
     missing = cfg.ensure_vectors_installed(c, strict=False)
     assert missing == []
@@ -136,7 +136,7 @@ def test_bundled_manifolds_materialize_after_in_process_home_switch(
     from saklas.io import manifolds as manifolds_mod
     from saklas.io.paths import manifolds_dir
 
-    monkeypatch.setattr(manifolds_mod, "_materialized_this_process", False)
+    monkeypatch.setattr(manifolds_mod, "_materialized_home", None)
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "first"))
     manifolds_mod.materialize_bundled_manifolds()
     assert (manifolds_dir() / "default" / "formal.casual").is_dir()

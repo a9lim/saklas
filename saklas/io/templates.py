@@ -48,6 +48,7 @@ from typing import Any, Iterator
 
 from saklas.core.errors import SaklasError
 from saklas.io.atomic import write_bytes_atomic, write_json_atomic
+from saklas.io.bootstrap import canonical_payload_sha256
 from saklas.io.integrity import NAME_REGEX
 from saklas.io.paths import ensure_within, templates_dir
 
@@ -79,8 +80,6 @@ def _slug_value(value: str) -> str:
 
 def _canonical_json(obj: Any) -> bytes:
     """Stable serialization for the staleness hash (sorted keys, compact)."""
-    import json
-
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -218,8 +217,6 @@ class TemplateFolder:
     @classmethod
     def load(cls, folder: Path) -> "TemplateFolder":
         """Load + validate a ``template.json`` from ``folder``."""
-        import json
-
         manifest = folder / "template.json"
         if not manifest.exists():
             raise TemplateFormatError(f"no template.json under {folder}")
@@ -486,10 +483,6 @@ def create_template_folder(
     return folder
 
 
-def load_template(namespace: str, name: str) -> TemplateFolder:
-    return TemplateFolder.load(template_dir(namespace, name))
-
-
 def iter_template_folders() -> Iterator[TemplateFolder]:
     """Yield every loadable template under ``templates_dir()`` (skips broken)."""
     root = templates_dir()
@@ -560,36 +553,30 @@ def remove_template_folder(namespace: str, name: str) -> bool:
 # node corpora derive deterministically from ``slot × values × contexts``), so
 # the copy is one file — no ``nodes/`` subtree to mirror.
 #
+# **Dormant, not dead.**  No template ships bundled at present, so
+# ``bundled_template_names()`` returns ``[]`` and the materializer no-ops.  The
+# mechanism stays because a template-derived bundled manifold is the one
+# artifact that authors deterministically and model-free — write the template,
+# and ``create_manifold_from_template`` derives the corpus with no generation
+# step.  The ordering invariant below is what makes that shippable.
+#
 # **Ordering invariant.**  A bundled *manifold* may ``template_ref`` a bundled
 # ``default/<name>`` template.  The manifold *fit* resolves that ref to use the
 # template's multi-turn contexts as elicitation prefixes
 # (``core/extraction.py``) — a hard ``TemplateNotFoundError`` if it's absent — and
 # the ``nodes_sha256`` staleness key folds the resolved template's sha256
-# (best-effort: it falls back to the ref string if unresolved).  So this MUST run
-# before ``materialize_bundled_manifolds`` at every bootstrap site, or the first
-# fit of a templated bundled manifold raises.
+# (best-effort: it falls back to the ref string if unresolved).  So this MUST
+# run before ``materialize_bundled_manifolds``.  That order is enforced in
+# exactly one place — :func:`saklas.io.bootstrap.materialize_bundled_artifacts`,
+# the entry point every bootstrap site calls — rather than by each site
+# remembering it.
 
-# Process-scope flag: set True after the first ``materialize_bundled_templates``
-# so a later call in the same process is a no-op.  Mirrors the manifold
+# Process-scope guard: the ``SAKLAS_HOME`` the first
+# ``materialize_bundled_templates`` call covered, so a later call for that same
+# root is a no-op (``None`` means "not yet materialized").  Mirrors the manifold
 # materializer — process-scope caching sidesteps the "bundle changed under user"
 # vs "user changed it via CLI" ambiguity (see that function's docstring).
-_templates_materialized_this_process: bool = False
 _templates_materialized_home: Path | None = None
-
-
-def _canonical_json_sha256(data: bytes) -> str:
-    """Content-stable sha256 of a JSON byte payload.
-
-    Hashes the canonical-JSON form so cosmetic-only differences (key order,
-    indent, trailing newline) compare equal.  Falls back to a raw sha256 if the
-    bytes don't parse, so unparseable on-disk content reads as "user edited"
-    rather than getting silently overwritten.
-    """
-    try:
-        parsed = json.loads(data)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return hashlib.sha256(data).hexdigest()
-    return hashlib.sha256(_canonical_json(parsed)).hexdigest()
 
 
 def _bundled_template_valid(pkg_root: Any) -> bool:
@@ -638,17 +625,15 @@ def materialize_bundled_templates() -> None:
     - **No change** — skip.
 
     Process-scoped no-op after the first call for a given ``SAKLAS_HOME``.
-    Switching homes in-process bootstraps the new root. Must run BEFORE
-    ``materialize_bundled_manifolds`` — see the module note above.
+    Switching homes in-process bootstraps the new root.  Must run BEFORE
+    ``materialize_bundled_manifolds``; call
+    :func:`saklas.io.bootstrap.materialize_bundled_artifacts`, which owns that
+    ordering, rather than invoking this directly.
     """
-    global _templates_materialized_this_process, _templates_materialized_home
+    global _templates_materialized_home
     home = templates_dir().parent
-    if (
-        _templates_materialized_this_process
-        and _templates_materialized_home == home
-    ):
+    if _templates_materialized_home == home:
         return
-    _templates_materialized_this_process = True
     _templates_materialized_home = home
 
     names = bundled_template_names()
@@ -676,8 +661,8 @@ def materialize_bundled_templates() -> None:
             continue
 
         hash_changed = (
-            _canonical_json_sha256(on_disk_bytes)
-            != _canonical_json_sha256(bundled_bytes)
+            canonical_payload_sha256(on_disk_bytes)
+            != canonical_payload_sha256(bundled_bytes)
         )
         fmt = on_disk_payload.get("format_version")
         format_stale = (

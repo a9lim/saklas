@@ -109,11 +109,16 @@ def pull_manifold(
 ) -> Path:
     """Download and atomically install while holding the target folder lock."""
     from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.selectors import invalidate as invalidate_selector_index
 
     with _locked_manifest(Path(target_folder)):
-        return _pull_manifold_locked(
+        installed = _pull_manifold_locked(
             coord, target_folder, force=force, revision=revision,
         )
+    # The installed roster changed; drop the resolver's memoized walks so a
+    # freshly pulled manifold's node labels resolve in this process.
+    invalidate_selector_index()
+    return installed
 
 
 def _pull_manifold_locked(
@@ -711,9 +716,15 @@ def install_manifold(
     """
     from saklas.io.paths import manifold_dir
 
+    from saklas.io.selectors import invalidate as invalidate_selector_index
+
     p = Path(target)
     if p.exists() and p.is_dir():
-        return _install_local_manifold(p, as_=as_, force=force)
+        installed = _install_local_manifold(p, as_=as_, force=force)
+        # The installed roster changed; drop the resolver's memoized walks.
+        # (The HF branch below invalidates inside ``pull_manifold``.)
+        invalidate_selector_index()
+        return installed
 
     coord, revision = split_revision(target)
     if "/" not in coord:
