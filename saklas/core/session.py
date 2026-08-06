@@ -445,11 +445,12 @@ def _split_composite_source(
 class GenState(IntEnum):
     """Lifecycle phases of a single generation call.
 
-    Replaces the v1.x ``_gen_active: bool`` flag with a typed state so the
-    five-handle teardown (lock, steering scope CM, capture, monitor live,
-    threading lock) is self-documenting.
+    A typed phase rather than a bare in-flight flag, so the five-handle
+    teardown (lock, steering scope CM, capture, monitor live, threading lock)
+    is self-documenting.
 
-    Transitions live in :meth:`SaklasSession._generate_core`:
+    Transitions live in :meth:`SaklasSession._generation_transaction` and
+    :meth:`SaklasSession._generate_core`:
 
     - ``IDLE`` → ``PREAMBLE``: lock acquired, re-entry guard passed.
     - ``PREAMBLE`` → ``RUNNING``: capture attached, monitor ``begin_live``,
@@ -906,12 +907,10 @@ class SaklasSession:
         # at probe time keeps the failure mode "StaticCache constructor
         # raised" rather than "compile + probe interaction").  We then
         # decide ``compile_mode`` based on the probe outcome and apply
-        # ``torch.compile`` manually below.  This closes the order-of-
-        # operations bug Codex flagged in v2.2 review: the previous
-        # shape committed to ``"reduce-overhead"`` based on the
-        # *requested* ``cuda_graphs=True`` before the probe could veto,
-        # so arch-failed sessions ran DynamicCache under a graph-capture
-        # compile mode (mode-and-cache mismatch).
+        # ``torch.compile`` manually below.  Ordering matters: committing
+        # to ``"reduce-overhead"`` from the *requested* ``cuda_graphs=True``
+        # before the probe can veto leaves an arch-failed session running
+        # DynamicCache under a graph-capture compile mode.
         model, tokenizer = load_model(
             model_id,
             quantize=quantize,
@@ -1067,8 +1066,8 @@ class SaklasSession:
         # populated lazily by ``ensure_manifold_loaded`` on scope entry.
         self._manifolds: dict[str, Manifold] = {}
 
-        # Phase 1 logit pass: session-level default for SamplingConfig
-        # .return_top_k.  Per-call value > 0 wins; per-call K=0 (the
+        # Session-level default for SamplingConfig.return_top_k.
+        # Per-call value > 0 wins; per-call K=0 (the
         # SamplingConfig default) inherits this stored value via the
         # composition in ``_generate_core``.  Clamped on entry mirroring
         # SamplingConfig.__post_init__ so out-of-range values from
@@ -1079,7 +1078,7 @@ class SaklasSession:
             return_top_k = 256
         self._default_return_top_k: int = int(return_top_k)
         self._steering = SteeringManager()
-        # CUDA-graphs / StaticCache routing (Phase B, v2.2).  Probe
+        # CUDA-graphs / StaticCache routing.  Probe
         # support once at construction so the per-generation hot path
         # only consults a boolean.  Off when (a) user opted out, (b)
         # device != cuda, or (c) the model's StaticCache constructor
@@ -1137,7 +1136,7 @@ class SaklasSession:
         self._steering_uses_compiled_offsets: bool = False
 
         # Persistent compile-clean *capture* buffers + hook handles, adopted from
-        # ``from_pretrained`` when compile stuck (slice 2).  The always-on hooks
+        # ``from_pretrained`` when compile stuck.  The always-on hooks
         # ``copy_`` each layer's last-token slice into ``_capture_buffers[L]``
         # every forward (fused into the compiled graph); a probed gen on the
         # compiled path reads them post-forward via ``HiddenCapture.ingest_persistent``
@@ -1193,14 +1192,11 @@ class SaklasSession:
         self._capture = HiddenCapture()
         # Per-gen capture configuration — one :class:`CaptureMode` plus the
         # orthogonal ``persistent`` flag (and the gated subset / keys for
-        # ``GATING_SUBSET``).  Replaces the former five correlated booleans
-        # (``_capture_incremental`` / ``_capture_aggregate_only`` /
-        # ``_capture_lean`` / ``_capture_gating_subset`` / ``_capture_persistent``)
-        # that a hand-kept if/elif chain had to keep consistent; the enum makes
-        # illegal combinations unrepresentable.  Set wholesale in
-        # ``_begin_capture`` and reset on teardown; the ``_score_*`` dispatch keys
-        # off ``mode``.  Each mode and its memory/scoring trade-off is documented
-        # on :class:`CaptureMode`.
+        # ``GATING_SUBSET``).  One enum rather than a set of correlated
+        # booleans, so illegal combinations are unrepresentable.  Set wholesale
+        # in ``_begin_capture`` and reset on teardown; the ``_score_*``
+        # dispatch keys off ``mode``.  Each mode and its memory/scoring
+        # trade-off is documented on :class:`CaptureMode`.
         self._capture_state: CaptureState = CaptureState()
         # Per-token reading buffers the modes append into (the *data*, distinct
         # from the *config* above).  ``_incremental_readings`` holds the full /
@@ -1300,8 +1296,8 @@ class SaklasSession:
         # channel) without reconstructing them from the envelope.
         self._last_token_probe_readings: dict[str, "ProbeReading"] | None = None
 
-        # Probe content-hash cache for transcript export / replay (v2.3
-        # phase 5).  Keyed by probe name → sha256 hex of the baked tensor
+        # Probe content-hash cache for transcript export / replay.
+        # Keyed by probe name → sha256 hex of the baked tensor
         # bytes (concatenated layer order).  Invalidated by
         # :meth:`add_probe` / :meth:`remove_probe`; rebuilt lazily by
         # :meth:`_probe_hash`.
@@ -1869,8 +1865,8 @@ class SaklasSession:
         Uses ``load_or_compute_neutral_activations`` (alignment.py) for
         disk caching; derives missing centering means from that same loaded
         tensor set, then instantiates the :class:`LayerWhitener`.  The shared
-        load matters on a cold model: probe bootstrap no longer reads the
-        neutral cache once for means and immediately again for covariance.
+        load matters on a cold model: probe bootstrap reads the neutral cache
+        once, for the means and the covariance together.
         Soft-fails to ``None``
         on any error — but the engine is Mahalanobis-only now, so a
         ``None`` whitener makes the activation-space consumers (fit,
@@ -2781,7 +2777,7 @@ class SaklasSession:
                     merged = _save_full(base)
                     # The live-state restore primes the locked adoption's
                     # rebuild; both must land as one lens-state
-                    # transaction (round-5: an un-locked restore write
+                    # transaction (an un-locked restore write
                     # between them could be observed torn).
                     with self._lens_instrument.state_lock:
                         if pre_evicted_live is not None:
@@ -5564,8 +5560,8 @@ class SaklasSession:
         - **Tagged concept axes** — for each bundled 2-node ``pca`` manifold
           tagged in a requested category (roster from
           :func:`~saklas.io.probes_bootstrap.load_default_manifolds`) fit-or-
-          load the per-model subspace (eager, same cost band as the legacy DiM
-          extraction — both run forward passes, both disk-cache) and hand the
+          load the per-model subspace (eager — a forward pass per node, then
+          disk-cached) and hand the
           flat :class:`Manifold` to the :class:`Monitor`, which reads it as a
           coordinate (the rank-1 case of the subspace readout).  Registered
           under the **bare** name (``confident.uncertain``) so the gate grammar
@@ -5578,9 +5574,9 @@ class SaklasSession:
           and would block startup for minutes, so an unfitted one is skipped
           with a one-line log (fit it and it auto-loads next launch).
           Registered under the qualified ``default/<name>`` selector so a manual
-          attach from the manifolds drawer matches — no duplicate rows.  This
-          folds the former serve-only bootstrap into the construction-time pass
-          so every frontend gets the same roster.
+          attach from the manifolds drawer matches — no duplicate rows.  The
+          bootstrap runs at construction, so every frontend gets the same
+          roster.
 
         A fit/load failure for one manifold is logged and skipped, never fatal
         to session construction.
@@ -5697,7 +5693,7 @@ class SaklasSession:
         callback mutating the stack mid-step) by raising the
         ``_internal_steering_pop`` flag around the ``__exit__``.
 
-        Exception-safety-critical (Codex review v2): ``old_internal`` is
+        Exception-safety-critical: ``old_internal`` is
         read *before* the ``try`` so the worst case under a signal between
         the read and the assignment is "we never set True", not "we leave
         True set" — the flag never leaks across the gen-lock boundary.
@@ -5982,8 +5978,8 @@ class SaklasSession:
         # ---- Per-family capture demand (Instrument.plan) -------------------
         # The planner hands each family what the session knows about this
         # generation's read demand; each family answers with its declared
-        # ``InstrumentPlan``.  The union of declared layers replaces the
-        # former inline per-family union branches.  RETENTION (incremental
+        # ``InstrumentPlan``, and the union of those declared layers is
+        # what capture covers.  RETENTION (incremental
         # vs tail ring vs full stack) stays session logic below — the
         # ``INCREMENTAL -> set_tail_with_sink`` upgrade is cross-instrument
         # resource sharing, which plans deliberately do not decide
@@ -6030,7 +6026,7 @@ class SaklasSession:
                 self._incremental_readings = []
                 return False
             layer_idxs = sorted(union)
-        # Persistent compile-clean capture (slice 2): when this gen is eligible
+        # Persistent compile-clean capture: when this gen is eligible
         # for the compiled clean path AND steering lowered to offsets (or is
         # unsteered), capture rides the always-on persistent buffers — the decode
         # loop ``copy_``s each slice in inside the compiled graph, and
@@ -6131,7 +6127,7 @@ class SaklasSession:
             not widen and self._monitor.probe_names
             and demand.need_per_token and demand.lean_per_token
         ):
-            # Lean-incremental (FIX F2): the only per-token consumers read just
+            # Lean-incremental: the only per-token consumers read just
             # the axis-0 coord (the trait stream / loom probe row) — no nearest /
             # assignment / per-layer trace, no probe gate.  Score each token
             # ``coords_only`` (skips the big-K nearest norm + assignment softmax +
@@ -6416,7 +6412,7 @@ class SaklasSession:
         accumulate: bool = True,
         pooled: dict[int, torch.Tensor] | None = None,
     ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
-        """Lean per-token coord stream + full aggregate from the tail ring (FIX F2).
+        """Lean per-token coord stream + full aggregate from the tail ring.
 
         The lean-incremental capture path scored each token ``coords_only`` (just
         the cross-layer axis-0 coord / fraction, no nearest / assignment /
@@ -6632,7 +6628,7 @@ class SaklasSession:
         removal is the instrument's atomic ``try_detach`` — a bare
         membership check + direct registry delete bypassed the
         lens-state lock and could land inside a ``prepare`` snapshot or
-        an adoption (round-5).
+        an adoption.
         """
         if self._lens_instrument.try_detach(name):
             pass
@@ -7297,7 +7293,7 @@ class SaklasSession:
         )
         return new_id
 
-    # -- Cast roster (phase 3) --
+    # -- Cast roster --
 
     def set_cast_member(
         self,
@@ -7421,7 +7417,7 @@ class SaklasSession:
     def rewind(self) -> None:
         """Walk the active node back one user→assistant pair.
 
-        Non-destructive under v2.3 loom: the rewound pair stays in the
+        Non-destructive: the rewound pair stays in the
         tree as a dead branch, navigable back via the sidebar / loom
         screen.  ``clear_history`` is the destructive verb.
         """
@@ -7435,7 +7431,7 @@ class SaklasSession:
     def clear_history(self) -> None:
         """Reset the tree to a fresh root.
 
-        Destructive — drops every branch.  Matches v2.2 user expectation
+        Destructive — drops every branch.  Matches user expectation
         of ``/clear`` meaning wipe.  Use :meth:`rewind` for the
         non-destructive step-back.
         """
@@ -7505,7 +7501,7 @@ class SaklasSession:
 
         Useful for batch workloads that re-issue the same chat-template
         head (system + leading user-instruction) hundreds of times — the
-        v3 emotional run motivating this method does 800 stateless
+        The motivating workload does 800 stateless
         generations with the same kaomoji instruction prefix tokens.
         Per-call savings scale with prefix_len / total_input_len.
 
@@ -8445,7 +8441,7 @@ class SaklasSession:
     ) -> tuple["str | Steering | None", SamplingConfig | None, bool | None]:
         """Fill unset per-call kwargs from the gen label's cast recipe.
 
-        The cast roster (phase 3) is the *weakest* tier: the member's
+        The cast roster is the *weakest* tier: the member's
         recipe fills only fields the call left unset (``steering=None``
         means "unset" here; pass ``""`` for an explicit unsteered
         override), sampling merges field-wise with the call's
@@ -8841,7 +8837,7 @@ class SaklasSession:
         # and no-probe paths) AND either unsteered or a static-affine steering that
         # lowered to the persistent offset buffers (``_steering_uses_compiled_offsets``
         # — the push rides the offset, no transient hook).  A probed gen on the
-        # persistent-capture path (slice 2) satisfies both, so it now keeps the
+        # persistent-capture path satisfies both, so it keeps the
         # compiled graph.  Everything else (transient ctx-consulting steering
         # hooks, transient capture hooks for curved/gated/return_hidden) graph-breaks
         # / recompiles, so route it to the eager original (``_orig_mod``) +
@@ -8908,7 +8904,7 @@ class SaklasSession:
             past_key_values=generation_pkv,
             cache_position_offset=cache_position_offset,
             score_callback=gating_callback,
-            # Per-token probe scoring fires post-forward (FIX F1), not inside the
+            # Per-token probe scoring fires post-forward, not inside the
             # capture hook.  On the persistent-capture path the step callback is
             # ``ingest_persistent`` (accumulate from the persistent buffers +
             # fire the step sink); otherwise ``fire_step_sink`` (the transient
@@ -8958,7 +8954,7 @@ class SaklasSession:
         """
         with self._generation_transaction() as txn:
 
-            # Cast roster (phase 3): the gen label's standing recipe is
+            # Cast roster: the gen label's standing recipe is
             # the weakest tier; the regen override below still composes
             # on top of the result.
             steering, sampling, thinking = self._apply_cast_defaults(
@@ -9309,7 +9305,7 @@ class SaklasSession:
             # would be a no-op called once per generated token, AND its presence
             # forces generate_steered to compute the unconditional fp32
             # log_softmax + entropy sync per step (gate at generation.py:571).
-            # Skipping it here trims that cost from the v3 stateless prefill
+            # Skipping it here trims that cost from the stateless prefill
             # workload (800 back-to-back gens of ~16 tokens each, no logprobs,
             # no streaming, no SSE).  Stop-sequence behavior is preserved by
             # not wiring _token_tap=None when stop_list is set — the tokenizer-
@@ -9358,7 +9354,7 @@ class SaklasSession:
             # context enters (``steering_cm.__enter__`` runs
             # ``SteeringComposer.install_composed_steering``, which consults this
             # to decide whether a probed gen may still lower steering to the
-            # persistent offset buffers — slice 2). Eligible when the compiled
+            # persistent offset buffers). Eligible when the compiled
             # CUDA/MPS graph + static cache are live, the persistent capture
             # buffers were adopted, and the caller didn't ask for the full per-step
             # hidden stack (``return_hidden`` keeps the transient full-retention
@@ -9564,7 +9560,7 @@ class SaklasSession:
             applied_steering = (
                 str(steering_obj) if steering_obj is not None else None
             )
-            # Phase 1 logit pass: convert the in-loop logprob accumulator
+            # Convert the in-loop logprob accumulator
             # into per-turn rollups before handing finalize the slot.
             # ``mean_logprob_count == 0`` covers both "no captures because
             # gen was empty" and "no captures because no on_token consumer
@@ -10744,10 +10740,10 @@ class SaklasSession:
             # so we can compose with new alpha terms via string concat.
             base_str = str(base_steering)
 
-        # v2.3 loom: anchor every sibling under a shared user turn so
+        # Anchor every sibling under a shared user turn so
         # the surfaces render the sweep as siblings under a common
         # parent rather than a flat result list.  Stateless sweeps
-        # skip the tree mutation entirely (matches the v2.2 contract);
+        # skip the tree mutation entirely;
         # stateful sweeps land siblings under ``parent_node_id`` (or
         # the active node when None) and dedup on identical user text.
         anchor_user_id: str | None = None

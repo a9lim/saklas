@@ -622,7 +622,7 @@ class _PenaltyState:
 # cached buffer.  Keyed on (id(tokenizer), system_prompt, frozen-tuple of
 # chat, thinking, add_generation_prompt) — id(tokenizer) implicitly
 # invalidates when a fresh tokenizer instance is loaded into a session.
-# Sized to comfortably absorb the v3 stateless workload (one identical
+# Sized to comfortably absorb the stateless prefill workload (one identical
 # prefix repeated 800×) without bloating; small chat lists serialize
 # cheaply to tuples so the per-lookup hash cost is negligible.
 _CHAT_INPUT_CACHE_MAX = 128

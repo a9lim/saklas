@@ -1,4 +1,4 @@
-"""Persistent compile-clean capture parity (slice 2).
+"""Persistent compile-clean capture parity.
 
 The compiled MPS path can't register transient per-token capture hooks (they
 graph-break / recompile), so probed generation rides always-on pre-compile
@@ -182,7 +182,7 @@ def test_persistent_ingest_matches_transient_incremental_and_sink():
     cap_t.set_incremental(lambda _step, latest: rows_t.append(
         {k: v.clone() for k, v in latest.items()}
     ))
-    # In-hook incremental accumulates during the forward; the FIX-F1 sink fires
+    # In-hook incremental accumulates during the forward; the step sink fires
     # post-forward via fire_step_sink.
     _drive(stack_t, clock_t, n, after=cap_t.fire_step_sink)
 

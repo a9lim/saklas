@@ -269,8 +269,7 @@ def test_begin_capture_widens_to_manifold_layers():
 
 
 def test_begin_capture_no_probes_returns_false():
-    """No probes attached → ``_begin_capture`` returns False (the v1
-    behavior)."""
+    """No probes attached → ``_begin_capture`` returns False."""
     session = _stub_session()
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
     session._capture.attach = lambda *args, **kw: None

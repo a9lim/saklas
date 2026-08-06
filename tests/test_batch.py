@@ -52,9 +52,8 @@ def _stub_generate_core(session: SaklasSession, *, capture: list[Any]) -> None:
 
     def _fake(input: Any, *, steering: Any = None, sampling: Any = None, stateless: bool = False, raw: bool = False, thinking: Any = None, on_token: Any = None, **kwargs: Any) -> GenerationResult:
         # ``kwargs`` swallows additions to ``_generate_core``'s signature
-        # (v2.3 added ``parent_node_id`` and ``recipe_override``) so this
-        # stub doesn't churn every time the core gains a new optional
-        # keyword.
+        # (``parent_node_id``, ``recipe_override``, ...) so this stub doesn't
+        # churn every time the core gains a new optional keyword.
         idx = counter["n"]
         counter["n"] += 1
         capture.append({"input": input, "steering": steering})
