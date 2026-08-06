@@ -4,9 +4,11 @@ Owns everything lens-probe-shaped: the probe registry, the live-readout
 runtime state, the per-forward stash, the per-generation disk-identity pin,
 and the six read surfaces (attach / per-step scoring / gate scalars /
 finalize aggregate / live display step / authored-prefill computation).
-The session re-exposes these state fields as delegating properties, under the
-private names ``_begin_capture``, the steering composer, the token tap, and
-the wire layers read them by.
+The instrument IS the addressing scheme for that state: ``_begin_capture``,
+the steering composer, the token tap, and the wire layers read
+``session._lens_instrument.<field>`` (or the public ``session.lens``); the
+transitional delegating properties that re-exposed it under historical
+private session names are gone.
 
 Division of labor (see ``protocol.py``): shared J-lens *primitives* —
 ``_jlens_logits_rows`` / depth caches / decode memo / transport stack /
@@ -31,8 +33,10 @@ from saklas.core.instruments.types import (
     Axis,
     GateRef,
     InstrumentBinding,
+    InstrumentFamily,
     InstrumentPlan,
     InstrumentPrep,
+    LensLiveState,
     LensPrep,
     ReadRequest,
     next_prep_token,
@@ -178,7 +182,7 @@ class LensRun:
 class LensInstrument:
     """Session-lifetime handle for the J-lens read family."""
 
-    family = "lens"
+    family: InstrumentFamily = "lens"
 
     #: Gate channels a lens probe can produce: the one strength axis.
     _GATE_CHANNELS: tuple[type, ...] = (Axis,)
@@ -943,7 +947,7 @@ class LensInstrument:
                 "layer_rows": {l: i for i, l in enumerate(layer_list)},
                 "unembed": get_unembedding(session._model),
                 "norm": get_final_norm(session._model),
-                "source": session._active_jlens_source_label(),
+                "source": self.active_source,
             }
             return list(layers)
 
@@ -959,6 +963,107 @@ class LensInstrument:
             if self.live is None:
                 return None
             return list(self.live["layers"])
+
+    @property
+    def active_source(self) -> str | None:
+        """The active J-lens source in the public source syntax.
+
+        THE resolver — one ``active.json`` read, the same label that stamps
+        every lens measurement binding.  A listing that answered from the
+        prepared-sources scan instead would report ``null`` for an active
+        pointer whose artifact is gone while persisted rows still carry its
+        label.
+        """
+        from saklas.io.lens_sources import (
+            lens_source_label, load_active_lens_source,
+        )
+
+        active = load_active_lens_source(self._session.model_id)
+        return None if active is None else lens_source_label(active)
+
+    @property
+    def live_state(self) -> LensLiveState:
+        layers = self.live_layers
+        return LensLiveState(
+            enabled=layers is not None,
+            layers=tuple(layers) if layers is not None else None,
+        )
+
+    def set_live(self, enabled: bool, **kwargs: Any) -> LensLiveState:
+        """Toggle the live workspace readout.
+
+        ``layers`` (the family extra) selects the live layer set; omitted
+        means every fitted layer.  Disabling with an explicit layer list is
+        a caller error, not a silent no-op.
+        """
+        layers = kwargs.pop("layers", None)
+        if kwargs:
+            raise TypeError(
+                f"lens live takes only 'layers', got {sorted(kwargs)}"
+            )
+        if not enabled:
+            if layers is not None:
+                raise TypeError("lens live disable takes no 'layers'")
+            self.disable_live()
+            return LensLiveState(enabled=False, layers=None)
+        resolved = self.enable_live(layers=layers)
+        return LensLiveState(enabled=True, layers=tuple(resolved))
+
+    # -------------------------------------------------------------- replay
+
+    def token_readout(
+        self,
+        node_id: str,
+        raw_index: int,
+        *,
+        top_k: int | None = None,
+        layers: "list[int] | str | None" = None,
+        apply_steering: bool = True,
+        raw: bool = False,
+    ) -> dict[str, Any]:
+        """The loom-anchored J-lens replay, as the finished
+        ``scope="replay"`` measurement envelope.
+
+        The session owns the replay itself (prompt rebuild, one capture
+        forward under the node's recipe steering); this method owns the
+        envelope, so the route never reshapes a family-native dict.  The
+        session hands back per-layer *probabilities*, which is exactly what
+        ``build_measurements`` takes — there is no exp/log round-trip on
+        this hop.
+        """
+        from saklas.core.measurements import build_measurements
+
+        width = 8 if top_k is None else int(top_k)
+        if not 1 <= width <= 256:
+            raise ValueError("top_k must be in [1, 256]")
+        out = self._session.jlens_token_readout(
+            node_id,
+            raw_index,
+            layers=layers if layers is not None else "all",
+            top_k=width,
+            apply_steering=apply_steering,
+            raw=raw,
+        )
+        readout = out.get("readout", {})
+        measurements = build_measurements(
+            scope="replay",
+            provenance="replayed",
+            lens_readout={
+                int(layer): [(str(tok), float(p_l)) for tok, p_l, _tid in rows]
+                for layer, rows in readout.items()
+            },
+            lens_token_ids={
+                int(layer): [int(tid) for _tok, _p_l, tid in rows]
+                for layer, rows in readout.items()
+            },
+            lens_aggregate=[
+                (str(tok), float(strength), float(com), float(spread))
+                for tok, strength, com, spread in out.get("aggregate", [])
+            ],
+            lens_source=self.active_source,
+            steering=(out.get("steering") if apply_steering else None),
+        )
+        return {"measurements": measurements}
 
     def live_readout_step(
         self, *, top_k: int = 8, step_id: int = -1,

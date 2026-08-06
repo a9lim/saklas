@@ -159,7 +159,7 @@ def finalize_generation(
     if (
         return_probe_readings
         and generated_ids
-        and session._lens_probes
+        and session.lens.names
     ):
         manifold_aggregates.update(
             session._score_lens_probes_aggregate(
@@ -170,7 +170,7 @@ def finalize_generation(
     if (
         return_probe_readings
         and generated_ids
-        and session._sae_probes
+        and session.sae.names
     ):
         manifold_aggregates.update(
             session._score_sae_probes_aggregate(

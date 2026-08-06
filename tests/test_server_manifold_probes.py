@@ -124,8 +124,8 @@ def _mock_session():
     session.tree.active_node_id = "test-assistant"
     session.tree.get.return_value.mean_logprob = None
     session.tree.get.return_value.mean_surprise = None
-    session.lens_probe_specs = {}
-    session.sae_probe_specs = {}
+    session.lens.specs.return_value = {}
+    session.sae.specs.return_value = {}
 
     # The unified monitor: one object, both ``probe_names`` (the wire/gate
     # surface) and ``attached_probes()`` (the serializer source).

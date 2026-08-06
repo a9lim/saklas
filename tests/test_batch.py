@@ -206,9 +206,9 @@ def _fast_batch_session():
         has_compiled_offsets=lambda: False,
         zero_compiled_offsets=lambda: None,
     )
-    s._live_lens = None
-    s._lens_probes = {}
-    s._sae_probes = {}
+    s._lens_instrument.live = None
+    s._lens_instrument.probes = {}
+    s._sae_instrument.probes = {}
     s._sae_layer = None
     s._active_gen_reservation = None
     s._last_token_probe_payload = None
@@ -425,7 +425,7 @@ class TestGenerateBatch:
         # none the batch declines to the serial loop rather than reading
         # nothing.
         s, model = _fast_batch_session()
-        cast(Any, s)._sae_probes = {"sae/17": {"feature_id": 17}}
+        cast(Any, s)._sae_instrument.probes = {"sae/17": {"feature_id": 17}}
         cast(Any, s)._sae_layer = None
         capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
@@ -485,7 +485,7 @@ class TestGenerateBatch:
         s._sae_layer = 0
         s._sae_width = 1
         s._sae_feature_meta = {}
-        s._sae_probes = {
+        s._sae_instrument.probes = {
             "sae/0": {
                 "feature_id": 0,
                 "layer": 0,
@@ -514,7 +514,7 @@ class TestGenerateBatch:
         s, model = _probe_fast_batch_session()
         cast(Any, s)._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
         s._sae_layer = 0
-        s._sae_probes = {
+        s._sae_instrument.probes = {
             "sae/0": {
                 "feature_id": 0,
                 "layer": 0,
@@ -541,8 +541,8 @@ class TestGenerateBatch:
         s, model = _probe_fast_batch_session()
         s_any = cast(Any, s)
         s_any._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
-        s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
-        s_any._lens_probe_layers = lambda: {0}
+        s_any._lens_instrument.probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
+        s_any._lens_instrument.probe_layers = lambda: {0}
 
         def _score_lens_probes(
             hidden: dict[int, Any],
@@ -577,13 +577,13 @@ class TestGenerateBatch:
         s, model = _probe_fast_batch_session()
         s_any = cast(Any, s)
         s_any._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
-        s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
-        s_any._lens_probe_layers = lambda: {0}
+        s_any._lens_instrument.probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
+        s_any._lens_instrument.probe_layers = lambda: {0}
 
         def _score_lens_probes(*_args: Any, **_kwargs: Any) -> dict[str, ProbeReading]:
             raise AssertionError("return_probe_readings=False should skip lens probes")
 
-        s_any._score_lens_probes = _score_lens_probes
+        s_any._lens_instrument.score_probes = _score_lens_probes
 
         def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
             raise AssertionError("serial generation path should not run")

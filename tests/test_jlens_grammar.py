@@ -105,7 +105,7 @@ def test_add_probe_routes_jlens_to_lens_registry() -> None:
 
     name = SaklasSession.add_probe(session, "jlens/g")  # type: ignore[arg-type]
     assert name == "jlens/g"
-    spec = session._lens_probes["jlens/g"]
+    spec = session._lens_instrument.probes["jlens/g"]
     assert spec["word"] == "g"
     assert spec["layers"] == session.jlens.source_layers
     # No direction fold, no profile registration — the readout channel is
@@ -131,7 +131,7 @@ def test_lens_probe_scores_strength_channel() -> None:
         l: torch.randn(d_model, generator=torch.Generator().manual_seed(l))
         for l in layers
     }
-    readings = session._score_lens_probes(hidden)
+    readings = session._lens_instrument.score_probes(hidden)
     reading = readings["jlens/g"]
     (strength,) = reading.coords
     assert 0.0 <= strength <= 1.0
@@ -141,7 +141,7 @@ def test_lens_probe_scores_strength_channel() -> None:
         session.jlens, [(l, hidden[l]) for l in layers],
     )
     depths = [l / (len(session._layers) - 1) for l in layers]
-    token_id = session._lens_probes["jlens/g"]["token_id"]
+    token_id = session._lens_instrument.probes["jlens/g"]["token_id"]
     ((exp_str, exp_com, exp_spread, per_layer),) = token_readout_stats(
         logits.float(), depths, [token_id],
     )
@@ -192,9 +192,9 @@ def test_gated_lens_probe_keys_and_gate_scalars() -> None:
     assert scalars["jlens/g"] == scalars["jlens/g[0]"]
     # The stash is armed for the display step to reuse this forward's logits —
     # keyed by the forward's step id (step identity replaced ``fresh``).
-    assert session._lens_step_stash is not None
-    assert session._lens_step_stash["step"] == 7
-    assert session._lens_step_stash["layers"] == tuple(layers)
+    assert session._lens_instrument.step_stash is not None
+    assert session._lens_instrument.step_stash["step"] == 7
+    assert session._lens_instrument.step_stash["layers"] == tuple(layers)
 
     # Composer-side detection: a gate on the pinned lens probe is recognized
     # from the steering stack without monitor attachment.
@@ -217,8 +217,8 @@ def test_lens_gate_scalar_scores_only_referenced_probe(
     session.fit_jlens(_PROMPTS)
     SaklasSession.add_probe(session, "jlens/g")  # type: ignore[arg-type]
     SaklasSession.add_probe(session, "jlens/a")  # type: ignore[arg-type]
-    session.enable_live_lens(layers=[1])
-    setattr(session, "_live_lens_active_for_generation", False)
+    session._lens_instrument.enable_live(layers=[1])
+    session._lens_instrument.active_for_generation = False
 
     class _FlatCapture:
         def __init__(self, latest: dict[int, torch.Tensor]) -> None:
@@ -246,8 +246,8 @@ def test_lens_gate_scalar_scores_only_referenced_probe(
     assert "jlens/g" in scalars
     assert "jlens/g[0]" in scalars
     assert "jlens/a" not in scalars
-    assert session._lens_step_stash is not None
-    assert "probabilities" not in session._lens_step_stash
+    assert session._lens_instrument.step_stash is not None
+    assert "probabilities" not in session._lens_instrument.step_stash
 
 
 # -------------------------------------------------------------- ns reservation

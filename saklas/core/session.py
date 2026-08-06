@@ -73,6 +73,7 @@ from saklas.core.model import (
 )
 from saklas.core.instruments.types import (
     AGG_TAIL_DEPTH,
+    InstrumentFamily,
     InstrumentPlan,
     ReadRequest,
 )
@@ -94,6 +95,7 @@ from saklas.core.manifold import Manifold
 if TYPE_CHECKING:
     from saklas.core.instruments.geometry import GeometryInstrument
     from saklas.core.instruments.lens import LensInstrument
+    from saklas.core.instruments.protocol import Instrument
     from saklas.core.instruments.sae import SaeInstrument
     from saklas.core.scoring import ChoiceScores
     from saklas.core.steering_composer import SteeringComposer
@@ -1364,10 +1366,10 @@ class SaklasSession:
         # metadata cache stay session-side (shared with steering atoms and
         # the offline token replay).
         _ = self._sae_instrument
-        # CAA live toggle: when False, per-token monitor scoring is disabled
-        # for UI/trait/loom consumers (aggregate-only capture); probe gates
-        # still force the per-token subset they need.
-        self._live_probe_scores: bool = True
+        # The CAA live toggle lives on the geometry instrument (touch it
+        # here so the lazy construction happens under __init__ like its
+        # lens/SAE siblings).
+        _ = self._geometry_instrument
         if probe_categories:
             self._whitener = self._build_whitener_from_cache_or_compute()
 
@@ -1882,8 +1884,8 @@ class SaklasSession:
         boundary's snapshot mid-``prepare``.
         """
         with self._lens_instrument.state_lock:
-            if self._generation_jlens_active:
-                return self._generation_jlens
+            if self._lens_instrument.generation_lens_active:
+                return self._lens_instrument.generation_lens
 
             from saklas.io.lens import load_lens, load_lens_sidecar
 
@@ -1936,8 +1938,8 @@ class SaklasSession:
         side effects serialize on the lens-state lock like the getter's.
         """
         with self._lens_instrument.state_lock:
-            if self._generation_jlens_active:
-                return self._generation_jlens is not None
+            if self._lens_instrument.generation_lens_active:
+                return self._lens_instrument.generation_lens is not None
 
             from saklas.io.lens import load_lens, load_lens_sidecar
 
@@ -1991,15 +1993,15 @@ class SaklasSession:
             self._jlens_depth_tensor_cache = {}
             self._readout_long_tensor_cache = {}
             self._jlens_decode_cache = {}
-            self._lens_step_stash = None
-            self._last_lens_step_readings = None
+            self._lens_instrument.step_stash = None
+            self._lens_instrument.last_step_readings = None
             for key in list(self._profiles):
                 if key.startswith("jlens/"):
                     self._profiles.pop(key, None)
-            for name, spec in self._lens_probes.items():
+            for name, spec in self._lens_instrument.probes.items():
                 spec["layers"] = []
                 self._probe_hash_cache.pop(name, None)
-            self._live_lens = None
+            self._lens_instrument.live = None
             self._invalidate_prefix_cache()
             self._invalidate_analytics_cache()
 
@@ -2025,7 +2027,7 @@ class SaklasSession:
         world, never a mix.
         """
         with self._lens_instrument.state_lock:
-            previous_live = self._live_lens
+            previous_live = self._lens_instrument.live
             previous_layers = (
                 list(previous_live["layers"])
                 if previous_live is not None else []
@@ -2043,17 +2045,17 @@ class SaklasSession:
             self._jlens_depth_tensor_cache = {}
             self._readout_long_tensor_cache = {}
             self._jlens_decode_cache = {}
-            self._lens_step_stash = None
-            self._last_lens_step_readings = None
+            self._lens_instrument.step_stash = None
+            self._lens_instrument.last_step_readings = None
             for key in list(self._profiles):
                 if key.startswith("jlens/"):
                     self._profiles.pop(key, None)
 
             readout_layers = [int(layer) for layer in lens.source_layers]
-            for name, spec in self._lens_probes.items():
+            for name, spec in self._lens_instrument.probes.items():
                 spec["layers"] = list(readout_layers)
                 self._probe_hash_cache.pop(name, None)
-            if self._lens_probes and readout_layers:
+            if self._lens_instrument.probes and readout_layers:
                 self._jlens_transport_stack(
                     lens, sorted(readout_layers), self._device,
                 )
@@ -2063,13 +2065,13 @@ class SaklasSession:
                     layer for layer in previous_layers
                     if layer in lens.jacobians
                 ]
-                self.enable_live_lens(
+                self._lens_instrument.enable_live(
                     layers=(
                         None if previous_used_all_layers else (valid or None)
                     ),
                 )
             else:
-                self._live_lens = None
+                self._lens_instrument.live = None
 
             self._invalidate_prefix_cache()
             self._invalidate_analytics_cache()
@@ -2349,14 +2351,14 @@ class SaklasSession:
                             if resident is not None:
                                 pre_evicted_live = (
                                     {
-                                        "layers": list(self._live_lens["layers"]),
+                                        "layers": list(self._lens_instrument.live["layers"]),
                                         "uses_all_layers": bool(
-                                            self._live_lens.get(
+                                            self._lens_instrument.live.get(
                                                 "uses_all_layers", False,
                                             )
                                         ),
                                     }
-                                    if self._live_lens is not None else None
+                                    if self._lens_instrument.live is not None else None
                                 )
                                 SaklasSession._evict_resident_jlens(self)
                                 resident = None
@@ -2600,12 +2602,12 @@ class SaklasSession:
                 ):
                     pre_evicted_live = (
                         {
-                            "layers": list(self._live_lens["layers"]),
+                            "layers": list(self._lens_instrument.live["layers"]),
                             "uses_all_layers": bool(
-                                self._live_lens.get("uses_all_layers", False)
+                                self._lens_instrument.live.get("uses_all_layers", False)
                             ),
                         }
-                        if self._live_lens is not None else None
+                        if self._lens_instrument.live is not None else None
                     )
                     SaklasSession._evict_resident_jlens(self)
                     resident_evicted_early = True
@@ -2742,7 +2744,7 @@ class SaklasSession:
                     # between them could be observed torn).
                     with self._lens_instrument.state_lock:
                         if pre_evicted_live is not None:
-                            self._live_lens = pre_evicted_live
+                            self._lens_instrument.live = pre_evicted_live
                         return SaklasSession._adopt_fitted_jlens(
                             self,
                             merged,
@@ -2754,7 +2756,7 @@ class SaklasSession:
                         if restored is not None:
                             with self._lens_instrument.state_lock:
                                 if pre_evicted_live is not None:
-                                    self._live_lens = pre_evicted_live
+                                    self._lens_instrument.live = pre_evicted_live
                                 SaklasSession._adopt_fitted_jlens(
                                     self, restored[0], sidecar=restored[1],
                                 )
@@ -2766,12 +2768,12 @@ class SaklasSession:
                 pre_evicted_live
                 if resident_evicted_early else
                 {
-                    "layers": list(self._live_lens["layers"]),
+                    "layers": list(self._lens_instrument.live["layers"]),
                     "uses_all_layers": bool(
-                        self._live_lens.get("uses_all_layers", False)
+                        self._lens_instrument.live.get("uses_all_layers", False)
                     ),
                 }
-                if self._live_lens is not None else None
+                if self._lens_instrument.live is not None else None
             )
             if resident is not None:
                 # The estimator takes ownership and converts averages to sums.
@@ -2814,7 +2816,7 @@ class SaklasSession:
                     sidecar = load_lens_sidecar(self.model_id)
                 with self._lens_instrument.state_lock:
                     if resume_live is not None:
-                        self._live_lens = resume_live
+                        self._lens_instrument.live = resume_live
                     return SaklasSession._adopt_fitted_jlens(
                         self, merged, sidecar=sidecar,
                     )
@@ -2825,7 +2827,7 @@ class SaklasSession:
                         restored_lens, restored_sidecar = restored
                         with self._lens_instrument.state_lock:
                             if resume_live is not None:
-                                self._live_lens = resume_live
+                                self._lens_instrument.live = resume_live
                             SaklasSession._adopt_fitted_jlens(
                                 self, restored_lens, sidecar=restored_sidecar,
                             )
@@ -3400,12 +3402,11 @@ class SaklasSession:
         self._invalidate_analytics_cache()
         return name
 
-    # -- J-lens instrument state (delegating views) --
-    # The lens read family lives on ``self._lens_instrument``; these
-    # properties re-expose its state under the historical private names so
-    # capture planning, the steering composer, the token tap, the wire
-    # layers, and tests keep one source of truth during the instrument
-    # migration (the plan/run split retargets the call sites later).
+    # -- The three read instruments --
+    # Each family owns its own state; there is ONE addressing scheme for
+    # it (``self._lens_instrument.<field>`` in-session, ``session.lens``
+    # / ``.sae`` / ``.geometry`` outside).  The historical private
+    # delegating properties are gone.
 
     @property
     def _lens_instrument(self) -> "LensInstrument":
@@ -3424,65 +3425,6 @@ class SaklasSession:
             self.__dict__["_lens_instrument"] = inst
         return inst
 
-    @property
-    def _lens_probes(self) -> dict[str, dict[str, Any]]:
-        return self._lens_instrument.probes
-
-    @_lens_probes.setter
-    def _lens_probes(self, value: dict[str, dict[str, Any]]) -> None:
-        self._lens_instrument.probes = value
-
-    @property
-    def _live_lens(self) -> dict[str, Any] | None:
-        return self._lens_instrument.live
-
-    @_live_lens.setter
-    def _live_lens(self, value: "dict[str, Any] | None") -> None:
-        self._lens_instrument.live = value
-
-    @property
-    def _lens_step_stash(self) -> dict[str, Any] | None:
-        return self._lens_instrument.step_stash
-
-    @_lens_step_stash.setter
-    def _lens_step_stash(self, value: "dict[str, Any] | None") -> None:
-        self._lens_instrument.step_stash = value
-
-    @property
-    def _last_lens_step_readings(self) -> "dict[str, ProbeReading] | None":
-        return self._lens_instrument.last_step_readings
-
-    @_last_lens_step_readings.setter
-    def _last_lens_step_readings(
-        self, value: "dict[str, ProbeReading] | None",
-    ) -> None:
-        self._lens_instrument.last_step_readings = value
-
-    @property
-    def _live_lens_active_for_generation(self) -> bool:
-        return self._lens_instrument.active_for_generation
-
-    @_live_lens_active_for_generation.setter
-    def _live_lens_active_for_generation(self, value: bool) -> None:
-        self._lens_instrument.active_for_generation = bool(value)
-
-    @property
-    def _generation_jlens(self) -> Any:
-        return self._lens_instrument.generation_lens
-
-    @_generation_jlens.setter
-    def _generation_jlens(self, value: Any) -> None:
-        self._lens_instrument.generation_lens = value
-
-    @property
-    def _generation_jlens_active(self) -> bool:
-        return self._lens_instrument.generation_lens_active
-
-    @_generation_jlens_active.setter
-    def _generation_jlens_active(self, value: bool) -> None:
-        self._lens_instrument.generation_lens_active = bool(value)
-
-    # -- SAE instrument state (delegating views) --
 
     @property
     def _sae_instrument(self) -> "SaeInstrument":
@@ -3497,48 +3439,6 @@ class SaklasSession:
         return inst
 
     @property
-    def _sae_probes(self) -> dict[str, dict[str, Any]]:
-        return self._sae_instrument.probes
-
-    @_sae_probes.setter
-    def _sae_probes(self, value: dict[str, dict[str, Any]]) -> None:
-        self._sae_instrument.probes = value
-
-    @property
-    def _live_sae(self) -> dict[str, Any] | None:
-        return self._sae_instrument.live
-
-    @_live_sae.setter
-    def _live_sae(self, value: "dict[str, Any] | None") -> None:
-        self._sae_instrument.live = value
-
-    @property
-    def _sae_step_stash(self) -> dict[str, Any] | None:
-        return self._sae_instrument.step_stash
-
-    @_sae_step_stash.setter
-    def _sae_step_stash(self, value: "dict[str, Any] | None") -> None:
-        self._sae_instrument.step_stash = value
-
-    @property
-    def _last_sae_step_readings(self) -> "dict[str, ProbeReading] | None":
-        return self._sae_instrument.last_step_readings
-
-    @_last_sae_step_readings.setter
-    def _last_sae_step_readings(
-        self, value: "dict[str, ProbeReading] | None",
-    ) -> None:
-        self._sae_instrument.last_step_readings = value
-
-    @property
-    def _live_sae_active_for_generation(self) -> bool:
-        return self._sae_instrument.active_for_generation
-
-    @_live_sae_active_for_generation.setter
-    def _live_sae_active_for_generation(self, value: bool) -> None:
-        self._sae_instrument.active_for_generation = bool(value)
-
-    @property
     def _geometry_instrument(self) -> "GeometryInstrument":
         """The geometry instrument (thin Monitor adapter), created lazily
         on first touch like its lens/SAE siblings."""
@@ -3551,11 +3451,17 @@ class SaklasSession:
         return inst
 
     @property
-    def instruments(self) -> dict[str, Any]:
-        """The three read-family instruments keyed by family name —
-        ``geometry`` (the Monitor adapter), ``lens``, ``sae``.  The
-        uniform registry behind the probe-hash roster, gate preflight,
-        and the server's instrument enumeration."""
+    def instruments(self) -> "dict[InstrumentFamily, Instrument]":
+        """THE read-family registry — ``geometry`` (the Monitor adapter),
+        ``lens``, ``sae``.
+
+        This mapping is the family *enumeration*, not a convenience view:
+        the probe-hash roster, the composer's gate preflight, and the
+        server's ``{family}`` validation + per-family dispatch all derive
+        from it, so a fourth read family is one registry entry plus its
+        :class:`~saklas.core.instruments.protocol.Instrument`
+        implementation.
+        """
         return {
             "geometry": self._geometry_instrument,
             "lens": self._lens_instrument,
@@ -3592,37 +3498,14 @@ class SaklasSession:
         stays on the session."""
         return self._sae_instrument
 
-    def enable_live_lens(
-        self,
-        *,
-        layers: "Sequence[int] | None" = None,
-    ) -> list[int]:
-        """Stream the J-lens readout live during generation.
-
-        Delegates to :meth:`LensInstrument.enable_live` — see
-        ``core/instruments/lens.py`` for the contract (device residency,
-        layer defaulting, no forward hooks / compile eligibility untouched).
-        Returns the resolved layer list.
-        """
-        return self._lens_instrument.enable_live(layers=layers)
-
-    def _active_jlens_source_label(self) -> str | None:
-        """Return the active J-lens source in the public source syntax."""
-        from saklas.io.lens_sources import (
-            lens_source_label, load_active_lens_source,
-        )
-
-        active = load_active_lens_source(self.model_id)
-        return None if active is None else lens_source_label(active)
-
-    def disable_live_lens(self) -> None:
-        """Stop streaming the live lens readout and free the device J_l copies."""
-        self._lens_instrument.disable_live()
-
     @property
-    def live_lens_layers(self) -> list[int] | None:
-        """The live lens readout's layer list, or ``None`` when it's off."""
-        return self._lens_instrument.live_layers
+    def geometry(self) -> "GeometryInstrument":
+        """The geometry instrument — the typed public face of the whitened
+        Monitor read family (``session.instruments["geometry"]``): probe
+        attach/detach, the CAA live toggle, the roster snapshots.  Manifold
+        artifact lifecycle (``fit`` / ``extract`` / ``ensure_manifold_
+        loaded``) stays on the session."""
+        return self._geometry_instrument
 
     def _jlens_workspace_band(self, lens: "Any") -> list[int]:
         """Explicit legacy ``workspace`` mode: fitted layers in the 40–90%
@@ -3822,17 +3705,17 @@ class SaklasSession:
             self._sae_layer = selected
             self._sae_width = width
             self._sae_feature_meta = feature_meta
-            self._live_sae = None
-            self._sae_step_stash = None
-            self._last_sae_step_readings = None
+            self._sae_instrument.live = None
+            self._sae_instrument.step_stash = None
+            self._sae_instrument.last_step_readings = None
             # Feature ids belong to the resident release; changing it evicts
             # stale directions and pinned probes rather than silently reusing ids.
             for name in [key for key in self._profiles if key.startswith("sae/")]:
                 del self._profiles[name]
             with self._sae_instrument.state_lock:
-                for name in list(self._sae_probes):
+                for name in list(self._sae_instrument.probes):
                     self._probe_hash_cache.pop(name, None)
-                self._sae_probes.clear()
+                self._sae_instrument.probes.clear()
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
         return self.sae_info or {}
@@ -3846,15 +3729,15 @@ class SaklasSession:
             self._sae_layer = None
             self._sae_width = None
             self._sae_feature_meta = {}
-            self._live_sae = None
-            self._sae_step_stash = None
-            self._last_sae_step_readings = None
+            self._sae_instrument.live = None
+            self._sae_instrument.step_stash = None
+            self._sae_instrument.last_step_readings = None
             for name in [key for key in self._profiles if key.startswith("sae/")]:
                 del self._profiles[name]
             with self._sae_instrument.state_lock:
-                for name in list(self._sae_probes):
+                for name in list(self._sae_instrument.probes):
                     self._probe_hash_cache.pop(name, None)
-                self._sae_probes.clear()
+                self._sae_instrument.probes.clear()
         self._invalidate_prefix_cache()
         self._invalidate_analytics_cache()
 
@@ -4059,7 +3942,7 @@ class SaklasSession:
         strength unit), so the probe-hash cache entry is invalidated too.
         """
         with self._sae_instrument.state_lock:
-            for name, spec in list(self._sae_probes.items()):
+            for name, spec in list(self._sae_instrument.probes.items()):
                 entry = fetched.get(str(spec.get("feature_id")))
                 if entry is None:
                     continue
@@ -4067,7 +3950,7 @@ class SaklasSession:
                 # hold per-call spec snapshots or shared references — a
                 # field-level mutation could hand them a half-updated
                 # unit (round-6).
-                self._sae_probes[name] = {
+                self._sae_instrument.probes[name] = {
                     **spec,
                     "label": entry.get("label"),
                     "max_act": entry.get("max_act"),
@@ -4090,18 +3973,6 @@ class SaklasSession:
         self._invalidate_analytics_cache()
         return name
 
-    def enable_live_sae(self) -> dict[str, Any]:
-        """Enable the one-matvec live feature readout at the resident layer
-        (delegates to :meth:`SaeInstrument.enable_live`)."""
-        return self._sae_instrument.enable_live()
-
-    def disable_live_sae(self) -> None:
-        self._sae_instrument.disable_live()
-
-    @property
-    def live_sae(self) -> bool:
-        return self._sae_instrument.is_live
-
     def _encode_sae_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         backend, layer, width = self._require_sae()
         row = hidden
@@ -4120,20 +3991,6 @@ class SaklasSession:
         # activations even during an otherwise inference-only session, which
         # retains an unnecessary graph and warns when probe values are scalarized.
         return acts.detach()
-
-    def _score_sae_probes(
-        self, hidden: dict[int, torch.Tensor] | None = None,
-        *, activations: torch.Tensor | None = None,
-        only: "set[str] | None" = None,
-        raw_by_fid: Mapping[int, float] | None = None,
-    ) -> dict[str, "ProbeReading"]:
-        """Score attached SAE probes (delegates to the instrument's
-        capture-slice or precomputed-activation entry)."""
-        if activations is not None:
-            return self._sae_instrument.score_probes_from_activations(
-                activations, only=only, raw_by_fid=raw_by_fid,
-            )
-        return self._sae_instrument.score_probes(hidden, only=only)
 
     def _score_sae_gate_scalars(
         self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
@@ -6626,39 +6483,6 @@ class SaklasSession:
         self._probe_hash_cache.pop(name, None)
         self._invalidate_analytics_cache()
 
-    @property
-    def lens_probe_names(self) -> list[str]:
-        """Names of the attached J-lens token probes (readout channel)."""
-        return self._lens_instrument.names
-
-    @property
-    def lens_probe_specs(self) -> dict[str, dict[str, Any]]:
-        """Snapshot of attached J-lens probe specifications."""
-        return self._lens_instrument.specs()
-
-    def _lens_probe_layers(self, names: set[str] | None = None) -> set[int]:
-        """Union of the attached lens probes' fitted layers."""
-        return self._lens_instrument.probe_layers(names)
-
-    @property
-    def sae_probe_names(self) -> list[str]:
-        return self._sae_instrument.names
-
-    @property
-    def sae_probe_specs(self) -> dict[str, dict[str, Any]]:
-        """Snapshot of attached SAE probe specifications."""
-        return self._sae_instrument.specs()
-
-    def _score_lens_probes(
-        self,
-        hidden: dict[int, torch.Tensor],
-        *,
-        only: "set[str] | None" = None,
-    ) -> dict[str, "ProbeReading"]:
-        """Score attached lens probes from capture slices (delegates to
-        :meth:`LensInstrument.score_probes`)."""
-        return self._lens_instrument.score_probes(hidden, only=only)
-
     def _score_lens_gate_scalars(
         self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
     ) -> dict[str, float]:
@@ -6681,21 +6505,6 @@ class SaklasSession:
         return self._lens_instrument.score_aggregate(
             generated_ids, pooled=pooled,
         )
-
-    @property
-    def live_probe_scores(self) -> bool:
-        """Whether per-token monitor scoring feeds live consumers (the CAA
-        live toggle).  When False, generations run aggregate-only capture —
-        probes still report the end-of-gen aggregate, but no per-token
-        stream, loom token rows, or trait events are produced.  Probe gates
-        are unaffected: a gate forces the per-token subset it needs."""
-        return self._live_probe_scores
-
-    def set_live_probe_scores(self, enabled: bool) -> bool:
-        """Toggle live per-token monitor scoring (see
-        :attr:`live_probe_scores`).  Returns the new state."""
-        self._live_probe_scores = bool(enabled)
-        return self._live_probe_scores
 
     def _resolve_probe_manifold(self, selector: str) -> "Manifold":
         """Resolve a probe selector to a loaded :class:`Manifold`.
@@ -8309,17 +8118,17 @@ class SaklasSession:
                 lens_aggregate=lens_aggregate,
                 lens_token_ids=lens_token_ids,
                 lens_source=(
-                    self._live_lens.get("source")
-                    if self._live_lens is not None else None
+                    self._lens_instrument.live.get("source")
+                    if self._lens_instrument.live is not None else None
                 ),
                 sae=sae_payload,
                 sae_source=(
-                    self._live_sae.get("source")
-                    if self._live_sae is not None else None
+                    self._sae_instrument.live.get("source")
+                    if self._sae_instrument.live is not None else None
                 ),
                 sae_layer=(
-                    int(self._live_sae["layer"])
-                    if self._live_sae is not None else None
+                    int(self._sae_instrument.live["layer"])
+                    if self._sae_instrument.live is not None else None
                 ),
                 steering=steering,
             )
@@ -9049,7 +8858,7 @@ class SaklasSession:
             # masked at the source — generations run aggregate-only capture
             # (probes still report the end-of-gen aggregate) and only probe
             # gates can force a per-token subset.
-            _live_scores_on = self._live_probe_scores
+            _live_scores_on = self._geometry_instrument.is_live
             _callback_options = consumer_options(on_token)
             _wants_live_token_scores = bool(
                 _live_scores_on
@@ -9148,22 +8957,22 @@ class SaklasSession:
                 # from the display logits inside the readout step) — merge them
                 # into every populated probe channel so the loom row, trait
                 # stream, and WS frames carry them uniformly.
-                if lens_step is not None and self._last_lens_step_readings:
+                if lens_step is not None and self._lens_instrument.last_step_readings:
                     if payload is None:
                         payload = TokenProbePayload()
                     payload.merge_readings(
-                        self._last_lens_step_readings,
+                        self._lens_instrument.last_step_readings,
                         family="lens",
                         per_layer=(
                             assistant_node_id is not None
                             and _persists_layer_scores
                         ),
                     )
-                if sae_step is not None and self._last_sae_step_readings:
+                if sae_step is not None and self._sae_instrument.last_step_readings:
                     if payload is None:
                         payload = TokenProbePayload()
                     payload.merge_readings(
-                        self._last_sae_step_readings,
+                        self._sae_instrument.last_step_readings,
                         family="sae",
                         per_layer=(
                             assistant_node_id is not None
@@ -9209,19 +9018,19 @@ class SaklasSession:
                         lens_aggregate=lens_aggregate_payload,
                         lens_token_ids=lens_token_ids,
                         lens_source=(
-                            self._live_lens.get("source")
-                            if self._live_lens is not None
+                            self._lens_instrument.live.get("source")
+                            if self._lens_instrument.live is not None
                             else None
                         ),
                         sae=sae_step,
                         sae_source=(
-                            self._live_sae.get("source")
-                            if self._live_sae is not None
+                            self._sae_instrument.live.get("source")
+                            if self._sae_instrument.live is not None
                             else None
                         ),
                         sae_layer=(
-                            int(self._live_sae["layer"])
-                            if self._live_sae is not None
+                            int(self._sae_instrument.live["layer"])
+                            if self._sae_instrument.live is not None
                             else None
                         ),
                         steering=recipe_steering,
@@ -9293,12 +9102,12 @@ class SaklasSession:
                 or stop_list is not None
             )
             _has_lens_consumer = bool(
-                self._live_lens is not None
+                self._lens_instrument.live is not None
                 and on_token is not None
                 and _callback_options.lens_readout
             )
             _has_sae_consumer = bool(
-                self._live_sae is not None
+                self._sae_instrument.live is not None
                 and on_token is not None
                 and _callback_options.sae_readout
             )
@@ -9379,8 +9188,8 @@ class SaklasSession:
             vector_snapshot: dict[str, float] = self._snapshot_steering_alphas()
 
             want_hidden = bool(sampling and sampling.return_hidden)
-            self._live_lens_active_for_generation = _has_lens_consumer
-            self._live_sae_active_for_generation = _has_sae_consumer
+            self._lens_instrument.active_for_generation = _has_lens_consumer
+            self._sae_instrument.active_for_generation = _has_sae_consumer
             authored_targets = self._pending_authored_prompt_targets(
                 assistant_node_id, raw=raw,
             )
@@ -9810,8 +9619,8 @@ class SaklasSession:
             # serialized envelope rides ``measurements``.
             if live_scores and (
                 self._monitor.probe_names
-                or self._lens_probes
-                or self._sae_probes
+                or self._lens_instrument.probes
+                or self._sae_instrument.probes
             ):
                 raw_readings = self._last_token_probe_readings
                 if isinstance(raw_readings, dict) and raw_readings:
@@ -9920,7 +9729,7 @@ class SaklasSession:
         return_probe_readings = bool(
             sampling is None or sampling.return_probe_readings
         )
-        has_sae_probes = bool(return_probe_readings and self._sae_probes)
+        has_sae_probes = bool(return_probe_readings and self._sae_instrument.probes)
         if has_sae_probes and self._sae_layer is None:
             return None
 
@@ -10217,8 +10026,8 @@ class SaklasSession:
                 list(self._monitor.probe_names)
                 if return_probe_readings else []
             )
-            has_lens_probes = bool(return_probe_readings and self._lens_probes)
-            has_sae_probes = bool(return_probe_readings and self._sae_probes)
+            has_lens_probes = bool(return_probe_readings and self._lens_instrument.probes)
+            has_sae_probes = bool(return_probe_readings and self._sae_instrument.probes)
             # Batched generation bypasses ``_begin_capture`` but binds the
             # instrument runs through the same helper.  One request serves all
             # three families here: the lens prepare takes the disk refresh +

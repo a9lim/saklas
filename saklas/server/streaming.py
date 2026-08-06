@@ -44,8 +44,8 @@ def probe_reading_aggregate(
     # ``result.probe_readings`` all the same — without this union the
     # attached-filter silently dropped their end-of-gen aggregates from every
     # streaming done frame.
-    attached.update(session.lens_probe_names)
-    attached.update(session.sae_probe_names)
+    attached.update(session.lens.names)
+    attached.update(session.sae.names)
     return {
         name: reading.to_dict()
         for name, reading in readings.items()
@@ -59,7 +59,7 @@ def probe_measurements_aggregate(
     """Aggregate-scope measurement envelope for the native WS ``done`` frame.
 
     Splits ``result.probe_readings`` by family — geometry (Monitor probes),
-    lens (``session.lens_probe_names``), SAE (``session.sae_probe_names``) — and
+    lens (``session.lens.names``), SAE (``session.sae.names``) — and
     builds one ``scope="aggregate"`` envelope
     (:func:`saklas.core.measurements.build_measurements`).  ``None`` when no
     probe is attached / no result recorded.  This is the ONE aggregate-readings
@@ -82,8 +82,8 @@ def probe_measurements_aggregate(
         return None
 
     geometry_names = set(session.monitor.probe_names)
-    lens_names = set(getattr(session, "lens_probe_names", []) or [])
-    sae_names = set(getattr(session, "sae_probe_names", []) or [])
+    lens_names = set(session.lens.names)
+    sae_names = set(session.sae.names)
     geometry = {n: r for n, r in readings.items() if n in geometry_names} or None
     lens = {n: r for n, r in readings.items() if n in lens_names} or None
     sae = {n: r for n, r in readings.items() if n in sae_names} or None

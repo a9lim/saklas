@@ -82,13 +82,11 @@ class _StubSession:
         self.monitor = monitor
         self._monitor = monitor
         self._joint_logprob_cache: dict[Any, Any] = {}
-        self.lens_probe_names: list[str] = []
-        self.sae_probe_names: list[str] = []
         # Public instrument surface — ``probe_measurements_aggregate`` reads
-        # the live source/layer binding off these, never the session's
-        # private ``_live_lens``/``_live_sae`` aliases.
-        self.lens = SimpleNamespace(live=None)
-        self.sae = SimpleNamespace(live=None)
+        # both the attached roster and the live source/layer binding off
+        # these faces.
+        self.lens = SimpleNamespace(live=None, names=[])
+        self.sae = SimpleNamespace(live=None, names=[])
         # End-of-generation readings the stub stamps onto every result, so a
         # test can pin the ``done`` frame's aggregate channel.
         self.stub_probe_readings: dict[str, Any] = {}
@@ -1005,7 +1003,7 @@ class TestWebSocketLoom:
             coords=(0.5,), fraction=0.1, residual=0.0, nearest=(),
         )
         session.monitor.probe_names = ["calm"]
-        session.lens_probe_names = ["jlens/fake"]
+        session.lens.names = ["jlens/fake"]
         session.lens.live = {"source": "local:default"}
         session.stub_probe_readings = {"calm": reading, "jlens/fake": reading}
 

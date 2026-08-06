@@ -41,7 +41,7 @@ def _enable_serve_live_lens_if_compatible(session: Any) -> bool:
                     break
         if not compatible:
             return False
-        layers = session.enable_live_lens()
+        layers = session.lens.set_live(True).layers or ()
         print(f"Live J-lens readout: on ({len(layers)} fitted layers)")
         return True
     except Exception as e:  # noqa: BLE001 — never block serve startup
@@ -112,10 +112,10 @@ def _enable_serve_live_sae_if_available(session: Any) -> bool:
             if release is None:
                 return False
             info = session.load_sae(release)
-        state = session.enable_live_sae()
+        state = session.sae.set_live(True)
         print(
             "Live SAE readout: on "
-            f"({info.get('release', 'active')} at L{state.get('layer')})"
+            f"({info.get('release', 'active')} at L{state.layer})"
         )
         return True
     except Exception as e:  # noqa: BLE001 — never block serve startup

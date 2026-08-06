@@ -3,9 +3,10 @@
 Owns everything SAE-probe-shaped: the probe registry, the live-discovery
 config, the per-forward stash, the per-generation active flag, and the read
 surfaces (attach / per-step scoring / gate scalars / finalize aggregate /
-live display step / authored-prefill computation).  The session re-exposes
-the state fields as delegating properties under the private names its own
-call sites read.
+live display step / authored-prefill computation).  In-session call sites
+address that state as ``session._sae_instrument.<field>`` (or through the
+public ``session.sae``); the transitional delegating properties under
+historical private session names are gone.
 
 Backend *residency* stays session-side (``_sae_backend``/``_sae_layer``/
 ``_sae_width``, ``_require_sae``, ``_encode_sae_hidden``, the Neuronpedia
@@ -34,9 +35,11 @@ from saklas.core.instruments.types import (
     Axis,
     GateRef,
     InstrumentBinding,
+    InstrumentFamily,
     InstrumentPlan,
     InstrumentPrep,
     ReadRequest,
+    SaeLiveState,
     next_prep_token,
     parse_gate_ref,
     validate_gate_channels,
@@ -159,7 +162,7 @@ class SaeRun:
 class SaeInstrument:
     """Session-lifetime handle for the SAE read family."""
 
-    family = "sae"
+    family: InstrumentFamily = "sae"
 
     #: Gate channels an SAE probe can produce: the one activation axis.
     _GATE_CHANNELS: tuple[type, ...] = (Axis,)
@@ -676,6 +679,109 @@ class SaeInstrument:
     def is_live(self) -> bool:
         with self.state_lock:
             return self.live is not None
+
+    @property
+    def active_source(self) -> str | None:
+        """The resident SAE release normalized to ``local:``/``saelens:``.
+
+        Residency is the source here: an SAE with no weights loaded has no
+        active source, and ``sae_info`` is the one place that identity lives.
+        """
+        info = self._session.sae_info
+        if not info:
+            return None
+        release = info.get("release")
+        if not release:
+            return None
+        text = str(release)
+        return (
+            text if text.startswith(("local:", "saelens:"))
+            else f"saelens:{text}"
+        )
+
+    @property
+    def live_state(self) -> SaeLiveState:
+        with self.state_lock:
+            live = self.live
+            if live is None:
+                return SaeLiveState(enabled=False)
+            return SaeLiveState(
+                enabled=True,
+                layer=(
+                    int(live["layer"]) if live.get("layer") is not None
+                    else None
+                ),
+                source=live.get("source"),
+            )
+
+    def set_live(self, enabled: bool, **kwargs: Any) -> SaeLiveState:
+        """Toggle the live feature-discovery readout.
+
+        Takes no family extras: the readout width follows the generation's
+        resolved alternatives (``return_top_k``), and the layer is the
+        resident hook layer — neither is an instrument-local dial.
+        """
+        if kwargs:
+            raise TypeError(
+                "sae live takes no extras (readout width follows the "
+                f"generation's alternatives), got {sorted(kwargs)}"
+            )
+        if enabled:
+            self.enable_live()
+        else:
+            self.disable_live()
+        return self.live_state
+
+    # -------------------------------------------------------------- replay
+
+    def token_readout(
+        self,
+        node_id: str,
+        raw_index: int,
+        *,
+        top_k: int | None = None,
+        layers: "list[int] | str | None" = None,
+        apply_steering: bool = True,
+        raw: bool = False,
+    ) -> dict[str, Any]:
+        """The loom-anchored SAE feature replay, as the finished
+        ``scope="replay"`` measurement envelope.
+
+        ``layers`` is **rejected**, not ignored: the SAE reads its ONE
+        resident hook layer, so a layer selection is a request this family
+        cannot honor.
+        """
+        from saklas.core.measurements import build_measurements
+
+        if layers is not None:
+            raise ValueError(
+                "sae token-readout takes no layers (the readout is at the "
+                "resident hook layer)"
+            )
+        out = self._session.sae_token_readout(
+            node_id,
+            raw_index,
+            top_k=8 if top_k is None else int(top_k),
+            apply_steering=apply_steering,
+            raw=raw,
+        )
+        measurements = build_measurements(
+            scope="replay",
+            provenance="replayed",
+            sae_features=[
+                (
+                    int(f["id"]),
+                    float(f["activation"]),
+                    f.get("label"),
+                    f.get("max_act"),
+                )
+                for f in out.get("features", [])
+            ],
+            sae_source=self.active_source,
+            sae_layer=out.get("layer"),
+            steering=(out.get("steering") if apply_steering else None),
+        )
+        return {"measurements": measurements}
 
     def live_readout_step(
         self, *, top_k: int = 8, step_id: int = -1,

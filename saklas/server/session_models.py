@@ -7,6 +7,7 @@ from typing import Any
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
+from saklas.server.instrument_routes import instrument_families
 from saklas.server.native_common import NativeRequest
 
 
@@ -111,7 +112,6 @@ def session_info(
     assistant_role_ok, user_role_ok = role_support(session)
     default_assistant_role, default_user_role = default_role_labels(session)
     jlens_fitted = session.has_compatible_jlens()
-    sae_info = session.sae_info
     return {
         "id": "default",
         "model_id": session.model_id,
@@ -126,13 +126,13 @@ def session_info(
         "thinking_is_optional": thinks_optional,
         "is_base_model": is_base,
         "jlens_fitted": jlens_fitted,
-        "live_lens_layers": session.live_lens_layers,
-        "sae_loaded": sae_info is not None,
-        "sae_info": sae_info,
-        "live_sae": session.live_sae,
-        # CAA live toggle state (POST .../instruments/geometry/live):
-        # whether per-token monitor scoring feeds live consumers.
-        "live_probe_scores": session.live_probe_scores,
+        # The read plane's ONE representation: the same per-family blocks
+        # ``GET .../instruments`` lists ({family, live, source, probes,
+        # capabilities}).  The pre-5.x flat keys that re-flattened this
+        # state in three divergent shapes (``live_lens_layers`` /
+        # ``live_sae`` / ``live_probe_scores`` / ``sae_loaded`` /
+        # ``sae_info``) are gone — clean break, no aliases.
+        "instruments": instrument_families(session),
         "default_steering": default_expr,
         "role_substitution_supported": assistant_role_ok,
         "user_role_supported": user_role_ok,

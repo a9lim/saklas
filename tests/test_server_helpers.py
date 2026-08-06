@@ -231,17 +231,13 @@ class TestProbeMeasurementsAggregate:
 
         session = MagicMock()
         session.monitor.probe_names = monitor_names
-        session.lens_probe_names = lens_names
-        session.sae_probe_names = sae_names
-        # The live source/layer binding is read through the PUBLIC instrument
-        # surface, not the session's delegating ``_live_lens``/``_live_sae``
-        # private aliases — a MagicMock would happily serve either, so the
-        # aliases are pinned to a sentinel that would fail the assertions if
-        # the helper ever reached for them again.
+        # Roster AND live binding both come off the public instrument
+        # faces — the session's private delegating aliases are gone, so
+        # there is one addressing scheme left to read.
+        session.lens.names = lens_names
+        session.sae.names = sae_names
         session.lens.live = {"source": "local:default"}
         session.sae.live = {"source": "saelens:rel", "layer": 17}
-        session._live_lens = {"source": "WRONG-private-alias"}
-        session._live_sae = {"source": "WRONG-private-alias", "layer": -1}
         return session
 
     @staticmethod
@@ -321,8 +317,8 @@ class TestProbeMeasurementsAggregate:
         result.applied_steering = None
         session = self._session([], ["jlens/fake"], ["sae/12"])
         # Any private-alias read would surface these sentinels instead.
-        del session._live_lens
-        del session._live_sae
+        del session._lens_instrument.live
+        del session._sae_instrument.live
 
         env = probe_measurements_aggregate(session, result)
         assert env is not None

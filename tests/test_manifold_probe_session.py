@@ -123,12 +123,12 @@ def _stub_session() -> SaklasSession:
     session._capture_state = CaptureState()
     session._jlens = None
     session._jlens_identity = None
-    session._generation_jlens = None
-    session._generation_jlens_active = False
-    session._live_lens = None
-    session._lens_probes = {}
-    session._live_sae = None
-    session._sae_probes = {}
+    session._lens_instrument.generation_lens = None
+    session._lens_instrument.generation_lens_active = False
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
     # All three families route through real instruments now: geometry for
     # the add_probe flow (exclusive section + whitener touch + resolve +
     # monitor.add_probe), lens/SAE because ``_begin_capture`` consumes
@@ -147,8 +147,8 @@ def _stub_session() -> SaklasSession:
     session._bind_instrument_runs = types.MethodType(
         SaklasSession._bind_instrument_runs, session,
     )
-    session._lens_step_stash = None
-    session._live_lens_active_for_generation = True
+    session._lens_instrument.step_stash = None
+    session._lens_instrument.active_for_generation = True
     session._incremental_readings = []
     session._incremental_gate_scores = []
     session._compiled_clean_eligible = False

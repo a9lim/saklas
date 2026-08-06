@@ -7,6 +7,12 @@ from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from saklas.core.instruments.types import (
+    GeometryLiveState,
+    LensLiveState,
+    SaeLiveState,
+)
 from fastapi.testclient import TestClient
 
 from saklas.core.errors import SaklasError
@@ -43,15 +49,28 @@ def _mock_session():
     session.manifolds = {}
     session.is_base_model = False
     session.has_compatible_jlens.return_value = False
-    session.live_lens_layers = None
     session.sae_info = None
-    session.live_sae = False
-    session.live_probe_scores = True
     session.scene_grammar = None
     session.joint_logprob_cache = {}
-    session.lens_probe_names = []
-    session.sae_probe_names = []
     session.token_probe_payload = {}
+    # Read plane: the three instrument faces the routes and session_info read.
+    session.geometry.names = []
+    session.geometry.specs.return_value = {}
+    session.geometry.active_source = None
+    session.geometry.live_state = GeometryLiveState(enabled=True)
+    session.lens.names = []
+    session.lens.specs.return_value = {}
+    session.lens.active_source = None
+    session.lens.live_state = LensLiveState(enabled=False)
+    session.sae.names = []
+    session.sae.specs.return_value = {}
+    session.sae.active_source = None
+    session.sae.live_state = SaeLiveState(enabled=False)
+    session.instruments = {
+        "geometry": session.geometry,
+        "lens": session.lens,
+        "sae": session.sae,
+    }
 
     monitor = MagicMock()
     monitor.probe_names = []
@@ -1703,7 +1722,7 @@ class TestNativeErrorEnvelope:
                 return (422, "geometry instrument is unavailable")
 
         session, client = session_and_client
-        session.set_live_probe_scores.side_effect = _Nope()
+        session.geometry.set_live.side_effect = _Nope()
         resp = client.post(
             "/saklas/v1/sessions/default/instruments/geometry/live",
             json={"enabled": True},

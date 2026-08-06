@@ -91,7 +91,7 @@ def _lens_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
 
 def _lens_probe_specs(session: SaklasSession) -> dict[str, dict[str, Any]]:
     """Snapshot the session's pinned lens-probe registry."""
-    return session.lens_probe_specs
+    return session.lens.specs()
 
 
 def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -120,7 +120,7 @@ def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sae_probe_specs(session: SaklasSession) -> dict[str, dict[str, Any]]:
-    return session.sae_probe_specs
+    return session.sae.specs()
 
 
 def register_probe_routes(app: FastAPI) -> None:
