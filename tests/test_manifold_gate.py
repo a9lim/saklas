@@ -4,7 +4,7 @@ Phase 2 of the manifold-probes feature.  The grammar work happens in
 ``steering_expr.py``; this file covers the integration story end to end —
 parse a manifold gate expression, drive ``Trigger.active`` with a fake
 ``TriggerContext.probe_scores`` dict that mirrors what
-``ManifoldMonitor.flat_scalars`` produces, and assert the gate fires
+``Monitor.flat_scalars`` produces, and assert the gate fires
 exactly when the corresponding scalar crosses its threshold.
 
 The runtime side has zero code changes: ``ProbeGate.probe`` stores the

@@ -1,6 +1,5 @@
 """Tests for the native /saklas/v1/* API (no GPU)."""
 
-import asyncio
 import json
 import time
 from typing import Any, cast
@@ -19,28 +18,16 @@ from saklas.core.errors import SaklasError
 from saklas.core.generation import GenerationConfig
 from saklas.core.results import GenerationResult, RunSet
 from saklas.server.ws_models import WSSamplingParams, build_sampling_config
+from tests._fakes import make_mock_session
 
 
 def _mock_session():
-    session = MagicMock()
-    session.model_id = "test/model"
-    session.model_info = {
-        "model_type": "gemma2",
-        "num_layers": 26,
-        "hidden_dim": 2304,
-        "device": "cpu",
-        "dtype": "torch.bfloat16",
-    }
+    # Shared native-API wiring lives in tests/_fakes.py; the routes here need
+    # a real GenerationConfig rather than the shared config mock.
+    session = make_mock_session(config=GenerationConfig())
     session.model = MagicMock()
     session.model.config.model_type = "gemma2"
-    session._device = "cpu"
-    session._dtype = "torch.bfloat16"
-    session._created_ts = 1_700_000_000
 
-    session.config = GenerationConfig()
-
-    session.profiles = {}
-    session.probes = {}
     session.tree = MagicMock()
     session.tree.messages_for.return_value = []
     session.tree.active_node_id = "test-assistant"
@@ -80,16 +67,11 @@ def _mock_session():
     session._layers = []
     session.last_per_token_scores = None
     session.last_result = None
-    session.last_per_token_scores = None
-    session.last_result = None
 
     gen_state = MagicMock()
     gen_state.finish_reason = "stop"
     gen_state.emit_map = []
     session.generation_state = gen_state
-
-    session.build_readings.return_value = {}
-    session.lock = asyncio.Lock()
 
     # EventBus mock with subscribe/unsubscribe support.
     _event_subscribers = []

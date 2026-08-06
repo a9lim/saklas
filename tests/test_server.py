@@ -89,7 +89,6 @@ def _mock_session():
     session.tokenizer = MagicMock()
     session.tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
 
-    session.build_readings.return_value = {}
     # Real asyncio.Lock so `async with session.lock:` works under the
     # FastAPI test client's event loop.
     session.lock = asyncio.Lock()
