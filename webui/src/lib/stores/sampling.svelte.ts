@@ -13,8 +13,6 @@ import { apiSessions } from "../api";
 import type { ChatRole, WSSampling } from "../types";
 import { probeRack, sessionState } from "../stores.svelte";
 
-// ------------------------------------------ session-defaults mirror ---
-
 export interface SamplingState {
   temperature: number | null;
   top_p: number | null;
@@ -77,6 +75,8 @@ export function setSampling<K extends keyof SamplingState>(
   samplingState[key] = value;
 }
 
+// ------------------------------------------ session-defaults mirror ---
+
 /** Mirror the server's session.config defaults into the local
  * ``samplingState``.  The local store was previously pre-seeded with its
  * own constants (``max_tokens: 256`` etc.) which drifted away from the
@@ -133,6 +133,8 @@ export async function patchSessionDefaults(
   sessionState.lastRefresh = Date.now();
   hydrateSamplingFromInfo();
 }
+
+// ------------------------------------------------- wire payload ------
 
 function parsedStopSequences(): string[] | null {
   const lines = samplingState.stop_sequences
