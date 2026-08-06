@@ -2515,10 +2515,10 @@ def test_affine_push_coord_form_interpolates_between_nodes(tmp_path: Path) -> No
 
 def test_affine_push_coord_form_arity_mismatch_raises(tmp_path: Path) -> None:
     """A coord-form position with the wrong number of coordinates raises
-    ``ManifoldArityError`` (a ``SteeringExprError``), matching the curved path.
+    ``ManifoldArityError`` (a ``SteeringCompositionError``), matching the
+    curved path.
     """
-    from saklas.core.errors import ManifoldArityError
-    from saklas.core.steering_expr import SteeringExprError
+    from saklas.core.errors import ManifoldArityError, SteeringCompositionError
     from saklas.core.session import _affine_manifold_push
 
     folder = _discover_folder(
@@ -2529,7 +2529,8 @@ def test_affine_push_coord_form_arity_mismatch_raises(tmp_path: Path) -> None:
     n = manifold.domain.intrinsic_dim
     with pytest.raises(ManifoldArityError) as exc:
         _affine_manifold_push(manifold, tuple([0.0] * (n + 1)))
-    assert isinstance(exc.value, SteeringExprError)
+    assert isinstance(exc.value, SteeringCompositionError)
+    assert exc.value.user_message()[0] == 422
 
 
 def test_discover_pca_flat_fit_skips_rbf_floor(tmp_path: Path) -> None:

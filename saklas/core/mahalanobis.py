@@ -62,16 +62,12 @@ from typing import Any, Iterable, Mapping
 
 import torch
 
-from saklas.core.errors import SaklasError
+# ``WhitenerError`` is defined in :mod:`saklas.core.errors` (the single home
+# for the engine's error taxonomy) and re-exported here so
+# ``from saklas.core.mahalanobis import WhitenerError`` keeps working.
+from saklas.core.errors import WhitenerError as WhitenerError
 
 log = logging.getLogger(__name__)
-
-
-class WhitenerError(ValueError, SaklasError):
-    """Raised when whitener construction or lookup fails."""
-
-    def user_message(self) -> tuple[int, str]:
-        return (400, str(self) or self.__class__.__name__)
 
 
 # Numerical guard for Mahalanobis denominators.  Mirrors the ``1e-12``

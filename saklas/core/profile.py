@@ -27,7 +27,10 @@ from typing import Any, Iterable, Iterator, Literal, Mapping, overload
 import torch
 from safetensors.torch import load as load_safetensors, save as save_safetensors
 
-from saklas.core.errors import SaklasError
+# ``ProfileError`` is defined in :mod:`saklas.core.errors` (the single home
+# for the engine's error taxonomy) and re-exported here so
+# ``from saklas.core.profile import ProfileError`` keeps working.
+from saklas.core.errors import ProfileError as ProfileError
 
 log = logging.getLogger(__name__)
 
@@ -57,13 +60,6 @@ _PROFILE_METHODS = frozenset({"profile", "manifold_pca", "merge"})
 # through ``json``.
 _PROVENANCE_SCALARS = (str, int, float)
 _PROVENANCE_MAX_DEPTH = 8
-
-
-class ProfileError(ValueError, SaklasError):
-    """Raised on invalid Profile operations (missing layer, empty, etc.)."""
-
-    def user_message(self) -> tuple[int, str]:
-        return (400, str(self) or self.__class__.__name__)
 
 
 def _validate_provenance(value: Any, *, depth: int = 0) -> None:

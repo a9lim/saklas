@@ -52,7 +52,14 @@ from typing import TYPE_CHECKING, Any, Sequence, cast
 
 import torch
 
-from saklas.core.errors import SaklasError, is_out_of_memory_error
+# ``UnknownManifoldLabelError`` is defined in :mod:`saklas.core.errors` (the
+# single home for the engine's error taxonomy) and re-exported here so
+# ``from saklas.core.manifold import UnknownManifoldLabelError`` keeps working.
+from saklas.core.errors import (
+    SaklasError,
+    UnknownManifoldLabelError as UnknownManifoldLabelError,
+    is_out_of_memory_error,
+)
 
 if TYPE_CHECKING:
     from saklas.core.mahalanobis import LayerWhitener
@@ -69,20 +76,6 @@ log = logging.getLogger(__name__)
 # format. Bump this whenever PCA/Fisher selection, topology choice, RBF/sigma
 # fitting, DLS, or share allocation changes incompatibly.
 MANIFOLD_FIT_POLICY_VERSION = 1
-
-
-class UnknownManifoldLabelError(KeyError, SaklasError):
-    """Raised when a manifold position payload names an unknown node label.
-
-    Produced by :meth:`Manifold.resolve_position` (and the nearest-node
-    helpers, which short-circuit on labels) when the label is not in
-    :attr:`Manifold.node_labels`.  Surfaces a 404-shaped error at the
-    HTTP layer through the shared :class:`SaklasError` MRO; CLI handlers print
-    the message and recover.
-    """
-
-    def user_message(self) -> tuple[int, str]:
-        return (404, str(self))
 
 
 # Default PCA width for a fitted manifold subspace.  Matches the paper's

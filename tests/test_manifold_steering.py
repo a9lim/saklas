@@ -32,8 +32,11 @@ from saklas.core.manifold import (
     fit_layer_subspace,
     invert_parameterization,
 )
-from saklas.core.errors import ManifoldArityError, OverlappingManifoldError
-from saklas.core.steering_expr import SteeringExprError
+from saklas.core.errors import (
+    ManifoldArityError,
+    OverlappingManifoldError,
+    SteeringCompositionError,
+)
 from saklas.core.triggers import Trigger, TriggerContext
 
 
@@ -361,11 +364,13 @@ def test_manager_steer_n2_manifold():
 def test_manager_position_length_mismatch_raises():
     manifold = _manifold2d(layers=(0,))
     mgr = SteeringManager()
-    # A 2-D manifold steered with a single coordinate.  ``ManifoldArityError``
-    # still subclasses ``SteeringExprError`` so the family catch keeps working.
+    # A 2-D manifold steered with a single coordinate.  The expression itself
+    # was well-formed, so this is a composition failure (422), not a parse
+    # error (400).
     with pytest.raises(ManifoldArityError) as exc:
         mgr.add_manifold("disk", manifold, position=(0.5,), along=0.5, onto=0.5)
-    assert isinstance(exc.value, SteeringExprError)
+    assert isinstance(exc.value, SteeringCompositionError)
+    assert exc.value.user_message()[0] == 422
 
 
 def test_manager_user_coeffs_clamped_to_unit():
@@ -577,7 +582,8 @@ def test_manager_rejects_overlapping_manifolds():
     layers = _model_layers(4)
     with pytest.raises(OverlappingManifoldError) as exc:
         mgr.apply_to_model(layers, torch.device("cpu"), torch.float32)
-    assert isinstance(exc.value, SteeringExprError)
+    assert isinstance(exc.value, SteeringCompositionError)
+    assert exc.value.user_message()[0] == 422
 
 
 def test_manager_clear_all_drops_manifolds():
