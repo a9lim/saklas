@@ -55,14 +55,18 @@ counts an escaping entry as a failure rather than reading off-tree. Its
 stat-identity fingerprint cache is purely an optimization — first load and any
 stat change still run the full sha256.
 
-`PROFILE_FORMAT_VERSION = 5` stamps the sidecars `core/profile.py::save_profile`
+`PROFILE_FORMAT_VERSION = 6` stamps the sidecars `core/profile.py::save_profile`
 writes. That schema is exactly `{format_version, saklas_version, method,
 tensor_sha256, provenance}` — four identity fields plus one free-form JSON-safe
 `provenance` object, so a producer records anything else there rather than
 growing the set. `method` is closed: `profile`, `manifold_pca` (the folded 2-node
 manifold view `session.extract` returns), `merge`. `tensor_sha256` binds the
 exact payload bytes, and writer-stamped fields are re-stamped on save so
-`Profile.load(p).save(q)` round-trips.
+`Profile.load(p).save(q)` round-trips. No cache rides this version — the
+neutral-activation and alignment caches carry their own schemas and versions in
+`alignment.py` — so the only reader a bump reaches is a user-saved `Profile`,
+and the reader's version check leads so a stale file is told which version it
+is and what to re-run, not which field the exact-set schema missed first.
 
 ### atomic.py / staging.py / shards.py
 
@@ -130,8 +134,16 @@ splits across four modules; `manifolds.py` re-exports them as the stable
 ### manifold_folder.py — the format core
 
 The dependency root: dataclasses, validators, `manifold.json` load/save,
-integrity, and the locks. `MANIFOLD_FORMAT_VERSION = 9`; readers and writers
-require exactly 9. `min_nodes(n) = 2n+1` is the curved-fit poisedness floor (a
+integrity, and the locks. `MANIFOLD_FORMAT_VERSION = 10`; readers and writers
+require exactly 10. A `manifold.json` at any other version is a hard
+`ManifoldFormatError`; a *fitted sidecar* at another version is **stale, not
+corrupt** — `ManifoldFolder.load` leaves its stem unregistered and the manifold
+reads as "not fitted for that model", a clean cache miss the next fit
+overwrites. Raising there would take the whole artifact out of the selector
+index on a format bump, unfitting its labels, probes, and steering along with
+the one expired tensor. Corrupt (rather than merely old) sidecars still raise,
+and a corpus-less `baked` manifold keeps the strict read because it has nothing
+to re-fit from. `min_nodes(n) = 2n+1` is the curved-fit poisedness floor (a
 flat `pca` fit needs only `k+1`). Node labels validate against `_LABEL_REGEX =
 ^[a-z][a-z0-9_-]{0,63}$` — stricter than `NAME_REGEX` because `.` is the bipolar
 separator and the steering lexer addresses a label as `%label`, so a dotted label
@@ -186,6 +198,13 @@ all-or-nothing against it: `auto` carries the resolved mode plus ranked
 `topology_candidates`, `merge` carries `components` + `bake_policy`, a transfer
 carries source model id + fingerprint, and an `sae-*` feature space carries a
 release + per-layer feature ids — each absent on every other kind of fit.
+Four fields exist so a refit can be proven unnecessary *off-model*:
+`model_source_fingerprint` (the pre-load-verifiable checkpoint identity —
+distinct from `source_model_fingerprint`, which names the other model a
+cross-model transfer came from), `capture_version`, `capture_render_sha256`
+(the tokenizer-render half of `capture_sha256` — node partition plus each
+rendered row's token ids and pool index), and `baseline_prompts_sha256`. See
+"weight-free fit preflight" under `manifold_lifecycle.py`.
 `node_spread_per_layer` is measured *before* DLS, so its keys are the
 evaluated-layer roster and may strictly contain `fitted_layers`, which is what
 lets a cache prove a layer was evaluated rather than accidentally omitted.
@@ -284,6 +303,36 @@ plain `ValueError` for an alignment covering no fitted layer surfaces here as
 the source and rejects only a trusted existing target before any model or
 alignment work; the backend repeats the proof authoritatively inside its own
 transaction.
+
+`preflight_manifold_fit_noop(folder, *, model_id, layer_indices, sae, fit_mode,
+hyperparams, quantize, device) → ManifoldFitProof | None` is the **weight-free
+fit preflight** — the manifold counterpart of `lens fit`'s model-free no-op, and
+the reason `manifold extract` / `manifold fit` no longer pay a model load to
+discover they had nothing to do. It proves, in the order the fit keys on them:
+`nodes_sha256` (recomputed from the folder); `model_source_fingerprint`
+(recomputed from the published config / local checkpoint files and the load
+representation); `model_fingerprint`, which is *not* recomputable off-model and
+is therefore **bridged** — the neutral-activation cache was written by a real
+load and binds this checkpoint source to the loaded fingerprint it produced, the
+same bridge `alignment.py`'s `_proven_sidecar` walks; `capture_version` +
+`capture_render_sha256` + `baseline_prompts_sha256`, re-rendered here from
+tokenizer + prompts + corpus, which with the two fingerprints covering the
+model-identity half make `capture_sha256` equality follow; `fit_policy_version`;
+and the fitted-layer set, resolved against the *config's* layer count
+(`core.model.config_model_shape`). The identity digests come from
+`core.extraction.offline_fit_identity` so the preflight and the fit cannot drift
+on what a corpus hashes to.
+
+`None` means **unproven**, never "stale": an SAE fit (whose key needs a resolved
+backend fingerprint), a discover override (which rewrites `manifold.json` inside
+the fit's own lock, so the visible hash is not the one the fit compares), a
+checkpoint with no provable source, a missing neutral cache, a config with no
+layer count, an unresolvable template, a corpus a templated fit would re-derive,
+or a tokenizer that will not load all return it, and the caller must fall
+through to the ordinary model-loading fit. A partial proof is the one thing this
+must never emit — it would serve a stale fit after a baseline-prompt edit.
+Nothing here mutates: no manifest rewrite, no capture-cache recovery, no
+promotion.
 
 `manifold_summary(folder, *, include_fits=False)` is the session-independent
 serializer shared by `pack show -j` and the HTTP summary route: identity, source,

@@ -90,25 +90,13 @@ def _run_sae_train(args: argparse.Namespace) -> None:
 def _model_shape_from_config(model_id: str) -> tuple[int, int]:
     """``(n_layers, hidden_dim)`` for ``model_id`` without loading weights.
 
-    Reads the published config and unwraps a multimodal ``text_config``, so
-    the numbers match what a loaded session would report — which is what the
-    SAE's covered-layer and residual-width checks compare against.
+    The CLI-local name kept as this module's monkeypatch seam; the shape rule
+    itself lives once in :func:`saklas.core.model.config_model_shape`, shared
+    with the manifold fit's weight-free no-op preflight.
     """
-    from transformers import AutoConfig
+    from saklas.core.model import config_model_shape
 
-    config = AutoConfig.from_pretrained(model_id)
-    text_config = getattr(config, "text_config", config)
-    n_layers = getattr(
-        text_config, "num_hidden_layers", getattr(text_config, "n_layer", None),
-    )
-    hidden = getattr(
-        text_config, "hidden_size", getattr(text_config, "n_embd", None),
-    )
-    if not isinstance(n_layers, int) or isinstance(n_layers, bool):
-        raise ValueError(f"{model_id} config declares no layer count")
-    if not isinstance(hidden, int) or isinstance(hidden, bool):
-        raise ValueError(f"{model_id} config declares no hidden size")
-    return int(n_layers), int(hidden)
+    return config_model_shape(model_id)
 
 
 def _run_sae_fetch(args: argparse.Namespace) -> None:

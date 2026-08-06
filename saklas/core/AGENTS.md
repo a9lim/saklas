@@ -334,7 +334,10 @@ token-exact capture identity (baseline prompts and tokenizer render included),
 the loaded-model fingerprint, and the fitted-layer set. The mandatory Mahalanobis
 whitener is resolved *after* the fitted-tensor fast path but *before* any
 activation capture, so a missing or partial neutral cache cannot waste a full
-model pass.
+model pass. `resolve_fit_layer_indices`, `prepare_capture_rows`, and
+`offline_fit_identity` are the pieces of that key derivable with no weights
+loaded; `io.manifold_lifecycle.preflight_manifold_fit_noop` consumes them so the
+weight-free no-op and the fit cannot drift on what a corpus hashes to.
 
 **Capture.** `compute_manifold_node_stats` pools the whole roster in one row
 stream that crosses node boundaries, so short nodes fill shared forward batches;

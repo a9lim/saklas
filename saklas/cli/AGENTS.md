@@ -201,9 +201,10 @@ returning a `:role-<slug>` name tail), `--kind {abstract,concrete,custom}`
 (default `abstract`), `--system TEMPLATE` (dest `custom_system`; required when
 `--kind custom`), `--namespace NS` (unset → `local/`), `--no-dls`. `--kind`
 selects the generation system template and elicitation role label — the same
-knob `manifold generate` carries. Cache-hit validation belongs to the loaded
-session/pipeline (model, corpus, tokenizer, role, SAE transform, manifest
-identity); bare file existence proves none of them.
+knob `manifold generate` carries. Cache-hit validation is the model-free
+preflight or the loaded session/pipeline — never bare file existence, which
+proves nothing about model, corpus, tokenizer, role, SAE transform, or manifest
+identity (see `manifold fit` below for the shared preflight).
 
 **manifold generate** — `name`, `--concepts C...` (required; the runner rejects
 fewer than 2), `--kind`, `--system`, `--samples-per-prompt K` (1),
@@ -237,9 +238,20 @@ for `--method pca` (a flat fit's subspace dim *is* its `--max-dim` layout dim);
 `-f` bypasses the per-model tensor cache and re-pools unconditionally — needed
 because `fit`, unlike `extract -f`, does not re-author the corpus, so an
 unchanged corpus always cache-hits and a code-level fit change could never be
-picked up. Cache validation runs after the model load so the sidecar can be
-checked against the actually-loaded weight fingerprint; a mutable model id alone
-cannot prove a hit.
+picked up.
+
+Without `-f`, both `fit` and `extract` run the model-free exact no-op preflight
+(`_try_manifold_fit_noop_preflight` → `io.preflight_manifold_fit_noop`) **before**
+`_make_session`: on a proven no-op they print the cache-hit line and exit 0
+having loaded no weights. A mutable model id still proves nothing — the
+preflight establishes sidecar integrity, corpus / role / template identity, the
+token-exact tokenizer render, and the checkpoint→loaded fingerprint bridge, and
+returns "unproven" for anything it cannot establish (an `--sae` fit, any
+discover override, a checkpoint with no provable source, a missing neutral
+cache). Unproven falls through to the ordinary loaded fit, whose cache check
+still runs against the actually-loaded weight fingerprint. `extract` additionally
+declines the preflight on a `--role` baseline the existing corpus does not carry,
+so that stays the loaded path's error rather than a silent hit.
 
 **manifold bake** — `name`, `expression`, `-f`, `-s/--strict`, `-m`. Lands a
 corpus-less baked manifold via `io.bake.merge_into_manifold`; only
