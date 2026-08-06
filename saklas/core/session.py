@@ -490,6 +490,50 @@ class PreparedCall:
     logprobs_list: list[Any] | None
 
 
+@dataclass(frozen=True, slots=True)
+class ReadDemand:
+    """What this generation's consumers need from the read plane.
+
+    Resolved once per generation by
+    :meth:`SaklasSession._resolve_read_demand` and consumed by
+    :meth:`SaklasSession._begin_capture`, which chooses the physical capture
+    retention from it.  Every derived predicate — notably
+    ``per_token_full_consumer`` — is computed in the resolver and only read
+    here, so the caller and the capture planner cannot form different opinions
+    about the same generation.  The defaults are the "everything, nothing
+    gated" demand a bare capture attach wants.
+
+    - ``need_per_token`` — anything consumes a per-token reading (a probe
+      gate, a loom token row, a trait stream, a live-scores client).  False
+      means aggregate-only: a bounded tail ring, no per-token scoring, one
+      pooled read at finalize.
+    - ``per_token_full_consumer`` — a per-token consumer wants the FULL
+      roster, not just a gate's scalars.  False with ``need_per_token`` true
+      is the gating-only case.
+    - ``gating_only_probes`` — the gated probe names when gating is the sole
+      per-token consumer; the step sink then scores just that subset and the
+      big-K roster's per-token nearest-distance work is skipped.  When
+      ``final_probe_aggregate`` is set the tail ring is kept alongside, so
+      finalize still pools the full roster once.
+    - ``lean_per_token`` — the live consumers read only axis-0 coords, so
+      per-token scoring drops nearest / assignment / per-layer work.
+    - ``capture_prompt`` — authored prompt rows are scored this generation,
+      which forces transient capture hooks over the persistent buffers.
+    """
+
+    need_per_token: bool = True
+    per_token_full_consumer: bool = True
+    gating_only_probes: "set[str] | None" = None
+    gating_probe_keys: "set[str] | None" = None
+    lens_gating_probe_keys: "set[str] | None" = None
+    sae_gating_probe_keys: "set[str] | None" = None
+    lean_per_token: bool = False
+    final_probe_aggregate: bool = True
+    live_lens_active: bool = True
+    live_sae_active: bool = True
+    capture_prompt: bool = False
+
+
 class ConcurrentGenerationError(RuntimeError, SaklasError):
     """Raised when a generation call is made while another is in progress."""
 
@@ -5674,19 +5718,105 @@ class SaklasSession:
         """
         self._steering_composer.rebuild_hooks()
 
+    def _resolve_read_demand(
+        self,
+        *,
+        want_hidden: bool,
+        live_scores_on: bool,
+        has_monitor_probes: bool,
+        loom_attached: bool,
+        has_trait_consumer: bool,
+        wants_live_token_scores: bool,
+        persists_layer_scores: bool,
+        persists_probe_row: bool,
+        persists_subspace_coords: bool,
+        live_lens_active: bool,
+        live_sae_active: bool,
+        final_probe_aggregate: bool,
+        capture_prompt: bool,
+    ) -> ReadDemand:
+        """Fold this generation's consumers into one :class:`ReadDemand`.
+
+        The single place the interdependent read-demand predicates are
+        derived, so :meth:`_begin_capture` re-derives none of them.
+        """
+        composer = self._steering_composer
+        needs_gating = composer.steering_needs_probe_gating()
+        gating_probe_keys = composer.gated_probe_keys() if needs_gating else None
+        lens_gating_probe_keys = (
+            composer.gated_lens_probe_keys() if needs_gating else None
+        )
+        sae_gating_probe_keys = (
+            composer.gated_sae_probe_keys() if needs_gating else None
+        )
+        # The five UI / trait / loom / persist consumers each need a per-token
+        # reading for the FULL roster.  When NONE of them is live but a probe
+        # gate is, gating is the SOLE per-token consumer: the step sink can
+        # score just the gated probes per token and leave the big-K roster to
+        # the one-shot full aggregate at finalize.
+        per_token_full_consumer = bool(
+            (live_scores_on and loom_attached)
+            or has_trait_consumer
+            or wants_live_token_scores
+            or persists_layer_scores
+            or persists_probe_row
+            or persists_subspace_coords
+        )
+        # J-lens token probes gate on the lens path (the gating score callback
+        # computes their scalars from the latest capture slices), so a
+        # lens-only gate doesn't force per-token MONITOR scoring —
+        # ``need_per_token`` keys on monitor-attached gate keys only.
+        needs_monitor_gating = bool(gating_probe_keys)
+        need_per_token = bool(needs_monitor_gating or per_token_full_consumer)
+        gating_only_probes = (
+            composer.gated_probe_names()
+            if (needs_monitor_gating and not per_token_full_consumer)
+            else None
+        )
+        # Lean-incremental: the live consumers present read ONLY the axis-0
+        # coord (the SSE trait stream, the loom probe row, the loom node
+        # text/aggregate) — none of the consumers that genuinely need a richer
+        # per-token reading is live, and there is no probe gate.  Then
+        # per-token scoring drops the nearest / assignment / per-layer work
+        # (the full aggregate is re-scored once from the tail ring at
+        # finalize), which is the common loom monitoring path.
+        full_reading_consumer = bool(
+            wants_live_token_scores       # full ProbeReading in TokenEvent
+            or persists_layer_scores      # per-layer heatmap row
+            or persists_subspace_coords   # inspector whitened coords
+        )
+        lean_per_token = bool(
+            need_per_token
+            and not want_hidden
+            and not needs_monitor_gating
+            and not full_reading_consumer
+            and has_monitor_probes
+        )
+        return ReadDemand(
+            need_per_token=need_per_token,
+            per_token_full_consumer=per_token_full_consumer,
+            gating_only_probes=gating_only_probes,
+            gating_probe_keys=gating_probe_keys,
+            lens_gating_probe_keys=lens_gating_probe_keys,
+            sae_gating_probe_keys=sae_gating_probe_keys,
+            lean_per_token=lean_per_token,
+            final_probe_aggregate=final_probe_aggregate,
+            live_lens_active=live_lens_active,
+            live_sae_active=live_sae_active,
+            capture_prompt=capture_prompt,
+        )
+
     def _begin_capture(
-        self, *, widen: bool = False, need_per_token: bool = True,
-        gating_only_probes: set[str] | None = None,
-        gating_probe_keys: set[str] | None = None,
-        lens_gating_probe_keys: set[str] | None = None,
-        sae_gating_probe_keys: set[str] | None = None,
-        lean_per_token: bool = False,
-        final_probe_aggregate: bool = True,
-        live_lens_active: bool = True,
-        live_sae_active: bool = True,
-        capture_prompt: bool = False,
+        self, demand: "ReadDemand | None" = None, *, widen: bool = False,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
+
+        ``demand`` is this generation's resolved :class:`ReadDemand` — every
+        predicate it carries was computed once by
+        :meth:`_resolve_read_demand`, and nothing is re-derived here, so the
+        capture cannot disagree with the caller about what the generation
+        needs.  ``None`` means the all-defaults demand: full per-token scoring,
+        a final aggregate, both live readouts on, no gates.
 
         The capture layer set is **plan-driven**: each instrument family
         prepares its source snapshot (``Instrument.prepare(ReadRequest)``),
@@ -5696,37 +5826,15 @@ class SaklasSession:
         planner's decision below — cross-instrument resource sharing the
         plans deliberately do not decide (``protocol.py``).
 
-        ``widen=False`` (default): cover the union of vector-probe
-        layers and manifold-probe layers — what both monitors need.
-        Fast path; matches v1 behavior when only vector probes are
-        attached.
-
-        ``widen=True``: cover every model layer.  Used when the caller
-        asked for ``SamplingConfig.return_hidden=True`` — the monitor still
-        reads its probe subset, but the full dict is available on
-        ``GenerationResult.hidden_states`` after the run.
-
-        ``need_per_token`` (default True): whether anything consumes a
-        per-token reading this gen — a probe gate, a loom token row, a trait
-        stream, or a live-scores client.  When False (probes attached but only
-        the end-of-gen aggregate is wanted, e.g. stateless server scoring) the
-        capture runs in **aggregate-only** mode: a bounded tail ring, NO
-        per-token scoring (T scorings + T host syncs → 1 at finalize via
-        :meth:`_score_aggregate_only`).
-
-        ``gating_only_probes`` (FIX #4): when per-token scoring is needed *only*
-        to feed probe gates (no UI / trait / loom / persist consumer), this is
-        the set of gated probe names.  The incremental step sink then scores
-        just that subset every token (the gate consumes only those scalars),
-        while the big-K roster's per-token nearest-distance work is skipped.
-        If ``final_probe_aggregate`` is true, the end-of-gen aggregate still
-        covers the **full** roster: the tail ring is also kept, so
-        :meth:`_finalize_generation` pools the last content token once and scores
-        every probe (the gated subset live-scored, the rest one-shot).  When the
-        caller explicitly disables final probe readings, capture narrows to the
-        gated probe layers and keeps no full-roster tail. ``None`` (or empty)
-        keeps the full per-token scoring.
+        ``widen`` is the one axis that isn't consumer demand but a retention
+        request, so it stays a parameter.  ``widen=False`` (default) covers
+        the union of the layers the instrument plans declared.  ``widen=True``
+        covers every model layer — the caller asked for
+        ``SamplingConfig.return_hidden=True``, so the monitor still reads its
+        probe subset but the full dict lands on
+        ``GenerationResult.hidden_states``.
         """
+        demand = ReadDemand() if demand is None else demand
         # ---- Per-family capture demand (Instrument.plan) -------------------
         # The planner hands each family what the session knows about this
         # generation's read demand; each family answers with its declared
@@ -5736,9 +5844,7 @@ class SaklasSession:
         # ``INCREMENTAL -> set_tail_with_sink`` upgrade is cross-instrument
         # resource sharing, which plans deliberately do not decide
         # (``protocol.py`` division of labor).
-        per_token_full_consumer = bool(
-            need_per_token and gating_only_probes is None
-        )
+        #
         # The uniform capture transaction (``protocol.py``): close →
         # prepare → plan → bind.  The defensive close first (the
         # generation finallys are the ordinary teardown) — a stale pin
@@ -5753,23 +5859,23 @@ class SaklasSession:
         # the ordering + snapshot rationale).
         self._close_instrument_runs()
         geometry_prep = self._geometry_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(gating_probe_keys or ()),
-            per_token_consumers=per_token_full_consumer,
-            final_aggregate=final_probe_aggregate,
+            gate_keys=frozenset(demand.gating_probe_keys or ()),
+            per_token_consumers=demand.per_token_full_consumer,
+            final_aggregate=demand.final_probe_aggregate,
             return_hidden=widen,
         ))
         lens_prep = self._lens_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(lens_gating_probe_keys or ()),
-            live=live_lens_active,
-            per_token_consumers=per_token_full_consumer,
-            final_aggregate=final_probe_aggregate,
+            gate_keys=frozenset(demand.lens_gating_probe_keys or ()),
+            live=demand.live_lens_active,
+            per_token_consumers=demand.per_token_full_consumer,
+            final_aggregate=demand.final_probe_aggregate,
             return_hidden=widen,
         ))
         sae_prep = self._sae_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(sae_gating_probe_keys or ()),
-            live=live_sae_active,
-            per_token_consumers=per_token_full_consumer,
-            final_aggregate=final_probe_aggregate,
+            gate_keys=frozenset(demand.sae_gating_probe_keys or ()),
+            live=demand.live_sae_active,
+            per_token_consumers=demand.per_token_full_consumer,
+            final_aggregate=demand.final_probe_aggregate,
             return_hidden=widen,
         ))
         geometry_plan = self._geometry_instrument.plan(geometry_prep)
@@ -5799,9 +5905,9 @@ class SaklasSession:
             if not union:
                 # No probes ⇒ the degenerate FULL (capture-disabled) state.
                 self._capture_state = CaptureState(
-                    gating_keys=set(gating_probe_keys or ())
-                    if gating_probe_keys else None,
-                    final_probe_aggregate=final_probe_aggregate,
+                    gating_keys=set(demand.gating_probe_keys or ())
+                    if demand.gating_probe_keys else None,
+                    final_probe_aggregate=demand.final_probe_aggregate,
                 )
                 self._incremental_readings = []
                 return False
@@ -5817,7 +5923,7 @@ class SaklasSession:
         # ``return_hidden``) falls back to transient capture hooks.
         use_persistent = bool(
             not widen
-            and not capture_prompt
+            and not demand.capture_prompt
             # Persistent capture buffers are installed for every layer before
             # compile; layer_idxs selects the subset this generation consumes.
             # Live lens layers can therefore ride the same compile-clean path
@@ -5839,8 +5945,11 @@ class SaklasSession:
         # from the compiled-clean routing decision and carried through unchanged.
         self._capture_state = CaptureState(
             persistent=use_persistent,
-            gating_keys=set(gating_probe_keys or ()) if gating_probe_keys else None,
-            final_probe_aggregate=final_probe_aggregate,
+            gating_keys=(
+                set(demand.gating_probe_keys or ())
+                if demand.gating_probe_keys else None
+            ),
+            final_probe_aggregate=demand.final_probe_aggregate,
         )
         self._incremental_readings = []
         self._incremental_gate_scores = []
@@ -5852,14 +5961,17 @@ class SaklasSession:
         # the gated subset's per-token rows are NOT the source of the final
         # readings, the one-shot full aggregate is, so no probe drops.
         gating_subset = (
-            gating_only_probes
-            if (gating_only_probes and need_per_token and not widen
+            demand.gating_only_probes
+            if (demand.gating_only_probes and demand.need_per_token and not widen
                 and self._monitor.probe_names)
             else None
         )
-        if not widen and self._monitor.probe_names and need_per_token and gating_subset:
+        if (
+            not widen and self._monitor.probe_names
+            and demand.need_per_token and gating_subset
+        ):
             subset = set(gating_subset)
-            gate_keys = set(gating_probe_keys or ())
+            gate_keys = set(demand.gating_probe_keys or ())
             gate_plan = self._monitor.plan_gate_scalars(
                 gate_keys, probe_names=subset,
             )
@@ -5879,7 +5991,7 @@ class SaklasSession:
                     if latest and gate_plan else {}
                 )
 
-            if final_probe_aggregate:
+            if demand.final_probe_aggregate:
                 # Deep tail ring (full-roster finalize via ``tail_slice_at``) PLUS a
                 # per-token step sink (gated subset, for the gate) — armed together by
                 # ``set_tail_with_sink`` (neither single setter gives both).
@@ -5892,14 +6004,14 @@ class SaklasSession:
             self._capture_state.mode = CaptureMode.GATING_SUBSET
             self._capture_state.gating_subset = subset
             self._capture_state.gating_keys = gate_keys
-            self._capture_state.final_probe_aggregate = final_probe_aggregate
+            self._capture_state.final_probe_aggregate = demand.final_probe_aggregate
             # The subset is scored one token per step in order, so curved gated
             # probes can warm-start their foot; cold-start the feet first.
             self._monitor.reset_curved_feet()
             self._monitor.enable_curved_warm(True)
         elif (
             not widen and self._monitor.probe_names
-            and need_per_token and lean_per_token
+            and demand.need_per_token and demand.lean_per_token
         ):
             # Lean-incremental (FIX F2): the only per-token consumers read just
             # the axis-0 coord (the trait stream / loom probe row) — no nearest /
@@ -5929,7 +6041,7 @@ class SaklasSession:
             # can warm-start their foot for the per-token coord stream.
             self._monitor.reset_curved_feet()
             self._monitor.enable_curved_warm(True)
-        elif not widen and self._monitor.probe_names and need_per_token:
+        elif not widen and self._monitor.probe_names and demand.need_per_token:
             geometry_run = self._geometry_instrument.current_run
 
             def _score_step(
@@ -5967,7 +6079,7 @@ class SaklasSession:
                     lens_plan.tail_layers | sae_plan.tail_layers
                 )
                 self._capture.set_tail_with_sink(
-                    _AGG_TAIL_DEPTH if final_probe_aggregate else 1,
+                    _AGG_TAIL_DEPTH if demand.final_probe_aggregate else 1,
                     _score_step,
                     tail_layers=readout_tail_layers or None,
                 )
@@ -6000,7 +6112,7 @@ class SaklasSession:
             # readings are disabled, keep a length-1 latest buffer instead of
             # cloning/popping the 8-deep EOS walk-back tail every token.
             self._capture.set_aggregate_tail(
-                _AGG_TAIL_DEPTH if final_probe_aggregate else 1
+                _AGG_TAIL_DEPTH if demand.final_probe_aggregate else 1
             )
             # The armed retention IS an aggregate tail, so record it: leaving
             # the FULL default here would make ``CaptureState`` describe a
@@ -9201,74 +9313,6 @@ class SaklasSession:
             vector_snapshot: dict[str, float] = self._snapshot_steering_alphas()
 
             want_hidden = bool(sampling and sampling.return_hidden)
-            # Per-token scoring is only needed when something consumes a
-            # per-token reading: a probe gate, a loom token row, an SSE trait
-            # stream, a live-scores client, or a per-layer-heatmap persist.
-            # Otherwise (probes attached but only the aggregate wanted, e.g. a
-            # stateless server gen) the capture skips per-token scoring entirely
-            # and pools the aggregate once at finalize.
-            composer = self._steering_composer
-            _needs_gating = composer.steering_needs_probe_gating()
-            # The five UI / trait / loom / persist consumers each need a
-            # per-token reading for the FULL roster.  When NONE of them is live
-            # but a probe gate is, gating is the SOLE per-token consumer (FIX
-            # #4): the step sink can score just the gated probes per token and
-            # leave the big-K roster to the one-shot full aggregate at finalize.
-            _per_token_full_consumer = bool(
-                (_live_scores_on and assistant_node_id is not None)
-                or _has_trait_consumer
-                or _wants_live_token_scores
-                or _persists_layer_scores
-                or _persists_probe_row
-                or _persists_subspace_coords
-            )
-            gating_probe_keys: set[str] | None = (
-                composer.gated_probe_keys()
-                if _needs_gating
-                else None
-            )
-            lens_gating_probe_keys: set[str] | None = (
-                composer.gated_lens_probe_keys()
-                if _needs_gating
-                else None
-            )
-            sae_gating_probe_keys: set[str] | None = (
-                composer.gated_sae_probe_keys()
-                if _needs_gating
-                else None
-            )
-            # J-lens token probes gate on the lens path (the gating score
-            # callback computes their scalars from the latest capture slices),
-            # so a lens-only gate doesn't force per-token MONITOR scoring —
-            # ``need_per_token`` keys on monitor-attached gate keys only.
-            _needs_monitor_gating = bool(gating_probe_keys)
-            need_per_token = bool(
-                _needs_monitor_gating or _per_token_full_consumer
-            )
-            gating_only_probes: set[str] | None = (
-                composer.gated_probe_names()
-                if (_needs_monitor_gating and not _per_token_full_consumer)
-                else None
-            )
-            # Lean-incremental (FIX F2): the live consumers present read ONLY the
-            # axis-0 coord (the SSE trait stream, the loom probe row, the loom
-            # node text/aggregate) — none of the consumers that genuinely need a
-            # richer per-token reading is live, and there is no probe gate.  Then
-            # the per-token scoring drops the nearest / assignment / per-layer
-            # work (the full aggregate is re-scored once from the tail ring at
-            # finalize), which is the common loom monitoring path.
-            _full_reading_consumer = bool(
-                _wants_live_token_scores       # full ProbeReading in TokenEvent
-                or _persists_layer_scores      # per-layer heatmap row
-                or _persists_subspace_coords   # inspector whitened coords
-            )
-            lean_per_token = bool(
-                need_per_token
-                and not want_hidden
-                and not _needs_monitor_gating
-                and not _full_reading_consumer
-                and _has_monitor_probes
-            )
             self._live_lens_active_for_generation = _has_lens_consumer
             self._live_sae_active_for_generation = _has_sae_consumer
             authored_targets = self._pending_authored_prompt_targets(
@@ -9322,24 +9366,35 @@ class SaklasSession:
                 if authored_targets and authored_channels_active
                 else None
             )
+            # Fold every consumer of this generation into one read demand.
+            # Per-token scoring is only needed when something consumes a
+            # per-token reading: a probe gate, a loom token row, an SSE trait
+            # stream, a live-scores client, or a per-layer-heatmap persist.
+            # Otherwise (probes attached but only the aggregate wanted, e.g. a
+            # stateless server gen) the capture skips per-token scoring
+            # entirely and pools the aggregate once at finalize.
+            read_demand = self._resolve_read_demand(
+                want_hidden=want_hidden,
+                live_scores_on=_live_scores_on,
+                has_monitor_probes=_has_monitor_probes,
+                loom_attached=assistant_node_id is not None,
+                has_trait_consumer=_has_trait_consumer,
+                wants_live_token_scores=_wants_live_token_scores,
+                persists_layer_scores=_persists_layer_scores,
+                persists_probe_row=_persists_probe_row,
+                persists_subspace_coords=_persists_subspace_coords,
+                live_lens_active=_has_lens_consumer,
+                live_sae_active=_has_sae_consumer,
+                final_probe_aggregate=return_probe_readings,
+                capture_prompt=authored_capture is not None,
+            )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
                 # inner try so a BaseException (KeyboardInterrupt, etc.)
                 # between any pair of these still hits the cleanup finally.
                 # ``_end_capture`` and ``end_live`` are idempotent.
-                self._begin_capture(
-                    widen=want_hidden, need_per_token=need_per_token,
-                    gating_only_probes=gating_only_probes,
-                    gating_probe_keys=gating_probe_keys,
-                    lens_gating_probe_keys=lens_gating_probe_keys,
-                    sae_gating_probe_keys=sae_gating_probe_keys,
-                    lean_per_token=lean_per_token,
-                    final_probe_aggregate=return_probe_readings,
-                    live_lens_active=_has_lens_consumer,
-                    live_sae_active=_has_sae_consumer,
-                    capture_prompt=authored_capture is not None,
-                )
+                self._begin_capture(read_demand, widen=want_hidden)
                 # Reset the steering manager's TriggerContext for this gen;
                 # ``generate_steered`` mutates it at lifecycle boundaries.
                 self._steering.ctx.reset()
