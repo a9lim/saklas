@@ -388,16 +388,15 @@ def register_profile_routes(app: FastAPI) -> None:
     async def bake_profile(session_id: str, req: BakeProfileRequest):
         """Merge an expression of installed directions into a baked manifold.
 
-        Wraps :func:`saklas.io.bake.merge_into_manifold` (model-scoped to
-        the session's loaded model) — the merge lands a corpus-less
-        ``fit_mode="baked"`` manifold — then folds the fitted tensor back to a
-        steering Profile and registers it so it's immediately steerable.
-        Returns the same profile-JSON shape ``GET /profiles/{name}`` produces.
+        The HTTP face of :meth:`SaklasSession.bake`, which owns the whole
+        sequence: the model-scoped merge (a corpus-less ``fit_mode="baked"``
+        manifold), the fold of its fitted tensor back to a steering Profile,
+        and the registration that makes it immediately steerable.  Because the
+        session method computes the loaded-weight fingerprint and hands it to
+        the merge, a bake whose components were fitted against different
+        weights is refused here exactly as it is in Python.  Returns the same
+        profile-JSON shape ``GET /profiles/{name}`` produces.
         """
-        from saklas.io.bake import merge_into_manifold, MergeError
-        from saklas.io.paths import tensor_filename
-        from saklas.io.manifold_tensors import load_manifold
-        from saklas.core.capture import folded_directions
         resolve_session_id(session_id)
 
         async with acquire_session_lock(session) as acquired:
@@ -407,29 +406,11 @@ def register_profile_routes(app: FastAPI) -> None:
             # gen-lock — parity with the manifold mutating routes, so a
             # merge can't race a concurrent extraction.
             refuse_if_busy(session)
-            try:
-                dst_folder = await asyncio.to_thread(
-                    merge_into_manifold,
-                    req.name,
-                    req.expression,
-                    session.model_id,
-                    force=True,  # session-driven merges always overwrite
-                    strict=False,
-                )
-            except MergeError:
-                # Re-raised through the SaklasError handler (400).
-                raise
-            tensor_path = dst_folder / tensor_filename(session.model_id)
-            if not tensor_path.is_file():
-                raise HTTPException(
-                    500,
-                    f"merge produced no tensor for {session.model_id} at {tensor_path}",
-                )
-
-            def _load_folded() -> Profile:
-                manifold = load_manifold(str(tensor_path))
-                return Profile(folded_directions(manifold))
-
-            profile = await asyncio.to_thread(_load_folded)
-            session.steer(req.name, profile)
-        return profile_to_json(req.name, profile)
+            # MergeError (a bad expression, a missing component, a
+            # fingerprint mismatch, a merge that produced no tensor) is a
+            # SaklasError and reaches the client as a 400 through the global
+            # handler.
+            name, profile = await asyncio.to_thread(
+                session.bake, req.name, req.expression,
+            )
+        return profile_to_json(name, profile)
