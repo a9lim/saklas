@@ -149,3 +149,43 @@ def test_classified_groups_are_key_disjoint_and_total():
 def test_normalized_entries_is_the_additive_view():
     steering = _mixed_steering()
     assert steering.normalized_entries() == steering.classified().additive
+
+
+# ---------------------------------------------------------------------------
+# triggers() + the entry readers: the shape-blind views over an entry.
+# ---------------------------------------------------------------------------
+
+
+def test_triggers_covers_every_entry_kind():
+    assert _mixed_steering().triggers() == {
+        Trigger.BOTH, Trigger.AFTER_THINKING, Trigger.GENERATED_ONLY,
+    }
+
+
+def test_triggers_gives_bare_floats_the_steering_default():
+    steering = Steering(
+        alphas={"bare": 0.3}, trigger=Trigger.GENERATED_ONLY,
+    )
+    assert steering.triggers() == {Trigger.GENERATED_ONLY}
+
+
+def test_entry_readers_are_shape_blind():
+    from saklas.core.steering import entry_coeff, entry_trigger
+    from saklas.core.steering_expr import AblationTerm, ManifoldTerm
+
+    tuple_entry = (0.4, Trigger.AFTER_THINKING)
+    ablation = AblationTerm(coeff=0.25, trigger=Trigger.BOTH, target="gone")
+    manifold = ManifoldTerm(
+        along=0.6, onto=0.2, trigger=Trigger.GENERATED_ONLY,
+        manifold="personas", position="hacker",
+    )
+
+    assert entry_trigger(tuple_entry) is Trigger.AFTER_THINKING
+    assert entry_trigger(ablation) is Trigger.BOTH
+    assert entry_trigger(manifold) is Trigger.GENERATED_ONLY
+
+    assert entry_coeff(tuple_entry) == 0.4
+    assert entry_coeff(ablation) == 0.25
+    # A manifold term's scalar strength is its ``along`` half — what the flat
+    # ``{name: alpha}`` views report.
+    assert entry_coeff(manifold) == 0.6

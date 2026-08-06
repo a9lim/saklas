@@ -1071,3 +1071,62 @@ class TestGenerateSweep:
         s = self._session()
         with pytest.raises(ValueError, match="non-empty list"):
             s.generate_sweep("test", sweep={"a": []})
+
+
+# ---------------------------------------------------------------------------
+# Batch-fast eligibility: only always-on steering can ride HF ``generate``.
+# ---------------------------------------------------------------------------
+
+
+class TestBatchFastSteeringGate:
+    """``_batch_fast_steering_is_always_on`` over every entry shape.
+
+    HF ``generate`` runs the whole batch in one call, so there is no per-step
+    hook re-evaluation to make a phased or gated trigger mean anything — the
+    gate has to see every entry kind, not just the additive ones.
+    """
+
+    @staticmethod
+    def _gate(value: str | None) -> bool:
+        from saklas.core.session import SaklasSession
+        from saklas.core.steering import Steering
+
+        return SaklasSession._batch_fast_steering_is_always_on(
+            Steering.from_value(value),
+        )
+
+    def test_unsteered_is_eligible(self) -> None:
+        assert self._gate(None) is True
+
+    @pytest.mark.parametrize(
+        "expr",
+        ["0.5 formal.casual", "!gone", "0.5 personas%hacker"],
+    )
+    def test_default_trigger_entries_are_eligible(self, expr: str) -> None:
+        assert self._gate(expr) is True
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "0.5 formal.casual@response",
+            "!gone@thinking",
+            "0.5 personas%hacker@after",
+            "0.5 formal.casual@when:confident.uncertain>0.4",
+        ],
+    )
+    def test_phased_or_gated_entries_are_not_eligible(self, expr: str) -> None:
+        assert self._gate(expr) is False
+
+    def test_one_phased_term_disqualifies_the_whole_expression(self) -> None:
+        assert self._gate("0.5 formal.casual + 0.3 warm.clinical@response") is False
+
+    def test_a_nondefault_steering_level_trigger_disqualifies(self) -> None:
+        """Bare floats inherit ``Steering.trigger``, so it counts too."""
+        from saklas.core.session import SaklasSession
+        from saklas.core.steering import Steering
+        from saklas.core.triggers import Trigger
+
+        steering = Steering(
+            alphas={"formal.casual": 0.5}, trigger=Trigger.GENERATED_ONLY,
+        )
+        assert SaklasSession._batch_fast_steering_is_always_on(steering) is False
