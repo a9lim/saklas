@@ -622,7 +622,7 @@ class _PenaltyState:
 # cached buffer.  Keyed on (id(tokenizer), system_prompt, frozen-tuple of
 # chat, thinking, add_generation_prompt) — id(tokenizer) implicitly
 # invalidates when a fresh tokenizer instance is loaded into a session.
-# Sized to comfortably absorb the v3 stateless workload (one identical
+# Sized to comfortably absorb the stateless prefill workload (one identical
 # prefix repeated 800×) without bloating; small chat lists serialize
 # cheaply to tuples so the per-lookup hash cost is negligible.
 _CHAT_INPUT_CACHE_MAX = 128
@@ -906,13 +906,14 @@ def generate_steered(
     nothing on the no-gate path — session-level wiring sets this to
     ``None`` unless the active steering contains a gated trigger.
 
-    ``step_callback`` is the per-token monitor-scoring hook (FIX F1):
-    invoked once per forward, post-``model()``, before ``score_callback``.
-    The session wires it to :meth:`HiddenCapture.fire_step_sink` so the
-    per-token probe scoring (and its device→host sync) runs *after* the
-    forward instead of inside the capture hook at the max probe layer,
-    keeping the sync out of the middle of the forward pass.  ``None`` when
-    no per-token scoring is needed (no probes, or aggregate-only capture).
+    ``step_callback`` is the per-token capture ingest/scoring hook: invoked
+    once per forward, post-``model()``, before ``score_callback``.  The
+    session wires it to :meth:`HiddenCapture.fire_step_sink` so the per-token
+    probe scoring (and its device→host sync) runs *after* the forward instead
+    of inside the capture hook at the max probe layer, keeping the sync out of
+    the middle of the forward pass.  ``None`` skips the ingest entirely; the
+    session always supplies one, and the capture itself decides whether that
+    step does any scoring work.
 
     ``use_static_cache`` routes generation through
     :class:`transformers.StaticCache` instead of the default
@@ -1121,7 +1122,11 @@ def generate_steered(
     response_char_len = 0
     state.response_text = None
     state.response_aggregate_index = None
-    lazy_token_text: dict[int, str | None] = {}
+    # Decode cache for the no-eager-table path: token id -> its own decoded
+    # text.  Never carries a "partial UTF-8" sentinel — ``_decode_piece``
+    # re-tests the decoded string, so an alt-token decode of the same id can't
+    # change what the emit path sees.
+    lazy_token_text: dict[int, str] = {}
 
     no_cache_buf: torch.Tensor | None = None
     no_cache_len = int(current_input.shape[1])
@@ -1193,16 +1198,34 @@ def generate_steered(
         return _decode_one(tid)
 
     def _decode_piece(tid: int) -> str | None:
-        """Decode one emitted token, preserving partial-UTF-8 buffering."""
+        """Decode one emitted token, preserving partial-UTF-8 buffering.
+
+        ``None`` marks a token that decodes to a replacement character on its
+        own \u2014 a partial UTF-8 byte sequence the caller buffers until a
+        completing token arrives.  The test runs on the decoded string every
+        call rather than on a cached sentinel, so it stays correct whichever
+        surface (emit or top-K alternative) decoded the id first.
+        """
         if token_table is not None and 0 <= tid < _vocab:
             return token_table[tid]
-        if tid in lazy_token_text:
-            return lazy_token_text[tid]
         s = _decode_one(tid)
-        if "\ufffd" in s:
-            lazy_token_text[tid] = None
-            return None
         return None if "\ufffd" in s else s
+
+    # One reused forward-kwargs mapping.  The four per-step entries are
+    # rewritten in place below; ``use_cache`` is constant and ``cache_position``
+    # is present iff the static-cache path is live (loop-invariant \u2014 it is set
+    # before the loop and only ever advanced inside that same branch).  Passing
+    # ``cache_position`` only when it exists is load-bearing: the DynamicCache
+    # path relies on HF deriving positions from the cache length, which an
+    # explicit ``None`` would not reproduce.
+    fwd_kwargs: dict[str, Any] = {
+        "input_ids": current_input,
+        "attention_mask": None,
+        "past_key_values": past_key_values,
+        "use_cache": True,
+    }
+    if cache_position is not None:
+        fwd_kwargs["cache_position"] = cache_position
 
     try:
         with torch.inference_mode():
@@ -1261,24 +1284,13 @@ def generate_steered(
                 # caps the LM head to the last position; the one-shot
                 # ``TypeError`` retry below covers a model whose signature
                 # advertised the kwarg but rejects the value at runtime.
+                fwd_kwargs["input_ids"] = current_input
+                fwd_kwargs["attention_mask"] = attn_mask_buf if prefill else None
+                fwd_kwargs["past_key_values"] = past_key_values
+                if cache_position is not None:
+                    fwd_kwargs["cache_position"] = cache_position
                 try:
-                    if cache_position is not None:
-                        outputs = model(
-                            input_ids=current_input,
-                            attention_mask=attn_mask_buf if prefill else None,
-                            past_key_values=past_key_values,
-                            use_cache=True,
-                            cache_position=cache_position,
-                            **logits_keep_kwargs,
-                        )
-                    else:
-                        outputs = model(
-                            input_ids=current_input,
-                            attention_mask=attn_mask_buf if prefill else None,
-                            past_key_values=past_key_values,
-                            use_cache=True,
-                            **logits_keep_kwargs,
-                        )
+                    outputs = model(**fwd_kwargs, **logits_keep_kwargs)
                 except TypeError:
                     if not logits_keep_kwargs or logits_keep_failed:
                         raise  # not our kwarg — a genuine signature error
@@ -1289,33 +1301,19 @@ def generate_steered(
                         "falling back to full-sequence logits (slower prefill)",
                         stacklevel=2,
                     )
-                    if cache_position is not None:
-                        outputs = model(
-                            input_ids=current_input,
-                            attention_mask=attn_mask_buf if prefill else None,
-                            past_key_values=past_key_values,
-                            use_cache=True,
-                            cache_position=cache_position,
-                        )
-                    else:
-                        outputs = model(
-                            input_ids=current_input,
-                            attention_mask=attn_mask_buf if prefill else None,
-                            past_key_values=past_key_values,
-                            use_cache=True,
-                        )
+                    outputs = model(**fwd_kwargs)
                 prefill = False
 
-                # Per-token monitor scoring (FIX F1): run the capture's step
-                # sink HERE, post-forward, rather than from inside the capture
-                # hook at the max probe layer.  The sink's score read ends in a
-                # device→host sync; firing it mid-forward (in the hook) drained
-                # the device pipeline before the remaining transformer layers +
-                # LM head were even enqueued.  Post-forward the captures are
-                # equally fresh (every probe layer stored this step's slice
-                # during the forward), so the readings are identical — only the
-                # sync no longer stalls the tail of the forward.  Runs before
-                # ``score_callback`` so a probe gate reads the freshly-scored row.
+                # Per-token monitor scoring runs HERE, post-forward, rather
+                # than from inside the capture hook at the max probe layer.
+                # The sink's score read ends in a device→host sync, and firing
+                # it mid-forward would drain the device pipeline before the
+                # remaining transformer layers + LM head are enqueued.
+                # Post-forward the captures are equally fresh (every probe
+                # layer stored this step's slice during the forward), so the
+                # readings are identical — only the sync stays out of the tail
+                # of the forward.  Runs before ``score_callback`` so a probe
+                # gate reads the freshly-scored row.
                 if step_callback is not None:
                     step_callback(forward_step)
 
@@ -1440,7 +1438,12 @@ def generate_steered(
                     entropy_nats = float((-(cand_probs * cand_logp)).sum().item())
                     current_perplexity = math.exp(entropy_nats)
                 else:
-                    current_perplexity = float("nan")
+                    # Not computed this step.  ``None`` is the contract every
+                    # consumer types (``TokenEvent.perplexity: float | None``,
+                    # the loom token row, the WS frame) and the value the
+                    # degenerate no-forward case already carries; a NaN would
+                    # read as a real measurement and is not valid JSON.
+                    current_perplexity = None
 
                 token_id = int(next_token.item())
 

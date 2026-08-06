@@ -34,7 +34,12 @@ from saklas.core.results import (
     ProbeReading,
     TokenEvent,
 )
-from saklas.core.session import CaptureMode, CaptureState, SaklasSession
+from saklas.core.session import (
+    CaptureMode,
+    CaptureState,
+    ReadDemand,
+    SaklasSession,
+)
 
 
 def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
@@ -136,6 +141,12 @@ def _stub_session() -> SaklasSession:
     session._geometry_instrument = GeometryInstrument(session)
     session._lens_instrument = LensInstrument(session)
     session._sae_instrument = SaeInstrument(session)
+    # ``_begin_capture`` runs the close → prepare → plan → bind ritual
+    # through this helper; the MagicMock default would hand it an empty
+    # iterable instead of the three real plans.
+    session._bind_instrument_runs = types.MethodType(
+        SaklasSession._bind_instrument_runs, session,
+    )
     session._lens_step_stash = None
     session._live_lens_active_for_generation = True
     session._incremental_readings = []
@@ -258,8 +269,7 @@ def test_begin_capture_widens_to_manifold_layers():
 
 
 def test_begin_capture_no_probes_returns_false():
-    """No probes attached → ``_begin_capture`` returns False (the v1
-    behavior)."""
+    """No probes attached → ``_begin_capture`` returns False."""
     session = _stub_session()
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
     session._capture.attach = lambda *args, **kw: None
@@ -321,7 +331,7 @@ def test_begin_capture_live_lens_ignored_without_consumer():
     session._incremental_readings = []
 
     ok = SaklasSession._begin_capture(
-        session, widen=False, live_lens_active=False,
+        session, ReadDemand(live_lens_active=False), widen=False,
     )
 
     assert ok is False
@@ -690,7 +700,9 @@ def test_full_incremental_sink_primes_geometry_observe_memo():
     session.add_probe("toy")
     holder = _wire_begin_capture(session)
 
-    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    ok = SaklasSession._begin_capture(
+        session, ReadDemand(need_per_token=True), widen=False,
+    )
     assert ok is True
     assert session._capture_state.mode is CaptureMode.INCREMENTAL
     run = session._geometry_instrument.current_run
@@ -724,7 +736,9 @@ def test_lean_and_gating_sinks_never_prime_observe_memo():
     holder = _wire_begin_capture(session)
 
     ok = SaklasSession._begin_capture(
-        session, widen=False, need_per_token=True, lean_per_token=True,
+        session,
+        ReadDemand(need_per_token=True, lean_per_token=True),
+        widen=False,
     )
     assert ok is True
     assert session._capture_state.mode is CaptureMode.LEAN_INCREMENTAL
@@ -744,11 +758,14 @@ def test_lean_and_gating_sinks_never_prime_observe_memo():
     session._incremental_gate_scores = []
     ok = SaklasSession._begin_capture(
         session,
+        ReadDemand(
+            need_per_token=True,
+            per_token_full_consumer=False,
+            gating_only_probes={"toy"},
+            gating_probe_keys={"toy"},
+            final_probe_aggregate=False,
+        ),
         widen=False,
-        need_per_token=True,
-        gating_only_probes={"toy"},
-        gating_probe_keys={"toy"},
-        final_probe_aggregate=False,
     )
     assert ok is True
     assert session._capture_state.mode is CaptureMode.GATING_SUBSET
@@ -802,7 +819,9 @@ def test_gate_callback_consumes_the_full_incremental_memo():
     )
     session.add_probe("toy")
     holder = _wire_begin_capture(session)
-    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    ok = SaklasSession._begin_capture(
+        session, ReadDemand(need_per_token=True), widen=False,
+    )
     assert ok is True
 
     latest = {
@@ -835,7 +854,9 @@ def test_token_payload_consumes_the_full_incremental_memo():
     )
     session.add_probe("toy")
     holder = _wire_begin_capture(session)
-    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    ok = SaklasSession._begin_capture(
+        session, ReadDemand(need_per_token=True), widen=False,
+    )
     assert ok is True
 
     latest = {

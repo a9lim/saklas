@@ -31,7 +31,7 @@ from saklas.core.loom import (
     Recipe,
     UnknownNodeError,
 )
-from saklas.core.session import SaklasSession
+from saklas.core.session import ReadDemand, SaklasSession
 from saklas.core.steering_composer import SteeringComposer
 from saklas.io.lens import (
     lens_checkpoint_paths,
@@ -111,6 +111,7 @@ class _StubSession:
     _generation_jlens = SaklasSession._generation_jlens
     _generation_jlens_active = SaklasSession._generation_jlens_active
     _close_instrument_runs = SaklasSession._close_instrument_runs
+    _bind_instrument_runs = SaklasSession._bind_instrument_runs
 
     def __init__(self, *, n_layers: int = 3) -> None:
         from saklas.core.instruments.geometry import GeometryInstrument
@@ -562,7 +563,7 @@ def test_generation_boundary_refreshes_external_lens_once() -> None:
     session_a._sae_probes = {}
 
     SaklasSession._begin_capture(
-        cast(Any, session_a), final_probe_aggregate=True,
+        cast(Any, session_a), ReadDemand(final_probe_aggregate=True),
     )
 
     snap = session_a._generation_jlens
@@ -581,7 +582,7 @@ def test_generation_boundary_refreshes_external_lens_once() -> None:
     # and the validated missing state is pinned (no per-token retry loop).
     assert remove_lens(_MODEL_ID)
     SaklasSession._begin_capture(
-        cast(Any, session_a), final_probe_aggregate=True,
+        cast(Any, session_a), ReadDemand(final_probe_aggregate=True),
     )
     assert session_a._generation_jlens_active is True
     assert session_a._generation_jlens is None
@@ -632,7 +633,7 @@ def test_external_lens_replacement_plans_and_freezes_refreshed_layers() -> None:
     session_a._sae_probes = {}
 
     ok = SaklasSession._begin_capture(
-        cast(Any, session_a), final_probe_aggregate=True,
+        cast(Any, session_a), ReadDemand(final_probe_aggregate=True),
     )
 
     assert ok is True

@@ -8,7 +8,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
-from enum import Enum, IntEnum
+from enum import IntEnum
 from types import TracebackType
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Protocol, cast, overload
@@ -21,6 +21,7 @@ from transformers import (
     StoppingCriteriaList,
 )
 
+from saklas.core.capture import CaptureMode, CaptureState
 from saklas.core.errors import SaklasError
 from saklas.core.events import (
     EventBus,
@@ -72,6 +73,7 @@ from saklas.core.model import (
 )
 from saklas.core.instruments.types import (
     AGG_TAIL_DEPTH,
+    InstrumentPlan,
     ReadRequest,
 )
 from saklas.core.monitor import Monitor
@@ -442,11 +444,12 @@ def _split_composite_source(
 class GenState(IntEnum):
     """Lifecycle phases of a single generation call.
 
-    Replaces the v1.x ``_gen_active: bool`` flag with a typed state so the
-    five-handle teardown (lock, steering scope CM, capture, monitor live,
-    threading lock) is self-documenting.
+    A typed phase rather than a bare in-flight flag, so the five-handle
+    teardown (lock, steering scope CM, capture, monitor live, threading lock)
+    is self-documenting.
 
-    Transitions live in :meth:`SaklasSession._generate_core`:
+    Transitions live in :meth:`SaklasSession._generation_transaction` and
+    :meth:`SaklasSession._generate_core`:
 
     - ``IDLE`` → ``PREAMBLE``: lock acquired, re-entry guard passed.
     - ``PREAMBLE`` → ``RUNNING``: capture attached, monitor ``begin_live``,
@@ -466,80 +469,86 @@ class GenState(IntEnum):
     FINALIZING = 3
 
 
-class CaptureMode(Enum):
-    """How the per-gen hidden-state capture scores its probes (legal-by-construction).
+@dataclass(frozen=True, slots=True)
+class PreparedCall:
+    """The per-call generation controls, normalized before any model work.
 
-    Replaces the five correlated capture booleans (``_capture_incremental`` /
-    ``_capture_aggregate_only`` / ``_capture_lean`` / ``_capture_gating_subset``)
-    that a hand-kept if/elif chain used to keep consistent — illegal combinations
-    (e.g. incremental *and* aggregate-only) were representable.  One mode is the
-    single source of truth; :meth:`SaklasSession._begin_capture` picks it and every
-    ``_score_*`` dispatch keys off it.  The modes trade only *when/how* scoring
-    runs (per token vs once) and what memory the capture keeps (length-1 buffer vs
-    tail ring vs full stack); every read is a full per-probe ``ProbeReading`` (see
-    ``hooks.py`` ``HiddenCapture``).
-
-    - ``INCREMENTAL`` — a full-reading live consumer wants per-token readings:
-      score each token live (full roster) into ``_incremental_readings``.
-    - ``LEAN_INCREMENTAL`` (FIX F2) — the only per-token consumers read axis-0
-      coords (trait stream / loom probe row): score each token ``coords_only`` and
-      re-score the full aggregate once at finalize from a bounded tail ring.
-    - ``AGGREGATE_ONLY`` — probes attached but nothing consumes a per-token
-      reading (e.g. stateless server gen): NO per-token scoring, pool the last
-      content token once at finalize from a bounded tail ring.
-    - ``GATING_SUBSET`` (FIX #4) — per-token scoring is needed *only* to feed probe
-      gates: score just the gated subset per token (into ``_incremental_gate_scores``)
-      while a tail ring lets finalize pool the FULL roster once.
-    - ``FULL`` — full-retention append (``return_hidden`` widen, or any
-      non-incremental read), or the degenerate no-probe / capture-disabled state:
-      distinct clones per step so ``stacked()`` builds the full ``[T, D]``.
+    Produced once by :meth:`SaklasSession._prepare_generation_call` and read by
+    both the ordinary and the batched entry points.  Named fields rather than a
+    positional tuple: several members share a type (two ``int | None``, two
+    ``float``), so a reordering would rebind silently at every unpack site.
     """
 
-    INCREMENTAL = "incremental"
-    LEAN_INCREMENTAL = "lean_incremental"
-    AGGREGATE_ONLY = "aggregate_only"
-    GATING_SUBSET = "gating_subset"
-    FULL = "full"
+    steering_obj: "Steering | None"
+    use_thinking_req: bool
+    gen_config: GenerationConfig
+    lp_count: int | None
+    seed: int | None
+    stop_list: list[str] | None
+    logit_bias: dict[int, float] | None
+    presence_penalty: float
+    frequency_penalty: float
+    logprobs_list: list[Any] | None
 
 
-@dataclass
-class CaptureState:
-    """Per-generation capture configuration — the legal-by-construction state.
+@dataclass(frozen=True, slots=True)
+class ReadDemand:
+    """What this generation's consumers need from the read plane.
 
-    Carries the one :class:`CaptureMode` plus the orthogonal ``persistent`` flag
-    (capture rides the always-on compile-clean buffers rather than transient
-    per-gen hooks) and, for gated generations, the gated probe names / exact
-    scalar keys.  Set wholesale in :meth:`SaklasSession._begin_capture`; read by
-    the ``_score_*`` dispatch, the gating callback, and the streaming tap.  The
-    convenience predicates name the modes so the read sites stay legible.
+    Resolved once per generation by
+    :meth:`SaklasSession._resolve_read_demand` and consumed by
+    :meth:`SaklasSession._begin_capture`, which chooses the physical capture
+    retention from it.  Every derived predicate — notably
+    ``per_token_full_consumer`` — is computed in the resolver and only read
+    here, so the caller and the capture planner cannot form different opinions
+    about the same generation.  The defaults are the "everything, nothing
+    gated" demand a bare capture attach wants.
+
+    - ``need_per_token`` — anything consumes a per-token reading (a probe
+      gate, a loom token row, a trait stream, a live-scores client).  False
+      means aggregate-only: a bounded tail ring, no per-token scoring, one
+      pooled read at finalize.
+    - ``per_token_full_consumer`` — a per-token consumer wants the FULL
+      roster, not just a gate's scalars.  False with ``need_per_token`` true
+      is the gating-only case.
+    - ``gating_only_probes`` — the gated probe names when gating is the sole
+      per-token consumer; the step sink then scores just that subset and the
+      big-K roster's per-token nearest-distance work is skipped.  When
+      ``final_probe_aggregate`` is set the tail ring is kept alongside, so
+      finalize still pools the full roster once.
+    - ``lean_per_token`` — the live consumers read only axis-0 coords, so
+      per-token scoring drops nearest / assignment / per-layer work.
+    - ``capture_prompt`` — authored prompt rows are scored this generation,
+      which forces transient capture hooks over the persistent buffers.
     """
 
-    mode: "CaptureMode" = CaptureMode.FULL
-    persistent: bool = False
-    gating_subset: "set[str] | None" = None
-    gating_keys: "set[str] | None" = None
+    need_per_token: bool = True
+    per_token_full_consumer: bool = True
+    gating_only_probes: "set[str] | None" = None
+    gating_probe_keys: "set[str] | None" = None
+    lens_gating_probe_keys: "set[str] | None" = None
+    sae_gating_probe_keys: "set[str] | None" = None
+    lean_per_token: bool = False
     final_probe_aggregate: bool = True
+    live_lens_active: bool = True
+    live_sae_active: bool = True
+    capture_prompt: bool = False
 
-    @property
-    def incremental(self) -> bool:
-        return self.mode is CaptureMode.INCREMENTAL
 
-    @property
-    def lean(self) -> bool:
-        return self.mode is CaptureMode.LEAN_INCREMENTAL
+class _GenerationTransaction:
+    """The mutable state :meth:`SaklasSession._generation_transaction` owns.
 
-    @property
-    def aggregate_only(self) -> bool:
-        # GATING_SUBSET also finalizes off the tail ring (its per-token rows feed
-        # only the gate), so it shares the aggregate-only full-roster pool when
-        # the caller still wants a final full probe aggregate.
-        return (
-            self.mode is CaptureMode.AGGREGATE_ONLY
-            or (
-                self.mode is CaptureMode.GATING_SUBSET
-                and self.final_probe_aggregate
-            )
-        )
+    ``steering_cm`` is whatever internal steering scope the body entered and
+    has not popped itself; the transaction pops the remainder on the way out.
+    ``failed`` records that the body is unwinding, which decides whether a
+    teardown ``Exception`` may mask the original failure.
+    """
+
+    __slots__ = ("failed", "steering_cm")
+
+    def __init__(self) -> None:
+        self.steering_cm: Any = None
+        self.failed: bool = False
 
 
 class ConcurrentGenerationError(RuntimeError, SaklasError):
@@ -897,12 +906,10 @@ class SaklasSession:
         # at probe time keeps the failure mode "StaticCache constructor
         # raised" rather than "compile + probe interaction").  We then
         # decide ``compile_mode`` based on the probe outcome and apply
-        # ``torch.compile`` manually below.  This closes the order-of-
-        # operations bug Codex flagged in v2.2 review: the previous
-        # shape committed to ``"reduce-overhead"`` based on the
-        # *requested* ``cuda_graphs=True`` before the probe could veto,
-        # so arch-failed sessions ran DynamicCache under a graph-capture
-        # compile mode (mode-and-cache mismatch).
+        # ``torch.compile`` manually below.  Ordering matters: committing
+        # to ``"reduce-overhead"`` from the *requested* ``cuda_graphs=True``
+        # before the probe can veto leaves an arch-failed session running
+        # DynamicCache under a graph-capture compile mode.
         model, tokenizer = load_model(
             model_id,
             quantize=quantize,
@@ -1058,8 +1065,8 @@ class SaklasSession:
         # populated lazily by ``ensure_manifold_loaded`` on scope entry.
         self._manifolds: dict[str, Manifold] = {}
 
-        # Phase 1 logit pass: session-level default for SamplingConfig
-        # .return_top_k.  Per-call value > 0 wins; per-call K=0 (the
+        # Session-level default for SamplingConfig.return_top_k.
+        # Per-call value > 0 wins; per-call K=0 (the
         # SamplingConfig default) inherits this stored value via the
         # composition in ``_generate_core``.  Clamped on entry mirroring
         # SamplingConfig.__post_init__ so out-of-range values from
@@ -1070,7 +1077,7 @@ class SaklasSession:
             return_top_k = 256
         self._default_return_top_k: int = int(return_top_k)
         self._steering = SteeringManager()
-        # CUDA-graphs / StaticCache routing (Phase B, v2.2).  Probe
+        # CUDA-graphs / StaticCache routing.  Probe
         # support once at construction so the per-generation hot path
         # only consults a boolean.  Off when (a) user opted out, (b)
         # device != cuda, or (c) the model's StaticCache constructor
@@ -1128,7 +1135,7 @@ class SaklasSession:
         self._steering_uses_compiled_offsets: bool = False
 
         # Persistent compile-clean *capture* buffers + hook handles, adopted from
-        # ``from_pretrained`` when compile stuck (slice 2).  The always-on hooks
+        # ``from_pretrained`` when compile stuck.  The always-on hooks
         # ``copy_`` each layer's last-token slice into ``_capture_buffers[L]``
         # every forward (fused into the compiled graph); a probed gen on the
         # compiled path reads them post-forward via ``HiddenCapture.ingest_persistent``
@@ -1184,14 +1191,11 @@ class SaklasSession:
         self._capture = HiddenCapture()
         # Per-gen capture configuration — one :class:`CaptureMode` plus the
         # orthogonal ``persistent`` flag (and the gated subset / keys for
-        # ``GATING_SUBSET``).  Replaces the former five correlated booleans
-        # (``_capture_incremental`` / ``_capture_aggregate_only`` /
-        # ``_capture_lean`` / ``_capture_gating_subset`` / ``_capture_persistent``)
-        # that a hand-kept if/elif chain had to keep consistent; the enum makes
-        # illegal combinations unrepresentable.  Set wholesale in
-        # ``_begin_capture`` and reset on teardown; the ``_score_*`` dispatch keys
-        # off ``mode``.  Each mode and its memory/scoring trade-off is documented
-        # on :class:`CaptureMode`.
+        # ``GATING_SUBSET``).  One enum rather than a set of correlated
+        # booleans, so illegal combinations are unrepresentable.  Set wholesale
+        # in ``_begin_capture`` and reset on teardown; the ``_score_*``
+        # dispatch keys off ``mode``.  Each mode and its memory/scoring
+        # trade-off is documented on :class:`CaptureMode`.
         self._capture_state: CaptureState = CaptureState()
         # Per-token reading buffers the modes append into (the *data*, distinct
         # from the *config* above).  ``_incremental_readings`` holds the full /
@@ -1291,8 +1295,8 @@ class SaklasSession:
         # channel) without reconstructing them from the envelope.
         self._last_token_probe_readings: dict[str, "ProbeReading"] | None = None
 
-        # Probe content-hash cache for transcript export / replay (v2.3
-        # phase 5).  Keyed by probe name → sha256 hex of the baked tensor
+        # Probe content-hash cache for transcript export / replay.
+        # Keyed by probe name → sha256 hex of the baked tensor
         # bytes (concatenated layer order).  Invalidated by
         # :meth:`add_probe` / :meth:`remove_probe`; rebuilt lazily by
         # :meth:`_probe_hash`.
@@ -1854,8 +1858,8 @@ class SaklasSession:
         Uses ``load_or_compute_neutral_activations`` (alignment.py) for
         disk caching; derives missing centering means from that same loaded
         tensor set, then instantiates the :class:`LayerWhitener`.  The shared
-        load matters on a cold model: probe bootstrap no longer reads the
-        neutral cache once for means and immediately again for covariance.
+        load matters on a cold model: probe bootstrap reads the neutral cache
+        once, for the means and the covariance together.
         Soft-fails to ``None``
         on any error — but the engine is Mahalanobis-only now, so a
         ``None`` whitener makes the activation-space consumers (fit,
@@ -2766,7 +2770,7 @@ class SaklasSession:
                     merged = _save_full(base)
                     # The live-state restore primes the locked adoption's
                     # rebuild; both must land as one lens-state
-                    # transaction (round-5: an un-locked restore write
+                    # transaction (an un-locked restore write
                     # between them could be observed torn).
                     with self._lens_instrument.state_lock:
                         if pre_evicted_live is not None:
@@ -4163,19 +4167,6 @@ class SaklasSession:
                 activations, only=only, raw_by_fid=raw_by_fid,
             )
         return self._sae_instrument.score_probes(hidden, only=only)
-
-    def _sae_probe_values(
-        self,
-        activations: torch.Tensor,
-        *,
-        only: "set[str] | None" = None,
-        raw_by_fid: Mapping[int, float] | None = None,
-    ) -> list[tuple[str, int, float, float]]:
-        """Pinned SAE probe values (delegates to
-        :meth:`SaeInstrument.probe_values`)."""
-        return self._sae_instrument.probe_values(
-            activations, only=only, raw_by_fid=raw_by_fid,
-        )
 
     def _score_sae_gate_scalars(
         self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
@@ -5575,8 +5566,8 @@ class SaklasSession:
         - **Tagged concept axes** — for each bundled 2-node ``pca`` manifold
           tagged in a requested category (roster from
           :func:`~saklas.io.probes_bootstrap.load_default_manifolds`) fit-or-
-          load the per-model subspace (eager, same cost band as the legacy DiM
-          extraction — both run forward passes, both disk-cache) and hand the
+          load the per-model subspace (eager — a forward pass per node, then
+          disk-cached) and hand the
           flat :class:`Manifold` to the :class:`Monitor`, which reads it as a
           coordinate (the rank-1 case of the subspace readout).  Registered
           under the **bare** name (``confident.uncertain``) so the gate grammar
@@ -5589,9 +5580,9 @@ class SaklasSession:
           and would block startup for minutes, so an unfitted one is skipped
           with a one-line log (fit it and it auto-loads next launch).
           Registered under the qualified ``default/<name>`` selector so a manual
-          attach from the manifolds drawer matches — no duplicate rows.  This
-          folds the former serve-only bootstrap into the construction-time pass
-          so every frontend gets the same roster.
+          attach from the manifolds drawer matches — no duplicate rows.  The
+          bootstrap runs at construction, so every frontend gets the same
+          roster.
 
         A fit/load failure for one manifold is logged and skipped, never fatal
         to session construction.
@@ -5708,7 +5699,7 @@ class SaklasSession:
         callback mutating the stack mid-step) by raising the
         ``_internal_steering_pop`` flag around the ``__exit__``.
 
-        Exception-safety-critical (Codex review v2): ``old_internal`` is
+        Exception-safety-critical: ``old_internal`` is
         read *before* the ``try`` so the worst case under a signal between
         the read and the assignment is "we never set True", not "we leave
         True set" — the flag never leaks across the gen-lock boundary.
@@ -5746,19 +5737,232 @@ class SaklasSession:
         """
         self._steering_composer.rebuild_hooks()
 
+    @contextmanager
+    def _generation_transaction(self) -> "Iterator[_GenerationTransaction]":
+        """The generation boundary: single-flight guard in, hard teardown out.
+
+        Every capture-owning generation path runs inside this — the ordinary
+        decode loop and the batched ``model.generate`` fast path — so the
+        order ARCHITECTURE.md §8.1/§8.3 describes exists once.  On entry: the
+        non-reentrant lock, the ``IDLE`` re-entry guard, and the phase
+        transition to ``PREAMBLE``.  On exit, whatever raised: pop any
+        steering scope the body left open, detach capture, drop the
+        per-generation session slots, close the instrument runs, reset capture
+        state, zero the persistent compile-clean steering offsets, and release
+        the phase and the lock.
+
+        The body owns the steering scope through ``txn.steering_cm``: it
+        assigns the scope when it enters one and clears the slot again if it
+        pops the scope itself (the decode path pops before finalizing, so the
+        finalize reads happen unsteered).  A scope still present here is
+        popped with ``swallow=txn.failed`` — a teardown ``Exception`` must not
+        mask the failure already propagating.
+        """
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentGenerationError("Generation already in progress")
+        if self._gen_phase is not GenState.IDLE:
+            self._gen_lock.release()
+            raise ConcurrentGenerationError("session generation already in flight")
+        self._gen_phase = GenState.PREAMBLE
+        txn = _GenerationTransaction()
+        try:
+            yield txn
+        except BaseException:
+            txn.failed = True
+            raise
+        finally:
+            try:
+                try:
+                    if txn.steering_cm is not None:
+                        self._exit_internal_steering(
+                            txn.steering_cm, swallow=txn.failed,
+                        )
+                finally:
+                    try:
+                        # Defense-in-depth: even if the body's own teardown
+                        # never ran (a BaseException between the transaction
+                        # entry and ``_begin_capture``), any hooks that did
+                        # get attached must come off.  Idempotent.
+                        self._end_capture()
+                        # The probe-inspector subspace-coords post-pass is
+                        # per-generation; clear it so it never leaks into a
+                        # later gen that didn't opt in.
+                        self._monitor.set_subspace_coords(False)
+                        # Release the loom-tree reservation in the same scope
+                        # as the gen-lock release.  Even if finalize raised,
+                        # mutators (edit / delete on this subtree) need to be
+                        # free again now that the streaming target is no
+                        # longer live.
+                        self._active_gen_reservation = None
+                        self._last_token_probe_payload = None
+                        self._last_token_probe_readings = None
+                    finally:
+                        # Run closure and capture-state resets must survive a
+                        # teardown failure above (a raising hook detach must
+                        # not leave a bound run pinning a stale lens).
+                        self._close_instrument_runs()
+                        # Reset capture state to the default (FULL,
+                        # non-persistent) so the next gen starts clean —
+                        # finalize has already consumed the rows, and
+                        # ``_begin_capture`` resets it at gen start too.
+                        self._capture_state = CaptureState()
+                        self._compiled_clean_eligible = False
+                        self._incremental_readings = []
+                        self._incremental_gate_scores = []
+                        # Zero the persistent compile-clean steering offsets so
+                        # a static-affine push can't leak into a later
+                        # generation that takes the eager / unsteered path
+                        # without re-running ``install_composed_steering``
+                        # (unsteered gens have no steering scope to reset
+                        # them).
+                        self._steering_uses_compiled_offsets = False
+                        if self._steering.has_compiled_offsets():
+                            self._steering.zero_compiled_offsets()
+            finally:
+                # Unconditional: an earlier teardown exception must not leave
+                # the session phase-wedged or the gen lock held.
+                self._gen_phase = GenState.IDLE
+                self._gen_lock.release()
+
+    def _bind_instrument_runs(
+        self,
+        geometry_request: ReadRequest,
+        lens_request: ReadRequest,
+        sae_request: ReadRequest,
+    ) -> "tuple[InstrumentPlan, InstrumentPlan, InstrumentPlan]":
+        """Run the uniform instrument transaction: close → prepare → plan → bind.
+
+        The defensive close comes first (the transaction teardown is the
+        ordinary one) — a stale pin would short-circuit the lens disk refresh
+        inside ``prepare``, and a stale binding would keep serving frozen specs
+        to idle reads.  ``prepare`` is the source-boundary step: the lens
+        family reads the disk-refreshing ``jlens`` getter under pin demand
+        there and snapshots specs + live config against that identity;
+        ``plan``/``bind`` consume the prep only, so an interleaved adoption
+        (the un-locked ``has_compatible_jlens``) cannot desynchronize them
+        (``LensInstrument.prepare`` carries the ordering + snapshot rationale).
+
+        ``bind`` freezes each family's probe specs into an immutable
+        ``InstrumentBinding`` (a concurrent SAE metadata backfill can no longer
+        change what this generation measures), starts fresh stashes and step
+        memos, and hands the lens run the pin its prep took — so every token,
+        gate, and final aggregate consumes the same resident lens even if
+        another process switches the active source mid-decode.
+
+        Returns the three plans; the caller unions their declared layers and
+        chooses the physical retention.
+        """
+        self._close_instrument_runs()
+        geometry_prep = self._geometry_instrument.prepare(geometry_request)
+        lens_prep = self._lens_instrument.prepare(lens_request)
+        sae_prep = self._sae_instrument.prepare(sae_request)
+        geometry_plan = self._geometry_instrument.plan(geometry_prep)
+        lens_plan = self._lens_instrument.plan(lens_prep)
+        sae_plan = self._sae_instrument.plan(sae_prep)
+        self._geometry_instrument.bind(geometry_plan, geometry_prep)
+        self._lens_instrument.bind(lens_plan, lens_prep)
+        self._sae_instrument.bind(sae_plan, sae_prep)
+        return geometry_plan, lens_plan, sae_plan
+
+    def _resolve_read_demand(
+        self,
+        *,
+        want_hidden: bool,
+        live_scores_on: bool,
+        has_monitor_probes: bool,
+        loom_attached: bool,
+        has_trait_consumer: bool,
+        wants_live_token_scores: bool,
+        persists_layer_scores: bool,
+        persists_probe_row: bool,
+        persists_subspace_coords: bool,
+        live_lens_active: bool,
+        live_sae_active: bool,
+        final_probe_aggregate: bool,
+        capture_prompt: bool,
+    ) -> ReadDemand:
+        """Fold this generation's consumers into one :class:`ReadDemand`.
+
+        The single place the interdependent read-demand predicates are
+        derived, so :meth:`_begin_capture` re-derives none of them.
+        """
+        composer = self._steering_composer
+        needs_gating = composer.steering_needs_probe_gating()
+        gating_probe_keys = composer.gated_probe_keys() if needs_gating else None
+        lens_gating_probe_keys = (
+            composer.gated_lens_probe_keys() if needs_gating else None
+        )
+        sae_gating_probe_keys = (
+            composer.gated_sae_probe_keys() if needs_gating else None
+        )
+        # The five UI / trait / loom / persist consumers each need a per-token
+        # reading for the FULL roster.  When NONE of them is live but a probe
+        # gate is, gating is the SOLE per-token consumer: the step sink can
+        # score just the gated probes per token and leave the big-K roster to
+        # the one-shot full aggregate at finalize.
+        per_token_full_consumer = bool(
+            (live_scores_on and loom_attached)
+            or has_trait_consumer
+            or wants_live_token_scores
+            or persists_layer_scores
+            or persists_probe_row
+            or persists_subspace_coords
+        )
+        # J-lens token probes gate on the lens path (the gating score callback
+        # computes their scalars from the latest capture slices), so a
+        # lens-only gate doesn't force per-token MONITOR scoring —
+        # ``need_per_token`` keys on monitor-attached gate keys only.
+        needs_monitor_gating = bool(gating_probe_keys)
+        need_per_token = bool(needs_monitor_gating or per_token_full_consumer)
+        gating_only_probes = (
+            composer.gated_probe_names()
+            if (needs_monitor_gating and not per_token_full_consumer)
+            else None
+        )
+        # Lean-incremental: the live consumers present read ONLY the axis-0
+        # coord (the SSE trait stream, the loom probe row, the loom node
+        # text/aggregate) — none of the consumers that genuinely need a richer
+        # per-token reading is live, and there is no probe gate.  Then
+        # per-token scoring drops the nearest / assignment / per-layer work
+        # (the full aggregate is re-scored once from the tail ring at
+        # finalize), which is the common loom monitoring path.
+        full_reading_consumer = bool(
+            wants_live_token_scores       # full ProbeReading in TokenEvent
+            or persists_layer_scores      # per-layer heatmap row
+            or persists_subspace_coords   # inspector whitened coords
+        )
+        lean_per_token = bool(
+            need_per_token
+            and not want_hidden
+            and not needs_monitor_gating
+            and not full_reading_consumer
+            and has_monitor_probes
+        )
+        return ReadDemand(
+            need_per_token=need_per_token,
+            per_token_full_consumer=per_token_full_consumer,
+            gating_only_probes=gating_only_probes,
+            gating_probe_keys=gating_probe_keys,
+            lens_gating_probe_keys=lens_gating_probe_keys,
+            sae_gating_probe_keys=sae_gating_probe_keys,
+            lean_per_token=lean_per_token,
+            final_probe_aggregate=final_probe_aggregate,
+            live_lens_active=live_lens_active,
+            live_sae_active=live_sae_active,
+            capture_prompt=capture_prompt,
+        )
+
     def _begin_capture(
-        self, *, widen: bool = False, need_per_token: bool = True,
-        gating_only_probes: set[str] | None = None,
-        gating_probe_keys: set[str] | None = None,
-        lens_gating_probe_keys: set[str] | None = None,
-        sae_gating_probe_keys: set[str] | None = None,
-        lean_per_token: bool = False,
-        final_probe_aggregate: bool = True,
-        live_lens_active: bool = True,
-        live_sae_active: bool = True,
-        capture_prompt: bool = False,
+        self, demand: "ReadDemand | None" = None, *, widen: bool = False,
     ) -> bool:
         """Attach hidden-state capture. Returns True if attached.
+
+        ``demand`` is this generation's resolved :class:`ReadDemand` — every
+        predicate it carries was computed once by
+        :meth:`_resolve_read_demand`, and nothing is re-derived here, so the
+        capture cannot disagree with the caller about what the generation
+        needs.  ``None`` means the all-defaults demand: full per-token scoring,
+        a final aggregate, both live readouts on, no gates.
 
         The capture layer set is **plan-driven**: each instrument family
         prepares its source snapshot (``Instrument.prepare(ReadRequest)``),
@@ -5768,95 +5972,45 @@ class SaklasSession:
         planner's decision below — cross-instrument resource sharing the
         plans deliberately do not decide (``protocol.py``).
 
-        ``widen=False`` (default): cover the union of vector-probe
-        layers and manifold-probe layers — what both monitors need.
-        Fast path; matches v1 behavior when only vector probes are
-        attached.
-
-        ``widen=True``: cover every model layer.  Used when the caller
-        asked for ``SamplingConfig.return_hidden=True`` — the monitor still
-        reads its probe subset, but the full dict is available on
-        ``GenerationResult.hidden_states`` after the run.
-
-        ``need_per_token`` (default True): whether anything consumes a
-        per-token reading this gen — a probe gate, a loom token row, a trait
-        stream, or a live-scores client.  When False (probes attached but only
-        the end-of-gen aggregate is wanted, e.g. stateless server scoring) the
-        capture runs in **aggregate-only** mode: a bounded tail ring, NO
-        per-token scoring (T scorings + T host syncs → 1 at finalize via
-        :meth:`_score_aggregate_only`).
-
-        ``gating_only_probes`` (FIX #4): when per-token scoring is needed *only*
-        to feed probe gates (no UI / trait / loom / persist consumer), this is
-        the set of gated probe names.  The incremental step sink then scores
-        just that subset every token (the gate consumes only those scalars),
-        while the big-K roster's per-token nearest-distance work is skipped.
-        If ``final_probe_aggregate`` is true, the end-of-gen aggregate still
-        covers the **full** roster: the tail ring is also kept, so
-        :meth:`_finalize_generation` pools the last content token once and scores
-        every probe (the gated subset live-scored, the rest one-shot).  When the
-        caller explicitly disables final probe readings, capture narrows to the
-        gated probe layers and keeps no full-roster tail. ``None`` (or empty)
-        keeps the full per-token scoring.
+        ``widen`` is the one axis that isn't consumer demand but a retention
+        request, so it stays a parameter.  ``widen=False`` (default) covers
+        the union of the layers the instrument plans declared.  ``widen=True``
+        covers every model layer — the caller asked for
+        ``SamplingConfig.return_hidden=True``, so the monitor still reads its
+        probe subset but the full dict lands on
+        ``GenerationResult.hidden_states``.
         """
+        demand = ReadDemand() if demand is None else demand
         # ---- Per-family capture demand (Instrument.plan) -------------------
         # The planner hands each family what the session knows about this
         # generation's read demand; each family answers with its declared
-        # ``InstrumentPlan``.  The union of declared layers replaces the
-        # former inline per-family union branches.  RETENTION (incremental
+        # ``InstrumentPlan``, and the union of those declared layers is
+        # what capture covers.  RETENTION (incremental
         # vs tail ring vs full stack) stays session logic below — the
         # ``INCREMENTAL -> set_tail_with_sink`` upgrade is cross-instrument
         # resource sharing, which plans deliberately do not decide
         # (``protocol.py`` division of labor).
-        per_token_full_consumer = bool(
-            need_per_token and gating_only_probes is None
+        geometry_plan, lens_plan, sae_plan = self._bind_instrument_runs(
+            ReadRequest(
+                gate_keys=frozenset(demand.gating_probe_keys or ()),
+                per_token_consumers=demand.per_token_full_consumer,
+                final_aggregate=demand.final_probe_aggregate,
+            ),
+            ReadRequest(
+                gate_keys=frozenset(demand.lens_gating_probe_keys or ()),
+                live=demand.live_lens_active,
+                per_token_consumers=demand.per_token_full_consumer,
+                final_aggregate=demand.final_probe_aggregate,
+            ),
+            ReadRequest(
+                gate_keys=frozenset(demand.sae_gating_probe_keys or ()),
+                live=demand.live_sae_active,
+                per_token_consumers=demand.per_token_full_consumer,
+                final_aggregate=demand.final_probe_aggregate,
+            ),
         )
-        # The uniform capture transaction (``protocol.py``): close →
-        # prepare → plan → bind.  The defensive close first (the
-        # generation finallys are the ordinary teardown) — a stale pin
-        # would short-circuit the lens disk refresh inside ``prepare``,
-        # and a stale binding would keep serving frozen specs to idle
-        # reads.  ``prepare`` is the source-boundary step: the lens
-        # family reads the disk-refreshing ``jlens`` getter under pin
-        # demand there and snapshots specs + live config against that
-        # identity; ``plan``/``bind`` consume the prep only, so an
-        # interleaved adoption (the un-locked ``has_compatible_jlens``)
-        # cannot desynchronize them (``LensInstrument.prepare`` carries
-        # the ordering + snapshot rationale).
-        self._close_instrument_runs()
-        geometry_prep = self._geometry_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(gating_probe_keys or ()),
-            per_token_consumers=per_token_full_consumer,
-            final_aggregate=final_probe_aggregate,
-        ))
-        lens_prep = self._lens_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(lens_gating_probe_keys or ()),
-            live=live_lens_active,
-            per_token_consumers=per_token_full_consumer,
-            final_aggregate=final_probe_aggregate,
-        ))
-        sae_prep = self._sae_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(sae_gating_probe_keys or ()),
-            live=live_sae_active,
-            per_token_consumers=per_token_full_consumer,
-            final_aggregate=final_probe_aggregate,
-        ))
-        geometry_plan = self._geometry_instrument.plan(geometry_prep)
-        lens_plan = self._lens_instrument.plan(lens_prep)
-        sae_plan = self._sae_instrument.plan(sae_prep)
         has_lens_gate = bool(lens_plan.gate_keys)
         has_sae_gate = bool(sae_plan.gate_keys)
-
-        # Bind each family's per-generation run (``Instrument.bind``): probe
-        # specs freeze into the immutable ``InstrumentBinding`` (a concurrent
-        # SAE metadata backfill can no longer change what this generation
-        # measures), stashes and step memos start fresh, and the lens run
-        # carries the pin its prep took — every token, gate, and final
-        # aggregate below consumes the same resident lens even if another
-        # process switches the active source/manifest mid-decode.
-        self._geometry_instrument.bind(geometry_plan, geometry_prep)
-        self._lens_instrument.bind(lens_plan, lens_prep)
-        self._sae_instrument.bind(sae_plan, sae_prep)
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
@@ -5868,14 +6022,14 @@ class SaklasSession:
             if not union:
                 # No probes ⇒ the degenerate FULL (capture-disabled) state.
                 self._capture_state = CaptureState(
-                    gating_keys=set(gating_probe_keys or ())
-                    if gating_probe_keys else None,
-                    final_probe_aggregate=final_probe_aggregate,
+                    gating_keys=set(demand.gating_probe_keys or ())
+                    if demand.gating_probe_keys else None,
+                    final_probe_aggregate=demand.final_probe_aggregate,
                 )
                 self._incremental_readings = []
                 return False
             layer_idxs = sorted(union)
-        # Persistent compile-clean capture (slice 2): when this gen is eligible
+        # Persistent compile-clean capture: when this gen is eligible
         # for the compiled clean path AND steering lowered to offsets (or is
         # unsteered), capture rides the always-on persistent buffers — the decode
         # loop ``copy_``s each slice in inside the compiled graph, and
@@ -5886,7 +6040,7 @@ class SaklasSession:
         # ``return_hidden``) falls back to transient capture hooks.
         use_persistent = bool(
             not widen
-            and not capture_prompt
+            and not demand.capture_prompt
             # Persistent capture buffers are installed for every layer before
             # compile; layer_idxs selects the subset this generation consumes.
             # Live lens layers can therefore ride the same compile-clean path
@@ -5908,8 +6062,11 @@ class SaklasSession:
         # from the compiled-clean routing decision and carried through unchanged.
         self._capture_state = CaptureState(
             persistent=use_persistent,
-            gating_keys=set(gating_probe_keys or ()) if gating_probe_keys else None,
-            final_probe_aggregate=final_probe_aggregate,
+            gating_keys=(
+                set(demand.gating_probe_keys or ())
+                if demand.gating_probe_keys else None
+            ),
+            final_probe_aggregate=demand.final_probe_aggregate,
         )
         self._incremental_readings = []
         self._incremental_gate_scores = []
@@ -5921,14 +6078,17 @@ class SaklasSession:
         # the gated subset's per-token rows are NOT the source of the final
         # readings, the one-shot full aggregate is, so no probe drops.
         gating_subset = (
-            gating_only_probes
-            if (gating_only_probes and need_per_token and not widen
+            demand.gating_only_probes
+            if (demand.gating_only_probes and demand.need_per_token and not widen
                 and self._monitor.probe_names)
             else None
         )
-        if not widen and self._monitor.probe_names and need_per_token and gating_subset:
+        if (
+            not widen and self._monitor.probe_names
+            and demand.need_per_token and gating_subset
+        ):
             subset = set(gating_subset)
-            gate_keys = set(gating_probe_keys or ())
+            gate_keys = set(demand.gating_probe_keys or ())
             gate_plan = self._monitor.plan_gate_scalars(
                 gate_keys, probe_names=subset,
             )
@@ -5948,7 +6108,7 @@ class SaklasSession:
                     if latest and gate_plan else {}
                 )
 
-            if final_probe_aggregate:
+            if demand.final_probe_aggregate:
                 # Deep tail ring (full-roster finalize via ``tail_slice_at``) PLUS a
                 # per-token step sink (gated subset, for the gate) — armed together by
                 # ``set_tail_with_sink`` (neither single setter gives both).
@@ -5961,16 +6121,16 @@ class SaklasSession:
             self._capture_state.mode = CaptureMode.GATING_SUBSET
             self._capture_state.gating_subset = subset
             self._capture_state.gating_keys = gate_keys
-            self._capture_state.final_probe_aggregate = final_probe_aggregate
+            self._capture_state.final_probe_aggregate = demand.final_probe_aggregate
             # The subset is scored one token per step in order, so curved gated
             # probes can warm-start their foot; cold-start the feet first.
             self._monitor.reset_curved_feet()
             self._monitor.enable_curved_warm(True)
         elif (
             not widen and self._monitor.probe_names
-            and need_per_token and lean_per_token
+            and demand.need_per_token and demand.lean_per_token
         ):
-            # Lean-incremental (FIX F2): the only per-token consumers read just
+            # Lean-incremental: the only per-token consumers read just
             # the axis-0 coord (the trait stream / loom probe row) — no nearest /
             # assignment / per-layer trace, no probe gate.  Score each token
             # ``coords_only`` (skips the big-K nearest norm + assignment softmax +
@@ -5998,7 +6158,7 @@ class SaklasSession:
             # can warm-start their foot for the per-token coord stream.
             self._monitor.reset_curved_feet()
             self._monitor.enable_curved_warm(True)
-        elif not widen and self._monitor.probe_names and need_per_token:
+        elif not widen and self._monitor.probe_names and demand.need_per_token:
             geometry_run = self._geometry_instrument.current_run
 
             def _score_step(
@@ -6036,7 +6196,7 @@ class SaklasSession:
                     lens_plan.tail_layers | sae_plan.tail_layers
                 )
                 self._capture.set_tail_with_sink(
-                    _AGG_TAIL_DEPTH if final_probe_aggregate else 1,
+                    _AGG_TAIL_DEPTH if demand.final_probe_aggregate else 1,
                     _score_step,
                     tail_layers=readout_tail_layers or None,
                 )
@@ -6069,8 +6229,12 @@ class SaklasSession:
             # readings are disabled, keep a length-1 latest buffer instead of
             # cloning/popping the 8-deep EOS walk-back tail every token.
             self._capture.set_aggregate_tail(
-                _AGG_TAIL_DEPTH if final_probe_aggregate else 1
+                _AGG_TAIL_DEPTH if demand.final_probe_aggregate else 1
             )
+            # The armed retention IS an aggregate tail, so record it: leaving
+            # the FULL default here would make ``CaptureState`` describe a
+            # retention the capture never installed.
+            self._capture_state.mode = CaptureMode.AGGREGATE_ONLY
             self._monitor.enable_curved_warm(False)
         else:
             # FULL retention (the ``CaptureState`` default): return_hidden full
@@ -6134,24 +6298,6 @@ class SaklasSession:
         )
         return _score_template(
             self, tmpl, steering=steering, system_prompt=system_prompt,
-        )
-
-    def score_captured(
-        self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
-        """Score probes from the last hidden-state capture.
-
-        Returns ``(aggregate_readings, per_token_scores)`` — the aggregate is a
-        per-probe :class:`ProbeReading` (coordinate reading), and
-        ``per_token_scores`` is the per-probe axis-0 coordinate stream. Both
-        dicts are empty when the capture was never attached or the generation
-        produced no tokens.
-        """
-        captured = self._capture.stacked()
-        if not captured or not generated_ids:
-            return {}, {}
-        return self._monitor.score_per_token(
-            captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
 
     def _aggregate_forward_index(self, generated_ids: list[int]) -> int | None:
@@ -6294,7 +6440,7 @@ class SaklasSession:
         accumulate: bool = True,
         pooled: dict[int, torch.Tensor] | None = None,
     ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
-        """Lean per-token coord stream + full aggregate from the tail ring (FIX F2).
+        """Lean per-token coord stream + full aggregate from the tail ring.
 
         The lean-incremental capture path scored each token ``coords_only`` (just
         the cross-layer axis-0 coord / fraction, no nearest / assignment /
@@ -6510,7 +6656,7 @@ class SaklasSession:
         removal is the instrument's atomic ``try_detach`` — a bare
         membership check + direct registry delete bypassed the
         lens-state lock and could land inside a ``prepare`` snapshot or
-        an adoption (round-5).
+        an adoption.
         """
         if self._lens_instrument.try_detach(name):
             pass
@@ -7165,7 +7311,7 @@ class SaklasSession:
         )
         return new_id
 
-    # -- Cast roster (phase 3) --
+    # -- Cast roster --
 
     def set_cast_member(
         self,
@@ -7289,7 +7435,7 @@ class SaklasSession:
     def rewind(self) -> None:
         """Walk the active node back one user→assistant pair.
 
-        Non-destructive under v2.3 loom: the rewound pair stays in the
+        Non-destructive: the rewound pair stays in the
         tree as a dead branch, navigable back via the sidebar / loom
         screen.  ``clear_history`` is the destructive verb.
         """
@@ -7303,7 +7449,7 @@ class SaklasSession:
     def clear_history(self) -> None:
         """Reset the tree to a fresh root.
 
-        Destructive — drops every branch.  Matches v2.2 user expectation
+        Destructive — drops every branch.  Matches user expectation
         of ``/clear`` meaning wipe.  Use :meth:`rewind` for the
         non-destructive step-back.
         """
@@ -7373,7 +7519,7 @@ class SaklasSession:
 
         Useful for batch workloads that re-issue the same chat-template
         head (system + leading user-instruction) hundreds of times — the
-        v3 emotional run motivating this method does 800 stateless
+        The motivating workload does 800 stateless
         generations with the same kaomoji instruction prefix tokens.
         Per-call savings scale with prefix_len / total_input_len.
 
@@ -8313,7 +8459,7 @@ class SaklasSession:
     ) -> tuple["str | Steering | None", SamplingConfig | None, bool | None]:
         """Fill unset per-call kwargs from the gen label's cast recipe.
 
-        The cast roster (phase 3) is the *weakest* tier: the member's
+        The cast roster is the *weakest* tier: the member's
         recipe fills only fields the call left unset (``steering=None``
         means "unset" here; pass ``""`` for an explicit unsteered
         override), sampling merges field-wise with the call's
@@ -8423,18 +8569,7 @@ class SaklasSession:
         steering: "str | Steering | None",
         sampling: SamplingConfig | None,
         thinking: bool | None,
-    ) -> tuple[
-        Steering | None,
-        bool,
-        GenerationConfig,
-        int | None,
-        int | None,
-        list[str] | None,
-        dict[int, float] | None,
-        float,
-        float,
-        list[Any] | None,
-    ]:
+    ) -> "PreparedCall":
         """Normalize per-call generation controls before model work."""
         steering_obj = Steering.from_value(
             steering, profile_names=set(self._profiles),
@@ -8469,17 +8604,17 @@ class SaklasSession:
             sampling.frequency_penalty if sampling is not None else 0.0
         )
         logprobs_list: list[Any] | None = [] if raw_lp is not None else None
-        return (
-            steering_obj,
-            use_thinking_req,
-            gen_config,
-            lp_count,
-            seed,
-            stop_list,
-            logit_bias,
-            presence_penalty,
-            frequency_penalty,
-            logprobs_list,
+        return PreparedCall(
+            steering_obj=steering_obj,
+            use_thinking_req=use_thinking_req,
+            gen_config=gen_config,
+            lp_count=lp_count,
+            seed=seed,
+            stop_list=stop_list,
+            logit_bias=logit_bias,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            logprobs_list=logprobs_list,
         )
 
     def _snapshot_steering_alphas(self) -> dict[str, float]:
@@ -8720,7 +8855,7 @@ class SaklasSession:
         # and no-probe paths) AND either unsteered or a static-affine steering that
         # lowered to the persistent offset buffers (``_steering_uses_compiled_offsets``
         # — the push rides the offset, no transient hook).  A probed gen on the
-        # persistent-capture path (slice 2) satisfies both, so it now keeps the
+        # persistent-capture path satisfies both, so it keeps the
         # compiled graph.  Everything else (transient ctx-consulting steering
         # hooks, transient capture hooks for curved/gated/return_hidden) graph-breaks
         # / recompiles, so route it to the eager original (``_orig_mod``) +
@@ -8787,7 +8922,7 @@ class SaklasSession:
             past_key_values=generation_pkv,
             cache_position_offset=cache_position_offset,
             score_callback=gating_callback,
-            # Per-token probe scoring fires post-forward (FIX F1), not inside the
+            # Per-token probe scoring fires post-forward, not inside the
             # capture hook.  On the persistent-capture path the step callback is
             # ``ingest_persistent`` (accumulate from the persistent buffers +
             # fire the step sink); otherwise ``fire_step_sink`` (the transient
@@ -8829,22 +8964,15 @@ class SaklasSession:
     ) -> GenerationResult:
         """Shared generation implementation.
 
-        Holds the gen lock + re-entry guard for the duration of the call,
-        composes a per-call GenerationConfig, opens an internal steering
-        scope (if any), runs ``generate_steered`` with capture attached,
-        and finalizes the result.  ``generate`` and ``generate_stream``
-        are thin wrappers around this.
+        Runs inside :meth:`_generation_transaction` (the lock, the re-entry
+        guard, and the exception-hard teardown), composes a per-call
+        GenerationConfig, opens an internal steering scope (if any), runs
+        ``generate_steered`` with capture attached, and finalizes the result.
+        ``generate`` and ``generate_stream`` are thin wrappers around this.
         """
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentGenerationError("Generation already in progress")
-        if self._gen_phase is not GenState.IDLE:
-            self._gen_lock.release()
-            raise ConcurrentGenerationError("session generation already in flight")
-        self._gen_phase = GenState.PREAMBLE
-        steering_cm = None
-        try:
+        with self._generation_transaction() as txn:
 
-            # Cast roster (phase 3): the gen label's standing recipe is
+            # Cast roster: the gen label's standing recipe is
             # the weakest tier; the regen override below still composes
             # on top of the result.
             steering, sampling, thinking = self._apply_cast_defaults(
@@ -8918,18 +9046,20 @@ class SaklasSession:
                     # not a request to open a fresh thinking channel.
                     thinking = False
 
-            (
-                steering_obj,
-                use_thinking_req,
-                gen_config,
-                lp_count,
-                seed,
-                stop_list,
-                logit_bias,
-                presence_penalty,
-                frequency_penalty,
-                logprobs_list,
-            ) = self._prepare_generation_call(steering, sampling, thinking)
+            # Bound out by name (not unpacked positionally) because the body
+            # below reads all ten deep in the transaction and reassigns
+            # ``stop_list`` after the seat augmentation.
+            prepared = self._prepare_generation_call(steering, sampling, thinking)
+            steering_obj = prepared.steering_obj
+            use_thinking_req = prepared.use_thinking_req
+            gen_config = prepared.gen_config
+            lp_count = prepared.lp_count
+            seed = prepared.seed
+            stop_list = prepared.stop_list
+            logit_bias = prepared.logit_bias
+            presence_penalty = prepared.presence_penalty
+            frequency_penalty = prepared.frequency_penalty
+            logprobs_list = prepared.logprobs_list
             readout_top_k = self._effective_readout_top_k(sampling)
             # Steering synthesis is Mahalanobis-normalized and therefore needs
             # the session whitener.  On a cold ``probes=[]`` session it may not
@@ -9193,7 +9323,7 @@ class SaklasSession:
             # would be a no-op called once per generated token, AND its presence
             # forces generate_steered to compute the unconditional fp32
             # log_softmax + entropy sync per step (gate at generation.py:571).
-            # Skipping it here trims that cost from the v3 stateless prefill
+            # Skipping it here trims that cost from the stateless prefill
             # workload (800 back-to-back gens of ~16 tokens each, no logprobs,
             # no streaming, no SSE).  Stop-sequence behavior is preserved by
             # not wiring _token_tap=None when stop_list is set — the tokenizer-
@@ -9242,7 +9372,7 @@ class SaklasSession:
             # context enters (``steering_cm.__enter__`` runs
             # ``SteeringComposer.install_composed_steering``, which consults this
             # to decide whether a probed gen may still lower steering to the
-            # persistent offset buffers — slice 2). Eligible when the compiled
+            # persistent offset buffers). Eligible when the compiled
             # CUDA/MPS graph + static cache are live, the persistent capture
             # buffers were adopted, and the caller didn't ask for the full per-step
             # hidden stack (``return_hidden`` keeps the transient full-retention
@@ -9257,7 +9387,7 @@ class SaklasSession:
             )
 
             if steering_obj is not None and steering_obj.alphas:
-                steering_cm = self.steering(steering_obj)
+                txn.steering_cm = self.steering(steering_obj)
 
             # Snapshot the chat-history anchor BEFORE _start_loom_assistant
             # mutates the tree.  Otherwise the new (empty) assistant node it
@@ -9293,8 +9423,8 @@ class SaklasSession:
                 continuation_node_id=continuation_node_id,
             )
 
-            if steering_cm is not None:
-                steering_cm.__enter__()
+            if txn.steering_cm is not None:
+                txn.steering_cm.__enter__()
             input_ids, use_thinking, prompt_tokens = self._generation_preamble(
                 input, raw, use_thinking_req, stateless=stateless,
                 parent_node_id=chat_history_anchor,
@@ -9308,74 +9438,6 @@ class SaklasSession:
             vector_snapshot: dict[str, float] = self._snapshot_steering_alphas()
 
             want_hidden = bool(sampling and sampling.return_hidden)
-            # Per-token scoring is only needed when something consumes a
-            # per-token reading: a probe gate, a loom token row, an SSE trait
-            # stream, a live-scores client, or a per-layer-heatmap persist.
-            # Otherwise (probes attached but only the aggregate wanted, e.g. a
-            # stateless server gen) the capture skips per-token scoring entirely
-            # and pools the aggregate once at finalize.
-            composer = self._steering_composer
-            _needs_gating = composer.steering_needs_probe_gating()
-            # The five UI / trait / loom / persist consumers each need a
-            # per-token reading for the FULL roster.  When NONE of them is live
-            # but a probe gate is, gating is the SOLE per-token consumer (FIX
-            # #4): the step sink can score just the gated probes per token and
-            # leave the big-K roster to the one-shot full aggregate at finalize.
-            _per_token_full_consumer = bool(
-                (_live_scores_on and assistant_node_id is not None)
-                or _has_trait_consumer
-                or _wants_live_token_scores
-                or _persists_layer_scores
-                or _persists_probe_row
-                or _persists_subspace_coords
-            )
-            gating_probe_keys: set[str] | None = (
-                composer.gated_probe_keys()
-                if _needs_gating
-                else None
-            )
-            lens_gating_probe_keys: set[str] | None = (
-                composer.gated_lens_probe_keys()
-                if _needs_gating
-                else None
-            )
-            sae_gating_probe_keys: set[str] | None = (
-                composer.gated_sae_probe_keys()
-                if _needs_gating
-                else None
-            )
-            # J-lens token probes gate on the lens path (the gating score
-            # callback computes their scalars from the latest capture slices),
-            # so a lens-only gate doesn't force per-token MONITOR scoring —
-            # ``need_per_token`` keys on monitor-attached gate keys only.
-            _needs_monitor_gating = bool(gating_probe_keys)
-            need_per_token = bool(
-                _needs_monitor_gating or _per_token_full_consumer
-            )
-            gating_only_probes: set[str] | None = (
-                composer.gated_probe_names()
-                if (_needs_monitor_gating and not _per_token_full_consumer)
-                else None
-            )
-            # Lean-incremental (FIX F2): the live consumers present read ONLY the
-            # axis-0 coord (the SSE trait stream, the loom probe row, the loom
-            # node text/aggregate) — none of the consumers that genuinely need a
-            # richer per-token reading is live, and there is no probe gate.  Then
-            # the per-token scoring drops the nearest / assignment / per-layer
-            # work (the full aggregate is re-scored once from the tail ring at
-            # finalize), which is the common loom monitoring path.
-            _full_reading_consumer = bool(
-                _wants_live_token_scores       # full ProbeReading in TokenEvent
-                or _persists_layer_scores      # per-layer heatmap row
-                or _persists_subspace_coords   # inspector whitened coords
-            )
-            lean_per_token = bool(
-                need_per_token
-                and not want_hidden
-                and not _needs_monitor_gating
-                and not _full_reading_consumer
-                and _has_monitor_probes
-            )
             self._live_lens_active_for_generation = _has_lens_consumer
             self._live_sae_active_for_generation = _has_sae_consumer
             authored_targets = self._pending_authored_prompt_targets(
@@ -9429,24 +9491,35 @@ class SaklasSession:
                 if authored_targets and authored_channels_active
                 else None
             )
+            # Fold every consumer of this generation into one read demand.
+            # Per-token scoring is only needed when something consumes a
+            # per-token reading: a probe gate, a loom token row, an SSE trait
+            # stream, a live-scores client, or a per-layer-heatmap persist.
+            # Otherwise (probes attached but only the aggregate wanted, e.g. a
+            # stateless server gen) the capture skips per-token scoring
+            # entirely and pools the aggregate once at finalize.
+            read_demand = self._resolve_read_demand(
+                want_hidden=want_hidden,
+                live_scores_on=_live_scores_on,
+                has_monitor_probes=_has_monitor_probes,
+                loom_attached=assistant_node_id is not None,
+                has_trait_consumer=_has_trait_consumer,
+                wants_live_token_scores=_wants_live_token_scores,
+                persists_layer_scores=_persists_layer_scores,
+                persists_probe_row=_persists_probe_row,
+                persists_subspace_coords=_persists_subspace_coords,
+                live_lens_active=_has_lens_consumer,
+                live_sae_active=_has_sae_consumer,
+                final_probe_aggregate=return_probe_readings,
+                capture_prompt=authored_capture is not None,
+            )
             self.events.emit(GenerationStarted(input=input, stateless=stateless))
             try:
                 # Capture attach + monitor live + ctx.reset live INSIDE the
                 # inner try so a BaseException (KeyboardInterrupt, etc.)
                 # between any pair of these still hits the cleanup finally.
                 # ``_end_capture`` and ``end_live`` are idempotent.
-                self._begin_capture(
-                    widen=want_hidden, need_per_token=need_per_token,
-                    gating_only_probes=gating_only_probes,
-                    gating_probe_keys=gating_probe_keys,
-                    lens_gating_probe_keys=lens_gating_probe_keys,
-                    sae_gating_probe_keys=sae_gating_probe_keys,
-                    lean_per_token=lean_per_token,
-                    final_probe_aggregate=return_probe_readings,
-                    live_lens_active=_has_lens_consumer,
-                    live_sae_active=_has_sae_consumer,
-                    capture_prompt=authored_capture is not None,
-                )
+                self._begin_capture(read_demand, widen=want_hidden)
                 # Reset the steering manager's TriggerContext for this gen;
                 # ``generate_steered`` mutates it at lifecycle boundaries.
                 self._steering.ctx.reset()
@@ -9493,17 +9566,19 @@ class SaklasSession:
             finally:
                 self._gen_state.stop_requested.set()
                 self._end_capture()
-                if steering_cm is not None:
+                if txn.steering_cm is not None:
                     # Internal scope cleanup (see ``_exit_internal_steering``);
                     # ``swallow=False`` so a teardown failure surfaces here.
-                    self._exit_internal_steering(steering_cm, swallow=False)
-                    steering_cm = None
+                    # Clearing the slot hands the transaction an already-popped
+                    # scope, so its own teardown has nothing left to do.
+                    self._exit_internal_steering(txn.steering_cm, swallow=False)
+                    txn.steering_cm = None
                 self._gen_phase = GenState.FINALIZING
 
             applied_steering = (
                 str(steering_obj) if steering_obj is not None else None
             )
-            # Phase 1 logit pass: convert the in-loop logprob accumulator
+            # Convert the in-loop logprob accumulator
             # into per-turn rollups before handing finalize the slot.
             # ``mean_logprob_count == 0`` covers both "no captures because
             # gen was empty" and "no captures because no on_token consumer
@@ -9527,65 +9602,6 @@ class SaklasSession:
             )
             self.events.emit(GenerationFinished(result=result))
             return result
-        except BaseException:
-            # If we bailed before the inner finally ran (e.g. preamble threw),
-            # make sure the steering scope is popped.  Same internal-cleanup
-            # bypass as the inner finally — phase may be PREAMBLE, RUNNING,
-            # or FINALIZING depending on where we threw, and the pop is
-            # always legitimate teardown here.
-            if steering_cm is not None:
-                # ``swallow=True``: we're already re-raising the original
-                # failure below, so a teardown ``Exception`` must not mask
-                # it (see ``_exit_internal_steering``).
-                self._exit_internal_steering(steering_cm, swallow=True)
-            raise
-        finally:
-            try:
-                try:
-                    # Defense-in-depth: even if the inner finally never ran
-                    # (e.g. a BaseException between the outer try entry and
-                    # ``begin_capture``), any hooks that did get attached
-                    # must come off.  Idempotent.
-                    self._end_capture()
-                    # Probe-inspector subspace-coords post-pass is
-                    # per-generation; clear it so it never leaks into a
-                    # later gen that didn't opt in.
-                    self._monitor.set_subspace_coords(False)
-                    # Release the loom-tree reservation in the same scope as
-                    # the gen-lock release.  Even if finalize raised,
-                    # mutators (edit / delete on this subtree) need to be
-                    # free again now that the streaming target is no longer
-                    # live.
-                    self._active_gen_reservation = None
-                    self._last_token_probe_payload = None
-                    self._last_token_probe_readings = None
-                finally:
-                    # Run closure and capture-state resets must survive a
-                    # teardown failure above (a raising hook detach must not
-                    # leave a bound run pinning a stale lens).
-                    self._close_instrument_runs()
-                    # Reset capture state to the default (FULL,
-                    # non-persistent) so the next gen starts clean (finalize
-                    # has already consumed the rows by now).
-                    # Belt-and-suspenders: ``_begin_capture`` resets it at
-                    # gen start too.
-                    self._capture_state = CaptureState()
-                    self._compiled_clean_eligible = False
-                    self._incremental_readings = []
-                    self._incremental_gate_scores = []
-                    # Zero the persistent compile-clean steering offsets so a
-                    # static-affine push can't leak into a later generation
-                    # that takes the eager / unsteered path without
-                    # re-running ``_install_composed_steering`` (unsteered
-                    # gens have no steering scope to reset them).
-                    self._steering_uses_compiled_offsets = False
-                    if self._steering.has_compiled_offsets():
-                        self._steering.zero_compiled_offsets()
-            finally:
-                # Unconditional: an earlier teardown exception must not
-                # leave the session phase-wedged or the gen lock held.
-                self._gen_phase = GenState.IDLE
-                self._gen_lock.release()
 
     def _generate_runset(
         self,
@@ -9970,29 +9986,21 @@ class SaklasSession:
         if has_sae_probes and self._sae_layer is None:
             return None
 
-        (
-            steering_obj,
-            use_thinking_req,
-            gen_config,
-            lp_count,
-            seed,
-            stop_list,
-            logit_bias,
-            presence_penalty,
-            frequency_penalty,
-            logprobs_list,
-        ) = self._prepare_generation_call(steering, sampling, thinking)
+        prepared = self._prepare_generation_call(steering, sampling, thinking)
         if (
-            use_thinking_req
-            or gen_config.max_new_tokens < 1
-            or lp_count is not None
-            or (seed is not None and gen_config.temperature > 0)
-            or stop_list is not None
-            or logit_bias is not None
-            or presence_penalty != 0.0
-            or frequency_penalty != 0.0
-            or logprobs_list is not None
-            or not self._batch_fast_steering_is_always_on(steering_obj)
+            prepared.use_thinking_req
+            or prepared.gen_config.max_new_tokens < 1
+            or prepared.lp_count is not None
+            or (
+                prepared.seed is not None
+                and prepared.gen_config.temperature > 0
+            )
+            or prepared.stop_list is not None
+            or prepared.logit_bias is not None
+            or prepared.presence_penalty != 0.0
+            or prepared.frequency_penalty != 0.0
+            or prepared.logprobs_list is not None
+            or not self._batch_fast_steering_is_always_on(prepared.steering_obj)
         ):
             return None
 
@@ -10003,9 +10011,9 @@ class SaklasSession:
         return self._run_generate_batch_fast(
             prompts,
             model=model,
-            steering_obj=steering_obj,
+            steering_obj=prepared.steering_obj,
             sampling=sampling,
-            gen_config=gen_config,
+            gen_config=prepared.gen_config,
             stateless=stateless,
             raw=raw,
             on_result=on_result,
@@ -10252,23 +10260,20 @@ class SaklasSession:
         raw: bool,
         on_result: Callable[[int, GenerationResult], None] | None,
     ) -> RunSet:
-        """Implementation of the compatible batched ``model.generate`` path."""
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentGenerationError("Generation already in progress")
-        if self._gen_phase is not GenState.IDLE:
-            self._gen_lock.release()
-            raise ConcurrentGenerationError("session generation already in flight")
+        """Implementation of the compatible batched ``model.generate`` path.
 
-        self._gen_phase = GenState.PREAMBLE
-        steering_cm = None
-        failed = False
-        try:
+        Shares :meth:`_generation_transaction` with the ordinary decode path,
+        so the boundary guard and the teardown are the same code; only the
+        body differs (one batched ``model.generate`` instead of the decode
+        loop, and no loom attachment).
+        """
+        with self._generation_transaction() as txn:
             if steering_obj is not None and steering_obj.alphas:
-                steering_cm = self.steering(steering_obj)
-                steering_cm.__enter__()
+                txn.steering_cm = self.steering(steering_obj)
+                txn.steering_cm.__enter__()
             vector_snapshot: dict[str, float] = (
                 self._snapshot_steering_alphas()
-                if self._steering_composer._stack or steering_cm is not None
+                if self._steering_composer._stack or txn.steering_cm is not None
                 else {}
             )
             pad_id = self._batch_pad_token_id()
@@ -10287,29 +10292,20 @@ class SaklasSession:
             )
             has_lens_probes = bool(return_probe_readings and self._lens_probes)
             has_sae_probes = bool(return_probe_readings and self._sae_probes)
-            # Batched generation bypasses ``_begin_capture`` but still owns
-            # one generation transaction, and runs the same uniform
-            # sequence: close → prepare → plan → bind.  The lens prepare
-            # takes the disk refresh + pin and snapshots specs against
-            # that identity BEFORE the plans/bindings consume them (its
-            # pin-demand formula reduces to "probes attached and a final
-            # aggregate wanted" on a batch request); one pinned lens then
-            # serves every row aggregate rather than reopening all shards
-            # per batch item, and the bindings freeze probe specs against
-            # concurrent mutation for the whole batch.
-            self._close_instrument_runs()
+            # Batched generation bypasses ``_begin_capture`` but binds the
+            # instrument runs through the same helper.  One request serves all
+            # three families here: the lens prepare takes the disk refresh +
+            # pin and snapshots specs against that identity before the plans
+            # and bindings consume them (its pin-demand formula reduces to
+            # "probes attached and a final aggregate wanted" on a batch
+            # request), so one pinned lens serves every row aggregate rather
+            # than reopening all shards per batch item.
             batch_request = ReadRequest(
                 final_aggregate=return_probe_readings,
             )
-            geometry_prep = self._geometry_instrument.prepare(batch_request)
-            lens_prep = self._lens_instrument.prepare(batch_request)
-            sae_prep = self._sae_instrument.prepare(batch_request)
-            geometry_plan = self._geometry_instrument.plan(geometry_prep)
-            lens_plan = self._lens_instrument.plan(lens_prep)
-            sae_plan = self._sae_instrument.plan(sae_prep)
-            self._geometry_instrument.bind(geometry_plan, geometry_prep)
-            self._lens_instrument.bind(lens_plan, lens_prep)
-            self._sae_instrument.bind(sae_plan, sae_prep)
+            geometry_plan, lens_plan, sae_plan = self._bind_instrument_runs(
+                batch_request, batch_request, batch_request,
+            )
             capture_probe_aggregates = bool(
                 probe_names or has_lens_probes or has_sae_probes
             )
@@ -10450,37 +10446,6 @@ class SaklasSession:
                     "batch_tok_per_sec": batch_tok_per_sec,
                 },
             )
-        except BaseException:
-            failed = True
-            raise
-        finally:
-            try:
-                try:
-                    if steering_cm is not None:
-                        self._exit_internal_steering(steering_cm, swallow=failed)
-                finally:
-                    try:
-                        self._end_capture()
-                        self._active_gen_reservation = None
-                        self._last_token_probe_payload = None
-                        self._last_token_probe_readings = None
-                    finally:
-                        # Run closure and state resets must survive a
-                        # teardown failure above (a raising hook detach must
-                        # not leave a bound run pinning a stale lens).
-                        self._close_instrument_runs()
-                        self._capture_state = CaptureState()
-                        self._compiled_clean_eligible = False
-                        self._incremental_readings = []
-                        self._incremental_gate_scores = []
-                        self._steering_uses_compiled_offsets = False
-                        if self._steering.has_compiled_offsets():
-                            self._steering.zero_compiled_offsets()
-            finally:
-                # Unconditional: an earlier teardown exception must not
-                # leave the session phase-wedged or the gen lock held.
-                self._gen_phase = GenState.IDLE
-                self._gen_lock.release()
 
     def generate_batch(
         self,
@@ -10792,10 +10757,10 @@ class SaklasSession:
             # so we can compose with new alpha terms via string concat.
             base_str = str(base_steering)
 
-        # v2.3 loom: anchor every sibling under a shared user turn so
+        # Anchor every sibling under a shared user turn so
         # the surfaces render the sweep as siblings under a common
         # parent rather than a flat result list.  Stateless sweeps
-        # skip the tree mutation entirely (matches the v2.2 contract);
+        # skip the tree mutation entirely;
         # stateful sweeps land siblings under ``parent_node_id`` (or
         # the active node when None) and dedup on identical user text.
         anchor_user_id: str | None = None
@@ -10870,9 +10835,32 @@ class SaklasSession:
     # -- Lifecycle --
 
     def close(self) -> None:
+        """Detach everything this session attached to the model.
+
+        ``from_pretrained`` installs two families of *permanent* forward hooks
+        before ``torch.compile`` — the persistent steering offsets and the
+        persistent capture buffers — and ``SaklasSession.__init__`` accepts a
+        pre-loaded model the caller may keep using, so the model does not
+        necessarily die with the session.  Both families come off here
+        alongside the transient steering hooks, releasing their
+        ``2 x n_layers x hidden_size`` of device buffers with them.
+        """
         self._steering.clear_all()
+        self._steering.detach_compiled_offsets()
+        self.detach_persistent_capture()
         self._profiles.clear()
         self._manifolds.clear()
+
+    def detach_persistent_capture(self) -> None:
+        """Remove the persistent capture hooks and drop their buffers.
+
+        The capture-side sibling of
+        :meth:`SteeringManager.detach_compiled_offsets`.  Idempotent.
+        """
+        for handle in self._capture_handles:
+            handle.remove()
+        self._capture_handles = []
+        self._capture_buffers = {}
 
     def __enter__(self) -> "SaklasSession":
         return self
