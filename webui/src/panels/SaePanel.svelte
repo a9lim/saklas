@@ -34,21 +34,19 @@
     activeProbeNames,
     addSaeToRack,
     attachProbe,
-    cancelSaeTrain,
-    checkSaeTrain,
     loadSae,
+    saeLoad,
+    saeTrain,
     probeRack,
     probeEntryForDisplay,
     saeState,
     saeSourceState,
-    saeTrainState,
     saeRawFallbackScale,
     saeReadoutForDisplay,
     seedProbeDisplay,
     sessionState,
     setLiveSae,
     setSaeSortMode,
-    startSaeTrain,
     steerRack,
     tokenHoverState,
     refreshSaeSources,
@@ -78,7 +76,7 @@
     label: row.release,
   })));
   const sourceBusy = $derived(
-    saeSourceState.loading || saeState.loading || saeTrainState.running,
+    saeSourceState.loading || saeLoad.state.running || saeTrain.state.running,
   );
   const selectedPreparedSource = $derived(
     saeSourceState.sources.find((source) => source.source === selectedSource),
@@ -110,26 +108,9 @@
   );
 
   onMount(() => {
-    void refreshSaeSources().then(() => {
-      const active = saeSourceState.sources.find((source) => source.active);
-      if (active) selectedSource = active.source;
-    });
-    void checkSaeTrain();
-  });
-
-  $effect(() => {
-    const active = saeSourceState.sources.find((source) => source.active);
-    const known = saeSourceState.sources.some(
-      (source) => source.source === selectedSource,
-    ) || providerOptions.some((source) => source.value === selectedSource) ||
-      selectedSource === "local";
-    if (
-      !selectedSource ||
-      !known
-    ) {
-      selectedSource = active?.source ?? saeSourceState.sources[0]?.source ??
-        providerOptions[0]?.value ?? "";
-    }
+    void refreshSaeSources();
+    void saeTrain.check();
+    void saeLoad.check();
   });
 
   $effect(() => {
@@ -171,14 +152,14 @@
   });
 
   function requestTrain(): void {
-    if (!localName.trim() || saeTrainState.running) return;
+    if (!localName.trim() || saeTrain.state.running) return;
     if (!trainConfirm) {
       trainConfirm = true;
       return;
     }
     trainConfirm = false;
     const parsedLayer = trainLayer.trim() === "" ? null : Number(trainLayer);
-    void startSaeTrain({
+    void saeTrain.start({
       name: localName.trim(),
       tokens: trainTokens,
       layer: parsedLayer != null && Number.isInteger(parsedLayer)
@@ -202,7 +183,7 @@
   }
 
   function loadSelectedSae(source: string): void {
-    void loadSae(source, selectedLayerNumber);
+    loadSae(source, selectedLayerNumber);
   }
 
   // ---------- STEER: sae-mode rack entries (by feature id) ----------
@@ -385,7 +366,7 @@
     busy={sourceBusy}
     accent="var(--pillar-sae)"
     sourceError={saeSourceState.error}
-    working={saeTrainState.running}
+    working={saeTrain.state.running}
     selectionCurrent={sourceSelectionCurrent}
     onuse={loadSelectedSae}
     providerOptions={providerOptions}
@@ -440,14 +421,14 @@
     {#snippet progress()}
       <div class="train-progress" role="status" aria-live="polite">
         <div class="train-line">
-          <span class="work-status">{saeTrainState.message ?? "training…"}</span>
+          <span class="work-status">{saeTrain.state.message ?? "training…"}</span>
           <span class="train-count">
-            {saeTrainState.tokensDone.toLocaleString()}/{saeTrainState.tokensTotal.toLocaleString()}
+            {saeTrain.state.current.toLocaleString()}/{saeTrain.state.total.toLocaleString()}
           </span>
         </div>
         <Bar
-          value={saeTrainState.tokensDone}
-          max={Math.max(saeTrainState.tokensTotal, 1)}
+          value={saeTrain.state.current}
+          max={Math.max(saeTrain.state.total, 1)}
           width={160}
           height={8}
           color="var(--pillar-sae)"
@@ -455,10 +436,10 @@
         <Button
           size="sm"
           variant="danger"
-          disabled={saeTrainState.cancelling}
-          onclick={() => void cancelSaeTrain()}
+          disabled={saeTrain.state.cancelling}
+          onclick={() => void saeTrain.cancel()}
         >
-          {saeTrainState.cancelling ? "cancelling…" : "cancel"}
+          {saeTrain.state.cancelling ? "cancelling…" : "cancel"}
         </Button>
       </div>
     {/snippet}
@@ -470,14 +451,14 @@
       {/if}
     {/snippet}
     {#snippet messages()}
-      {#if saeState.loading && saeState.loadMessage}
-        <p class="hint" role="status" aria-live="polite">{saeState.loadMessage}</p>
+      {#if saeLoad.state.running && saeLoad.state.message}
+        <p class="hint" role="status" aria-live="polite">{saeLoad.state.message}</p>
       {/if}
-      {#if saeState.loadError}
-        <p class="hint load-error" role="alert">{saeState.loadError}</p>
+      {#if saeLoad.state.error}
+        <p class="hint load-error" role="alert">{saeLoad.state.error}</p>
       {/if}
-      {#if saeTrainState.error}
-        <p class="hint load-error" role="alert">local train: {saeTrainState.error}</p>
+      {#if saeTrain.state.error}
+        <p class="hint load-error" role="alert">local train: {saeTrain.state.error}</p>
       {/if}
       {#if discoverError}
         <p class="hint" role="alert">registry: {discoverError}</p>

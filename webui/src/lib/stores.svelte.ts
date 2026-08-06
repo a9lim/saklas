@@ -27,7 +27,6 @@ import {
 } from "./api";
 import type {
   CorrelationData,
-  InstrumentFamily,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
@@ -45,7 +44,6 @@ import type {
   InstrumentSourceJSON,
   LensReadoutBlockJSON,
   MeasurementsEnvelopeJSON,
-  PreparationStatusJSON,
   SaeFeatureJSON,
   ManifoldSteerEntry,
   PendingAction,
@@ -70,6 +68,7 @@ import {
   parseProbeTarget,
 } from "./tokens";
 import { pushToast } from "./stores/toasts.svelte";
+import { createPreparationSlice } from "./stores/preparations.svelte";
 
 export * from "./stores/drawers.svelte";
 export * from "./stores/inputHistory.svelte";
@@ -234,9 +233,6 @@ export interface SaeState {
    *  workspace sorter. */
   sortMode: SaeSortMode;
   busy: boolean;
-  loading: boolean;
-  loadMessage: string | null;
-  loadError: string | null;
 }
 
 export const saeState: SaeState = $state({
@@ -248,9 +244,6 @@ export const saeState: SaeState = $state({
   layer: null,
   sortMode: "strength",
   busy: false,
-  loading: false,
-  loadMessage: null,
-  loadError: null,
 });
 
 // ================================================= token hover readout ====
@@ -555,167 +548,39 @@ export async function setLiveSae(enabled: boolean): Promise<void> {
   }
 }
 
-/** Generic poll loop over a family's unified ``/instruments/{family}/
- *  preparations`` resource.  The four background jobs (lens fetch/fit, sae
- *  load/train) share one status shape, so each wrapper supplies only its
- *  state adapter (``apply``, every tick) + completion handler (``onSettled``,
- *  once the job leaves ``running``) and this drives the interval. */
-async function pollPreparationJob(
-  family: InstrumentFamily,
-  apply: (st: PreparationStatusJSON) => void,
-  onSettled: (st: PreparationStatusJSON) => void | Promise<void>,
-  intervalMs: number,
-): Promise<void> {
-  for (;;) {
-    const st = await apiInstruments.preparationStatus(family);
-    apply(st);
-    if (st.state !== "running") {
-      await onSettled(st);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-}
-
-function _applySaeLoadStatus(st: PreparationStatusJSON): void {
-  saeState.loading = st.state === "running";
-  saeState.loadMessage = st.message;
-  saeState.loadError = st.error;
-}
-
-async function pollSaeLoad(): Promise<void> {
-  await pollPreparationJob("sae", _applySaeLoadStatus, async (st) => {
+/** The four background preparations, one slice each — see
+ *  ``lib/stores/preparations.svelte.ts`` for the shared contract.  Each
+ *  supplies only its poll cadence, its toast wording, and the refreshes
+ *  its result invalidates. */
+export const saeLoad = createPreparationSlice("sae", "load", {
+  label: "SAE load",
+  intervalMs: 1000,
+  successMessage: "SAE loaded",
+  onSettled: async () => {
     await refreshSession();
     await refreshSaeSources();
     await refreshProbeList();
-    if (!st.error && st.finished_at !== null) {
-      pushToast("SAE loaded", { kind: "info" });
-    }
-  }, 1000);
-}
-
-export async function loadSae(
-  release: string,
-  layer: number | null = null,
-): Promise<void> {
-  if (saeState.loading || !release.trim()) return;
-  try {
-    _applySaeLoadStatus(
-      await apiInstruments.startPreparation("sae", {
-        operation: "load",
-        release: release.trim(),
-        layer,
-      }),
-    );
-    await pollSaeLoad();
-  } catch (e) {
-    saeState.loading = false;
-    saeState.loadError = e instanceof Error ? e.message : String(e);
-    pushToast(`SAE load: ${saeState.loadError}`, { kind: "error" });
-  }
-}
-
-export interface SaeTrainState {
-  running: boolean;
-  tokensDone: number;
-  tokensTotal: number;
-  message: string | null;
-  error: string | null;
-  polling: boolean;
-  cancelling: boolean;
-}
-
-export const saeTrainState: SaeTrainState = $state({
-  running: false,
-  tokensDone: 0,
-  tokensTotal: 0,
-  message: null,
-  error: null,
-  polling: false,
-  cancelling: false,
+  },
 });
 
-function _applySaeTrainStatus(st: PreparationStatusJSON): void {
-  saeTrainState.running = st.state === "running";
-  saeTrainState.tokensDone = st.progress?.current ?? 0;
-  saeTrainState.tokensTotal = st.progress?.total ?? 0;
-  saeTrainState.message = st.message;
-  saeTrainState.error = st.error;
-  if (st.state !== "running") saeTrainState.cancelling = false;
-}
+export const saeTrain = createPreparationSlice("sae", "train", {
+  label: "SAE train",
+  intervalMs: 1500,
+  successMessage: "SAE trained · live",
+  onSettled: async () => {
+    await refreshSession();
+    await refreshSaeSources();
+    await refreshProbeList();
+  },
+});
 
-export async function pollSaeTrain(): Promise<void> {
-  if (saeTrainState.polling) return;
-  saeTrainState.polling = true;
-  try {
-    await pollPreparationJob("sae", _applySaeTrainStatus, async (st) => {
-      await refreshSession();
-      await refreshSaeSources();
-      await refreshProbeList();
-      if (st.finished_at !== null) {
-        if (st.message === "cancelled") {
-          pushToast("SAE train cancelled", { kind: "info" });
-        } else {
-          pushToast(
-            st.error ? `SAE train: ${st.error}` : "SAE trained · live",
-            { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
-          );
-        }
-      }
-    }, 1500);
-  } catch (e) {
-    saeTrainState.error = e instanceof Error ? e.message : String(e);
-  } finally {
-    saeTrainState.polling = false;
-  }
-}
-
-export async function startSaeTrain(body: {
-  name: string;
-  layer?: number | null;
-  tokens?: number;
-  width?: number | null;
-}): Promise<void> {
-  if (saeTrainState.running || saeTrainState.polling) return;
-  try {
-    _applySaeTrainStatus(
-      await apiInstruments.startPreparation("sae", { operation: "train", ...body }),
-    );
-    void pollSaeTrain();
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    saeTrainState.error = message;
-    pushToast(`SAE train: ${message}`, { kind: "error" });
-  }
-}
-
-export async function cancelSaeTrain(): Promise<void> {
-  if (!saeTrainState.running || saeTrainState.cancelling) return;
-  saeTrainState.cancelling = true;
-  try {
-    _applySaeTrainStatus(await apiInstruments.cancelPreparation("sae"));
-  } catch (e) {
-    saeTrainState.cancelling = false;
-    pushToast(
-      `SAE cancel: ${e instanceof Error ? e.message : String(e)}`,
-      { kind: "error" },
-    );
-  }
-}
-
-export async function checkSaeTrain(): Promise<void> {
-  if (saeTrainState.polling) return;
-  try {
-    // The SAE family shares one preparations resource across load + train,
-    // so only reflect it when the running-or-last job is actually a train.
-    const st = await apiInstruments.preparationStatus("sae");
-    if (st.operation === "train") {
-      _applySaeTrainStatus(st);
-      if (st.state === "running") void pollSaeTrain();
-    }
-  } catch {
-    // Source setup remains usable when no background status is available.
-  }
+/** Load a resident SAE — ``local:<name>`` or ``saelens:<release>``, with an
+ *  optional hook layer.  Thin wrapper over the slice: the release is the
+ *  only field that needs trimming + an empty check. */
+export function loadSae(release: string, layer: number | null = null): void {
+  const trimmed = release.trim();
+  if (!trimmed) return;
+  void saeLoad.start({ release: trimmed, layer });
 }
 
 // ================================================== CAA live toggle ====
@@ -788,198 +653,30 @@ export async function setLiveLens(enabled: boolean): Promise<void> {
   }
 }
 
-export interface LensFetchState {
-  running: boolean;
-  message: string | null;
-  error: string | null;
-  polling: boolean;
-}
-
-export const lensFetchState: LensFetchState = $state({
-  running: false,
-  message: null,
-  error: null,
-  polling: false,
+export const lensFetch = createPreparationSlice("lens", "fetch", {
+  label: "J-lens fetch",
+  intervalMs: 1000,
+  successMessage: "J-lens active · live",
+  onSettled: async () => {
+    await refreshSession();
+    await refreshLensSources();
+  },
 });
 
-function _applyLensFetchStatus(st: PreparationStatusJSON): void {
-  lensFetchState.running = st.state === "running";
-  lensFetchState.message = st.message;
-  lensFetchState.error = st.error;
-}
-
-export async function pollLensFetch(): Promise<void> {
-  if (lensFetchState.polling) return;
-  lensFetchState.polling = true;
-  try {
-    await pollPreparationJob("lens", _applyLensFetchStatus, async (st) => {
-      await refreshSession();
-      await refreshLensSources();
-      if (st.finished_at !== null) {
-        pushToast(
-          st.error ? `J-lens fetch: ${st.error}` : "J-lens active · live",
-          { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
-        );
-      }
-    }, 1000);
-  } catch (e) {
-    lensFetchState.error = e instanceof Error ? e.message : String(e);
-  } finally {
-    lensFetchState.polling = false;
-  }
-}
-
-export async function startLensFetch(
-  source: string = "neuronpedia",
-): Promise<void> {
-  if (lensFetchState.running || lensFetchState.polling) return;
-  try {
-    _applyLensFetchStatus(
-      await apiInstruments.startPreparation("lens", { operation: "fetch", source }),
-    );
-    void pollLensFetch();
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    lensFetchState.error = message;
-    pushToast(`J-lens fetch: ${message}`, { kind: "error" });
-  }
-}
-
-export async function checkLensFetch(): Promise<void> {
-  if (lensFetchState.polling) return;
-  try {
-    // The lens family shares one preparations resource across fetch + fit,
-    // so only reflect it when the running-or-last job is actually a fetch.
-    const st = await apiInstruments.preparationStatus("lens");
-    if (st.operation === "fetch") {
-      _applyLensFetchStatus(st);
-      if (st.state === "running") void pollLensFetch();
-    }
-  } catch {
-    // A fetch status is optional setup state; leave the rest of the panel live.
-  }
-}
-
-// ------------------------------------------------- lens fit (button) --
-
-export interface LensFitState {
-  /** Mirrors the server's background-fit status (polled). */
-  running: boolean;
-  promptsDone: number;
-  promptsTotal: number;
-  message: string | null;
-  error: string | null;
-  /** Poll-loop guard — one interval regardless of how many panels ask. */
-  polling: boolean;
-  cancelling: boolean;
-}
-
-export const lensFitState: LensFitState = $state({
-  running: false,
-  promptsDone: 0,
-  promptsTotal: 0,
-  message: null,
-  error: null,
-  polling: false,
-  cancelling: false,
+/** The background Jacobian-lens fit.  On completion the session info is
+ *  refreshed (``jlens_fitted`` flips, and the server's post-fit
+ *  auto-enable lands in ``live_lens_layers`` → the WORKSPACE toggle reads
+ *  on).  A cancel stops the worker after its current estimator pass; any
+ *  prior complete checkpoint stays resumable. */
+export const lensFit = createPreparationSlice("lens", "fit", {
+  label: "J-lens fit",
+  intervalMs: 3000,
+  successMessage: "J-lens fitted · live",
+  onSettled: async () => {
+    await refreshSession();
+    await refreshLensSources();
+  },
 });
-
-const LENS_FIT_POLL_MS = 3000;
-
-function _applyFitStatus(st: PreparationStatusJSON): void {
-  lensFitState.running = st.state === "running";
-  lensFitState.promptsDone = st.progress?.current ?? 0;
-  lensFitState.promptsTotal = st.progress?.total ?? 0;
-  lensFitState.message = st.message;
-  lensFitState.error = st.error;
-  if (st.state !== "running") lensFitState.cancelling = false;
-}
-
-/** Poll the background lens fit until it settles.  On completion the
- *  session info is refreshed (``jlens_fitted`` flips, and the server's
- *  post-fit auto-enable lands in ``live_lens_layers`` → the WORKSPACE
- *  toggle reads on). */
-export async function pollLensFit(): Promise<void> {
-  if (lensFitState.polling) return;
-  lensFitState.polling = true;
-  try {
-    await pollPreparationJob("lens", _applyFitStatus, async (st) => {
-      if (st.finished_at !== null) {
-        if (st.message === "cancelled") {
-          pushToast("J-lens fit cancelled", { kind: "info" });
-        } else if (st.error) {
-          pushToast(`J-lens fit: ${st.error}`, {
-            kind: "error",
-            ttlMs: null,
-          });
-        } else {
-          pushToast("J-lens fitted · live", { kind: "info" });
-        }
-        await refreshSession();
-        await refreshLensSources();
-      }
-    }, LENS_FIT_POLL_MS);
-  } catch (e) {
-    lensFitState.error = e instanceof Error ? e.message : String(e);
-  } finally {
-    lensFitState.polling = false;
-  }
-}
-
-/** Kick off the background Jacobian-lens fit (the "fit j-lens" button) and
- *  start polling. Server defaults: 100 fineweb-edu prompts, all source
- *  layers, resume-if-matching. */
-export async function startLensFit(
-  body: { prompts?: number; layers?: string } = {},
-): Promise<void> {
-  if (lensFitState.running || lensFitState.polling) return;
-  try {
-    const st = await apiInstruments.startPreparation("lens", {
-      operation: "fit",
-      ...body,
-    });
-    _applyFitStatus(st);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`J-lens fit: ${msg}`, { kind: "error" });
-    return;
-  }
-  void pollLensFit();
-}
-
-/** Ask the background worker to stop after its current provider read or
- * estimator pass. Any prior complete checkpoint remains resumable. */
-export async function cancelLensFit(): Promise<void> {
-  if (!lensFitState.running || lensFitState.cancelling) return;
-  lensFitState.cancelling = true;
-  try {
-    const st = await apiInstruments.cancelPreparation("lens");
-    _applyFitStatus(st);
-    pushToast("J-lens cancelling…", { kind: "info" });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`J-lens cancel: ${msg}`, { kind: "error" });
-    lensFitState.cancelling = false;
-  }
-}
-
-/** Resume-visibility check for panel mount: if a fit is already running
- *  server-side (page reload mid-fit), pick up the polling loop. */
-export async function checkLensFit(): Promise<void> {
-  if (lensFitState.polling) return;
-  try {
-    // The lens family shares one preparations resource across fetch + fit,
-    // so only reflect it when the running-or-last job is actually a fit.
-    const st = await apiInstruments.preparationStatus("lens");
-    if (st.operation === "fit") {
-      _applyFitStatus(st);
-      if (st.state === "running") void pollLensFit();
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`J-lens status: ${msg}`, { kind: "error" });
-  }
-}
 
 /** Mirror the server's session.config defaults into the local
  * ``samplingState``.  The local store was previously pre-seeded with its

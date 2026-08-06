@@ -40,11 +40,8 @@
     addJLensToRack,
     activeProbeNames,
     attachProbe,
-    checkLensFetch,
-    cancelLensFit,
-    checkLensFit,
-    lensFitState,
-    lensFetchState,
+    lensFetch,
+    lensFit,
     lensSourceState,
     lensState,
     lensAggregateForDisplay,
@@ -56,8 +53,6 @@
     sessionState,
     setLensWorkspaceSortMode,
     setLiveLens,
-    startLensFetch,
-    startLensFit,
     steerRack,
     tokenHoverState,
     useLensSource,
@@ -76,7 +71,7 @@
   });
   const sourceBusy = $derived(
     lensSourceState.loading || lensSourceState.busy ||
-      lensFetchState.running || lensFitState.running,
+      lensFetch.state.running || lensFit.state.running,
   );
   const LENS_PROVIDER_OPTIONS = [
     { value: "neuronpedia", label: "neuronpedia" },
@@ -90,7 +85,7 @@
       fitLayers.trim().length > 0,
   );
   const fitIsPreparing = $derived(
-    (lensFitState.message ?? "").startsWith("streaming "),
+    (lensFit.state.message ?? "").startsWith("streaming "),
   );
 
   function requestFit(): void {
@@ -99,7 +94,7 @@
       return;
     }
     fitConfirm = false;
-    void startLensFit({
+    void lensFit.start({
       prompts: fitPrompts,
       layers: fitLayers.trim(),
     });
@@ -108,27 +103,9 @@
   // Resume-visibility: a page reload mid-fit should pick the progress
   // polling back up (the fit runs server-side regardless of the client).
   onMount(() => {
-    void checkLensFit();
-    void checkLensFetch();
-    void refreshLensSources().then(() => {
-      const active = lensSourceState.sources.find((source) => source.active);
-      if (active) selectedSource = active.source;
-    });
-  });
-
-  $effect(() => {
-    const active = lensSourceState.sources.find((source) => source.active);
-    const known = lensSourceState.sources.some(
-      (source) => source.source === selectedSource,
-    ) || LENS_PROVIDER_OPTIONS.some((source) => source.value === selectedSource) ||
-      selectedSource === "local";
-    if (
-      !selectedSource ||
-      !known
-    ) {
-      selectedSource = active?.source ?? lensSourceState.sources[0]?.source ??
-        LENS_PROVIDER_OPTIONS[0]?.value ?? "";
-    }
+    void lensFit.check();
+    void lensFetch.check();
+    void refreshLensSources();
   });
 
   $effect(() => {
@@ -361,11 +338,11 @@
     busy={sourceBusy}
     accent="var(--pillar-lens)"
     sourceError={lensSourceState.error}
-    working={lensFetchState.running || lensFitState.running}
+    working={lensFetch.state.running || lensFit.state.running}
     onuse={(source) => void useLensSource(source)}
     providerOptions={LENS_PROVIDER_OPTIONS}
     providerPlaceholder="lens provider"
-    onfetch={(source) => void startLensFetch(source)}
+    onfetch={(source) => void lensFetch.start({ source })}
     localActionLabel={fitConfirm ? "confirm fit" : "fit"}
     localActionDisabled={sourceBusy || !fitReady}
     onlocal={requestFit}
@@ -397,9 +374,9 @@
       </label>
     {/snippet}
     {#snippet progress()}
-      {#if lensFetchState.running}
+      {#if lensFetch.state.running}
         <p class="work-status" role="status" aria-live="polite">
-          {lensFetchState.message ?? "fetching official lens…"}
+          {lensFetch.state.message ?? "fetching official lens…"}
         </p>
       {:else}
         <div
@@ -409,10 +386,10 @@
           aria-label="Lens fit progress"
         >
           <div class="fit-line">
-            <span class="fit-msg">{lensFitState.message ?? "fitting…"}</span>
-            {#if lensFitState.promptsTotal > 0}
+            <span class="fit-msg">{lensFit.state.message ?? "fitting…"}</span>
+            {#if lensFit.state.total > 0}
               <span class="fit-count">
-                {lensFitState.promptsDone}/{lensFitState.promptsTotal}
+                {lensFit.state.current}/{lensFit.state.total}
               </span>
             {/if}
           </div>
@@ -421,19 +398,19 @@
             role="progressbar"
             aria-label="J-lens prompts fitted"
             aria-valuemin="0"
-            aria-valuemax={Math.max(lensFitState.promptsTotal, 1)}
-            aria-valuenow={lensFitState.promptsDone}
+            aria-valuemax={Math.max(lensFit.state.total, 1)}
+            aria-valuenow={lensFit.state.current}
           >
             <Bar
-              value={lensFitState.promptsDone}
-              max={Math.max(lensFitState.promptsTotal, 1)}
+              value={lensFit.state.current}
+              max={Math.max(lensFit.state.total, 1)}
               width={160}
               height={8}
               color="var(--pillar-lens)"
             />
           </div>
           <p class="hint">
-            {#if lensFitState.cancelling}
+            {#if lensFit.state.cancelling}
               stopping background work…
             {:else if fitIsPreparing}
               generation available during corpus setup
@@ -444,27 +421,27 @@
           <Button
             size="sm"
             variant="danger"
-            disabled={lensFitState.cancelling}
-            onclick={() => void cancelLensFit()}
+            disabled={lensFit.state.cancelling}
+            onclick={() => void lensFit.cancel()}
           >
-            {lensFitState.cancelling ? "cancelling…" : "cancel"}
+            {lensFit.state.cancelling ? "cancelling…" : "cancel"}
           </Button>
         </div>
       {/if}
     {/snippet}
     {#snippet warning()}
-      {#if fitConfirm && !lensFitState.running}
+      {#if fitConfirm && !lensFit.state.running}
         <p class="hint fit-warning" role="alert">
           Blocks generation; may take hours. Confirm again.
         </p>
       {/if}
     {/snippet}
     {#snippet messages()}
-      {#if lensFitState.error}
-        <p class="hint fit-error" role="alert">local fit: {lensFitState.error}</p>
+      {#if lensFit.state.error}
+        <p class="hint fit-error" role="alert">local fit: {lensFit.state.error}</p>
       {/if}
-      {#if lensFetchState.error}
-        <p class="hint fit-error" role="alert">official fetch: {lensFetchState.error}</p>
+      {#if lensFetch.state.error}
+        <p class="hint fit-error" role="alert">official fetch: {lensFetch.state.error}</p>
       {/if}
     {/snippet}
   </InstrumentSourceSection>
