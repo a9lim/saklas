@@ -966,10 +966,12 @@ def test_recipe_survives_node_and_cast_round_trips():
     t.set_cast_member("deer", CastMember(recipe=Recipe(steering="0.2 skittish")))
 
     t2 = LoomTree.from_dict(t.to_dict())
-    assert t2.nodes[a].recipe is not None
-    assert t2.nodes[a].recipe.steering == "0.5 calm"
-    assert t2.cast["deer"].recipe is not None
-    assert t2.cast["deer"].recipe.steering == "0.2 skittish"
+    node_recipe = t2.nodes[a].recipe
+    assert node_recipe is not None
+    assert node_recipe.steering == "0.5 calm"
+    cast_recipe = t2.cast["deer"].recipe
+    assert cast_recipe is not None
+    assert cast_recipe.steering == "0.2 skittish"
 
 
 def test_children_order_preserved_through_save(tmp_path: Path):

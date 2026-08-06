@@ -1,6 +1,8 @@
 """Tests for the loom tree-pruning filter grammar (v2.3 phase 5)."""
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from saklas import (
@@ -129,8 +131,8 @@ class _SyntheticNode:
         self,
         readings: dict[str, float],
         *,
-        tokens: list[dict] | None = None,
-        thinking_tokens: list[dict] | None = None,
+        tokens: list[dict[str, Any]] | None = None,
+        thinking_tokens: list[dict[str, Any]] | None = None,
     ) -> None:
         self.id = "n0"
         self.aggregate_readings = readings
@@ -138,7 +140,7 @@ class _SyntheticNode:
         self.thinking_tokens = thinking_tokens
 
 
-def _rows(probe: str, values: list[float]) -> list[dict]:
+def _rows(probe: str, values: list[float]) -> list[dict[str, Any]]:
     """Token rows carrying ``probe`` in the 5.x measurement envelope."""
     return [
         {
