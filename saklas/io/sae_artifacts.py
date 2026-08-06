@@ -19,9 +19,9 @@ from saklas.io.atomic import artifact_lock, fsync_directory, write_json_atomic
 from saklas.io.integrity import NAME_REGEX, hash_file
 from saklas.io.paths import ensure_within, model_dir
 from saklas.io.sae import (
-    SAE_SOURCE_FORMAT_VERSION,
+    SAE_SOURCES,
     load_active_sae_source,
-    sae_active_path,
+    sae_runtime_dir,
     set_active_sae_source,
 )
 
@@ -189,7 +189,14 @@ def save_local_sae(
     l1_coefficient: float,
     dead_feature_threshold: float,
     force: bool = False,
+    activate: bool = True,
 ) -> Path:
+    """Publish a Saklas-trained SAE and (by default) make it the active source.
+
+    ``activate=False`` writes the artifact without selecting it — the same
+    opt-out ``fetch_neuronpedia_lens`` and ``save_sae_metadata`` have, for a
+    caller that trains one SAE while another stays resident.
+    """
     name = normalize_local_sae_name(name)
     required = {"W_enc", "W_dec", "b_enc", "b_dec"}
     if set(tensors) != required:
@@ -255,11 +262,13 @@ def save_local_sae(
             if old != tensor_path:
                 old.unlink(missing_ok=True)
         fsync_directory(root)
-    set_active_sae_source(model_id, "local", name)
+    if activate:
+        set_active_sae_source(model_id, "local", name)
     return manifest_path
 
 
 def remove_local_sae(model_id: str, name: str) -> bool:
+    """Delete a Saklas-trained SAE, unpublishing it if it was selected."""
     name = normalize_local_sae_name(name)
     root = local_sae_dir(model_id, name)
     manifest = root / "manifest.json"
@@ -273,15 +282,12 @@ def remove_local_sae(model_id: str, name: str) -> bool:
                 root.rmdir()
             except OSError:
                 pass
-        active = load_active_sae_source(model_id)
-        if active == {
-            "format_version": 1,
-            "model_id": model_id,
-            "kind": "local",
-            "name": name,
-        }:
-            sae_active_path(model_id).unlink(missing_ok=True)
-        return removed
+    # Unpublish after the artifact is gone, so the selection can never outlive
+    # what it points at.  The registry owns the payload shape.
+    SAE_SOURCES.clear_if_active(
+        sae_runtime_dir(model_id), model_id, "local", name,
+    )
+    return removed
 
 
 def list_local_saes(model_id: str) -> list[dict[str, Any]]:

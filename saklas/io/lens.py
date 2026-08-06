@@ -1270,11 +1270,18 @@ def remove_lens(model_id: str) -> bool:
             except OSError as exc:
                 log.warning("could not remove J-lens tensor %s: %s", path, exc)
         fsync_directory(final_anchor.parent)
-        from saklas.io.lens_sources import lens_active_path, load_active_lens_source
+        # Unpublish the selection when it named the lens just deleted, so it
+        # can never outlive what it points at.  The registry owns the payload
+        # shape.
+        from saklas.io.lens_sources import (
+            LENS_SOURCES, lens_root, load_active_lens_source,
+        )
 
         active = load_active_lens_source(model_id)
         if active is not None and active["kind"] == "local":
-            lens_active_path(model_id).unlink(missing_ok=True)
+            LENS_SOURCES.clear_if_active(
+                lens_root(model_id), model_id, "local", active["name"],
+            )
         return removed
 
 
