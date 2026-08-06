@@ -58,7 +58,11 @@
     useLensSource,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
-  import type { JLensSteerEntry, ProbeRackEntry } from "../lib/types";
+  import type {
+    JLensSteerEntry,
+    ProbeRackEntry,
+    ScalarReadingJSON,
+  } from "../lib/types";
   import type { LensWorkspaceSortMode } from "../lib/stores.svelte";
 
   const fitted = $derived(sessionState.info?.jlens_fitted === true);
@@ -205,15 +209,19 @@
       if (!name.startsWith("jlens/")) continue;
       const entry = probeEntryForDisplay(name);
       if (!entry) continue;
-      const latest = entry.aggregate ?? entry.reading;
+      // A pinned lens probe reads the family's NATIVE one-channel
+      // reading — value + depth summary, no coordinate vector to unwrap.
+      const latest = (entry.aggregate ?? entry.reading) as
+        | ScalarReadingJSON
+        | null;
       const word = name.slice("jlens/".length);
       rows.push({
         key: name,
         sortName: word,
         token: word,
-        strength: latest?.coords?.[0] ?? entry.current ?? 0,
-        com: latest?.depth_com?.[0] ?? null,
-        spread: latest?.depth_spread?.[0] ?? null,
+        strength: latest?.value ?? entry.current ?? 0,
+        com: latest?.depth?.center?.[0] ?? null,
+        spread: latest?.depth?.spread?.[0] ?? null,
         series: entry.sparkline ?? [],
         cells: pinnedCells(entry),
         pinned: true,

@@ -67,28 +67,12 @@ export interface SessionInfo {
    *  (a server-side path check, not a load).  Gates the token
    *  drilldown's j-lens tab. */
   jlens_fitted: boolean;
-  /** Live workspace-readout state (``POST .../instruments/lens/live``): the
-   *  resolved layer list while the live lens is enabled, ``null`` while off.
-   *  Rehydrates the WORKSPACE panel toggle across page reloads. */
-  live_lens_layers: number[] | null;
-  /** Resident SAE runtime capability and identity. */
-  sae_loaded: boolean;
-  sae_info: {
-    release: string;
-    revision?: string | null;
-    fingerprint?: string | null;
-    layer: number;
-    width: number;
-    sae_id?: string | null;
-    repo_id?: string | null;
-    neuronpedia_id?: string | null;
-  } | null;
-  /** True while per-token SAE discovery readout is enabled. */
-  live_sae: boolean;
-  /** CAA live toggle state (``POST .../instruments/geometry/live``): whether
-   *  per-token monitor scoring feeds live consumers.  Off ⇒ probes report only
-   *  the end-of-gen aggregate (gates still force what they need). */
-  live_probe_scores: boolean;
+  /** The read plane, as one list of per-family blocks — exactly what
+   *  ``GET .../instruments`` returns.  ONE representation: the pre-5.x flat
+   *  keys (``live_lens_layers`` / ``live_sae`` / ``live_probe_scores`` /
+   *  ``sae_loaded`` / ``sae_info``) re-flattened this same state in three
+   *  divergent shapes and are gone. */
+  instruments: InstrumentFamilyBlock[];
   /** True iff the loaded model family supports assistant-role
    *  substitution (Qwen / Gemma / Llama / GLM / gpt-oss yes; Mistral /
    *  talkie no). Drives whether the roles control is enabled. */
@@ -172,11 +156,11 @@ export interface LensTokenReadoutJSON {
 
 /** The instrument-preparation operation a POST launches / a GET/DELETE
  *  reports. */
-export type PreparationOp = "fetch" | "fit" | "load" | "train";
+export type PreparationOp = "fetch" | "fit" | "train";
 
 /** Unified status of a background instrument preparation
  *  (``POST/GET/DELETE .../instruments/{family}/preparations``).  One shape
- *  over lens ``fetch``/``fit`` and sae ``load``/``train`` — ``state`` is the
+ *  over lens ``fetch``/``fit`` and sae ``fetch``/``train`` — ``state`` is the
  *  discriminator, ``progress.unit`` carries ``"prompts"`` vs ``"tokens"`` for
  *  the label, and the op-specific extras (``live_layers`` / ``release`` /
  *  ``name`` / ``info``) ride alongside.  ``state === "done"`` (finished, no
@@ -194,12 +178,56 @@ export interface PreparationStatusJSON {
   live_layers?: number[] | null;
   /** fetch: the artifact source being fetched. */
   source?: string | null;
-  /** load: the resident release. */
+  /** sae fetch: the resident release. */
   release?: string | null;
   /** train: the local SAE name. */
   name?: string | null;
-  /** load/train: resident SAE identity once the preparation lands. */
-  info?: SessionInfo["sae_info"];
+  /** sae fetch/train: resident SAE identity once the preparation lands. */
+  info?: SaeRuntimeInfo | null;
+}
+
+/** Resident SAE identity, as the preparation status reports it once a
+ *  fetch/train lands. */
+export interface SaeRuntimeInfo {
+  release: string;
+  revision?: string | null;
+  fingerprint?: string | null;
+  layer: number;
+  width: number;
+  sae_id?: string | null;
+  repo_id?: string | null;
+  neuronpedia_id?: string | null;
+}
+
+export type InstrumentFamily = "geometry" | "lens" | "sae";
+
+/** Live-readout state, discriminated by family: geometry is an
+ *  all-or-nothing switch, the lens resolves a layer list, the SAE reports
+ *  its resident layer + source. */
+export type InstrumentLiveState =
+  | { enabled: boolean }
+  | { enabled: boolean; layers: number[] | null }
+  | { enabled: boolean; layer: number | null; source: string | null };
+
+/** What a family supports, declared by the server rather than guessed. */
+export interface InstrumentCapabilities {
+  sources: boolean;
+  preparations: PreparationOp[];
+  token_readout: boolean;
+  source_switch: boolean;
+}
+
+/** One read family's state.  The SAME block is listed by
+ *  ``GET .../instruments`` and embedded in ``session_info.instruments`` —
+ *  there is one representation of instrument state on the wire. */
+export interface InstrumentFamilyBlock {
+  family: InstrumentFamily;
+  live: InstrumentLiveState;
+  /** Active source label in the public source syntax, ``null`` for a family
+   *  with no source lifecycle (geometry) or none active. */
+  source: string | null;
+  probes: string[];
+  capabilities: InstrumentCapabilities;
 }
 
 /** One usable artifact source. The ``source`` string is deliberately the
@@ -285,11 +313,47 @@ export interface LensReadoutBlockJSON {
   aggregate: LensAggregateTokenJSON[];
 }
 
+/** Per-axis depth centre of mass + spread, tagged with the mass ``basis``.
+ *  ``depth_com`` means three mathematically unrelated things across the
+ *  families, so the basis travels with it — never compare centres across
+ *  bases. */
+export interface DepthSummaryJSON {
+  center: number[];
+  spread: number[];
+  basis: "share_weighted_coord_mass" | "readout_probability_mass" | "single_layer";
+}
+
+/** The single-axis families' NATIVE reading: one value with an explicit
+ *  unit, its per-layer trace, and a depth summary.  It carries no
+ *  fraction / nearest / residual / assignment / membership — a readout
+ *  channel has no subspace behind it, and the server used to ship those as
+ *  constants on every token. */
+export interface ScalarReadingJSON {
+  value: number;
+  /** ``mean_token_probability`` (lens), ``activation_over_max`` or
+   *  ``raw_activation`` (SAE) — the client no longer has to infer it. */
+  unit: "mean_token_probability" | "activation_over_max" | "raw_activation";
+  /** Layer index (as a string key) → the per-layer channel value. */
+  per_layer: Record<string, number>;
+  depth: DepthSummaryJSON | null;
+  meta?: Record<string, unknown>;
+}
+
+/** Either family's reading shape, as it arrives inside the envelope. */
+export type AnyReadingJSON = ProbeReadingJSON | ScalarReadingJSON;
+
+/** True for the single-axis families' native reading. */
+export function isScalarReading(
+  reading: AnyReadingJSON,
+): reading is ScalarReadingJSON {
+  return "value" in reading;
+}
+
 /** J-lens family — attached ``jlens/<word>`` probe ``readings`` plus the
  *  native ``readout`` discovery surface, with a ``binding``. */
 export interface LensInstrumentJSON {
   binding: MeasurementBindingJSON;
-  readings?: Record<string, ProbeReadingJSON>;
+  readings?: Record<string, ScalarReadingJSON>;
   readout?: LensReadoutBlockJSON;
 }
 
@@ -302,7 +366,7 @@ export interface SaeReadoutBlockJSON {
  *  ``readout`` discovery surface, with a ``binding``. */
 export interface SaeInstrumentJSON {
   binding: MeasurementBindingJSON;
-  readings?: Record<string, ProbeReadingJSON>;
+  readings?: Record<string, ScalarReadingJSON>;
   readout?: SaeReadoutBlockJSON;
 }
 
@@ -740,13 +804,12 @@ export interface ExtractRequest {
 
 // ----------------------------------------------------- probes --
 
-/** One attached probe — any rank.  The unified read-side row the server's
- *  ``probe_routes._probe_info`` emits (the pre-4.0 split of vector probes vs
- *  manifold probes collapsed onto one ``/probes`` collection).  ``is_affine``
- *  is the flat-vs-curved discriminator the client classifies on: flat probes
- *  (a 2-node concept axis through the rank-8 personas fan) are the *subspace*
+/** One attached GEOMETRY probe — any rank.  ``is_affine`` is the
+ *  flat-vs-curved discriminator the client classifies on: flat probes (a
+ *  2-node concept axis through the rank-8 personas fan) are the *subspace*
  *  family, curved fits the *manifold* family. */
-export interface ProbeInfo {
+export interface GeometryProbeInfo {
+  family: "geometry";
   /** Registered probe name (defaults to the selector at attach time). */
   name: string;
   /** Underlying manifold display name (``ns/name`` or bare). */
@@ -770,24 +833,45 @@ export interface ProbeInfo {
    *  Backs the mini-map node dots + per-token trajectory lookup.  ``null``
    *  on an unfitted discover manifold (no per-model layout yet). */
   node_coords?: number[][] | null;
-  /** True for a pinned J-lens token probe (the READOUT channel — the one
-   *  coordinate axis is ``strength`` in [0,1], the mean fitted-layer probability;
-   *  per-layer traces are ``(p_l,)`` over all fitted layers; no subspace
-   *  geometry behind it). */
-  lens?: boolean;
-  /** The lens probe's word (``jlens/<word>``). */
-  word?: string;
-  /** The lens probe's resolved single-token vocabulary id. */
-  token_id?: number | null;
-  /** True for a pinned resident SAE feature probe. */
-  sae?: boolean;
-  feature_id?: number | null;
-  label?: string | null;
-  /** SAE probes only — the strength unit.  Coords (and so sparklines /
-   *  gate scalars) are ``activation / max_act`` when set, raw activation
-   *  when null (no Neuronpedia metadata). */
-  max_act?: number | null;
 }
+
+/** One pinned J-lens token probe (the READOUT channel).  There is no
+ *  subspace behind it, so the row carries no manifold/domain/node geometry
+ *  — the server used to invent ``manifold: "jlens"``, ``domain: {}`` and a
+ *  ``node_labels: [word]`` stand-in to fake the geometry row shape. */
+export interface LensProbeInfo {
+  family: "lens";
+  name: string;
+  /** Fitted lens layers the channel reads. */
+  layers: number[];
+  /** One axis: ``strength`` in [0,1], the mean fitted-layer probability. */
+  intrinsic_dim: number;
+  feature_space: "readout";
+  /** The probe's word (``jlens/<word>``). */
+  word: string;
+  /** Its resolved single-token vocabulary id. */
+  token_id: number | null;
+}
+
+/** One pinned resident SAE feature probe (the encoder readout channel). */
+export interface SaeProbeInfo {
+  family: "sae";
+  name: string;
+  /** The one resident hook layer. */
+  layers: number[];
+  intrinsic_dim: number;
+  feature_space: "sae-readout";
+  feature_id: number;
+  label: string | null;
+  /** The strength unit: readings are ``activation / max_act`` when set, raw
+   *  activation when null (no Neuronpedia metadata). */
+  max_act: number | null;
+}
+
+/** One attached probe row, discriminated by ``family`` — the unified
+ *  read-side collection under ``/probes`` (the pre-4.0 split of vector vs
+ *  manifold probes collapsed onto one route). */
+export type ProbeInfo = GeometryProbeInfo | LensProbeInfo | SaeProbeInfo;
 
 export interface ProbeListResponse {
   probes: ProbeInfo[];
@@ -1559,10 +1643,10 @@ export interface ProbeRackEntry {
   perLayer: Record<string, number>;
   /** Latest full per-token reading (coords / fraction / nearest / residual +
    *  per-layer traces).  Null until the first ``token`` event lands. */
-  reading: ProbeReadingJSON | null;
+  reading: AnyReadingJSON | null;
   /** End-of-gen aggregate the ``done`` event lands — the settled reading.
    *  Null between gens; set on ``done``, cleared on the next ``started``. */
-  aggregate: ProbeReadingJSON | null;
+  aggregate: AnyReadingJSON | null;
   /** Scalar aggregate restored from the selected saved Loom node.  The tree
    * keeps this portable summary but not the full per-layer reading; cards use
    * it instead of presenting a false zero after reload/navigation. */

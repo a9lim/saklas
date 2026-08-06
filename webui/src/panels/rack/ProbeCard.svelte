@@ -20,7 +20,11 @@
   // regardless of geometry, so curved probes are valid highlight targets
   // (the top-bar dropdown already lists them; this wires the click too).
 
-  import type { ProbeRackEntry } from "../../lib/types";
+  import type {
+    GeometryProbeInfo,
+    ProbeReadingJSON,
+    ProbeRackEntry,
+  } from "../../lib/types";
   import Bar from "../../lib/charts/Bar.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import { nodeCoordExtent, parseProbeTarget } from "../../lib/tokens";
@@ -45,7 +49,10 @@
 
   let { name, entry }: Props = $props();
 
-  const info = $derived(entry.info);
+  // The rack renders GEOMETRY probes only — the lens and SAE families
+  // have their own cards in their own tabs (``ProbeRack`` filters them
+  // out), so this row reads the whitened reading shape directly.
+  const info = $derived(entry.info as GeometryProbeInfo);
   /** Flat (affine) ⇒ subspace family; curved ⇒ manifold family. */
   const affine = $derived(info.is_affine);
 
@@ -58,7 +65,9 @@
   const axisScale = $derived(affine ? nodeCoordExtent(info.node_coords, 0) : 1);
 
   // ---------- latest reading: live during gen, settled (aggregate) after ----------
-  const latest = $derived(entry.aggregate ?? entry.reading);
+  const latest = $derived(
+    (entry.aggregate ?? entry.reading) as ProbeReadingJSON | null,
+  );
   /** Subspaceness — share of the centered activation living in this probe's
    *  subspace, [0,1].  Backs the white top-row bar. */
   const fraction = $derived(
@@ -111,7 +120,9 @@
   const nearestDistance = $derived(topNearest?.[1] ?? null);
 
   // ---------- curved settled meta (end-of-gen aggregate) ----------
-  const aggregate = $derived(entry.aggregate ?? null);
+  const aggregate = $derived(
+    (entry.aggregate ?? null) as ProbeReadingJSON | null,
+  );
   const residual = $derived(aggregate?.residual ?? null);
   const trajectory = $derived(entry.trajectory ?? []);
 
@@ -338,7 +349,7 @@
     {#if showMiniMap}
       <div class="map-wrap">
         <ManifoldMiniMap
-          info={entry.info}
+          {info}
           trajectory={trajectory}
           settled={aggregate?.coords ?? null}
         />

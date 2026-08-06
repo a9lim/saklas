@@ -356,7 +356,7 @@
   function axisOptionsFor(name: string): { value: string; label: string }[] {
     const info = probeRack.entries.get(name)?.info;
     const dim = info?.intrinsic_dim ?? 0;
-    const flat = info?.is_affine ?? true;
+    const flat = info?.family === "geometry" ? info.is_affine : true;
     // Labels strip the namespace prefix (``default/emotions`` → ``emotions``)
     // to match the probe cards; the option value keeps the full registered
     // name so lookups stay unambiguous.

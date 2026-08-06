@@ -18,10 +18,10 @@
   // ``coords`` readout instead (callers gate on this via
   // ``_isMiniMapCandidate`` in stores).
 
-  import type { AxisSpec, ProbeInfo } from "../../lib/types";
+  import type { AxisSpec, GeometryProbeInfo } from "../../lib/types";
 
   interface Props {
-    info: ProbeInfo;
+    info: GeometryProbeInfo;
     /** Per-token inferred coords, in domain-authoring space.  Empty
      *  until the first token of the first generation lands. */
     trajectory: number[][];

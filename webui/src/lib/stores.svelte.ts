@@ -36,15 +36,20 @@ import type {
   WSServerMessage,
 } from "./api";
 import type {
+  AnyReadingJSON,
   AtomMode,
   AtomSteerEntry,
   CastMemberJSON,
   ChatTurn,
   GenStatus,
+  GeometryProbeInfo,
+  InstrumentFamily,
+  InstrumentFamilyBlock,
   InstrumentSourceJSON,
   LensReadoutBlockJSON,
   MeasurementsEnvelopeJSON,
   SaeFeatureJSON,
+  SaeProbeInfo,
   ManifoldSteerEntry,
   PendingAction,
   ProbeInfo,
@@ -59,6 +64,7 @@ import type {
   ChatRole,
   WSSampling,
 } from "./types";
+import { isScalarReading } from "./types";
 import { serializeExpression } from "./expression";
 import { resolveReadoutTopK } from "./readouts";
 import {
@@ -96,6 +102,21 @@ export const sessionState: SessionState = $state({
   error: null,
 });
 
+/** One read family's block from session info — the SAME shape
+ *  ``GET .../instruments`` lists, so there is one representation of
+ *  instrument state to read from. */
+export function instrumentFamily(
+  family: InstrumentFamily,
+): InstrumentFamilyBlock | undefined {
+  return sessionState.info?.instruments?.find((row) => row.family === family);
+}
+
+/** True iff an SAE is resident (its family block reports an active
+ *  source).  Replaces the flat ``sae_loaded`` key. */
+export function saeLoaded(): boolean {
+  return instrumentFamily("sae")?.source != null;
+}
+
 export async function refreshSession(): Promise<void> {
   try {
     const info = await apiSessions.get();
@@ -103,14 +124,20 @@ export async function refreshSession(): Promise<void> {
     sessionState.lastRefresh = Date.now();
     sessionState.error = null;
     _hydrateSamplingFromInfo();
-    // Rehydrate the PROBE-section toggles from server state (both are
-    // session-side, so a page reload must reflect the server exactly.
-    lensState.layers = info.live_lens_layers;
-    saeState.live = info.live_sae;
+    // Rehydrate the PROBE-section toggles from ONE server representation —
+    // the same per-family blocks ``GET .../instruments`` lists.  A page
+    // reload must reflect the server exactly.
+    const lens = instrumentFamily("lens");
+    const sae = instrumentFamily("sae");
+    const geometry = instrumentFamily("geometry");
+    lensState.layers = lens?.live.enabled
+      ? ("layers" in lens.live ? lens.live.layers : null)
+      : null;
+    saeState.live = sae?.live.enabled === true;
     // Feature ids (and their metadata) belong to the resident release —
     // reset the discovery/metadata state when it changes.
-    const release = info.sae_info?.release ?? null;
-    const layer = info.sae_info?.layer ?? null;
+    const release = sae?.source ?? null;
+    const layer = sae && "layer" in sae.live ? sae.live.layer : null;
     if (release !== saeState.release || layer !== saeState.layer) {
       saeState.release = release;
       saeState.layer = layer;
@@ -119,7 +146,7 @@ export async function refreshSession(): Promise<void> {
       saeState.meta.clear();
       _saeMetaRequested.clear();
     }
-    probesLiveState.enabled = info.live_probe_scores;
+    probesLiveState.enabled = geometry?.live.enabled !== false;
   } catch (e) {
     sessionState.error = e instanceof Error ? e.message : String(e);
   }
@@ -130,8 +157,8 @@ export async function refreshSession(): Promise<void> {
 export interface LensState {
   /** Resolved fitted-layer list while the live J-lens readout is
    * enabled; ``null`` while off.  Mirrors the server's
-   * ``live_lens_layers`` — the panel toggle reads this, not a local
-   * boolean, so reloads and multi-tab stay honest. */
+   * lens family block's ``live.layers`` — the panel toggle reads this, not
+   * a local boolean, so reloads and multi-tab stay honest. */
   layers: number[] | null;
   /** Latest decode step's readout: layer-index string → descending
    * ``[token, p]`` top-k (per-layer softmax probability — the one
@@ -255,7 +282,7 @@ export interface TokenHoverState {
   active: boolean;
   key: string | null;
   tokenText: string;
-  probeReadings: Record<string, ProbeReadingJSON> | null;
+  probeReadings: Record<string, AnyReadingJSON> | null;
   probes: Record<string, number> | null;
   coordsByProbe: Record<string, number[]> | null;
   perLayerScores: Record<string, Record<string, number>> | null;
@@ -322,7 +349,7 @@ function _lensReadoutSnapshot(
  *  every probe strip. */
 function _mergedReadings(
   m: MeasurementsEnvelopeJSON | undefined | null,
-): Record<string, ProbeReadingJSON> | undefined {
+): Record<string, AnyReadingJSON> | undefined {
   if (!m) return undefined;
   const g = m.instruments.geometry?.readings;
   const l = m.instruments.lens?.readings;
@@ -401,8 +428,7 @@ export function beginTokenHover(
   if (!nodeId || rawIndex === null) return;
   const needsLens = capturedLens === undefined &&
     sessionState.info?.jlens_fitted === true;
-  const needsSae = capturedSae === undefined &&
-    sessionState.info?.sae_loaded === true;
+  const needsSae = capturedSae === undefined && saeLoaded();
   tokenHoverState.lensLoading = needsLens;
   tokenHoverState.saeLoading = needsSae;
   if (!needsLens && !needsSae) return;
@@ -503,7 +529,7 @@ const _saeMetaRequested = new Set<number>();
  *  surfaced that has none yet.  Fire-and-forget from the ``done``
  *  handler — never per token. */
 export async function backfillSaeMeta(): Promise<void> {
-  if (!sessionState.info?.sae_loaded) return;
+  if (!saeLoaded()) return;
   const wanted: number[] = [];
   for (const id of saeState.history.keys()) {
     if (saeState.meta.get(id)?.max_act != null) continue;
@@ -552,8 +578,11 @@ export async function setLiveSae(enabled: boolean): Promise<void> {
  *  ``lib/stores/preparations.svelte.ts`` for the shared contract.  Each
  *  supplies only its poll cadence, its toast wording, and the refreshes
  *  its result invalidates. */
-export const saeLoad = createPreparationSlice("sae", "load", {
-  label: "SAE load",
+// The SAE source-binding preparation.  The HTTP operation is ``fetch``,
+// matching the CLI verb and the lens family (it used to be spelled
+// ``load`` over HTTP alone).
+export const saeLoad = createPreparationSlice("sae", "fetch", {
+  label: "SAE fetch",
   intervalMs: 1000,
   successMessage: "SAE loaded",
   onSettled: async () => {
@@ -636,7 +665,7 @@ export async function setLiveLens(enabled: boolean): Promise<void> {
   lensState.busy = true;
   try {
     const out = await apiInstruments.setLive("lens", { enabled });
-    lensState.layers = out.enabled ? (out.layers ?? []) : null;
+    lensState.layers = out.enabled && "layers" in out ? (out.layers ?? []) : null;
     if (!out.enabled) {
       lensState.readout = null;
       lensState.aggregate = null;
@@ -665,7 +694,7 @@ export const lensFetch = createPreparationSlice("lens", "fetch", {
 
 /** The background Jacobian-lens fit.  On completion the session info is
  *  refreshed (``jlens_fitted`` flips, and the server's post-fit
- *  auto-enable lands in ``live_lens_layers`` → the WORKSPACE toggle reads
+ *  auto-enable lands in the lens block's ``live.layers`` → the toggle reads
  *  on).  A cancel stops the worker after its current estimator pass; any
  *  prior complete checkpoint stays resumable. */
 export const lensFit = createPreparationSlice("lens", "fit", {
@@ -1284,11 +1313,13 @@ export const probeRack: ProbeRackState = $state({
  *  coordinate for a flat (subspace) probe, the [0,1] readout strength
  *  (axis 0 — mean fitted-layer probability) for a J-lens token probe, the [0,1]
  *  subspace fraction for a curved (manifold) probe. */
-function _primaryScalar(info: ProbeInfo, reading: ProbeReadingJSON): number {
-  if (info.is_affine || info.lens || info.sae) {
-    return reading.coords.length > 0 ? reading.coords[0] : 0;
-  }
-  return reading.fraction;
+function _primaryScalar(info: ProbeInfo, reading: AnyReadingJSON): number {
+  // The single-axis families ship their native one-channel reading, so the
+  // shape answers this — no family sniffing, no eight constant geometry
+  // fields to look past.
+  if (isScalarReading(reading)) return reading.value;
+  if (info.family === "geometry" && !info.is_affine) return reading.fraction;
+  return reading.coords.length > 0 ? reading.coords[0] : 0;
 }
 
 /** Per-layer column for the expanded layer strip: axis-0 ``coords_per_layer``
@@ -1297,9 +1328,12 @@ function _primaryScalar(info: ProbeInfo, reading: ProbeReadingJSON): number {
  *  one. */
 function _primaryPerLayer(
   info: ProbeInfo,
-  reading: ProbeReadingJSON,
+  reading: AnyReadingJSON,
 ): Record<string, number> {
-  if (!info.is_affine && !info.lens && !info.sae) return reading.fraction_per_layer ?? {};
+  if (isScalarReading(reading)) return reading.per_layer ?? {};
+  if (info.family === "geometry" && !info.is_affine) {
+    return reading.fraction_per_layer ?? {};
+  }
   const out: Record<string, number> = {};
   for (const [layer, c] of Object.entries(reading.coords_per_layer ?? {})) {
     out[layer] = Array.isArray(c) && c.length > 0 ? c[0] : 0;
@@ -1314,7 +1348,8 @@ export function probeEntryForDisplay(name: string): ProbeRackEntry | undefined {
   const base = probeRack.entries.get(name);
   if (!base || !tokenHoverState.active) return base;
 
-  let reading: ProbeReadingJSON | null = tokenHoverState.probeReadings?.[name] ?? null;
+  let reading: AnyReadingJSON | null =
+    tokenHoverState.probeReadings?.[name] ?? null;
   if (!reading) {
     let scalar = tokenHoverState.probes?.[name];
     const tokenCoords = tokenHoverState.coordsByProbe?.[name];
@@ -1340,12 +1375,14 @@ export function probeEntryForDisplay(name: string): ProbeRackEntry | undefined {
         }
       }
     }
-    if (scalar === undefined && name.startsWith("sae/")) {
-      const id = Number(name.slice("sae/".length));
-      const feature = tokenHoverState.saeReadout?.find((row) => row.id === id);
+    if (scalar === undefined && base.info.family === "sae") {
+      const feature = tokenHoverState.saeReadout?.find(
+        (row) => row.id === (base.info as SaeProbeInfo).feature_id,
+      );
       if (feature) {
-        scalar = base.info.max_act != null && base.info.max_act > 0
-          ? feature.activation / base.info.max_act
+        const maxAct = (base.info as SaeProbeInfo).max_act;
+        scalar = maxAct != null && maxAct > 0
+          ? feature.activation / maxAct
           : feature.activation;
         const layer = base.info.layers[0];
         if (layer !== undefined) perLayer[String(layer)] = scalar;
@@ -1354,7 +1391,28 @@ export function probeEntryForDisplay(name: string): ProbeRackEntry | undefined {
 
     if (scalar !== undefined || Object.keys(perLayer).length > 0) {
       const value = scalar ?? 0;
-      const usesCoords = base.info.is_affine || base.info.lens || base.info.sae;
+      if (base.info.family !== "geometry") {
+        // The single-axis families synthesize their NATIVE reading, so the
+        // hover overlay and the live stream carry the same shape.
+        return {
+          ...base,
+          current: value,
+          perLayer,
+          reading: {
+            value,
+            unit: base.info.family === "lens"
+              ? "mean_token_probability"
+              : ((base.info as SaeProbeInfo).max_act != null
+                ? "activation_over_max"
+                : "raw_activation"),
+            per_layer: perLayer,
+            depth: null,
+          },
+          aggregate: null,
+          savedAggregate: null,
+        };
+      }
+      const usesCoords = base.info.is_affine;
       const coords = usesCoords
         ? (tokenCoords ?? [value])
         : [];
@@ -1399,22 +1457,31 @@ export function probeEntryForDisplay(name: string): ProbeRackEntry | undefined {
     // describe the hovered token, so the ephemeral view fills both slots.
     aggregate: reading,
     savedAggregate: null,
-    nearest: reading.nearest,
+    nearest: _readingNearest(reading),
     trajectory: [],
   };
 }
 
+/** The nearest-node list — a GEOMETRY channel.  A one-channel reading has
+ *  no nodes to be near, so it reports none rather than a constant empty
+ *  field on the wire. */
+function _readingNearest(reading: AnyReadingJSON): [string, number][] {
+  return isScalarReading(reading) ? [] : reading.nearest;
+}
+
 /** A probe targets a 2-D-authored ``BoxDomain`` — the regime the mini-map
  *  renders.  Higher-dim and sphere/custom probes attach but skip it. */
-function _probeIsMiniMapCandidate(info: ProbeInfo): boolean {
-  if (info.intrinsic_dim !== 2) return false;
+function _probeIsMiniMapCandidate(info: ProbeInfo): info is GeometryProbeInfo {
+  if (info.family !== "geometry" || info.intrinsic_dim !== 2) return false;
   const d = info.domain as { type?: string };
   return d?.type === "box" && !!info.node_coords && info.node_coords.length > 0;
 }
 
 /** Look up ``node_coords`` for a label.  Null when absent or the row carries
  *  no coords (unfitted discover).  Returns a copy so callers can push. */
-function _lookupNodeCoords(info: ProbeInfo, label: string): number[] | null {
+function _lookupNodeCoords(
+  info: GeometryProbeInfo, label: string,
+): number[] | null {
   const coords = info.node_coords;
   if (!coords) return null;
   const idx = info.node_labels.indexOf(label);
@@ -1446,7 +1513,9 @@ function _emptyProbeEntry(info: ProbeInfo): ProbeRackEntry {
  *  reads ``coords[0]`` (domain-frame) for every probe, flat or curved, so the
  *  node extent is the right normalizer in both cases. */
 export function probeAxisScale(name: string, axis = 0): number {
-  return nodeCoordExtent(probeRack.entries.get(name)?.info?.node_coords, axis);
+  const info = probeRack.entries.get(name)?.info;
+  if (!info || info.family !== "geometry") return 1;
+  return nodeCoordExtent(info.node_coords, axis);
 }
 
 /** Shared raw-activation unit for SAE features without Neuronpedia
@@ -1457,11 +1526,10 @@ export function probeAxisScale(name: string, axis = 0): number {
 export function saeRawFallbackScale(): number {
   let max = 0;
   for (const name of probeRack.active) {
-    if (!name.startsWith("sae/")) continue;
     const entry = probeRack.entries.get(name);
-    if (!entry || entry.info.max_act != null) continue;
-    const reading = entry.aggregate ?? entry.reading;
-    max = Math.max(max, reading?.coords?.[0] ?? entry.current ?? 0);
+    if (!entry || entry.info.family !== "sae") continue;
+    if (entry.info.max_act != null) continue;
+    max = Math.max(max, entry.current ?? 0);
   }
   for (const feature of saeReadoutForDisplay()) {
     const meta = saeState.meta.get(feature.id);
@@ -1480,7 +1548,8 @@ export function highlightScale(target: string | null): number {
   if (!target || target === SURPRISE_TARGET) return HIGHLIGHT_SAT;
   if (target.startsWith("jlens/")) return 1;
   if (target.startsWith("sae/")) {
-    return probeRack.entries.get(target)?.info.max_act != null
+    const info = probeRack.entries.get(target)?.info;
+    return info?.family === "sae" && info.max_act != null
       ? 1
       : saeRawFallbackScale();
   }
@@ -1581,8 +1650,8 @@ export function seedProbeDisplay(
     current: number;
     sparkline?: number[];
     perLayer?: Record<string, number>;
-    reading?: ProbeReadingJSON | null;
-    aggregate?: ProbeReadingJSON | null;
+    reading?: AnyReadingJSON | null;
+    aggregate?: AnyReadingJSON | null;
   },
 ): void {
   const prev = probeRack.entries.get(name);
@@ -1637,7 +1706,7 @@ export function resetProbeStreams(): void {
  *  fires reactivity — a bare ``entry.current = v`` would freeze probe strips
  *  at zero through a whole generation. */
 export function updateProbesFromReadings(
-  readings: Record<string, ProbeReadingJSON> | undefined,
+  readings: Record<string, AnyReadingJSON> | undefined,
 ): void {
   if (!readings) return;
   for (const [name, reading] of Object.entries(readings)) {
@@ -1650,8 +1719,9 @@ export function updateProbesFromReadings(
       sparkline.splice(0, sparkline.length - MAX_SPARKLINE);
     }
     let trajectory = prev.trajectory;
-    if (_probeIsMiniMapCandidate(prev.info) && reading.nearest.length > 0) {
-      const xy = _lookupNodeCoords(prev.info, reading.nearest[0][0]);
+    const nearest = _readingNearest(reading);
+    if (_probeIsMiniMapCandidate(prev.info) && nearest.length > 0) {
+      const xy = _lookupNodeCoords(prev.info, nearest[0][0]);
       if (xy) {
         trajectory = prev.trajectory.slice();
         trajectory.push(xy);
@@ -1664,7 +1734,9 @@ export function updateProbesFromReadings(
     // coords (present only while the inspector requested them).  Stored across
     // all probed layers so the inspector reprojects for any scrubbed layer.
     let subspaceTrail = prev.subspaceTrail;
-    const sc = reading.subspace_coords_per_layer;
+    const sc = isScalarReading(reading)
+      ? undefined
+      : reading.subspace_coords_per_layer;
     if (sc && Object.keys(sc).length > 0) {
       subspaceTrail = prev.subspaceTrail.slice();
       subspaceTrail.push({ perLayer: sc });
@@ -1680,7 +1752,7 @@ export function updateProbesFromReadings(
       perLayer: _primaryPerLayer(prev.info, reading),
       reading,
       savedAggregate: null,
-      nearest: reading.nearest,
+      nearest,
       trajectory,
       subspaceTrail,
     });
@@ -1690,7 +1762,7 @@ export function updateProbesFromReadings(
 /** Land the end-of-gen aggregate readings (the ``done`` event) — the settled
  *  ``ProbeReading`` per probe. */
 export function setProbeAggregates(
-  aggregates: Record<string, ProbeReadingJSON> | undefined,
+  aggregates: Record<string, AnyReadingJSON> | undefined,
 ): void {
   if (!aggregates) return;
   for (const [name, agg] of Object.entries(aggregates)) {
@@ -1702,7 +1774,7 @@ export function setProbeAggregates(
       savedAggregate: null,
       current: _primaryScalar(prev.info, agg),
       perLayer: _primaryPerLayer(prev.info, agg),
-      nearest: agg.nearest,
+      nearest: _readingNearest(agg),
     });
   }
 }
@@ -1842,7 +1914,11 @@ function tokenRowToScore(row: NonNullable<LoomNodeJSON["tokens"]>[number]): Toke
   if (readings) {
     const byProbe: Record<string, number[]> = {};
     for (const [name, reading] of Object.entries(readings)) {
-      if (reading.coords.length > 1) byProbe[name] = reading.coords;
+      // Multi-axis coordinates are a geometry-only channel — a one-channel
+      // reading has nothing to spread across axes.
+      if (!isScalarReading(reading) && reading.coords.length > 1) {
+        byProbe[name] = reading.coords;
+      }
     }
     if (Object.keys(byProbe).length > 0) out.coordsByProbe = byProbe;
   }

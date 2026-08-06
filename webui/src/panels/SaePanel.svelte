@@ -50,14 +50,29 @@
     steerRack,
     tokenHoverState,
     refreshSaeSources,
+    instrumentFamily,
+    saeLoaded,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
-  import type { SaeSteerEntry } from "../lib/types";
+  import type {
+    SaeProbeInfo,
+    SaeSteerEntry,
+    ScalarReadingJSON,
+  } from "../lib/types";
   import type { SaeSortMode } from "../lib/stores.svelte";
 
-  const loaded = $derived(sessionState.info?.sae_loaded === true);
+  const loaded = $derived(saeLoaded());
   const displayReadout = $derived(saeReadoutForDisplay());
-  const info = $derived(sessionState.info?.sae_info ?? null);
+  /** The resident SAE, read off the family block + the prepared-sources
+   *  listing (the flat ``sae_info`` key is gone — the read plane has one
+   *  representation now). */
+  const residentSource = $derived(instrumentFamily("sae")?.source ?? null);
+  const residentLayer = $derived.by((): number | null => {
+    const active = saeSourceState.sources.find((row) => row.active);
+    if (active?.layer != null) return active.layer;
+    const live = instrumentFamily("sae")?.live;
+    return live && "layer" in live ? live.layer : null;
+  });
   let selectedSource = $state("");
   let selectedLayer = $state("");
   let layerSource = $state("");
@@ -98,13 +113,13 @@
     label: `layer ${layer}`,
   })));
   const sourceMatchesLoaded = $derived(
-    loaded && info !== null && selectedRelease === info.release,
+    loaded && residentSource !== null && selectedSource === residentSource,
   );
   const selectedLayerNumber = $derived(
     selectedLayer === "" ? null : Number(selectedLayer),
   );
   const sourceSelectionCurrent = $derived(
-    sourceMatchesLoaded && selectedLayerNumber === info?.layer,
+    sourceMatchesLoaded && selectedLayerNumber === residentLayer,
   );
 
   onMount(() => {
@@ -118,7 +133,7 @@
     const layers = availableLayers;
     if (source !== layerSource) {
       layerSource = source;
-      const resident = sourceMatchesLoaded ? info?.layer : null;
+      const resident = sourceMatchesLoaded ? residentLayer : null;
       const cached = selectedPreparedSource?.layer ?? null;
       const preferred = resident != null && layers.includes(resident)
         ? resident
@@ -243,17 +258,20 @@
   const pinnedRows = $derived.by((): VisibleProbeCard[] =>
     pinnedBase.map((row) => {
       const entry = row.entry!;
-      const value = entry.aggregate?.coords?.[0] ??
-        entry.reading?.coords?.[0] ?? entry.current;
-      const id = Number(row.name.slice(4));
+      const info = entry.info as SaeProbeInfo;
+      const latest = (entry.aggregate ?? entry.reading) as
+        | ScalarReadingJSON
+        | null;
+      const value = latest?.value ?? entry.current;
       return {
         kind: "pinned",
         key: row.name,
         name: row.name,
         entry,
-        sortName: entry.info.label || String(id),
-        // Pinned values with max_act are already normalized server-side.
-        strength: entry.info.max_act != null ? value : value / fallbackScale,
+        sortName: info.label || String(info.feature_id),
+        // Pinned values with max_act are already normalized server-side —
+        // the reading's own ``unit`` says which one applied.
+        strength: info.max_act != null ? value : value / fallbackScale,
       };
     }));
 
@@ -321,7 +339,9 @@
         // Attachment may discover Neuronpedia metadata that the live row
         // did not have yet. Seed in the unit the attached probe declares,
         // not the stale pre-attach unit.
-        const maxAct = attached.max_act ?? preAttachMaxAct;
+        const maxAct =
+          (attached.family === "sae" ? attached.max_act : null) ??
+          preAttachMaxAct;
         const value = maxAct != null && maxAct > 0
           ? live.activation / maxAct
           : live.activation;
@@ -528,16 +548,17 @@
             {#each probeCards as row (row.key)}
               <div role="listitem">
                 {#if row.kind === "pinned"}
-                  {@const reading = row.entry.aggregate ?? row.entry.reading}
-                  <!-- A pinned probe's channel (coords, sparkline, gates) is
+                  {@const reading = (row.entry.aggregate ?? row.entry.reading) as ScalarReadingJSON | null}
+                  {@const probe = row.entry.info as SaeProbeInfo}
+                  <!-- A pinned probe's channel (value, sparkline, gates) is
                        already normalized server-side when max_act is set. -->
                   <SaeProbeCard
-                    id={Number(row.name.slice(4))}
-                    label={row.entry.info.label}
-                    layer={info?.layer ?? null}
-                    value={reading?.coords?.[0] ?? row.entry.current ?? 0}
-                    maxAct={row.entry.info.max_act ?? null}
-                    valueIsStrength={row.entry.info.max_act != null}
+                    id={probe.feature_id}
+                    label={probe.label}
+                    layer={residentLayer}
+                    value={reading?.value ?? row.entry.current ?? 0}
+                    maxAct={probe.max_act}
+                    valueIsStrength={probe.max_act != null}
                     {fallbackScale}
                     series={row.entry.sparkline}
                     pinned={true}
@@ -546,7 +567,7 @@
                   <SaeProbeCard
                     id={row.feature.id}
                     label={row.feature.label}
-                    layer={info?.layer ?? null}
+                    layer={residentLayer}
                     value={row.feature.activation}
                     maxAct={row.feature.max_act}
                     {fallbackScale}

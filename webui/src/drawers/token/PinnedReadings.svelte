@@ -1,10 +1,11 @@
 <script lang="ts">
   // Pinned-probe readings section for the lens and sae tabs — the
   // ``instruments.<family>.readings`` block of the token's captured
-  // measurements envelope, which the drilldown previously dropped on the
-  // floor.  One row per pinned probe: name · strength bar (the family's
-  // absolute 0..1 unit) · depth-CoM chip · value, with the per-layer
-  // strength strip below when the probe carries a multi-layer trace.
+  // measurements envelope.  These are the single-axis families, so the
+  // block carries their NATIVE one-channel reading — value + its explicit
+  // unit + the per-layer trace + a depth summary that names its own mass
+  // basis.  One row per pinned probe: name · strength bar · depth-CoM chip
+  // · value, with the per-layer strip below when the trace spans layers.
   // Present only on live-captured tokens (replay endpoints return the
   // discovery readout, not the pinned roster).
 
@@ -15,7 +16,7 @@
   import RackMarker, {
     type RackMarkerShape,
   } from "../../panels/rack/RackMarker.svelte";
-  import type { ProbeReadingJSON } from "../../lib/types";
+  import type { ScalarReadingJSON } from "../../lib/types";
   import DetailSection from "./DetailSection.svelte";
   import DetailCardHeader from "./DetailCardHeader.svelte";
 
@@ -24,7 +25,7 @@
     accent,
     shape,
   }: {
-    readings: Record<string, ProbeReadingJSON>;
+    readings: Record<string, ScalarReadingJSON>;
     /** Family CSS custom-property name, e.g. --pillar-lens. */
     accent: string;
     shape: RackMarkerShape;
@@ -44,22 +45,25 @@
     title: string;
   }
 
-  /** Axis-0 per-layer trace (p_l for a lens probe, strength for sae). */
-  function stripCells(reading: ProbeReadingJSON): StripCell[] {
-    const perLayer = reading.coords_per_layer ?? {};
+  /** The channel's per-layer trace (p_l for a lens probe, activation for
+   *  sae) — plain numbers, no coordinate-vector unwrap. */
+  function stripCells(reading: ScalarReadingJSON): StripCell[] {
+    const perLayer = reading.per_layer ?? {};
     return Object.keys(perLayer)
       .sort((a, b) => Number(a) - Number(b))
-      .map((layer) => {
-        const c = perLayer[layer];
-        const v = Array.isArray(c) && c.length > 0 ? c[0] : null;
-        return {
-          layer: Number(layer),
-          value: v,
-          title:
-            v == null ? `L${layer} · —` : `L${layer} · ${v.toPrecision(3)}`,
-        };
-      });
+      .map((layer) => ({
+        layer: Number(layer),
+        value: perLayer[layer],
+        title: `L${layer} · ${perLayer[layer].toPrecision(3)}`,
+      }));
   }
+
+  /** The reading says what its number means, so the row can too. */
+  const UNIT_LABEL: Record<ScalarReadingJSON["unit"], string> = {
+    mean_token_probability: "mean fitted-layer probability",
+    activation_over_max: "activation / corpus max",
+    raw_activation: "raw activation (no corpus max cached)",
+  };
 
   /** Cell color scale — the probe's own max (absolute p spans orders of
    *  magnitude; same convention as the rack's pinned lens cards). */
@@ -83,8 +87,8 @@
             <DetailCardHeader
               primary={name}
               primaryTitle={`probe ${name}`}
-              meta={reading.depth_com && reading.depth_com[0] != null
-                ? `@${reading.depth_com[0].toFixed(2)} ±${(reading.depth_spread?.[0] ?? 0).toFixed(2)}`
+              meta={reading.depth?.center?.[0] != null
+                ? `@${reading.depth.center[0].toFixed(2)} ±${(reading.depth.spread?.[0] ?? 0).toFixed(2)}`
                 : null}
               metaTitle="depth center of mass ± spread (0 = first block, 1 = last)"
             >
@@ -93,17 +97,21 @@
           {/snippet}
           {#snippet body()}
             <ProbeReadingRow ariaLabel={`Pinned probe ${name}`}>
-              {#snippet left()}<span class="row-label">strength</span>{/snippet}
+              {#snippet left()}
+                <span class="row-label" title={UNIT_LABEL[reading.unit]}>
+                  strength
+                </span>
+              {/snippet}
               {#snippet bar()}
                 <Bar
-                  value={Math.max(reading.coords[0] ?? 0, 0)}
+                  value={Math.max(reading.value, 0)}
                   max={1}
                   color={accentColor}
                 />
               {/snippet}
               {#snippet middle()}<span aria-hidden="true"></span>{/snippet}
               {#snippet right()}
-                <span class="pinned-value">{(reading.coords[0] ?? 0).toFixed(3)}</span>
+                <span class="pinned-value">{reading.value.toFixed(3)}</span>
               {/snippet}
             </ProbeReadingRow>
             {#if cells.length > 1}
