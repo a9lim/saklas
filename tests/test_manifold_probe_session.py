@@ -141,6 +141,12 @@ def _stub_session() -> SaklasSession:
     session._geometry_instrument = GeometryInstrument(session)
     session._lens_instrument = LensInstrument(session)
     session._sae_instrument = SaeInstrument(session)
+    # ``_begin_capture`` runs the close → prepare → plan → bind ritual
+    # through this helper; the MagicMock default would hand it an empty
+    # iterable instead of the three real plans.
+    session._bind_instrument_runs = types.MethodType(
+        SaklasSession._bind_instrument_runs, session,
+    )
     session._lens_step_stash = None
     session._live_lens_active_for_generation = True
     session._incremental_readings = []

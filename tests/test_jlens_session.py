@@ -111,6 +111,7 @@ class _StubSession:
     _generation_jlens = SaklasSession._generation_jlens
     _generation_jlens_active = SaklasSession._generation_jlens_active
     _close_instrument_runs = SaklasSession._close_instrument_runs
+    _bind_instrument_runs = SaklasSession._bind_instrument_runs
 
     def __init__(self, *, n_layers: int = 3) -> None:
         from saklas.core.instruments.geometry import GeometryInstrument

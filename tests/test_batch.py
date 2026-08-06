@@ -139,6 +139,9 @@ class _BatchProbeMonitor:
     def enable_curved_warm(self, flag: bool) -> None:
         del flag
 
+    def set_subspace_coords(self, flag: bool) -> None:
+        del flag
+
     def score_aggregate(
         self,
         hidden_per_layer: dict[int, Any],
@@ -185,7 +188,7 @@ def _fast_batch_session():
     s_any._gen_lock = threading.Lock()
     s._gen_phase = GenState.IDLE
     s._gen_state = GenerationState()
-    s_any._monitor = SimpleNamespace(probe_names=[])
+    s_any._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
     s._profiles = {}
     s._manifolds = {}
     s._default_return_top_k = 0
@@ -451,7 +454,7 @@ class TestGenerateBatch:
         from saklas.core.sae import MockSaeBackend
 
         s, model = _probe_fast_batch_session()
-        cast(Any, s)._monitor = SimpleNamespace(probe_names=[])
+        cast(Any, s)._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
         s._sae_backend = MockSaeBackend(layers=frozenset({0}), d_model=1, d_feature=1)
         s._sae_layer = 0
         s._sae_width = 1
@@ -483,7 +486,7 @@ class TestGenerateBatch:
         from saklas.core.sampling import SamplingConfig
 
         s, model = _probe_fast_batch_session()
-        cast(Any, s)._monitor = SimpleNamespace(probe_names=[])
+        cast(Any, s)._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
         s._sae_layer = 0
         s._sae_probes = {
             "sae/0": {
@@ -511,7 +514,7 @@ class TestGenerateBatch:
     def test_lens_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
         s, model = _probe_fast_batch_session()
         s_any = cast(Any, s)
-        s_any._monitor = SimpleNamespace(probe_names=[])
+        s_any._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
         s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
         s_any._lens_probe_layers = lambda: {0}
 
@@ -547,7 +550,7 @@ class TestGenerateBatch:
 
         s, model = _probe_fast_batch_session()
         s_any = cast(Any, s)
-        s_any._monitor = SimpleNamespace(probe_names=[])
+        s_any._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
         s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
         s_any._lens_probe_layers = lambda: {0}
 

@@ -74,6 +74,7 @@ from saklas.core.model import (
 )
 from saklas.core.instruments.types import (
     AGG_TAIL_DEPTH,
+    InstrumentPlan,
     ReadRequest,
 )
 from saklas.core.monitor import Monitor
@@ -532,6 +533,22 @@ class ReadDemand:
     live_lens_active: bool = True
     live_sae_active: bool = True
     capture_prompt: bool = False
+
+
+class _GenerationTransaction:
+    """The mutable state :meth:`SaklasSession._generation_transaction` owns.
+
+    ``steering_cm`` is whatever internal steering scope the body entered and
+    has not popped itself; the transaction pops the remainder on the way out.
+    ``failed`` records that the body is unwinding, which decides whether a
+    teardown ``Exception`` may mask the original failure.
+    """
+
+    __slots__ = ("failed", "steering_cm")
+
+    def __init__(self) -> None:
+        self.steering_cm: Any = None
+        self.failed: bool = False
 
 
 class ConcurrentGenerationError(RuntimeError, SaklasError):
@@ -5718,6 +5735,133 @@ class SaklasSession:
         """
         self._steering_composer.rebuild_hooks()
 
+    @contextmanager
+    def _generation_transaction(self) -> "Iterator[_GenerationTransaction]":
+        """The generation boundary: single-flight guard in, hard teardown out.
+
+        Every capture-owning generation path runs inside this — the ordinary
+        decode loop and the batched ``model.generate`` fast path — so the
+        order ARCHITECTURE.md §8.1/§8.3 describes exists once.  On entry: the
+        non-reentrant lock, the ``IDLE`` re-entry guard, and the phase
+        transition to ``PREAMBLE``.  On exit, whatever raised: pop any
+        steering scope the body left open, detach capture, drop the
+        per-generation session slots, close the instrument runs, reset capture
+        state, zero the persistent compile-clean steering offsets, and release
+        the phase and the lock.
+
+        The body owns the steering scope through ``txn.steering_cm``: it
+        assigns the scope when it enters one and clears the slot again if it
+        pops the scope itself (the decode path pops before finalizing, so the
+        finalize reads happen unsteered).  A scope still present here is
+        popped with ``swallow=txn.failed`` — a teardown ``Exception`` must not
+        mask the failure already propagating.
+        """
+        if not self._gen_lock.acquire(blocking=False):
+            raise ConcurrentGenerationError("Generation already in progress")
+        if self._gen_phase is not GenState.IDLE:
+            self._gen_lock.release()
+            raise ConcurrentGenerationError("session generation already in flight")
+        self._gen_phase = GenState.PREAMBLE
+        txn = _GenerationTransaction()
+        try:
+            yield txn
+        except BaseException:
+            txn.failed = True
+            raise
+        finally:
+            try:
+                try:
+                    if txn.steering_cm is not None:
+                        self._exit_internal_steering(
+                            txn.steering_cm, swallow=txn.failed,
+                        )
+                finally:
+                    try:
+                        # Defense-in-depth: even if the body's own teardown
+                        # never ran (a BaseException between the transaction
+                        # entry and ``_begin_capture``), any hooks that did
+                        # get attached must come off.  Idempotent.
+                        self._end_capture()
+                        # The probe-inspector subspace-coords post-pass is
+                        # per-generation; clear it so it never leaks into a
+                        # later gen that didn't opt in.
+                        self._monitor.set_subspace_coords(False)
+                        # Release the loom-tree reservation in the same scope
+                        # as the gen-lock release.  Even if finalize raised,
+                        # mutators (edit / delete on this subtree) need to be
+                        # free again now that the streaming target is no
+                        # longer live.
+                        self._active_gen_reservation = None
+                        self._last_token_probe_payload = None
+                        self._last_token_probe_readings = None
+                    finally:
+                        # Run closure and capture-state resets must survive a
+                        # teardown failure above (a raising hook detach must
+                        # not leave a bound run pinning a stale lens).
+                        self._close_instrument_runs()
+                        # Reset capture state to the default (FULL,
+                        # non-persistent) so the next gen starts clean —
+                        # finalize has already consumed the rows, and
+                        # ``_begin_capture`` resets it at gen start too.
+                        self._capture_state = CaptureState()
+                        self._compiled_clean_eligible = False
+                        self._incremental_readings = []
+                        self._incremental_gate_scores = []
+                        # Zero the persistent compile-clean steering offsets so
+                        # a static-affine push can't leak into a later
+                        # generation that takes the eager / unsteered path
+                        # without re-running ``install_composed_steering``
+                        # (unsteered gens have no steering scope to reset
+                        # them).
+                        self._steering_uses_compiled_offsets = False
+                        if self._steering.has_compiled_offsets():
+                            self._steering.zero_compiled_offsets()
+            finally:
+                # Unconditional: an earlier teardown exception must not leave
+                # the session phase-wedged or the gen lock held.
+                self._gen_phase = GenState.IDLE
+                self._gen_lock.release()
+
+    def _bind_instrument_runs(
+        self,
+        geometry_request: ReadRequest,
+        lens_request: ReadRequest,
+        sae_request: ReadRequest,
+    ) -> "tuple[InstrumentPlan, InstrumentPlan, InstrumentPlan]":
+        """Run the uniform instrument transaction: close → prepare → plan → bind.
+
+        The defensive close comes first (the transaction teardown is the
+        ordinary one) — a stale pin would short-circuit the lens disk refresh
+        inside ``prepare``, and a stale binding would keep serving frozen specs
+        to idle reads.  ``prepare`` is the source-boundary step: the lens
+        family reads the disk-refreshing ``jlens`` getter under pin demand
+        there and snapshots specs + live config against that identity;
+        ``plan``/``bind`` consume the prep only, so an interleaved adoption
+        (the un-locked ``has_compatible_jlens``) cannot desynchronize them
+        (``LensInstrument.prepare`` carries the ordering + snapshot rationale).
+
+        ``bind`` freezes each family's probe specs into an immutable
+        ``InstrumentBinding`` (a concurrent SAE metadata backfill can no longer
+        change what this generation measures), starts fresh stashes and step
+        memos, and hands the lens run the pin its prep took — so every token,
+        gate, and final aggregate consumes the same resident lens even if
+        another process switches the active source mid-decode.
+
+        Returns the three plans; the caller unions their declared layers and
+        chooses the physical retention.
+        """
+        self._close_instrument_runs()
+        geometry_prep = self._geometry_instrument.prepare(geometry_request)
+        lens_prep = self._lens_instrument.prepare(lens_request)
+        sae_prep = self._sae_instrument.prepare(sae_request)
+        geometry_plan = self._geometry_instrument.plan(geometry_prep)
+        lens_plan = self._lens_instrument.plan(lens_prep)
+        sae_plan = self._sae_instrument.plan(sae_prep)
+        self._geometry_instrument.bind(geometry_plan, geometry_prep)
+        self._lens_instrument.bind(lens_plan, lens_prep)
+        self._sae_instrument.bind(sae_plan, sae_prep)
+        return geometry_plan, lens_plan, sae_plan
+
     def _resolve_read_demand(
         self,
         *,
@@ -5844,56 +5988,30 @@ class SaklasSession:
         # ``INCREMENTAL -> set_tail_with_sink`` upgrade is cross-instrument
         # resource sharing, which plans deliberately do not decide
         # (``protocol.py`` division of labor).
-        #
-        # The uniform capture transaction (``protocol.py``): close →
-        # prepare → plan → bind.  The defensive close first (the
-        # generation finallys are the ordinary teardown) — a stale pin
-        # would short-circuit the lens disk refresh inside ``prepare``,
-        # and a stale binding would keep serving frozen specs to idle
-        # reads.  ``prepare`` is the source-boundary step: the lens
-        # family reads the disk-refreshing ``jlens`` getter under pin
-        # demand there and snapshots specs + live config against that
-        # identity; ``plan``/``bind`` consume the prep only, so an
-        # interleaved adoption (the un-locked ``has_compatible_jlens``)
-        # cannot desynchronize them (``LensInstrument.prepare`` carries
-        # the ordering + snapshot rationale).
-        self._close_instrument_runs()
-        geometry_prep = self._geometry_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(demand.gating_probe_keys or ()),
-            per_token_consumers=demand.per_token_full_consumer,
-            final_aggregate=demand.final_probe_aggregate,
-            return_hidden=widen,
-        ))
-        lens_prep = self._lens_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(demand.lens_gating_probe_keys or ()),
-            live=demand.live_lens_active,
-            per_token_consumers=demand.per_token_full_consumer,
-            final_aggregate=demand.final_probe_aggregate,
-            return_hidden=widen,
-        ))
-        sae_prep = self._sae_instrument.prepare(ReadRequest(
-            gate_keys=frozenset(demand.sae_gating_probe_keys or ()),
-            live=demand.live_sae_active,
-            per_token_consumers=demand.per_token_full_consumer,
-            final_aggregate=demand.final_probe_aggregate,
-            return_hidden=widen,
-        ))
-        geometry_plan = self._geometry_instrument.plan(geometry_prep)
-        lens_plan = self._lens_instrument.plan(lens_prep)
-        sae_plan = self._sae_instrument.plan(sae_prep)
+        geometry_plan, lens_plan, sae_plan = self._bind_instrument_runs(
+            ReadRequest(
+                gate_keys=frozenset(demand.gating_probe_keys or ()),
+                per_token_consumers=demand.per_token_full_consumer,
+                final_aggregate=demand.final_probe_aggregate,
+                return_hidden=widen,
+            ),
+            ReadRequest(
+                gate_keys=frozenset(demand.lens_gating_probe_keys or ()),
+                live=demand.live_lens_active,
+                per_token_consumers=demand.per_token_full_consumer,
+                final_aggregate=demand.final_probe_aggregate,
+                return_hidden=widen,
+            ),
+            ReadRequest(
+                gate_keys=frozenset(demand.sae_gating_probe_keys or ()),
+                live=demand.live_sae_active,
+                per_token_consumers=demand.per_token_full_consumer,
+                final_aggregate=demand.final_probe_aggregate,
+                return_hidden=widen,
+            ),
+        )
         has_lens_gate = bool(lens_plan.gate_keys)
         has_sae_gate = bool(sae_plan.gate_keys)
-
-        # Bind each family's per-generation run (``Instrument.bind``): probe
-        # specs freeze into the immutable ``InstrumentBinding`` (a concurrent
-        # SAE metadata backfill can no longer change what this generation
-        # measures), stashes and step memos start fresh, and the lens run
-        # carries the pin its prep took — every token, gate, and final
-        # aggregate below consumes the same resident lens even if another
-        # process switches the active source/manifest mid-decode.
-        self._geometry_instrument.bind(geometry_plan, geometry_prep)
-        self._lens_instrument.bind(lens_plan, lens_prep)
-        self._sae_instrument.bind(sae_plan, sae_prep)
         if widen:
             layer_idxs = list(range(len(self._layers)))
         else:
@@ -8832,20 +8950,13 @@ class SaklasSession:
     ) -> GenerationResult:
         """Shared generation implementation.
 
-        Holds the gen lock + re-entry guard for the duration of the call,
-        composes a per-call GenerationConfig, opens an internal steering
-        scope (if any), runs ``generate_steered`` with capture attached,
-        and finalizes the result.  ``generate`` and ``generate_stream``
-        are thin wrappers around this.
+        Runs inside :meth:`_generation_transaction` (the lock, the re-entry
+        guard, and the exception-hard teardown), composes a per-call
+        GenerationConfig, opens an internal steering scope (if any), runs
+        ``generate_steered`` with capture attached, and finalizes the result.
+        ``generate`` and ``generate_stream`` are thin wrappers around this.
         """
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentGenerationError("Generation already in progress")
-        if self._gen_phase is not GenState.IDLE:
-            self._gen_lock.release()
-            raise ConcurrentGenerationError("session generation already in flight")
-        self._gen_phase = GenState.PREAMBLE
-        steering_cm = None
-        try:
+        with self._generation_transaction() as txn:
 
             # Cast roster (phase 3): the gen label's standing recipe is
             # the weakest tier; the regen override below still composes
@@ -9262,7 +9373,7 @@ class SaklasSession:
             )
 
             if steering_obj is not None and steering_obj.alphas:
-                steering_cm = self.steering(steering_obj)
+                txn.steering_cm = self.steering(steering_obj)
 
             # Snapshot the chat-history anchor BEFORE _start_loom_assistant
             # mutates the tree.  Otherwise the new (empty) assistant node it
@@ -9298,8 +9409,8 @@ class SaklasSession:
                 continuation_node_id=continuation_node_id,
             )
 
-            if steering_cm is not None:
-                steering_cm.__enter__()
+            if txn.steering_cm is not None:
+                txn.steering_cm.__enter__()
             input_ids, use_thinking, prompt_tokens = self._generation_preamble(
                 input, raw, use_thinking_req, stateless=stateless,
                 parent_node_id=chat_history_anchor,
@@ -9441,11 +9552,13 @@ class SaklasSession:
             finally:
                 self._gen_state.stop_requested.set()
                 self._end_capture()
-                if steering_cm is not None:
+                if txn.steering_cm is not None:
                     # Internal scope cleanup (see ``_exit_internal_steering``);
                     # ``swallow=False`` so a teardown failure surfaces here.
-                    self._exit_internal_steering(steering_cm, swallow=False)
-                    steering_cm = None
+                    # Clearing the slot hands the transaction an already-popped
+                    # scope, so its own teardown has nothing left to do.
+                    self._exit_internal_steering(txn.steering_cm, swallow=False)
+                    txn.steering_cm = None
                 self._gen_phase = GenState.FINALIZING
 
             applied_steering = (
@@ -9475,65 +9588,6 @@ class SaklasSession:
             )
             self.events.emit(GenerationFinished(result=result))
             return result
-        except BaseException:
-            # If we bailed before the inner finally ran (e.g. preamble threw),
-            # make sure the steering scope is popped.  Same internal-cleanup
-            # bypass as the inner finally — phase may be PREAMBLE, RUNNING,
-            # or FINALIZING depending on where we threw, and the pop is
-            # always legitimate teardown here.
-            if steering_cm is not None:
-                # ``swallow=True``: we're already re-raising the original
-                # failure below, so a teardown ``Exception`` must not mask
-                # it (see ``_exit_internal_steering``).
-                self._exit_internal_steering(steering_cm, swallow=True)
-            raise
-        finally:
-            try:
-                try:
-                    # Defense-in-depth: even if the inner finally never ran
-                    # (e.g. a BaseException between the outer try entry and
-                    # ``begin_capture``), any hooks that did get attached
-                    # must come off.  Idempotent.
-                    self._end_capture()
-                    # Probe-inspector subspace-coords post-pass is
-                    # per-generation; clear it so it never leaks into a
-                    # later gen that didn't opt in.
-                    self._monitor.set_subspace_coords(False)
-                    # Release the loom-tree reservation in the same scope as
-                    # the gen-lock release.  Even if finalize raised,
-                    # mutators (edit / delete on this subtree) need to be
-                    # free again now that the streaming target is no longer
-                    # live.
-                    self._active_gen_reservation = None
-                    self._last_token_probe_payload = None
-                    self._last_token_probe_readings = None
-                finally:
-                    # Run closure and capture-state resets must survive a
-                    # teardown failure above (a raising hook detach must not
-                    # leave a bound run pinning a stale lens).
-                    self._close_instrument_runs()
-                    # Reset capture state to the default (FULL,
-                    # non-persistent) so the next gen starts clean (finalize
-                    # has already consumed the rows by now).
-                    # Belt-and-suspenders: ``_begin_capture`` resets it at
-                    # gen start too.
-                    self._capture_state = CaptureState()
-                    self._compiled_clean_eligible = False
-                    self._incremental_readings = []
-                    self._incremental_gate_scores = []
-                    # Zero the persistent compile-clean steering offsets so a
-                    # static-affine push can't leak into a later generation
-                    # that takes the eager / unsteered path without
-                    # re-running ``_install_composed_steering`` (unsteered
-                    # gens have no steering scope to reset them).
-                    self._steering_uses_compiled_offsets = False
-                    if self._steering.has_compiled_offsets():
-                        self._steering.zero_compiled_offsets()
-            finally:
-                # Unconditional: an earlier teardown exception must not
-                # leave the session phase-wedged or the gen lock held.
-                self._gen_phase = GenState.IDLE
-                self._gen_lock.release()
 
     def _generate_runset(
         self,
@@ -10192,23 +10246,20 @@ class SaklasSession:
         raw: bool,
         on_result: Callable[[int, GenerationResult], None] | None,
     ) -> RunSet:
-        """Implementation of the compatible batched ``model.generate`` path."""
-        if not self._gen_lock.acquire(blocking=False):
-            raise ConcurrentGenerationError("Generation already in progress")
-        if self._gen_phase is not GenState.IDLE:
-            self._gen_lock.release()
-            raise ConcurrentGenerationError("session generation already in flight")
+        """Implementation of the compatible batched ``model.generate`` path.
 
-        self._gen_phase = GenState.PREAMBLE
-        steering_cm = None
-        failed = False
-        try:
+        Shares :meth:`_generation_transaction` with the ordinary decode path,
+        so the boundary guard and the teardown are the same code; only the
+        body differs (one batched ``model.generate`` instead of the decode
+        loop, and no loom attachment).
+        """
+        with self._generation_transaction() as txn:
             if steering_obj is not None and steering_obj.alphas:
-                steering_cm = self.steering(steering_obj)
-                steering_cm.__enter__()
+                txn.steering_cm = self.steering(steering_obj)
+                txn.steering_cm.__enter__()
             vector_snapshot: dict[str, float] = (
                 self._snapshot_steering_alphas()
-                if self._steering_composer._stack or steering_cm is not None
+                if self._steering_composer._stack or txn.steering_cm is not None
                 else {}
             )
             pad_id = self._batch_pad_token_id()
@@ -10227,30 +10278,21 @@ class SaklasSession:
             )
             has_lens_probes = bool(return_probe_readings and self._lens_probes)
             has_sae_probes = bool(return_probe_readings and self._sae_probes)
-            # Batched generation bypasses ``_begin_capture`` but still owns
-            # one generation transaction, and runs the same uniform
-            # sequence: close → prepare → plan → bind.  The lens prepare
-            # takes the disk refresh + pin and snapshots specs against
-            # that identity BEFORE the plans/bindings consume them (its
-            # pin-demand formula reduces to "probes attached and a final
-            # aggregate wanted" on a batch request); one pinned lens then
-            # serves every row aggregate rather than reopening all shards
-            # per batch item, and the bindings freeze probe specs against
-            # concurrent mutation for the whole batch.
-            self._close_instrument_runs()
+            # Batched generation bypasses ``_begin_capture`` but binds the
+            # instrument runs through the same helper.  One request serves all
+            # three families here: the lens prepare takes the disk refresh +
+            # pin and snapshots specs against that identity before the plans
+            # and bindings consume them (its pin-demand formula reduces to
+            # "probes attached and a final aggregate wanted" on a batch
+            # request), so one pinned lens serves every row aggregate rather
+            # than reopening all shards per batch item.
             batch_request = ReadRequest(
                 final_aggregate=return_probe_readings,
                 batch=True,
             )
-            geometry_prep = self._geometry_instrument.prepare(batch_request)
-            lens_prep = self._lens_instrument.prepare(batch_request)
-            sae_prep = self._sae_instrument.prepare(batch_request)
-            geometry_plan = self._geometry_instrument.plan(geometry_prep)
-            lens_plan = self._lens_instrument.plan(lens_prep)
-            sae_plan = self._sae_instrument.plan(sae_prep)
-            self._geometry_instrument.bind(geometry_plan, geometry_prep)
-            self._lens_instrument.bind(lens_plan, lens_prep)
-            self._sae_instrument.bind(sae_plan, sae_prep)
+            geometry_plan, lens_plan, sae_plan = self._bind_instrument_runs(
+                batch_request, batch_request, batch_request,
+            )
             capture_probe_aggregates = bool(
                 probe_names or has_lens_probes or has_sae_probes
             )
@@ -10391,37 +10433,6 @@ class SaklasSession:
                     "batch_tok_per_sec": batch_tok_per_sec,
                 },
             )
-        except BaseException:
-            failed = True
-            raise
-        finally:
-            try:
-                try:
-                    if steering_cm is not None:
-                        self._exit_internal_steering(steering_cm, swallow=failed)
-                finally:
-                    try:
-                        self._end_capture()
-                        self._active_gen_reservation = None
-                        self._last_token_probe_payload = None
-                        self._last_token_probe_readings = None
-                    finally:
-                        # Run closure and state resets must survive a
-                        # teardown failure above (a raising hook detach must
-                        # not leave a bound run pinning a stale lens).
-                        self._close_instrument_runs()
-                        self._capture_state = CaptureState()
-                        self._compiled_clean_eligible = False
-                        self._incremental_readings = []
-                        self._incremental_gate_scores = []
-                        self._steering_uses_compiled_offsets = False
-                        if self._steering.has_compiled_offsets():
-                            self._steering.zero_compiled_offsets()
-            finally:
-                # Unconditional: an earlier teardown exception must not
-                # leave the session phase-wedged or the gen lock held.
-                self._gen_phase = GenState.IDLE
-                self._gen_lock.release()
 
     def generate_batch(
         self,
