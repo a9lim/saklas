@@ -4028,9 +4028,10 @@ class SaklasSession:
         generated_ids: list[int],
         *,
         pooled: dict[int, torch.Tensor] | None = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """End-of-gen SAE-probe aggregate (delegates to
-        :meth:`SaeInstrument.score_aggregate`)."""
+        :meth:`SaeInstrument.score_aggregate`) — the family's native
+        one-channel readings."""
         return self._sae_instrument.score_aggregate(
             generated_ids, pooled=pooled,
         )
@@ -6508,9 +6509,10 @@ class SaklasSession:
         generated_ids: list[int],
         *,
         pooled: dict[int, torch.Tensor] | None = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """End-of-gen lens-probe aggregate (delegates to
-        :meth:`LensInstrument.score_aggregate`)."""
+        :meth:`LensInstrument.score_aggregate`) — the family's native
+        one-channel readings."""
         return self._lens_instrument.score_aggregate(
             generated_ids, pooled=pooled,
         )
