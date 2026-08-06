@@ -758,6 +758,38 @@ class TestWebSocket:
         assert msg["code"] == "ValidationError"
         assert "Extra inputs are not permitted" in msg["message"]
 
+    def test_generate_accepts_labelled_input_messages(
+        self, session_and_client: Any,
+    ) -> None:
+        """The dashboard's auto-regen shadow replays a conversation as an
+        explicit message list carrying each turn's cast ``label``.  The wire
+        message is the same shape a loom-derived message dict is, so the
+        label reaches ``_prepare_input`` verbatim — re-rendering the shadow
+        under default labels would be a different prompt than the one being
+        shadowed."""
+        session, client = session_and_client
+        self._attach_generate(session, ["ok"])
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate",
+                "input": [
+                    {"role": "user", "content": "hi", "label": "narrator"},
+                    {"role": "assistant", "content": "hello", "label": "deer"},
+                    {"role": "user", "content": "again", "label": None},
+                ],
+                "steering": "",
+                "stateless": True,
+            })
+            while (msg := ws.receive_json())["type"] != "done":
+                assert msg["type"] != "error", msg
+
+        sent = session.generate.call_args.args[0]
+        assert sent == [
+            {"role": "user", "content": "hi", "label": "narrator"},
+            {"role": "assistant", "content": "hello", "label": "deer"},
+            {"role": "user", "content": "again", "label": None},
+        ]
+
     def test_stale_n_way_token_callback_stays_on_original_queue(
         self, session_and_client: Any,
     ) -> None:

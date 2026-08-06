@@ -36,6 +36,15 @@ class WSInputMessage(NativeRequest):
 
     role: Literal["system", "user", "assistant"]
     content: str
+    #: Cast label for this turn — the same per-turn ``role_label`` the loom
+    #: stamps on its nodes, rendered into the constructed header by the scene
+    #: stitcher (``core.generation.build_chat_input`` reads the ``"label"``
+    #: key).  The dashboard's auto-regen shadow replays a conversation as an
+    #: explicit message list, so without this field a shadow of any
+    #: custom-labelled turn was rejected outright by ``extra="forbid"`` — and
+    #: dropping it would silently re-render those turns under the default
+    #: labels, which is a different prompt from the one being shadowed.
+    label: str | None = None
 
 
 class WSGenerateMessage(NativeRequest):
@@ -160,8 +169,13 @@ def build_sampling_config(body: WSSamplingParams | None) -> SamplingConfig | Non
 
 def build_input(
     body: str | list[WSInputMessage] | None,
-) -> str | list[dict[str, str]] | None:
-    """Lower the strict wire message objects to the engine's mapping shape."""
+) -> str | list[dict[str, Any]] | None:
+    """Lower the strict wire message objects to the engine's mapping shape.
+
+    ``model_dump`` carries ``label`` through verbatim, which is exactly the
+    per-turn key ``session._prepare_input`` hands to ``build_chat_input`` —
+    the wire message and a loom-derived message dict are the same shape.
+    """
     if not isinstance(body, list):
         return body
     return [message.model_dump() for message in body]

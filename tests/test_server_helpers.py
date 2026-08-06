@@ -122,6 +122,44 @@ class TestWsAdapterSharesTheConstructor:
         assert ws_build_sampling_config(None) is None
 
 
+class TestWSInputMessageLabel:
+    """The wire message and a loom-derived message dict are the same shape.
+
+    ``build_chat_input`` reads a per-turn ``"label"`` key (rendered into the
+    constructed header by the scene stitcher; parity covered in
+    tests/test_scene_wiring.py), and ``_prepare_input`` forwards a list input
+    to it verbatim — so accepting the field here is what makes the dashboard's
+    labelled shadow replay render the prompt it is shadowing.
+    """
+
+    def test_label_survives_the_lowering(self) -> None:
+        from saklas.server.ws_models import WSInputMessage, build_input
+
+        lowered = build_input([
+            WSInputMessage(role="user", content="ahoy", label="captain"),
+            WSInputMessage(role="assistant", content="arr"),
+        ])
+        assert lowered == [
+            {"role": "user", "content": "ahoy", "label": "captain"},
+            {"role": "assistant", "content": "arr", "label": None},
+        ]
+
+    def test_label_is_optional_and_still_rejects_unknown_keys(self) -> None:
+        import pydantic
+
+        from saklas.server.ws_models import WSInputMessage
+
+        assert WSInputMessage(role="user", content="hi").label is None
+        with pytest.raises(pydantic.ValidationError):
+            WSInputMessage(role="user", content="hi", name="old")  # type: ignore[call-arg]
+
+    def test_string_and_none_inputs_pass_through(self) -> None:
+        from saklas.server.ws_models import build_input
+
+        assert build_input("plain prompt") == "plain prompt"
+        assert build_input(None) is None
+
+
 class TestWSGenerateSchemaValidation:
     """Mode consistency is a schema property of ``WSGenerateMessage``.
 
