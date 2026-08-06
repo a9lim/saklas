@@ -125,7 +125,8 @@ webui/src/
     api.ts                    # typed REST + WS + SSE clients; ApiError + describeError
     stores.svelte.ts          # runes-based shared state + cross-cutting WS/tree/chat state
     stores/                   # slices: drawers, inputHistory, palette, preparations, toasts
-    types.ts                  # shared wire + UI interfaces; DrawerName union
+    types.ts                  # THE import surface: re-exports types.gen.ts, owns WS + request + UI types
+    types.gen.ts              # GENERATED REST response types (scripts/generate_webui_types.py) — do not edit
     highlight.ts              # THE per-token highlight implementation (score lookup + style)
     tokens.ts                 # pure ramp math: HIGHLIGHT_SAT, scoreToRgb, two-stripe/blend
     templates.ts              # THE client mirror of the template artifact's invariants
@@ -660,7 +661,9 @@ String(e)` fallback.
 mount it from `App.svelte`, `npm run build`, commit the regenerated `dist/`.
 
 **Drawer:** write it under `drawers/`, add the name to the `DrawerName` union in
-`lib/types.ts` (and to `NARROW_DRAWERS` in `App.svelte` for forms/pickers),
+`lib/types.ts` (a client-local type, so it stays hand-written — the generated
+half is REST responses only) (and to `NARROW_DRAWERS` in `App.svelte` for
+forms/pickers),
 add an `App.svelte` switch branch, re-export from `drawers/index.ts`, and — if it
 should be palette-launchable rather than opened from a specific surface — add it
 to a `RAIL_CATEGORIES` group in `lib/commands.ts`.

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
 
 from saklas.core.generation import supports_thinking, thinking_is_optional
 from saklas.core.session import SaklasSession
 from saklas.core.steering import Steering
 from saklas.server.instrument_routes import instrument_families
 from saklas.server.native_common import NativeRequest
+from saklas.server.response_models import SamplingFields, SessionInfo
 
 
 class CreateSessionRequest(NativeRequest):
@@ -30,7 +30,7 @@ class ValidateSteeringRequest(NativeRequest):
     expression: str
 
 
-def session_config_dict(session: SaklasSession) -> dict[str, Any]:
+def session_config_dict(session: SaklasSession) -> SamplingFields:
     cfg = session.config
     return {
         "temperature": cfg.temperature,
@@ -85,25 +85,21 @@ def device_dtype(session: SaklasSession) -> tuple[str, str]:
     return str(info["device"]), str(info["dtype"])
 
 
-def _scene_capabilities(session: SaklasSession) -> dict[str, bool]:
-    """Serialize the current session's validated scene grammar."""
+def _scene_capabilities(session: SaklasSession) -> tuple[bool, bool, bool]:
+    """The current session's validated scene grammar, as three flags."""
     grammar = session.scene_grammar
-    return {
-        "scene_mode": grammar is not None,
-        "thinking_input_supported": bool(
-            grammar is not None and isinstance(grammar.think_open, str)
-        ),
-        "strips_history_thinking": bool(
-            grammar is not None and grammar.strips_history_thinking is True
-        ),
-    }
+    return (
+        grammar is not None,
+        bool(grammar is not None and isinstance(grammar.think_open, str)),
+        bool(grammar is not None and grammar.strips_history_thinking is True),
+    )
 
 
 def session_info(
     session: SaklasSession,
     default_steering: Steering | None,
     created_ts: int,
-) -> dict[str, Any]:
+) -> SessionInfo:
     device, dtype = device_dtype(session)
     thinks = bool(supports_thinking(session.tokenizer))
     thinks_optional = bool(thinking_is_optional(session.tokenizer))
@@ -112,6 +108,7 @@ def session_info(
     assistant_role_ok, user_role_ok = role_support(session)
     default_assistant_role, default_user_role = default_role_labels(session)
     jlens_fitted = session.has_compatible_jlens()
+    scene_mode, thinking_input, strips_history_thinking = _scene_capabilities(session)
     return {
         "id": "default",
         "model_id": session.model_id,
@@ -142,5 +139,7 @@ def session_info(
         # the seat toggle + free commit seating, thinking_input_supported
         # the committed-thinking box, strips_history_thinking its
         # "lasts one turn" pre-submit warning.
-        **_scene_capabilities(session),
+        "scene_mode": scene_mode,
+        "thinking_input_supported": thinking_input,
+        "strips_history_thinking": strips_history_thinking,
     }

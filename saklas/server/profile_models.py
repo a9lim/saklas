@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from saklas.core.profile import Profile
 from saklas.server.native_common import NativeRequest
+from saklas.server.response_models import VectorInfo
 
 
 class ExtractRequest(NativeRequest):
@@ -33,7 +34,7 @@ class BakeProfileRequest(NativeRequest):
     expression: str
 
 
-def profile_to_json(name: str, profile: Profile) -> dict[str, Any]:
+def profile_to_json(name: str, profile: Profile) -> VectorInfo:
     return {
         "name": name,
         "layers": profile.layers,

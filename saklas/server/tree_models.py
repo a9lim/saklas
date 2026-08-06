@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from saklas.core.session import SaklasSession
 from saklas.server.native_common import NativeRequest
+from saklas.server.response_models import (
+    ActivePathJSON,
+    CastMemberJSON,
+    LoomNodeDetailJSON,
+    LoomTreeJSON,
+)
 
 
 class TreeNavigateRequest(NativeRequest):
@@ -68,7 +74,7 @@ class JointLogprobsRequest(NativeRequest):
     b_id: str
 
 
-def cast_json(session: SaklasSession) -> dict[str, Any]:
+def cast_json(session: SaklasSession) -> dict[str, CastMemberJSON]:
     """Serialize the effective auto-derived cast with configuration origin."""
     configured = session.tree.cast
     out: dict[str, Any] = {}
@@ -83,14 +89,14 @@ def cast_json(session: SaklasSession) -> dict[str, Any]:
     return out
 
 
-def tree_to_json(session: SaklasSession) -> dict[str, Any]:
+def tree_to_json(session: SaklasSession) -> LoomTreeJSON:
     """Serialize the session's loom tree to JSON with token payloads."""
-    out = session.tree.to_dict(include_tokens=True)
+    out = cast(LoomTreeJSON, session.tree.to_dict(include_tokens=True))
     out["cast"] = cast_json(session)
     return out
 
 
-def active_path_json(session: SaklasSession) -> dict[str, Any]:
+def active_path_json(session: SaklasSession) -> ActivePathJSON:
     tree = session.tree
     path = tree.active_path()
     messages: list[dict[str, str]] = []
@@ -100,16 +106,16 @@ def active_path_json(session: SaklasSession) -> dict[str, Any]:
             continue
         messages.append({"role": node.role, "content": node.text})
         node_ids.append(node.id)
-    return {
+    return cast(ActivePathJSON, {
         "active_node_id": tree.active_node_id,
         "rev": tree.rev,
         "messages": messages,
         "node_ids": node_ids,
-    }
+    })
 
 
-def node_json(session: SaklasSession, node_id: str) -> dict[str, Any]:
+def node_json(session: SaklasSession, node_id: str) -> LoomNodeDetailJSON:
     node = session.tree.get(node_id)
-    out = node.to_dict(include_tokens=True)
+    out = cast(LoomNodeDetailJSON, node.to_dict(include_tokens=True))
     out["children"] = list(session.tree.children_of.get(node_id, []))
     return out

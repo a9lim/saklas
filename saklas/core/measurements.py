@@ -73,6 +73,59 @@ class MeasurementBinding(TypedDict):
     layer: NotRequired[int | None]
 
 
+class DepthSummaryDict(TypedDict):
+    """Wire form of ``instruments.types.DepthSummary``.
+
+    ``basis`` travels with the numbers because ``center`` means three
+    mathematically unrelated things across the families.
+    """
+
+    center: list[float]
+    spread: list[float]
+    basis: str
+
+
+class ScalarReadingDict(TypedDict):
+    """Wire form of ``ScalarReading.to_dict()`` — the lens/SAE reading.
+
+    One value with an explicit ``unit``, its per-layer trace, and a depth
+    summary.  No geometry fields: a readout channel has no subspace behind
+    it.  ``meta`` is emitted only when the producer attached one.
+    """
+
+    value: float
+    unit: str
+    per_layer: dict[str, float]
+    depth: DepthSummaryDict | None
+    meta: NotRequired[dict[str, Any]]
+
+
+class ProbeReadingDict(TypedDict):
+    """Wire form of ``ProbeReading.to_dict()`` — the geometry reading.
+
+    The complete key set that serializer emits, in its order.  Declaring it
+    here (rather than as an anonymous ``dict[str, Any]`` on the channel)
+    is what lets the generated dashboard types name the geometry reading
+    instead of falling back to an opaque record.
+    """
+
+    fraction: float
+    nearest: list[tuple[str, float]]
+    coords: list[float]
+    residual: float
+    fraction_per_layer: dict[str, float]
+    coords_per_layer: dict[str, list[float]]
+    residual_per_layer: dict[str, float]
+    # The live serializer always emits these five, but a *persisted* loom
+    # row written before they existed does not, and the same wire type
+    # covers both — so they are optional on read.
+    assignment: NotRequired[list[tuple[str, float]]]
+    membership: NotRequired[float]
+    depth_com: NotRequired[list[float]]
+    depth_spread: NotRequired[list[float]]
+    subspace_coords_per_layer: NotRequired[dict[str, list[float]]]
+
+
 class LensReadoutToken(TypedDict):
     token: str
     id: int
@@ -108,19 +161,22 @@ class SaeReadout(TypedDict):
 
 
 class GeometryChannel(TypedDict):
-    readings: dict[str, Any] | None
+    # Never null: ``build_measurements`` creates the channel only when there
+    # are geometry readings to put in it, so the historical ``| None`` was
+    # defensive over-typing that every consumer then had to defend against.
+    readings: dict[str, ProbeReadingDict]
     binding: NotRequired[MeasurementBinding]
 
 
 class LensChannel(TypedDict):
     binding: MeasurementBinding
-    readings: NotRequired[dict[str, Any]]
+    readings: NotRequired[dict[str, ScalarReadingDict]]
     readout: NotRequired[LensReadout]
 
 
 class SaeChannel(TypedDict):
     binding: MeasurementBinding
-    readings: NotRequired[dict[str, Any]]
+    readings: NotRequired[dict[str, ScalarReadingDict]]
     readout: NotRequired[SaeReadout]
 
 
@@ -301,6 +357,7 @@ def build_measurements(
 
 
 __all__ = [
+    "DepthSummaryDict",
     "GeometryChannel",
     "Instruments",
     "LensAggregateToken",
@@ -314,8 +371,10 @@ __all__ = [
     "MeasurementScope",
     "Measurements",
     "MeasurementsEnvelope",
+    "ProbeReadingDict",
     "SaeChannel",
     "SaeFeature",
     "SaeReadout",
+    "ScalarReadingDict",
     "build_measurements",
 ]

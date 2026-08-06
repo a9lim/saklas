@@ -265,7 +265,7 @@ def register_ws_stream(app: FastAPI) -> None:
             # well as explicit configuration.  Inline the small effective
             # roster on every mutation so adds, deletes, and restores reconcile
             # identity without a refetch or provenance inference client-side.
-            mutated_payload["cast"] = cast_json(session)
+            mutated_payload["cast"] = cast(JSONValue, cast_json(session))
             _queue_tree_event(mutated_payload)
         loom_unsub = session.events.subscribe(_on_loom_event)
 

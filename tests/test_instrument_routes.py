@@ -331,7 +331,13 @@ class TestSources:
         )
         monkeypatch.setattr(
             "saklas.core.sae.list_sae_releases",
-            lambda _m: [{"release": "scope", "layer": 14}],
+            # A release row is keyed by ``release`` and carries ``layers``
+            # (plural) — the registry's own shape, not the prepared-source
+            # shape above.
+            lambda _m: [{
+                "release": "scope", "model": "test/model", "layers": [14],
+                "repo_id": None, "neuronpedia": False, "source": "saelens",
+            }],
         )
         resp = client.get(f"{_BASE}/sae/sources")
         assert resp.status_code == 200
@@ -723,14 +729,19 @@ class TestExtras:
 
     def test_sae_feature_validate(self, session_and_client: Any) -> None:
         session, client = session_and_client
+        # The double emits the full contract ``SaeFeatureValidationJSON`` —
+        # ``max_act`` is the strength unit and rides every real response, so a
+        # double that omits it would test a shape the server cannot produce.
         session.validate_sae_feature.return_value = {
-            "id": 42, "label": "fruit", "layer": 14,
+            "id": 42, "label": "fruit", "layer": 14, "max_act": None,
         }
         resp = client.post(
             f"{_BASE}/sae/features/validate", json={"id": 42},
         )
         assert resp.status_code == 200
-        assert resp.json() == {"id": 42, "label": "fruit", "layer": 14}
+        assert resp.json() == {
+            "id": 42, "label": "fruit", "layer": 14, "max_act": None,
+        }
         session.validate_sae_feature.assert_called_once_with(42)
 
     def test_sae_features_metadata(self, session_and_client: Any) -> None:

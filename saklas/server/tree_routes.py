@@ -5,13 +5,29 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 
 from saklas.server.app import acquire_session_lock
 from saklas.server.native_common import resolve_session_id
+from saklas.server.response_models import (
+    ActivePathJSON,
+    CastMemberResponse,
+    CastRosterResponse,
+    EdgeLabelResponse,
+    FilterMatchesJSON,
+    JointLogprobsJSON,
+    LoomNodeDetailJSON,
+    LoomTreeJSON,
+    NodeDiffJSON,
+    TranscriptLoadResponseJSON,
+    TranscriptResponse,
+    TreeBranchResponse,
+    TreeDeleteResponse,
+    TreeRestoreResponse,
+)
 from saklas.server.tree_models import (
     CastMemberRequest,
     JointLogprobsRequest,
@@ -36,7 +52,7 @@ def register_tree_routes(app: FastAPI) -> None:
     session = app.state.session
 
     @app.get("/saklas/v1/sessions/{session_id}/tree")
-    def get_tree(session_id: str):
+    def get_tree(session_id: str) -> LoomTreeJSON:
         """Full tree as JSON.
 
         Same shape :meth:`LoomTree.to_dict` produces. Surfaces hydrate
@@ -47,7 +63,9 @@ def register_tree_routes(app: FastAPI) -> None:
         return tree_to_json(session)
 
     @app.put("/saklas/v1/sessions/{session_id}/tree")
-    async def restore_tree(session_id: str, req: TreeRestoreRequest):
+    async def restore_tree(
+        session_id: str, req: TreeRestoreRequest,
+    ) -> TreeRestoreResponse:
         """Atomically restore a complete Loom tree from its JSON form.
 
         This is the inverse of the full-tree GET and backs the dashboard's
@@ -68,7 +86,7 @@ def register_tree_routes(app: FastAPI) -> None:
         }
 
     @app.get("/saklas/v1/sessions/{session_id}/tree/active")
-    def get_tree_active(session_id: str):
+    def get_tree_active(session_id: str) -> ActivePathJSON:
         """Active path: chat messages + parallel node-id list.
 
         Cheaper than the full tree for surfaces that only need the
@@ -79,7 +97,9 @@ def register_tree_routes(app: FastAPI) -> None:
         return active_path_json(session)
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/navigate")
-    async def tree_navigate(session_id: str, req: TreeNavigateRequest):
+    async def tree_navigate(
+        session_id: str, req: TreeNavigateRequest,
+    ) -> ActivePathJSON:
         """Re-point the active node.
 
         Free relative to in-flight generation (per the concurrency
@@ -91,7 +111,9 @@ def register_tree_routes(app: FastAPI) -> None:
         return active_path_json(session)
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/edit")
-    async def tree_edit(session_id: str, req: TreeEditRequest):
+    async def tree_edit(
+        session_id: str, req: TreeEditRequest,
+    ) -> LoomNodeDetailJSON:
         """In-place text replacement.
 
         409 when the node is in the reservation of an in-flight
@@ -103,7 +125,9 @@ def register_tree_routes(app: FastAPI) -> None:
         return node_json(session, req.node_id)
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/branch")
-    async def tree_branch(session_id: str, req: TreeBranchRequest):
+    async def tree_branch(
+        session_id: str, req: TreeBranchRequest,
+    ) -> TreeBranchResponse:
         """Always-sibling — create a new node next to ``node_id``.
 
         Allowed during in-flight generation; the new sibling sits on the
@@ -123,7 +147,9 @@ def register_tree_routes(app: FastAPI) -> None:
         }
 
     @app.delete("/saklas/v1/sessions/{session_id}/tree/{node_id}")
-    async def tree_delete(session_id: str, node_id: str):
+    async def tree_delete(
+        session_id: str, node_id: str,
+    ) -> TreeDeleteResponse:
         """Subtree delete.
 
         400 for the root delete; 409 when the subtree intersects an
@@ -138,7 +164,9 @@ def register_tree_routes(app: FastAPI) -> None:
         return {"removed": removed}
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/star")
-    async def tree_star(session_id: str, req: TreeStarRequest):
+    async def tree_star(
+        session_id: str, req: TreeStarRequest,
+    ) -> LoomNodeDetailJSON:
         """Toggle a node's ``starred`` flag.
 
         Decoration-only; never raises a concurrency conflict.
@@ -148,7 +176,9 @@ def register_tree_routes(app: FastAPI) -> None:
         return node_json(session, req.node_id)
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/note")
-    async def tree_note(session_id: str, req: TreeNoteRequest):
+    async def tree_note(
+        session_id: str, req: TreeNoteRequest,
+    ) -> LoomNodeDetailJSON:
         """Set a node's free-text ``notes`` annotation.
 
         Decoration-only; never raises a concurrency conflict.
@@ -158,7 +188,7 @@ def register_tree_routes(app: FastAPI) -> None:
         return node_json(session, req.node_id)
 
     @app.get("/saklas/v1/sessions/{session_id}/tree/cast")
-    def tree_cast(session_id: str):
+    def tree_cast(session_id: str) -> CastRosterResponse:
         """The tree's cast roster: label → member (recipe + notes).
 
         Also rides the full-tree GET (``cast`` key when non-empty) and
@@ -169,7 +199,9 @@ def register_tree_routes(app: FastAPI) -> None:
         return {"cast": cast_json(session)}
 
     @app.put("/saklas/v1/sessions/{session_id}/tree/cast/{label}")
-    async def tree_cast_put(session_id: str, label: str, req: CastMemberRequest):
+    async def tree_cast_put(
+        session_id: str, label: str, req: CastMemberRequest,
+    ) -> CastMemberResponse:
         """Create or replace the cast member under ``label``.
 
         Validates the label as a role slug and the steering expression's
@@ -212,7 +244,9 @@ def register_tree_routes(app: FastAPI) -> None:
         return Response(status_code=204)
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/transcript")
-    def tree_transcript(session_id: str, req: TreeTranscriptRequest):
+    def tree_transcript(
+        session_id: str, req: TreeTranscriptRequest,
+    ) -> TranscriptResponse:
         """Render the path ending at ``node_id`` (or active) as transcript YAML.
 
         Phase 5 producer: uses :meth:`Transcript.from_path` so probe
@@ -233,7 +267,7 @@ def register_tree_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/tree/transcript/load")
     async def tree_transcript_load(
         session_id: str, req: TreeTranscriptLoadRequest,
-    ):
+    ) -> TranscriptLoadResponseJSON:
         """Import a transcript YAML into the live session tree (phase 5).
 
         Wraps :meth:`Transcript.from_yaml` + :meth:`Transcript.import_into`.
@@ -292,8 +326,10 @@ def register_tree_routes(app: FastAPI) -> None:
             "guards": captured,
         }
 
-    @app.get("/saklas/v1/sessions/{session_id}/tree/edge_label")
-    def tree_edge_label(session_id: str, parent_id: str, child_id: str):
+    @app.get("/saklas/v1/sessions/{session_id}/tree/edge-label")
+    def tree_edge_label(
+        session_id: str, parent_id: str, child_id: str,
+    ) -> EdgeLabelResponse:
         """Steering-delta label for the parent → child edge (phase 5).
 
         Returns ``{"label": "<text>"}`` — empty string when the two
@@ -316,7 +352,7 @@ def register_tree_routes(app: FastAPI) -> None:
         return {"label": steering_delta(parent_expr, child_expr)}
 
     @app.get("/saklas/v1/sessions/{session_id}/tree/filter")
-    def tree_filter(session_id: str, expr: str = ""):
+    def tree_filter(session_id: str, expr: str = "") -> FilterMatchesJSON:
         """Apply a filter-grammar expression and return matching node ids.
 
         Grammar in :mod:`saklas.core.tree_filter` — comma-AND'd
@@ -339,7 +375,7 @@ def register_tree_routes(app: FastAPI) -> None:
         return {"expr": text, "matching_node_ids": sorted(matches)}
 
     @app.post("/saklas/v1/sessions/{session_id}/tree/diff")
-    def tree_diff(session_id: str, req: TreeDiffRequest):
+    def tree_diff(session_id: str, req: TreeDiffRequest) -> NodeDiffJSON:
         """Cross-branch diff between two generated nodes (phase 5).
 
         Returns a JSON view of :class:`NodeDiff` (text spans + readings
@@ -404,7 +440,7 @@ def register_tree_routes(app: FastAPI) -> None:
                 for sp in spans
             )
 
-        return {
+        return cast(NodeDiffJSON, {
             "a_id": diff.a_id,
             "b_id": diff.b_id,
             "parent_id": diff.parent_id,
@@ -438,10 +474,12 @@ def register_tree_routes(app: FastAPI) -> None:
                 for rd in diff.readings
             ],
             "per_token": per_token_spans,
-        }
+        })
 
-    @app.post("/saklas/v1/sessions/{session_id}/tree/joint_logprobs")
-    async def tree_joint_logprobs(session_id: str, req: JointLogprobsRequest):
+    @app.post("/saklas/v1/sessions/{session_id}/tree/joint-logprobs")
+    async def tree_joint_logprobs(
+        session_id: str, req: JointLogprobsRequest,
+    ) -> JointLogprobsJSON:
         """Cross-evaluation between two sibling generated nodes.
 
         Force-replays each branch under the node's stamped recipe, steering hooks, probe
@@ -490,4 +528,7 @@ def register_tree_routes(app: FastAPI) -> None:
                         compute_joint_logprobs, session, req.a_id, req.b_id,
                     )
                     cache[key] = hit
-        return reorient_for_request(hit, req.a_id, req.b_id).to_dict()
+        return cast(
+            JointLogprobsJSON,
+            reorient_for_request(hit, req.a_id, req.b_id).to_dict(),
+        )

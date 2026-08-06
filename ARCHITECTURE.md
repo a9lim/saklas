@@ -778,8 +778,11 @@ When extending Saklas, change the narrow owner first:
 - New model architecture: one layer accessor and focused model tests; avoid
   scattering model-type branches through capture and hooks.
 - New native endpoint: reuse a session/IO owner, register before the SPA, and
-  keep request/response types mirrored in `webui/src/lib/types.ts` if consumed
-  there.
+  annotate the return type with a `server/response_models.py` TypedDict — the
+  dashboard's REST types are generated from the emitted OpenAPI schema
+  (`scripts/generate_webui_types.py` → `webui/src/lib/types.gen.ts`), and CI
+  fails on an unregenerated diff. Request bodies and WS frames stay
+  hand-written in `webui/src/lib/types.ts`.
 - WebUI changes: edit `webui/src`, run the Svelte/theme checks, rebuild the
   committed `saklas/web/dist` bundle, and verify the production artifact.
 

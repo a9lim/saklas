@@ -24,6 +24,15 @@ from saklas.core.monitor_attach import AttachedManifoldProbe
 from saklas.core.session import SaklasSession
 from saklas.io.probes_bootstrap import load_default_manifolds
 from saklas.server.native_common import NativeRequest, resolve_session_id
+from saklas.server.response_models import (
+    GeometryProbeInfo,
+    LensProbeInfo,
+    ProbeDefaultsResponse,
+    ProbeGeometryResponse,
+    ProbeInfo,
+    ProbeListResponse,
+    SaeProbeInfo,
+)
 
 
 class ProbeRequest(NativeRequest):
@@ -34,7 +43,7 @@ class ProbeRequest(NativeRequest):
     top_n: int | None = None
 
 
-def _probe_info(name: str, probe: AttachedManifoldProbe) -> dict[str, Any]:
+def _probe_info(name: str, probe: AttachedManifoldProbe) -> GeometryProbeInfo:
     """Serialize one attached geometry probe (any rank) to JSON for the wire.
 
     Rows are discriminated by an explicit ``family`` key and carry only what
@@ -70,7 +79,7 @@ def _probe_info(name: str, probe: AttachedManifoldProbe) -> dict[str, Any]:
     }
 
 
-def _lens_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
+def _lens_probe_info(name: str, spec: dict[str, Any]) -> LensProbeInfo:
     """Serialize one pinned J-lens token probe (readout channel) to JSON.
 
     There is no subspace behind a readout probe, so the row carries no
@@ -96,7 +105,7 @@ def _lens_probe_specs(session: SaklasSession) -> dict[str, dict[str, Any]]:
     return session.lens.specs()
 
 
-def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
+def _sae_probe_info(name: str, spec: dict[str, Any]) -> SaeProbeInfo:
     """Serialize one pinned SAE feature probe (encoder readout channel).
 
     Same discipline as the lens row: no invented ``manifold``/``domain``/
@@ -126,10 +135,12 @@ def register_probe_routes(app: FastAPI) -> None:
     session = app.state.session
 
     @app.get("/saklas/v1/sessions/{session_id}/probes")
-    def list_probes(session_id: str):
+    def list_probes(session_id: str) -> ProbeListResponse:
         resolve_session_id(session_id)
         attached = session.monitor.attached_probes()
-        rows = [_probe_info(name, probe) for name, probe in attached.items()]
+        rows: list[ProbeInfo] = [
+            _probe_info(name, probe) for name, probe in attached.items()
+        ]
         rows.extend(
             _lens_probe_info(name, spec)
             for name, spec in _lens_probe_specs(session).items()
@@ -141,12 +152,12 @@ def register_probe_routes(app: FastAPI) -> None:
         return {"probes": rows}
 
     @app.get("/saklas/v1/sessions/{session_id}/probes/defaults")
-    def list_default_probes(session_id: str):
+    def list_default_probes(session_id: str) -> ProbeDefaultsResponse:
         resolve_session_id(session_id)
         return {"defaults": load_default_manifolds()}
 
     @app.get("/saklas/v1/sessions/{session_id}/probes/{name:path}/geometry")
-    def probe_geometry(session_id: str, name: str):
+    def probe_geometry(session_id: str, name: str) -> ProbeGeometryResponse:
         """Static geometry for the dashboard probe-inspector plot.
 
         Per-layer node centroids + neutral + (rank>=3) a top-3 PCA rotation +
@@ -162,7 +173,7 @@ def register_probe_routes(app: FastAPI) -> None:
             raise HTTPException(404, f"probe '{name}' not attached") from e
 
     @app.post("/saklas/v1/sessions/{session_id}/probes", status_code=201)
-    def add_probe(session_id: str, req: ProbeRequest):
+    def add_probe(session_id: str, req: ProbeRequest) -> ProbeInfo:
         resolve_session_id(session_id)
         if not req.selector or not req.selector.strip():
             raise HTTPException(400, "selector must not be empty")

@@ -51,6 +51,7 @@ import type {
   ScoreTemplateResponse,
   SaeFeatureMetaResponse,
   SessionInfo,
+  SourcesResponse,
   TemplateDetail,
   TemplateSummary,
   TranscriptLoadResponseJSON,
@@ -759,7 +760,7 @@ export const apiTree = {
     id: string = SESSION,
   ): Promise<{ label: string }> {
     const q = new URLSearchParams({ parent_id, child_id });
-    return request(`${SESSION_BASE(id)}/tree/edge_label?${q.toString()}`);
+    return request(`${SESSION_BASE(id)}/tree/edge-label?${q.toString()}`);
   },
   /** Apply a filter-grammar expression server-side and get the
    *  matching node id list back.  Empty ``expr`` returns []. */
@@ -823,7 +824,7 @@ export const apiTree = {
     id: string = SESSION,
   ): Promise<JointLogprobsJSON> {
     return request(
-      `${SESSION_BASE(id)}/tree/joint_logprobs`,
+      `${SESSION_BASE(id)}/tree/joint-logprobs`,
       jsonBody({ a_id, b_id }),
     );
   },
@@ -860,14 +861,7 @@ export const apiInstruments = {
   sources(
     family: InstrumentFamily,
     id: string = SESSION,
-  ): Promise<{
-    sources: InstrumentSourceJSON[];
-    releases?: {
-      release: string; model?: string | null; layers: number[];
-      repo_id?: string | null; neuronpedia?: boolean;
-      source?: "local" | "saelens";
-    }[];
-  }> {
+  ): Promise<SourcesResponse> {
     return request(`${SESSION_BASE(id)}/instruments/${family}/sources`);
   },
 

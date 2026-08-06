@@ -38,7 +38,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, NotRequired, TypedDict
+from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException
 from pydantic import Field, ValidationError
@@ -54,6 +54,20 @@ from saklas.server.background_job import (
     scrub_job_error,
 )
 from saklas.server.native_common import NativeRequest, resolve_session_id
+from saklas.server.response_models import (
+    InstrumentCapabilities,
+    InstrumentFamilyBlock,
+    InstrumentLiveState,
+    InstrumentSourceJSON,
+    InstrumentsResponse,
+    LensTokenValidationJSON,
+    PreparationStatusJSON,
+    SaeFeatureMetaResponse,
+    SaeFeatureValidationJSON,
+    SaeReleaseJSON,
+    SourceSwitchResponse,
+    SourcesResponse,
+)
 
 log = logging.getLogger(__name__)
 
@@ -61,70 +75,14 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Response shapes
 # ---------------------------------------------------------------------------
-# 51 strict *request* models and zero response models is how the wire
-# contract ended up maintained by hand in TypeScript.  These TypedDicts are
-# the Python-side declaration for this route tree; the route functions
-# annotate them and ``tests/test_measurements_envelope.py`` pins the exact
-# key sets, so a shape change that isn't mirrored fails a test rather than
-# a dashboard.
-
-class CapabilitiesBlock(TypedDict):
-    sources: bool
-    preparations: list[str]
-    token_readout: bool
-    source_switch: bool
-
-
-class FamilyBlock(TypedDict):
-    """One read family's state — the shared shape ``GET /instruments``
-    lists and ``session_info`` embeds."""
-
-    family: str
-    live: dict[str, Any]
-    source: str | None
-    probes: list[str]
-    capabilities: CapabilitiesBlock
-
-
-class InstrumentsResponse(TypedDict):
-    instruments: list[FamilyBlock]
-
-
-class SourcesResponse(TypedDict):
-    sources: list[dict[str, Any]]
-    releases: NotRequired[list[dict[str, Any]]]
-
-
-class SourceSwitchResponse(TypedDict):
-    source: str
-    live_layers: list[int]
-
-
-class PreparationProgress(TypedDict):
-    current: int | None
-    total: int | None
-    unit: str
-
-
-class PreparationStatus(TypedDict, total=False):
-    state: str
-    operation: str | None
-    progress: PreparationProgress | None
-    message: str | None
-    error: str | None
-    started_at: float | None
-    finished_at: float | None
-    cancellable: bool
-
-
-class LensTokenValidation(TypedDict):
-    word: str
-    token_id: int
-
-
-class SaeFeatureMetadataResponse(TypedDict):
-    features: dict[str, Any]
-
+# The wire contract used to be maintained by hand in TypeScript.  It now
+# lives in ``server/response_models.py`` as the Python-side declaration every
+# non-streaming native route annotates: FastAPI emits a real OpenAPI response
+# schema from it, ``scripts/generate_webui_types.py`` renders
+# ``webui/src/lib/types.gen.ts`` from that schema, and
+# ``tests/test_measurements_envelope.py`` pins the exact key sets — so a shape
+# change that isn't mirrored fails a test or the parity check rather than a
+# dashboard.
 
 @dataclass(frozen=True)
 class FamilyCapabilities:
@@ -146,7 +104,7 @@ class FamilyCapabilities:
     source_switch_error: "tuple[int, str] | None" = None
     preparations_error: "tuple[int, str] | None" = None
 
-    def to_dict(self) -> CapabilitiesBlock:
+    def to_dict(self) -> InstrumentCapabilities:
         return {
             "sources": self.sources,
             "preparations": list(self.preparations),
@@ -196,7 +154,7 @@ CAPABILITIES: dict[str, FamilyCapabilities] = {
 }
 
 
-def family_block(session: Any, family: str) -> FamilyBlock:
+def family_block(session: Any, family: str) -> InstrumentFamilyBlock:
     """The per-family wire block: ``{family, live, source, probes,
     capabilities}``.
 
@@ -219,7 +177,7 @@ def family_block(session: Any, family: str) -> FamilyBlock:
     }
 
 
-def instrument_families(session: Any) -> list[FamilyBlock]:
+def instrument_families(session: Any) -> list[InstrumentFamilyBlock]:
     """Every read family's block, in registry order."""
     return [family_block(session, family) for family in session.instruments]
 
@@ -446,7 +404,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         done_field: str | None,
         total_field: str | None,
         extras: tuple[str, ...],
-    ) -> PreparationStatus:
+    ) -> PreparationStatusJSON:
         st = job.status()
         running = bool(st.get("running"))
         error = st.get("error")
@@ -466,7 +424,7 @@ def register_instrument_routes(app: FastAPI) -> None:
                 "total": st.get(total_field),
                 "unit": unit,
             }
-        common: PreparationStatus = {
+        common: PreparationStatusJSON = {
             "state": state,
             "operation": operation,
             "progress": progress,
@@ -493,7 +451,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         ),
     }
 
-    def _idle_status() -> PreparationStatus:
+    def _idle_status() -> PreparationStatusJSON:
         return {
             "state": "idle",
             "operation": None,
@@ -505,7 +463,7 @@ def register_instrument_routes(app: FastAPI) -> None:
             "cancellable": False,
         }
 
-    def _prep_status(family: str) -> PreparationStatus:
+    def _prep_status(family: str) -> PreparationStatusJSON:
         specs = _JOB_SPECS.get(family)
         if not specs:
             return _idle_status()
@@ -556,7 +514,7 @@ def register_instrument_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/instruments/{family}/live")
     async def instrument_live(
         session_id: str, family: str, body: InstrumentLiveRequest,
-    ):
+    ) -> InstrumentLiveState:
         """Uniform live toggle: ``instrument.set_live(enabled, **extras)``.
 
         Family extras travel as keyword arguments and the *instrument*
@@ -603,7 +561,9 @@ def register_instrument_routes(app: FastAPI) -> None:
 
         return {
             "sources": [
-                {k: v for k, v in row.items() if k != "path"}
+                cast(InstrumentSourceJSON, {
+                    k: v for k, v in row.items() if k != "path"
+                })
                 for row in list_lens_sources(session.model_id)
             ],
         }
@@ -615,7 +575,12 @@ def register_instrument_routes(app: FastAPI) -> None:
         from saklas.io.sae import list_sae_sources
 
         rows = await asyncio.to_thread(list_sae_sources, session.model_id)
-        sources = [{k: v for k, v in row.items() if k != "path"} for row in rows]
+        sources = [
+            cast(InstrumentSourceJSON, {
+                k: v for k, v in row.items() if k != "path"
+            })
+            for row in rows
+        ]
         try:
             releases = await asyncio.to_thread(
                 list_sae_releases, session.model_id,
@@ -623,7 +588,10 @@ def register_instrument_routes(app: FastAPI) -> None:
         except SaklasError as exc:
             status, message = exc.user_message()
             raise HTTPException(status, message) from exc
-        return {"sources": sources, "releases": releases}
+        return {
+            "sources": sources,
+            "releases": cast(list[SaeReleaseJSON], releases),
+        }
 
     _SOURCE_LISTERS = {"lens": _lens_sources, "sae": _sae_sources}
 
@@ -647,7 +615,9 @@ def register_instrument_routes(app: FastAPI) -> None:
     # =====================================================================
 
     @app.put("/saklas/v1/sessions/{session_id}/instruments/{family}/source")
-    async def instrument_source(session_id: str, family: str, body: SourceRequest):
+    async def instrument_source(
+        session_id: str, family: str, body: SourceRequest,
+    ) -> SourceSwitchResponse:
         resolve_session_id(session_id)
         require_family(session, family)
         caps = CAPABILITIES[family]
@@ -816,7 +786,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         except Exception:
             log.exception("could not auto-enable live SAE after training")
 
-    def _start_lens_fetch(fields: dict[str, Any]) -> dict[str, Any]:
+    def _start_lens_fetch(fields: dict[str, Any]) -> PreparationStatusJSON:
         body = LensFetchRequest(**fields)
         lens_fetch_job.refuse_if_busy()
         lens_fetch_job.start(
@@ -827,7 +797,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         )
         return _prep_status("lens")
 
-    def _start_lens_fit(fields: dict[str, Any]) -> dict[str, Any]:
+    def _start_lens_fit(fields: dict[str, Any]) -> PreparationStatusJSON:
         from saklas.core.jlens import JacobianLensCancelled
 
         body = LensFitRequest(**fields)
@@ -856,7 +826,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         )
         return _prep_status("lens")
 
-    def _start_sae_fetch(fields: dict[str, Any]) -> dict[str, Any]:
+    def _start_sae_fetch(fields: dict[str, Any]) -> PreparationStatusJSON:
         body = SaeFetchRequest(**fields)
         sae_load_job.refuse_if_busy()
         source = body.release.strip()
@@ -871,7 +841,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         )
         return _prep_status("sae")
 
-    def _start_sae_train(fields: dict[str, Any]) -> dict[str, Any]:
+    def _start_sae_train(fields: dict[str, Any]) -> PreparationStatusJSON:
         from saklas.core.sae_training import SaeTrainingCancelled
 
         body = SaeTrainRequest(**fields)
@@ -920,7 +890,9 @@ def register_instrument_routes(app: FastAPI) -> None:
         "/saklas/v1/sessions/{session_id}/instruments/{family}/preparations",
         status_code=202,
     )
-    async def preparations_start(session_id: str, family: str, body: dict[str, Any]):
+    async def preparations_start(
+        session_id: str, family: str, body: dict[str, Any],
+    ) -> PreparationStatusJSON:
         resolve_session_id(session_id)
         require_family(session, family)
         caps = CAPABILITIES[family]
@@ -948,7 +920,9 @@ def register_instrument_routes(app: FastAPI) -> None:
     @app.get(
         "/saklas/v1/sessions/{session_id}/instruments/{family}/preparations",
     )
-    def preparations_status(session_id: str, family: str):
+    def preparations_status(
+        session_id: str, family: str,
+    ) -> PreparationStatusJSON:
         resolve_session_id(session_id)
         require_family(session, family)
         caps = CAPABILITIES[family]
@@ -962,7 +936,9 @@ def register_instrument_routes(app: FastAPI) -> None:
     @app.delete(
         "/saklas/v1/sessions/{session_id}/instruments/{family}/preparations",
     )
-    async def preparations_cancel(session_id: str, family: str):
+    async def preparations_cancel(
+        session_id: str, family: str,
+    ) -> PreparationStatusJSON:
         resolve_session_id(session_id)
         require_family(session, family)
         caps = CAPABILITIES[family]
@@ -1050,7 +1026,7 @@ def register_instrument_routes(app: FastAPI) -> None:
     )
     def validate_lens_token(
         session_id: str, body: LensTokenValidationRequest,
-    ) -> LensTokenValidation:
+    ) -> LensTokenValidationJSON:
         """Read-only single-token check for the J-lens steer/probe add forms."""
         resolve_session_id(session_id)
         word = body.word.strip()
@@ -1065,7 +1041,9 @@ def register_instrument_routes(app: FastAPI) -> None:
     @app.post(
         "/saklas/v1/sessions/{session_id}/instruments/sae/features/validate",
     )
-    def sae_feature_validate(session_id: str, body: SaeFeatureRequest):
+    def sae_feature_validate(
+        session_id: str, body: SaeFeatureRequest,
+    ) -> SaeFeatureValidationJSON:
         resolve_session_id(session_id)
         try:
             return session.validate_sae_feature(body.id)
@@ -1078,7 +1056,7 @@ def register_instrument_routes(app: FastAPI) -> None:
     )
     async def sae_features_metadata(
         session_id: str, body: SaeFeatureMetaRequest,
-    ) -> SaeFeatureMetadataResponse:
+    ) -> SaeFeatureMetaResponse:
         """Fetch-and-cache Neuronpedia metadata (label + maxActApprox).
 
         Network + disk-cache only (no model use), so it deliberately does not
