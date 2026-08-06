@@ -1373,12 +1373,17 @@ def _fmt_number(x: float) -> str:
 def referenced_selectors(
     text: str,
 ) -> list[tuple[Optional[str], str, str]]:
-    """Return every ``(namespace, concept, variant)`` referenced in ``text``.
+    """Return every **concept atom** ``(namespace, concept, variant)`` in ``text``.
 
     Walks the AST before pole resolution so namespace prefixes survive —
     useful at install time, when the CLI needs to know which pack to fetch
     for each atom.  Projection terms contribute two entries (base + onto).
-    Manifold terms are skipped — a manifold name is not a concept.
+
+    Concept atoms *only*: a ``%`` manifold term names an artifact, not a
+    concept, and is skipped.  A caller preflighting artifacts (rather than
+    concepts) — deciding what to fetch or register before a generation — has
+    to handle manifold terms itself by walking ``parse_expr(text).alphas``
+    for :class:`ManifoldTerm` values.
     """
     if not text or not text.strip():
         return []

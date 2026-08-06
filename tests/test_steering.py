@@ -81,3 +81,71 @@ def test_normalized_entries_coerces_int_alpha_to_float():
     entries = s.normalized_entries()
     assert entries == {"foo": (1.0, Trigger.BOTH)}
     assert isinstance(entries["foo"][0], float)
+
+
+# ---------------------------------------------------------------------------
+# classified(): one walk, three consumer shapes.
+#
+# normalized_entries silently drops AblationTerm and ManifoldTerm while
+# calling itself "the canonical form", which forced its caller to re-walk
+# ``alphas`` twice more to recover them.  classified() is the single pass.
+# ---------------------------------------------------------------------------
+
+
+def _mixed_steering() -> Steering:
+    from saklas.core.steering_expr import AblationTerm, ManifoldTerm, ProjectedTerm
+
+    return Steering(alphas={
+        "bare": 0.3,
+        "tuple": (0.4, Trigger.AFTER_THINKING),
+        "a~b": ProjectedTerm(
+            coeff=0.5, trigger=Trigger.GENERATED_ONLY,
+            operator="~", base="a", onto="b",
+        ),
+        "!gone": AblationTerm(
+            coeff=1.0, trigger=Trigger.BOTH, target="gone",
+        ),
+        "personas%hacker": ManifoldTerm(
+            along=0.6, onto=0.2, trigger=Trigger.BOTH,
+            manifold="personas", position="hacker",
+        ),
+    })
+
+
+def test_classified_splits_every_entry_kind():
+    from saklas.core.steering_expr import AblationTerm, ManifoldTerm
+
+    entries = _mixed_steering().classified()
+
+    assert entries.additive == {
+        "bare": (0.3, Trigger.BOTH),
+        "tuple": (0.4, Trigger.AFTER_THINKING),
+        "a~b": (0.5, Trigger.GENERATED_ONLY),
+    }
+    assert set(entries.ablations) == {"!gone"}
+    assert isinstance(entries.ablations["!gone"], AblationTerm)
+    assert entries.ablations["!gone"].target == "gone"
+    assert set(entries.manifolds) == {"personas%hacker"}
+    manifold_term = entries.manifolds["personas%hacker"]
+    assert isinstance(manifold_term, ManifoldTerm)
+    # The along/onto split survives — it is exactly what the additive
+    # flattening cannot carry.
+    assert manifold_term.along == 0.6
+    assert manifold_term.onto == 0.2
+
+
+def test_classified_groups_are_key_disjoint_and_total():
+    steering = _mixed_steering()
+    entries = steering.classified()
+    keys = (
+        set(entries.additive) | set(entries.ablations) | set(entries.manifolds)
+    )
+    assert keys == set(steering.alphas)
+    assert len(entries.additive) + len(entries.ablations) + len(entries.manifolds) == len(
+        steering.alphas
+    )
+
+
+def test_normalized_entries_is_the_additive_view():
+    steering = _mixed_steering()
+    assert steering.normalized_entries() == steering.classified().additive

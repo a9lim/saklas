@@ -104,21 +104,23 @@ class Steering:
             f"got {type(value).__name__}"
         )
 
-    def normalized_entries(self) -> "dict[str, tuple[float, Trigger]]":
-        """Return a plain ``{name: (alpha, trigger)}`` dict.
+    def classified(self) -> "SteeringEntries":
+        """Split ``alphas`` into its three consumer shapes in one walk.
 
-        Every entry carries an explicit trigger: tuple entries keep their
-        per-entry trigger, bare-float entries take ``self.trigger``, and
-        :class:`~saklas.core.steering_expr.ProjectedTerm` values flatten
-        to ``(coeff, term.trigger)``.  This is the canonical form consumed
-        by the session's steering stack and the hook manager — everything
-        downstream of pole resolution works in this shape.  Synthetic
-        projection keys (``"<base><op><onto>"``) pass through verbatim;
-        the session is responsible for materializing the derived profile
-        before the manager sees the key.  ``AblationTerm`` and
-        ``ManifoldTerm`` values are skipped — ablation and manifold
-        steering are dispatched directly off ``Steering.alphas`` at the
-        session layer rather than through this flattened view.
+        The five entry kinds lower to three: plain floats and
+        ``(alpha, Trigger)`` tuples and
+        :class:`~saklas.core.steering_expr.ProjectedTerm` values all become
+        ``{key: (alpha, trigger)}`` additive entries (a projection's
+        ``operator``/``base``/``onto`` fields are consumed earlier, when the
+        session materializes the derived profile under the synthetic key);
+        :class:`~saklas.core.steering_expr.AblationTerm` and
+        :class:`~saklas.core.steering_expr.ManifoldTerm` values are kept whole,
+        because their extra fields (the ablation target, the manifold's
+        ``along``/``onto`` split and position) have no place in the additive
+        shape.  Keys stay verbatim and live in disjoint namespaces
+        (``<name>`` / ``<base><op><onto>`` / ``!<target>`` /
+        ``<manifold>%<position>``), so a caller can merge the three back into
+        one dict without collision.
         """
         from saklas.core.steering_expr import (
             AblationTerm,
@@ -126,21 +128,52 @@ class Steering:
             ProjectedTerm,
         )
 
-        out: dict[str, tuple[float, Trigger]] = {}
+        additive: dict[str, tuple[float, Trigger]] = {}
+        ablations: dict[str, "AblationTerm"] = {}
+        manifolds: dict[str, "ManifoldTerm"] = {}
         default = self.trigger
         for name, val in self.alphas.items():
-            if isinstance(val, (AblationTerm, ManifoldTerm)):
-                continue
-            if isinstance(val, ProjectedTerm):
-                out[name] = (float(val.coeff), val.trigger)
-                continue
-            if isinstance(val, tuple):
+            if isinstance(val, AblationTerm):
+                ablations[name] = val
+            elif isinstance(val, ManifoldTerm):
+                manifolds[name] = val
+            elif isinstance(val, ProjectedTerm):
+                additive[name] = (float(val.coeff), val.trigger)
+            elif isinstance(val, tuple):
                 alpha, trig = val
-                out[name] = (float(alpha), trig)
-                continue
-            out[name] = (float(val), default)
-        return out
+                additive[name] = (float(alpha), trig)
+            else:
+                additive[name] = (float(val), default)
+        return SteeringEntries(
+            additive=additive, ablations=ablations, manifolds=manifolds,
+        )
+
+    def normalized_entries(self) -> "dict[str, tuple[float, Trigger]]":
+        """Return just the **additive** view: ``{name: (alpha, trigger)}``.
+
+        The additive third of :meth:`classified` — plain, tuple and projection
+        entries with an explicit trigger each (bare floats take
+        ``self.trigger``).  Ablation and manifold entries are absent; reach for
+        :meth:`classified` when you need them, rather than re-walking
+        ``alphas`` alongside this view.
+        """
+        return self.classified().additive
 
     def __str__(self) -> str:
         from saklas.core.steering_expr import format_expr
         return format_expr(self)
+
+
+@dataclass(frozen=True)
+class SteeringEntries:
+    """The three consumer shapes :meth:`Steering.classified` splits into.
+
+    ``additive`` is the ``{key: (alpha, trigger)}`` view every scalar term
+    lowers to; ``ablations`` and ``manifolds`` keep their term objects whole
+    because their extra fields don't survive that flattening.  Keys are the
+    verbatim ``Steering.alphas`` keys and the three groups are key-disjoint.
+    """
+
+    additive: dict[str, tuple[float, Trigger]]
+    ablations: "dict[str, AblationTerm]"
+    manifolds: "dict[str, ManifoldTerm]"
