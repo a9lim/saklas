@@ -61,13 +61,14 @@ steered forward.
 | Hidden capture | `core/hooks.py::HiddenCapture` | Retains the minimum layer/time slices selected by the session planner. |
 | Read protocol | `core/instruments/` | Three instrument families under one prepare/plan/bind/observe contract. |
 | Geometry reads | `core/monitor.py` | Mahalanobis coordinates, distances, assignments, membership, and per-layer traces. |
-| J-lens | `core/jlens.py` | Fit, transport, readout, token directions, and J-space decomposition. |
+| J-lens | `core/jlens.py`, `core/jlens_fit.py` | Readout, transport, token directions, and J-space decomposition; the fit estimator lives in its own module so importing the readout never loads it. |
 | SAE runtime/training | `core/sae.py`, `core/sae_training.py` | External or local sources, feature readout, and decoder-row steering. |
 | Result shapes | `core/results.py`, `core/measurements.py`, `core/token_payloads.py` | Python results and the canonical read-side wire envelope. |
 | Conversation state | `core/loom.py` | Branching authored/generated nodes, recipes, raw tokens, measurements, cast, and persistence. |
 | Artifact I/O | `io/` | Exact schemas, selectors, integrity, atomic publication, Hugging Face distribution, and lifecycle. |
 | HTTP/WebSocket protocols | `server/` | Thin validation/serialization layers over one session. |
 | Dashboard | `webui/`, `saklas/web/` | Svelte source plus the committed production bundle served last as an SPA. |
+| Notebook figures | `saklas/notebook/` | Plotly/pandas helpers over the public result types; optional `[notebook]` extra. |
 
 The main dependency direction is `server/cli/web -> session -> core + io`. Pure
 geometry in `core/manifold.py` does not import the session or persistence layer;
@@ -418,9 +419,19 @@ The registry `session.instruments` contains:
 
 Geometry readings use `ProbeReading`: coordinates, fraction, nearest labels,
 residual, membership/assignment, per-layer coordinates, and depth summaries.
-Lens and SAE implement their honest internal result as `ScalarReading`, then
-bridge it to the shared `ProbeReading` wire/result shape with non-applicable
-geometry fields neutralized.
+Lens and SAE readings are `ScalarReading`s — one value with an explicit unit,
+a per-layer trace, and a depth summary that names its mass basis — and the
+measurement envelope carries that native shape. The `ProbeReading` bridge
+exists only at the vendor-extension boundary (`TokenEvent.probe_readings` and
+the OpenAI/Ollama `x-saklas-probe-readings` header), never on the native
+per-token wire.
+
+All three families implement one instrument contract
+(`core/instruments/protocol.py`): probe registry access, `set_live`/`live_state`
+returning a per-family frozen `LiveState`, `active_source`, gate validation,
+probe hashing, and `token_readout` returning the finished replay envelope. The
+`session.instruments` registry is the family enumeration the server dispatch,
+the composer's gate preflight, and the token-payload slots all derive from.
 
 The J-lens readout computes `softmax(W_U * norm(J_l h_l))` at each fitted layer.
 Its aggregate strength is the mean per-layer probability for a token; depth
