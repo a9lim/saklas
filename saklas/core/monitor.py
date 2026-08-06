@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import re
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
+from saklas.core.instruments.types import parse_gate_ref
 from saklas.core.manifold import BoxDomain, invert_parameterization
 from saklas.core.monitor_attach import (
     DEFAULT_NEAREST_TOP_N,
@@ -127,7 +127,6 @@ class Monitor:
     """
 
     def __init__(self, probe_manifolds: dict[str, "Manifold"] | None = None,
-                 layer_means: dict[int, torch.Tensor] | None = None,
                  whitener: Any = None,
                  n_layers: int | None = None):
         """
@@ -135,19 +134,17 @@ class Monitor:
             concept axis or rank-R discover fit).  Ad-hoc baked directions
             are wrapped into a 1-pole affine manifold by the session before
             registration (``fold_directions_to_subspace``).
-        layer_means: maps layer_idx -> neutral mean activation (kept for
-            init-signature parity with :class:`Monitor`; the
-            coordinate readout centers on each fit's own ``LayerSubspace.mean``,
-            not the global layer mean, so this is not consulted on the hot
-            path — only exposed via the ``layer_means`` property).
         whitener: the :class:`~saklas.core.mahalanobis.LayerWhitener`;
             mandatory at scoring time (covers every probed layer or raise).
         n_layers: the model's block count — the depth axis for the
             ``depth_com``/``depth_spread`` reading statistics.  ``None``
             (direct-constructed test monitors) leaves them empty.
+
+        There is no per-layer neutral-mean input: the coordinate readout
+        centers on each fit's own ``LayerSubspace.mean``, and the whitener
+        carries the neutral statistics the metric needs.
         """
         self._probes: dict[str, AttachedManifoldProbe] = {}
-        self._layer_means: dict[int, torch.Tensor] = dict(layer_means) if layer_means else {}
         self._whitener: Any = whitener
         # Depth denominator for _depth_stats: layer / (n_layers − 1) ∈ [0, 1].
         self._depth_denom: float = (
@@ -241,17 +238,6 @@ class Monitor:
         for probe in probes:
             out.update(probe.manifold.layers.keys())
         return out
-
-    @property
-    def layer_means(self) -> dict[int, torch.Tensor]:
-        return self._layer_means
-
-    @layer_means.setter
-    def layer_means(self, value: dict[int, torch.Tensor]) -> None:
-        value_in: Any = value
-        if value_in is not None and not isinstance(value_in, dict):
-            raise TypeError(f"layer_means must be a dict, got {type(value).__name__}")
-        self._layer_means = dict(value) if value else {}
 
     @property
     def whitener(self) -> Any:
@@ -830,13 +816,21 @@ class Monitor:
         *,
         probe_names: set[str] | None = None,
     ) -> tuple[_ProbeGateScalarPlan, ...]:
-        """Pre-parse exact monitor gate scalar keys for the decode hot path."""
+        """Pre-parse exact monitor gate scalar keys for the decode hot path.
+
+        ``probe_names`` narrows the plan to a caller-supplied roster subset;
+        without it the probe names are recovered from the keys through
+        :func:`parse_gate_ref`, the one place the scalar-key discrimination
+        lives.  A char-class split would truncate a variant-suffixed probe
+        name (``pirate:role-x`` at ``:role-x``) and silently plan nothing for
+        it, so the gate would never fire.
+        """
         if not gate_keys or not self._probes:
             return ()
         names = (
             set(probe_names)
             if probe_names is not None
-            else {re.split(r"[\[:@~]", k, maxsplit=1)[0] for k in gate_keys}
+            else {parse_gate_ref(k).probe for k in gate_keys}
         )
         plans: list[_ProbeGateScalarPlan] = []
         for name, probe in self._probes.items():
@@ -846,21 +840,6 @@ class Monitor:
             if plan is not None:
                 plans.append(plan)
         return tuple(plans)
-
-    def _score_probe_gate_scalars(
-        self,
-        probe: "AttachedManifoldProbe",
-        hidden_per_layer: dict[int, torch.Tensor],
-        gate_keys: set[str],
-        sih_cache: dict[int, torch.Tensor] | None = None,
-    ) -> dict[str, float]:
-        """Score only the exact scalar channels a probe gate consumes."""
-        plan = self._plan_probe_gate_scalars(probe, gate_keys)
-        if plan is None:
-            return {}
-        return self._score_planned_probe_gate_scalars(
-            probe, hidden_per_layer, plan, sih_cache,
-        )
 
     def _score_planned_probe_gate_scalars(
         self,
@@ -1057,7 +1036,12 @@ class Monitor:
         hidden_per_layer: dict[int, torch.Tensor],
         plan: tuple[_ProbeGateScalarPlan, ...],
     ) -> dict[str, float]:
-        """Score a pre-parsed gate scalar plan without rebuilding key maps."""
+        """Score a pre-parsed gate scalar plan without rebuilding key maps.
+
+        The gate path is deliberately two calls: :meth:`plan_gate_scalars`
+        parses the key space once per generation, this scores that plan every
+        token.  Only the probes a gate key references do any work.
+        """
         if not hidden_per_layer or not self._probes or not plan:
             return {}
         sih_cache: dict[int, torch.Tensor] = {}
@@ -1072,23 +1056,6 @@ class Monitor:
                 )
             )
         return out
-
-    def score_gate_scalars(
-        self,
-        hidden_per_layer: dict[int, torch.Tensor],
-        gate_keys: set[str],
-        *,
-        probe_names: set[str] | None = None,
-    ) -> dict[str, float]:
-        """Return exact gate scalar keys without building full readings."""
-        if not hidden_per_layer or not self._probes or not gate_keys:
-            return {}
-        # Only the probes a gate key actually references do any work (FIX F3).
-        # Compatibility callers build a one-shot plan; generation's
-        # GATING_SUBSET hot path builds this once per generation and calls
-        # ``score_planned_gate_scalars`` each token.
-        plan = self.plan_gate_scalars(gate_keys, probe_names=probe_names)
-        return self.score_planned_gate_scalars(hidden_per_layer, plan)
 
     def _subspace_coords_for(
         self,
@@ -1679,24 +1646,6 @@ class Monitor:
             hidden_per_layer, accumulate=False, only=only,
             coords_only=coords_only,
         )
-
-    def score_single_token_per_layer(
-        self,
-        hidden_per_layer: dict[int, torch.Tensor],
-    ) -> dict[int, dict[str, float]]:
-        """Per-layer × per-probe domain coordinate (axis 0) for a single token.
-
-        ``{layer_idx: {probe_name: coord}}`` — the un-aggregated axis-0
-        domain coordinate per layer, a view over the full reading's
-        ``coords_per_layer``.  Now covers curved probes too (their per-layer
-        coords fall out of the foot solve), not just the affine roster.
-        """
-        readings = self._score_full(hidden_per_layer)
-        out: dict[int, dict[str, float]] = {}
-        for name, reading in readings.items():
-            for layer_idx, coord in reading.coords_per_layer.items():
-                out.setdefault(layer_idx, {})[name] = coord[0] if coord else 0.0
-        return out
 
     def measure_from_hidden(
         self, hidden_per_layer: dict[int, torch.Tensor], accumulate: bool = True,

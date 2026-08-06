@@ -288,7 +288,7 @@ class TestTraitMonitor:
                 "sad", dict(sad_profile), dict(layer_means), whitener=whit,
             ),
         }
-        monitor = Monitor(probe_profiles, layer_means, whitener=whit)
+        monitor = Monitor(probe_profiles, whitener=whit)
 
         # Steer toward happy
         mgr = SteeringManager()

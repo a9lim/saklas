@@ -1105,7 +1105,7 @@ class TestScoreSingleToken:
         m = fold_directions_to_subspace(
             "test_probe", {0: probe_vec}, means, whitener=whit,
         )
-        monitor = Monitor({"test_probe": m}, means, whitener=whit)
+        monitor = Monitor({"test_probe": m}, whitener=whit)
 
         hidden = {0: torch.randn(dim)}
         scores = monitor.score_single_token(hidden)
@@ -1130,7 +1130,7 @@ class TestScoreSingleToken:
             "p1", {0: torch.randn(dim), 1: torch.randn(dim)}, means,
             whitener=whit,
         )
-        monitor = Monitor({"p1": m}, means, whitener=whit)
+        monitor = Monitor({"p1": m}, whitener=whit)
 
         hidden = {0: torch.randn(dim), 1: torch.randn(dim)}
         single = monitor.score_single_token(hidden)

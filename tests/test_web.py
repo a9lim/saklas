@@ -278,14 +278,22 @@ class TestRemovedDashboardSurfaces:
 
 
 # ---------------------------------------------------------------------------
-# monitor.score_single_token_per_layer — un-aggregated heatmap source.
+# The un-aggregated per-layer heatmap view: the token payload's
+# ``per_layer_scores``, derived from a full reading's ``coords_per_layer``.
 # ---------------------------------------------------------------------------
 
 
-class TestScoreSingleTokenPerLayer:
+def _per_layer_scores(monitor: Any, hidden: dict[int, Any]) -> dict[str, Any]:
+    """The heatmap row the token tap writes, from a live single-token read."""
+    from saklas.core.token_payloads import _per_layer_axis0
+
+    return _per_layer_axis0(monitor.score_single_token(hidden)) or {}
+
+
+class TestPerLayerScores:
     def test_returns_per_layer_per_probe_dict(self) -> None:
-        # Build a real TraitMonitor, register two probes that share
-        # layer 0, score against a hidden state.  No torch model needed.
+        # Two probes sharing layer 0, scored against a hidden state.  No
+        # torch model needed.
         from saklas.core.monitor import Monitor
         from saklas.core.capture import fold_directions_to_subspace
 
@@ -306,17 +314,17 @@ class TestScoreSingleTokenPerLayer:
                 means, whitener=whit,
             ),
         }
-        monitor = Monitor(probes, layer_means=means, whitener=whit)
+        monitor = Monitor(probes, whitener=whit)
 
         hidden = {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}
-        result = monitor.score_single_token_per_layer(hidden)
+        result = _per_layer_scores(monitor, hidden)
 
-        assert 0 in result
-        assert set(result[0].keys()) == {"honest", "warm"}
+        assert "0" in result
+        assert set(result["0"].keys()) == {"honest", "warm"}
         # Hidden aligns with the honest direction (coord ≈ 1 at the pole);
         # warm is orthogonal (coord ≈ 0 under isotropic Σ).
-        assert result[0]["honest"] == pytest.approx(1.0, abs=0.1)
-        assert result[0]["warm"] == pytest.approx(0.0, abs=0.1)
+        assert result["0"]["honest"] == pytest.approx(1.0, abs=0.1)
+        assert result["0"]["warm"] == pytest.approx(0.0, abs=0.1)
 
     def test_empty_input_returns_empty(self) -> None:
         from saklas.core.monitor import Monitor
@@ -329,8 +337,8 @@ class TestScoreSingleTokenPerLayer:
             "honest", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, means,
             whitener=whit,
         )
-        monitor = Monitor({"honest": m}, layer_means=means, whitener=whit)
-        assert monitor.score_single_token_per_layer({}) == {}
+        monitor = Monitor({"honest": m}, whitener=whit)
+        assert _per_layer_scores(monitor, {}) == {}
 
     def test_layers_outside_probe_cache_omitted(self) -> None:
         from saklas.core.monitor import Monitor
@@ -343,12 +351,11 @@ class TestScoreSingleTokenPerLayer:
             "honest", {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, means,
             whitener=whit,
         )
-        monitor = Monitor({"honest": m}, layer_means=means, whitener=whit)
+        monitor = Monitor({"honest": m}, whitener=whit)
         # Hidden state at layer 1, but honest only covers layer 0.
         hidden = {1: torch.tensor([1.0, 0.0, 0.0, 0.0])}
-        result = monitor.score_single_token_per_layer(hidden)
         # Layer 1 has no probe coverage; output omits it entirely.
-        assert result == {}
+        assert _per_layer_scores(monitor, hidden) == {}
 
 
 # ---------------------------------------------------------------------------

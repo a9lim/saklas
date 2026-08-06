@@ -69,7 +69,7 @@ def _probe_manifold(
 def _monitor_with_probe() -> Monitor:
     """A monitor with a single axis-0 ray probe on layer 0, covered by a whitener."""
     m = _probe_manifold({0: _PROBE0.clone()}, _MEANS0, _WHIT0)
-    return Monitor({"x": m}, layer_means=dict(_MEANS0), whitener=_WHIT0)
+    return Monitor({"x": m}, whitener=_WHIT0)
 
 
 def test_score_stack_aligned_beats_anti_aligned():
@@ -310,7 +310,7 @@ def test_anisotropic_whitened_read_downweights_high_variance_axis():
         "x", {0: torch.tensor([0.0, 1.0, 0.0, 0.0])}, {0: mean},
         whitener=whitener,
     )
-    maha = Monitor({"x": m}, layer_means={0: mean}, whitener=whitener)
+    maha = Monitor({"x": m}, whitener=whitener)
     # A hidden along the probe (low-var axis) reads strongly; one along the
     # high-var axis reads weakly under the whitened metric.
     on_probe = maha.measure_from_hidden(
@@ -341,7 +341,7 @@ def test_set_whitener_invalidates_cache_and_switches_metric():
 
     direction = {0: torch.tensor([1.0, 1.0, 0.0, 0.0]) / (2 ** 0.5)}
     m = fold_directions_to_subspace("x", direction, {0: mean}, whitener=whit_a)
-    mon = Monitor({"x": m}, layer_means={0: mean}, whitener=whit_a)
+    mon = Monitor({"x": m}, whitener=whit_a)
     h = {0: torch.tensor([10.0, 0.5, 0.0, 0.0]) + mean}
     before = mon.measure_from_hidden(h, accumulate=False)["x"].coords[0]
     assert mon.whitener is whit_a

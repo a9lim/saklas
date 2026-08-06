@@ -1425,7 +1425,7 @@ class SaklasSession:
         # ``TriggerContext.probe_scores`` so ``@when:`` gates fire on any probe
         # without grammar changes.
         self._monitor = Monitor(
-            probe_manifolds, self._layer_means, whitener=self._whitener,
+            probe_manifolds, whitener=self._whitener,
             n_layers=len(self._layers),
         )
 
@@ -6606,7 +6606,6 @@ class SaklasSession:
         """
         if not self._layer_means:
             _ = self.layer_means
-            self._monitor.layer_means = self._layer_means
         from saklas.core.capture import fold_directions_to_subspace
         return fold_directions_to_subspace(
             name, dict(profile), self._layer_means, whitener=self.whitener,
