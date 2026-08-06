@@ -348,6 +348,30 @@ def test_stale_fit_is_overwritten_by_the_next_fit(
     assert _preflight(fitted) is not None
 
 
+def test_stale_fit_resolves_as_a_miss_not_a_codec_error(
+    fitted: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Steering / probe resolution must say "refit", not raise a format error.
+
+    ``_bootstrap_manifold_probes`` retries a `ManifoldNotRegisteredError` by
+    fitting; a raw `ManifoldFormatError` escapes that retry and silently drops
+    the probe, which is how a format bump could empty a session's whole roster.
+    """
+    from saklas import ManifoldNotRegisteredError
+    from saklas.core.steering_composer import SteeringComposer
+    from saklas.io.manifold_folder import MANIFOLD_FORMAT_VERSION
+
+    _rewrite_sidecar(fitted, format_version=MANIFOLD_FORMAT_VERSION - 1)
+
+    session = SimpleNamespace(
+        _manifolds={}, model_id=_MODEL_ID, _model=fitted.handle.model,
+    )
+    composer = SteeringComposer.__new__(SteeringComposer)
+    composer._session = session  # type: ignore[attr-defined]
+    with pytest.raises(ManifoldNotRegisteredError, match="no fitted tensor"):
+        composer.ensure_manifold_loaded("local/mood")
+
+
 def test_corrupt_sidecar_still_raises(fitted: Any) -> None:
     """Staleness is forgiven; corruption is not."""
     from saklas.io.manifold_folder import ManifoldFormatError

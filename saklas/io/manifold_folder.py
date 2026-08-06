@@ -954,7 +954,7 @@ class ManifoldSidecar:
         )
 
 
-def _fitted_sidecar_is_current(path: Path) -> bool:
+def fitted_sidecar_is_current(path: Path) -> bool:
     """Whether a fitted sidecar carries exactly the current format version.
 
     A cheap version peek, deliberately narrower than the full validator: only a
@@ -1434,7 +1434,7 @@ class ManifoldFolder:
             # unfitting its labels, probes, and steering along with it.  A
             # corpus-less baked manifold has nothing to re-fit from, so it keeps
             # the strict read (and the tensor-less check below then fires).
-            if fit_mode != "baked" and not _fitted_sidecar_is_current(sc_path):
+            if fit_mode != "baked" and not fitted_sidecar_is_current(sc_path):
                 continue
             inst._sidecars[t.stem] = ManifoldSidecar.load(sc_path)
 

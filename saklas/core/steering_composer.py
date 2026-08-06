@@ -204,10 +204,20 @@ class SteeringComposer:
             transferred_from_is_encoded=transferred_from is not None,
         )
 
+        # A fit from an older artifact format is a *miss*, not a corrupt
+        # artifact: the corpus is intact, so the answer is "refit", which is
+        # exactly what the no-tensor branch below already says. Screening it
+        # here keeps a format bump from raising a raw codec error out of every
+        # steering resolution and probe bootstrap on the way to that refit.
+        from saklas.io.manifold_folder import fitted_sidecar_is_current
+
         matches = [
-            (ns, manifold_dir(ns, name) / fname)
-            for ns in search_ns
-            if (manifold_dir(ns, name) / fname).exists()
+            (ns, path)
+            for ns, path in (
+                (ns, manifold_dir(ns, name) / fname) for ns in search_ns
+            )
+            if path.exists()
+            and fitted_sidecar_is_current(path.with_suffix(".json"))
         ]
         if not matches:
             raise ManifoldNotRegisteredError(
