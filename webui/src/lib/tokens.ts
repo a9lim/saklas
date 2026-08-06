@@ -1,8 +1,9 @@
-// Per-token highlighting helpers.
+// Per-token highlighting: the pure ramp math.
 //
-// Shared saturation knob and RGB mapping for per-token probe highlighting.
-// This module emits CSS color strings the Chat panel attaches as inline
-// ``background-color`` styles per token.
+// Saturation knob, score lookup, and score → CSS colour mapping for
+// per-token probe highlighting.  Deliberately store-free — ``lib/highlight``
+// is the thin layer that reads ``highlightState`` and drives these, and it
+// is what the rendering surfaces call.
 //
 // The two-stripe variant renders two probes simultaneously by splitting each
 // token's background vertically.
@@ -218,10 +219,12 @@ export function formatScoreTooltip(scores: Record<string, number>): string {
     .join("\n");
 }
 
-/** Convenience: combine the three above into a single per-token style
- * spec the renderer can spread onto an element.  ``probeB`` null means
- * single-probe mode (use scoreToRgb backgroundColor); when both probes
- * are non-null use the two-stripe gradient. */
+/** Combine the ramp helpers above into one per-token style spec the
+ * renderer spreads onto an element.  ``scoreB`` null/undefined means
+ * single-probe mode (a ``backgroundColor`` off ``scoreToRgb``); with both
+ * scores present it emits the two-stripe (or, with ``smooth``, blended)
+ * gradient.  ``lib/highlight::highlightStyleFor`` is the caller that binds
+ * the scales and hues to the live highlight selection. */
 export function tokenBackgroundStyle(
   scoreA: number | null | undefined,
   scoreB: number | null | undefined = null,

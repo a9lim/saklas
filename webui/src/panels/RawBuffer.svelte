@@ -22,20 +22,17 @@
     sendStop,
     highlightState,
     openDrawer,
-    highlightScale,
     beginTokenHover,
     endTokenHover,
   } from "../lib/stores.svelte";
   import type { ChatTurn, TokenScore } from "../lib/types";
   import Button from "../lib/ui/Button.svelte";
   import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
+  import { SURPRISE_TARGET } from "../lib/tokens";
   import {
-    scoreToRgb,
-    highlightHue,
-    surpriseScore,
-    SURPRISE_TARGET,
-    probeScoreForTarget,
-  } from "../lib/tokens";
+    highlightScoreFor,
+    highlightStyleString,
+  } from "../lib/highlight";
 
   // ---------- buffer text ----------
 
@@ -267,23 +264,6 @@
       allTokens.length > 0,
   );
 
-  function tokenScore(t: TokenScore): number | undefined {
-    const target = highlightState.target;
-    if (!target) return undefined;
-    if (target === SURPRISE_TARGET) return surpriseScore(t.logprob);
-    const s = probeScoreForTarget(t, target);
-    return s !== undefined ? s : t.score;
-  }
-
-  function tintStyle(t: TokenScore): string {
-    const bg = scoreToRgb(
-      tokenScore(t),
-      highlightScale(highlightState.target),
-      highlightHue(highlightState.target),
-    );
-    return bg === "transparent" ? "" : `background-color: ${bg}`;
-  }
-
   // ---------- edit / inspect mode ----------
   //
   // Edit mode is the free-text textarea (plus the optional tint mirror).
@@ -327,7 +307,7 @@
     const tok = v.tok;
     if (!tok) return "";
     const parts: string[] = [];
-    const sc = tokenScore(tok);
+    const sc = highlightScoreFor(tok, highlightState.target);
     if (sc !== undefined && highlightState.target) {
       const label =
         highlightState.target === SURPRISE_TARGET
@@ -391,7 +371,7 @@
               class="seg tok clickable"
               class:tinted={highlightState.target !== null}
               class:has-alts={(v.tok?.topAlts?.length ?? 0) > 0}
-              style={v.tok ? tintStyle(v.tok) : ""}
+              style={v.tok ? highlightStyleString(v.tok) : ""}
               title={inspectTooltip(v)}
               role="button"
               tabindex="-1"
@@ -414,7 +394,7 @@
       {#if showTint}
         <div class="tint-mirror" aria-hidden="true">
           {#each allTokens as tok, i (i)}
-            <span class="tok" style={tintStyle(tok)}>{tok.text}</span>
+            <span class="tok" style={highlightStyleString(tok)}>{tok.text}</span>
           {/each}
         </div>
       {/if}
