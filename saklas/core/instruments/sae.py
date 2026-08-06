@@ -461,21 +461,43 @@ class SaeInstrument:
 
     def score_probes(
         self, hidden: dict[int, torch.Tensor] | None = None,
-        *, activations: torch.Tensor | None = None,
+        *, only: "set[str] | None" = None,
+    ) -> dict[str, "ProbeReading"]:
+        """Score attached probes from capture hidden slices.
+
+        The capture-slice entry: encodes the resident hook layer itself.
+        Callers holding this forward's encode already use
+        :meth:`score_probes_from_activations`.
+        """
+        session = self._session
+        if not self._measurement_specs():
+            return {}
+        _backend, layer, _width = session._require_sae()
+        if hidden is None or layer not in hidden:
+            return {}
+        return self.score_probes_from_activations(
+            session._encode_sae_hidden(hidden[layer]), only=only,
+        )
+
+    def score_probes_from_activations(
+        self,
+        activations: torch.Tensor,
+        *,
         only: "set[str] | None" = None,
         raw_by_fid: Mapping[int, float] | None = None,
     ) -> dict[str, "ProbeReading"]:
+        """Score attached probes from an already-encoded activation vector.
+
+        The entry for callers that encoded this forward once and share it
+        (the gate callback, the live display step, authored prefill);
+        ``raw_by_fid`` additionally seeds values a caller already transferred.
+        """
         from saklas.core.results import ProbeReading
 
         session = self._session
         if not self._measurement_specs():
             return {}
         _backend, layer, _width = session._require_sae()
-        if activations is None:
-            if hidden is None or layer not in hidden:
-                return {}
-            activations = session._encode_sae_hidden(hidden[layer])
-        assert activations is not None
         out: dict[str, ProbeReading] = {}
         for name, _fid, _raw_value, value in self.probe_values(
             activations, only=only, raw_by_fid=raw_by_fid,
@@ -701,9 +723,8 @@ class SaeInstrument:
         if stashed_raw_by_fid:
             raw_by_fid = {**stashed_raw_by_fid, **raw_by_fid}
         if self._measurement_specs():
-            self.last_step_readings = self.score_probes(
-                activations=acts,
-                raw_by_fid=raw_by_fid,
+            self.last_step_readings = self.score_probes_from_activations(
+                acts, raw_by_fid=raw_by_fid,
             )
             # Full-roster readings — prime the run's observe memo for this
             # forward (never an ``only=`` subset on this path).
@@ -757,8 +778,8 @@ class SaeInstrument:
             int(fid): float(value)
             for fid, value in zip(id_list, value_list, strict=True)
         }
-        readings = self.score_probes(
-            activations=activations, raw_by_fid=raw_by_fid,
+        readings = self.score_probes_from_activations(
+            activations, raw_by_fid=raw_by_fid,
         ) if self._measurement_specs() else {}
         rows = [
             (

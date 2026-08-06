@@ -698,6 +698,27 @@ def test_detach_during_bound_generation_keeps_aggregate_roster() -> None:
     assert readings == {}  # the removal applies at the next boundary
 
 
+def test_score_probes_entries_are_disjoint() -> None:
+    """Two entries, no placeholder argument: ``score_probes`` takes capture
+    slices and encodes them, ``score_probes_from_activations`` takes this
+    forward's encode.  Both land the same reading."""
+    session = _session()
+    inst = session._sae_instrument
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": None, "max_act": 10.0,
+    }
+    hidden = session._capture.latest_per_layer()
+    acts = session._encode_sae_hidden(hidden[1])
+
+    from_slices = inst.score_probes(hidden)
+    from_acts = inst.score_probes_from_activations(acts)
+    assert from_slices["sae/2"].coords == pytest.approx(
+        from_acts["sae/2"].coords,
+    )
+    # A layer the resident hook does not cover reads nothing.
+    assert inst.score_probes({7: hidden[1]}) == {}
+
+
 def test_bound_run_reads_its_bind_time_live_snapshot() -> None:
     """The lens's live-state discipline, mirrored: a bound run reads the
     live-discovery config its generation started with, so a toggle from

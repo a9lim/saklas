@@ -4152,11 +4152,13 @@ class SaklasSession:
         only: "set[str] | None" = None,
         raw_by_fid: Mapping[int, float] | None = None,
     ) -> dict[str, "ProbeReading"]:
-        """Score attached SAE probes (delegates to
-        :meth:`SaeInstrument.score_probes`)."""
-        return self._sae_instrument.score_probes(
-            hidden, activations=activations, only=only, raw_by_fid=raw_by_fid,
-        )
+        """Score attached SAE probes (delegates to the instrument's
+        capture-slice or precomputed-activation entry)."""
+        if activations is not None:
+            return self._sae_instrument.score_probes_from_activations(
+                activations, only=only, raw_by_fid=raw_by_fid,
+            )
+        return self._sae_instrument.score_probes(hidden, only=only)
 
     def _sae_probe_values(
         self,
@@ -6543,20 +6545,11 @@ class SaklasSession:
         self,
         hidden: dict[int, torch.Tensor],
         *,
-        logits: torch.Tensor | None = None,
-        probabilities: torch.Tensor | None = None,
-        layers: "Sequence[int] | None" = None,
         only: "set[str] | None" = None,
     ) -> dict[str, "ProbeReading"]:
-        """Score attached lens probes (delegates to
+        """Score attached lens probes from capture slices (delegates to
         :meth:`LensInstrument.score_probes`)."""
-        return self._lens_instrument.score_probes(
-            hidden,
-            logits=logits,
-            probabilities=probabilities,
-            layers=layers,
-            only=only,
-        )
+        return self._lens_instrument.score_probes(hidden, only=only)
 
     def _score_lens_gate_scalars(
         self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,

@@ -1091,8 +1091,8 @@ def test_generation_lens_snapshot_avoids_per_token_disk_validation(
     vocab = int(session._model.lm_head.weight.shape[0])
     probabilities = torch.softmax(torch.randn(len(layers), vocab), dim=-1)
     for _ in range(3):
-        readings = session._score_lens_probes(
-            {}, probabilities=probabilities, layers=layers,
+        readings = session._lens_instrument.score_probes_from_rows(
+            layers=layers, probabilities=probabilities,
         )
         assert "jlens/a" in readings
 
@@ -2545,3 +2545,47 @@ def test_jlens_token_readout_errors() -> None:
     s.tree.finalize_assistant(bare, text="no raw record", finish_reason="stop")
     with pytest.raises(InvalidNodeOperationError, match="no raw token record"):
         s.jlens_token_readout(bare, 0)
+
+
+def test_score_probes_entries_are_disjoint_and_guarded() -> None:
+    """Two entries, no placeholder argument: ``score_probes`` takes capture
+    slices, ``score_probes_from_rows`` takes a precomputed matrix.  The
+    logits-xor-probabilities rule is a real guard, so ``python -O`` behaves
+    identically to a normal run."""
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s._add_lens_probe("jlens/g", as_name=None)
+    inst = s._lens_instrument
+    layers = [int(layer) for layer in s.jlens.source_layers]
+    d_model = next(iter(s.jlens.jacobians.values())).shape[0]
+    hidden = {
+        layer: torch.randn(
+            d_model, generator=torch.Generator().manual_seed(layer),
+        )
+        for layer in layers
+    }
+
+    from saklas.core.jlens import readout_probabilities
+
+    logits = s._jlens_logits_rows(
+        s.jlens, [(layer, hidden[layer]) for layer in layers],
+    )
+    from_slices = inst.score_probes(hidden)
+    from_logits = inst.score_probes_from_rows(layers=layers, logits=logits)
+    from_probs = inst.score_probes_from_rows(
+        layers=layers, probabilities=readout_probabilities(logits),
+    )
+    assert from_slices["jlens/g"].coords == pytest.approx(
+        from_logits["jlens/g"].coords,
+    )
+    assert from_logits["jlens/g"].coords == pytest.approx(
+        from_probs["jlens/g"].coords,
+    )
+
+    with pytest.raises(ValueError, match="logits OR probabilities"):
+        inst.score_probes_from_rows(layers=layers)
+    with pytest.raises(ValueError, match="logits OR probabilities"):
+        inst.score_probes_from_rows(
+            layers=layers, logits=logits,
+            probabilities=readout_probabilities(logits),
+        )

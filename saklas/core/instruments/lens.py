@@ -636,23 +636,15 @@ class LensInstrument:
         self,
         hidden: dict[int, torch.Tensor],
         *,
-        logits: torch.Tensor | None = None,
-        probabilities: torch.Tensor | None = None,
-        layers: "Sequence[int] | None" = None,
         only: "set[str] | None" = None,
     ) -> dict[str, "ProbeReading"]:
-        """Score every attached probe from hidden slices (or reuse
-        precomputed lens ``logits``/``probabilities`` rows aligned with
-        ``layers``).
+        """Score every attached probe from capture hidden slices.
 
-        Returns ``{name: ProbeReading}`` with ``coords = (strength,)`` —
-        the ONE readout channel, mean layer probability —
-        ``coords_per_layer[l] = (p_l,)``, and the depth CoM — the
-        readout-channel synthesis of the unified reading shape (geometry
-        fields defaulted).  Empty when no probe layer is available.
+        The capture-slice entry: computes the lens logits itself over the
+        probes' fitted layers that ``hidden`` covers.  Callers that already
+        hold a calibrated row matrix use :meth:`score_probes_from_rows`.
+        Empty when no probe layer is available.
         """
-        from saklas.core.results import ProbeReading
-
         session = self._session
         lens, probes = self._measurement_state()
         if not probes or lens is None:
@@ -660,28 +652,77 @@ class LensInstrument:
         readout_layers: set[int] = set()
         for spec in probes.values():
             readout_layers.update(spec["layers"])
-        if logits is not None and probabilities is not None:
-            raise ValueError("pass lens logits or probabilities, not both")
-        if logits is None and probabilities is None:
-            layers = sorted(l for l in readout_layers if l in hidden)
-            if not layers:
-                return {}
-            logits = session._jlens_logits_rows(
-                lens, [(l, hidden[l]) for l in layers],
+        layers = sorted(l for l in readout_layers if l in hidden)
+        if not layers:
+            return {}
+        logits = session._jlens_logits_rows(
+            lens, [(l, hidden[l]) for l in layers],
+        )
+        return self._readings_from_rows(
+            probes, layers, logits=logits, only=only,
+        )
+
+    def score_probes_from_rows(
+        self,
+        *,
+        layers: "Sequence[int]",
+        logits: torch.Tensor | None = None,
+        probabilities: torch.Tensor | None = None,
+        only: "set[str] | None" = None,
+    ) -> dict[str, "ProbeReading"]:
+        """Score attached probes from precomputed lens rows aligned to
+        ``layers`` — exactly one of ``logits`` / ``probabilities``.
+
+        The entry for callers that already calibrated this forward's matrix
+        (the gate callback, the live display step, authored prefill): rows are
+        restricted to the probes' fitted layer set, never recomputed.
+        """
+        if (logits is None) == (probabilities is None):
+            raise ValueError(
+                "score_probes_from_rows takes lens logits OR probabilities"
             )
-        else:
-            assert layers is not None
-            # Restrict precomputed rows (e.g. a custom live-lens layer set)
-            # to the probes' fitted layer set.
-            keep = [i for i, l in enumerate(layers) if l in readout_layers]
-            if not keep:
-                return {}
-            if len(keep) != len(layers):
-                if logits is not None:
-                    logits = logits[keep]
-                if probabilities is not None:
-                    probabilities = probabilities[keep]
-            layers = [layers[i] for i in keep]
+        _lens, probes = self._measurement_state()
+        if not probes:
+            return {}
+        readout_layers: set[int] = set()
+        for spec in probes.values():
+            readout_layers.update(spec["layers"])
+        # Restrict precomputed rows (e.g. a custom live-lens layer set) to the
+        # probes' fitted layer set.
+        keep = [i for i, l in enumerate(layers) if l in readout_layers]
+        if not keep:
+            return {}
+        if len(keep) != len(layers):
+            if logits is not None:
+                logits = logits[keep]
+            if probabilities is not None:
+                probabilities = probabilities[keep]
+        return self._readings_from_rows(
+            probes,
+            [layers[i] for i in keep],
+            logits=logits,
+            probabilities=probabilities,
+            only=only,
+        )
+
+    def _readings_from_rows(
+        self,
+        probes: "Mapping[str, Mapping[str, Any]]",
+        layers: "Sequence[int]",
+        *,
+        logits: torch.Tensor | None = None,
+        probabilities: torch.Tensor | None = None,
+        only: "set[str] | None" = None,
+    ) -> dict[str, "ProbeReading"]:
+        """Synthesize the readout-channel readings for ``layers``' rows.
+
+        Returns ``{name: ProbeReading}`` with ``coords = (strength,)`` — the
+        ONE readout channel, mean layer probability — ``coords_per_layer[l] =
+        (p_l,)``, and the depth CoM (geometry fields defaulted).
+        """
+        from saklas.core.results import ProbeReading
+
+        session = self._session
         names = [
             name for name in probes
             if only is None or name in only
@@ -689,27 +730,20 @@ class LensInstrument:
         if not names:
             return {}
         token_ids = [probes[n]["token_id"] for n in names]
-        prob_device = (
-            probabilities.device
-            if probabilities is not None
-            else cast(torch.Tensor, logits).device
-        )
-        token_ids_tensor = session._readout_long_tensor(token_ids, prob_device)
-        depth_tensor = session._jlens_depth_tensor(layers, prob_device)
-        if probabilities is None:
-            assert logits is not None
-            stats = token_readout_stats(
-                logits,
-                session._jlens_depths(layers),
-                token_ids,
+        rows = probabilities if probabilities is not None else logits
+        row_device = cast(torch.Tensor, rows).device
+        token_ids_tensor = session._readout_long_tensor(token_ids, row_device)
+        depth_tensor = session._jlens_depth_tensor(layers, row_device)
+        depths = session._jlens_depths(layers)
+        if probabilities is not None:
+            stats = token_readout_stats_from_probabilities(
+                probabilities, depths, token_ids,
                 token_ids_tensor=token_ids_tensor,
                 depth_tensor=depth_tensor,
             )
         else:
-            stats = token_readout_stats_from_probabilities(
-                probabilities,
-                session._jlens_depths(layers),
-                token_ids,
+            stats = token_readout_stats(
+                cast(torch.Tensor, logits), depths, token_ids,
                 token_ids_tensor=token_ids_tensor,
                 depth_tensor=depth_tensor,
             )
@@ -805,10 +839,9 @@ class LensInstrument:
                 "step": step_id,
             }
         if probabilities is not None:
-            readings = self.score_probes(
-                {},
-                probabilities=probabilities,
+            readings = self.score_probes_from_rows(
                 layers=layers,
+                probabilities=probabilities,
                 only=probe_read_only,
             )
             live_stash = cast("dict[str, Any]", self.step_stash)
@@ -822,8 +855,8 @@ class LensInstrument:
                 # ``observe(step_id, …)`` for this same forward is a hit.
                 self.current_run.prime_observation(step_id, readings)
         else:
-            readings = self.score_probes(
-                {}, logits=logits, layers=layers, only=probe_read_only,
+            readings = self.score_probes_from_rows(
+                layers=layers, logits=logits, only=probe_read_only,
             )
             if probe_read_only is None:
                 self.current_run.prime_observation(step_id, readings)
@@ -1096,8 +1129,8 @@ class LensInstrument:
                     )
                     readings_reused = True
             if not readings_reused:
-                self.last_step_readings = self.score_probes(
-                    {}, probabilities=probabilities, layers=list(layers_present),
+                self.last_step_readings = self.score_probes_from_rows(
+                    layers=list(layers_present), probabilities=probabilities,
                 )
                 # The display's readings cover the full roster (no ``only=``),
                 # so prime the run's observe memo for this forward.
@@ -1184,8 +1217,8 @@ class LensInstrument:
             lens, [(layer, hidden[layer]) for layer in layers],
         )
         probabilities = readout_probabilities(logits)
-        readings = self.score_probes(
-            {}, probabilities=probabilities, layers=layers,
+        readings = self.score_probes_from_rows(
+            layers=layers, probabilities=probabilities,
         ) if specs else {}
         k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
         values, indices = probabilities.topk(k, dim=-1)

@@ -11,8 +11,16 @@ from typing import Any
 import torch
 
 
-class _SaeCaptureComplete(RuntimeError):
-    """Internal short-circuit after the selected residual layer is captured."""
+class _SaeCaptureComplete(BaseException):
+    """Private non-error control flow: the selected residual layer is captured.
+
+    ``BaseException``, like ``capture._CaptureComplete`` and the J-lens fit's
+    terminal sentinel: a broad ``except Exception`` anywhere in third-party
+    modeling code would otherwise swallow the signal, and the rest of the
+    forward (final norm + the full vocabulary head) would run silently on
+    every training batch.  The exact-once guard below would not catch that —
+    the capture has already appended by the time the raise is absorbed.
+    """
 
 
 class SaeTrainingCancelled(RuntimeError):
