@@ -42,6 +42,17 @@ from saklas.core.instruments.types import (
     parse_gate_ref,
     validate_gate_channels,
 )
+# The readout half of the lens module is import-light by construction (the
+# estimator lives in ``jlens_fit``), so the per-decode-step surfaces below bind
+# these at module scope instead of re-importing inside each hot call.
+from saklas.core.jlens import (
+    aggregate_readout_tensors_from_probabilities,
+    pack_readout_rows_to_host,
+    readout_probabilities,
+    resolve_word_token,
+    token_readout_stats,
+    token_readout_stats_from_probabilities,
+)
 
 if TYPE_CHECKING:
     from saklas.core.results import ProbeReading
@@ -471,8 +482,6 @@ class LensInstrument:
         probe-hash cache, analytics) is the session's job at its
         ``add_probe`` boundary.
         """
-        from saklas.core.jlens import resolve_word_token
-
         session = self._session
         word = selector.split("/", 1)[1]
         if not word:
@@ -657,10 +666,6 @@ class LensInstrument:
         readout-channel synthesis of the unified reading shape (geometry
         fields defaulted).  Empty when no probe layer is available.
         """
-        from saklas.core.jlens import (
-            token_readout_stats,
-            token_readout_stats_from_probabilities,
-        )
         from saklas.core.results import ProbeReading
 
         session = self._session
@@ -800,8 +805,6 @@ class LensInstrument:
         )
         probabilities = None
         if live_display_needs_full_probs:
-            from saklas.core.jlens import readout_probabilities
-
             probabilities = readout_probabilities(logits)
             live_stash: dict[str, Any] = {
                 "layers": tuple(layers),
@@ -1070,8 +1073,6 @@ class LensInstrument:
                     ],
                     dim=0,
                 )
-        from saklas.core.jlens import readout_probabilities
-
         if probabilities is None:
             if not cached_probs and not computed_logits:
                 probabilities = readout_probabilities(logits)
@@ -1133,11 +1134,6 @@ class LensInstrument:
         # Display scores are per-layer softmax probabilities — the one
         # strength unit every lens surface reports (softmax is monotone, so
         # the top-k selection is unchanged from the raw-logit ranking).
-        from saklas.core.jlens import (
-            aggregate_readout_tensors_from_probabilities,
-            pack_readout_rows_to_host,
-        )
-
         k = min(max(int(top_k), 0), int(probabilities.shape[-1]))
         vals, idxs = probabilities.topk(k, dim=-1)
         depth_tensor = session._jlens_depth_tensor(
@@ -1212,8 +1208,6 @@ class LensInstrument:
         logits = session._jlens_logits_rows(
             lens, [(layer, hidden[layer]) for layer in layers],
         )
-        from saklas.core.jlens import readout_probabilities
-
         probabilities = readout_probabilities(logits)
         readings = self.score_probes(
             {}, probabilities=probabilities, layers=layers,

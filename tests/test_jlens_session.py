@@ -2122,7 +2122,11 @@ def test_jlens_row_selector_avoids_copy_for_identity_and_contiguous_rows() -> No
 def test_live_lens_step_normalizes_once_across_all_consumers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.jlens as jlens_module
+    # The instrument binds the readout primitives at module scope (the per-step
+    # surfaces must not re-import), so the counters patch its namespace.
+    import saklas.core.instruments.lens as lens_instrument_module
+
+    jlens_module = lens_instrument_module
 
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
