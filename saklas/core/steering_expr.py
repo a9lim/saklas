@@ -13,7 +13,8 @@ Grammar::
     label       := NAME                                # a manifold node label
     atom        := [ns "/"] NAME ["." NAME] [":" variant]
                  | "sae" "/" INT
-    trigger     := preset | gate
+    trigger     := phase ["&" gate] | gate
+    phase       := preset | ("first" | "after") ":" INT
     preset      := "before" | "after" | "both" | "thinking" | "response"
                  | "prompt" | "generated"
     gate        := "when" ":" probe_atom op NUM
@@ -44,11 +45,23 @@ Grammar::
 that node's coords); the parser only collects the payload, arity /
 label-existence is validated at manifold-load time.
 
-Probe gates (v2.1): ``@when:<probe><op><threshold>`` fires the term only
-on decode steps where the named probe's last reading satisfies the
+Probe gates: ``@when:<probe><op><threshold>`` fires the term only on
+decode steps where the named probe's last reading satisfies the
 comparison.  Implicit ``prompt=False`` (no probe reading during prefill).
-Compose with other windows via the programmatic surface — the v1
-grammar accepts a single ``@`` clause per term.
+A gate composes with a phase window as ``@<phase>&when:...``
+(``@after&when:angry.calm>0.4`` = post-thinking *and* gated).
+
+Counted decode windows: ``@first:N`` / ``@after:N`` are the grammar forms
+of :meth:`Trigger.first` / :meth:`Trigger.after` — apply only to the first
+``N`` generated tokens, or only from token ``N`` on.  The ``:N`` is
+required, and is what separates ``@after:5`` (token window) from the bare
+``@after`` preset (post-thinking).
+
+Between them these cover every ``Trigger`` a public factory builds, so
+``parse_expr(format_expr(s)) == s`` holds for any ``Steering`` whose
+triggers came from the public surface.  A ``Trigger`` hand-built outside
+that set has no grammar form and :func:`format_expr` raises rather than
+emitting an unparseable string.
 
 Manifold-probe gates extend the same shape over the two scalar channels
 :class:`Monitor` exposes: ``@when:<manifold>:fraction <op> N``
@@ -100,7 +113,7 @@ subspace-replace.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Optional, TYPE_CHECKING, cast
 
 from saklas.core.errors import SteeringExprError
@@ -153,6 +166,21 @@ _TRIGGER_CANONICAL: dict[Trigger, str] = {
     Trigger.THINKING_ONLY: "thinking",
     Trigger.GENERATED_ONLY: "response",
 }
+
+# Counted decode windows: ``@first:N`` / ``@after:N`` are the grammar forms of
+# :meth:`Trigger.first` / :meth:`Trigger.after`.  Both require the ``:N``, which
+# is also what disambiguates ``@after:5`` (the token window) from the bare
+# ``@after`` preset (post-thinking).  Rendered by :func:`_phase_name`.
+_COUNTED_TRIGGER_KEYWORDS = ("first", "after")
+
+# One human-readable list of everything ``@`` accepts, shared by the parse
+# errors so the grammar surface is described in exactly one place.
+_TRIGGER_FORMS_HELP = (
+    "valid: " + ", ".join(sorted(_TRIGGER_PRESETS)) + "; "
+    "'first:<n>' / 'after:<n>' token windows; "
+    "'when:<probe><op><threshold>' probe gates; "
+    "or a compound '<preset>&when:<probe><op><threshold>'"
+)
 
 
 @dataclass(frozen=True)
@@ -264,7 +292,7 @@ _SINGLE_CHAR_TOKENS = {
     ".": "DOT", "/": "SLASH", ":": "COLON", "*": "STAR",
     "+": "PLUS", "-": "MINUS", "@": "AT", "~": "TILDE",
     "|": "ORTHO", "!": "BANG", "%": "PERCENT", ",": "COMMA",
-    "[": "LBRACK", "]": "RBRACK",
+    "[": "LBRACK", "]": "RBRACK", "&": "AMP",
 }
 
 # Comparison-op tokens.  Two-char ops (``>=``, ``<=``) take precedence
@@ -487,37 +515,96 @@ class _Parser:
         trigger: Trigger | None = None
         if self._peek().kind == "AT":
             self._consume()
-            tok = self._expect("IDENT")
-            kw = str(tok.value)
-            if kw == "when":
-                # Probe-gated trigger: ``when:<probe><op><threshold>``.
-                # The trailing COLON disambiguates from preset names that
-                # happen to start with "when" (none ship today, but the
-                # check keeps future namespace freedom).
-                if self._peek().kind != "COLON":
-                    raise SteeringExprError(
-                        f"trigger '@when' requires ':' followed by a "
-                        f"probe gate (e.g. '@when:angry.calm>0.4'); "
-                        f"got {self._peek().kind}",
-                        col=self._peek().col,
-                    )
-                self._consume()  # COLON
-                trigger = self._parse_when_gate(tok.col)
-            elif kw in _TRIGGER_PRESETS:
-                trigger = _TRIGGER_PRESETS[kw]
-            else:
-                valid = ", ".join(sorted(_TRIGGER_PRESETS.keys()))
-                raise SteeringExprError(
-                    f"unknown trigger '@{kw}'; valid: {valid}, or "
-                    f"'when:<probe><op><threshold>'.  Note: '@' is for "
-                    f"triggers only; HF revisions are not accepted "
-                    f"inside steering expressions.",
-                    col=tok.col,
-                )
+            trigger = self._parse_trigger()
         return _Term(
             coeff=coeff, selector=selector, trigger=trigger,
             ablation=ablation, coeffs=coeffs,
         )
+
+    def _parse_trigger(self) -> Trigger:
+        """Parse the whole ``@`` clause into a :class:`Trigger`.
+
+        Already consumed: the ``@``.  Grammar::
+
+            trigger := (phase ["&" gate] | gate)
+            phase   := preset | ("first" | "after") ":" INT
+
+        Every publicly-constructible ``Trigger`` has a form here — the five
+        presets, the counted decode windows :meth:`Trigger.first` /
+        :meth:`Trigger.after`, the bare probe gate :meth:`Trigger.when`, and a
+        gate narrowed to a phase (``@after&when:x>0.4``, the shape
+        ``Trigger.when``'s own docstring points callers at).  That totality is
+        what keeps ``parse_expr(format_expr(s)) == s``: without it,
+        ``format_expr`` would have to emit an unparseable sentinel and every
+        Recipe / ``applied_steering`` string stamped from such a Trigger would
+        poison the regen / transcript / loom replay that re-parses it.
+        """
+        tok = self._expect("IDENT")
+        kw = str(tok.value)
+        if kw == "when":
+            # A bare gate: no phase clause, so it can't be followed by "&".
+            return self._parse_when_gate_clause(tok.col)
+        base = self._parse_phase(tok)
+        if self._peek().kind != "AMP":
+            return base
+        self._consume()  # AMP
+        gate_tok = self._expect("IDENT")
+        if str(gate_tok.value) != "when":
+            raise SteeringExprError(
+                f"a compound trigger's second clause must be a probe gate "
+                f"('&when:<probe><op><threshold>'); got '{gate_tok.value}'",
+                col=gate_tok.col,
+            )
+        gated = self._parse_when_gate_clause(gate_tok.col)
+        # The phase clause supplies the window verbatim, the gate clause the
+        # condition — so ``@<preset>&when:…`` is exactly "that preset, gated",
+        # which is what makes the compound form an exact round-trip of a
+        # ``replace(preset, gate=…)`` Trigger.  The phase's ``prompt`` flag is
+        # left alone: a gate can never fire during prefill anyway (there is no
+        # post-forward probe reading yet), so ``Trigger.active`` ignores it.
+        return replace(base, gate=gated.gate)
+
+    def _parse_phase(self, tok: _Tok) -> Trigger:
+        """Parse a preset name or a ``first:N`` / ``after:N`` token window."""
+        kw = str(tok.value)
+        if kw in _COUNTED_TRIGGER_KEYWORDS and self._peek().kind == "COLON":
+            self._consume()  # COLON
+            n_tok = self._expect("NUM")
+            n_val = float(n_tok.value)
+            n = int(n_val)
+            if n_val != n or n < 0:
+                raise SteeringExprError(
+                    f"trigger '@{kw}:' takes a non-negative integer token "
+                    f"count, got '{n_tok.value}'",
+                    col=n_tok.col,
+                )
+            return Trigger.first(n) if kw == "first" else Trigger.after(n)
+        if kw == "first":
+            raise SteeringExprError(
+                "trigger '@first' requires ':' followed by a token count "
+                "(e.g. '@first:5')",
+                col=tok.col,
+            )
+        if kw in _TRIGGER_PRESETS:
+            return _TRIGGER_PRESETS[kw]
+        raise SteeringExprError(
+            f"unknown trigger '@{kw}'; {_TRIGGER_FORMS_HELP}.  Note: '@' is "
+            f"for triggers only; HF revisions are not accepted inside "
+            f"steering expressions.",
+            col=tok.col,
+        )
+
+    def _parse_when_gate_clause(self, when_col: int) -> Trigger:
+        """Consume the ``:`` after a ``when`` keyword, then its gate payload."""
+        if self._peek().kind != "COLON":
+            raise SteeringExprError(
+                f"trigger '@when' requires ':' followed by a "
+                f"probe gate (e.g. '@when:angry.calm>0.4'); "
+                f"got {self._peek().kind}",
+                col=self._peek().col,
+            )
+        self._consume()  # COLON
+        return self._parse_when_gate(when_col)
 
     def _parse_when_gate(self, when_col: int) -> Trigger:
         """Parse the ``when:`` payload into a probe-gated :class:`Trigger`.
@@ -1218,27 +1305,56 @@ def _fmt_manifold(m: ManifoldTerm) -> str:
     return body
 
 
+def _phase_name(base: Trigger) -> str | None:
+    """Render a gate-free Trigger's window, or ``None`` if it has no form.
+
+    Covers the five presets and the two counted decode windows
+    (:meth:`Trigger.first` / :meth:`Trigger.after`) — i.e. every window a
+    public factory can produce.  A ``Trigger`` hand-built with a field
+    combination outside that set (say ``first_n`` *and* ``after_n``, or a
+    narrowed phase on top of a count) has no grammar form and returns
+    ``None``.
+    """
+    if base in _TRIGGER_CANONICAL:
+        return _TRIGGER_CANONICAL[base]
+    if base.first_n is not None and base == Trigger.first(base.first_n):
+        return f"first:{base.first_n}"
+    if base.after_n is not None and base == Trigger.after(base.after_n):
+        return f"after:{base.after_n}"
+    return None
+
+
 def _trigger_name(trig: Trigger) -> str:
-    if trig in _TRIGGER_CANONICAL:
-        return _TRIGGER_CANONICAL[trig]
-    # Probe gate (v2.1) — round-trip via the ``when:`` syntax.  Gate-
-    # only triggers (the canonical shape produced by ``Trigger.when``)
-    # render as ``when:<probe><op><threshold>``; any other custom
-    # trigger (e.g. user-built with ``first_n=`` plus a gate) falls
-    # through to the ``"custom"`` sentinel — programmatic-only,
-    # callers don't expect it to round-trip through the grammar.
-    if (
-        trig.gate is not None
-        and trig.prompt is False
-        and trig.generated is True
-        and trig.thinking is True
-        and trig.response is True
-        and trig.first_n is None
-        and trig.after_n is None
-    ):
-        g = trig.gate
-        return f"when:{g.probe}{g.op}{_fmt_number(g.threshold)}"
-    return "custom"
+    """Render a :class:`Trigger` into its ``@`` clause (no leading ``@``).
+
+    Raises :class:`SteeringExprError` for a Trigger with no grammar form,
+    rather than emitting a sentinel that would not parse back.  Every public
+    factory (:meth:`Trigger.first` / :meth:`Trigger.after` /
+    :meth:`Trigger.when`, the five presets) and their gate-narrowed compounds
+    round-trip, so this only fires on a hand-built dataclass.
+    """
+    gate = trig.gate
+    if gate is None:
+        name = _phase_name(trig)
+        if name is None:
+            raise SteeringExprError(
+                f"trigger {trig!r} has no steering-expression form; it is "
+                f"programmatic-only and cannot be rendered to a string"
+            )
+        return name
+    gate_str = f"when:{gate.probe}{gate.op}{_fmt_number(gate.threshold)}"
+    base = replace(trig, gate=None)
+    # ``Trigger.when``'s own window is GENERATED_ONLY, so a bare gate renders
+    # without a phase clause; any other window renders the compound form.
+    if base == Trigger.GENERATED_ONLY:
+        return gate_str
+    phase = _phase_name(base)
+    if phase is None:
+        raise SteeringExprError(
+            f"trigger {trig!r} has no steering-expression form; it is "
+            f"programmatic-only and cannot be rendered to a string"
+        )
+    return f"{phase}&{gate_str}"
 
 
 def _fmt_number(x: float) -> str:
