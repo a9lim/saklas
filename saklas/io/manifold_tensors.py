@@ -329,7 +329,9 @@ def _replace_manifold_file(source: Path, target: Path) -> None:
 # ``origin_per_layer``). Those are computed from the fitted object above and
 # must win over anything a caller happens to pass.
 _WRITER_PROVENANCE_KEYS = (
-    "nodes_sha256", "capture_sha256", "model_fingerprint", "fit_policy_version",
+    "nodes_sha256", "capture_sha256", "capture_version",
+    "capture_render_sha256", "baseline_prompts_sha256",
+    "model_fingerprint", "model_source_fingerprint", "fit_policy_version",
     "sae_release", "sae_revision", "sae_fingerprint", "sae_ids_by_layer",
     "sae_full_coverage",
     "share_metric", "subspace_metric",

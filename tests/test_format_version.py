@@ -32,7 +32,7 @@ def test_load_profile_rejects_missing_format_version(tmp_path: Path):
     data.pop("format_version", None)
     sc_path.write_text(json.dumps(data))
 
-    with pytest.raises(ProfileError, match="exact schema"):
+    with pytest.raises(ProfileError, match="need exactly"):
         load_profile(str(path))
 
 
@@ -49,7 +49,36 @@ def test_load_profile_rejects_non_current_format_version(
     data["format_version"] = version
     sc_path.write_text(json.dumps(data))
 
-    with pytest.raises(ProfileError, match="format identity"):
+    # A stale artifact says so by version, not by whichever field the current
+    # exact-set schema happens to miss first, and names the remedy.
+    with pytest.raises(ProfileError, match="need exactly"):
+        load_profile(str(path))
+
+
+def test_load_profile_rejects_pre_cut_sidecar_by_version(tmp_path: Path):
+    """The pre-5.x fourteen-key sidecar is rejected on version, not shape.
+
+    The field set was cut without a bump, so a file stamped ``5`` already
+    failed the exact-set check; ``PROFILE_FORMAT_VERSION = 6`` makes that
+    rejection say what actually happened.
+    """
+    profile = {0: torch.zeros(4)}
+    path = tmp_path / "x.safetensors"
+    save_profile(profile, str(path), {"method": "profile"})
+
+    sc_path = path.with_suffix(".json")
+    data = json.loads(sc_path.read_text())
+    data.pop("provenance")
+    data.update({
+        "format_version": 5, "statements_sha256": "x", "components": None,
+        "bake": None, "sae_release": None, "sae_revision": None,
+        "sae_ids_by_layer": {}, "source_model_id": None,
+        "alignment_map_hash": None, "transfer_quality_estimate": None,
+        "diagnostics_by_layer": {},
+    })
+    sc_path.write_text(json.dumps(data))
+
+    with pytest.raises(ProfileError, match="format_version=5"):
         load_profile(str(path))
 
 

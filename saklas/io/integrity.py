@@ -22,8 +22,15 @@ from saklas.io.paths import ensure_within
 
 NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 
-# Current profile-cache sidecar format version.
-PROFILE_FORMAT_VERSION = 5
+# Current profile sidecar format version.  v6 is the honest stamp for the
+# five-key schema (``format_version`` / ``saklas_version`` / ``method`` /
+# ``tensor_sha256`` / ``provenance``): the field set was cut from fourteen keys
+# without a bump, so a v5 file already fails the exact-set validator and the
+# invalidation was paid in practice before it was declared.  No cache rides this
+# version — the neutral-activation and alignment caches carry their own sidecar
+# schemas and format versions in :mod:`saklas.io.alignment` — so the only reader
+# affected is a user-saved ``Profile``, which gets a clear regenerate error.
+PROFILE_FORMAT_VERSION = 6
 
 
 def hash_file(path: Path) -> str:

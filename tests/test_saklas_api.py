@@ -219,8 +219,19 @@ class TestSessions:
         assert session.config.top_k is None
 
     def test_validate_steering_parses_and_dry_installs(
-        self, session_and_client: Any,
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
     ) -> None:
+        # The bare-atom name tier reads the installed manifold roster, so this
+        # has to assert against a roster the test owns.  Reading the developer's
+        # real ``~/.saklas`` made the outcome depend on whether that home
+        # happened to hold current-format bundled folders.
+        import saklas.io.selectors as selectors
+        from saklas.io.bootstrap import materialize_bundled_artifacts
+
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        materialize_bundled_artifacts()
+        selectors.invalidate()
+
         session, client = session_and_client
         resp = client.post(
             "/saklas/v1/sessions/default/steering/validate",

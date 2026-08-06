@@ -48,6 +48,16 @@ if TYPE_CHECKING:
 
 
 _CAPTURE_CACHE_FORMAT_VERSION = 4
+
+# Schema revision of the manifold fit's capture identity — the payload
+# ``prepare_manifold_capture_identity`` hashes into ``capture_sha256``.  Bumping
+# it invalidates every fitted tensor *and* every cached capture group, so it is
+# the knob for "the residuals a corpus produces are no longer the same".  It
+# also rides the fitted sidecar as ``capture_version`` so a weight-free
+# preflight can prove the stored identity was built under this exact schema
+# instead of inferring it from the format version.
+MANIFOLD_CAPTURE_VERSION = 3
+
 _ROW_DIGEST_CACHE_MAX = 512
 _row_digest_cache: set[tuple[object, ...]] = set()
 _row_digest_cache_lock = threading.Lock()
@@ -838,6 +848,186 @@ class ModelHandle(Protocol):
     ) -> dict[str, list[str]]: ...
 
 
+def resolve_fit_layer_indices(
+    layer_indices: "Sequence[int] | str | None", n_layers: int,
+) -> list[int]:
+    """Normalize a ``layer_indices`` request against a model's layer count.
+
+    ``None``/``"all"`` is every layer, ``"workspace"`` the 40–90% band, any
+    other string a comma-separated index list.  Shared with the weight-free fit
+    preflight, which resolves the same request against the *config's* layer
+    count: the two must agree exactly or a proof could cover a different roster
+    than the fit would evaluate.
+    """
+    if layer_indices is None or layer_indices == "all":
+        requested = list(range(n_layers))
+    elif layer_indices == "workspace":
+        requested = workspace_layer_indices(range(n_layers), n_layers)
+    elif isinstance(layer_indices, str):
+        try:
+            requested = sorted({
+                int(part.strip()) for part in layer_indices.split(",")
+                if part.strip()
+            })
+        except ValueError as exc:
+            raise ValueError(
+                "layer_indices must be 'all', 'workspace', or a "
+                "comma-separated integer list"
+            ) from exc
+    else:
+        requested = sorted({int(idx) for idx in layer_indices})
+    if not requested:
+        raise ValueError("layer_indices must name at least one layer")
+    if any(idx < 0 or idx >= n_layers for idx in requested):
+        raise ValueError(
+            f"layer_indices must lie in [0, {n_layers}); got {requested}"
+        )
+    return requested
+
+
+def baseline_prompts_sha256(
+    baseline_prompts: "Sequence[str | list[dict[str, str]]]",
+) -> str:
+    """Digest the exact shared elicitation prompt set a fit paired rows against.
+
+    Plain strings (the shared baseline set) and multi-turn message lists (a
+    templated manifold's resolved contexts) hash through one canonical JSON
+    encoding, so the channel means the same thing for both corpus sources.
+    """
+    return hashlib.sha256(json.dumps(
+        list(baseline_prompts), sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def capture_render_sha256(
+    node_groups: "Sequence[tuple[str, list[str]]]",
+    prepared_rows: "Sequence[tuple[torch.Tensor, int]]",
+) -> str:
+    """Digest the tokenizer-render half of the capture identity.
+
+    Exactly the node partition plus every rendered row's token ids and pool
+    index — the part of ``capture_sha256`` that a tokenizer, the baseline
+    prompts, and the node corpora reproduce with **no weights loaded**.  The
+    complementary model-identity half rides ``model_fingerprint`` +
+    ``model_source_fingerprint``, so together the two prove ``capture_sha256``
+    equality without instantiating the transformer.
+    """
+    digest = hashlib.sha256(json.dumps(
+        {"node_sizes": [len(rows) for _label, rows in node_groups]},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8"))
+    for ids, content_end in prepared_rows:
+        digest.update(repr((ids[0].tolist(), int(content_end))).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def prepare_capture_rows(
+    tokenizer: Any,
+    *,
+    node_groups: "Sequence[tuple[str, list[str]]]",
+    baseline_prompts: "Sequence[str | list[dict[str, str]]]",
+    node_roles: "Sequence[str | None]",
+    model_type: str | None,
+) -> tuple[list[tuple[torch.Tensor, int]], str]:
+    """Render + tokenize every fit row and digest that render.
+
+    The single owner of the row flattening (``response[i]`` answers
+    ``baseline_prompt[i % k]``, per-node role carried through) that both the
+    live fit and the weight-free preflight must agree on byte-for-byte.  Needs
+    a tokenizer, never a model.
+    """
+    from saklas.core.capture import _prepare_capture_batch
+
+    flat_prompts: list[str | list[dict[str, str]]] = []
+    flat_responses: list[str] = []
+    flat_roles: list[str | None] = []
+    k_prompts = len(baseline_prompts)
+    for (_label, responses), role in zip(node_groups, node_roles, strict=True):
+        for row_idx, response in enumerate(responses):
+            flat_prompts.append(baseline_prompts[row_idx % k_prompts])
+            flat_responses.append(response)
+            flat_roles.append(role)
+    prepared_rows = _prepare_capture_batch(
+        tokenizer, flat_prompts, flat_responses,
+        roles=flat_roles, model_type=model_type,
+    )
+    return prepared_rows, capture_render_sha256(node_groups, prepared_rows)
+
+
+@dataclass(frozen=True)
+class OfflineFitIdentity:
+    """The fit-identity digests derivable with no model weights loaded.
+
+    Every field is something :class:`ManifoldExtractionPipeline` would compute
+    for the same folder, reproduced from the folder, the shared baseline
+    prompts (or a templated manifold's resolved contexts), and a tokenizer.
+    What is *not* here — the loaded-model fingerprint and therefore
+    ``capture_sha256`` itself — is exactly what the preflight proves through
+    the neutral cache's ``(source, loaded)`` fingerprint binding instead.
+    """
+
+    nodes_sha256: str
+    baseline_prompts_sha256: str
+    capture_render_sha256: str
+    node_labels: tuple[str, ...]
+
+
+def offline_fit_identity(
+    mf: Any, *, tokenizer: Any, model_type: str | None,
+) -> OfflineFitIdentity | None:
+    """Recompute a folder's weight-free fit identity, or ``None`` if it cannot be.
+
+    Returns ``None`` — never a partial answer — when any input the fit would
+    consume cannot be reproduced offline: an unresolvable ``template_ref``, a
+    templated corpus the fit would re-derive before hashing, per-node roles with
+    no ``model_type`` to resolve their headers, or a tokenizer that cannot
+    render.  A caller must treat ``None`` as "load the model", because a partial
+    identity is precisely what would serve a stale fit after a corpus or
+    baseline-prompt edit.
+    """
+    node_roles = mf._roles_padded()
+    if any(role is not None for role in node_roles) and model_type is None:
+        return None
+    template_sha: str | None = None
+    try:
+        node_groups = mf.node_groups()
+        if mf.template_ref is not None:
+            from saklas.io.templates import resolve_template
+
+            tmpl = resolve_template(mf.template_ref)
+            # The fit re-derives (and rewrites) a drifted templated corpus
+            # under the manifest lock before it hashes anything, so a mismatch
+            # here means the on-disk corpus is not what the fit would hash.
+            if dict(node_groups) != tmpl.node_corpora():
+                return None
+            template_sha = tmpl.sha256()
+            baseline_prompts: list[str | list[dict[str, str]]] = [
+                context.messages() for context in tmpl.contexts
+            ]
+        else:
+            from saklas.core.capture import _load_baseline_prompts
+
+            baseline_prompts = list(_load_baseline_prompts())
+        if not baseline_prompts:
+            return None
+        nodes_sha = mf.nodes_sha256(resolved_template_sha256=template_sha)
+        _rows, render_sha = prepare_capture_rows(
+            tokenizer,
+            node_groups=node_groups,
+            baseline_prompts=baseline_prompts,
+            node_roles=node_roles,
+            model_type=model_type,
+        )
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return None
+    return OfflineFitIdentity(
+        nodes_sha256=nodes_sha,
+        baseline_prompts_sha256=baseline_prompts_sha256(baseline_prompts),
+        capture_render_sha256=render_sha,
+        node_labels=tuple(label for label, _rows in node_groups),
+    )
+
+
 def prepare_manifold_capture_identity(
     handle: ModelHandle,
     mf: Any,
@@ -853,8 +1043,17 @@ def prepare_manifold_capture_identity(
     list[str | None],
     list[str | None],
     str | None,
+    str | None,
+    str,
 ]:
-    """Render/tokenize all fit rows and return their exact capture identity."""
+    """Render/tokenize all fit rows and return their exact capture identity.
+
+    The trailing two elements are the weight-free-provable halves:
+    ``capture_render_sha256`` (``None`` when the handle has no callable
+    tokenizer, exactly like ``capture_sha256``) and ``baseline_prompts_sha256``.
+    They are appended rather than inserted so index-addressed callers — the
+    steering composer reads ``[3]`` — keep their positions.
+    """
     model = handle.model
     base_model = getattr(model, "_orig_mod", model)
     config = getattr(base_model, "config", getattr(model, "config", None))
@@ -886,23 +1085,14 @@ def prepare_manifold_capture_identity(
     tokenizer = handle.tokenizer
     prepared_rows: list[tuple[torch.Tensor, int]] | None = None
     capture_sha: str | None = None
+    render_sha: str | None = None
     if callable(tokenizer):
-        from saklas.core.capture import _prepare_capture_batch
-
-        flat_prompts: list[str | list[dict[str, str]]] = []
-        flat_responses: list[str] = []
-        flat_roles: list[str | None] = []
-        k_prompts = len(baseline_prompts)
-        for (_label, responses), role in zip(
-            node_groups, node_roles, strict=True,
-        ):
-            for row_idx, response in enumerate(responses):
-                flat_prompts.append(baseline_prompts[row_idx % k_prompts])
-                flat_responses.append(response)
-                flat_roles.append(role)
-        prepared_rows = _prepare_capture_batch(
-            tokenizer, flat_prompts, flat_responses,
-            roles=flat_roles, model_type=model_type,
+        prepared_rows, render_sha = prepare_capture_rows(
+            tokenizer,
+            node_groups=node_groups,
+            baseline_prompts=baseline_prompts,
+            node_roles=node_roles,
+            model_type=model_type,
         )
         capture_model_fingerprint = {
             "model_id": handle.model_id,
@@ -912,7 +1102,7 @@ def prepare_manifold_capture_identity(
             "commit": getattr(config, "_commit_hash", None),
             "name_or_path": getattr(config, "_name_or_path", None),
             "model_type": getattr(config, "model_type", None),
-            "capture_version": 3,
+            "capture_version": MANIFOLD_CAPTURE_VERSION,
             "fingerprint": model_fingerprint,
         }
         capture_hash = hashlib.sha256(json.dumps(
@@ -930,6 +1120,7 @@ def prepare_manifold_capture_identity(
     return (
         node_groups, baseline_prompts, prepared_rows, capture_sha,
         node_roles, node_kinds, model_type,
+        render_sha, baseline_prompts_sha256(baseline_prompts),
     )
 
 
@@ -1052,7 +1243,10 @@ def _base_fit_metadata(
     method: str,
     nodes_sha: str,
     model_fingerprint: str,
+    model_source_fp: str | None,
     capture_sha: str | None,
+    capture_render_sha: str | None,
+    baseline_prompts_sha: str | None,
     fitted_layers: list[int],
     subspace_metric: str,
     sae_backend: "SaeBackend | None",
@@ -1076,7 +1270,15 @@ def _base_fit_metadata(
         "method": method,
         "nodes_sha256": nodes_sha,
         "model_fingerprint": model_fingerprint,
+        # ``None`` when the loaded weights carry no provable source (an
+        # in-memory or opaque model).  A fit stamped that way can never be
+        # preflight-proven, which is the correct outcome: nothing off-model
+        # could establish that the same weights would come back.
+        "model_source_fingerprint": model_source_fp,
         "capture_sha256": capture_sha,
+        "capture_version": MANIFOLD_CAPTURE_VERSION,
+        "capture_render_sha256": capture_render_sha,
+        "baseline_prompts_sha256": baseline_prompts_sha,
         "fitted_layers": fitted_layers,
         "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
         # Provenance only (nothing branches on these at load).
@@ -1652,32 +1854,7 @@ class ManifoldExtractionPipeline:
         model = self._handle.model
         layers = self._handle.layers
         n_layers = len(layers)
-        if layer_indices is None or layer_indices == "all":
-            requested_fit_layers = list(range(n_layers))
-        elif layer_indices == "workspace":
-            requested_fit_layers = workspace_layer_indices(
-                range(n_layers), n_layers,
-            )
-        elif isinstance(layer_indices, str):
-            try:
-                requested_fit_layers = sorted({
-                    int(part.strip()) for part in layer_indices.split(",")
-                    if part.strip()
-                })
-            except ValueError as exc:
-                raise ValueError(
-                    "layer_indices must be 'all', 'workspace', or a "
-                    "comma-separated integer list"
-                ) from exc
-        else:
-            requested_fit_layers = sorted({int(idx) for idx in layer_indices})
-        if not requested_fit_layers:
-            raise ValueError("layer_indices must name at least one layer")
-        if any(idx < 0 or idx >= n_layers for idx in requested_fit_layers):
-            raise ValueError(
-                f"layer_indices must lie in [0, {n_layers}); got "
-                f"{requested_fit_layers}"
-            )
+        requested_fit_layers = resolve_fit_layer_indices(layer_indices, n_layers)
         model_fingerprint = (
             _model_fingerprint
             if _model_fingerprint is not None
@@ -1734,7 +1911,18 @@ class ManifoldExtractionPipeline:
         (
             node_groups, baseline_prompts, prepared_rows, capture_sha,
             node_roles, node_kinds, model_type,
+            capture_render_sha, baseline_prompts_sha,
         ) = prepared_identity
+        # The exact source identity the loader proved for these weights (set by
+        # ``_load_with_fallbacks``).  Stamping the fit with it is what lets a
+        # later ``model_source_fingerprint(model_id)`` recompute prove, off-model,
+        # that the checkpoint behind this tensor is still the one on disk.
+        base_model = getattr(model, "_orig_mod", model)
+        model_source_fp = getattr(
+            base_model, "_saklas_source_fingerprint", None,
+        )
+        if not isinstance(model_source_fp, str) or not model_source_fp:
+            model_source_fp = None
         tokenizer = self._handle.tokenizer
         device = self._handle.device
         K = len(node_groups)
@@ -2387,7 +2575,10 @@ class ManifoldExtractionPipeline:
                 ),
                 nodes_sha=nodes_sha,
                 model_fingerprint=model_fingerprint,
+                model_source_fp=model_source_fp,
                 capture_sha=capture_sha,
+                capture_render_sha=capture_render_sha,
+                baseline_prompts_sha=baseline_prompts_sha,
                 fitted_layers=list(fit_layers),
                 # The fold keeps the raw δ̂ basis, so the subspace is
                 # metric-free — see ``_base_fit_metadata`` for why that is a
@@ -2835,7 +3026,10 @@ class ManifoldExtractionPipeline:
             method=method,
             nodes_sha=nodes_sha,
             model_fingerprint=model_fingerprint,
+            model_source_fp=model_source_fp,
             capture_sha=capture_sha,
+            capture_render_sha=capture_render_sha,
+            baseline_prompts_sha=baseline_prompts_sha,
             fitted_layers=sorted(layer_subs),
             subspace_metric="mahalanobis",
             sae_backend=sae_backend,
