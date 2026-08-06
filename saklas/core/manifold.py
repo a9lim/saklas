@@ -180,7 +180,7 @@ class ManifoldDomain(ABC):
         (wrap-aware shortest arc) and :class:`SphereDomain` for great-circle
         slerp. This is the operator the two-op ``along`` step slides the
         projected foot through, so the path stays *on the surface* rather than
-        cutting the ambient chord the old additive injection took.
+        cutting the ambient chord a straight A->B displacement would take.
         """
         return self.clamp_position(a + frac * (b - a))
 
@@ -1901,8 +1901,8 @@ class Manifold:
     metadata: dict[str, object] = field(default_factory=dict)
     # Per-node assistant-role substitution recorded at fit time, aligned
     # with ``node_labels``.  ``None`` for a given node = "pooled under
-    # the standard assistant baseline" (the legacy shape, what every
-    # non-role manifold carries).  Used by
+    # the standard assistant baseline" — the default, and what every
+    # non-role manifold carries.  Used by
     # :meth:`Manifold.nearest_node_role` for role-paired steering.
     node_roles: list[str | None] = field(default_factory=_OmittedNodeRoster)
     # Per-node conceptual ``kind`` — ``"abstract"`` (a trait/quality, e.g.
@@ -3013,9 +3013,9 @@ def subspace_inject(
 
     new_par = (foot_new_red + Hn_final) @ basis          # (.., D) back to world
 
-    # The off-subspace residual ``H_o`` is kept verbatim (the old ``toward`` op
-    # that scaled it is removed — it scaled the orthogonal complement of this
-    # subspace, breaking orthogonal composition with neighboring terms).
+    # The off-subspace residual ``H_o`` is kept verbatim: it is the orthogonal
+    # complement of this subspace, i.e. every composing neighbor's span, so
+    # scaling it would couple otherwise-orthogonal terms.
     new_perp = h_perp                                    # (.., D) kept verbatim
 
     h_new = mean + new_par + new_perp                    # (.., D)
@@ -3241,9 +3241,10 @@ def compute_store_reduced_covariances(
 ) -> list[dict[int, torch.Tensor]]:
     """Project a layer-major activation spool into per-node covariances.
 
-    The legacy helper above is useful for one standalone node, but iterating it
-    over an :class:`ActivationRowStore` visits a layer-major mmap in node-major
-    order and launches one ``(N_node,D) @ (D,R)`` projection per node and layer.
+    :func:`compute_node_reduced_covariance_from_rows` above handles one
+    standalone node, but iterating it over an :class:`ActivationRowStore` visits
+    a layer-major mmap in node-major order and launches one ``(N_node,D) @
+    (D,R)`` projection per node and layer.
     This fit-wide sibling streams each layer once in bounded row chunks, performs
     large projection GEMMs, and segments only the small ``(N,R)`` results by the
     store's contiguous node boundaries.  Covariance is translation-invariant, so

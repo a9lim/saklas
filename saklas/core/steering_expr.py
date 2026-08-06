@@ -1016,8 +1016,8 @@ def _expand_along_onto_coeffs(
     ``along`` is *the* steering knob: it slides the projected foot toward
     the target on the manifold and keeps everything else.  ``onto`` (flatten
     the off-manifold in-subspace residual) is aggressive and so off by
-    default.  The off-*subspace* residual is always kept verbatim — the old
-    third op (``toward``) that scaled it is removed.
+    default.  The off-*subspace* residual is always kept verbatim — that is
+    the composition invariant, so it has no coefficient.
 
     A run of length 0 or > 2 is a programming error here — the parser
     rejects the 3-coeff case at parse time and a term always carries at
