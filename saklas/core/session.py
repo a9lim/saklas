@@ -1317,17 +1317,12 @@ class SaklasSession:
         # concepts and manifolds (e.g. ``happy.sad``, ``personas``) all
         # materialize in the same pre-invalidate window so the bare-name
         # resolver picks up every bundled node label.
-        from saklas.io.manifolds import (
-            materialize_bundled_manifolds as _materialize_bundled_manifolds,
-        )
-        from saklas.io.templates import (
-            materialize_bundled_templates as _materialize_bundled_templates,
-        )
-        # Templates first: a bundled manifold may ``template_ref`` a bundled
-        # ``default/<name>`` template, and its fit resolves that ref.
-        _materialize_bundled_templates()
-        _materialize_bundled_manifolds()
-        _selectors.invalidate()
+        from saklas.io.bootstrap import materialize_bundled_artifacts
+
+        # Owns the templates-before-manifolds ordering (a bundled manifold may
+        # ``template_ref`` a bundled ``default/<name>`` template, and its fit
+        # resolves that ref) and drops the stale selector index.
+        materialize_bundled_artifacts()
 
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes
