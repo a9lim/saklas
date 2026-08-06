@@ -2923,3 +2923,47 @@ def test_dls_true_passes_the_real_baseline(
     ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
     assert len(seen) == 1
     assert seen[0] is handle.layer_means
+
+
+@pytest.mark.parametrize("dls", [True, False])
+def test_session_fit_forwards_its_dls_setting(
+    dls: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``SaklasSession.fit`` hands ``self._dls`` to the pipeline.
+
+    The session-side half of the ``--no-dls`` chain: the CLI sets ``dls=`` at
+    construction, and this is the hop that has to carry it into the fit that
+    consumes it.
+    """
+    import saklas.core.extraction as extraction_mod
+    from saklas.core.session import SaklasSession
+
+    fit_kwargs: dict[str, Any] = {}
+    fitted = object()
+
+    class _FakePipeline:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def fit(self, *_args: Any, **kwargs: Any) -> Any:
+            fit_kwargs.update(kwargs)
+            return fitted
+
+    monkeypatch.setattr(
+        extraction_mod, "ManifoldExtractionPipeline", _FakePipeline,
+    )
+
+    @contextmanager
+    def _exclusive(*_args: Any, **_kwargs: Any) -> Any:
+        yield
+
+    session: Any = object.__new__(SaklasSession)
+    session._dls = dls
+    session.events = EventBus()
+    session._model_exclusive = _exclusive
+    session._steering_composer = cast(Any, type("_C", (), {"_stack": []})())
+    session._adopt_fitted_manifold = lambda *_a, **_kw: None
+    session._invalidate_analytics_cache = lambda: None
+
+    assert session.fit("folder") is fitted
+    assert fit_kwargs["dls"] is dls

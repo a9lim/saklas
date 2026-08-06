@@ -146,17 +146,27 @@ _SAE_VERBS: list[tuple[str, str]] = [
 ]
 
 
-def _add_injection_args(p: argparse.ArgumentParser) -> None:
-    """Steering and extraction options for model-backed CLI surfaces.
+def _add_dls_arg(p: argparse.ArgumentParser) -> None:
+    """The ``--no-dls`` opt-out, shared by every fit-capable surface.
 
-    ``None`` defaults flow through to the YAML override layer (or ultimately
-    to the session defaults: Mahalanobis projection + DLS on).
+    ``manifold extract`` / ``manifold fit`` carry this alone: the rest of
+    :func:`_add_injection_args` is generation-time compilation state, which
+    an artifact-authoring verb has no use for.
     """
     p.add_argument(
         "--no-dls", dest="no_dls", action="store_true",
         help="Keep every extracted layer instead of dropping layers whose "
              "fitted poles do not straddle the neutral baseline.",
     )
+
+
+def _add_injection_args(p: argparse.ArgumentParser) -> None:
+    """Steering and extraction options for model-backed CLI surfaces.
+
+    ``None`` defaults flow through to the YAML override layer (or ultimately
+    to the session defaults: Mahalanobis projection + DLS on).
+    """
+    _add_dls_arg(p)
     p.add_argument(
         "--compile", dest="compile", action="store_true",
         help="Enable ``torch.compile`` on CUDA or MPS. Off by default because "
@@ -256,6 +266,7 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "webui ExtractDrawer's namespace control and with "
              "``manifold`` / ``discover``'s NS slot.",
     )
+    _add_dls_arg(p)
     p.set_defaults(quantize=None, device="auto", probes=None)
 
 
@@ -388,6 +399,7 @@ def _build_manifold_fit(fit: argparse.ArgumentParser) -> None:
              "the connectivity scale (default 0.5); higher = stricter periodic "
              "detection. Valid only for --method auto.",
     )
+    _add_dls_arg(fit)
     fit.set_defaults(quantize=None, device="auto", probes=None)
 
 

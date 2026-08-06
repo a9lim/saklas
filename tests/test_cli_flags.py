@@ -436,6 +436,68 @@ def test_fit_smoothing_override_is_delegated_to_fit_transaction(
     assert fit_kwargs["hyperparams"] == {"smoothing": 0.25}
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["manifold", "extract", "happy.sad", "-m", "fake/model"],
+        ["manifold", "fit", "happy.sad", "-m", "fake/model"],
+    ],
+    ids=["extract", "fit"],
+)
+@pytest.mark.parametrize("flag, expected_dls", [([], True), (["--no-dls"], False)])
+def test_no_dls_reaches_session_construction(
+    argv: list[str],
+    flag: list[str],
+    expected_dls: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--no-dls`` is accepted by both fit verbs and inverts into ``dls=``.
+
+    The two verbs where DLS actually applies did not expose the flag at all,
+    so this pins the subparser plus ``_make_session``'s
+    ``dls = not args.no_dls`` inversion.  The session-side hop
+    (``self._dls`` -> ``pipe.fit(dls=...)``) is pinned in
+    ``test_manifold_extraction``.
+    """
+    from saklas.core.session import SaklasSession
+    from saklas.io.manifold_authoring import create_discover_manifold_folder
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "happy.sad", "", fit_mode="pca",
+        node_corpora={"happy": ["yes"], "sad": ["no"]},
+    )
+    captured: dict[str, Any] = {}
+
+    class _FakeSession:
+        model_info: dict[str, Any] = {}
+
+        def extract(self, *_args: Any, **_kwargs: Any) -> Any:
+            return "happy.sad", object()
+
+        def fit(self, *_args: Any, **_kwargs: Any) -> Any:
+            from saklas.core.manifold import CustomDomain
+            return SimpleNamespace(
+                name="happy.sad", layers={0: object()},
+                node_labels=["happy", "sad"], domain=CustomDomain(1),
+                feature_space="raw", metadata={"fit_mode": "pca"},
+            )
+
+    def _fake_from_pretrained(_model_id: str, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _FakeSession()
+
+    monkeypatch.setattr(
+        SaklasSession, "from_pretrained", staticmethod(_fake_from_pretrained),
+    )
+    monkeypatch.setattr(cli_runners, "_print_startup", lambda _args: None)
+    monkeypatch.setattr(cli_runners, "_print_model_info", lambda _session: None)
+
+    cli.main([*argv, *flag])
+    assert captured["dls"] is expected_dls
+
+
 def test_serve_stale_lens_gate_uses_weight_compatibility() -> None:
     class _Session:
         enabled = False
