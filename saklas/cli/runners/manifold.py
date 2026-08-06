@@ -4,6 +4,7 @@ fit/bake/merge/transfer/compare/why) and their dispatch table."""
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 from operator import itemgetter
 import sys
 from pathlib import Path
@@ -15,8 +16,6 @@ from saklas.cli.runners.shared import (
     _print_verb_menu, _resolve_manifold_folder, _resolve_manifold_ns_name,
     _saklas_error_exit, _split_manifold_ns_name,
 )
-from saklas.core.histogram import summarize_diagnostics
-from saklas.core.stats import median_or_zero
 from saklas.io.paths import VARIANT_SUFFIX_RE
 
 if TYPE_CHECKING:
@@ -464,7 +463,6 @@ def _run_manifold_why(args: argparse.Namespace) -> None:
         key=itemgetter(0),
     )
     total_layers = len(profile)
-    diagnostics = profile.diagnostics  # None when extracted before saklas 1.6
 
     if args.json_output:
         result: dict[str, Any] = {
@@ -473,31 +471,9 @@ def _run_manifold_why(args: argparse.Namespace) -> None:
             "total_layers": total_layers,
             "layers": [{"layer": l, "magnitude": round(m, 6)} for l, m in layer_mags],
         }
-        if diagnostics is not None:
-            result["diagnostics_by_layer"] = {
-                str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
-                for layer, metrics in sorted(diagnostics.items())
-            }
-            result["diagnostics_summary"] = summarize_diagnostics(diagnostics)
         print(_json.dumps(result, indent=2))
     else:
         _print_why_histogram(concept_name, args.model, total_layers, layer_mags)
-        if diagnostics is not None:
-            _print_diagnostics(diagnostics)
-
-
-def _print_diagnostics(diagnostics: dict[int, dict[str, float]]) -> None:
-    """Render the diagnostics summary + per-layer table beneath the histogram."""
-    summary = summarize_diagnostics(diagnostics)
-    quality = summary["quality"]
-    print()
-    print(f"  DIAGNOSTICS (probe quality: {quality}):")
-    print(
-        f"    median EVR:                 {summary['median_evr']:.3f}\n"
-        f"    median intra-pair variance: {summary['median_intra_pair_variance']:.4f}\n"
-        f"    median inter-pair alignment:{summary['median_inter_pair_alignment']:>7.3f}\n"
-        f"    median diff→PC projection:  {summary['median_diff_principal_projection']:.3f}"
-    )
 
 
 def _print_why_histogram(
@@ -857,6 +833,22 @@ def _run_manifold_merge(args: argparse.Namespace) -> None:
     )
 
 
+def _median(values: "Iterable[float]") -> float:
+    """Median of ``values``; ``0.0`` for an empty iterable.
+
+    Summarizes the per-layer Procrustes alignment qualities into the single
+    ``transfer_quality_estimate`` the transferred sidecar records.
+    """
+    ordered = sorted(float(v) for v in values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2 == 1:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
 def _run_manifold_transfer(args: argparse.Namespace) -> None:
     """Cross-model manifold transfer via Procrustes.
 
@@ -915,7 +907,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         print(f"manifold transfer failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
+    median_quality = _median(quality_per_layer.values()) if quality_per_layer else None
 
     try:
         out_path = transfer_manifold(

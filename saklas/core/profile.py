@@ -348,32 +348,6 @@ class Profile:
         """Copy of the metadata dict carried alongside the tensors."""
         return dict(self._metadata)
 
-    @property
-    def diagnostics(self) -> dict[int, dict[str, float]] | None:
-        """Per-layer fit-quality metrics carried in provenance, if any.
-
-        Reads a ``diagnostics`` key off :attr:`metadata` — layer index →
-        ``{metric_name: float}``.  Nothing in saklas writes one: the unified
-        pipeline's diagnostics (``PcaDiagnostics`` / ``SpectralDiagnostics``)
-        ride the *manifold* sidecar instead, a separate channel surfaced by
-        ``manifold show`` / ``pack show``.  This surface therefore returns
-        ``None`` for every profile saklas hands out and exists for callers
-        that stash their own per-layer metrics; branch on
-        :attr:`has_diagnostics` first.
-        """
-        diag = self._metadata.get("diagnostics")
-        if not isinstance(diag, dict) or not diag:
-            return None
-        # Defensive copy: callers shouldn't be able to mutate the cached
-        # metric dicts through this surface.
-        return {int(L): dict(metrics) for L, metrics in diag.items()}
-
-    @property
-    def has_diagnostics(self) -> bool:
-        """True iff this profile carries per-layer diagnostic metrics."""
-        diag = self._metadata.get("diagnostics")
-        return isinstance(diag, dict) and bool(diag)
-
     def as_dict(self) -> dict[int, torch.Tensor]:
         """Return the underlying dict (shared reference, not a copy).
 

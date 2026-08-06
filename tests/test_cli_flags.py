@@ -932,13 +932,11 @@ def _setup_why_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return tmp_path / "manifolds"
 
 
-def _mock_why_profile(layer_mags: dict[int, float], diagnostics: dict[str, Any] | None = None) -> Any:
+def _mock_why_profile(layer_mags: dict[int, float]) -> Any:
     """Return a duck-typed mock profile for _run_why.
 
-    Carries the four surfaces ``_run_why`` reads: ``items()`` (per-layer
-    magnitudes), ``__len__`` (total layers), ``diagnostics``, and
-    ``has_diagnostics``.  Diagnostics default to ``None`` to mirror the
-    pre-1.6 sidecar shape.
+    Carries the two surfaces ``_run_why`` reads: ``items()`` (per-layer
+    magnitudes) and ``__len__`` (total layers).
     """
     import torch
 
@@ -948,14 +946,6 @@ def _mock_why_profile(layer_mags: dict[int, float], diagnostics: dict[str, Any] 
 
         def __len__(self):
             return len(layer_mags)
-
-        @property
-        def diagnostics(self):
-            return diagnostics
-
-        @property
-        def has_diagnostics(self):
-            return diagnostics is not None and bool(diagnostics)
 
     return MockProfile()
 
