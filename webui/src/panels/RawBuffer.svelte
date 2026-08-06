@@ -25,7 +25,7 @@
     beginTokenHover,
     endTokenHover,
   } from "../lib/stores.svelte";
-  import type { ChatTurn, TokenScore } from "../lib/types";
+  import type { TokenScore } from "../lib/types";
   import Button from "../lib/ui/Button.svelte";
   import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
   import { SURPRISE_TARGET } from "../lib/tokens";
