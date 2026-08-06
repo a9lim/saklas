@@ -41,6 +41,9 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Iterator, Literal, cast
 
 from saklas.core.errors import SaklasError
+# ``LoomMutated`` is defined in ``events`` (one module owns the bus's payload
+# types) and re-exported here — the historical import path.
+from saklas.core.events import EventBus, LoomMutated
 from saklas.core.sampling import SamplingConfig
 
 # ---------------------------------------------------------------------------
@@ -127,6 +130,12 @@ def _is_number(value: Any) -> bool:
 
 
 _CAST_MEMBER_FIELDS = frozenset({"recipe", "notes"})
+_RECIPE_FIELDS = frozenset({
+    "steering", "sampling", "thinking", "seed", "probes", "probe_hashes",
+})
+# Derived from the dataclass so a new sampling knob can't drift the reader
+# away from what ``Recipe.to_dict`` writes.
+_SAMPLING_FIELDS = frozenset(f.name for f in fields(SamplingConfig))
 _NODE_FIELDS = frozenset({
     "id", "parent_id", "role", "text", "role_label", "thinking_text",
     "recipe", "aggregate_readings", "applied_steering", "finish_reason",
@@ -196,23 +205,40 @@ class Recipe:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Recipe":
+        """Read the complete current writer shape — strict, like its siblings.
+
+        A recipe is nested inside both node and cast payloads, so a lenient
+        read here would let a corrupt or future-format recipe slip through the
+        strict outer gate and land as a partially-defaulted object.  Every
+        field ``to_dict`` writes is required; unknown keys are rejected; the
+        nested sampling block is checked against ``SamplingConfig``'s own
+        fields so a bad key raises :class:`LoomTreeError` rather than a bare
+        ``TypeError`` out of the constructor.
+        """
+        _require_fields(data, _RECIPE_FIELDS, "recipe")
         sampling = None
-        s = data.get("sampling")
+        s = data["sampling"]
         if s is not None:
             s = dict(s)
+            _require_fields(s, _SAMPLING_FIELDS, "recipe sampling")
             if s.get("logit_bias") is not None:
                 s["logit_bias"] = {
                     int(tid): float(bias)
                     for tid, bias in dict(s["logit_bias"]).items()
                 }
-            sampling = SamplingConfig(**{k: v for k, v in s.items() if v is not None})
+            try:
+                sampling = SamplingConfig(
+                    **{k: v for k, v in s.items() if v is not None}
+                )
+            except TypeError as e:
+                raise LoomTreeError(f"recipe sampling is not constructible: {e}") from e
         return cls(
-            steering=data.get("steering"),
+            steering=data["steering"],
             sampling=sampling,
-            thinking=data.get("thinking"),
-            seed=data.get("seed"),
-            probes=list(data.get("probes", [])),
-            probe_hashes=dict(data.get("probe_hashes", {})),
+            thinking=data["thinking"],
+            seed=data["seed"],
+            probes=list(data["probes"]),
+            probe_hashes=dict(data["probe_hashes"]),
         )
 
     # ------------------------------------------------------------------
@@ -588,49 +614,6 @@ class LoomNode:
 
 
 # ---------------------------------------------------------------------------
-# Events
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class LoomMutated:
-    """Tree-mutation event for ``session.events``.
-
-    ``op`` is one of ``"edit"``, ``"branch"``, ``"navigate"``, ``"delete"``,
-    ``"star"``, ``"note"``, ``"reset"``, ``"add_user"``, ``"begin_assistant"``,
-    ``"finalize_assistant"``, ``"capture_authored"``,
-    ``"restore"`` (whole-tree replacement),
-    ``"cast"`` (roster change — no node ids;
-    clients refetch the roster).
-
-    Delta payload fields carry ids only at the engine level — the
-    server WS layer (:mod:`saklas.server.ws_stream`'s
-    ``WS /saklas/v1/sessions/{id}/stream``) enriches each id into full
-    ``LoomNodeJSON`` payloads via :func:`saklas.server.tree_models.node_json`
-    before forwarding to clients. The wire-level ``tree_mutated`` event
-    therefore carries full nodes while in-process
-    in-process subscribers that already hold the tree
-    look the ids up themselves; the network hop is the only place that
-    needs the inlined node data.
-
-    Field semantics:
-
-    - ``added``: newly-created node ids
-    - ``removed``: dropped node ids (delete_subtree)
-    - ``updated``: ids of nodes whose fields changed in place (edit/star/note)
-    - ``active_node_id``: present when the active node moves
-    - ``rev``: monotonic tree revision after the mutation
-    """
-
-    op: str
-    rev: int
-    added: tuple[str, ...] = ()
-    removed: tuple[str, ...] = ()
-    updated: tuple[str, ...] = ()
-    active_node_id: str | None = None
-
-
-# ---------------------------------------------------------------------------
 # Seed schedule
 # ---------------------------------------------------------------------------
 
@@ -713,14 +696,14 @@ class LoomTree:
     def __init__(
         self,
         *,
-        events: Any | None = None,
+        events: EventBus | None = None,
         model_id: str | None = None,
         session_id: str | None = None,
         name: str | None = None,
         conflict_check: ConflictChecker | None = None,
     ) -> None:
         self._lock = threading.RLock()
-        self._events = events  # EventBus-like; emit(LoomMutated) when set
+        self._events: EventBus | None = events  # emits LoomMutated when set
         self.model_id: str | None = model_id
         self.session_id: str | None = session_id
         self.name: str | None = name
@@ -755,7 +738,7 @@ class LoomTree:
         """
         self._conflict_check = fn or _noop_conflict_check
 
-    def attach_events(self, events: Any | None) -> None:
+    def attach_events(self, events: EventBus | None) -> None:
         """Wire (or unwire) the EventBus that mutations emit on."""
         self._events = events
 
@@ -775,10 +758,6 @@ class LoomTree:
     def children(self, node_id: str) -> list[LoomNode]:
         with self._lock:
             return [self.nodes[c] for c in self.children_of.get(node_id, [])]
-
-    def child_ids(self, node_id: str) -> list[str]:
-        with self._lock:
-            return list(self.children_of.get(node_id, []))
 
     def descendants(self, node_id: str) -> Iterator[LoomNode]:
         """Depth-first iteration over the descendants of ``node_id``."""
@@ -1542,7 +1521,7 @@ class LoomTree:
         cls,
         data: dict[str, Any],
         *,
-        events: Any | None = None,
+        events: EventBus | None = None,
         conflict_check: ConflictChecker | None = None,
     ) -> "LoomTree":
         _require_fields(
@@ -1711,7 +1690,7 @@ class LoomTree:
         write_json_atomic(out_path, data)
 
     @classmethod
-    def load(cls, path: Any, *, events: Any | None = None) -> "LoomTree":
+    def load(cls, path: Any, *, events: EventBus | None = None) -> "LoomTree":
         from pathlib import Path
 
         in_path = Path(path)

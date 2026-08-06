@@ -24,7 +24,11 @@ from saklas import (
     UnknownNodeError,
     derive_seed_schedule,
 )
-from saklas.core.loom import TOKEN_SIDECAR_FORMAT_VERSION, TREE_FORMAT_VERSION
+from saklas.core.loom import (
+    TOKEN_SIDECAR_FORMAT_VERSION,
+    TREE_FORMAT_VERSION,
+    LoomTreeError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +913,63 @@ def test_recipe_round_trip():
     assert r2.sampling.logprobs == 3
     assert r2.sampling.return_hidden is True
     assert r2.sampling.return_top_k == 12
+
+
+def test_recipe_from_dict_rejects_missing_field():
+    """Recipe reads the complete writer shape, like every sibling reader.
+
+    It used to ``.get()`` every field with a default, so a corrupt or
+    future-format recipe nested inside a node/cast payload passed the strict
+    outer gate and landed as a partially-defaulted object.
+    """
+    rd = Recipe(steering="0.3 honest").to_dict()
+    del rd["probe_hashes"]
+    with pytest.raises(LoomTreeError, match="missing required fields"):
+        Recipe.from_dict(rd)
+
+
+def test_recipe_from_dict_rejects_unknown_field():
+    rd = Recipe().to_dict()
+    rd["mystery"] = 1
+    with pytest.raises(LoomTreeError, match="unknown fields"):
+        Recipe.from_dict(rd)
+
+
+def test_recipe_from_dict_rejects_unknown_sampling_key():
+    """An unrecognized sampling key is a ``LoomTreeError``, not a TypeError.
+
+    The nested ``SamplingConfig(**...)`` used to raise a bare ``TypeError``
+    straight out of the constructor, breaking the module's error contract.
+    """
+    rd = Recipe(sampling=SamplingConfig(temperature=0.5)).to_dict()
+    assert rd["sampling"] is not None
+    rd["sampling"]["nonexistent_knob"] = 1
+    with pytest.raises(LoomTreeError, match="unknown fields"):
+        Recipe.from_dict(rd)
+
+
+def test_recipe_survives_node_and_cast_round_trips():
+    """The strict read still accepts everything the writers emit."""
+    recipe = Recipe(
+        steering="0.5 calm",
+        sampling=SamplingConfig(temperature=0.4),
+        thinking=True,
+        seed=7,
+        probes=["calm"],
+        probe_hashes={"calm": "abc"},
+    )
+    t = LoomTree()
+    u = t.add_user_turn("hi")
+    a = t.begin_assistant(u, recipe=recipe)
+    t.finalize_assistant(a, text="yo")
+    from saklas.core.loom import CastMember
+    t.set_cast_member("deer", CastMember(recipe=Recipe(steering="0.2 skittish")))
+
+    t2 = LoomTree.from_dict(t.to_dict())
+    assert t2.nodes[a].recipe is not None
+    assert t2.nodes[a].recipe.steering == "0.5 calm"
+    assert t2.cast["deer"].recipe is not None
+    assert t2.cast["deer"].recipe.steering == "0.2 skittish"
 
 
 def test_children_order_preserved_through_save(tmp_path: Path):
