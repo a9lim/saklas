@@ -24,6 +24,8 @@
   import Button from "../lib/ui/Button.svelte";
   import { onMount } from "svelte";
   import SaeProbeCard from "./rack/SaeProbeCard.svelte";
+  import { mergeInstrumentProbeRows } from "./rack/probeRows";
+  import type { InstrumentProbeRow } from "./rack/probeRows";
   import AtomSteerCard from "./rack/AtomSteerCard.svelte";
   import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
@@ -246,71 +248,19 @@
     return maxAct != null && maxAct > 0 ? value / maxAct : value / fallbackScale;
   }
 
-  const pinned = $derived.by(() => {
-    const rows = [...pinnedBase];
-    if (saeState.sortMode === "name") {
-      rows.sort((a, b) => {
-        const aid = Number(a.name.slice(4));
-        const bid = Number(b.name.slice(4));
-        const an = a.entry?.info.label || String(aid);
-        const bn = b.entry?.info.label || String(bid);
-        return an.localeCompare(bn, undefined, { numeric: true });
-      });
-    } else {
-      rows.sort((a, b) => {
-        const ae = a.entry!;
-        const be = b.entry!;
-        const av = ae.aggregate?.coords?.[0] ?? ae.reading?.coords?.[0] ?? ae.current;
-        const bv = be.aggregate?.coords?.[0] ?? be.reading?.coords?.[0] ?? be.current;
-        // Pinned values with max_act are already normalized by the server.
-        const as = ae.info.max_act != null ? av : av / fallbackScale;
-        const bs = be.info.max_act != null ? bv : bv / fallbackScale;
-        return bs - as;
-      });
-    }
-    return rows;
-  });
-
-  const discovery = $derived.by(() => {
-    const rows = [...discoveryBase];
-    if (saeState.sortMode === "name") {
-      rows.sort((a, b) =>
-        (a.label || String(a.id)).localeCompare(
-          b.label || String(b.id),
-          undefined,
-          { numeric: true },
-        ),
-      );
-    } else {
-      rows.sort((a, b) =>
-        visibleStrength(b.activation, b.max_act ?? null) -
-        visibleStrength(a.activation, a.max_act ?? null),
-      );
-    }
-    return rows;
-  });
-
   type VisibleProbeCard =
-    | {
+    | ({
         kind: "pinned";
-        key: string;
         name: string;
         entry: NonNullable<(typeof pinnedBase)[number]["entry"]>;
-        sortName: string;
-        strength: number;
-      }
-    | {
+      } & InstrumentProbeRow)
+    | ({
         kind: "discovery";
-        key: string;
         feature: (typeof discoveryBase)[number];
-        sortName: string;
-        strength: number;
-      };
+      } & InstrumentProbeRow);
 
-  /** One visible list, one sort order. Pinning changes persistence/actions,
-   *  never a card's position outside the selected sort. */
-  const probeCards = $derived.by((): VisibleProbeCard[] => {
-    const rows: VisibleProbeCard[] = pinned.map((row) => {
+  const pinnedRows = $derived.by((): VisibleProbeCard[] =>
+    pinnedBase.map((row) => {
       const entry = row.entry!;
       const value = entry.aggregate?.coords?.[0] ??
         entry.reading?.coords?.[0] ?? entry.current;
@@ -321,26 +271,30 @@
         name: row.name,
         entry,
         sortName: entry.info.label || String(id),
+        // Pinned values with max_act are already normalized server-side.
         strength: entry.info.max_act != null ? value : value / fallbackScale,
       };
-    });
-    if (saeState.live || tokenHoverState.active) {
-      rows.push(...discovery.map((feature) => ({
-        kind: "discovery" as const,
-        key: `sae/${feature.id}`,
-        feature,
-        sortName: feature.label || String(feature.id),
-        strength: visibleStrength(feature.activation, feature.max_act ?? null),
-      })));
-    }
-    rows.sort(saeState.sortMode === "name"
-      ? (a, b) => a.sortName.localeCompare(
-          b.sortName, undefined, { numeric: true },
-        ) || b.strength - a.strength
-      : (a, b) => b.strength - a.strength ||
-          a.sortName.localeCompare(b.sortName, undefined, { numeric: true }));
-    return rows;
-  });
+    }));
+
+  const discoveryRows = $derived.by((): VisibleProbeCard[] =>
+    discoveryBase.map((feature) => ({
+      kind: "discovery",
+      key: `sae/${feature.id}`,
+      feature,
+      sortName: feature.label || String(feature.id),
+      strength: visibleStrength(feature.activation, feature.max_act ?? null),
+    })));
+
+  /** One visible list, one sort order. Pinning changes persistence/actions,
+   *  never a card's position outside the selected sort. */
+  const probeCards = $derived(
+    mergeInstrumentProbeRows(
+      pinnedRows,
+      saeState.live || tokenHoverState.active ? discoveryRows : [],
+      saeState.sortMode,
+      { numericNames: true },
+    ),
+  );
 
   let steerInput = $state("");
   let probeInput = $state("");
@@ -574,7 +528,7 @@
     <section class="section probe">
       <RackSectionHeader
         title="PROBE"
-        count={`${pinned.length} pinned`}
+        count={`${pinnedBase.length} pinned`}
         live={saeState.live}
         liveBusy={saeState.busy}
         liveTitle={saeState.live
@@ -633,7 +587,7 @@
             <p class="hint">no SAE score for this token</p>
           {/if}
         {:else if saeState.live}
-          {#if discovery.length === 0}
+          {#if discoveryBase.length === 0}
             <p class="hint">run to discover</p>
           {/if}
         {:else}
