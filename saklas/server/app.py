@@ -19,7 +19,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
-from fastapi.utils import is_body_allowed_for_status_code
 from pydantic import BaseModel, model_validator
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -591,17 +590,20 @@ def create_app(session: SaklasSession,
         so a client had to guess.  On ``/saklas/v1/*`` it is always a string;
         every other prefix keeps FastAPI's default rendering.
         """
+        response = await http_exception_handler(request, exc)
         if (
             request.url.path.startswith(NATIVE_PREFIX)
             and not isinstance(exc.detail, str)
-            and is_body_allowed_for_status_code(exc.status_code)
+            # A bodiless status (204 / 304) comes back as a bare ``Response``
+            # from the default handler — leave those alone.
+            and isinstance(response, JSONResponse)
         ):
             return JSONResponse(
                 status_code=exc.status_code,
                 content={"detail": _detail_text(exc.detail)},
                 headers=getattr(exc, "headers", None),
             )
-        return await http_exception_handler(request, exc)
+        return response
 
     _register_routes(app)
 

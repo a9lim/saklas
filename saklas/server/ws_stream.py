@@ -448,12 +448,12 @@ def _validate_generate(
     msg: WSGenerateMessage,
     native_commit_role: "Literal['user', 'assistant'] | None",
 ) -> None:
-    """Check the mode fields a ``generate`` frame must carry together.
+    """Check the fields a ``generate`` frame's mode must carry together.
 
-    The five modes (plain generate, logit fork, answer-prefill, commit, seat)
-    are mutually exclusive and each has fields that only make sense as a set.
-    Raises :class:`_WSRequestError` on a violation; returns on a well-formed
-    frame.
+    Fork, prefill, and commit are mutually exclusive, and each is selected by
+    one field while needing others alongside it — relationships the flat
+    pydantic schema can't express.  Raises :class:`_WSRequestError` on a
+    violation; returns on a well-formed frame.
     """
     if msg.n < 1:
         raise _WSRequestError(f"n must be >= 1, got {msg.n}")

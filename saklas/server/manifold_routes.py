@@ -281,7 +281,7 @@ def _fitted_geometry(path: Path) -> tuple[list[list[float]], bool | None]:
 
     The flat/curved discriminator is the same one ``load_manifold`` keys on:
     the *absence* of any ``layer_<L>.node_params`` entry marks an affine fit.
-    ``(=[], None)`` when the artifact is missing or unreadable — the caller
+    ``([], None)`` when the artifact is missing or unreadable — the caller
     reports an unresolved geometry rather than failing the whole listing.
     """
     from safetensors import SafetensorError, safe_open
