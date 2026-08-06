@@ -160,6 +160,22 @@ def _parse_layers(layers: str | None) -> list[int] | str | None:
         ) from e
 
 
+def _validation_message(exc: ValidationError) -> str:
+    """Flatten a pydantic ``ValidationError`` into one ``detail`` string.
+
+    The preparation bodies are re-parsed into per-operation models after the
+    ``{operation, …}`` envelope is split, so their failures arrive as a raw
+    ``exc.errors()`` list.  The native envelope's ``detail`` is always a
+    string, so render the field paths here rather than shipping the list.
+    """
+    parts: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()))
+        msg = str(err.get("msg", "invalid value"))
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts) or "invalid preparation fields"
+
+
 def _require_family(family: str) -> str:
     if family not in _FAMILIES:
         raise HTTPException(
@@ -168,16 +184,6 @@ def _require_family(family: str) -> str:
             f"(want one of {', '.join(_FAMILIES)})",
         )
     return family
-
-
-def _active_lens_source(session: Any) -> str | None:
-    """The active J-lens source label, from the public source listing."""
-    from saklas.io.lens_sources import list_lens_sources
-
-    for row in list_lens_sources(session.model_id):
-        if row.get("active"):
-            return row.get("source")
-    return None
 
 
 def _sae_source_label(session: Any) -> str | None:
@@ -401,7 +407,12 @@ def register_instrument_routes(app: FastAPI) -> None:
         return {
             "family": "lens",
             "live": {"enabled": layers is not None, "layers": layers},
-            "source": _active_lens_source(session),
+            # The same resolver that stamps the source onto every lens
+            # measurement binding — a listing that answered from the
+            # prepared-sources scan instead would report ``null`` for an
+            # active pointer whose artifact is gone while the persisted
+            # rows still carry its label.
+            "source": session._active_jlens_source_label(),
             "probes": list(session.lens_probe_names),
             "capabilities": {
                 "sources": True,
@@ -849,7 +860,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         try:
             return starter(fields)
         except ValidationError as exc:
-            raise HTTPException(400, exc.errors()) from exc
+            raise HTTPException(400, _validation_message(exc)) from exc
 
     @app.get(
         "/saklas/v1/sessions/{session_id}/instruments/{family}/preparations",
@@ -1005,7 +1016,7 @@ def register_instrument_routes(app: FastAPI) -> None:
             lens_readout=lens_readout,
             lens_aggregate=lens_aggregate,
             lens_token_ids=lens_token_ids,
-            lens_source=_active_lens_source(session),
+            lens_source=session._active_jlens_source_label(),
             steering=(out.get("steering") if steered else None),
         )
         return {"measurements": measurements}

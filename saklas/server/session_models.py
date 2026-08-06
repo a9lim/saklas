@@ -130,8 +130,8 @@ def session_info(
         "sae_loaded": sae_info is not None,
         "sae_info": sae_info,
         "live_sae": session.live_sae,
-        # CAA live toggle state (POST .../probes/live): whether per-token
-        # monitor scoring feeds live consumers.
+        # CAA live toggle state (POST .../instruments/geometry/live):
+        # whether per-token monitor scoring feeds live consumers.
         "live_probe_scores": session.live_probe_scores,
         "default_steering": default_expr,
         "role_substitution_supported": assistant_role_ok,

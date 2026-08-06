@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 import torch
 from safetensors.torch import load_file, save as serialize_safetensors, save_file
 
+from saklas.core.errors import SaklasError
 from saklas.core.events import EventBus, ManifoldExtracted
 from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
 from saklas.core.topology import PcaDiagnostics, SpectralDiagnostics
@@ -140,8 +141,18 @@ def _repair_incomplete_target_locked(
         write_json_atomic(manifest_path, payload)
 
 
-class ManifoldAuthoringChangedError(RuntimeError):
-    """The authoring inputs changed while a target was being fitted."""
+class ManifoldAuthoringChangedError(RuntimeError, SaklasError):
+    """The authoring inputs changed while a target was being fitted.
+
+    Semantically the conflict :class:`~saklas.core.session.ConcurrentExtractionError`
+    models, reached from the other direction: the fit is fine, the folder moved
+    under it.  Reports 409 so the caller retries against the current revision
+    instead of reading it as a server fault.  ``RuntimeError`` stays in the
+    MRO, so existing catch sites are unaffected.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (409, str(self) or self.__class__.__name__)
 
 
 def _assert_authoring_revision(

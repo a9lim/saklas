@@ -63,10 +63,9 @@ class TestListing:
         self, session_and_client: Any, monkeypatch: Any,
     ) -> None:
         session, client = session_and_client
-        monkeypatch.setattr(
-            "saklas.io.lens_sources.list_lens_sources",
-            lambda _m: [{"source": "local:default", "active": True}],
-        )
+        # The listing answers from the canonical active-source resolver, the
+        # same one that stamps lens measurement bindings.
+        session._active_jlens_source_label.return_value = "local:default"
         session.lens_probe_names = ["jlens/fake"]
         session.sae_info = {"release": "scope", "layer": 14, "width": 16_384}
         resp = client.get(_BASE)
@@ -98,6 +97,25 @@ class TestListing:
             "sources": True, "preparations": ["load", "train"],
             "token_readout": True, "source_switch": False,
         }
+
+    def test_source_survives_a_missing_prepared_artifact(
+        self, session_and_client: Any, monkeypatch: Any,
+    ) -> None:
+        """The listing reports the active pointer, not the on-disk scan.
+
+        ``list_lens_sources`` only emits rows whose manifest/binding file
+        still exists, so an active pointer naming a removed artifact drops
+        out of it entirely.  Answering the listing from that scan made the
+        dashboard say ``source: null`` while every persisted measurement
+        binding still carried the label.
+        """
+        session, client = session_and_client
+        monkeypatch.setattr(
+            "saklas.io.lens_sources.list_lens_sources", lambda _m: [],
+        )
+        session._active_jlens_source_label.return_value = "local:default"
+        fams = {f["family"]: f for f in client.get(_BASE).json()["instruments"]}
+        assert fams["lens"]["source"] == "local:default"
 
     def test_live_states_reflect_runtime(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -310,6 +328,25 @@ class TestPreparations:
         )
         assert resp.status_code == 400  # 'load' is an sae op, not lens
 
+    def test_invalid_op_fields_render_a_string_detail(
+        self, session_and_client: Any,
+    ) -> None:
+        """Op bodies are re-parsed after the envelope split — flatten those.
+
+        The per-operation models are validated by hand here, so their failure
+        arrives as a raw ``exc.errors()`` list; the native envelope's
+        ``detail`` is always a string.
+        """
+        _session, client = session_and_client
+        resp = client.post(
+            f"{_BASE}/lens/preparations",
+            json={"operation": "fit", "prompts": 999_999},
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert isinstance(detail, str)
+        assert "prompts" in detail
+
     def test_lens_fit_status_mapping_and_mutual_exclusion(
         self, session_and_client: Any, monkeypatch: Any,
     ) -> None:
@@ -512,14 +549,9 @@ class TestTokenReadout:
         )
         assert resp.status_code == 404
 
-    def test_lens_replay_envelope(
-        self, session_and_client: Any, monkeypatch: Any,
-    ) -> None:
+    def test_lens_replay_envelope(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        monkeypatch.setattr(
-            "saklas.io.lens_sources.list_lens_sources",
-            lambda _m: [{"source": "local:default", "active": True}],
-        )
+        session._active_jlens_source_label.return_value = "local:default"
         session.jlens_token_readout.return_value = dict(self._LENS_OUT)
         resp = client.get(
             f"{_BASE}/lens/token-readout",

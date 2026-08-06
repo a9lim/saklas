@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from saklas.core.results import GenerationResult
 from saklas.core.sampling import SamplingConfig
+from saklas.server import request_helpers
 from saklas.server.native_common import NativeRequest
 
 
@@ -87,26 +88,31 @@ class WSSubmitMessage(NativeRequest):
     recipe_override: str | None = None
 
 
-def build_sampling(body: WSSamplingParams | None) -> SamplingConfig | None:
+def build_sampling_config(body: WSSamplingParams | None) -> SamplingConfig | None:
+    """Adapt the WS sampling block onto the shared sampling constructor.
+
+    Same operation the OpenAI and Ollama routes perform under the same name
+    (:func:`saklas.server.request_helpers.build_sampling_config`); this is just
+    the native wire body's field mapping onto it.
+    """
     if body is None:
         return None
-    stop = tuple(body.stop) if body.stop else None
-    return SamplingConfig(
+    return request_helpers.build_sampling_config(
         temperature=body.temperature,
         top_p=body.top_p,
         top_k=body.top_k,
         max_tokens=body.max_tokens,
         seed=body.seed,
-        stop=stop,
+        stop=body.stop,
         logit_bias=body.logit_bias,
-        presence_penalty=body.presence_penalty or 0.0,
-        frequency_penalty=body.frequency_penalty or 0.0,
+        presence_penalty=body.presence_penalty,
+        frequency_penalty=body.frequency_penalty,
         return_top_k=body.return_top_k,
-        return_probe_readings=bool(body.return_probe_readings),
-        user_role=(body.user_role or None),
-        assistant_role=(body.assistant_role or None),
-        persist_per_layer_scores=bool(body.persist_per_layer_scores),
-        persist_subspace_coords=bool(body.persist_subspace_coords),
+        return_probe_readings=body.return_probe_readings,
+        user_role=body.user_role,
+        assistant_role=body.assistant_role,
+        persist_per_layer_scores=body.persist_per_layer_scores,
+        persist_subspace_coords=body.persist_subspace_coords,
     )
 
 

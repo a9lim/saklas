@@ -1398,6 +1398,71 @@ class TestCommitContinued:
         assert session.tree.rev > rev_before
 
 
+class TestWSErrorFrameShape:
+    """Every WS ``error`` frame carries the same five keys.
+
+    The frames used to be hand-built at ~20 sites with three different key
+    sets — some carried ``status``, some also ``node_id``/``sibling_index``,
+    the connection-level ones neither — so a client had to probe.
+    """
+
+    _KEYS = {"type", "message", "code", "status", "node_id", "sibling_index"}
+
+    def _first_error(self, client: Any, frame: dict[str, Any]) -> dict[str, Any]:
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json(frame)
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "error":
+                    return msg
+
+    def test_unknown_message_type(self, session_and_client: Any) -> None:
+        _session, client = session_and_client
+        msg = self._first_error(client, {"type": "nonsense"})
+        assert set(msg) == self._KEYS
+        assert msg["status"] == 400
+
+    def test_pydantic_rejection(self, session_and_client: Any) -> None:
+        _session, client = session_and_client
+        msg = self._first_error(
+            client, {"type": "generate", "n": "not-an-int"},
+        )
+        assert set(msg) == self._KEYS
+        assert msg["code"] == "ValidationError"
+
+    def test_hand_validated_mode_rejection(self, session_and_client: Any) -> None:
+        _session, client = session_and_client
+        msg = self._first_error(
+            client, {"type": "generate", "fork_node_id": "n1"},
+        )
+        assert set(msg) == self._KEYS
+        assert msg["status"] == 400
+        assert msg["node_id"] is None
+        assert msg["sibling_index"] == 0
+
+    def test_submit_rejection(self, session_and_client: Any) -> None:
+        _session, client = session_and_client
+        msg = self._first_error(client, {"type": "submit", "text": ""})
+        assert set(msg) == self._KEYS
+        assert msg["status"] == 400
+
+    def test_steering_expression_rejection(self, session_and_client: Any) -> None:
+        """A malformed expression is a frame, not a socket close."""
+        _session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate", "input": "hi", "steering": "0.5 *** bad",
+            })
+            while True:
+                msg = ws.receive_json()
+                if msg["type"] == "error":
+                    break
+            assert set(msg) == self._KEYS
+            assert msg["status"] == 400
+            # The connection survives — the client can retry on the same WS.
+            ws.send_json({"type": "stop"})
+
+
 class TestCast:
     def test_cast_crud_round_trip(self, session_and_client: Any) -> None:
         session, client = session_and_client

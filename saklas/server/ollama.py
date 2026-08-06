@@ -226,13 +226,10 @@ def _resolve_options(
                 f"Ollama option '{name}' must be an integer"
             ) from e
 
+    # Only a string or a list is a stop spec here; anything else Ollama
+    # clients send under that key is dropped rather than stringified.
     stop_raw = opts.get("stop") or body.get("stop")
-    if isinstance(stop_raw, str):
-        stop_tuple: tuple[str, ...] | None = (stop_raw,)
-    elif isinstance(stop_raw, list):
-        stop_tuple = tuple(str(s) for s in stop_raw)
-    else:
-        stop_tuple = None
+    stop_spec = stop_raw if isinstance(stop_raw, (str, list)) else None
 
     temperature = _number_option("temperature")
     top_p = _number_option("top_p")
@@ -292,7 +289,7 @@ def _resolve_options(
         top_k=top_k,
         max_tokens=_int_option("num_predict", max_tokens),
         seed=seed,
-        stop=stop_tuple,
+        stop=stop_spec,
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
     )

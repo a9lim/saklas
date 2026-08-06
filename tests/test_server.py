@@ -233,6 +233,76 @@ class TestChatCompletions:
         assert err["code"] == 404
         assert err["type"] == "invalid_request_error"
         assert "No profile registered for 'missing'" in err["message"]
+        # The stream still terminates: openai-python's ``Stream`` (and
+        # LangChain's ``ChatOpenAI``) wait for the sentinel, exactly like
+        # ollama-python waits for the Ollama path's terminating done frame.
+        assert lines[-1] == "data: [DONE]"
+
+    def test_streaming_conflict_terminates_the_stream(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.generate_stream.return_value = TestGenerationStream(
+            [], None, error=ConcurrentGenerationError("busy"),
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        })
+        assert resp.status_code == 200
+        lines = [l for l in resp.text.strip().split("\n") if l.startswith("data: ")]
+        err = json.loads(lines[-2].removeprefix("data: "))["error"]
+        assert err["code"] == 409
+        assert err["type"] == "conflict"
+        assert lines[-1] == "data: [DONE]"
+
+    def test_streaming_lock_timeout_terminates_the_stream(
+        self, session_and_client: Any, monkeypatch: Any,
+    ) -> None:
+        """The 503 busy frame is terminated like every other error frame."""
+        import contextlib
+
+        import saklas.server.app as app_module
+
+        session, client = session_and_client
+
+        @contextlib.asynccontextmanager
+        async def _never_acquires(_session: Any):
+            yield False
+
+        monkeypatch.setattr(app_module, "acquire_session_lock", _never_acquires)
+        session.generate_stream.return_value = TestGenerationStream([], None)
+
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        })
+        assert resp.status_code == 200
+        lines = [l for l in resp.text.strip().split("\n") if l.startswith("data: ")]
+        err = json.loads(lines[0].removeprefix("data: "))["error"]
+        assert err["code"] == 503
+        assert err["type"] == "server_error"
+        assert lines[-1] == "data: [DONE]"
+
+    def test_non_streaming_error_type_matches_the_streaming_one(
+        self, session_and_client: Any,
+    ) -> None:
+        """404 reads ``invalid_request_error`` on both OpenAI surfaces.
+
+        The exception handler used to special-case only 400, so a 404 came
+        back as ``server_error`` there while the in-band SSE frame called the
+        same failure ``invalid_request_error``.
+        """
+        session, client = session_and_client
+        session.generate.side_effect = ProfileNotRegisteredError(
+            "No profile registered for 'missing'"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "steering": "0.5 missing",
+        })
+        assert resp.status_code == 404
+        assert resp.json()["error"]["type"] == "invalid_request_error"
 
     def test_conflict_on_concurrent_generation(self, session_and_client: Any) -> None:
         session, client = session_and_client

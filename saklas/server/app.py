@@ -14,33 +14,41 @@ if TYPE_CHECKING:
     from saklas.core.results import GenerationResult
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, model_validator
 from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from saklas.core.errors import SaklasError
 from saklas.core.session import ConcurrentGenerationError, GenerationStream, SaklasSession
 from saklas.core.steering import Steering
 from saklas.server.request_helpers import (
     UnsupportedContentError,
-    build_sampling_config as _build_sampling_config,
-    flatten_content as _flatten_content,
-    merge_steering as _merge_steering,
-    parse_request_steering as _parse_req_steering,
-    probe_token_readings as _probe_token_readings,
-    strict_model_enabled as _strict_model_enabled,
+    build_sampling_config,
+    flatten_content,
+    merge_steering,
+    parse_request_steering,
+    probe_token_readings,
+    strict_model_enabled,
 )
 from saklas.server.streaming import (
-    _usage_dict,
-    probe_reading_aggregate as _probe_reading_aggregate,
+    probe_reading_aggregate,
     stream_finalizer,
+    usage_dict,
 )
 
 
 SESSION_LOCK_TIMEOUT_SECONDS = 300
+
+#: Route-prefix discriminators for the three protocols served on one port.
+#: Each owns an error envelope: OpenAI ``{"error": {message, type, param,
+#: code}}``, Ollama ``{"error": "<msg>"}``, native ``{"detail": "<msg>"}``.
+NATIVE_PREFIX = "/saklas/v1/"
+OLLAMA_PREFIX = "/api/"
 
 
 @asynccontextmanager
@@ -74,10 +82,10 @@ class ChatMessage(BaseModel):
     name: str | None = None
 
     @model_validator(mode="after")
-    def _flatten_content(self):
+    def _normalize_content(self):
         # Accept OpenAI multimodal content-part arrays for text-only use:
         # concatenate text parts, reject anything else with a clear error.
-        self.content = _flatten_content(self.content)
+        self.content = flatten_content(self.content)
         return self
 
 
@@ -159,11 +167,11 @@ class _SamplingBase(BaseModel):
         inside ``session.steering()`` — the server does not resolve poles
         here.
         """
-        req_steering, explicit_clear = _parse_req_steering(self.steering)
+        req_steering, explicit_clear = parse_request_steering(self.steering)
         thinking: bool | None = self.thinking
         if req_steering is not None and req_steering.thinking is not None:
             thinking = req_steering.thinking
-        return _merge_steering(
+        return merge_steering(
             req_steering, default_steering, explicit_clear, thinking,
         )
 
@@ -184,6 +192,20 @@ def _make_id() -> str:
     return f"saklas-{uuid.uuid4().hex[:12]}"
 
 
+def openai_error_type(status: int) -> str:
+    """Map an HTTP status onto OpenAI's ``error.type`` vocabulary.
+
+    One table for both OpenAI surfaces — the non-streaming exception handler
+    and the in-band SSE error frame — so a 404 / 409 / 422 reads the same on
+    either.
+    """
+    if status == 409:
+        return "conflict"
+    if 400 <= status < 500:
+        return "invalid_request_error"
+    return "server_error"
+
+
 def _error(status: int, message: str, error_type: str = "error",
            param: str | None = None) -> JSONResponse:
     return JSONResponse(
@@ -191,6 +213,30 @@ def _error(status: int, message: str, error_type: str = "error",
         content={"error": {"message": message, "type": error_type,
                            "param": param, "code": status}},
     )
+
+
+def _detail_text(detail: Any) -> str:
+    """Flatten an ``HTTPException.detail`` to the native envelope's string."""
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict):
+        for key in ("message", "msg", "detail"):
+            value = detail.get(key)
+            if isinstance(value, str):
+                return value
+        return json.dumps(detail, default=str)
+    if isinstance(detail, (list, tuple)):
+        return "; ".join(_detail_text(item) for item in detail)
+    return str(detail)
+
+
+def _protocol_error(path: str, status: int, message: str) -> JSONResponse:
+    """Render one error message in the envelope the request's protocol owns."""
+    if path.startswith(OLLAMA_PREFIX):
+        return JSONResponse(status_code=status, content={"error": message})
+    if path.startswith(NATIVE_PREFIX):
+        return JSONResponse(status_code=status, content={"detail": message})
+    return _error(status, message, openai_error_type(status))
 
 
 _bearer = HTTPBearer(auto_error=False)
@@ -263,35 +309,20 @@ def _sampling_kwargs(
     is the native request override; ``None`` triggers
     ``supports_thinking`` auto-detect inside ``_generate_core``.
     """
-    stop_tuple: tuple[str, ...] | None
-    if req.stop is None:
-        stop_tuple = None
-    elif isinstance(req.stop, str):
-        stop_tuple = (req.stop,)
-    else:
-        stop_tuple = tuple(req.stop)
-
-    # chat: logprobs is bool + top_logprobs gives count.
-    # completions: logprobs is int (number of top alternatives).
-    # Internally saklas takes an int count (0 = chosen only, None = disabled).
-    lp: int | None
-    if isinstance(req.logprobs, bool):
-        lp = (req.top_logprobs or 0) if req.logprobs else None
-    elif isinstance(req.logprobs, int):
-        lp = req.logprobs
-    else:
-        lp = None
-
-    sc = _build_sampling_config(
+    # ``stop`` (str or list) and the two OpenAI ``logprobs`` shapes (chat's
+    # bool + ``top_logprobs`` count, completions' bare int) are normalized
+    # inside the shared constructor.
+    sc = build_sampling_config(
         temperature=req.temperature,
         top_p=req.top_p,
         max_tokens=req.max_tokens,
         seed=req.seed,
-        stop=stop_tuple,
+        stop=req.stop,
         logit_bias=req.logit_bias,
-        presence_penalty=req.presence_penalty or 0.0,
-        frequency_penalty=req.frequency_penalty or 0.0,
-        logprobs=lp,
+        presence_penalty=req.presence_penalty,
+        frequency_penalty=req.frequency_penalty,
+        logprobs=req.logprobs,
+        top_logprobs=req.top_logprobs,
     )
 
     steering = req.to_steering(default_steering)
@@ -395,10 +426,29 @@ async def _stream_generation(
     client is gone, so the GPU isn't spent on a stream nobody reads.
     """
     created_ts = int(time.time())
+
+    def _error_frames(status: int, message: str) -> list[str]:
+        """One in-band error frame plus the terminating ``[DONE]`` sentinel.
+
+        ``openai-python``'s ``Stream`` and LangChain's ``ChatOpenAI`` treat an
+        SSE body that ends without ``[DONE]`` the way ollama-python treats a
+        missing terminating ``done`` frame — they wait for it.  The Ollama
+        NDJSON path already terminates after an in-band error chunk; this is
+        the same contract on the SSE side.
+        """
+        err = {
+            "error": {
+                "message": message,
+                "type": openai_error_type(status),
+                "code": status,
+            },
+        }
+        return [f"data: {json.dumps(err)}\n\n", "data: [DONE]\n\n"]
+
     async with acquire_session_lock(session) as acquired:
         if not acquired:
-            err = {"error": {"message": "Server busy", "type": "server_error", "code": 503}}
-            yield f"data: {json.dumps(err)}\n\n"
+            for frame in _error_frames(503, "Server busy"):
+                yield frame
             return
 
         if role_delta:
@@ -423,7 +473,7 @@ async def _stream_generation(
                 # that don't read the field stay unaffected.  Populated
                 # only when at least one manifold probe is attached
                 # and ``live_scores`` is True on the stream.
-                mf_token = _probe_token_readings(event)
+                mf_token = probe_token_readings(event)
                 if mf_token is not None:
                     choice["x-saklas-probe-readings"] = mf_token
                 chunk = {
@@ -435,24 +485,13 @@ async def _stream_generation(
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
         except ConcurrentGenerationError:
-            err = {"error": {"message": "Generation already in progress", "type": "conflict", "code": 409}}
-            yield f"data: {json.dumps(err)}\n\n"
+            for frame in _error_frames(409, "Generation already in progress"):
+                yield frame
             return
         except SaklasError as e:
             status, msg = e.user_message()
-            err_type = (
-                "conflict" if status == 409
-                else "invalid_request_error" if 400 <= status < 500
-                else "server_error"
-            )
-            err = {
-                "error": {
-                    "message": msg,
-                    "type": err_type,
-                    "code": status,
-                }
-            }
-            yield f"data: {json.dumps(err)}\n\n"
+            for frame in _error_frames(status, msg):
+                yield frame
             return
         finally:
             # Deterministically tear down the engine worker thread (stop-flag
@@ -522,21 +561,49 @@ def create_app(session: SaklasSession,
     @app.exception_handler(SaklasError)
     async def _on_saklas_error(request: Request, exc: SaklasError):
         status, msg = exc.user_message()
-        path = request.url.path
-        if path.startswith("/api/"):
-            # Ollama error shape: {"error": "<msg>"}
-            return JSONResponse(status_code=status, content={"error": msg})
-        err_type = "conflict" if status == 409 else "invalid_request_error" if status == 400 else "server_error"
-        return _error(status, msg, err_type)
+        return _protocol_error(request.url.path, status, msg)
 
     @app.exception_handler(RequestValidationError)
-    async def _on_validation_error(_request: Request, exc: RequestValidationError):
+    async def _on_validation_error(request: Request, exc: RequestValidationError):
         errs = exc.errors()
         first = errs[0] if errs else {}
         loc = first.get("loc", ())
         param = ".".join(str(p) for p in loc[1:]) if len(loc) > 1 else (str(loc[0]) if loc else None)
         msg = first.get("msg", "Invalid request")
+        path = request.url.path
+        if path.startswith(NATIVE_PREFIX) or path.startswith(OLLAMA_PREFIX):
+            # The native tree and the Ollama shim each own an envelope; a
+            # body-validation failure has to speak the same one the rest of
+            # that protocol's failures do.
+            return _protocol_error(
+                path, 400, f"{param}: {msg}" if param else msg,
+            )
         return _error(400, msg, "invalid_request_error", param=param)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _on_http_exception(request: Request, exc: StarletteHTTPException):
+        """Normalize the native tree's ``HTTPException``s to one envelope.
+
+        Almost every native route raises a bare ``HTTPException``, which
+        Starlette renders as ``{"detail": …}`` — but ``detail`` could be a
+        string, the auth dependency's dict, or a list of pydantic error dicts,
+        so a client had to guess.  On ``/saklas/v1/*`` it is always a string;
+        every other prefix keeps FastAPI's default rendering.
+        """
+        response = await http_exception_handler(request, exc)
+        if (
+            request.url.path.startswith(NATIVE_PREFIX)
+            and not isinstance(exc.detail, str)
+            # A bodiless status (204 / 304) comes back as a bare ``Response``
+            # from the default handler — leave those alone.
+            and isinstance(response, JSONResponse)
+        ):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": _detail_text(exc.detail)},
+                headers=getattr(exc, "headers", None),
+            )
+        return response
 
     _register_routes(app)
 
@@ -577,7 +644,7 @@ def _openai_known_model_names(session: SaklasSession) -> set[str]:
 
 
 def _check_openai_model_strict(session: SaklasSession, name: str | None) -> None:
-    if not _strict_model_enabled():
+    if not strict_model_enabled():
         return
     if not name:
         return
@@ -681,7 +748,7 @@ def _register_routes(app: FastAPI) -> None:
             "logprobs": _render_logprobs_chat(result, session),
             "finish_reason": result.finish_reason,
         }
-        mf_chat = _probe_reading_aggregate(session, result)
+        mf_chat = probe_reading_aggregate(session, result)
         if mf_chat:
             chat_choice["x-saklas-probe-readings"] = mf_chat
         body = {
@@ -690,7 +757,7 @@ def _register_routes(app: FastAPI) -> None:
             "created": int(time.time()),
             "model": model_id,
             "choices": [chat_choice],
-            "usage": _usage_dict(result),
+            "usage": usage_dict(result),
         }
         return body
 
@@ -732,7 +799,7 @@ def _register_routes(app: FastAPI) -> None:
             "logprobs": _render_logprobs_completions(result, session),
             "finish_reason": result.finish_reason,
         }
-        mf_completion = _probe_reading_aggregate(session, result)
+        mf_completion = probe_reading_aggregate(session, result)
         if mf_completion:
             completion_choice["x-saklas-probe-readings"] = mf_completion
         body = {
@@ -741,6 +808,6 @@ def _register_routes(app: FastAPI) -> None:
             "created": int(time.time()),
             "model": model_id,
             "choices": [completion_choice],
-            "usage": _usage_dict(result),
+            "usage": usage_dict(result),
         }
         return body

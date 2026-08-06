@@ -1,17 +1,14 @@
 """Native probe route group — the read-side counterpart to manifold steering.
 
-One unified collection under ``/saklas/v1/sessions/{id}/probes``.  Every probe
-is a :class:`~saklas.core.manifold.Manifold` — a 2-node concept axis is the
-rank-1 case, a discover / curved fit the rank-R case — attached on the session's
-single :class:`~saklas.core.monitor.Monitor` via ``add_probe`` / ``remove_probe``.
-The pre-4.0 split (vector probes by name under ``/probes``; manifold probes by
-selector under ``/manifold-probes``) collapsed with the monitor unification.
+One unified collection under ``/saklas/v1/sessions/{id}/probes`` covering every
+probe shape.  A Monitor probe is a :class:`~saklas.core.manifold.Manifold` — a
+2-node concept axis is the rank-1 case, a discover / curved fit the rank-R case
+— attached via ``add_probe`` / ``remove_probe``; a ``jlens/<word>`` or
+``sae/<id>`` selector lands on the session's readout-channel registries instead
+and is listed alongside.
 
-One-shot text scoring (``POST .../probe`` / ``.../manifold-probe``) was removed in
-4.0: scoring out of generation context required re-rendering arbitrary text in a
-non-conversational regime, which the conversational (A2) capture model retires.
 Live per-token scoring during generation rides the traits SSE stream and the
-WS / OpenAI / Ollama reading extensions.
+WS / OpenAI / Ollama reading extensions, not a route here.
 """
 
 from __future__ import annotations
@@ -127,7 +124,7 @@ def _sae_probe_specs(session: SaklasSession) -> dict[str, dict[str, Any]]:
 
 
 def register_probe_routes(app: FastAPI) -> None:
-    """Mount the unified probe listing + attach / detach + live-toggle routes."""
+    """Mount the unified probe listing + defaults + geometry + attach / detach."""
     session = app.state.session
 
     @app.get("/saklas/v1/sessions/{session_id}/probes")

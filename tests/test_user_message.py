@@ -211,3 +211,92 @@ def test_server_routes_user_message_status_codes():
         assert resp.status_code == expected_status, (
             f"{type(exc).__name__} → got {resp.status_code}, expected {expected_status}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The family invariant
+# ---------------------------------------------------------------------------
+
+
+def _public_exception_classes() -> list[type[BaseException]]:
+    """Every public exception class defined anywhere under ``saklas``."""
+    import importlib
+    import inspect
+    import pkgutil
+    import warnings
+
+    import saklas
+
+    modules = [saklas]
+    for info in pkgutil.walk_packages(saklas.__path__, prefix="saklas."):
+        # Underscore-private modules are internal; their classes are too.
+        if any(part.startswith("_") for part in info.name.split(".")[1:]):
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                modules.append(importlib.import_module(info.name))
+            except ImportError:
+                # An optional-dependency module (gguf, sae_lens, …) that
+                # isn't installed carries no reachable exception class.
+                continue
+
+    found: dict[type[BaseException], None] = {}
+    for module in modules:
+        for name, obj in vars(module).items():
+            if name.startswith("_") or not inspect.isclass(obj):
+                continue
+            if not issubclass(obj, BaseException) or issubclass(obj, Warning):
+                continue
+            # Only classes this module defines, so a re-export isn't
+            # attributed to every importer.
+            if obj.__module__ != module.__name__:
+                continue
+            found.setdefault(obj, None)
+    return list(found)
+
+
+def test_every_public_exception_is_a_saklas_error() -> None:
+    """AGENTS.md: "Every saklas exception subclasses ``SaklasError``".
+
+    The point is that ``except SaklasError`` catches the whole family, so one
+    escapee silently drops out of every caller written against the contract —
+    and out of the server's status mapping, landing as a 500.  Nothing
+    enforced the invariant until now; ``SaeTrainingCancelled`` and
+    ``ManifoldAuthoringChangedError`` had both escaped it.
+    """
+    classes = _public_exception_classes()
+    assert len(classes) > 40, "walk found suspiciously few exception classes"
+    escapees = sorted(
+        f"{cls.__module__}.{cls.__qualname__}"
+        for cls in classes
+        if not issubclass(cls, SaklasError)
+    )
+    assert not escapees, (
+        "public exception classes outside the SaklasError family (add "
+        "SaklasError to the bases, keeping the stdlib base first, and give "
+        "it a user_message()):\n  " + "\n  ".join(escapees)
+    )
+
+
+def test_cancellation_errors_agree_across_preparation_families() -> None:
+    """A cooperative cancel reports 409 on both background-job families."""
+    from saklas.core.jlens import JacobianLensCancelled
+    from saklas.core.sae_training import SaeTrainingCancelled
+
+    for exc in (JacobianLensCancelled("stopped"), SaeTrainingCancelled("stopped")):
+        assert isinstance(exc, SaklasError)
+        assert isinstance(exc, RuntimeError)
+        assert exc.user_message()[0] == 409
+
+
+def test_manifold_authoring_conflict_is_a_retryable_409() -> None:
+    """Re-authoring under an in-flight fit is a conflict, not a server fault."""
+    from saklas.core.extraction import ManifoldAuthoringChangedError
+
+    exc = ManifoldAuthoringChangedError("authoring changed during fit")
+    assert isinstance(exc, SaklasError)
+    assert isinstance(exc, RuntimeError)
+    status, message = exc.user_message()
+    assert status == 409
+    assert "authoring changed" in message
