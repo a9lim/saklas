@@ -35,11 +35,8 @@ import torch
 from safetensors.torch import load_file, save as serialize_safetensors, save_file
 
 from saklas.core.events import EventBus, ManifoldExtracted
-from saklas.core.manifold import (
-    MANIFOLD_FIT_POLICY_VERSION,
-    PcaDiagnostics,
-    SpectralDiagnostics,
-)
+from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
+from saklas.core.topology import PcaDiagnostics, SpectralDiagnostics
 from saklas.core.model import loaded_model_fingerprint, workspace_layer_indices
 from saklas.core.sae import SaeBackend
 from saklas.io.paths import model_dir, tensor_filename
@@ -1152,7 +1149,7 @@ class ManifoldExtractionPipeline:
         user supplied a domain spec + per-node coordinates) or
         discover-mode (the user supplied only labeled node corpora; the
         coords are derived per-model via
-        :func:`saklas.core.manifold.discover_coords`).  Returns a
+        :func:`saklas.core.topology.discover_coords`).  Returns a
         :class:`~saklas.core.manifold.Manifold`.
 
         A cache hit — the per-model tensor exists and its sidecar
@@ -1172,16 +1169,15 @@ class ManifoldExtractionPipeline:
             Manifold,
             compute_manifold_node_stats,
             compute_store_reduced_covariances,
-            discover_coords,
             domain_from_spec,
             fit_affine_subspace,
             fit_layer_subspace,
             fit_sigma_field,
             invert_parameterization,
-            neutral_layout_coord,
             prepare_rbf_fit_plan,
             subspace_share,
         )
+        from saklas.core.topology import discover_coords, neutral_layout_coord
         from saklas.core.capture import compute_dls_axes
         from saklas.io.manifolds import (
             ManifoldFolder, ManifoldSidecar, min_nodes,
@@ -2085,7 +2081,7 @@ class ManifoldExtractionPipeline:
             # coords + domain; the per-layer fit below runs unchanged on the
             # resolved mode.  Sphere is authored-only (not an auto candidate).
             from saklas.io.manifolds import sanitize_hyperparams
-            from saklas.core.manifold import select_topology
+            from saklas.core.topology import select_topology
             st_hyper = sanitize_hyperparams("auto", dict(mf.hyperparams))
             consensus_gram = torch.stack(
                 [layer_grams[idx] for idx in fit_layers]

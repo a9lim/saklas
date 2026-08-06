@@ -20,9 +20,8 @@ from typing import Any
 import pytest
 import torch
 
-from saklas.core.manifold import (
-    BoxDomain,
-    CustomDomain,
+from saklas.core.manifold import BoxDomain, CustomDomain
+from saklas.core.topology import (
     _count_persistent_loops,
     _faint_cycle_coords,
     _is_angular_harmonic,
@@ -93,7 +92,7 @@ def test_ph_dense_complete_complex_no_spurious_loops() -> None:
     essential (which routed the 107-node ``personas`` heap to a spurious
     8-torus).  The raised cap keeps every triangle across the supported regime.
     """
-    from saklas.core.manifold import _rips_h1_persistence
+    from saklas.core.topology import _rips_h1_persistence
 
     g = torch.Generator().manual_seed(7)
     cluster = torch.randn(109, 6, generator=g) * 0.1
@@ -567,17 +566,17 @@ def test_select_topology_deterministic() -> None:
 def test_select_topology_reuses_laplacian_eigensystem(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.manifold as manifold_mod
+    import saklas.core.topology as topology_mod
 
     calls = 0
-    real = manifold_mod._laplacian_eigen
+    real = topology_mod._laplacian_eigen
 
     def _counted(*args: Any, **kwargs: Any):
         nonlocal calls
         calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(manifold_mod, "_laplacian_eigen", _counted)
+    monkeypatch.setattr(topology_mod, "_laplacian_eigen", _counted)
     choice = _choose(_circle(40))
     assert choice.winner_name == "torus-T1"
     assert calls == 1

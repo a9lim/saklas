@@ -24,7 +24,7 @@ import math
 import pytest
 import torch
 
-from saklas.core.manifold import (
+from saklas.core.topology import (
     PcaDiagnostics,
     SpectralDiagnostics,
     derive_pca_coords,
