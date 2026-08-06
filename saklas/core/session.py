@@ -860,6 +860,7 @@ class SaklasSession:
         compile_mode: str | None = None,
         cuda_graphs: bool = False,
         return_top_k: int = 0,
+        on_progress: Callable[[str], None] | None = None,
     ) -> "SaklasSession":
         """Load a HF model + tokenizer and return a fully initialized session.
 
@@ -898,6 +899,12 @@ class SaklasSession:
         StaticCache for full graph capture) and ``"default"`` otherwise
         (kernel fusion only).  Pass an explicit value to force a
         specific mode regardless of the cuda_graphs decision.
+
+        ``on_progress`` receives one line per construction step — the
+        model-load status lines, the neutral/whitener forward pass, and each
+        bundled concept fit the default probe roster still needs.  Unset (the
+        library default) constructs silently; the CLI passes a printing
+        callback so a first ``saklas serve`` narrates instead of hanging.
         """
         # Load WITHOUT compile so the StaticCache probe runs against the
         # bare nn.Module (probing through the OptimizedModule wrapper
@@ -915,6 +922,7 @@ class SaklasSession:
             device=device,
             dtype=dtype,
             compile=False,
+            on_progress=on_progress,
         )
 
         cg_supported = False
@@ -989,6 +997,11 @@ class SaklasSession:
                             layers_ml, int(hidden_size), device_obj, model_dtype,
                         )
                     )
+            if on_progress is not None:
+                on_progress(
+                    f"Compiling model with torch.compile"
+                    f"(mode={effective_compile_mode!r})..."
+                )
             model = _compile_with_probe(
                 model, tokenizer, device_obj,
                 mode=effective_compile_mode,
@@ -999,6 +1012,11 @@ class SaklasSession:
                 "(supported only on CUDA / MPS)",
                 device_obj.type,
             )
+            if on_progress is not None:
+                on_progress(
+                    f"compile=True but device={device_obj.type} — skipping "
+                    f"torch.compile (supported only on CUDA / MPS)"
+                )
 
         # ``__init__`` consults the same probe helper, but the helper now
         # caches by the underlying module id (survives the torch.compile
@@ -1014,6 +1032,7 @@ class SaklasSession:
             dls=dls,
             cuda_graphs=cuda_graphs,
             return_top_k=return_top_k,
+            on_progress=on_progress,
         )
         # Adopt the persistent offset + capture hooks iff compile actually stuck;
         # if it fell back to eager, drop them (their add_(0) / copy_ would be pure
@@ -1043,6 +1062,7 @@ class SaklasSession:
         dls: bool = True,
         cuda_graphs: bool = False,
         return_top_k: int = 0,
+        on_progress: Callable[[str], None] | None = None,
     ):
         self._model = model
         self._tokenizer = tokenizer
@@ -1380,7 +1400,9 @@ class SaklasSession:
         # lens/SAE siblings).
         _ = self._geometry_instrument
         if probe_categories:
-            self._whitener = self._build_whitener_from_cache_or_compute()
+            self._whitener = self._build_whitener_from_cache_or_compute(
+                on_progress,
+            )
 
         # DLS toggle stored on the session so ``session.extract`` / ``fit``
         # inherit it without re-passing; both thread it into
@@ -1407,6 +1429,7 @@ class SaklasSession:
             # category list (``probes=[...]``) is honored exactly — no sweep.
             probe_manifolds = self._bootstrap_manifold_probes(
                 probe_categories, include_fitted_defaults=probes is None,
+                on_progress=on_progress,
             )
 
         # One unified Monitor for every probe shape — flat concept axes
@@ -1831,7 +1854,9 @@ class SaklasSession:
             with self._geometry_instrument.state_lock:
                 monitor.set_whitener(self._whitener)
 
-    def _build_whitener_from_cache_or_compute(self) -> "Any":
+    def _build_whitener_from_cache_or_compute(
+        self, on_progress: Callable[[str], None] | None = None,
+    ) -> "Any":
         """Compute or load the per-model whitener.
 
         Uses ``load_or_compute_neutral_activations`` (alignment.py) for
@@ -1850,6 +1875,10 @@ class SaklasSession:
         extraction at session init, on-demand ``session.whitener``
         access, or ``manifold compare``) trigger the
         forward-pass loop over neutral statements.
+
+        ``on_progress`` narrates that forward-pass loop (session construction
+        passes the caller's callback through); a cache hit is silent because
+        it runs no model.
         """
         from saklas.core.mahalanobis import LayerWhitener
         from saklas.io.alignment import load_or_compute_neutral_activations
@@ -1858,6 +1887,7 @@ class SaklasSession:
             neutral_acts = load_or_compute_neutral_activations(
                 self._model, self._tokenizer, self._layers,
                 model_id=self._model_info.get("model_id", "unknown"),
+                on_progress=on_progress,
             )
             if not self._layer_means:
                 self._layer_means = {
@@ -4635,6 +4665,7 @@ class SaklasSession:
         baseline: str | None = None,
         *,
         kind: str = "abstract",
+        custom_system: str | None = None,
         force: bool = False,
         on_progress: Callable[[str], None] | None = None,
         sae: str | None = None,
@@ -4666,9 +4697,11 @@ class SaklasSession:
 
         Flags:
 
-        - ``kind=`` (``"abstract"`` | ``"concrete"``): selects each node's system
-          template + elicitation role label (``someone {c}`` vs ``{c}``).
-          Applies to both poles of a bipolar axis.
+        - ``kind=`` (``"abstract"`` | ``"concrete"`` | ``"custom"``): selects each
+          node's system template + elicitation role label (``someone {c}`` vs
+          ``{c}``).  Applies to both poles of a bipolar axis.  ``"custom"``
+          rides ``custom_system`` (``{c}`` = the concept) with no role swap —
+          the system-only frame every model family supports — and requires it.
         - ``force=True``: regenerate the corpora + re-author the folder
           (otherwise an existing manifold's corpus is reused and the fit
           cache-hits when a tensor for this model is already present).
@@ -4730,7 +4763,8 @@ class SaklasSession:
                 )
                 corpora = self.generate_responses(
                     gen_concepts, [kind] * len(gen_concepts),
-                    roles=gen_roles, on_progress=on_progress,
+                    roles=gen_roles, custom_system=custom_system,
+                    on_progress=on_progress,
                 )
                 node_corpora = {
                     label: corpora[c]
@@ -5385,6 +5419,7 @@ class SaklasSession:
 
     def _bootstrap_manifold_probes(
         self, categories: list[str], *, include_fitted_defaults: bool = False,
+        on_progress: Callable[[str], None] | None = None,
     ) -> dict[str, "Manifold"]:
         """Source the default probe roster as fitted bundled manifolds.
 
@@ -5412,29 +5447,40 @@ class SaklasSession:
           roster.
 
         A fit/load failure for one manifold is logged and skipped, never fatal
-        to session construction.
+        to session construction.  ``on_progress`` narrates the roster —
+        an upfront count, then each concept's own fit progress — because an
+        unfitted roster is minutes of silent forward passes otherwise.
         """
         from saklas.io.probes_bootstrap import load_default_manifolds
         from saklas.io.paths import manifold_dir, safe_model_id
 
         defaults = load_default_manifolds()
         probes: dict[str, "Manifold"] = {}
-        seen: set[str] = set()
-        for cat in categories:
-            for name in defaults.get(cat, []):
-                if name in seen:
-                    continue
-                seen.add(name)
-                key = f"default/{name}"
+        # ``dict.fromkeys`` dedupes (a concept can be tagged in two requested
+        # categories) while preserving roster order, so the announced count is
+        # the number of concepts actually walked.
+        roster = list(dict.fromkeys(
+            name for cat in categories for name in defaults.get(cat, [])
+        ))
+        if on_progress is not None and roster:
+            on_progress(
+                f"Fitting default probe roster ({len(roster)} concepts)..."
+            )
+        for name in roster:
+            key = f"default/{name}"
+            try:
                 try:
-                    try:
-                        self.ensure_manifold_loaded(key)
-                    except ManifoldNotRegisteredError:
-                        self.fit(manifold_dir("default", name))
-                        self.ensure_manifold_loaded(key)
-                    probes[name] = self._manifolds[key]
-                except Exception as e:
-                    _log.warning("manifold probe '%s' failed to fit/load: %s", name, e)
+                    self.ensure_manifold_loaded(key)
+                except ManifoldNotRegisteredError:
+                    if on_progress is not None:
+                        on_progress(f"Fitting probe '{name}'...")
+                    self.fit(
+                        manifold_dir("default", name), on_progress=on_progress,
+                    )
+                    self.ensure_manifold_loaded(key)
+                probes[name] = self._manifolds[key]
+            except Exception as e:
+                _log.warning("manifold probe '%s' failed to fit/load: %s", name, e)
 
         if not include_fitted_defaults:
             return probes

@@ -257,6 +257,24 @@ def _build_vector_extract(p: argparse.ArgumentParser) -> None:
              "carry a substitutable role label and raise at runtime.",
     )
     p.add_argument(
+        "--kind", choices=("abstract", "concrete", "custom"), default="abstract",
+        help=(
+            "Conceptual kind for both poles (default: abstract).  Selects the "
+            "generation system template + elicitation role label: abstract -> "
+            "'someone {c}', concrete -> '{art} {c}', custom -> the --system "
+            "template (no role swap).  Same knob `manifold generate` carries."
+        ),
+    )
+    p.add_argument(
+        "--system", dest="custom_system", default=None, metavar="TEMPLATE",
+        help=(
+            "Custom elicitation system prompt for --kind custom; use {c} for "
+            "the concept.  The framing rides the system prompt and the corpus "
+            "pools in standard-assistant space, so it works on every model "
+            "family.  Required when --kind custom."
+        ),
+    )
+    p.add_argument(
         "--namespace", default=None, metavar="NS",
         help="Destination namespace for the extracted concept manifold. "
              "Unset lands under "

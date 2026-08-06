@@ -492,6 +492,34 @@ def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
             session.manifolds.pop(key, None)
 
 
+def _install_error_frame(exc: Exception) -> dict[str, Any] | None:
+    """SSE ``error``-frame body for a typed install failure.
+
+    The two ``SaklasError`` install failures carry their own safe messages
+    through ``user_message()``, and a ``ValueError`` here is always an
+    argument-shape rejection (the ``as_`` grammar / ``NAME_REGEX``), so both
+    surface verbatim — the same statuses and texts the JSON branch returns.
+    Everything else, ``FileNotFoundError`` above all (its message is a
+    filesystem path), routes to the shared catch-all scrubber.
+    """
+    if isinstance(exc, HTTPException):
+        # The only ``HTTPException`` the install job raises is
+        # ``refuse_if_busy``'s engine-busy 409, whose detail is a fixed
+        # retry-shortly string.
+        return {"message": str(exc.detail), "code": "Conflict"}
+    if isinstance(exc, (ManifoldInstallConflict, ManifoldHFError)):
+        _status, message = exc.user_message()
+        return {"message": message, "code": type(exc).__name__}
+    if isinstance(exc, ImportError):
+        return {
+            "message": "huggingface_hub is not installed",
+            "code": "ImportError",
+        }
+    if isinstance(exc, ValueError):
+        return {"message": str(exc), "code": type(exc).__name__}
+    return None
+
+
 # ------------------------------------------------------------------- routes ---
 
 def register_manifold_routes(app: FastAPI) -> None:
@@ -669,45 +697,58 @@ def register_manifold_routes(app: FastAPI) -> None:
         return _manifold_json(mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds/install", status_code=201)
-    async def install_remote_manifold(req: InstallManifoldRequest):
+    async def install_remote_manifold(req: InstallManifoldRequest, request: Request):
         """Install a manifold from an HF coord or local folder.
 
         ``target`` is an HF coord (``owner/name[@revision]``) or a local
         folder path; ``as_`` overrides the destination namespace+name
         (must be fully qualified); ``force`` overwrites an existing
         folder.  Held under the session lock so a parallel delete / fit
-        can't race the swap-into-place.  Returns the same manifold-detail
-        JSON shape ``GET /saklas/v1/manifolds/{ns}/{name}`` ships.
+        can't race the swap-into-place.  SSE progress when ``Accept:
+        text/event-stream``, JSON otherwise — a manifold repo carries a
+        per-model safetensors payload, so the download plus stage/verify/swap
+        tail is a long operation like ``generate`` / ``fit``.  Both branches
+        return the manifold-detail JSON shape ``GET
+        /saklas/v1/manifolds/{ns}/{name}`` ships.
         """
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            refuse_if_busy(session)
-            try:
-                folder = await asyncio.to_thread(
-                    install_manifold,
-                    req.target,
-                    req.as_,
-                    force=req.force,
-                )
-            except ManifoldInstallConflict as e:
-                raise HTTPException(409, str(e)) from e
-            except FileNotFoundError as e:
-                raise HTTPException(404, str(e)) from e
-            except ValueError as e:
-                raise HTTPException(400, str(e)) from e
-            except ImportError as e:
-                raise HTTPException(503, f"huggingface_hub not installed: {e}") from e
-            except ManifoldHFError as e:
-                raise HTTPException(502, str(e)) from e
+        def _install(on_progress: Callable[[str], None]) -> dict[str, Any]:
+            folder = install_manifold(
+                req.target,
+                req.as_,
+                force=req.force,
+                on_progress=on_progress,
+            )
+            # The just-installed folder lives at ``manifolds/<ns>/<name>/`` —
+            # derive namespace/name from the resolved path so the response
+            # carries the destination identity even when ``as_`` re-routed it.
+            mf = _find_manifold(folder.parent.name, folder.name)
+            # No ``done`` marker: the SSE client keys off the frame's event
+            # name, and the plain JSON body stays exactly what non-streaming
+            # callers already parse.
+            return _manifold_json(mf, session, full=True)
 
-        # The just-installed folder lives at ``manifolds/<ns>/<name>/`` —
-        # derive namespace/name from the resolved path so the response
-        # carries the destination identity even when ``as_`` re-routed it.
-        dst_namespace = folder.parent.name
-        dst_name = folder.name
-        mf = _find_manifold(dst_namespace, dst_name)
-        return _manifold_json(mf, session, full=True)
+        async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+            # Under the session lock in both branches; the gen-lock probe has
+            # to run before the worker thread starts writing the folder.
+            refuse_if_busy(session)
+            return await asyncio.to_thread(_install, on_progress)
+
+        return await sse_or_json(
+            request,
+            session,
+            _job,
+            error_message="install failed",
+            log_message="manifold install crashed",
+            error_formatter=_install_error_frame,
+            json_errors=(
+                (ManifoldInstallConflict, 409),
+                (FileNotFoundError, 404),
+                (ValueError, 400),
+                (ImportError, 503),
+                (ManifoldHFError, 502),
+            ),
+            logger=log,
+        )
 
     @app.post("/saklas/v1/manifolds/generate", status_code=201)
     async def generate_manifold(req: GenerateManifoldRequest, request: Request):

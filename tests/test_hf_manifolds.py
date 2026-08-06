@@ -418,7 +418,10 @@ def test_install_manifold_conflict_relocate_via_as(
     # pull_manifold itself to keep this focused on the as_ retarget routing.
     pulled: dict[str, Any] = {}
 
-    def fake_pull(coord: str, target_folder: Path, *, force: bool, revision: Any) -> Path:
+    def fake_pull(
+        coord: str, target_folder: Path, *, force: bool, revision: Any,
+        on_progress: Any = None,
+    ) -> Path:
         pulled["coord"] = coord
         pulled["target"] = target_folder
         target_folder.mkdir(parents=True, exist_ok=True)
@@ -440,7 +443,10 @@ def test_install_manifold_default_namespace_is_local(
 
     seen: dict[str, Any] = {}
 
-    def fake_pull(coord: str, target_folder: Path, *, force: bool, revision: Any) -> Path:
+    def fake_pull(
+        coord: str, target_folder: Path, *, force: bool, revision: Any,
+        on_progress: Any = None,
+    ) -> Path:
         seen["target"] = target_folder
         target_folder.mkdir(parents=True, exist_ok=True)
         return target_folder
@@ -458,7 +464,10 @@ def test_install_manifold_revision_threads_through(
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     seen: dict[str, Any] = {}
 
-    def fake_pull(coord: str, target_folder: Path, *, force: bool, revision: Any) -> Path:
+    def fake_pull(
+        coord: str, target_folder: Path, *, force: bool, revision: Any,
+        on_progress: Any = None,
+    ) -> Path:
         seen["coord"] = coord
         seen["revision"] = revision
         target_folder.mkdir(parents=True, exist_ok=True)
@@ -483,7 +492,10 @@ def test_install_manifold_local_folder_routes_to_copy(
 
     routed: dict[str, Any] = {}
 
-    def fake_local(p: Path, *, as_: Any = None, force: bool = False) -> Path:
+    def fake_local(
+        p: Path, *, as_: Any = None, force: bool = False,
+        on_progress: Any = None,
+    ) -> Path:
         routed["src"] = p
         routed["as_"] = as_
         return tmp_path / "home" / "installed"

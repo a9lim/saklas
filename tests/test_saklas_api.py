@@ -458,6 +458,66 @@ class TestExtract:
         assert session.extract.call_args.args == ("angry", "calm")
         session.steer.assert_called_once_with("angry.calm", profile)
 
+    def test_extract_defaults_kind_to_abstract(self, session_and_client: Any) -> None:
+        """The elicitation framing is explicit on the wire, defaulted here."""
+        import torch
+        from saklas.core.profile import Profile
+        session, client = session_and_client
+        session.extract.return_value = ("angry.calm", Profile({0: torch.zeros(4)}))
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={"concept": "angry", "baseline": "calm"},
+        )
+        assert resp.status_code == 200
+        assert session.extract.call_args.kwargs["kind"] == "abstract"
+        assert session.extract.call_args.kwargs["custom_system"] is None
+
+    def test_extract_threads_kind_and_custom_system(
+        self, session_and_client: Any,
+    ) -> None:
+        """``kind`` / ``custom_system`` reach ``session.extract`` verbatim."""
+        import torch
+        from saklas.core.profile import Profile
+        session, client = session_and_client
+        session.extract.return_value = ("january.july", Profile({0: torch.zeros(4)}))
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={
+                "concept": "january", "baseline": "july",
+                "kind": "custom",
+                "custom_system": "You are the month of {c}.",
+            },
+        )
+        assert resp.status_code == 200
+        assert session.extract.call_args.kwargs["kind"] == "custom"
+        assert (
+            session.extract.call_args.kwargs["custom_system"]
+            == "You are the month of {c}."
+        )
+
+    def test_extract_rejects_custom_kind_without_system(
+        self, session_and_client: Any,
+    ) -> None:
+        """Same rejection ``POST /manifolds/generate`` applies — one contract."""
+        session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={"concept": "january", "baseline": "july", "kind": "custom"},
+        )
+        assert resp.status_code == 400
+        assert "custom_system" in resp.text
+        session.extract.assert_not_called()
+
+    def test_extract_rejects_unknown_kind(self, session_and_client: Any) -> None:
+        """``kind`` is a closed set at the pydantic layer."""
+        session, client = session_and_client
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={"concept": "a", "baseline": "b", "kind": "nope"},
+        )
+        assert resp.status_code == 400
+        session.extract.assert_not_called()
+
     def test_extract_json_still_reports_progress_lines(
         self, session_and_client: Any,
     ) -> None:

@@ -399,7 +399,10 @@ def test_parse_manifold_no_verb_lists_compute_subverbs(capsys: pytest.CaptureFix
 def test_run_manifold_install_calls_backend(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     calls: list[tuple[Any, ...]] = []
 
-    def fake_install(target: str, as_: Any = None, *, force: bool = False) -> Path:
+    def fake_install(
+        target: str, as_: Any = None, *, force: bool = False,
+        on_progress: Any = None,
+    ) -> Path:
         calls.append((target, as_, force))
         return Path("/home/.saklas/manifolds/local/circumplex")
 

@@ -782,6 +782,14 @@ export interface ExtractRequest {
   /** Concept represented by the positive node (or sole monopolar node). */
   concept: string;
   baseline?: string | null;
+  /** Elicitation framing for both poles — the same knob
+   *  ``POST /manifolds/generate`` carries. ``abstract`` -> "someone {c}",
+   *  ``concrete`` -> "{art} {c}", ``custom`` -> ``custom_system`` (no role
+   *  swap, works on every model family). */
+  kind?: "abstract" | "concrete" | "custom";
+  /** System template for ``kind: "custom"`` ({c} = the concept). Required
+   *  when ``kind`` is ``custom``; rejected-with-400 otherwise. */
+  custom_system?: string | null;
   sae?: string | null;
   /** Role-augmented extraction: replace the assistant-role label in
    * the chat template with this slug at extract time (e.g. "pirate").

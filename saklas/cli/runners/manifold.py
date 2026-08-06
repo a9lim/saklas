@@ -72,6 +72,19 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
 
+    # Same rejection the multi-node authoring path applies: ``custom`` has no
+    # built-in system template, so the caller must supply one.
+    kind = getattr(args, "kind", None) or "abstract"
+    custom_system = getattr(args, "custom_system", None)
+    if kind == "custom" and not custom_system:
+        print(
+            "manifold extract: --kind custom requires --system "
+            '(a template with a {c} placeholder, e.g. "You are the month of '
+            '{c}; speak as that month.")',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # A steering vector is a 2-node ``pca`` manifold (4.0); a role-augmented
     # fit bakes into its node corpora and writes the canonical tensor name (no
     # ``_role-`` suffix). Cache validation belongs to the loaded session/pipeline
@@ -83,7 +96,14 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
     session = _pkg._make_session(args, load_probes=False)
     _pkg._print_model_info(session)
 
-    extract_kwargs: dict[str, Any] = {}
+    # ``extract`` generates up to 96 in-character responses and then runs a
+    # full fit, so it narrates per batch like its ``fit`` / ``generate``
+    # siblings rather than going quiet until the final line.
+    extract_kwargs: dict[str, Any] = {
+        "kind": kind,
+        "custom_system": custom_system,
+        "on_progress": lambda m: print(f"  {m}"),
+    }
     if requested_release:
         extract_kwargs["sae"] = args.sae
     if requested_role:

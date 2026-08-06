@@ -352,10 +352,18 @@ def register_profile_routes(app: FastAPI) -> None:
         ``progress`` lines the SSE branch streams as frames.
         """
         resolve_session_id(session_id)
+        # Same rejection ``POST /manifolds/generate`` applies, so the two
+        # authoring paths refuse an unframed custom kind identically.
+        if req.kind == "custom" and not req.custom_system:
+            raise HTTPException(
+                400, "kind='custom' requires custom_system (a system template "
+                "with a {c} placeholder)",
+            )
 
         def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
             return session.extract(
                 req.concept, req.baseline,
+                kind=req.kind, custom_system=req.custom_system,
                 on_progress=on_progress,
                 sae=req.sae,
                 role=req.role, namespace=req.namespace, force=req.force,
