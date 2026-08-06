@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -27,6 +28,32 @@ def _trigger_active(trigger: Trigger, ctx: TriggerContext) -> bool:
     return trigger is Trigger.BOTH or trigger.active(ctx)
 
 
+def _affine_push_offset(
+    subspace: LayerSubspace,
+    target: torch.Tensor,
+    eff_along: float,
+    *,
+    device: "torch.device | None" = None,
+) -> torch.Tensor:
+    """The world-space constant a pure-push affine slide adds at one layer.
+
+    ``c = (eff_along · target) @ basis`` — the ``(D,)`` displacement the affine
+    branch of :func:`subspace_inject` produces when the per-axis collapse mask
+    ``κ`` is all zero (``p_new − q = eff_along·target``, independent of ``h``).
+    Both consumers of a lowered affine term contract through here: the transient
+    hook's constant-add fast path (:meth:`SteeringHook._pure_push_constant`) and
+    the persistent compiled-offset buffers
+    (:meth:`SteeringManager.compute_static_offsets`), so the compiled and eager
+    pushes are the same tensor expression rather than two transcriptions of it.
+
+    fp32 throughout (the project-wide norm/accumulation invariant); ``device``
+    ``None`` keeps the inputs where they are.
+    """
+    basis = subspace.basis.to(device=device, dtype=torch.float32)   # (R, D)
+    tgt = target.to(device=device, dtype=torch.float32)             # (R,)
+    return (eff_along * tgt) @ basis                                # (D,)
+
+
 class HiddenCapture:
     """Accumulates the last-position hidden state at each hooked layer on every
     forward pass. Paired with a KV-cached generation loop, one capture per step
@@ -39,31 +66,35 @@ class HiddenCapture:
     following token. The k-th capture is thus semantically "the activation that
     produced generated token k."
 
-    Hot-path discipline: hooks copy a (dim,) slice via ``detach().clone()``
-    (device-local, no sync) and append to a per-layer Python list. Stacking and
-    fp32 casting happen after detach, not in the hot path.
+    Hot-path discipline: the hook does device work only — a ``(dim,)`` slice
+    ``detach()``-ed and either ``copy_``-ed into a preallocated per-layer
+    buffer (incremental retention, zero steady-state allocation) or cloned
+    into a per-layer Python list (the tail ring and full retention, where each
+    step needs a distinct tensor). Stacking, fp32 casting, and every host read
+    happen after the forward, not inside it.
 
-    Incremental mode (``set_incremental``): for the gated / live-stream
-    monitored case the full ``[T, D]`` stack is never needed — the session
-    scores each token as it is produced and keeps only the per-token score
-    rows. In this mode each per-layer hook OVERWRITES its bucket (length-1)
-    instead of appending, so device memory stays O(layers·D) for the whole
-    generation, and a ``step_sink`` callback fires once per forward (after
-    the highest hooked layer stores its slice) with the latest per-layer
-    slice. ``latest_per_layer()`` and the ``bucket[-1]`` reads the
-    streaming tap relies on keep working — a length-1 bucket's ``[-1]`` is
-    still the latest.
+    Retention is armed by :meth:`set_retention` (or one of its three named
+    aliases) after :meth:`attach`, along two orthogonal axes:
 
-    Aggregate-only mode (``set_aggregate_tail``): when the caller needs only
-    the end-of-gen aggregate (no probe gate, no per-token stream — e.g.
-    stateless server scoring), the hook keeps a bounded *ring* of the last
-    ``depth`` slices per layer and runs NO step sink, so the decode loop pays
-    zero per-token monitor scoring (T scorings → 1 at finalize). The session
-    pools the last content token via :meth:`tail_slice_at`; the ring is deep
-    enough to walk back past trailing special tokens (EOS / end-of-turn).
+    - **depth 1** — each per-layer hook OVERWRITES a single preallocated
+      ``(D,)`` buffer instead of appending, so device memory stays
+      O(layers·D) for the whole generation and the decode loop allocates
+      nothing. ``latest_per_layer()`` and the ``bucket[-1]`` reads the
+      streaming tap relies on keep working — a length-1 bucket's ``[-1]`` is
+      still the latest.
+    - **depth > 1** — a bounded *ring* of the last ``depth`` slices per layer,
+      so finalize can pool the last *content* token via
+      :meth:`tail_slice_at`; the ring is deep enough to walk back past
+      trailing special tokens (EOS / end-of-turn).
+    - **step_sink set / unset** — with a sink, one callback fires per forward
+      (via :meth:`fire_step_sink` / :meth:`ingest_persistent`) carrying the
+      latest per-layer slice, and the session scores that token. Without one,
+      the decode loop pays zero per-token scoring: T scorings collapse to a
+      single pooled read at finalize.
 
-    Non-incremental mode is byte-identical to the append path: ``stacked()``
-    returns the full ``[T, D]`` (used for ``return_hidden``).
+    Unarmed (the state :meth:`attach` leaves) is full retention: a distinct
+    clone per step, so ``stacked()`` returns the full ``[T, D]`` — the
+    ``return_hidden`` path.
     """
 
     def __init__(self) -> None:
@@ -123,9 +154,9 @@ class HiddenCapture:
         self._per_layer = {idx: [] for idx in layer_indices}
         self._handles = []
         # Attach resets incremental state — a fresh capture starts in the
-        # append (full-retention) mode. ``set_incremental`` /
-        # ``set_aggregate_tail`` must be called after attach to opt into
-        # incremental scoring / bounded-tail capture for this gen.
+        # append (full-retention) mode. ``set_retention`` (or one of its named
+        # aliases) must be called after attach to opt into incremental scoring
+        # / bounded-tail capture for this gen.
         self._incremental = False
         self._step_sink = None
         self._max_layer = None
@@ -191,13 +222,12 @@ class HiddenCapture:
                         # The highest hooked layer fires last in the forward
                         # (forward hooks run in layer-execution order), so by the
                         # time it stores its slice every hooked layer holds this
-                        # step's value.  Count the forward (drives the tail ring's
-                        # ``tail_slice_at`` mapping); the per-token monitor scoring
-                        # that used to fire *here* now runs post-forward via
-                        # :meth:`fire_step_sink` (FIX F1) so the host-side score
-                        # read no longer drains the device pipeline mid-forward at
-                        # the max probe layer — the remaining transformer layers +
-                        # LM head stay queued.
+                        # step's value.  Count the forward — it drives the tail
+                        # ring's ``tail_slice_at`` mapping.  The step sink is
+                        # deliberately NOT run here: it fires post-forward from
+                        # :meth:`fire_step_sink`, so its host-side score read
+                        # never drains the device pipeline mid-forward and the
+                        # remaining transformer layers + LM head stay queued.
                         if layer_idx == self._max_layer:
                             self._forward_count += 1
                     else:
@@ -245,41 +275,59 @@ class HiddenCapture:
                 layers[idx].register_forward_hook(_make(bucket, idx)),
             )
 
-    def set_incremental(
-        self, step_sink: Callable[[int, dict[int, torch.Tensor]], None],
+    def set_retention(
+        self,
+        *,
+        depth: int = 1,
+        step_sink: "Callable[[int, dict[int, torch.Tensor]], None] | None" = None,
+        tail_layers: "set[int] | frozenset[int] | None" = None,
     ) -> None:
-        """Enable incremental mode: overwrite buckets + per-step scoring.
+        """Arm incremental capture: how much to retain, and who reads it.
 
-        Must be called after :meth:`attach`. Flips the per-layer hook from
-        append to length-1 overwrite and records the highest hooked layer
-        as the per-forward counter trigger. ``step_sink`` receives
-        ``(step_id, latest_per_layer)`` once per forward via
-        :meth:`fire_step_sink`,
-        which ``generate_steered`` invokes **post-forward** (FIX F1) — not from
-        inside the capture hook — so the score read doesn't drain the device
-        pipeline mid-forward.
+        The single retention setter — must be called after :meth:`attach`.  It
+        flips the per-layer hook out of the append (full-retention) mode and
+        sets the two orthogonal choices the four capture modes pick between:
+
+        - ``depth`` — how many trailing slices each layer keeps.  ``1`` (the
+          default) is a single preallocated ``(D,)`` buffer per layer,
+          ``copy_``-ed in place every forward, so the decode loop allocates
+          nothing and ``bucket[-1]`` reads stay valid.  ``> 1`` keeps a ring of
+          the last ``depth`` slices so finalize can pool the last *content*
+          token via :meth:`tail_slice_at` (deep enough to walk back past
+          trailing specials: EOS, end-of-turn).
+        - ``step_sink`` — the per-token reader, or ``None`` for no per-token
+          scoring at all.  It receives ``(step_id, latest_per_layer)`` once per
+          forward through :meth:`fire_step_sink` (or
+          :meth:`ingest_persistent`), which the decode loop calls after the
+          model forward returns.
+
+        ``tail_layers`` optionally restricts the deep ring to the layers a
+        final readout aggregate can consume; the rest stay length-1
+        latest-slice buffers and are omitted from :meth:`tail_slice_at`.
+
+        The highest hooked layer is recorded as the per-forward counter
+        trigger; it fires last in a forward, so by then every hooked layer
+        holds this step's value.
         """
         self._incremental = True
-        self._tail_depth = 1
-        self._tail_layers = None
+        self._tail_depth = max(1, int(depth))
+        self._tail_layers = (
+            frozenset(int(layer) for layer in tail_layers)
+            if tail_layers is not None
+            else None
+        )
         self._step_sink = step_sink
         self._max_layer = max(self._per_layer) if self._per_layer else None
 
-    def set_aggregate_tail(self, depth: int) -> None:
-        """Enable bounded-tail capture (aggregate-only, no per-token scoring).
+    def set_incremental(
+        self, step_sink: Callable[[int, dict[int, torch.Tensor]], None],
+    ) -> None:
+        """Length-1 buffers + per-token scoring (the INCREMENTAL mode)."""
+        self.set_retention(depth=1, step_sink=step_sink)
 
-        Must be called after :meth:`attach`. Keeps the last ``depth`` slices
-        per layer (a ring) and installs *no* step sink, so the decode loop pays
-        no per-token monitor scoring; the session pools the last content token
-        at finalize via :meth:`tail_slice_at`. ``depth`` must exceed the most
-        trailing special tokens a generation can append after its last content
-        token (EOS, end-of-turn) so the walk-back lands inside the ring.
-        """
-        self._incremental = True
-        self._step_sink = None
-        self._tail_depth = max(1, int(depth))
-        self._tail_layers = None
-        self._max_layer = max(self._per_layer) if self._per_layer else None
+    def set_aggregate_tail(self, depth: int) -> None:
+        """Bounded tail ring, no per-token scoring (the AGGREGATE_ONLY mode)."""
+        self.set_retention(depth=depth)
 
     def set_tail_with_sink(
         self,
@@ -288,28 +336,15 @@ class HiddenCapture:
         *,
         tail_layers: set[int] | frozenset[int] | None = None,
     ) -> None:
-        """Bounded-tail ring PLUS a per-token step sink (gating-subset / lean).
+        """Tail ring PLUS a per-token sink (GATING_SUBSET / LEAN_INCREMENTAL).
 
-        Must be called after :meth:`attach`.  This combination can't be had
-        through either single setter — :meth:`set_incremental` forces a length-1
-        buffer and drops the ring, :meth:`set_aggregate_tail` installs no sink —
-        so this arms the deep ring and wires the sink together.  The hook fires
-        the sink whenever one is set, independent of tail depth (see
-        :meth:`attach`'s ``_hook``).  Used by the GATING_SUBSET (gated-subset
-        scalar scoring) and LEAN_INCREMENTAL (``coords_only`` per-token scoring)
-        capture modes, both of which still pool the FULL roster once at finalize
-        from the retained ring. ``tail_layers`` optionally restricts the deep
-        ring to layers a final readout aggregate can consume; other layers stay
-        length-1 latest-slice buffers and are omitted from
-        :meth:`tail_slice_at`.
+        Both of those modes score a *partial* reading per token (a gated
+        subset's scalars, or ``coords_only`` rows) and still pool the FULL
+        roster once at finalize from the retained ring.
         """
-        self.set_aggregate_tail(depth)
-        self._tail_layers = (
-            frozenset(int(layer) for layer in tail_layers)
-            if tail_layers is not None
-            else None
+        self.set_retention(
+            depth=depth, step_sink=step_sink, tail_layers=tail_layers,
         )
-        self._step_sink = step_sink
 
     def attach_persistent(
         self, layer_indices: list[int], buffers: dict[int, torch.Tensor],
@@ -324,8 +359,8 @@ class HiddenCapture:
         records the buffer source, but registers **no** transient hook.  The
         generation loop calls :meth:`ingest_persistent` post-forward to run the
         same accumulation (length-1 / tail ring / full stack) + step sink the
-        in-hook path runs.  Mode setters (:meth:`set_incremental` /
-        :meth:`set_aggregate_tail`) apply identically afterward.
+        in-hook path runs.  :meth:`set_retention` applies identically
+        afterward.
         """
         self._per_layer = {idx: [] for idx in layer_indices}
         self._handles = []
@@ -345,7 +380,8 @@ class HiddenCapture:
         The compile-clean mirror of the in-hook accumulation: for each captured
         layer, append / overwrite / ring its latest persistent slice exactly as
         :meth:`attach`'s hook would, advance the forward counter, then fire the
-        step sink once (the FIX F1 post-forward scoring point).  Wired as the
+        step sink once — the same post-forward scoring point
+        :meth:`fire_step_sink` is on the transient path.  Wired as the
         decode loop's ``step_callback`` when capture is persistent, so the call
         order (forward → ingest → gate scoring) and the resulting bucket shapes
         are byte-identical to the transient path — every downstream consumer
@@ -526,7 +562,7 @@ class HiddenCapture:
         return bool(self._handles)
 
     def fire_step_sink(self, step_id: int) -> None:
-        """Run the per-token step sink once, **after** the model forward (FIX F1).
+        """Run the per-token step sink once, **after** the model forward.
 
         Invoked by ``generate_steered`` post-``model()`` rather than from inside
         the capture hook at the max probe layer.  Scoring here keeps the
@@ -546,14 +582,28 @@ class HiddenCapture:
 class SteeringHook:
     """Per-layer steering state: zero or more subspace / manifold groups.
 
-    The 4.0 unified backend.  Every steering term — vectors, poles,
-    ``~``/``|`` projections, ``!`` ablations, affine and curved ``%`` — lowers
-    to a per-layer :func:`subspace_inject` group: the dispatch-synthesized
-    merged affine subspace, plus zero or more mutually-orthogonal curved
-    manifolds.  There is no additive/angular vector fast path any more, so a
-    steered layer always runs the (ctx-consulting) slow hook — per-step
-    triggers and probe gates work uniformly, at the cost of the StaticCache /
-    graph-capture path that the old composed-tensor fast path enabled.
+    Every steering term — vectors, poles, ``~``/``|`` projections, ``!``
+    ablations, affine and curved ``%`` — lowers to a per-layer
+    :func:`subspace_inject` group: the dispatch-synthesized merged affine
+    subspace, plus zero or more mutually-orthogonal curved manifolds.
+
+    :meth:`hook_fn` dispatches on the shape :meth:`recompose` armed, cheapest
+    first, and the first three consult no :class:`TriggerContext` at all:
+
+    1. :attr:`_const_single` — one always-active pure-push affine group: a
+       single in-place ``hidden.add_(c)``.
+    2. :attr:`_single_affine_lowrank` — the same group with an ``!`` ablation:
+       the fixed push plus a projection restricted to the nonzero-κ rows.
+    3. :attr:`_single_affine_fast` — the general single-affine fallback: one
+       ``subspace_inject`` + ``copy_``, no group loop, no foot state.
+    4. the general path — multiple groups, any curved manifold, or a gated /
+       phased trigger: read ``_ctx``, skip inactive groups, thread the
+       per-token foot.
+
+    Cases 1–3 are a fixed tensor-op sequence, identical on every decode step,
+    which is what makes a steered generation StaticCache / ``torch.compile``
+    eligible (:meth:`SteeringManager.static_steerable`).  Case 4 keeps per-step
+    triggers and probe gates dynamic and forces the eager DynamicCache path.
     """
 
     def __init__(self) -> None:
@@ -771,13 +821,14 @@ class SteeringHook:
     ) -> "torch.Tensor | None":
         """Precompute the constant world offset for a pure-push affine group.
 
-        Returns ``c = (along·target) @ basis`` ((D,) per-layer offset) when the
-        per-axis collapse mask ``kappa`` is all zero (a push-only term: vectors,
-        poles, ``~``/``|`` projections, affine ``%``, and merges of them) — the
-        case where the affine injection is exactly ``h_new = h + c`` (see
-        :meth:`recompose`).  ``None`` for a mixed push+ablate group (any
-        ``κ ≠ 0``), whose injection ``p_new − q = along·(target − κ·q)`` depends
-        on ``q`` (hence ``h``) and so must keep the full kernel.
+        Returns :func:`_affine_push_offset` — ``c = (along·target) @ basis``,
+        a ``(D,)`` per-layer offset — when the per-axis collapse mask ``kappa``
+        is all zero (a push-only term: vectors, poles, ``~``/``|`` projections,
+        affine ``%``, and merges of them), the case where the affine injection
+        is exactly ``h_new = h + c`` (see :meth:`recompose`).  ``None`` for a
+        mixed push+ablate group (any ``κ ≠ 0``), whose injection
+        ``p_new − q = along·(target − κ·q)`` depends on ``q`` (hence ``h``) and
+        so must keep the full kernel.
 
         The offset is cast to the model ``dtype`` when known so the hot-path
         ``hidden.add_`` is a single fused kernel with no per-fire cast; ``None``
@@ -794,18 +845,13 @@ class SteeringHook:
                 return None
         elif float(kappa) != 0.0:
             return None
-        basis = sub.basis.to(device=device, dtype=torch.float32)   # (R, D)
-        tgt = target.to(device=device, dtype=torch.float32)        # (R,)
-        c = (along * tgt) @ basis                                  # (D,) world offset
-        # ``norm_cap`` (``‖h_new‖ ≤ 3·‖h‖``) is deliberately **skipped** here.
-        # For the constant-add path it only ever guarded curved-RBF off-domain
-        # extrapolation (``clamp_position`` keeps affine ``p_new`` in-box, and a
-        # flat affine fit has no RBF to extrapolate — the affine-branch comment
-        # in ``subspace_inject`` calls the cap "belt-and-suspenders, not the norm
-        # semantic" for exactly this reason): a bounded steering offset ``c``
-        # added to a large-norm residual-stream ``h`` cannot plausibly push
-        # ``‖h + c‖`` past ``3·‖h‖``.  Dropping it is the point of the fix —
-        # it removes the two per-fire norm reductions the cap needs.
+        c = _affine_push_offset(sub, target, along, device=device)
+        # The constant-add path carries no ``norm_cap`` (``‖h_new‖ ≤ 3·‖h‖``);
+        # that guard rides the curved path, where the RBF can extrapolate
+        # off-domain.  A flat affine fit has no RBF and ``clamp_position`` keeps
+        # its ``p_new`` in-box, so a bounded offset ``c`` added to a large-norm
+        # residual-stream ``h`` cannot push ``‖h + c‖`` past ``3·‖h‖``.  Its
+        # absence is what makes this path one kernel with no norm reductions.
         return c.to(dtype) if dtype is not None else c
 
     @staticmethod
@@ -870,11 +916,23 @@ class SteeringHook:
             hidden = output if isinstance(output, torch.Tensor) else output[0]
             basis, basis_t, kappa, mean_proj, const, along = lowrank
             if hidden.dtype != basis.dtype:
+                # ``recompose`` casts to the dtype ``apply_to_model`` threaded in
+                # (``next(model.parameters()).dtype``), which a wrapper model can
+                # disagree with at the block output — a multimodal / mixed-
+                # precision stack whose language blocks emit a narrower dtype
+                # than the wrapper's first parameter.  Recast once and **store
+                # it back**, so the hot path pays the five allocations on the
+                # first fire after a recompose and none thereafter (the hot-path
+                # rule is zero steady-state allocation; a per-fire recast would
+                # break it on exactly the models this branch protects).
                 basis = basis.to(hidden.dtype)
                 basis_t = basis.T.contiguous()
                 kappa = kappa.to(hidden.dtype)
                 mean_proj = mean_proj.to(hidden.dtype)
                 const = const.to(hidden.dtype)
+                self._single_affine_lowrank = (
+                    basis, basis_t, kappa, mean_proj, const, along,
+                )
             if basis.shape[0] == 1:
                 # MPS dispatch dominates a rank-1 GEMM.  Express the same
                 # projection as a dot + axpy so Metal can use elementwise
@@ -926,9 +984,8 @@ class SteeringHook:
     ) -> None:
         """Apply every active manifold group via the unified kernel.
 
-        Each group runs :func:`subspace_inject` — the single along/onto
-        injection that replaced the angular/additive mode split.  The two
-        per-layer coefficients are already share-weighted at
+        Each group runs :func:`subspace_inject`, the one along/onto injection.
+        The two per-layer coefficients are already share-weighted at
         :meth:`SteeringManager.apply_to_model` time, so the hot path just routes
         them through the kernel and threads the per-token foot.
 
@@ -943,9 +1000,9 @@ class SteeringHook:
         decode position forward, and carrying the last prompt position from
         prefill into the first decode step.
 
-        The only steering path in 4.0 — the merged affine subspace and every
-        curved manifold are both groups here, dispatched by the kernel's
-        ``is_affine`` branch (analytic slide vs foot-following GN).
+        The merged affine subspace and every curved manifold are both groups
+        here, dispatched by the kernel's ``is_affine`` branch (analytic slide
+        vs foot-following GN).
         """
         lead = hidden.shape[:-1]
         all_groups_always_active = self._all_groups_always_active
@@ -1008,68 +1065,30 @@ class SteeringHook:
             self._handle = None
 
 
-# *Base* gain for the unified subspace/manifold steering backend — one gain
-# for every term (vectors, poles, projections, ablations, affine and curved
-# ``%``), since 4.0 lowers them all to the one along/onto kernel.
+# --- steering gains ----------------------------------------------------------
+# Three constants, one per operation/path.  They all ride the same per-layer
+# share weighting, whose contract lives once in ``_normalize_shares_mean1``
+# below — read that first; each comment here covers only its own constant.
 #
-# Each op moves a piece of ``h`` whose *magnitude* is carried by the target's
-# **neutral-anchored real coords** (Step 3): a high-signal layer's pole sits
-# farther from the origin, so sliding ``along`` toward it displaces more there.
-# The per-layer share (``_manifold_layer_shares`` / ``synth.share``) is
-# normalized to **mean 1** (``Σ_L share_L = n_layers``), so
-# ``eff_along_L = share_L · base_gain`` reads as a clean per-layer *slide
-# fraction* ≈ ``base_gain`` on a typical layer — above ``base`` on the
-# high-spread layers, below it on the flat ones — and is **n_layers-invariant**:
-# one covered layer and a 30-layer fit both put ≈ ``base`` of slide on each
-# contributing layer (a 4-dim and a 16-dim fit reach comparable behavior at the
-# same α; an ``A ⊂ B`` nested subspace steers its shared axis identically).
-#
-# There is **no lever / ``N`` correction** (torn out in Step 8): it
-# double-counted the magnitude the de-rogued real coords already carry, broke
-# the A⊂B consistency above, and blew the gain up on whitened low-rank fits
-# (``N ≈ 1e-4`` → ``base/N`` saturating every layer).  And **no ``[0, 1]`` clamp
-# / water-fill** on ``along``: a high-signal layer is *meant* to overshoot past
-# the pole; the affine/RBF ``norm_cap = 3·‖h‖`` inside ``subspace_inject`` is
-# the only bound.  ``onto`` stays clamped ``[0, 1]`` (a residual-shrink fraction
-# beyond 1 would overshoot through the zero-thickness wire or σ-tube).
-#
-# This is the **onto** (off-surface collapse) gain only: ``eff_onto_L =
-# clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)``.  On an SAE-space
-# curved fit the kernel scales the off-surface residual by ``(1 − eff_onto)``; on
-# a fuzzy σ-field fit it instead shrinks residual norm toward the local tube
-# thickness.  That residual carries the per-token content variation, so combined
-# with a directional ``along`` push too much onto erases the spread and degenerates
-# into looping — the exact failure the translate-not-collapse ``along`` design
-# avoids, reintroduced by over-shrinking the residual that held the spread.
-# Calibrated on the gemma-4-12b ``emotions%dominant`` onto sweep — the affect
-# manifold under a curved fit, along fixed at 0.3:
-# at the old ``1.0`` even ``onto = 0.5`` fragmented and ``onto = 1.0`` collapsed to
-# ``!!!``; ``0.5`` puts the recommended ``onto ≈ 0.5`` at a clean sweet spot and
-# keeps ``onto = 1.0`` a strong-but-coherent ceiling, while below ``~0.3`` the
-# [0, 1] knob saturates into no dynamic range (``onto = 0.5 ≈ 1.0``).  A [0, 1]
-# dial whose top emits garbage is a bad dial, so ``onto = 1.0`` is deliberately the
-# coherent maximum, not the over-steer edge.
-_MANIFOLD_ONTO_GAIN = 0.5
+#   affine ``along``   ``eff_along_L = share_L · _SUBSPACE_GAIN``
+#   curved ``along``   ``eff_along_L = along · share_L · _MANIFOLD_ALONG_GAIN``
+#                      (periodic ``BoxDomain``: unweighted + clamped to [0, 1])
+#   ``onto``           ``eff_onto_L  = clamp(onto · share_L · _MANIFOLD_ONTO_GAIN, 0, 1)``
 
-# --- translate gain (prototype) ----------------------------------------------
-# The injection *translates* the in-subspace foot by a fixed offset toward the
-# target rather than collapsing every token's foot onto it (see
-# ``subspace_inject`` / ``ManifoldDomain.translate_foot``): the fixed offset
-# preserves the per-token in-subspace spread, which the kernel ablation showed
-# keeps strong steer coherent (collapse → looping degeneration).
-#
-# Translate is unbounded where collapse saturated (a fixed offset compounds
-# across layers rather than landing *on* the target), so the slide gain runs ~an
-# order of magnitude below the old collapse gain.  A typical layer gets
+# **Affine ``along`` gain** (prototype).  The injection *translates* the
+# in-subspace foot by a fixed offset toward the target rather than collapsing
+# every token's foot onto it (see ``subspace_inject`` /
+# ``ManifoldDomain.translate_foot``): the fixed offset preserves the per-token
+# in-subspace spread, which the kernel ablation showed keeps strong steer
+# coherent (collapse → looping degeneration).  A typical layer gets
 # ``eff_along ≈ _SUBSPACE_GAIN``.
 #
-# **Whitened-normalization recalibration.**  ``synthesize_subspace`` now emits a
-# *whitened-unit* affine target (``‖target@basis‖_M = 1`` per push term, magnitude
-# carried by α), so the avg per-layer whitened push is simply ``GAIN·α`` — the same
-# for every target.  Under the prior raw-Euclidean target the push was
-# ``eff_along · ‖node_coords‖₂``, which baked in each node's distance from neutral
-# (caveman ~17, formal ~0.3, a ~100× spread); the old ``0.125`` was tuned against
-# that ~17 scale, so on the unit scale it under-pushes ~100×.
+# ``synthesize_subspace`` emits a *whitened-unit* affine target
+# (``‖target@basis‖_M = 1`` per push term, magnitude carried by α), so the avg
+# per-layer whitened push is simply ``GAIN·α`` — the same for every target.
+# That is what makes one scalar gain calibratable at all: steering by the
+# raw-Euclidean node distance baked in each node's distance from neutral
+# (caveman ~17, formal ~0.3, a ~100× spread across targets).
 #
 # Live-calibrated on a gemma-4-12b α-sweep (thinking off; ``formal.casual%formal``,
 # ``personas%caveman``, ``personas%hacker``).  In **effective gain ``E = GAIN·α``**:
@@ -1078,43 +1097,60 @@ _MANIFOLD_ONTO_GAIN = 0.5
 # ``E ≈ 12``, caveman at ``E ≈ 17``, formal still coherent past ``E ≈ 22``.  There
 # is **no single E** that makes caveman full AND keeps hacker coherent; this is the
 # §10 per-persona coherence variance, which a scalar gain cannot unify (it is a
-# steering-access property of the fit, not the geometric scale the whitened
-# normalization fixed).
+# steering-access property of the fit, not a geometric scale the whitened
+# normalization could remove).
 #
 # So the calibration is **coherence-first**: put the recommended ``α ≈ 0.5`` at
 # ``E ≈ 8`` — the strongest setting where *every* target (including the fragile
 # hacker) is clearly register-shifted yet coherent — giving ``GAIN = 16``.  ``α ≈
 # 1.0`` then lands at ``E ≈ 16`` (the documented "strong / over-steered" zone:
 # robust concepts still coherent, hard personas break — dial α down per target).
-# This is the payoff of the whitened normalization: pre-fix, ``0.5 formal%formal``
-# did nothing while ``0.5 personas%caveman`` slammed; now ``0.5`` of *either* lands
-# in the same coherent band.  (Tune up toward ``E ≈ 12`` — α ≈ 0.75 — for fuller
-# persona expression where the target tolerates it.)  ``_MANIFOLD_ONTO_GAIN`` stays the
-# gain for ``onto`` only (the off-surface collapse share-weight).
+# ``0.5`` of a tight concept and ``0.5`` of a far persona both land in that band.
+# (Tune up toward ``E ≈ 12`` — α ≈ 0.75 — for fuller persona expression where the
+# target tolerates it.)
 _SUBSPACE_GAIN = 16.0
 
-# --- curved-path translate gain (separate from the affine gain above) --------
-# The ``_SUBSPACE_GAIN = 16`` above is the **affine** path's free-magnitude gain
-# (whitened-unit target, ``norm_cap``-bounded).  The **curved** path is different
-# in kind: its target is the node's *raw domain coordinates* and ``subspace_inject``
-# translates the foot by ``eff_along·(target − origin)`` (``domain.translate_foot``),
-# so ``eff_along`` is a **fraction of the way to the node** (``1.0`` lands on it),
-# not a free magnitude.  ``norm_cap = 3·‖h‖`` bounds the off-domain RBF
-# extrapolation, so a curved fit doesn't detonate the way the affine path would —
-# instead, *past* ``eff_along ≈ 1`` the foot keeps translating past the node.
+# **Curved ``along`` gain** — different in kind from the affine gain above.  The
+# curved target is the node's *raw domain coordinates* and ``subspace_inject``
+# translates the foot by ``eff_along·(target − origin)``
+# (``domain.translate_foot``), so ``eff_along`` is a **fraction of the way to the
+# node** (``1.0`` lands on it), not a free magnitude.  ``norm_cap = 3·‖h‖``
+# bounds the off-domain RBF extrapolation, so a curved fit doesn't detonate the
+# way the affine path would — instead, *past* ``eff_along ≈ 1`` the foot keeps
+# translating past the node.
 #
-# Live-calibrated on a clean, stateless gemma-4-12b
-# ``months_loop%january`` α-sweep. ``along=1.0``
-# at gain ``4`` (``eff_along ≈ 4``) lands the vivid coherent winter sweet spot
-# ("skeletal trees heavy with frost", consistent across seeds); gain ``2`` is milder
-# but clearly cold; the prior ``1.5`` was too weak (only a "cool prickle").
+# Live-calibrated on a clean, stateless gemma-4-12b ``months_loop%january``
+# α-sweep: ``along=1.0`` at gain ``4`` (``eff_along ≈ 4``) lands the vivid
+# coherent winter sweet spot ("skeletal trees heavy with frost", consistent
+# across seeds); gain ``2`` is milder but clearly cold; ``1.5`` is too weak (only
+# a "cool prickle").
 #
 # Periodic ``BoxDomain`` fits are a distinct case: the runtime drops
-# share-weighting and clamps ``eff_along = along * gain`` to ``[0,1]`` uniformly
-# across layers. This prevents each layer from wrapping around the domain at a
-# different rate; ``along=1`` therefore lands every layer on the target node.
-# Non-periodic curved fits retain the share-weighted, unclamped translation.
+# share-weighting and clamps ``eff_along = along · gain`` to ``[0, 1]`` uniformly
+# across layers, because share ∈ [0.19, 1.47] × gain 4 sends many layers past 1
+# on a ring and each would then wrap to a different node, scattering the signal.
+# ``along = 1`` therefore lands every layer on the target node.  Non-periodic
+# curved fits keep the share-weighted, unclamped translation.
 _MANIFOLD_ALONG_GAIN = 4.0
+
+# **``onto`` gain** — the off-surface collapse only, on the curved path.  With no
+# σ-field the kernel scales the off-surface residual by ``(1 − eff_onto)``; on a
+# fuzzy σ-field fit it instead shrinks the residual norm toward the local tube
+# thickness.  That residual carries the per-token content variation, so combined
+# with a directional ``along`` push too much ``onto`` erases the spread and
+# degenerates into looping — the same failure the translate-not-collapse
+# ``along`` design avoids, reintroduced by over-shrinking the residual that held
+# the spread.
+#
+# Calibrated on the gemma-4-12b ``emotions%dominant`` onto sweep (the affect
+# manifold under a curved fit, along fixed at 0.3): at ``1.0`` even ``onto = 0.5``
+# fragmented and ``onto = 1.0`` collapsed to ``!!!``; ``0.5`` puts the recommended
+# ``onto ≈ 0.5`` at a clean sweet spot and keeps ``onto = 1.0`` a
+# strong-but-coherent ceiling, while below ``~0.3`` the [0, 1] knob saturates into
+# no dynamic range (``onto = 0.5 ≈ 1.0``).  A [0, 1] dial whose top emits garbage
+# is a bad dial, so ``onto = 1.0`` is deliberately the coherent maximum, not the
+# over-steer edge.
+_MANIFOLD_ONTO_GAIN = 0.5
 
 # Max |cosine| between two *curved* manifold subspaces sharing a layer before
 # they are deemed overlapping (``OverlappingManifoldError``).  Curved manifolds
@@ -1173,9 +1209,33 @@ _MANIFOLD_COLD_GN_STEPS = 4
 def _normalize_shares_mean1(raw: dict[int, float]) -> dict[int, float]:
     """Normalize per-layer share scores to **mean 1** (``Σ_L share_L = n_layers``).
 
-    So ``eff_along_L = share_L · base`` is a clean per-layer slide fraction
-    ≈ ``base`` on a typical layer and n_layers-invariant (see
-    ``_MANIFOLD_ONTO_GAIN``). Inputs are exact positive current geometry.
+    The share weighting every steering gain rides — the one place its contract
+    lives.  A raw share (``synth.share`` = the whitened push displacement
+    ``‖Δ_L‖_M``, or ``_manifold_layer_shares`` = the baked
+    ``mahalanobis_share``) says how much signal a layer carries; mean-1
+    normalization turns that into a *relative* weight, so
+    ``eff_L = share_L · gain`` reads as a clean per-layer slide fraction ≈
+    ``gain`` on a typical layer — above it on the high-signal layers, below it
+    on the flat ones.
+
+    The property that buys is **n_layers-invariance**: one covered layer and a
+    30-layer fit both put ≈ ``gain`` of slide on each contributing layer, so a
+    4-dim and a 16-dim fit reach comparable behavior at the same α and an
+    ``A ⊂ B`` nested subspace steers its shared axis identically.  (Normalizing
+    to sum 1 instead would divide the strength by the layer count; a per-fit
+    lever correction would double-count the magnitude the whitened target
+    already carries and blow up on low-rank fits.)
+
+    ``along`` is **not** clamped afterwards: a high-signal layer is *meant* to
+    overshoot past the target, and the bounded whitened-unit target (affine) or
+    ``norm_cap = 3·‖h‖`` inside ``subspace_inject`` (curved) is what holds it.
+    The two exceptions are documented at their gains — a periodic ``BoxDomain``
+    curved fit drops this weighting entirely, and ``onto`` stays clamped
+    ``[0, 1]`` (a residual-shrink fraction beyond 1 would overshoot through the
+    zero-thickness wire or σ-tube).
+
+    Inputs must be finite and strictly positive — exact current geometry, never
+    a degenerate placeholder.
     """
     if not raw or any(not math.isfinite(s) or s <= 0.0 for s in raw.values()):
         raise ValueError("layer shares must be a nonempty finite positive mapping")
@@ -1185,16 +1245,14 @@ def _normalize_shares_mean1(raw: dict[int, float]) -> dict[int, float]:
 
 
 def _manifold_layer_shares(manifold: Manifold) -> dict[int, float]:
-    # Prefer the whitened (Mahalanobis) per-layer share baked at fit time —
-    # the subspace-restricted analogue of vector steering's ``‖d‖_M`` bake
-    # score (see ``LayerWhitener.subspace_gram`` /
-    # ``ManifoldExtractionPipeline.fit``).  Requires *full* layer coverage:
+    # A curved manifold's per-layer share is the whitened (Mahalanobis) weight
+    # baked at fit time — the subspace-restricted analogue of vector steering's
+    # ``‖d‖_M`` bake score (see ``LayerWhitener.subspace_gram`` /
+    # ``ManifoldExtractionPipeline.fit``).  *Full* layer coverage is required:
     # the share is a cross-layer-normalized weight, so mixing whitened and
-    # Euclidean scalars across layers would compare incommensurable
-    # metrics. Normalized to **mean 1** (``Σ_L share_L =
-    # n_layers``, not 1) so ``eff_along_L = share_L · base_gain`` is a clean
-    # per-layer slide fraction ≈ ``base`` on a typical layer and
-    # n_layers-invariant — see ``_MANIFOLD_ONTO_GAIN``.
+    # Euclidean scalars across layers would compare incommensurable metrics.
+    # ``_normalize_shares_mean1`` then turns it into the relative per-layer
+    # weight the gains ride (see its docstring).
     baked = manifold.mahalanobis_share
     missing = set(manifold.layers) - set(baked)
     extra = set(baked) - set(manifold.layers)
@@ -1207,6 +1265,111 @@ def _manifold_layer_shares(manifold: Manifold) -> dict[int, float]:
         layer_idx: float(baked[layer_idx]) for layer_idx in manifold.layers
     }
     return _normalize_shares_mean1(layer_scores)
+
+
+@dataclass(frozen=True)
+class LoweredAffine:
+    """One layer's merged affine steering term in runtime form.
+
+    The output of :func:`_lower_affine_subspaces` — a
+    :class:`~saklas.core.manifold.SynthesizedSubspace` layer reduced to exactly
+    what the injection needs: the (possibly curved-orthogonalized) affine
+    ``subspace``, its ``(R,)`` push ``target`` (every active push term's
+    coeff-scaled fragment already composed in by ``synthesize_subspace``), the
+    per-layer slide budget ``eff_along = share_L · _SUBSPACE_GAIN`` with
+    ``share_L`` mean-1 normalized, and the gain-compensated per-axis collapse
+    mask ``kappa`` (``requested_κ / eff_along``, so the kernel's ``along · κ``
+    product is exactly the user's ablation coefficient).
+    """
+
+    subspace: LayerSubspace
+    target: torch.Tensor
+    eff_along: float
+    kappa: torch.Tensor
+
+    @property
+    def is_pure_push(self) -> bool:
+        """True when no axis ablates, i.e. the injection is a constant add.
+
+        ``κ = 0`` on every axis ⇒ ``p_new − q = eff_along·target`` independent
+        of ``h``, which is what both constant-add paths
+        (:meth:`SteeringHook._pure_push_constant`, the compiled offset buffers)
+        require.  Gain compensation divides by a strictly positive
+        ``eff_along``, so this reads the same as testing the requested κ.
+        """
+        return not bool(self.kappa.any())
+
+
+def _lower_affine_subspaces(
+    synth: SynthesizedSubspace,
+    *,
+    curved_basis_by_layer: "dict[int, torch.Tensor] | None" = None,
+) -> dict[int, LoweredAffine]:
+    """Lower one synthesized affine subspace to its per-layer runtime terms.
+
+    **The** affine lowering: mean-1 share normalization, optional
+    orthogonalization against the curved manifolds sharing a layer,
+    ``eff_along_L = share_L · _SUBSPACE_GAIN``, and the κ gain compensation.
+    Both consumers go through here — :meth:`SteeringManager.apply_to_model`
+    builds transient hook entries from the result and
+    :meth:`SteeringManager.compute_static_offsets` contracts it into the
+    persistent compiled offset buffers — so compiled and eager generations
+    steer by construction, not by two implementations agreeing.
+
+    ``curved_basis_by_layer`` supplies the stacked orthonormal rows of every
+    curved manifold at a layer; the affine span is projected out of them
+    (curved wins the shared directions, ARCHITECTURE §6) and the layer is
+    dropped entirely when nothing is left to steer there.  ``None`` (the
+    compiled path, which only lowers when there is no curved manifold at all)
+    skips that step.
+
+    Runs at compose time, once per steering push — never per token.
+    """
+    layer_set = list(synth.layers)
+    if not layer_set:
+        return {}
+    # ``synth.share`` is the un-normalized whitened push displacement ``‖Δ_L‖_M``
+    # per layer; ``_normalize_shares_mean1`` turns it into the relative weight
+    # the gain multiplies (its docstring owns that contract).
+    shares = _normalize_shares_mean1(
+        {L: float(synth.share[L]) for L in layer_set}
+    )
+    lowered: dict[int, LoweredAffine] = {}
+    for L in layer_set:
+        sub_L = synth.layers[L]
+        target = synth.target_coord[L].to(torch.float32)
+        # Per-axis requested ablation coefficient (0 on push axes).
+        # Orthogonalization runs on these user-space coefficients first, then
+        # the single scalar division below preserves the resulting operator
+        # exactly.
+        requested_kappa = synth.kappa[L].to(torch.float32)
+        curved = (
+            curved_basis_by_layer.get(L)
+            if curved_basis_by_layer is not None
+            else None
+        )
+        if curved is not None:
+            res = _orthogonalize_affine_against(
+                sub_L, target, requested_kappa, curved,
+            )
+            if res is None:
+                # The affine span lies entirely inside the curved span —
+                # nothing left to steer at this layer.
+                continue
+            sub_L, target, requested_kappa = res
+        # No lever / ``N`` and no ``[0, 1]`` clamp: the de-rogued whitened-unit
+        # target carries the magnitude, so a high-share layer is *meant* to
+        # overshoot past the target.
+        eff_along = shares[L] * _SUBSPACE_GAIN
+        # ``subspace_inject`` multiplies κ by ``along``; dividing by the affine
+        # push gain here keeps ``0.15 !x`` at 15% rather than ``16×`` that.
+        lowered[L] = LoweredAffine(
+            subspace=sub_L,
+            target=target,
+            eff_along=eff_along,
+            kappa=requested_kappa / eff_along,
+        )
+    return lowered
 
 
 class SteeringManager:
@@ -1223,10 +1386,10 @@ class SteeringManager:
         self.hooks: dict[int, SteeringHook] = {}
         self.manifolds: dict[str, dict[str, Any]] = {}
         # Dispatch-synthesized merged affine subspaces (one per active trigger
-        # group), the 4.0 unified vector/pole/projection/ablation/affine-``%``
-        # backend.  Each value is ``{synth, trigger}``; ``apply_to_model``
-        # lowers them to per-layer ``subspace_inject`` entries alongside curved
-        # manifolds.
+        # group) — where vectors, poles, ``~``/``|`` projections, ``!``
+        # ablations, and affine ``%`` all land.  Each value is
+        # ``{synth, trigger}``; ``apply_to_model`` lowers them to per-layer
+        # ``subspace_inject`` entries alongside the curved manifolds.
         self.subspaces: dict[str, dict[str, Any]] = {}
         self.ctx: TriggerContext = TriggerContext()
         # Persistent compile-clean steering path (CUDA/MPS torch.compile). A single
@@ -1243,13 +1406,22 @@ class SteeringManager:
         self._compiled_offset_handles: list[Any] = []
 
     def all_fast_path(self) -> bool:
-        """True iff no steering hook is attached (the unsteered path).
+        """True iff no **transient** steering hook is attached.
 
-        The cheapest case: nothing mutates the residual stream, so StaticCache
-        / ``torch.compile`` graph capture is unconditionally eligible.  A
-        ctx-consulting / curved / gated hook still forces the eager
-        DynamicCache path; the *static-affine* steered case is captured by the
-        separate :meth:`static_steerable` signal below.
+        Two states satisfy it: genuinely unsteered, and steering that lowered
+        to the persistent compiled offset buffers (the composer calls
+        :meth:`detach_transient_hooks` after
+        :meth:`write_compiled_offsets`, so ``hooks`` is empty while the
+        branchless ``add_(offset)`` hooks are actively steering).  Either way
+        no ctx-consulting hook can fire, so StaticCache / ``torch.compile``
+        graph capture is eligible — which is what this signal is for.
+
+        It is therefore **not** an "is this generation unsteered" test.
+        Callers that need that distinction read the session's
+        ``_steering_uses_compiled_offsets`` alongside it.  A curved / gated /
+        phased hook stays on the transient list and forces the eager
+        DynamicCache path; the *static-affine* transient case is the separate
+        :meth:`static_steerable` signal below.
         """
         return not self.hooks
 
@@ -1307,8 +1479,9 @@ class SteeringManager:
         ``along`` / ``onto`` are the user coefficients (each clamped to
         ``[0, 1]`` at apply time): ``along`` slides the foot toward
         ``position`` geodesically, ``onto`` collapses the off-manifold
-        in-subspace residual.  The off-subspace residual is always kept
-        verbatim (the old ``toward`` op is removed).
+        in-subspace residual.  The off-*subspace* residual is always kept
+        verbatim — that is what lets a vector and N orthogonal manifolds
+        compose with zero cross-talk.
         """
         manifold.validate_runtime_geometry()
         resolved = manifold.resolve_position(position)
@@ -1336,23 +1509,20 @@ class SteeringManager:
         *,
         trigger: Trigger = Trigger.BOTH,
     ) -> None:
-        """Register a dispatch-synthesized merged affine subspace (4.0).
+        """Register a dispatch-synthesized merged affine subspace.
 
         ``synth`` (one per active trigger group) carries the per-layer affine
         :class:`LayerSubspace`, the ``along`` ``target_coord`` (every active
         push term's coeff-scaled pole already composed in), and the
-        un-normalized per-layer budget ``share`` (``‖Δ_L‖``).
+        un-normalized per-layer budget ``share`` (``‖Δ_L‖_M``).
 
-        At :meth:`apply_to_model` each layer becomes a per-layer
+        :func:`_lower_affine_subspaces` reduces it to per-layer
+        :class:`LoweredAffine` terms, which :meth:`apply_to_model` wraps as
         ``(subspace, CustomDomain(R_L), target_coord, origin=0, eff_along,
-        onto=0)`` entry routed through the same :func:`subspace_inject` hot
+        onto=0)`` entries routed through the same :func:`subspace_inject` hot
         path as a curved manifold — the affine analytic shortcut slides the
-        in-subspace component toward ``target_coord`` with
-        ``eff_along_L = share_L · base_gain`` (``share_L`` mean-1 normalized; no
-        lever / ``N``, no ``[0, 1]`` clamp — the de-rogued real-coord target
-        carries the magnitude and the ``norm_cap`` inside ``subspace_inject``
-        bounds an over-share layer's overshoot).  ``onto = 0`` (the surface
-        fills its span).
+        in-subspace component toward ``target_coord``.  ``onto = 0`` (the
+        surface fills its span).
         """
         self.subspaces[name] = {
             "synth": synth,
@@ -1387,16 +1557,14 @@ class SteeringManager:
         # curved spans so the merged affine subspace can be orthogonalized
         # against them below.
         #
-        # **Gain (share-weight every op).**  Each of ``along`` / ``onto`` gets
-        # the same per-layer factor ``share_L · base``: ``share_L`` (whitened
-        # Mahalanobis share, else Euclidean centroid-spread) is how
-        # discriminative the manifold is at that layer, normalized to mean 1
-        # (``Σ_L share_L = n_layers``); ``base`` is the one gain constant.  No
-        # lever / ``N`` and no water-fill (both torn out in Step 8 — see the
-        # ``_MANIFOLD_ONTO_GAIN`` docstring): ``along`` is left un-clamped so a
-        # high-share layer overshoots past the target (the ``norm_cap`` inside
-        # ``subspace_inject`` is the only bound), while ``onto`` stays clamped
-        # ``[0, 1]`` per layer (beyond 1 would overshoot through the wire/tube).
+        # **Gain.**  Both curved coefficients are share-weighted by the manifold's
+        # mean-1 per-layer share (``_normalize_shares_mean1`` owns that contract)
+        # and scaled by their own constant — ``_MANIFOLD_ALONG_GAIN`` for
+        # ``along``, ``_MANIFOLD_ONTO_GAIN`` for ``onto``.  ``along`` is left
+        # un-clamped so a high-share layer overshoots past the target (the
+        # ``norm_cap`` inside ``subspace_inject`` is the only bound); ``onto``
+        # clamps to ``[0, 1]`` per layer (beyond 1 would overshoot through the
+        # wire/tube).
         manifold_by_layer: dict[
             int,
             list[tuple[
@@ -1417,15 +1585,16 @@ class SteeringManager:
             shares: dict[int, float] = m.get("shares", {})
 
             # Curved-path **fraction** gain (NOT the affine magnitude gain):
-            # ``eff_along`` is the fraction of the way to the node, so it must stay
-            # near [0, ~2] or the RBF extrapolates off-domain (see
+            # ``eff_along`` is the fraction of the way to the node, so it must
+            # stay near [0, ~2] or the RBF extrapolates off-domain (see
             # ``_MANIFOLD_ALONG_GAIN``).  ``onto`` clamps per layer.
             #
-            # Periodic (loop) domains: drop share-weighting and clamp eff_along to
-            # [0, 1] so no layer wraps past the target node.  (AGENTS.md deferred
-            # fix — share∈[0.19,1.47] × gain 4 sends many layers past 1 on a ring,
-            # scattering the signal across different nodes.)  Non-periodic curved
-            # fits keep the existing share-weighted, unclamped behavior.
+            # Periodic (loop) domains take the other branch: share-weighting is
+            # dropped and ``eff_along`` clamps to [0, 1] uniformly, so no layer
+            # wraps past the target node.  (Share ∈ [0.19, 1.47] × gain 4 sends
+            # many layers past 1 on a ring, and each would then land on a
+            # different node — scattering the signal.)  Non-periodic curved fits
+            # keep the share-weighted, unclamped translation.
             domain = manifold.domain
             _is_periodic = isinstance(domain, BoxDomain) and any(
                 ax.periodic for ax in domain.axes
@@ -1486,68 +1655,30 @@ class SteeringManager:
                     eff_along[layer_idx], eff_onto[layer_idx], 0.0, trigger,
                 ))  # κ = 0: curved manifolds are push-only (pure translate)
 
-        # Dispatch-synthesized merged affine subspaces (4.0 unified backend).
-        # Each ``synth`` is already neutral-anchored with its ``along`` target
-        # composed from every active push term's coeff-scaled pole; here we only
-        # set the per-layer slide budget ``eff_along_L = share_L · base`` (mean-1
-        # share, no lever / clamp — Step 8) and lower each layer to a
-        # ``CustomDomain(R_L)`` ``subspace_inject`` entry (the affine analytic
-        # shortcut — no GN / RBF / foot solve).  The target carries the
-        # strength, so there is no separate user-α multiply here; ``onto = 0``
-        # (the surface fills its span).  Curved-vs-affine orthogonalization +
-        # the relaxed overlap check land with the session dispatch flip (Step
-        # 5b); here a subspace simply joins ``manifold_by_layer``.
+        # Dispatch-synthesized merged affine subspaces.  Each ``synth`` is
+        # already neutral-anchored with its ``along`` target composed from every
+        # active push term's coeff-scaled pole, so all that remains is
+        # :func:`_lower_affine_subspaces` (the shared share-normalization /
+        # gain / κ-compensation / curved-orthogonalization step, also consumed
+        # by :meth:`compute_static_offsets`) and wrapping each layer as a
+        # ``CustomDomain(R_L)`` ``subspace_inject`` entry — the affine analytic
+        # shortcut, no GN / RBF / foot solve.  The target carries the strength,
+        # so there is no separate user-α multiply here; ``onto = 0`` (the
+        # surface fills its span).
         for s in self.subspaces.values():
             synth: SynthesizedSubspace = s["synth"]
             sub_trigger: Trigger = s["trigger"]
-            layer_set = list(synth.layers)
-            if not layer_set:
-                continue
-
-            # Normalize the per-layer budget share to **mean 1**
-            # (``Σ_L share_L = n_layers``) so ``eff_along_L = share_L · base``
-            # is a clean per-layer slide fraction and n_layers-invariant (one
-            # covered layer and a 30-layer fit both put ≈ ``base`` of slide on
-            # each contributing layer; A⊂B steers its shared axis identically).
-            raw_share = {L: float(synth.share[L]) for L in layer_set}
-            shares = _normalize_shares_mean1(raw_share)
-
-            for L in layer_set:
-                sub_L = synth.layers[L]
-                sub_target = synth.target_coord[L].to(torch.float32)
-                # Per-axis requested ablation coefficient (0 on push axes).
-                # ``subspace_inject`` multiplies it by ``along``; compensate
-                # for the affine push gain below so ``0.15 !x`` removes 15%,
-                # not ``16×`` that amount.  Orthogonalization runs on the
-                # user-space coefficients first, then this one scalar division
-                # preserves the resulting operator exactly.
-                requested_kappa = synth.kappa[L].to(torch.float32)
-                # Orthogonalize the affine subspace against any curved manifold
-                # sharing this layer (curved wins the shared directions); κ rides
-                # through the re-orthonormalization.  Drop the layer if the affine
-                # span lies entirely inside the curved span (nothing left here).
-                curved = curved_basis_by_layer.get(L)
-                if curved is not None:
-                    res = _orthogonalize_affine_against(
-                        sub_L, sub_target, requested_kappa, curved,
-                    )
-                    if res is None:
-                        continue
-                    sub_L, sub_target, requested_kappa = res
-                r_l = sub_L.rank
-                sub_domain = CustomDomain(r_l)
+            lowered = _lower_affine_subspaces(
+                synth, curved_basis_by_layer=curved_basis_by_layer,
+            )
+            for L, low in lowered.items():
+                r_l = low.subspace.rank
                 # Affine origin is span-coord 0 (neutral → coord 0, §5); the
                 # foot seed / cold-start is unused on the affine shortcut.
                 sub_origin = torch.zeros(r_l, dtype=torch.float32)
-                # No lever / ``N`` and no ``[0, 1]`` clamp (Step 8): the
-                # de-rogued real-coord target carries the magnitude; the per-axis
-                # share-weighted ``eff_along`` is unclamped (``norm_cap`` bounds
-                # it in ``subspace_inject``).
-                eff_along_L = shares[L] * _SUBSPACE_GAIN
-                sub_kappa = requested_kappa / eff_along_L
                 manifold_by_layer.setdefault(L, []).append((
-                    sub_L, sub_domain, sub_target, sub_origin,
-                    eff_along_L, 0.0, sub_kappa, sub_trigger,
+                    low.subspace, CustomDomain(r_l), low.target, sub_origin,
+                    low.eff_along, 0.0, low.kappa, sub_trigger,
                 ))
 
         active_layers = set(manifold_by_layer)
@@ -1615,10 +1746,15 @@ class SteeringManager:
         for the static-affine pure-push case (every subspace is an always-active
         ``Trigger.BOTH`` push with zero ablation mask κ and no curved manifold),
         and ``None`` for anything that needs the per-token kernel (curved ``%``,
-        a probe gate / phase trigger, or an ``!`` ablation).  The offset is the
-        same world vector the transient :meth:`SteeringHook._pure_push_constant`
-        fast path adds (``(share_L·gain·target) @ basis``), so the compiled and
-        eager pushes are numerically identical.
+        a probe gate / phase trigger, or an ``!`` ablation).
+
+        Compiled/eager parity is structural: the terms come from the same
+        :func:`_lower_affine_subspaces` :meth:`apply_to_model` consumes, and the
+        offset is contracted by the same :func:`_affine_push_offset` the
+        transient :meth:`SteeringHook._pure_push_constant` fast path adds — so a
+        change to the share normalization, the gain, or the κ semantics moves
+        both paths together.  ``curved_basis_by_layer`` is omitted from the
+        lowering because a curved manifold disqualifies this path outright.
         """
         if self.manifolds:
             return None  # a curved manifold isn't a constant add
@@ -1627,20 +1763,12 @@ class SteeringManager:
             synth: SynthesizedSubspace = s["synth"]
             if s["trigger"] is not Trigger.BOTH:
                 return None  # gated / phased — needs the ctx-consulting hook
-            layer_set = list(synth.layers)
-            if not layer_set:
-                continue
-            raw_share = {L: float(synth.share[L]) for L in layer_set}
-            shares = _normalize_shares_mean1(raw_share)
-            for L in layer_set:
-                sub_L = synth.layers[L]
-                kappa = synth.kappa[L]
-                if bool((kappa.abs() > 0).any()):
+            for L, low in _lower_affine_subspaces(synth).items():
+                if not low.is_pure_push:
                     return None  # ablation: injection depends on h, not a const
-                target = synth.target_coord[L].to(torch.float32)
-                basis = sub_L.basis.to(torch.float32)              # (R, D)
-                eff_along = shares[L] * _SUBSPACE_GAIN
-                c = (eff_along * target) @ basis                   # (D,)
+                c = _affine_push_offset(
+                    low.subspace, low.target, low.eff_along,
+                )
                 offsets[L] = offsets[L] + c if L in offsets else c
         return offsets
 

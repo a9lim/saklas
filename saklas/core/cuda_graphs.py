@@ -1,34 +1,40 @@
-"""CUDA-graphs / StaticCache support.
+"""StaticCache support — the ``torch.compile`` enabler, on every backend.
 
-When enabled (``cuda_graphs=True`` + device==cuda + supported architecture
-+ fast-path-eligible steering), generation routes through
-:class:`transformers.StaticCache` instead of the default ``DynamicCache``.
-Static caches don't grow per step, so kernel shapes stay fixed across the
-decode loop, which lets ``torch.compile(mode="reduce-overhead")`` capture
-CUDA graphs internally for the inference-shape regions.
+:class:`transformers.StaticCache` pre-allocates fixed-shape K/V buffers, so
+kernel shapes stay constant across the decode loop where the default
+``DynamicCache`` grows one position per step.  That is what lets inductor reuse
+a single trace instead of re-specializing every token, and it is **not**
+CUDA-specific: the MPS path takes it too (measured ~+16% eager, and it unlocks
+the ~1.7× ``compile`` win on top).  CUDA graphs are the *superset* — with
+``cuda_graphs=True`` on CUDA, ``torch.compile(mode="reduce-overhead")`` can
+additionally capture graphs for the inference-shape regions.
 
-This module owns *detection* and *fallback*: probing whether StaticCache
-construction succeeds on a given model + device, caching that answer, and
-exposing a single factory used by :mod:`saklas.core.generation` and
-:mod:`saklas.core.session`.  The actual cache pass-through (allocating,
-sizing, per-step ``cache_position``) happens at the call sites; we keep
-the policy in one place so the eager path stays uncluttered.
+This module owns *detection*, *construction*, and *fallback*:
 
-Caller responsibilities:
-- Call :func:`is_cuda_graphs_supported` during construction; it caches by
-  underlying module id (through ``torch.compile``'s ``_orig_mod`` wrapper),
-  device, and dtype, then the session stores the boolean result.
-- On supported sessions, keep an identity-stable StaticCache built via
-  :func:`make_static_cache`, reset it between generations, and grow it only when
-  the requested ``prompt_len + max_new_tokens + cache_position_offset`` exceeds
-  its capacity.
-- On unsupported sessions, fall back transparently to DynamicCache —
-  the eager loop is unchanged.
+- :func:`is_static_cache_supported` — the device-agnostic viability probe,
+  cached by underlying module id (through ``torch.compile``'s ``_orig_mod``
+  wrapper), device, and dtype.  Every StaticCache-eligible backend consults it.
+- :func:`is_cuda_graphs_supported` — the CUDA-only gate on top of it, which
+  decides ``reduce-overhead`` vs the ``default`` (fusion-only) compile mode.
+- :func:`make_static_cache` — the single factory used by
+  :mod:`saklas.core.generation`, :mod:`saklas.core.session`, and
+  :mod:`saklas.core.model`.  It early-initializes the layer buffers so
+  Transformers can mark stable K/V addresses outside Dynamo, and flags the
+  sliding layers that cannot slide for this generation so
+  :func:`_patch_static_sliding_mask`'s constant mask keeps them in the compiled
+  graph.
+- :func:`warn_once` — logs a CUDA-graph fallback reason once per model.
 
-Slow-path steering (probe gates, multi-trigger, ablation under CTX
-mutation) bypasses StaticCache: the hooks read mutating state per step,
-which CUDA-graph capture can't track without recapture overhead.  The
-eligibility check lives at the steering layer, not here.
+The cache pass-through itself (sizing, per-step ``cache_position``) happens at
+the call sites; the policy lives here so the eager path stays uncluttered.
+Callers keep an identity-stable cache, reset it between generations, and grow it
+only when ``prompt_len + max_new_tokens + cache_position_offset`` exceeds its
+capacity; an unsupported model falls back transparently to DynamicCache.
+
+Steering eligibility is decided at the steering layer, not here
+(``SteeringManager.all_fast_path`` / ``static_steerable``): curved, gated, and
+phase-triggered hooks read mutating per-step state, so they route to the eager
+DynamicCache path.
 """
 from __future__ import annotations
 
@@ -76,9 +82,9 @@ def is_static_cache_supported(
     not require CUDA.  StaticCache (pre-allocated, fixed-shape K/V) is the
     enabler for ``torch.compile`` on *any* backend: fixed kernel shapes across
     the decode loop let inductor reuse one trace instead of re-specializing as a
-    ``DynamicCache`` grows.  On MPS the fixed-shape benefit is real (measured
-    ~+16% eager, and it unlocks the ~1.7x ``compile`` win on top), not the
-    "negligible" the old CUDA-only gate assumed.
+    ``DynamicCache`` grows.  The MPS path calls this directly and pairs it with
+    ``default`` compile mode; the fixed-shape benefit there is real (measured
+    ~+16% eager, and it unlocks the ~1.7x ``compile`` win on top).
 
     Returns ``(supported, reason)``.  Checks: (1) ``StaticCache`` importable
     (transformers ≥ 4.40); (2) it constructs against the model config with a
@@ -208,9 +214,10 @@ def make_static_cache(
     prompt_len + max_new_tokens + cache_position_offset``; sizing too
     tight causes the model to OOM the cache mid-generation.
 
-    Raises whatever the StaticCache constructor raises.  Callers that
-    want graceful fallback should call :func:`is_cuda_graphs_supported`
-    first and check the boolean.
+    Called on **every** StaticCache-eligible backend, not only CUDA.  Raises
+    whatever the StaticCache constructor raises; callers that want graceful
+    fallback probe first — :func:`is_static_cache_supported` on any device,
+    :func:`is_cuda_graphs_supported` when they also need graph capture.
     """
     from transformers import StaticCache
     _patch_static_sliding_mask()
