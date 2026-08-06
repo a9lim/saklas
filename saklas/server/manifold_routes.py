@@ -54,6 +54,14 @@ from saklas.server.native_common import (
     extraction_json_errors,
     refuse_if_busy,
 )
+from saklas.server.response_models import (
+    ManifoldDeleteResponse,
+    ManifoldFitInfo,
+    ManifoldInfo,
+    ManifoldListResponse,
+    ManifoldSearchResponse,
+    RemoteManifoldInfo,
+)
 from saklas.server.sse import ProgressCallback, sse_or_json
 
 log = logging.getLogger("saklas.api")
@@ -303,7 +311,7 @@ def _manifold_json(
     session: SaklasSession,
     *,
     full: bool,
-) -> dict[str, Any]:
+) -> ManifoldInfo:
     """Serialize a :class:`ManifoldFolder` for the wire.
 
     The session-independent fields come straight from
@@ -323,7 +331,7 @@ def _manifold_json(
     ``full`` adds per-node statements and per-tensor fit detail — the
     list route omits both to stay light.
     """
-    out: dict[str, Any] = manifold_summary(mf.folder)
+    out = cast(ManifoldInfo, manifold_summary(mf.folder))
 
     from saklas.io.paths import tensor_filename
 
@@ -436,13 +444,13 @@ def _manifold_json(
                 }
                 for i, label in enumerate(mf.node_labels)
             ]
-        fitted: list[dict[str, Any]] = []
+        fitted: list[ManifoldFitInfo] = []
         for stem in fitted_models:
             try:
                 sc = mf.sidecar(stem)
             except KeyError:
                 continue
-            entry: dict[str, Any] = {
+            entry: ManifoldFitInfo = {
                 "stem": stem,
                 "method": sc.method,
                 "feature_space": sc.feature_space,
@@ -528,7 +536,7 @@ def register_manifold_routes(app: FastAPI) -> None:
     session: SaklasSession = app.state.session
 
     @app.get("/saklas/v1/manifolds")
-    def list_manifolds():
+    def list_manifolds() -> ManifoldListResponse:
         """List every installed manifold with per-session fit status."""
         return {
             "manifolds": [
@@ -538,13 +546,13 @@ def register_manifold_routes(app: FastAPI) -> None:
         }
 
     @app.get("/saklas/v1/manifolds/{namespace}/{name}")
-    def get_manifold(namespace: str, name: str):
+    def get_manifold(namespace: str, name: str) -> ManifoldInfo:
         """One manifold: domain, nodes with statements, per-tensor fit detail."""
         mf = _find_manifold(namespace, name)
         return _manifold_json(mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds", status_code=201)
-    def create_manifold(req: CreateManifoldRequest):
+    def create_manifold(req: CreateManifoldRequest) -> ManifoldInfo:
         """Author a fresh authored manifold artifact on disk.
 
         Writes ``manifold.json`` + the ``nodes/`` corpus.  Returns the
@@ -569,7 +577,9 @@ def register_manifold_routes(app: FastAPI) -> None:
         return body
 
     @app.post("/saklas/v1/manifolds/discover", status_code=201)
-    def create_discover_manifold(req: CreateDiscoverManifoldRequest):
+    def create_discover_manifold(
+        req: CreateDiscoverManifoldRequest,
+    ) -> ManifoldInfo:
         """Author a fresh discover-mode manifold from supplied per-concept corpora.
 
         Nodes carry ``{label, statements}`` only — coords are derived
@@ -600,7 +610,7 @@ def register_manifold_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/manifolds/from-template", status_code=201)
     def create_manifold_from_template_route(
         req: CreateManifoldFromTemplateRequest,
-    ):
+    ) -> ManifoldInfo:
         """Author a discover manifold from an existing template artifact."""
         try:
             folder = create_manifold_from_template(
@@ -622,7 +632,9 @@ def register_manifold_routes(app: FastAPI) -> None:
         return _manifold_json(mf, session, full=True)
 
     @app.get("/saklas/v1/manifolds/search")
-    def search_remote_manifolds(q: str = "", limit: int = 20):
+    def search_remote_manifolds(
+        q: str = "", limit: int = 20,
+    ) -> ManifoldSearchResponse:
         """Search HF for ``saklas-manifold``-tagged repos matching ``q``.
 
         Delegates to :func:`saklas.io.hf_manifolds.search_manifolds` and returns
@@ -642,10 +654,10 @@ def register_manifold_routes(app: FastAPI) -> None:
         if limit and limit > 0:
             rows = rows[: int(limit)]
         # The response echoes the query alongside the rows.
-        return {"query": q, "results": rows}
+        return {"query": q, "results": cast(list[RemoteManifoldInfo], rows)}
 
     @app.post("/saklas/v1/manifolds/merge", status_code=201)
-    async def merge_manifold(req: MergeManifoldRequest):
+    async def merge_manifold(req: MergeManifoldRequest) -> ManifoldInfo:
         """Union N discover-mode manifolds' nodes into a fresh discover folder.
 
         Pools source node corpora into one unfitted discover folder. The next
@@ -696,7 +708,11 @@ def register_manifold_routes(app: FastAPI) -> None:
         mf = _find_manifold(folder.parent.name, folder.name)
         return _manifold_json(mf, session, full=True)
 
-    @app.post("/saklas/v1/manifolds/install", status_code=201)
+    @app.post(
+        "/saklas/v1/manifolds/install",
+        status_code=201,
+        response_model=ManifoldInfo,
+    )
     async def install_remote_manifold(req: InstallManifoldRequest, request: Request):
         """Install a manifold from an HF coord or local folder.
 
@@ -711,7 +727,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         return the manifold-detail JSON shape ``GET
         /saklas/v1/manifolds/{ns}/{name}`` ships.
         """
-        def _install(on_progress: Callable[[str], None]) -> dict[str, Any]:
+        def _install(on_progress: Callable[[str], None]) -> ManifoldInfo:
             folder = install_manifold(
                 req.target,
                 req.as_,
@@ -727,7 +743,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             # callers already parse.
             return _manifold_json(mf, session, full=True)
 
-        async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+        async def _job(on_progress: ProgressCallback) -> ManifoldInfo:
             # Under the session lock in both branches; the gen-lock probe has
             # to run before the worker thread starts writing the folder.
             refuse_if_busy(session)
@@ -750,7 +766,11 @@ def register_manifold_routes(app: FastAPI) -> None:
             logger=log,
         )
 
-    @app.post("/saklas/v1/manifolds/generate", status_code=201)
+    @app.post(
+        "/saklas/v1/manifolds/generate",
+        status_code=201,
+        response_model=ManifoldInfo,
+    )
     async def generate_manifold(req: GenerateManifoldRequest, request: Request):
         """LLM-author a discover-mode manifold from a flat concept list (A2).
 
@@ -784,7 +804,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             node_roles_map = {c: c for c in req.concepts}
         node_kinds_map: dict[str, str | None] = {c: req.kind for c in req.concepts}
 
-        def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
+        def _gen(on_progress: Callable[[str], None]) -> ManifoldInfo:
             # ``force`` is a clean slate; the default *resumes* — fill missing
             # nodes + append any concepts new to the roster.
             try:
@@ -817,7 +837,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             body["done"] = True
             return body
 
-        async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+        async def _job(on_progress: ProgressCallback) -> ManifoldInfo:
             return await asyncio.to_thread(_gen, on_progress)
 
         def _format_error(e: Exception) -> dict[str, Any] | None:
@@ -851,7 +871,7 @@ def register_manifold_routes(app: FastAPI) -> None:
     @app.patch("/saklas/v1/manifolds/{namespace}/{name}")
     async def update_manifold(
         namespace: str, name: str, req: UpdateManifoldRequest,
-    ):
+    ) -> ManifoldInfo:
         """Re-author a manifold's description and/or node corpus.
 
         Held under the session lock so a node-corpus rewrite cannot race
@@ -889,7 +909,9 @@ def register_manifold_routes(app: FastAPI) -> None:
         return _manifold_json(mf, session, full=True)
 
     @app.delete("/saklas/v1/manifolds/{namespace}/{name}")
-    async def delete_manifold(namespace: str, name: str):
+    async def delete_manifold(
+        namespace: str, name: str,
+    ) -> ManifoldDeleteResponse:
         """Remove a manifold folder.
 
         Delegates the actual removal to
@@ -917,15 +939,21 @@ def register_manifold_routes(app: FastAPI) -> None:
             refuse_if_busy(session)
             _evict_manifold(session, namespace, name)
             try:
-                return await asyncio.to_thread(
-                    remove_manifold_folder, namespace, name,
+                return cast(
+                    ManifoldDeleteResponse,
+                    await asyncio.to_thread(
+                        remove_manifold_folder, namespace, name,
+                    ),
                 )
             except FileNotFoundError as e:
                 # Lost a race with another delete between the pre-lock
                 # existence check and acquiring the lock.
                 raise HTTPException(404, str(e)) from e
 
-    @app.post("/saklas/v1/manifolds/{namespace}/{name}/fit")
+    @app.post(
+        "/saklas/v1/manifolds/{namespace}/{name}/fit",
+        response_model=ManifoldInfo,
+    )
     async def fit_manifold(
         namespace: str, name: str, req: FitManifoldRequest, request: Request,
     ):
@@ -941,7 +969,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         if not (folder / "manifold.json").exists():
             raise HTTPException(404, f"manifold {namespace}/{name} not found")
 
-        def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
+        def _fit(on_progress: Callable[[str], None]) -> ManifoldInfo:
             manifold = session.fit(
                 folder, sae=req.sae,
                 layers=req.layers,
@@ -958,7 +986,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             body["feature_space"] = manifold.feature_space
             return body
 
-        async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+        async def _job(on_progress: ProgressCallback) -> ManifoldInfo:
             return await asyncio.to_thread(_fit, on_progress)
 
         return await sse_or_json(

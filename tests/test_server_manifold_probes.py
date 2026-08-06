@@ -39,6 +39,45 @@ from tests._fakes import make_mock_session
 from tests._generation_stream import TestGenerationStream
 
 
+def manifold_json_stub(namespace: str, name: str, **extra: Any) -> dict[str, Any]:
+    """A complete ``ManifoldInfo`` body for routes that stub ``_manifold_json``.
+
+    The manifold routes declare a response schema, so a stub that carried
+    only the two or three keys a test asserts on is now a
+    ``ResponseValidationError`` — which is the point: a double that cannot
+    produce the contract is testing a shape the server cannot emit.  This
+    is the minimum complete body; tests layer their assertions on top via
+    ``extra``.
+    """
+    body: dict[str, Any] = {
+        "namespace": namespace,
+        "name": name,
+        "description": "",
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
+        "fit_mode": "pca",
+        "is_discover": True,
+        "domain": {},
+        "domain_label": "discover-pca",
+        "intrinsic_dim": 0,
+        "min_nodes": None,
+        "node_count": 0,
+        "node_labels": [],
+        "node_coords": [],
+        "node_roles": [],
+        "node_kinds": [],
+        "hyperparams": {},
+        "fitted_models": [],
+        "tensor_variants": {},
+        "fitted_for_session": False,
+        "stale": False,
+        "resolved_fit_mode": None,
+    }
+    body.update(extra)
+    return body
+
+
 def _single_run(**kwargs: Any) -> RunSet:
     return RunSet([GenerationResult(**kwargs)])
 
@@ -360,11 +399,9 @@ class TestManifoldCrudRoutes:
         )
         monkeypatch.setattr(
             "saklas.server.manifold_routes._manifold_json",
-            lambda mf, sess, *, full=False: {
-                "namespace": mf.folder.parent.name,
-                "name": mf.name,
-                "fit_mode": "pca",
-            },
+            lambda mf, sess, *, full=False: manifold_json_stub(
+                mf.folder.parent.name, mf.name, fit_mode="pca",
+            ),
         )
 
         resp = client.post(
@@ -380,11 +417,9 @@ class TestManifoldCrudRoutes:
             },
         )
         assert resp.status_code == 201
-        assert resp.json() == {
-            "namespace": "local",
-            "name": "combined",
-            "fit_mode": "pca",
-        }
+        assert resp.json() == manifold_json_stub(
+            "local", "combined", fit_mode="pca",
+        )
         # Inner call shape: target identity, source tuples, fit_mode
         # ride through unchanged.
         assert captured["args"] == ("local", "combined", "fold heap")
@@ -450,11 +485,9 @@ class TestManifoldCrudRoutes:
         )
         monkeypatch.setattr(
             "saklas.server.manifold_routes._manifold_json",
-            lambda mf, sess, *, full=False: {
-                "namespace": mf.folder.parent.name,
-                "name": mf.name,
-                "fitted": [],
-            },
+            lambda mf, sess, *, full=False: manifold_json_stub(
+                mf.folder.parent.name, mf.name, fitted=[],
+            ),
         )
 
         resp = client.post(
@@ -462,11 +495,7 @@ class TestManifoldCrudRoutes:
             json={"target": "a9lim/personas"},
         )
         assert resp.status_code == 201
-        assert resp.json() == {
-            "namespace": "local",
-            "name": "personas",
-            "fitted": [],
-        }
+        assert resp.json() == manifold_json_stub("local", "personas", fitted=[])
 
     def test_install_route_streams_progress_over_sse(
         self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,

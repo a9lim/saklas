@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Generate ``webui/src/lib/types.gen.ts`` from the server's OpenAPI schema.
+
+The dashboard's REST types used to be hand-mirrored from the route
+serializers, which is exactly the kind of contract that drifts silently: a
+route grows a key, nobody edits ``types.ts``, and the panel that needed it
+renders a blank.  This script closes the loop — the FastAPI app is the
+single authority, and the TypeScript is a build artifact of its schema.
+
+Usage::
+
+    python scripts/generate_webui_types.py            # write the file
+    python scripts/generate_webui_types.py --check    # fail on drift
+    python scripts/generate_webui_types.py --stdout   # print, write nothing
+
+``--check`` is what CI and ``tests/test_webui_types_parity.py`` run: it
+regenerates in memory and diffs against the committed file, so an unmirrored
+route change fails the build instead of the dashboard.
+
+Scope.  Only the **response** schemas of the native ``/saklas/v1/*`` tree are
+rendered, plus everything they transitively reference.  Request bodies stay
+hand-written: they are pydantic models with ``extra="forbid"``, so a drifted
+request fails loudly with a 400 at runtime, whereas a drifted *response* is
+silent.  The streaming surfaces (SSE progress frames, the WebSocket frame
+vocabulary) are not OpenAPI-describable and also stay in ``types.ts``.
+
+The app is built against a stub session — no model load, no network — so
+this runs anywhere the package imports.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT = REPO_ROOT / "webui" / "src" / "lib" / "types.gen.ts"
+
+#: Only responses under this prefix are rendered.  The OpenAI and Ollama
+#: compat protocols have their own client ecosystems and no dashboard
+#: consumer; the dashboard speaks the native tree.
+NATIVE_PREFIX = "/saklas/v1/"
+
+#: Schema component → TypeScript interface name, for the shapes whose Python
+#: name is the engine's own vocabulary rather than the dashboard's.  Renaming
+#: the engine types to match the frontend would be the tail wagging the dog;
+#: this table is the seam instead.  Everything else is emitted under its
+#: schema name, which is why ``server/response_models.py`` names its
+#: TypedDicts exactly as the dashboard imports them.
+SCHEMA_RENAMES: dict[str, str] = {
+    "Measurements": "MeasurementsEnvelopeJSON",
+    "MeasurementsEnvelope": "MeasurementsReplayJSON",
+    "Instruments": "MeasurementInstrumentsJSON",
+    "GeometryChannel": "GeometryInstrumentJSON",
+    "LensChannel": "LensInstrumentJSON",
+    "SaeChannel": "SaeInstrumentJSON",
+    "MeasurementBinding": "MeasurementBindingJSON",
+    "LensReadout": "LensReadoutBlockJSON",
+    "LensReadoutLayer": "LensReadoutLayerJSON",
+    "LensReadoutToken": "LensReadoutTokenJSON",
+    "LensAggregateToken": "LensAggregateTokenJSON",
+    "SaeReadout": "SaeReadoutBlockJSON",
+    "SaeFeature": "SaeFeatureJSON",
+    "ProbeReadingDict": "ProbeReadingJSON",
+    "ScalarReadingDict": "ScalarReadingJSON",
+    "DepthSummaryDict": "DepthSummaryJSON",
+}
+
+#: ``(TS interface, property) → TS type`` escapes, for payloads the server
+#: deliberately keeps opaque.  Each one names a shape whose *producer* is not
+#: a response model: an open loom token row, a per-method diagnostics block.
+#: Declaring them precisely in Python would mean running thousands of
+#: engine-owned records through response validation on every fetch — a cost
+#: and a rejection risk — so the type is asserted here and the hand-written
+#: declaration stays in ``types.ts``.
+PROPERTY_OVERRIDES: dict[tuple[str, str], str] = {
+    ("LoomNodeJSON", "tokens"): "LoomTokenRowJSON[] | null",
+    ("LoomNodeJSON", "thinking_tokens"): "LoomTokenRowJSON[] | null",
+    ("LoomNodeDetailJSON", "tokens"): "LoomTokenRowJSON[] | null",
+    ("LoomNodeDetailJSON", "thinking_tokens"): "LoomTokenRowJSON[] | null",
+    ("ManifoldFitInfo", "diagnostics"):
+        "ManifoldPcaDiagnostics | ManifoldSpectralDiagnostics",
+    ("ManifoldFitInfo", "hyperparams"): "Record<string, number | string>",
+    ("ManifoldInfo", "hyperparams"): "Record<string, number | string>",
+    ("ManifoldInfo", "domain"): "ManifoldDomain",
+    # An unfitted discover probe has no geometry yet, so its domain is the
+    # empty object rather than a tagged member of the union.
+    ("GeometryProbeInfo", "domain"): "ManifoldDomain | Record<string, never>",
+}
+
+#: Names the overrides pull back in from the hand-written module.  The import
+#: is type-only, so the runtime module graph stays acyclic even though
+#: ``types.ts`` re-exports this file.
+EXTERNAL_IMPORTS: tuple[str, ...] = (
+    "LoomTokenRowJSON",
+    "ManifoldDomain",
+    "ManifoldPcaDiagnostics",
+    "ManifoldSpectralDiagnostics",
+)
+
+BANNER = """\
+// DO NOT EDIT — generated by scripts/generate_webui_types.py from the
+// FastAPI app's OpenAPI schema.  Run that script (or `npm run gen:types`)
+// after changing a native `/saklas/v1/*` response shape; CI regenerates and
+// fails on a diff.
+//
+// These are the REST response shapes only.  Request bodies, the WebSocket
+// frame vocabulary, and the dashboard's own client-local types are
+// hand-written in `./types`, which re-exports everything below — import from
+// `./types`, never from here.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Schema → TypeScript
+# ---------------------------------------------------------------------------
+
+def build_schema() -> dict[str, Any]:
+    """Build the FastAPI app against a stub session and return its schema."""
+    from saklas.server import create_app
+
+    app = create_app(MagicMock(), default_steering=None)
+    return app.openapi()
+
+
+def ref_name(ref: str) -> str:
+    return ref.rsplit("/", 1)[-1]
+
+
+def ts_name(schema_name: str) -> str:
+    return SCHEMA_RENAMES.get(schema_name, schema_name)
+
+
+def collect_response_refs(schema: dict[str, Any]) -> set[str]:
+    """Every component reachable from a native route's success response."""
+    seeds: set[str] = set()
+    for path, ops in schema.get("paths", {}).items():
+        if not path.startswith(NATIVE_PREFIX):
+            continue
+        for op in ops.values():
+            if not isinstance(op, dict):
+                continue
+            for status, response in (op.get("responses") or {}).items():
+                if not str(status).startswith("2"):
+                    continue
+                body = (response.get("content") or {}).get("application/json")
+                if body and "schema" in body:
+                    seeds |= _refs_in(body["schema"])
+    return _close_over_refs(schema, seeds)
+
+
+def _refs_in(node: Any) -> set[str]:
+    """Every ``$ref`` component name appearing anywhere under ``node``."""
+    found: set[str] = set()
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            found.add(ref_name(ref))
+        for value in node.values():
+            found |= _refs_in(value)
+    elif isinstance(node, list):
+        for item in node:
+            found |= _refs_in(item)
+    return found
+
+
+def _close_over_refs(schema: dict[str, Any], seeds: set[str]) -> set[str]:
+    components = schema.get("components", {}).get("schemas", {})
+    seen: set[str] = set()
+    queue = list(seeds)
+    while queue:
+        name = queue.pop()
+        if name in seen or name not in components:
+            continue
+        seen.add(name)
+        queue.extend(_refs_in(components[name]))
+    return seen
+
+
+def render_type(node: Any, *, owner: str = "", prop: str = "") -> str:
+    """One JSON-Schema node as a TypeScript type expression."""
+    override = PROPERTY_OVERRIDES.get((owner, prop))
+    if override is not None:
+        return override
+    if not isinstance(node, dict) or not node:
+        return "unknown"
+
+    if "$ref" in node:
+        return ts_name(ref_name(node["$ref"]))
+
+    for key in ("anyOf", "oneOf"):
+        if key in node:
+            parts = [render_type(sub, owner=owner, prop=prop) for sub in node[key]]
+            # ``anyOf`` order follows the Python annotation; dedupe but keep it.
+            seen: list[str] = []
+            for part in parts:
+                if part not in seen:
+                    seen.append(part)
+            return " | ".join(seen) if seen else "unknown"
+    if "allOf" in node and len(node["allOf"]) == 1:
+        return render_type(node["allOf"][0], owner=owner, prop=prop)
+
+    if "const" in node:
+        return _literal(node["const"])
+    if "enum" in node:
+        return " | ".join(_literal(v) for v in node["enum"]) or "unknown"
+
+    node_type = node.get("type")
+    if node_type == "string":
+        return "string"
+    if node_type in ("integer", "number"):
+        return "number"
+    if node_type == "boolean":
+        return "boolean"
+    if node_type == "null":
+        return "null"
+    if node_type == "array":
+        prefix = node.get("prefixItems")
+        if prefix:
+            return "[" + ", ".join(
+                render_type(sub, owner=owner, prop=prop) for sub in prefix
+            ) + "]"
+        items = node.get("items")
+        inner = render_type(items, owner=owner, prop=prop) if items else "unknown"
+        return f"({inner})[]" if "|" in inner else f"{inner}[]"
+    if node_type == "object":
+        if "properties" in node:
+            return _inline_object(node, owner=owner, prop=prop)
+        extra = node.get("additionalProperties")
+        if isinstance(extra, dict) and extra:
+            return f"Record<string, {render_type(extra, owner=owner, prop=prop)}>"
+        return "Record<string, unknown>"
+    return "unknown"
+
+
+def _literal(value: Any) -> str:
+    if isinstance(value, str):
+        return f'"{value}"'
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    return str(value)
+
+
+def _inline_object(node: dict[str, Any], *, owner: str, prop: str) -> str:
+    required = set(node.get("required", ()))
+    fields = []
+    for key, sub in node["properties"].items():
+        mark = "" if key in required else "?"
+        fields.append(f"{_key(key)}{mark}: {render_type(sub, owner=owner, prop=prop)}")
+    if node.get("additionalProperties") is True:
+        fields.append("[key: string]: unknown")
+    return "{ " + "; ".join(fields) + " }"
+
+
+_IDENT = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+
+def _key(name: str) -> str:
+    return name if _IDENT.match(name) else f'"{name}"'
+
+
+def jsdoc(text: str | None, indent: str = "") -> list[str]:
+    if not text:
+        return []
+    lines = [line.rstrip() for line in text.strip().splitlines()]
+    if len(lines) == 1:
+        return [f"{indent}/** {lines[0]} */"]
+    out = [f"{indent}/**"]
+    out.extend(f"{indent} * {line}".rstrip() for line in lines)
+    out.append(f"{indent} */")
+    return out
+
+
+def render_interface(name: str, node: dict[str, Any]) -> str:
+    """One named component as an exported interface (or type alias)."""
+    target = ts_name(name)
+    lines = jsdoc(node.get("description"))
+    props = node.get("properties")
+    if props is None:
+        lines.append(f"export type {target} = {render_type(node, owner=target)};")
+        return "\n".join(lines)
+
+    required = set(node.get("required", ()))
+    lines.append(f"export interface {target} {{")
+    for key, sub in props.items():
+        lines.extend(jsdoc(sub.get("description"), "  "))
+        mark = "" if key in required else "?"
+        rendered = render_type(sub, owner=target, prop=key)
+        lines.append(f"  {_key(key)}{mark}: {rendered};")
+    if node.get("additionalProperties") is True:
+        lines.append("  /** Open shape — the producer may carry more than the")
+        lines.append("   *  contract names; unknown keys ride through. */")
+        lines.append("  [key: string]: unknown;")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def generate() -> str:
+    schema = build_schema()
+    components = schema.get("components", {}).get("schemas", {})
+    wanted = collect_response_refs(schema)
+
+    emitted = {ts_name(n): n for n in wanted}
+    duplicates = [n for n in emitted.values() if list(emitted.values()).count(n) > 1]
+    if len(emitted) != len(wanted):
+        raise SystemExit(
+            f"generate_webui_types: schema names collide after rename: {duplicates}"
+        )
+
+    used_external = sorted(
+        name
+        for name in EXTERNAL_IMPORTS
+        if any(name in value for value in PROPERTY_OVERRIDES.values())
+    )
+
+    chunks = [BANNER]
+    if used_external:
+        imports = ",\n  ".join(used_external)
+        chunks.append(
+            "import type {\n  " + imports + ",\n} from \"./types\";\n"
+        )
+    for ts in sorted(emitted):
+        chunks.append(render_interface(emitted[ts], components[emitted[ts]]) + "\n")
+    return "\n".join(chunks)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check", action="store_true",
+        help="fail (exit 1) when the committed file differs from the schema",
+    )
+    parser.add_argument(
+        "--stdout", action="store_true", help="print the result, write nothing",
+    )
+    args = parser.parse_args(argv)
+
+    rendered = generate()
+    if args.stdout:
+        sys.stdout.write(rendered)
+        return 0
+    if args.check:
+        current = OUTPUT.read_text() if OUTPUT.exists() else ""
+        if current != rendered:
+            import difflib
+
+            diff = difflib.unified_diff(
+                current.splitlines(keepends=True),
+                rendered.splitlines(keepends=True),
+                fromfile=f"{OUTPUT.name} (committed)",
+                tofile=f"{OUTPUT.name} (from schema)",
+            )
+            sys.stdout.writelines(diff)
+            print(
+                "\ntypes.gen.ts is out of date — run "
+                "`python scripts/generate_webui_types.py`",
+            )
+            return 1
+        print(f"{OUTPUT.relative_to(REPO_ROOT)} is current")
+        return 0
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT.write_text(rendered)
+    print(f"wrote {OUTPUT.relative_to(REPO_ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
