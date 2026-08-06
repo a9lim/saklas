@@ -1327,6 +1327,32 @@ class TestManifoldRoutes:
         assert client.get(
             "/saklas/v1/manifolds/local/ghost").status_code == 404
 
+    def test_authored_node_label_resolves_without_restart(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        """A dashboard-authored manifold must steer in the same serve process.
+
+        ``saklas serve`` is long-lived, so a resolver index warmed before the
+        POST would otherwise hide the new node labels until restart — the
+        one-command-one-process CLI shape hides this entirely.
+        """
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        _session, client = session_and_client
+        from saklas.io import selectors
+
+        selectors.invalidate()
+        assert selectors.resolve_manifold_label("afraid") is None  # warms it
+
+        assert client.post(
+            "/saklas/v1/manifolds", json=_box1d_payload(),
+        ).status_code == 201
+
+        hit = selectors.resolve_manifold_label("afraid")
+        assert hit is not None and hit.manifold_key == "local/mood"
+
+        assert client.delete("/saklas/v1/manifolds/local/mood").status_code == 200
+        assert selectors.resolve_manifold_label("afraid") is None
+
     def test_delete_refuses_when_busy(self, session_and_client: Any, tmp_path: Any,
                                       monkeypatch: Any) -> None:
         # A fit thread holding the engine gen-lock must block a delete —

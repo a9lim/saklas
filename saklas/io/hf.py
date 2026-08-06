@@ -1,12 +1,13 @@
-"""Shared Hugging Face Hub primitives.
+"""Shared Hugging Face Hub primitives — the single HF seam for :mod:`saklas.io`.
 
-After the 4.0 collapse this module is just the generic HF surface the manifold
-distribution path (:mod:`saklas.io.hf_manifolds`) and ``manifold push`` build
-on: the snapshot/file download indirections (monkeypatchable in tests), the
-``HFError`` type, the ``owner/name@revision`` splitter, and the push-coord
-resolver.  All pack-shaped distribution (``pull_pack`` / ``push_pack`` /
-``search_packs`` / ``fetch_info`` / the synthesized-pack install path) is gone —
-manifolds own distribution now.
+Every Hub call in the package routes through the three indirections here
+(``_hf_snapshot_download`` / ``_hf_hub_download`` / ``_hf_api``): manifold
+distribution (:mod:`saklas.io.hf_manifolds`) and the external J-lens source
+registry (:mod:`saklas.io.lens_sources`) both import them under these exact
+names, so a test monkeypatching ``<module>._hf_hub_download`` blocks the
+network on either path.  New HF work belongs here, not in a second local
+copy.  Also owns the ``HFError`` type, the ``owner/name@revision`` splitter,
+and the push-coord resolver.
 """
 from __future__ import annotations
 
@@ -35,18 +36,26 @@ def split_revision(target: str) -> tuple[str, Optional[str]]:
     return coord, rev
 
 
-def _hf_snapshot_download(repo_id: str, **kwargs: Any) -> str:
+def _hf_snapshot_download(
+    repo_id: str, *, repo_type: str = "model", **kwargs: Any,
+) -> str:
     """Thin indirection so tests can monkeypatch."""
     from huggingface_hub import snapshot_download
-    return snapshot_download(repo_id=repo_id, repo_type="model", **kwargs)
+    return snapshot_download(repo_id=repo_id, repo_type=repo_type, **kwargs)
 
 
-def _hf_hub_download(repo_id: str, filename: str, **kwargs: Any) -> str:
+def _hf_hub_download(
+    repo_id: str, filename: str, *, repo_type: str = "model", **kwargs: Any,
+) -> str:
+    """Thin indirection so tests can monkeypatch."""
     from huggingface_hub import hf_hub_download
-    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type="model", **kwargs)
+    return hf_hub_download(
+        repo_id=repo_id, filename=filename, repo_type=repo_type, **kwargs,
+    )
 
 
 def _hf_api():
+    """Thin indirection so tests can monkeypatch."""
     from huggingface_hub import HfApi
     return HfApi()
 

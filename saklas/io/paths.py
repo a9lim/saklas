@@ -28,7 +28,6 @@ _VARIANT_SEPARATORS: tuple[tuple[str, str], ...] = (
     (_VARIANT_SEP_SAE, "sae"),
     (_VARIANT_SEP_FROM, "from"),
 )
-_UNSAFE_VARIANT_CHARS = re.compile(r"[^a-z0-9._-]+")
 
 
 def encode_release_id(release: str) -> str:

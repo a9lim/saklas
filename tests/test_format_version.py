@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from saklas.io.packs import PROFILE_FORMAT_VERSION
+from saklas.io.integrity import PROFILE_FORMAT_VERSION
 from saklas.core.profile import Profile, ProfileError
 from saklas.core.profile import load_profile, save_profile
 

@@ -40,7 +40,6 @@ from saklas.core.generation import (
 )
 from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.naming import BIPOLAR_SEP, _slug, canonical_concept_name
-from saklas.io import selectors as _selectors
 from saklas.core.token_callback import (
     StepTokenCallback,
     TokenCallback,
@@ -1305,29 +1304,21 @@ class SaklasSession:
         self._trait_queues: list[tuple[Any, ...]] = []
         self._trait_lock = threading.Lock()
 
-        # Ensure bundled concepts are materialized in the user cache and
-        # the selector cache reflects them.  ``_bootstrap_manifold_probes``
-        # does this transitively via ``load_default_manifolds``, but is
-        # skipped entirely when
-        # ``probes=[]`` — leaving freshly-added bundled concepts (e.g. via
-        # updating package-data bundled manifolds) invisible to the selector
-        # layer for the rest of the session.  Calling explicitly here keeps
-        # the invariant intact regardless of probe-loading config; the call
-        # is cheap when up-to-date (format-version short-circuit).  Bundled
-        # concepts and manifolds (e.g. ``happy.sad``, ``personas``) all
-        # materialize in the same pre-invalidate window so the bare-name
-        # resolver picks up every bundled node label.
-        from saklas.io.manifolds import (
-            materialize_bundled_manifolds as _materialize_bundled_manifolds,
-        )
-        from saklas.io.templates import (
-            materialize_bundled_templates as _materialize_bundled_templates,
-        )
-        # Templates first: a bundled manifold may ``template_ref`` a bundled
-        # ``default/<name>`` template, and its fit resolves that ref.
-        _materialize_bundled_templates()
-        _materialize_bundled_manifolds()
-        _selectors.invalidate()
+        # Ensure bundled concepts are materialized in the user cache and the
+        # selector index reflects them.  ``_bootstrap_manifold_probes`` does
+        # this transitively via ``load_default_manifolds``, but is skipped
+        # entirely when ``probes=[]`` — leaving freshly-added bundled concepts
+        # (e.g. via updating package-data bundled manifolds) invisible to the
+        # selector layer for the rest of the session.  Calling explicitly here
+        # keeps the invariant intact regardless of probe-loading config; the
+        # call is cheap when up-to-date (per-home process guard).  The io
+        # entry point owns the templates-before-manifolds ordering (a bundled
+        # manifold may ``template_ref`` a bundled ``default/<name>`` template,
+        # and its fit resolves that ref) and drops the stale selector index
+        # itself, so the bare-name resolver sees every bundled node label.
+        from saklas.io.bootstrap import materialize_bundled_artifacts
+
+        materialize_bundled_artifacts()
 
         # Bootstrap probes
         probe_categories = PROBE_CATEGORIES if probes is None else probes

@@ -401,7 +401,7 @@ def _capture_pending_path(
 def _capture_pointer_sha256(path: pathlib.Path) -> str | None:
     if not path.exists():
         return None
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     return hash_file(path)
 
@@ -509,7 +509,7 @@ def _capture_generation_is_complete(
             or key not in centroid_shapes
         ):
             return False
-    from saklas.io.packs import verify_integrity
+    from saklas.io.integrity import verify_integrity
 
     if files and not verify_integrity(capture_dir, files)[0]:
         return False
@@ -1055,11 +1055,11 @@ def _base_fit_metadata(
 
     Shared by the monopolar early branch and the general fit tail so a new
     provenance key lands on both.  Their remaining divergence is exactly two
-    entries — the monopolar fold keeps the raw δ̂ basis, so it passes
+    entry — the monopolar fold keeps the raw δ̂ basis, so it passes
     ``subspace_metric="euclidean"`` (a basis *label*: ``concept − ν`` cancels
-    common-mode by differencing, like DiM, so no whitened-PCA selection ran)
-    and adds ``monopolar: True`` on top of this dict.  The share is always
-    Mahalanobis; the whitener gate upstream guarantees it.
+    common-mode by differencing, like DiM, so no whitened-PCA selection ran;
+    ``method="manifold_monopolar"`` carries the branch identity).  The share
+    is always Mahalanobis; the whitener gate upstream guarantees it.
     """
     metadata: dict[str, Any] = {
         "method": method,
@@ -1750,7 +1750,7 @@ class ManifoldExtractionPipeline:
         if not force and not _verified_cache_miss:
             from saklas.io.manifold_tensors import _load_manifold_locked
             from saklas.io.manifold_folder import manifold_pair_lock
-            from saklas.io.packs import verify_integrity
+            from saklas.io.integrity import verify_integrity
 
             # Clear/rm/refresh take the folder lock and then this same stable
             # pair lock.  The fast path deliberately takes only the pair lock:
@@ -2011,7 +2011,7 @@ class ManifoldExtractionPipeline:
         if cache_meta is not None and cache_meta.exists():
             try:
                 from saklas.io.manifold_tensors import ActivationRowStore
-                from saklas.io.packs import verify_integrity
+                from saklas.io.integrity import verify_integrity
 
                 with open(cache_meta) as handle:
                     meta = json.load(handle)
@@ -2389,7 +2389,6 @@ class ManifoldExtractionPipeline:
                 any_role=any_role,
                 any_kind=any_kind,
             )
-            metadata["monopolar"] = True
             return self._publish_and_emit(
                 folder,
                 expected_revision=_authoring_revision or nodes_sha,

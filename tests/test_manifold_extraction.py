@@ -1120,10 +1120,10 @@ def test_concurrent_deferred_row_topups_merge_latest_pointer(
 def test_row_cache_uses_layer_digests_without_container_rehash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from saklas.io import packs
+    from saklas.io import integrity
     from saklas.io.paths import model_dir
 
-    real_hash_file = packs.hash_file
+    real_hash_file = integrity.hash_file
     hashed: list[Path] = []
 
     def _tracked_hash(path: Path) -> str:
@@ -1133,7 +1133,7 @@ def test_row_cache_uses_layer_digests_without_container_rehash(
             raise AssertionError("row shard was redundantly whole-file hashed")
         return real_hash_file(resolved)
 
-    monkeypatch.setattr(packs, "hash_file", _tracked_hash)
+    monkeypatch.setattr(integrity, "hash_file", _tracked_hash)
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
     pipe.fit(folder)

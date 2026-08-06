@@ -1,15 +1,13 @@
 """Shared artifact primitives: name validation, integrity, and profile versioning.
 
-The 4.0 collapse retired the pack *format/distribution* surface
-(``PackMetadata`` / ``ConceptFolder`` / ``Sidecar`` / ``enumerate_variants`` /
-``materialize_bundled`` / HF pack distribution) — concepts are manifolds now
-(:mod:`saklas.io.manifolds`).  What remains here is the cross-cutting
-infrastructure several layers still share:
+The cross-cutting infrastructure every artifact family in :mod:`saklas.io`
+shares:
 
-- ``NAME_REGEX`` — the artifact-name grammar (manifolds reuse it);
+- ``NAME_REGEX`` — the artifact-name grammar.  Manifolds, selectors, templates,
+  and the local lens/SAE source names all validate against this one pattern;
 - ``hash_file`` / ``verify_integrity`` — the sha256
-  integrity helpers (the neutral/layer-means/alignment caches + the manifold
-  format's own integrity manifest build on these);
+  integrity helpers (the neutral/alignment caches, the lens shard sidecars, and
+  the manifold format's own integrity manifest build on these);
 - ``PROFILE_FORMAT_VERSION`` — the current profile sidecar version written by
   :func:`saklas.core.profile.save_profile`.
 """

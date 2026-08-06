@@ -208,7 +208,7 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import saklas.io.lens as lens_io
-    from saklas.io import packs
+    from saklas.io import integrity
 
     real_save = lens_io._save_fp32_square_safetensors_atomic
     writes = 0
@@ -222,14 +222,14 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     monkeypatch.setattr(
         lens_io, "_save_fp32_square_safetensors_atomic", _counting_save,
     )
-    real_hash = packs.hash_file
+    real_hash = integrity.hash_file
 
     def _counting_hash(path: Path) -> str:
         nonlocal hashes
         hashes += 1
         return real_hash(path)
 
-    monkeypatch.setattr(packs, "hash_file", _counting_hash)
+    monkeypatch.setattr(integrity, "hash_file", _counting_hash)
     fitted = _StubSession().fit_jlens(
         _PROMPTS[:2], force=True, checkpoint_every=2,
     )
@@ -1787,7 +1787,7 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
 ) -> None:
     import saklas.core.jlens as jlens_mod
     import saklas.io.lens as lens_io
-    from saklas.io import packs
+    from saklas.io import integrity
 
     full = _StubSession().fit_jlens(
         _PROMPTS, force=True, source_layers=[0, 1],
@@ -1817,14 +1817,14 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
     real_save = lens_io.save_lens
     reused: list[set[int]] = []
     hashes = 0
-    real_hash = packs.hash_file
+    real_hash = integrity.hash_file
 
     def _count_hash(path: Path) -> str:
         nonlocal hashes
         hashes += 1
         return real_hash(path)
 
-    monkeypatch.setattr(packs, "hash_file", _count_hash)
+    monkeypatch.setattr(integrity, "hash_file", _count_hash)
 
     def _capture_reuse(*args: Any, **kwargs: Any) -> Any:
         reused.append(set(kwargs.get("reuse_layers") or ()))

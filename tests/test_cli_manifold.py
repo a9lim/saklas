@@ -4,7 +4,7 @@ Parser shape + runner dispatch for the parity verbs added alongside the
 fit/discover/generate/ls/show block: install / search / merge / push /
 rm / clear / refresh / transfer, plus the ``ls -v`` and ``show -j``
 changes.  The io-layer backends are mocked the way ``test_cli_flags``
-mocks ``cache_ops`` / ``hf`` — these tests exercise the CLI plumbing
+mocks the io lifecycle / HF layer — these tests exercise the CLI plumbing
 (arg parsing, runner→backend call shape, output idioms), not the
 backends themselves (those live in ``test_manifolds_io`` /
 ``test_hf``).
@@ -134,7 +134,7 @@ def _materialize_bundles_for_cli_test(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    monkeypatch.setattr("saklas.io.manifolds._materialized_this_process", False)
+    monkeypatch.setattr("saklas.io.manifolds._materialized_home", None)
     from saklas.io import selectors
     from saklas.io.manifolds import materialize_bundled_manifolds
     selectors.invalidate()
@@ -1785,13 +1785,18 @@ def test_run_manifold_show_json_uses_summary_keys(monkeypatch: pytest.MonkeyPatc
 
 
 def test_run_manifold_show_json_matches_summary_helper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    """CLI ``show -j`` output is byte-equivalent to ``manifold_summary``."""
+    """CLI ``show -j`` output is byte-equivalent to ``manifold_summary``.
+
+    ``show`` is an inspection surface, so it opts into the per-tensor
+    ``fitted`` block; the light listing surfaces do not.
+    """
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = _author_circumplex_lite(tmp_path)
     from saklas.io import selectors
     selectors.invalidate()
     from saklas.io.manifolds import manifold_summary
-    expected = manifold_summary(folder)
+    expected = manifold_summary(folder, include_fits=True)
+    assert "fitted" in expected
     cli.main(["pack", "show", "local/moodlite", "-j"])
     out = capsys.readouterr().out
     assert _json.loads(out) == expected

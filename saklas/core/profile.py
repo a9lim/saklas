@@ -104,7 +104,7 @@ def _validate_profile_sidecar(
     method = data["method"]
     if method not in _PROFILE_METHODS:
         raise ProfileError(f"profile sidecar has invalid method {method!r}")
-    from saklas.io.packs import PROFILE_FORMAT_VERSION
+    from saklas.io.integrity import PROFILE_FORMAT_VERSION
 
     if (
         isinstance(data["format_version"], bool)
@@ -191,7 +191,7 @@ def save_profile(
     tensor_digest = hashlib.sha256(tensor_bytes).hexdigest()
 
     from saklas import __version__ as _saklas_version
-    from saklas.io.packs import PROFILE_FORMAT_VERSION
+    from saklas.io.integrity import PROFILE_FORMAT_VERSION
 
     sidecar: dict[str, Any] = {
         "format_version": PROFILE_FORMAT_VERSION,

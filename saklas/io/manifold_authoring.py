@@ -37,8 +37,11 @@ from saklas.io.manifold_folder import (
     min_nodes,
 )
 from saklas.core.manifold import domain_from_spec
-from saklas.io.packs import NAME_REGEX
+from saklas.io.integrity import NAME_REGEX
 from saklas.io.paths import manifold_dir, manifolds_dir
+# Every authoring entry point that changes the installed manifold roster drops
+# the resolver's memoized walks itself — callers carry no invalidation duty.
+from saklas.io.selectors import invalidate as invalidate_selector_index
 
 
 def _lock_namespace_name(func: Any) -> Any:
@@ -283,6 +286,7 @@ def create_manifold_folder(
         "template_ref": None,
     }
     write_json_atomic(folder / "manifold.json", payload)
+    invalidate_selector_index()
 
     _, advisories = _load_with_advisories(folder)
     return folder, advisories
@@ -532,6 +536,7 @@ def _create_discover_manifold_folder(
         "template_ref": template_ref,
     }
     write_json_atomic(folder / "manifold.json", payload)
+    invalidate_selector_index()
     return folder
 
 
@@ -619,6 +624,7 @@ def create_baked_manifold_folder(
     if not manifest_path.exists():
         folder.mkdir(parents=True, exist_ok=True)
         write_json_atomic(manifest_path, payload)
+        invalidate_selector_index()
 
     save_baked_manifold_tensor(
         folder, manifold, model_id, method=method, components=components,
@@ -643,7 +649,7 @@ def _recoverable_baked_first_publication(
     """Whether ``folder`` is the interrupted first write of this baked target."""
 
     from saklas.io.manifold_folder import manifold_folder_tensor_paths
-    from saklas.io.packs import verify_integrity
+    from saklas.io.integrity import verify_integrity
     from saklas.io.paths import parse_tensor_filename, tensor_filename
 
     try:
@@ -824,6 +830,7 @@ def init_discover_manifold_folder(
         "template_ref": None,
     }
     write_json_atomic(folder / "manifold.json", payload)
+    invalidate_selector_index()
     return folder
 
 
@@ -862,6 +869,10 @@ def append_discover_manifold_node(
         nodes_dir / _node_filename(index, label),
         [str(s) for s in statements],
     )
+    # A skeleton with missing corpus files does not load, so
+    # ``iter_manifold_folders`` skips it — the node that completes the corpus
+    # is what makes the whole manifold discoverable.
+    invalidate_selector_index()
 
 
 def _discover_manifest_payload(
@@ -994,6 +1005,7 @@ def plan_discover_generation(
                 kinds_resolved, tags,
             ),
         )
+        invalidate_selector_index()
         return DiscoverGenerationPlan(
             folder=folder,
             index_of={label: i for i, label in enumerate(labels)},
@@ -1124,6 +1136,7 @@ def plan_discover_generation(
             for label in full_labels
         ]
         write_json_atomic(meta_path, data)
+        invalidate_selector_index()
     else:
         changed = False
         if data.get("description") != description:
@@ -1134,6 +1147,7 @@ def plan_discover_generation(
             changed = True
         if changed:
             write_json_atomic(meta_path, data)
+            invalidate_selector_index()
 
     nodes_dir.mkdir(exist_ok=True)
     index_of = {label: i for i, label in enumerate(full_labels)}
@@ -1323,5 +1337,6 @@ def update_manifold_folder(
         mf.node_roles = [entry.get("role") for entry in nodes]
         mf.node_kinds = [entry.get("kind") for entry in nodes]
     mf.write_metadata()
+    invalidate_selector_index()
     _, advisories = _load_with_advisories(folder)
     return folder, advisories

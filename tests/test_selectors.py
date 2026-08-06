@@ -424,3 +424,189 @@ def test_bare_atom_cross_manifold_label_collision_raises(
     sel.invalidate()
     with pytest.raises(sel.AmbiguousSelectorError):
         sel.resolve_bare_atom("pirate")
+
+
+# ---------------------------------------------------------------------------
+# io mutators own their own invalidation
+# ---------------------------------------------------------------------------
+#
+# In a one-command-one-process CLI run a stale resolver index is invisible: the
+# process exits before anything re-resolves. In a long-lived ``saklas serve``
+# process it is not — a dashboard-authored manifold's node labels would not
+# resolve until restart. These pin that every io entry point which changes the
+# installed roster drops the index itself, with no caller-side help.
+
+
+def _warm_index() -> None:
+    """Populate the memoized walk so a stale entry would be observable."""
+    sel.invalidate()
+    assert sel.all_concepts() is not None
+
+
+def test_create_discover_folder_invalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _warm_index()
+    _mk_nodes("local", "personas", ["pirate", "wizard"])
+    # No ``sel.invalidate()`` here — that is the point.
+    hit = sel.resolve_manifold_label("pirate")
+    assert hit is not None and hit.manifold_key == "local/personas"
+
+
+def test_create_authored_folder_invalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import create_manifold_folder
+
+    _warm_index()
+    create_manifold_folder(
+        "local", "mood", "d",
+        {"type": "box",
+         "axes": [{"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]},
+        [
+            {"label": "calm", "coords": [0.0], "statements": ["calm."]},
+            {"label": "mid", "coords": [0.5], "statements": ["mid."]},
+            {"label": "afraid", "coords": [1.0], "statements": ["afraid."]},
+        ],
+    )
+    assert sel.resolve_manifold_label("afraid") is not None
+
+
+def test_update_manifold_folder_invalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Re-authoring node labels must not leave the old roster resolvable."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import create_manifold_folder, update_manifold_folder
+
+    domain = {"type": "box",
+              "axes": [{"name": "t", "periodic": False, "lo": 0.0, "hi": 1.0}]}
+    folder, _ = create_manifold_folder(
+        "local", "mood", "d", domain,
+        [
+            {"label": "calm", "coords": [0.0], "statements": ["calm."]},
+            {"label": "mid", "coords": [0.5], "statements": ["mid."]},
+            {"label": "afraid", "coords": [1.0], "statements": ["afraid."]},
+        ],
+    )
+    assert sel.resolve_manifold_label("afraid") is not None
+    update_manifold_folder(folder, nodes=[
+        {"label": "calm", "coords": [0.0], "statements": ["calm."]},
+        {"label": "mid", "coords": [0.5], "statements": ["mid."]},
+        {"label": "furious", "coords": [1.0], "statements": ["furious."]},
+    ])
+    assert sel.resolve_manifold_label("afraid") is None
+    assert sel.resolve_manifold_label("furious") is not None
+
+
+def test_merge_discover_manifolds_invalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import merge_discover_manifolds
+
+    _mk_nodes("local", "a", ["alpha"])
+    _mk_nodes("local", "b", ["beta"])
+    _warm_index()
+    merge_discover_manifolds(
+        "local", "ab", "merged", sources=[("local", "a"), ("local", "b")],
+    )
+    assert "ab" in {c.name for c in sel.all_concepts()}
+    hit = sel.resolve_manifold_name("ab")
+    assert hit is not None and hit.manifold_key == "local/ab"
+
+
+def test_remove_manifold_folder_invalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import remove_manifold_folder
+
+    _mk_nodes("local", "personas", ["pirate", "wizard"])
+    assert sel.resolve_manifold_label("pirate") is not None
+    remove_manifold_folder("local", "personas")
+    assert sel.resolve_manifold_label("pirate") is None
+    assert sel.all_concepts() == []
+
+
+def test_streaming_authoring_path_invalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A skeleton is invisible until its last node corpus lands, then resolves.
+
+    ``init_discover_manifold_folder`` publishes the manifest but the folder
+    does not load until every declared corpus exists, so it is the final
+    ``append_discover_manifold_node`` that makes the manifold discoverable —
+    that call has to drop the index too.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import (
+        append_discover_manifold_node, init_discover_manifold_folder,
+    )
+
+    _warm_index()
+    folder = init_discover_manifold_folder(
+        "local", "streamed", "d", fit_mode="pca", labels=["alpha", "beta"],
+    )
+    assert sel.resolve_manifold_label("alpha") is None
+    append_discover_manifold_node(folder, 0, "alpha", ["alpha statement."])
+    assert sel.resolve_manifold_label("alpha") is None
+    append_discover_manifold_node(folder, 1, "beta", ["beta statement."])
+    assert sel.resolve_manifold_label("alpha") is not None
+
+
+def test_bundled_materialization_invalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A cold resolve before bootstrap must not pin an empty roster."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io import manifolds as manifolds_mod
+    from saklas.io.bootstrap import materialize_bundled_artifacts
+
+    monkeypatch.setattr(manifolds_mod, "_materialized_home", None)
+    sel.invalidate()
+    assert sel.all_concepts() == []
+    materialize_bundled_artifacts()
+    assert sel.all_concepts() != []
+
+
+def test_invalidate_clears_every_view(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """All three views come from one walk, so one clear drops all of them."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    _mk_nodes("local", "deer.wolf", ["deer", "wolf"])
+    sel.invalidate()
+    assert sel.all_concepts()
+    assert sel.resolve_manifold_label("deer") is not None
+    assert sel.resolve_manifold_name("deer.wolf") is not None
+    assert len(sel._index_cache) == 1
+    sel.invalidate()
+    assert sel._index_cache == {}
+
+
+def test_single_walk_serves_all_three_views(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A cold compound resolve parses the manifold tree exactly once."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io import manifolds as manifolds_mod
+
+    _mk_nodes("local", "deer.wolf", ["deer", "wolf"])
+    sel.invalidate()
+
+    walks = 0
+    real_iter = manifolds_mod.iter_manifold_folders
+
+    def counting_iter(*args: object, **kwargs: object):
+        nonlocal walks
+        walks += 1
+        return real_iter(*args, **kwargs)
+
+    monkeypatch.setattr(manifolds_mod, "iter_manifold_folders", counting_iter)
+    sel.all_concepts()
+    sel.resolve_manifold_label("deer")
+    sel.resolve_manifold_name("deer.wolf")
+    assert walks == 1

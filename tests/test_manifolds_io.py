@@ -680,6 +680,50 @@ def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
     assert loaded.metadata["topology_winner"] == "flat-pca"
 
 
+def test_save_manifold_rejects_unknown_metadata_key(tmp_path: Path):
+    """A provenance key outside the schema must fail loudly, not vanish.
+
+    The canonical-shape assert after the copy loop catches a *missing* sidecar
+    field but is structurally blind to an extra one: extras are dropped before
+    it runs.  A fit author adding a key would get no error and no persisted
+    field.  The read-side ``_tensor_sha256`` annotation stays tolerated so a
+    load → transfer → save round-trip still works.
+    """
+    import torch
+    from saklas.core.manifold import (
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace,
+    )
+    from saklas.io.manifold_tensors import load_manifold, save_manifold
+
+    g = torch.Generator().manual_seed(0)
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
+    coords = torch.tensor([[0.0], [0.5], [1.0]])
+    sub, _ = fit_layer_subspace(torch.randn(3, 6, generator=g), domain.embed(coords))
+    man = Manifold(
+        name="unknownmeta", domain=domain, node_labels=["a", "b", "c"],
+        node_coords=coords, layers={4: sub}, mahalanobis_share={4: 1.0},
+        origin={4: torch.zeros(domain.intrinsic_dim)}, feature_space="sae-test",
+    )
+    sae_provenance = {
+        "sae_release": "test", "sae_revision": "rev-1",
+        "sae_fingerprint": "fingerprint", "sae_ids_by_layer": {"4": "mock-4"},
+    }
+    out = tmp_path / "unknownmeta.safetensors"
+    with pytest.raises(ValueError, match="unknown key"):
+        save_manifold(man, out, {
+            "method": "manifold_sae", "fit_mode": "authored",
+            "monopolar": True, **sae_provenance,
+        })
+    assert not out.exists()
+
+    save_manifold(man, out, {
+        "method": "manifold_sae", "fit_mode": "authored",
+        "_tensor_sha256": "0" * 64, **sae_provenance,
+    })
+    assert "_tensor_sha256" not in json.loads(out.with_suffix(".json").read_text())
+    assert load_manifold(out).name == "unknownmeta"
+
+
 # --------------------------------------------------- authoring (create/update) ---
 
 def _author_nodes(labels: list[str]) -> list[dict[str, Any]]:
@@ -809,7 +853,7 @@ def test_update_manifold_folder_does_not_hash_fitted_payloads(
         "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
     )
     _fake_fit_tensor(folder, "test/model")
-    from saklas.io import packs
+    from saklas.io import integrity
 
     hashed: list[Path] = []
 
@@ -817,7 +861,7 @@ def test_update_manifold_folder_does_not_hash_fitted_payloads(
         hashed.append(Path(path))
         raise AssertionError("metadata-only authoring hashed a fitted payload")
 
-    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    monkeypatch.setattr(integrity, "hash_file", unexpected_hash)
     update_manifold_folder(folder, description="edited")
     assert hashed == []
 
@@ -1276,7 +1320,7 @@ def test_merge_discover_does_not_hash_source_fitted_payloads(
     ]
     for folder in folders:
         _fake_fit_tensor(folder, "test/model")
-    from saklas.io import packs
+    from saklas.io import integrity
 
     hashed: list[Path] = []
 
@@ -1284,7 +1328,7 @@ def test_merge_discover_does_not_hash_source_fitted_payloads(
         hashed.append(Path(path))
         raise AssertionError("metadata-only merge hashed a fitted payload")
 
-    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    monkeypatch.setattr(integrity, "hash_file", unexpected_hash)
     merge_discover_manifolds(
         "local", "combined", "", sources=[
             ("local", "src_a"), ("local", "src_b"),
@@ -1480,7 +1524,7 @@ def test_underscore_and_hyphen_labels_still_valid(tmp_path: Path, monkeypatch: p
 # ============================================================ B3: lifecycle ===
 #
 # remove_manifold_folder / clear_manifold_tensors / refresh_manifold —
-# the manifold analogue of pack rm / clear / refresh in cache_ops.
+# the folder-addressed rm / clear / refresh lifecycle.
 
 
 def _fake_fit_tensor(folder: Path, model_id: str, *, release: str | None = None) -> Path:
@@ -1899,7 +1943,7 @@ def test_metadata_only_lifecycle_does_not_hash_fitted_payloads(
         "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
     )
     _fake_fit_tensor(folder, "test/model")
-    from saklas.io import packs
+    from saklas.io import integrity
 
     hashed: list[Path] = []
 
@@ -1907,7 +1951,7 @@ def test_metadata_only_lifecycle_does_not_hash_fitted_payloads(
         hashed.append(Path(path))
         raise AssertionError("metadata-only lifecycle hashed a fitted payload")
 
-    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    monkeypatch.setattr(integrity, "hash_file", unexpected_hash)
     assert refresh_manifold("local", "mood") == "skipped"
     assert remove_manifold_folder("local", "mood")["removed"] is True
     assert hashed == []
@@ -1946,7 +1990,7 @@ def test_refresh_manifold_model_scope_clears_fit_no_repull(
 ):
     """A scoped refresh drops just the model's fit pair, never re-pulling.
 
-    Mirrors ``cache_ops.refresh``'s scoped path: HF pulls are whole-repo,
+    Scoped refresh drops tensors only: HF pulls are whole-repo,
     so a single-model refresh is a tensors-only delete (re-fits on next
     use), even on an ``hf://``-sourced manifold.
     """
@@ -2439,7 +2483,7 @@ def test_transfer_preflight_rejects_non_object_manifest_before_payload_hash(
     _fit_real_manifold(folder, "src/model", dim=4)
     (folder / "manifold.json").write_text(root)
     monkeypatch.setattr(
-        "saklas.io.packs.verify_integrity",
+        "saklas.io.integrity.verify_integrity",
         lambda *_args, **_kwargs: pytest.fail(
             "non-object manifest reached payload hashing"
         ),
@@ -2462,7 +2506,7 @@ def test_transfer_preflight_rejects_invalid_selected_digest_before_hashing(
     manifest["files"][source.name] = digest
     manifest_path.write_text(json.dumps(manifest))
     monkeypatch.setattr(
-        "saklas.io.packs.verify_integrity",
+        "saklas.io.integrity.verify_integrity",
         lambda *_args, **_kwargs: pytest.fail(
             "malformed selected digest reached payload hashing"
         ),
@@ -2485,7 +2529,7 @@ def test_transfer_preflight_rejects_future_manifest_before_payload_hash(
     manifest_path.write_text(json.dumps(manifest))
 
     monkeypatch.setattr(
-        "saklas.io.packs.verify_integrity",
+        "saklas.io.integrity.verify_integrity",
         lambda *_args, **_kwargs: pytest.fail(
             "future manifest reached payload hashing"
         ),
@@ -2514,7 +2558,7 @@ def test_strict_fitted_load_normalizes_trusted_corrupt_sidecar(
     tmp_path: Path, payload: str, message: str,
 ) -> None:
     from saklas.io.manifold_tensors import load_manifold
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     folder = _author_manifold(tmp_path)
     source = _fit_real_manifold(folder, "src/model", dim=4)
@@ -2541,7 +2585,7 @@ def test_strict_fitted_load_rejects_invalid_digest_before_hashing(
     manifest["files"][source.name] = "invalid"
     manifest_path.write_text(json.dumps(manifest))
     monkeypatch.setattr(
-        "saklas.io.packs.verify_integrity",
+        "saklas.io.integrity.verify_integrity",
         lambda *_args, **_kwargs: pytest.fail(
             "invalid digest reached fitted payload hashing"
         ),
@@ -2975,7 +3019,104 @@ def test_manifold_summary_reports_transfer_variant(
     assert summ["tensor_variants"][tgt_safe] == [
         f"from-{encode_release_id('src/m')}"
     ]
+    # The transfer provenance is on the per-tensor block, opt-in. It keys on
+    # the full tensor *stem*, so the variant gets its own entry.
+    assert "fitted" not in summ
+    detail = manifold_summary(folder, include_fits=True)
+    stems = {f["stem"]: f for f in detail["fitted"]}
+    variant_stem = f"{tgt_safe}_from-{encode_release_id('src/m')}"
+    assert set(stems) == {src_safe, variant_stem}
+    assert stems[variant_stem]["method"] == "manifold_procrustes_transfer"
+    assert stems[variant_stem]["share_metric"] == "mahalanobis"
 
+
+def test_manifold_summary_reports_template_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A templated manifold must be distinguishable from a hand-authored one.
+
+    Its corpus is a derived materialization whose authoring source of truth
+    lives in the template — exactly what a user needs to know before editing
+    ``nodes/`` by hand.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import create_manifold_from_template
+    from saklas.io.templates import create_template_folder
+
+    create_template_folder(
+        "local", "weekday", slot="[DAY]",
+        values=["Monday", "Tuesday", "Wednesday"],
+        contexts=[{
+            "turns": [{"role": "user", "content": "what day is it?"}],
+            "assistant": "today is [DAY]",
+        }],
+    )
+    plain = create_discover_manifold_folder(
+        "local", "handmade", "d", fit_mode="pca",
+        node_corpora={"a": ["x"], "b": ["y"], "c": ["z"]},
+    )
+    assert manifold_summary(plain)["template_ref"] is None
+
+    derived = create_manifold_from_template(
+        "local", "fromtmpl", "d", template_ref="weekday", fit_mode="pca",
+    )
+    assert manifold_summary(derived)["template_ref"] == "local/weekday"
+
+
+def test_manifold_fit_summary_surfaces_auto_topology_evidence(tmp_path: Path):
+    """An ``auto`` fit's flat-vs-curved evidence must be readable, not just stored.
+
+    ``resolved_fit_mode`` / ``topology_winner`` / ``topology_candidates`` are
+    the whole record of why ``select_topology`` chose the geometry it did;
+    they were written and schema-validated but no reader lifted them.
+    """
+    import torch
+    from saklas.core.manifold import (
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace,
+    )
+    from saklas.io.manifold_folder import ManifoldSidecar
+    from saklas.io.manifold_tensors import save_manifold
+    from saklas.io.manifolds import manifold_fit_summary
+
+    g = torch.Generator().manual_seed(0)
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
+    coords = torch.tensor([[0.0], [0.5], [1.0]])
+    sub, _ = fit_layer_subspace(torch.randn(3, 6, generator=g), domain.embed(coords))
+    man = Manifold(
+        name="autotopo2", domain=domain, node_labels=["a", "b", "c"],
+        node_coords=coords, layers={4: sub}, mahalanobis_share={4: 1.0},
+        origin={4: torch.zeros(domain.intrinsic_dim)}, feature_space="sae-test",
+    )
+    candidates = [
+        {"name": "flat-pca", "fit_mode": "pca", "intrinsic_dim": 2,
+         "score": 12.5, "viable": True, "reason": None},
+    ]
+    out = tmp_path / "autotopo2.safetensors"
+    save_manifold(man, out, {
+        "method": "manifold_discover_auto", "fit_mode": "auto",
+        "resolved_fit_mode": "pca", "topology_winner": "flat-pca",
+        "topology_candidates": candidates,
+        "share_metric": "mahalanobis", "subspace_metric": "mahalanobis",
+        "sae_release": "test", "sae_revision": "rev-1",
+        "sae_fingerprint": "fingerprint", "sae_ids_by_layer": {"4": "mock-4"},
+    })
+
+    sc = ManifoldSidecar.load(out.with_suffix(".json"))
+    assert sc.resolved_fit_mode == "pca"
+    assert sc.topology_winner == "flat-pca"
+    assert [c["name"] for c in sc.topology_candidates] == ["flat-pca"]
+    assert sc.share_metric == "mahalanobis"
+    assert sc.subspace_metric == "mahalanobis"
+
+    entry = manifold_fit_summary(sc, "autotopo2")
+    assert entry["resolved_fit_mode"] == "pca"
+    assert entry["topology_winner"] == "flat-pca"
+    assert [c["name"] for c in entry["topology_candidates"]] == ["flat-pca"]
+    assert entry["share_metric"] == "mahalanobis"
+    assert entry["subspace_metric"] == "mahalanobis"
+    # Empty diagnostics stay omitted so a pinned/authored fit reads terse.
+    assert "rbf_smoothing" not in entry
+    assert "sigma_field" not in entry
 
 
 # --------------------------------------------- streaming discover writers ---
@@ -3473,7 +3614,7 @@ def test_baked_publication_hashes_each_new_file_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import manifold_folder as folder_module, packs
+    from saklas.io import manifold_folder as folder_module, integrity
 
     real_hash = folder_module.hash_file
     hashed: list[Path] = []
@@ -3483,7 +3624,7 @@ def test_baked_publication_hashes_each_new_file_once(
         return real_hash(Path(path))
 
     monkeypatch.setattr(folder_module, "hash_file", count_hash)
-    monkeypatch.setattr(packs, "hash_file", count_hash)
+    monkeypatch.setattr(integrity, "hash_file", count_hash)
     manifold, _ = _baked_manifold("merged")
 
     create_baked_manifold_folder(

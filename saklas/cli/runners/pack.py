@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Any
 
 from saklas.cli.parsers import _PACK_VERBS
 from saklas.cli.runners.shared import (
@@ -69,23 +68,12 @@ def _run_pack_show(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
     ns, mf = matches[0]
-    fitted = []
-    for stem in mf.tensor_models():
-        sc = mf.sidecar(stem)
-        entry: dict[str, Any] = {
-            "stem": stem,
-            "method": sc.method,
-            "feature_space": sc.feature_space,
-            "node_count": sc.node_count,
-            "fit_mode": sc.fit_mode,
-        }
-        if sc.hyperparams:
-            entry["hyperparams"] = sc.hyperparams
-        if sc.diagnostics:
-            entry["diagnostics"] = sc.diagnostics
-        if sc.node_spread_per_layer:
-            entry["node_spread"] = sc.node_spread_per_layer
-        fitted.append(entry)
+    from saklas.io.manifolds import manifold_fit_summary
+
+    fitted = [
+        manifold_fit_summary(mf.sidecar(stem), stem)
+        for stem in mf.tensor_models()
+    ]
 
     # In discover mode the folder itself has no per-node coords (they are
     # derived per-model at fit time) — try to surface the derived coords
@@ -120,7 +108,9 @@ def _run_pack_show(args: argparse.Namespace) -> None:
         # in the fitted safetensors; the text path below still surfaces
         # the derived coords for interactive use.
         from saklas.io.manifolds import manifold_summary
-        print(_json.dumps(manifold_summary(mf.folder), indent=2))
+        print(_json.dumps(
+            manifold_summary(mf.folder, include_fits=True), indent=2,
+        ))
         return
 
     print(f"{ns}/{mf.name}")
@@ -257,10 +247,9 @@ def _run_pack_push(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # The coord follows pack push's resolution: ``--as owner/name`` wins,
-    # else ``<whoami>/<name>``.  ``push_manifold`` takes the resolved
-    # coord directly (no internal selector machinery), so the runner owns
-    # the resolution the way ``cache_ops.push`` does for packs.
+    # Coord resolution: ``--as owner/name`` wins, else ``<whoami>/<name>``.
+    # ``push_manifold`` takes the resolved coord directly (no internal
+    # selector machinery), so the runner owns the resolution.
     try:
         coord = resolve_target_coord(name, args.as_target)
     except Exception as e:
@@ -332,8 +321,7 @@ def _run_pack_refresh(args: argparse.Namespace) -> None:
 
     ns, name = _resolve_manifold_ns_name(args.selector)
     # ``args.model`` is the raw model id; ``refresh_manifold`` converts to
-    # a safe id at the io boundary (via ``clear_manifold_tensors``), the
-    # same convention ``cache_ops.refresh``'s scoped path uses.
+    # a safe id at the io boundary (via ``clear_manifold_tensors``).
     try:
         tier = refresh_manifold(ns, name, model_scope=args.model)
     except FileNotFoundError as e:
@@ -360,7 +348,7 @@ def _run_pack_export(args: argparse.Namespace) -> None:
     if fmt != "gguf":
         print(f"Unknown export format: {fmt}", file=sys.stderr)
         sys.exit(2)
-    from saklas.io.cache_ops import export_gguf_manifold
+    from saklas.io.gguf_io import export_gguf_manifold
 
     ns, name = _resolve_manifold_ns_name(args.name)
     try:
