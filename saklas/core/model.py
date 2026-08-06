@@ -188,6 +188,31 @@ def model_source_fingerprint(
         return None
 
 
+def config_model_shape(model_id: str) -> tuple[int, int]:
+    """``(n_layers, hidden_dim)`` for ``model_id`` without loading weights.
+
+    Reads the published config and unwraps a multimodal ``text_config``, so the
+    numbers match what a loaded session would report — which is what every
+    weight-free preflight compares against (the SAE's covered-layer and
+    residual-width checks, the manifold fit no-op's requested-layer set).
+    Raises when the config declares neither, because a *guessed* layer count
+    would silently widen or narrow a proof.
+    """
+    config = AutoConfig.from_pretrained(model_id)
+    text_config = getattr(config, "text_config", config)
+    n_layers = getattr(
+        text_config, "num_hidden_layers", getattr(text_config, "n_layer", None),
+    )
+    hidden = getattr(
+        text_config, "hidden_size", getattr(text_config, "n_embd", None),
+    )
+    if not isinstance(n_layers, int) or isinstance(n_layers, bool):
+        raise ValueError(f"{model_id} config declares no layer count")
+    if not isinstance(hidden, int) or isinstance(hidden, bool):
+        raise ValueError(f"{model_id} config declares no hidden size")
+    return int(n_layers), int(hidden)
+
+
 def workspace_layer_indices(
     candidates: "list[int] | range", n_layers: int,
 ) -> list[int]:

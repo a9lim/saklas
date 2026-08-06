@@ -31,6 +31,53 @@ def _run_manifold_bake(args: argparse.Namespace) -> None:
     print(f"Merged manifold written to {dst}")
 
 
+def _try_manifold_fit_noop_preflight(
+    args: argparse.Namespace,
+    folder: "Path",
+    *,
+    sae: str | None = None,
+    fit_mode: str | None = None,
+    hyperparams: "dict[str, object] | None" = None,
+    expected_role: str | None = None,
+    enforce_role: bool = False,
+) -> "Any | None":
+    """Prove this fit target is already exact before any model load.
+
+    The ``lens fit`` no-op shape for manifolds.  Everything decisive lives in
+    ``io.preflight_manifold_fit_noop``; this wrapper only supplies the CLI's
+    request shape and applies the one check that is an *authoring* concern
+    rather than a fit-identity one — ``extract --role`` refuses to reuse a
+    folder whose corpus carries a different role baseline, and that refusal is
+    an error the loaded path must be allowed to raise.  ``manifold fit`` takes
+    the folder's roles as given (a persona manifold is authored with them), so
+    it leaves ``enforce_role`` off.
+    """
+    from saklas.io.manifold_folder import ManifoldFolder, ManifoldFormatError
+    from saklas.io.manifolds import preflight_manifold_fit_noop
+
+    if not (folder / "manifold.json").exists():
+        return None
+    if enforce_role:
+        try:
+            roles = ManifoldFolder.load(
+                folder, verify_manifest=False,
+            )._roles_padded()
+        except (ManifoldFormatError, OSError, ValueError):
+            return None
+        if not roles or not all(role == expected_role for role in roles):
+            return None
+    return preflight_manifold_fit_noop(
+        folder,
+        model_id=args.model,
+        layer_indices=getattr(args, "layers", None),
+        sae=sae,
+        fit_mode=fit_mode,
+        hyperparams=hyperparams,
+        quantize=getattr(args, "quantize", None),
+        device=getattr(args, "device", None) or "auto",
+    )
+
+
 def _require_model(args: argparse.Namespace) -> None:
     if not args.model:
         # The compute leaves (extract / fit / generate / bake / transfer) carry
@@ -87,11 +134,34 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
 
     # A steering vector is a 2-node ``pca`` manifold (4.0); a role-augmented
     # fit bakes into its node corpora and writes the canonical tensor name (no
-    # ``_role-`` suffix). Cache validation belongs to the loaded session/pipeline
-    # because bare file existence cannot prove sidecar integrity, corpus/role/SAE
-    # identity, or the loaded model fingerprint.
+    # ``_role-`` suffix).  Bare file existence proves nothing, so the cache
+    # check runs through the weight-free preflight (sidecar integrity, corpus /
+    # role / template identity, the token-exact render, and the checkpoint→
+    # loaded fingerprint bridge) and falls through to the loaded session
+    # whenever any component is unproven.
+    from saklas.core.naming import canonical_concept_name
+
     ns = getattr(args, "namespace", None) or "local"
     tensor_name = tensor_filename(args.model, release=requested_release)
+    if not args.force:
+        canonical = canonical_concept_name(raw, baseline)
+        proof = _try_manifold_fit_noop_preflight(
+            args,
+            pathlib.Path(manifold_dir(ns, canonical)),
+            sae=requested_release,
+            expected_role=requested_role,
+            enforce_role=True,
+        )
+        if proof is not None:
+            variant_tail = f":role-{requested_role}" if requested_role else ""
+            print(
+                f"extracted {canonical}{variant_tail} -> {proof.tensor_path}"
+            )
+            print(
+                "Already fitted for this corpus and exact model source "
+                "— nothing to do."
+            )
+            return
     _pkg._print_startup(args)
     session = _pkg._make_session(args, load_probes=False)
     _pkg._print_model_info(session)
@@ -631,6 +701,31 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             requested_hyperparams["persistence_frac"] = float(
                 args.persistence_frac,
             )
+
+    # Weight-free no-op: if every component of the fit's cache key can be
+    # proven off-model, the model load (minutes on a cold cache) buys nothing.
+    # An override patch is deliberately not proven — it rewrites
+    # ``manifold.json`` inside the fit's own lock, so the on-disk hash the
+    # preflight can see is not the one the fit would compare against.
+    if not bool(getattr(args, "force", False)):
+        proof = _try_manifold_fit_noop_preflight(
+            args, folder,
+            sae=getattr(args, "sae", None),
+            fit_mode=requested_fit_mode,
+            hyperparams=requested_hyperparams,
+        )
+        if proof is not None:
+            print(
+                f"fitted manifold '{proof.manifold_name}' "
+                f"({len(proof.fitted_layers)} layers, "
+                f"{len(proof.node_labels)} nodes, {proof.fit_mode})"
+            )
+            print(
+                "Already fitted for this corpus and exact model source "
+                "— nothing to do."
+            )
+            print(f"Artifact: {proof.tensor_path}")
+            return
 
     _pkg._print_startup(args)
     session = _pkg._make_session(args, load_probes=False)

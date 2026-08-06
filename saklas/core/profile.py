@@ -99,17 +99,29 @@ def _validate_provenance(value: Any, *, depth: int = 0) -> None:
 def _validate_profile_sidecar(
     data: Any, *, tensor_sha256: str | None = None,
 ) -> None:
+    from saklas.io.integrity import PROFILE_FORMAT_VERSION
+
+    # The version check leads: an older artifact should say *that*, not report
+    # whichever field the current exact-set schema happens to miss first.  The
+    # message names the remedy because there is no migration — a profile is a
+    # user-saved interchange file, so the recompute is theirs to run.
+    if isinstance(data, dict) and (
+        isinstance(data.get("format_version"), bool)
+        or data.get("format_version") != PROFILE_FORMAT_VERSION
+    ):
+        raise ProfileError(
+            f"profile sidecar has format_version="
+            f"{data.get('format_version')!r}; need exactly "
+            f"{PROFILE_FORMAT_VERSION}. Re-save it with the current saklas "
+            "(for an extracted concept, re-run `saklas manifold extract`)."
+        )
     if not isinstance(data, dict) or set(data) != _PROFILE_SIDECAR_FIELDS:
         raise ProfileError("profile sidecar does not match the current exact schema")
     method = data["method"]
     if method not in _PROFILE_METHODS:
         raise ProfileError(f"profile sidecar has invalid method {method!r}")
-    from saklas.io.integrity import PROFILE_FORMAT_VERSION
-
     if (
-        isinstance(data["format_version"], bool)
-        or data["format_version"] != PROFILE_FORMAT_VERSION
-        or not isinstance(data["saklas_version"], str)
+        not isinstance(data["saklas_version"], str)
         or not data["saklas_version"]
     ):
         raise ProfileError("profile sidecar has invalid format identity")
