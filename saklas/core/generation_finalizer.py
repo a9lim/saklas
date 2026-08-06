@@ -8,6 +8,12 @@ import torch
 
 from saklas.core.capture import CaptureMode
 from saklas.core.events import ProbeScored
+from saklas.core.instruments.types import (
+    ScalarReading,
+    as_probe_reading,
+    reading_axis0,
+)
+from saklas.core.measurements import build_measurements
 from saklas.core.results import GenerationResult, ProbeReading
 
 if TYPE_CHECKING:
@@ -150,34 +156,57 @@ def finalize_generation(
             trimmed[layer_idx] = hidden.detach().to("cpu")
         hidden_states = trimmed
 
-    manifold_aggregates: dict[str, Any] = {}
+    geometry_aggregates: dict[str, ProbeReading] = {}
     if return_probe_readings and session._monitor.probe_names and generated_ids:
-        manifold_aggregates = dict(agg_vals)
+        geometry_aggregates = dict(agg_vals)
     # Pinned J-lens token probes (readout channel — not monitor probes):
     # one band readout pooled at the last content token, same aggregate
-    # semantics as the monitor roster.
+    # semantics as the monitor roster.  Their native ``ScalarReading``s stay
+    # native all the way into the envelope; the cross-family
+    # ``probe_readings`` dict below is the one projection.
+    lens_aggregates: dict[str, ScalarReading] = {}
     if (
         return_probe_readings
         and generated_ids
         and session.lens.names
     ):
-        manifold_aggregates.update(
-            session._score_lens_probes_aggregate(
-                generated_ids,
-                pooled=_aggregate_pooled_slice(),
-            )
+        lens_aggregates = session._score_lens_probes_aggregate(
+            generated_ids, pooled=_aggregate_pooled_slice(),
         )
+    sae_aggregates: dict[str, ScalarReading] = {}
     if (
         return_probe_readings
         and generated_ids
         and session.sae.names
     ):
-        manifold_aggregates.update(
-            session._score_sae_probes_aggregate(
-                generated_ids,
-                pooled=_aggregate_pooled_slice(),
-            )
+        sae_aggregates = session._score_sae_probes_aggregate(
+            generated_ids, pooled=_aggregate_pooled_slice(),
         )
+
+    manifold_aggregates: dict[str, Any] = {
+        **geometry_aggregates, **lens_aggregates, **sae_aggregates,
+    }
+    live_lens = session.lens.live
+    live_sae = session.sae.live
+    measurements = build_measurements(
+        scope="aggregate",
+        geometry_readings=geometry_aggregates or None,
+        lens_readings=lens_aggregates or None,
+        sae_readings=sae_aggregates or None,
+        lens_source=(
+            live_lens.get("source")
+            if lens_aggregates and isinstance(live_lens, dict) else None
+        ),
+        sae_source=(
+            live_sae.get("source")
+            if sae_aggregates and isinstance(live_sae, dict) else None
+        ),
+        sae_layer=(
+            live_sae.get("layer")
+            if sae_aggregates and isinstance(live_sae, dict) else None
+        ),
+        steering=applied_steering,
+    )
 
     result = GenerationResult(
         text=text, tokens=list(generated_ids), token_count=token_count,
@@ -188,16 +217,21 @@ def finalize_generation(
         logprobs=logprobs_list,
         applied_steering=applied_steering,
         hidden_states=hidden_states,
-        probe_readings=manifold_aggregates,
+        # The compatibility dict: one reading type across families, for the
+        # vendor extension and cross-family callers.
+        probe_readings={
+            name: as_probe_reading(reading)
+            for name, reading in manifold_aggregates.items()
+        },
+        measurements=measurements,
     )
     session._last_result = result
 
     if manifold_aggregates:
-        scalar_readings = {
-            name: (reading.coords[0] if reading.coords else 0.0)
+        session.events.emit(ProbeScored(readings={
+            name: reading_axis0(reading)
             for name, reading in manifold_aggregates.items()
-        }
-        session.events.emit(ProbeScored(readings=scalar_readings))
+        }))
 
     if not stateless and assistant_node_id is not None:
         session._stamp_raw_indices(assistant_node_id)
@@ -223,7 +257,7 @@ def finalize_generation(
             assistant_node_id,
             text=text,
             aggregate_readings={
-                name: (reading.coords[0] if reading.coords else 0.0)
+                name: reading_axis0(reading)
                 for name, reading in manifold_aggregates.items()
             },
             applied_steering=applied_steering,

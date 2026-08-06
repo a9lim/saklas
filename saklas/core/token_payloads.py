@@ -7,12 +7,23 @@ from typing import Any
 
 import torch
 
+from saklas.core.instruments.types import (
+    InstrumentFamily,
+    Reading,
+    ScalarReading,
+    as_probe_reading,
+    reading_axis0,
+    reading_per_layer_axis0,
+)
 from saklas.core.measurements import build_measurements
 from saklas.core.results import ProbeReading
 
-# Per-family reading slot names, keyed by the ``family`` argument to
-# :meth:`TokenProbePayload.merge_readings`.
-_FAMILY_SLOTS = {
+#: Per-family reading slot names, keyed by the ``family`` argument to
+#: :meth:`TokenProbePayload.merge_readings`.  One slot per member of
+#: ``InstrumentFamily`` — ``tests/test_instruments_types.py`` pins the two
+#: sets equal against ``session.instruments``, so a fourth read family
+#: cannot land a slot-less payload.
+_FAMILY_SLOTS: dict[InstrumentFamily, str] = {
     "geometry": "geometry_readings",
     "lens": "lens_readings",
     "sae": "sae_readings",
@@ -33,21 +44,29 @@ class TokenProbePayload:
     scores: dict[str, float] | None = None
     per_layer_scores: dict[str, dict[str, float]] | None = None
     geometry_readings: dict[str, ProbeReading] | None = None
-    lens_readings: dict[str, ProbeReading] | None = None
-    sae_readings: dict[str, ProbeReading] | None = None
+    lens_readings: dict[str, ScalarReading] | None = None
+    sae_readings: dict[str, ScalarReading] | None = None
 
     @property
     def all_readings(self) -> dict[str, ProbeReading]:
-        """The three family slots merged into one per-probe dict.
+        """The three family slots merged into one ``ProbeReading`` dict.
 
-        Some internal consumers (the library ``TokenEvent.probe_readings``
-        field, the aggregate split) want the cross-family union rather than a
-        single family's slot.
+        A COMPATIBILITY view, and the only one on this path: the library
+        ``TokenEvent.probe_readings`` field keys probes across families by a
+        single reading type, so the single-axis families' native
+        ``ScalarReading``s are projected here.  The native WS path never
+        touches it — ``to_token_payload`` serializes each family's own
+        shape — so the projection does not run per token unless a caller
+        asked for the cross-family dict.
         """
         merged: dict[str, ProbeReading] = {}
-        for slot in (self.geometry_readings, self.lens_readings, self.sae_readings):
+        if self.geometry_readings:
+            merged.update(self.geometry_readings)
+        for slot in (self.lens_readings, self.sae_readings):
             if slot:
-                merged.update(slot)
+                merged.update(
+                    {n: as_probe_reading(r) for n, r in slot.items()}
+                )
         return merged
 
     def to_token_payload(
@@ -90,7 +109,7 @@ class TokenProbePayload:
 
     def merge_readings(
         self,
-        extra: dict[str, ProbeReading],
+        extra: dict[str, Any],
         *,
         family: str,
         per_layer: bool = False,
@@ -119,24 +138,19 @@ class TokenProbePayload:
             self.per_layer_scores = merged or None
 
 
-def _axis0_scores(
-    readings: dict[str, ProbeReading],
-) -> dict[str, float]:
+def _axis0_scores(readings: dict[str, Reading]) -> dict[str, float]:
     return {
-        name: (reading.coords[0] if reading.coords else 0.0)
-        for name, reading in readings.items()
+        name: reading_axis0(reading) for name, reading in readings.items()
     }
 
 
 def _per_layer_axis0(
-    readings: dict[str, ProbeReading],
+    readings: dict[str, Reading],
 ) -> dict[str, dict[str, float]] | None:
     by_layer: dict[str, dict[str, float]] = {}
     for probe_name, reading in readings.items():
-        for layer, coord in reading.coords_per_layer.items():
-            by_layer.setdefault(str(layer), {})[probe_name] = round(
-                float(coord[0] if coord else 0.0), 6,
-            )
+        for layer, value in reading_per_layer_axis0(reading).items():
+            by_layer.setdefault(str(layer), {})[probe_name] = round(value, 6)
     return by_layer or None
 
 

@@ -780,6 +780,12 @@ class TestWebSocketProbeReadings:
                 probe_readings=(
                     {"circumplex": aggregate} if aggregate else {}
                 ),
+                measurements=build_measurements(
+                    scope="aggregate",
+                    geometry_readings=(
+                        {"circumplex": aggregate} if aggregate else None
+                    ),
+                ),
             )
             session.last_result = result
             session.last_result = result

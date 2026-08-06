@@ -308,10 +308,53 @@ class ScalarReading:
         )
 
 
-def scalar_gate_keys(
-    readings: Mapping[str, ScalarReading],
-) -> dict[str, float]:
-    """Flatten one-channel readings into gate scalars.
+#: What a family's ``score_probes`` returns: the geometry family's full
+#: whitened :class:`~saklas.core.results.ProbeReading`, or the single-axis
+#: families' :class:`ScalarReading`.  The three helpers below are the only
+#: places a consumer needs to care which.
+Reading = Union["ProbeReading", ScalarReading]
+
+
+def reading_axis0(reading: "Reading") -> float:
+    """The reading's primary scalar — a ``ScalarReading``'s ``value`` or a
+    ``ProbeReading``'s coordinate axis 0.  This is the number the flat
+    cross-family ``scores`` view and the loom's aggregate row carry."""
+    if isinstance(reading, ScalarReading):
+        return float(reading.value)
+    coords = reading.coords
+    return float(coords[0]) if coords else 0.0
+
+
+def reading_per_layer_axis0(reading: "Reading") -> dict[int, float]:
+    """The per-layer trace of :func:`reading_axis0`."""
+    if isinstance(reading, ScalarReading):
+        return {
+            int(layer): float(value)
+            for layer, value in reading.per_layer.items()
+        }
+    return {
+        int(layer): float(coord[0] if coord else 0.0)
+        for layer, coord in reading.coords_per_layer.items()
+    }
+
+
+def as_probe_reading(reading: "Reading") -> "ProbeReading":
+    """Project any reading into the shared ``ProbeReading`` shape.
+
+    The COMPATIBILITY boundary, and only that: ``TokenEvent.probe_readings``
+    (a cross-family dict keyed by one reading type) and the OpenAI/Ollama
+    ``x-saklas-probe-readings`` vendor extension, whose shape is a user
+    contract.  It must not run on the native per-token path — the versioned
+    measurement envelope carries each family's own reading shape, which is
+    the whole point of :class:`ScalarReading`.
+    """
+    if isinstance(reading, ScalarReading):
+        return reading.to_probe_reading()
+    return reading
+
+
+def scalar_gate_keys(values: Mapping[str, float]) -> dict[str, float]:
+    """Flatten one-channel probe values into gate scalars.
 
     The :meth:`Monitor.flat_scalars` counterpart for the single-axis
     families: ONLY the real strength channel (``<name>`` and its explicit
@@ -320,10 +363,10 @@ def scalar_gate_keys(
     error (``validate_gate``), never a silently-constant comparison.
     """
     out: dict[str, float] = {}
-    for name, reading in readings.items():
-        value = float(reading.value)
-        out[name] = value
-        out[f"{name}[0]"] = value
+    for name, value in values.items():
+        scalar = float(value)
+        out[name] = scalar
+        out[f"{name}[0]"] = scalar
     return out
 
 
@@ -539,12 +582,16 @@ __all__ = [
     "LiveState",
     "Membership",
     "ReadRequest",
+    "Reading",
     "SaeLiveState",
     "ScalarReading",
     "UNIT_ACTIVATION_OVER_MAX",
     "UNIT_MEAN_TOKEN_PROBABILITY",
     "UNIT_RAW_ACTIVATION",
+    "as_probe_reading",
     "parse_gate_ref",
+    "reading_axis0",
+    "reading_per_layer_axis0",
     "scalar_gate_keys",
     "validate_gate_channels",
 ]

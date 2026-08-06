@@ -90,6 +90,7 @@ class _StubSession:
         # End-of-generation readings the stub stamps onto every result, so a
         # test can pin the ``done`` frame's aggregate channel.
         self.stub_probe_readings: dict[str, Any] = {}
+        self.stub_lens_readings: dict[str, Any] = {}
         self.token_probe_payload: dict[str, Any] = {}
         self._tokenizer = MagicMock()
         self._tokenizer.encode.side_effect = lambda text, **_: [
@@ -225,11 +226,26 @@ class _StubSession:
                 if self._block_until_stop:
                     assert self._stop_event.wait(timeout=5.0)
                 full_text = prefix + token_text
+                from saklas.core.measurements import build_measurements
+
                 result = GenerationResult(
                     text=full_text, tokens=[1000 + sibling_idx],
                     token_count=1, tok_per_sec=10.0, elapsed=0.1,
                     finish_reason="stop",
                     probe_readings=dict(self.stub_probe_readings) or None,
+                    # The engine builds this once at finalize; the ``done``
+                    # frame just forwards it.
+                    measurements=build_measurements(
+                        scope="aggregate",
+                        geometry_readings=(
+                            dict(self.stub_probe_readings) or None
+                        ),
+                        lens_readings=dict(self.stub_lens_readings) or None,
+                        lens_source=(
+                            (self.lens.live or {}).get("source")
+                            if self.stub_lens_readings else None
+                        ),
+                    ),
                 )
                 self.tree.finalize_assistant(
                     assistant_id,
@@ -996,6 +1012,7 @@ class TestWebSocketLoom:
         The flat pre-5.x ``result.probe_readings`` block is gone (the same
         clean break the ``token`` frame already made); it survives only on
         the OpenAI / Ollama ``x-saklas-probe-readings`` vendor extension."""
+        from saklas.core.instruments.types import ScalarReading
         from saklas.core.results import ProbeReading
 
         session, client = session_and_client
@@ -1005,7 +1022,12 @@ class TestWebSocketLoom:
         session.monitor.probe_names = ["calm"]
         session.lens.names = ["jlens/fake"]
         session.lens.live = {"source": "local:default"}
-        session.stub_probe_readings = {"calm": reading, "jlens/fake": reading}
+        session.stub_probe_readings = {"calm": reading}
+        session.stub_lens_readings = {
+            "jlens/fake": ScalarReading(
+                value=0.5, unit="mean_token_probability",
+            ),
+        }
 
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({"type": "generate", "input": "measure me"})

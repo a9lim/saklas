@@ -33,6 +33,7 @@ import torch
 
 from saklas.core.instruments.types import (
     Axis,
+    DepthSummary,
     GateRef,
     InstrumentBinding,
     InstrumentFamily,
@@ -40,13 +41,16 @@ from saklas.core.instruments.types import (
     InstrumentPrep,
     ReadRequest,
     SaeLiveState,
+    ScalarReading,
+    UNIT_ACTIVATION_OVER_MAX,
+    UNIT_RAW_ACTIVATION,
     next_prep_token,
     parse_gate_ref,
+    scalar_gate_keys,
     validate_gate_channels,
 )
 
 if TYPE_CHECKING:
-    from saklas.core.results import ProbeReading
     from saklas.core.session import SaklasSession
 
 
@@ -84,15 +88,15 @@ class SaeRun:
         self.live_state = live_state
         self.bound = bound
         self.step_stash: dict[str, Any] | None = None
-        self.last_step_readings: dict[str, "ProbeReading"] | None = None
+        self.last_step_readings: dict[str, ScalarReading] | None = None
         self._memo_step: int | None = None
-        self._memo_readings: dict[str, "ProbeReading"] | None = None
+        self._memo_readings: dict[str, ScalarReading] | None = None
 
     # ------------------------------------------------------------ protocol
 
     def observe(
         self, step_id: int, hidden: dict[int, torch.Tensor],
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """Readings for every attached probe at this step, memoized by
         ``step_id`` while bound.  The workers' full-roster reads prime
         this memo (``prime_observation``); the encode-level gate→display
@@ -132,7 +136,7 @@ class SaeRun:
         )
 
     def prime_observation(
-        self, step_id: int, readings: dict[str, "ProbeReading"],
+        self, step_id: int, readings: dict[str, ScalarReading],
     ) -> None:
         """Prime the step memo with FULL-roster readings a hot-path worker
         already computed this forward — a later ``observe(step_id, …)``
@@ -145,7 +149,7 @@ class SaeRun:
 
     def observe_aggregate(
         self, pooled: dict[int, Any],
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """End-of-generation aggregate at the pooled last-content slice."""
         return self._instrument.score_probes(pooled)
 
@@ -201,12 +205,12 @@ class SaeInstrument:
         self.current_run.step_stash = value
 
     @property
-    def last_step_readings(self) -> "dict[str, ProbeReading] | None":
+    def last_step_readings(self) -> "dict[str, ScalarReading] | None":
         return self.current_run.last_step_readings
 
     @last_step_readings.setter
     def last_step_readings(
-        self, value: "dict[str, ProbeReading] | None",
+        self, value: "dict[str, ScalarReading] | None",
     ) -> None:
         self.current_run.last_step_readings = value
 
@@ -462,7 +466,7 @@ class SaeInstrument:
     def score_probes(
         self, hidden: dict[int, torch.Tensor] | None = None,
         *, only: "set[str] | None" = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """Score attached probes from capture hidden slices.
 
         The capture-slice entry: encodes the resident hook layer itself.
@@ -485,30 +489,66 @@ class SaeInstrument:
         *,
         only: "set[str] | None" = None,
         raw_by_fid: Mapping[int, float] | None = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """Score attached probes from an already-encoded activation vector.
 
         The entry for callers that encoded this forward once and share it
         (the gate callback, the live display step, authored prefill);
         ``raw_by_fid`` additionally seeds values a caller already transferred.
-        """
-        from saklas.core.results import ProbeReading
 
-        session = self._session
-        if not self._measurement_specs():
+        Returns the family-native :class:`ScalarReading`: ONE channel whose
+        ``unit`` says which normalization actually applied (the Neuronpedia
+        corpus max when cached, raw activation otherwise) and whose depth
+        summary names its single-layer basis.  A feature activation is not
+        a geometry reading, so it carries none of those fields.
+        """
+        specs = self._measurement_specs()
+        if not specs:
             return {}
+        session = self._session
         _backend, layer, _width = session._require_sae()
-        out: dict[str, ProbeReading] = {}
-        for name, _fid, _raw_value, value in self.probe_values(
+        live_fallback = not self.current_run.bound
+        depth = DepthSummary(
+            center=(layer / max(len(session._layers) - 1, 1),),
+            spread=(0.0,),
+            basis="single_layer",
+        )
+        out: dict[str, ScalarReading] = {}
+        for name, fid, _raw_value, value in self.probe_values(
             activations, only=only, raw_by_fid=raw_by_fid,
         ):
-            out[name] = ProbeReading(
-                fraction=0.0, nearest=[], coords=(value,), residual=0.0,
-                coords_per_layer={layer: (value,)},
-                depth_com=(layer / max(len(session._layers) - 1, 1),),
-                depth_spread=(0.0,),
+            normalized = self._resolve_max_act(
+                specs.get(name) or {}, fid, live_fallback,
+            ) is not None
+            out[name] = ScalarReading(
+                value=float(value),
+                unit=(
+                    UNIT_ACTIVATION_OVER_MAX if normalized
+                    else UNIT_RAW_ACTIVATION
+                ),
+                per_layer={int(layer): float(value)},
+                depth=depth,
             )
         return out
+
+    def _resolve_max_act(
+        self, spec: "Mapping[str, Any]", fid: int, live_fallback: bool,
+    ) -> float | None:
+        """The feature's normalization constant, or ``None`` when there is
+        none (offline / unlisted feature -> the reading is raw activation).
+
+        A bound run's unit was resolved into the binding snapshot at bind,
+        so the un-locked Neuronpedia backfill cannot change a running
+        generation's unit; the live cache fallback applies only between
+        generations.  ONE resolver, shared by the value path and the unit
+        the reading reports, so the two cannot disagree.
+        """
+        max_act = spec.get("max_act")
+        if isinstance(max_act, (int, float)) and float(max_act) > 0:
+            return float(max_act)
+        if live_fallback:
+            return self._session._sae_max_act(int(fid))
+        return None
 
     def probe_values(
         self,
@@ -572,11 +612,9 @@ class SaeInstrument:
             # only when no metadata exists (offline / not on Neuronpedia).
             # A bound run's unit was resolved into the snapshot at bind; the
             # live cache fallback applies only between generations.
-            max_act = spec.get("max_act")
-            if not (isinstance(max_act, (int, float)) and float(max_act) > 0):
-                max_act = session._sae_max_act(fid) if live_fallback else None
+            max_act = self._resolve_max_act(spec, fid, live_fallback)
             if max_act is not None:
-                value = value / float(max_act)
+                value = value / max_act
             out.append((name, fid, raw_value, value))
         return out
 
@@ -615,7 +653,6 @@ class SaeInstrument:
         if layer not in latest:
             return {}
         acts = session._encode_sae_hidden(latest[layer])
-        scalars: dict[str, float] = {}
         values = self.probe_values(acts, only=only)
         self.step_stash = {
             "activations": acts,
@@ -625,17 +662,16 @@ class SaeInstrument:
                 for _name, fid, raw_value, _value in values
             },
         }
-        for name, _fid, _raw_value, value in values:
-            scalars[name] = value
-            scalars[f"{name}[0]"] = value
-        return scalars
+        return scalar_gate_keys({
+            name: value for name, _fid, _raw_value, value in values
+        })
 
     def score_aggregate(
         self,
         generated_ids: list[int],
         *,
         pooled: dict[int, torch.Tensor] | None = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """End-of-gen aggregate pooled at the last content token.
 
         Shares the session's ``_pooled_aggregate_slice`` with the monitor
@@ -858,7 +894,7 @@ class SaeInstrument:
         top_k: int,
     ) -> tuple[
         list[tuple[int, float, str | None, float | None]],
-        dict[str, "ProbeReading"],
+        dict[str, ScalarReading],
     ] | None:
         """Live SAE payload for one retained authored producer row.
 

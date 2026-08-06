@@ -133,9 +133,10 @@ def test_lens_probe_scores_strength_channel() -> None:
     }
     readings = session._lens_instrument.score_probes(hidden)
     reading = readings["jlens/g"]
-    (strength,) = reading.coords
+    strength = reading.value
+    assert reading.unit == "mean_token_probability"
     assert 0.0 <= strength <= 1.0
-    assert sorted(reading.coords_per_layer) == layers
+    assert sorted(reading.per_layer) == layers
     # Cross-check against the pure math on the same logits.
     logits = session._jlens_logits_rows(
         session.jlens, [(l, hidden[l]) for l in layers],
@@ -149,23 +150,32 @@ def test_lens_probe_scores_strength_channel() -> None:
     # strength is the mean of the per-layer probabilities — the objective
     # apples-to-apples identity a within-layer normalization can't satisfy.
     assert strength == pytest.approx(sum(per_layer) / len(per_layer))
-    assert reading.depth_com == pytest.approx((exp_com,))
-    assert reading.depth_spread == pytest.approx((exp_spread,))
+    assert reading.depth is not None
+    assert reading.depth.center == pytest.approx((exp_com,))
+    assert reading.depth.spread == pytest.approx((exp_spread,))
+    # The depth mass names its own basis — ``depth_com`` means three
+    # unrelated things across families, so a bare float invites a
+    # meaningless cross-family comparison.
+    assert reading.depth.basis == "readout_probability_mass"
     for l, p_l in zip(layers, per_layer):
-        assert reading.coords_per_layer[l] == pytest.approx((p_l,))
+        assert reading.per_layer[l] == pytest.approx(p_l)
         assert 0.0 <= p_l <= 1.0
-    # Geometry fields are defaulted — there is no subspace behind a readout
-    # probe.
-    assert reading.fraction == 0.0
-    assert reading.residual == 0.0
-    assert reading.nearest == []
-    assert reading.membership == 1.0
+    # There are no geometry fields to default: a readout probe has no
+    # subspace behind it, so the native reading simply doesn't carry
+    # fraction / residual / nearest / assignment / membership.  They
+    # reappear only at the explicit compatibility projection.
+    for absent in ("fraction", "residual", "nearest", "membership", "coords"):
+        assert not hasattr(reading, absent)
+    compat = reading.to_probe_reading()
+    assert compat.coords == (strength,)
+    assert compat.fraction == 0.0
+    assert compat.membership == 1.0
 
 
 def test_gated_lens_probe_keys_and_gate_scalars() -> None:
     """Composer detection + the gate scalar key space: ``jlens/<word>`` =
-    strength (the one channel), emitted by ``Monitor.flat_scalars`` over
-    the synthesized reading."""
+    strength (the one channel), emitted by ``scalar_gate_keys`` over the
+    native readings — no ``:fraction`` / ``:membership`` constants."""
     from saklas.core.session import SaklasSession
 
     session = _StubSession()

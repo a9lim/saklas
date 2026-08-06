@@ -53,65 +53,6 @@ def probe_reading_aggregate(
     }
 
 
-def probe_measurements_aggregate(
-    session: "SaklasSession", result: "GenerationResult | None",
-) -> dict[str, Any] | None:
-    """Aggregate-scope measurement envelope for the native WS ``done`` frame.
-
-    Splits ``result.probe_readings`` by family — geometry (Monitor probes),
-    lens (``session.lens.names``), SAE (``session.sae.names``) — and
-    builds one ``scope="aggregate"`` envelope
-    (:func:`saklas.core.measurements.build_measurements`).  ``None`` when no
-    probe is attached / no result recorded.  This is the ONE aggregate-readings
-    channel on the native ``done`` frame; :func:`probe_reading_aggregate` is the
-    parallel flat shape the OpenAI / Ollama ``x-saklas-probe-readings`` vendor
-    extension is contractually pinned to.
-
-    Source / layer binding fields come from the live lens / SAE configs when a
-    family actually contributed readings; otherwise ``None`` (so a historical
-    row stays interpretable after a source switch).  Read through the public
-    instrument surface (``session.lens.live`` / ``session.sae.live``) rather
-    than the session's delegating private aliases.
-    """
-    from saklas.core.measurements import build_measurements
-
-    if result is None:
-        return None
-    readings = result.probe_readings or {}
-    if not readings:
-        return None
-
-    geometry_names = set(session.monitor.probe_names)
-    lens_names = set(session.lens.names)
-    sae_names = set(session.sae.names)
-    geometry = {n: r for n, r in readings.items() if n in geometry_names} or None
-    lens = {n: r for n, r in readings.items() if n in lens_names} or None
-    sae = {n: r for n, r in readings.items() if n in sae_names} or None
-
-    live_lens = session.lens.live
-    live_sae = session.sae.live
-    lens_source = (
-        live_lens.get("source") if lens and isinstance(live_lens, dict) else None
-    )
-    sae_source = (
-        live_sae.get("source") if sae and isinstance(live_sae, dict) else None
-    )
-    sae_layer = (
-        live_sae.get("layer") if sae and isinstance(live_sae, dict) else None
-    )
-
-    return build_measurements(
-        scope="aggregate",
-        geometry_readings=geometry,
-        lens_readings=lens,
-        sae_readings=sae,
-        lens_source=lens_source,
-        sae_source=sae_source,
-        sae_layer=sae_layer,
-        steering=getattr(result, "applied_steering", None),
-    )
-
-
 def usage_dict(result: "GenerationResult") -> dict[str, int]:
     pt = result.prompt_tokens
     ct = result.token_count

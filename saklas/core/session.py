@@ -76,7 +76,11 @@ from saklas.core.instruments.types import (
     InstrumentFamily,
     InstrumentPlan,
     ReadRequest,
+    ScalarReading,
+    as_probe_reading,
+    reading_axis0,
 )
+from saklas.core.measurements import build_measurements
 from saklas.core.monitor import Monitor
 from saklas.io.probes_bootstrap import bootstrap_layer_means
 from saklas.core.profile import Profile, load_profile as _load_profile
@@ -9775,15 +9779,27 @@ class SaklasSession:
         prompt_tokens: int,
         finish_reason: str,
         applied_steering: str | None,
-        probe_readings: dict[str, ProbeReading],
+        geometry_readings: dict[str, ProbeReading],
+        lens_readings: "dict[str, ScalarReading]",
+        sae_readings: "dict[str, ScalarReading]",
     ) -> GenerationResult:
-        """Build a stateless batch result with pre-scored probe aggregates."""
+        """Build a stateless batch result with pre-scored probe aggregates.
+
+        Per-family in, per-family out: the aggregate envelope keeps each
+        family's native reading shape (the serial finalize does the same),
+        and ``probe_readings`` is the cross-family compatibility projection.
+        """
         token_count = len(generated_ids)
         tok_per_sec = (
             token_count / elapsed if elapsed > MIN_ELAPSED_FOR_RATE else 0.0
         )
         decoded = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
         text = decoded if isinstance(decoded, str) else decoded[0]
+        merged: dict[str, Any] = {
+            **geometry_readings, **lens_readings, **sae_readings,
+        }
+        live_lens = self._lens_instrument.live
+        live_sae = self._sae_instrument.live
         result = GenerationResult(
             text=text,
             tokens=list(generated_ids),
@@ -9796,16 +9812,37 @@ class SaklasSession:
             logprobs=None,
             applied_steering=applied_steering,
             hidden_states=None,
-            probe_readings=probe_readings,
+            probe_readings={
+                name: as_probe_reading(reading)
+                for name, reading in merged.items()
+            },
+            measurements=build_measurements(
+                scope="aggregate",
+                geometry_readings=geometry_readings or None,
+                lens_readings=lens_readings or None,
+                sae_readings=sae_readings or None,
+                lens_source=(
+                    live_lens.get("source")
+                    if lens_readings and isinstance(live_lens, dict) else None
+                ),
+                sae_source=(
+                    live_sae.get("source")
+                    if sae_readings and isinstance(live_sae, dict) else None
+                ),
+                sae_layer=(
+                    live_sae.get("layer")
+                    if sae_readings and isinstance(live_sae, dict) else None
+                ),
+                steering=applied_steering,
+            ),
         )
         self._last_result = result
         self._last_per_token_scores = None
-        if probe_readings:
-            scalar_readings = {
-                name: (reading.coords[0] if reading.coords else 0.0)
-                for name, reading in probe_readings.items()
-            }
-            self.events.emit(ProbeScored(readings=scalar_readings))
+        if merged:
+            self.events.emit(ProbeScored(readings={
+                name: reading_axis0(reading)
+                for name, reading in merged.items()
+            }))
         return result
 
     def _batch_probe_aggregate_for_row(
@@ -9846,26 +9883,28 @@ class SaklasSession:
     def _batch_readout_probe_aggregate_for_row(
         self,
         pooled: dict[int, torch.Tensor],
-    ) -> dict[str, ProbeReading]:
-        """Pinned J-lens/SAE readout probe aggregates from a batched tail slice.
+    ) -> "tuple[dict[str, ScalarReading], dict[str, ScalarReading]]":
+        """Pinned J-lens/SAE readout probe aggregates from a batched tail
+        slice, kept per family (``(lens, sae)``).
 
-        The forwarders resolve through each family's bound run state
-        (frozen spec snapshot + pinned lens), so every row of the batch
-        measures against the same bind-time binding — the guards consult
-        the binding too, so an ``on_result`` callback detaching a probe
-        cannot change later rows' roster."""
+        The runs resolve through each family's bound state (frozen spec
+        snapshot + pinned lens), so every row of the batch measures against
+        the same bind-time binding — the guards consult the binding too, so
+        an ``on_result`` callback detaching a probe cannot change later
+        rows' roster."""
         if not pooled:
-            return {}
-        out: dict[str, ProbeReading] = {}
+            return {}, {}
+        lens_readings: dict[str, ScalarReading] = {}
+        sae_readings: dict[str, ScalarReading] = {}
         if self._lens_instrument._measurement_specs():
-            out.update(
+            lens_readings = (
                 self._lens_instrument.current_run.observe_aggregate(pooled)
             )
         if self._sae_instrument._measurement_specs():
-            out.update(
+            sae_readings = (
                 self._sae_instrument.current_run.observe_aggregate(pooled)
             )
-        return out
+        return lens_readings, sae_readings
 
     @staticmethod
     def _batch_fast_sampling_blocked(sampling: SamplingConfig | None) -> bool:
@@ -10128,7 +10167,7 @@ class SaklasSession:
                 self._gen_state.finish_reason = finish_reason
                 if capture_probe_aggregates:
                     pooled = self._batch_pooled_aggregate_for_row(idx, generated_ids)
-                    probe_readings: dict[str, ProbeReading] = (
+                    geometry_readings: dict[str, ProbeReading] = (
                         self._batch_probe_aggregate_for_row(
                             idx,
                             generated_ids,
@@ -10138,7 +10177,7 @@ class SaklasSession:
                         if probe_names
                         else {}
                     )
-                    probe_readings.update(
+                    lens_readings, sae_readings = (
                         self._batch_readout_probe_aggregate_for_row(pooled)
                     )
                     result = self._finalize_batch_probe_result(
@@ -10148,7 +10187,9 @@ class SaklasSession:
                         prompt_tokens=prompt_lengths[idx],
                         finish_reason=finish_reason,
                         applied_steering=applied_steering,
-                        probe_readings=probe_readings,
+                        geometry_readings=geometry_readings,
+                        lens_readings=lens_readings,
+                        sae_readings=sae_readings,
                     )
                 else:
                     result = self._finalize_generation(

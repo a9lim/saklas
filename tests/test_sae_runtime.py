@@ -154,8 +154,9 @@ def test_live_sae_readout_and_probe_share_one_encoder_result() -> None:
     # The probe channel is normalized strength — activation / maxActApprox —
     # while the readout row keeps the raw activation beside the unit.
     reading = session._sae_instrument.last_step_readings["sae/2"]  # type: ignore[index]
-    assert reading.coords == (0.5,)
-    assert reading.coords_per_layer == {1: (0.5,)}
+    assert reading.value == 0.5
+    assert reading.unit == "activation_over_max"
+    assert reading.per_layer == {1: 0.5}
 
 
 def test_live_sae_readout_seeds_topk_raw_values_for_pinned_probes() -> None:
@@ -193,7 +194,8 @@ def test_sae_probe_without_metadata_reads_raw_activation() -> None:
     session._sae_instrument.enable_live()
     session._live_sae_readout_step(top_k=1)
     reading = session._sae_instrument.last_step_readings["sae/1"]  # type: ignore[index]
-    assert reading.coords == (3.0,)
+    assert reading.value == 3.0
+    assert reading.unit == "raw_activation"
 
 
 def test_sae_gate_scalar_stashes_activations_for_live_step() -> None:
@@ -236,7 +238,9 @@ def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
     assert scalars["sae/2"] == pytest.approx(0.5)
     assert readout is not None
     assert session._sae_instrument.last_step_readings is not None
-    assert session._sae_instrument.last_step_readings["sae/2"].coords == pytest.approx((0.5,))
+    assert session._sae_instrument.last_step_readings["sae/2"].value == (
+        pytest.approx(0.5)
+    )
 
 
 def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
@@ -267,7 +271,9 @@ def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
     assert readout is not None
     assert seen_raw[0] == pytest.approx(0.2)
     assert session._sae_instrument.last_step_readings is not None
-    assert session._sae_instrument.last_step_readings["sae/0"].coords == pytest.approx((0.2,))
+    assert session._sae_instrument.last_step_readings["sae/0"].value == (
+        pytest.approx(0.2)
+    )
 
 
 def test_sae_probe_values_reuse_feature_selector_tensor() -> None:
@@ -288,8 +294,8 @@ def test_sae_probe_values_reuse_feature_selector_tensor() -> None:
     }
     second = session._sae_instrument.score_probes_from_activations(acts)
 
-    assert first["sae/1"].coords == second["sae/1"].coords
-    assert first["sae/2"].coords == second["sae/2"].coords
+    assert first["sae/1"].value == second["sae/1"].value
+    assert first["sae/2"].value == second["sae/2"].value
     assert first_ids
     assert {
         key: id(value)
@@ -717,8 +723,8 @@ def test_score_probes_entries_are_disjoint() -> None:
 
     from_slices = inst.score_probes(hidden)
     from_acts = inst.score_probes_from_activations(acts)
-    assert from_slices["sae/2"].coords == pytest.approx(
-        from_acts["sae/2"].coords,
+    assert from_slices["sae/2"].value == pytest.approx(
+        from_acts["sae/2"].value,
     )
     # A layer the resident hook does not cover reads nothing.
     assert inst.score_probes({7: hidden[1]}) == {}
@@ -765,8 +771,8 @@ def test_idle_observe_never_memoizes_stale_readings() -> None:
     assert run.bound is False
     first = run.observe(0, {1: torch.tensor([0.2, 3.0, 5.0, 1.0])})
     second = run.observe(0, {1: torch.tensor([0.2, 8.0, 5.0, 1.0])})
-    assert first["sae/1"].coords == (3.0,)
-    assert second["sae/1"].coords == (8.0,)
+    assert first["sae/1"].value == 3.0
+    assert second["sae/1"].value == 8.0
 
 
 @pytest.mark.parametrize("max_act", [float("nan"), float("inf")])

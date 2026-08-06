@@ -254,6 +254,16 @@ class GenerationResult:
     # Keyed by registered probe name; round-trips through ``to_dict`` as a
     # nested mapping.
     probe_readings: dict[str, "ProbeReading"] = field(default_factory=dict)
+    # The ``scope="aggregate"`` measurement envelope for this generation —
+    # the same versioned record the per-token frames carry, built once at
+    # finalize (``core/measurements.py``).  It keeps each family's NATIVE
+    # reading shape (geometry's full ``ProbeReading``, the single-axis
+    # families' ``ScalarReading`` with its unit and depth basis), which
+    # ``probe_readings`` above cannot: that field is the cross-family
+    # compatibility dict keyed by one reading type, and it is what the
+    # OpenAI / Ollama ``x-saklas-probe-readings`` vendor extension
+    # serializes.  ``None`` when nothing was measured.
+    measurements: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -269,6 +279,7 @@ class GenerationResult:
             "probe_readings": {
                 k: v.to_dict() for k, v in self.probe_readings.items()
             },
+            "measurements": self.measurements,
         }
 
 

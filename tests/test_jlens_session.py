@@ -2146,8 +2146,8 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     assert calls == 1
     assert stat_calls == 1
     assert s._lens_instrument.last_step_readings is not None
-    assert s._lens_instrument.last_step_readings["jlens/g"].coords[0] == pytest.approx(
-        scalars["jlens/g"],
+    assert s._lens_instrument.last_step_readings["jlens/g"].value == (
+        pytest.approx(scalars["jlens/g"])
     )
 
 
@@ -2558,11 +2558,11 @@ def test_score_probes_entries_are_disjoint_and_guarded() -> None:
     from_probs = inst.score_probes_from_rows(
         layers=layers, probabilities=readout_probabilities(logits),
     )
-    assert from_slices["jlens/g"].coords == pytest.approx(
-        from_logits["jlens/g"].coords,
+    assert from_slices["jlens/g"].value == pytest.approx(
+        from_logits["jlens/g"].value,
     )
-    assert from_logits["jlens/g"].coords == pytest.approx(
-        from_probs["jlens/g"].coords,
+    assert from_logits["jlens/g"].value == pytest.approx(
+        from_probs["jlens/g"].value,
     )
 
     with pytest.raises(ValueError, match="logits OR probabilities"):
