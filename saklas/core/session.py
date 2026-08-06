@@ -4647,8 +4647,9 @@ class SaklasSession:
         length directive is common-mode with the neutral corpus and with capture
         (it leads every system prompt), so it cancels at extraction.  Responses
         are emitted samples-outer / prompts-inner so ``response[i]`` aligns to
-        ``prompt[i % k]`` -- the alignment :func:`compute_node_centroid` and the
-        node corpus files assume.
+        ``prompt[i % k]`` -- the alignment
+        :func:`~saklas.core.manifold.compute_manifold_node_stats` and the node
+        corpus files assume.
 
         ``custom_system`` is the system template used for any concept whose
         ``kind`` is ``"custom"`` (``{c}`` = the humanized concept) -- the

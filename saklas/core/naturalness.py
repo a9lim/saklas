@@ -117,11 +117,11 @@ def compute_node_behavior_centroid(
 ) -> torch.Tensor:
     """Mean next-token probability distribution over a node's statements.
 
-    The behavior-space analogue of
-    :func:`~saklas.core.manifold.compute_node_centroid`: each statement is
-    run through the model and the softmax over the final-position logits is
-    taken; the per-statement distributions are averaged.  Returns a ``(V,)``
-    distribution in fp32 on CPU.
+    The behavior-space analogue of the activation centroids
+    :func:`~saklas.core.manifold.compute_manifold_node_stats` pools: each
+    statement is run through the model and the softmax over the final-position
+    logits is taken; the per-statement distributions are averaged.  Returns a
+    ``(V,)`` distribution in fp32 on CPU.
     """
     if not statements:
         raise ValueError("manifold node has no statements")
