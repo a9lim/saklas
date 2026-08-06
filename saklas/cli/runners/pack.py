@@ -7,8 +7,8 @@ import sys
 
 from saklas.cli.parsers import _PACK_VERBS
 from saklas.cli.runners.shared import (
-    _iter_manifold_folders, _resolve_manifold_ns_name, _saklas_error_exit,
-    _split_manifold_ns_name,
+    _iter_manifold_folders, _print_verb_menu, _resolve_manifold_ns_name,
+    _saklas_error_exit, _split_manifold_ns_name,
 )
 
 
@@ -197,6 +197,9 @@ def _run_pack_show(args: argparse.Namespace) -> None:
 def _run_pack_install(args: argparse.Namespace) -> None:
     from saklas.io.hf_manifolds import install_manifold
 
+    # Announce before the network call — hub progress bars are suppressed
+    # off-TTY, so without this the verb is silent while it downloads.
+    print(f"Installing {args.target}...", flush=True)
     dst = install_manifold(args.target, args.as_target, force=args.force)
     print(f"Installed {args.target} -> {dst}")
 
@@ -205,6 +208,9 @@ def _run_pack_search(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.hf_manifolds import search_manifolds
 
+    if not getattr(args, "json_output", False):
+        target = f" matching {args.query!r}" if args.query else ""
+        print(f"Searching Hugging Face for manifolds{target}...", flush=True)
     try:
         rows = search_manifolds(args.query or None)
     except ImportError as e:
@@ -256,6 +262,8 @@ def _run_pack_push(args: argparse.Namespace) -> None:
         print(f"manifold push: {e}", file=sys.stderr)
         sys.exit(2)
 
+    action = "Dry-run: resolving push of" if args.dry_run else "Pushing"
+    print(f"{action} {ns}/{name} to {coord}...", flush=True)
     try:
         repo_url, sha = push_manifold(
             folder, coord,
@@ -280,14 +288,19 @@ def _run_pack_rm(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import remove_manifold_folder
 
     ns, name = _resolve_manifold_ns_name(args.selector)
-    # Bundled (``default/``) manifolds re-materialize on next session
-    # init — mirror ``pack rm``'s confirmation guard for the broad/
-    # destructive case (here: a bundled folder the user likely didn't
-    # mean to nuke).  ``-y`` skips it.
-    if ns == "default" and not args.yes:
+    # Removal is irrecoverable for every namespace *except* bundled
+    # (``default/``), which re-materializes on the next session start — so
+    # the guard covers all of them, hardest-to-reproduce included (a
+    # ``local/`` manifold cost real extraction/fit time).  ``-y`` confirms.
+    # Same ``-y``-or-exit-2 idiom as ``template rm``.
+    if not args.yes:
+        tail = (
+            " (re-materializes on restart)" if ns == "default"
+            else " (this cannot be undone)"
+        )
         print(
-            f"refusing to remove bundled manifold {ns}/{name} "
-            f"(re-materializes on restart); pass --yes to confirm",
+            f"refusing to remove manifold {ns}/{name}{tail}; "
+            f"pass -y/--yes to confirm",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -385,16 +398,7 @@ def _run_pack(args: argparse.Namespace) -> None:
     """Dispatch ``saklas pack <verb>`` (the manifold lifecycle verbs)."""
     cmd = getattr(args, "pack_cmd", None)
     if cmd is None:
-        print("usage: saklas pack <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _PACK_VERBS)
-        for v, desc in _PACK_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas pack <verb> -h` for verb-specific options.")
+        _print_verb_menu("pack", _PACK_VERBS)
         sys.exit(0)
-    runner = _PACK_RUNNERS.get(cmd)
-    if runner is None:
-        print(f"unknown pack verb {cmd!r}", file=sys.stderr)
-        sys.exit(2)
-    runner(args)
+    # Registered-subparser invariant: argparse rejects an unknown verb.
+    _PACK_RUNNERS[cmd](args)

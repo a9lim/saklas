@@ -6,7 +6,9 @@ import argparse
 import sys
 
 from saklas.cli.parsers import _TEMPLATE_VERBS
-from saklas.cli.runners.shared import _saklas_error_exit, _split_manifold_ns_name
+from saklas.cli.runners.shared import (
+    _print_verb_menu, _saklas_error_exit, _split_manifold_ns_name,
+)
 
 
 def _normalize_context_entry(entry: object) -> dict[str, object]:
@@ -224,16 +226,7 @@ def _run_template(args: argparse.Namespace) -> None:
     """Dispatch ``saklas template <verb>`` (the templated-completion artifact)."""
     cmd = getattr(args, "template_cmd", None)
     if cmd is None:
-        print("usage: saklas template <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _TEMPLATE_VERBS)
-        for v, desc in _TEMPLATE_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas template <verb> -h` for verb-specific options.")
+        _print_verb_menu("template", _TEMPLATE_VERBS)
         sys.exit(0)
-    runner = _TEMPLATE_RUNNERS.get(cmd)
-    if runner is None:
-        print(f"unknown template verb {cmd!r}", file=sys.stderr)
-        sys.exit(2)
-    runner(args)
+    # Registered-subparser invariant: argparse rejects an unknown verb.
+    _TEMPLATE_RUNNERS[cmd](args)

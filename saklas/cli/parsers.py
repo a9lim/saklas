@@ -580,8 +580,17 @@ def _build_pack_push(push: argparse.ArgumentParser) -> None:
         "-m", "--model", default=None, metavar="MODEL_ID",
         help="Restrict the pushed tensors to one base model",
     )
-    push.add_argument("-p", "--private", action="store_true")
-    push.add_argument("-d", "--dry-run", action="store_true")
+    # Long-only, deliberately: `-p` is `--probes` and `-d` is `--device`
+    # everywhere else in the tree, and `pack push` is the one verb that
+    # publishes.  Muscle memory must not flip visibility or skip the upload.
+    push.add_argument(
+        "--private", action="store_true",
+        help="Create the target repo as private",
+    )
+    push.add_argument(
+        "--dry-run", action="store_true",
+        help="Resolve the coord and report what would be pushed",
+    )
     push.add_argument(
         "--variant", choices=["raw", "sae", "all"], default="raw",
         help="Which tensor variant(s) to push. Default: raw. (SAE variants "
@@ -593,7 +602,8 @@ def _build_pack_rm(rm: argparse.ArgumentParser) -> None:
     rm.add_argument("selector", help="Manifold name (or ns/name)")
     rm.add_argument(
         "-y", "--yes", action="store_true",
-        help="Skip the confirmation prompt for a bundled (default/) manifold",
+        help="Confirm removal (required — removal is irrecoverable outside "
+             "the bundled default/ namespace)",
     )
 
 
@@ -1128,12 +1138,16 @@ def _build_sae_parser(parser: argparse.ArgumentParser) -> None:
             child.add_argument("-d", "--device", default="auto")
             child.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
             child.add_argument("-j", "--json", dest="json_output", action="store_true")
-        elif verb in {"show", "rm"}:
+        elif verb == "show":
             child.add_argument("source", nargs="?", default=None,
                                help="local:NAME or saelens:RELEASE (default: active)")
             child.add_argument("-j", "--json", dest="json_output", action="store_true")
-            if verb == "rm":
-                child.add_argument("-y", "--yes", action="store_true")
+        elif verb == "rm":
+            # No ``-j``: removal reports one line of prose, matching
+            # ``lens rm``.  (``show`` needs JSON; ``rm`` never emitted any.)
+            child.add_argument("source", nargs="?", default=None,
+                               help="local:NAME or saelens:RELEASE (default: active)")
+            child.add_argument("-y", "--yes", action="store_true")
         elif verb == "use":
             child.add_argument("source", help="local:NAME or saelens:RELEASE")
         else:  # ls
@@ -1173,15 +1187,29 @@ def _build_experiment_fan(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
-        "-S", "--base-steering",
+        "-S", "--steer",
+        dest="base_steering",
         default=None,
         metavar="EXPR",
         help="Fixed steering expression composed under each grid row",
     )
+    # Historical spelling, same dest — kept working, kept out of --help so
+    # `-S/--steer` reads identically on every verb that takes one.
+    p.add_argument(
+        "--base-steering",
+        dest="base_steering",
+        default=None,
+        metavar="EXPR",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
     p.add_argument("-d", "--device", default="auto")
     p.add_argument("-p", "--probes", nargs="*", default=None)
-    p.add_argument("--max-tokens", type=_positive_int, default=256)
+    # ``None`` (not 256) so ``_load_effective_config`` can tell "unset" from
+    # an explicit ``--max-tokens 256``; the runner supplies 256 after the
+    # config merge.
+    p.add_argument("--max-tokens", type=_positive_int, default=None,
+                   help="Max generation tokens per grid row (default: 256)")
     p.add_argument("-j", "--json", dest="json_output", action="store_true")
     _add_injection_args(p)
     _add_logit_args(p)
@@ -1231,8 +1259,11 @@ def _build_experiment_transcript_parser(parser: argparse.ArgumentParser) -> None
         help="Probe categories (default: all)",
     )
     run.add_argument(
-        "--max-tokens", type=_positive_int, default=256,
-        help="Default max generation tokens per replay turn",
+        # ``None`` = unset, so YAML ``max_tokens:`` can fill it and an
+        # explicit value survives the config merge; the runner floors it
+        # at 256 afterwards.
+        "--max-tokens", type=_positive_int, default=None,
+        help="Default max generation tokens per replay turn (default: 256)",
     )
     _add_injection_args(run)
     _add_config_args(run)
@@ -1267,7 +1298,10 @@ def _build_experiment_naturalness(p: argparse.ArgumentParser) -> None:
         help="Also score a linear-chord steering baseline (the manifold "
              "term must be a single '%%' term)",
     )
-    p.add_argument("--max-tokens", type=_positive_int, default=128)
+    # ``None`` = unset (see ``experiment fan``); the runner floors it at 128
+    # after the config merge.
+    p.add_argument("--max-tokens", type=_positive_int, default=None,
+                   help="Max generation tokens per scored run (default: 128)")
     p.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
     p.add_argument("-d", "--device", default="auto")
     p.add_argument("-p", "--probes", nargs="*", default=None)

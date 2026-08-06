@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING, Any
 import saklas.cli.runners as _pkg
 from saklas.cli.parsers import _MANIFOLD_VERBS
 from saklas.cli.runners.shared import (
-    _resolve_manifold_folder, _resolve_manifold_ns_name, _saklas_error_exit,
-    _split_manifold_ns_name,
+    _print_verb_menu, _resolve_manifold_folder, _resolve_manifold_ns_name,
+    _saklas_error_exit, _split_manifold_ns_name,
 )
 from saklas.core.histogram import summarize_diagnostics
 from saklas.core.stats import median_or_zero
@@ -983,16 +983,8 @@ def _run_manifold(args: argparse.Namespace) -> None:
     """Dispatch ``saklas manifold <verb>`` (the compute verbs)."""
     cmd = getattr(args, "manifold_cmd", None)
     if cmd is None:
-        print("usage: saklas manifold <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _MANIFOLD_VERBS)
-        for v, desc in _MANIFOLD_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas manifold <verb> -h` for verb-specific options.")
+        _print_verb_menu("manifold", _MANIFOLD_VERBS)
         sys.exit(0)
-    runner = _MANIFOLD_RUNNERS.get(cmd)
-    if runner is None:
-        print(f"unknown manifold verb {cmd!r}", file=sys.stderr)
-        sys.exit(2)
-    runner(args)
+    # Every verb is a registered subparser, so argparse rejects an unknown
+    # one with its own "invalid choice" error before dispatch gets here.
+    _MANIFOLD_RUNNERS[cmd](args)

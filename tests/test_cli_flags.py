@@ -213,6 +213,91 @@ def test_cli_compile_overrides_yaml_compile_false(monkeypatch: pytest.MonkeyPatc
     assert args.compile is True
 
 
+# ---------------------------------------------------------------------------
+# --max-tokens: CLI wins, YAML fills gaps, runner default floors it
+# ---------------------------------------------------------------------------
+
+#: (argv-prefix, runner default) for every verb carrying its own --max-tokens.
+_MAX_TOKEN_VERBS = [
+    (["experiment", "fan", "m/x", "prompt", "-g", "a=0,1"], 256),
+    (["experiment", "transcript", "run", "t.yaml", "m/x"], 256),
+    (
+        [
+            "experiment", "naturalness", "m/x", "prompt",
+            "--manifold", "f", "-S", "0.5 a",
+        ],
+        128,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "argv,runner_default", _MAX_TOKEN_VERBS,
+    ids=["fan", "transcript-run", "naturalness"],
+)
+def test_cli_max_tokens_survives_effective_config(
+    argv: list[str], runner_default: int,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """An explicit ``--max-tokens N`` must reach the runner unchanged.
+
+    The shared helper was written for ``serve`` (no such flag) and used to
+    stamp the YAML value or a hardcoded 1024 over whatever the flag parsed.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    p = tmp_path / "setup.yaml"
+    p.write_text("max_tokens: 999\n")
+    args = cli.parse_args([*argv, "-c", str(p), "--max-tokens", "64"])
+    assert args.max_tokens == 64
+    cli_runners._load_effective_config(args, default_max_tokens=runner_default)
+    assert args.max_tokens == 64
+
+
+@pytest.mark.parametrize(
+    "argv,runner_default", _MAX_TOKEN_VERBS,
+    ids=["fan", "transcript-run", "naturalness"],
+)
+def test_yaml_max_tokens_fills_unset_flag(
+    argv: list[str], runner_default: int,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """With the flag unset, YAML fills the gap (the flag defaults to None)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    p = tmp_path / "setup.yaml"
+    p.write_text("max_tokens: 999\n")
+    args = cli.parse_args([*argv, "-c", str(p)])
+    assert args.max_tokens is None
+    cli_runners._load_effective_config(args, default_max_tokens=runner_default)
+    assert args.max_tokens == 999
+
+
+@pytest.mark.parametrize(
+    "argv,runner_default", _MAX_TOKEN_VERBS,
+    ids=["fan", "transcript-run", "naturalness"],
+)
+def test_runner_default_max_tokens_floors_unset_flag_and_yaml(
+    argv: list[str], runner_default: int,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """Neither CLI nor YAML supplied one — the runner's own default lands."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    args = cli.parse_args(argv)
+    cli_runners._load_effective_config(args, default_max_tokens=runner_default)
+    assert args.max_tokens == runner_default
+
+
+def test_serve_max_tokens_defaults_to_1024(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """``serve`` has no ``--max-tokens`` flag, so it always gets the helper's
+    own 1024 default (unchanged by the CLI-wins seeding)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    args = cli.parse_args(["serve", "google/gemma-2-2b-it"])
+    assert getattr(args, "max_tokens", None) is None
+    cli_runners._load_effective_config(args)
+    assert args.max_tokens == 1024
+
+
 def test_yaml_compile_invalid_type_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Reject non-boolean ``compile:`` values rather than coercing —
     ``compile: "true"`` (a string) would otherwise pass through as
@@ -1053,3 +1138,86 @@ def test_vector_extract_sae_requires_value():
         cli.parse_args([
             "manifold","extract", "honest.deceptive", "-m", "m", "--sae",
         ])
+
+
+# ---------------------------------------------------------------------------
+# experiment fan — sweep progress
+# ---------------------------------------------------------------------------
+
+class _FanSession:
+    """Minimal ``generate_sweep`` stand-in that drives ``on_result``."""
+
+    def __init__(self) -> None:
+        self.model_info = {"model_type": "fake", "num_layers": 1,
+                           "hidden_dim": 8, "vram_used_gb": 0.0}
+        self.probes = {}
+        self.on_result_arg: Any = "unset"
+
+    def generate_sweep(
+        self, _prompt: Any, sweep: dict[str, list[float]], **kwargs: Any,
+    ) -> Any:
+        from saklas.core.results import RunSet
+
+        self.on_result_arg = kwargs.get("on_result")
+        rows = [
+            {name: alpha for name, alpha in zip(sweep, combo, strict=True)}
+            for combo in _product(*sweep.values())
+        ]
+        results = [
+            SimpleNamespace(
+                token_count=7 + i, finish_reason="stop",
+                to_dict=lambda i=i: {"token_count": 7 + i},
+            )
+            for i in range(len(rows))
+        ]
+        if self.on_result_arg is not None:
+            for i, (result, row) in enumerate(zip(results, rows, strict=True)):
+                self.on_result_arg(i, result, row)
+        return RunSet(results, node_ids=[None] * len(rows), grid=rows, kind="fan")
+
+
+def _product(*lists: list[float]):
+    import itertools
+    return itertools.product(*lists)
+
+
+def _patch_fan_session(monkeypatch: pytest.MonkeyPatch) -> _FanSession:
+    session = _FanSession()
+    monkeypatch.setattr(
+        cli_runners, "_make_session", lambda _args, **_kw: session,
+    )
+    monkeypatch.setattr(cli_runners, "_print_model_info", lambda _s: None)
+    monkeypatch.setattr(cli_runners, "_print_startup", lambda _a: None)
+    monkeypatch.setattr(
+        cli_runners, "_load_effective_config", lambda _a, **_kw: None,
+    )
+    return session
+
+
+def test_experiment_fan_reports_progress_per_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+):
+    """A 6-row grid is 6 sequential generations; the runner must report each
+    completion rather than sit silent until the whole sweep finishes."""
+    session = _patch_fan_session(monkeypatch)
+    cli.main([
+        "experiment", "fan", "m/x", "prompt",
+        "-g", "a=0,0.5,1", "-g", "b=0,1",
+    ])
+    assert session.on_result_arg is not None
+    out = capsys.readouterr().out
+    assert "  1/6: a=+0.000, b=+0.000" in out
+    assert "  6/6: a=+1.000, b=+1.000" in out
+
+
+def test_experiment_fan_json_suppresses_progress(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+):
+    """``-j`` must leave stdout a single parseable document."""
+    import json as _json
+
+    session = _patch_fan_session(monkeypatch)
+    cli.main(["experiment", "fan", "m/x", "prompt", "-g", "a=0,1", "-j"])
+    assert session.on_result_arg is None
+    out = capsys.readouterr().out
+    assert _json.loads(out)["kind"] == "fan"

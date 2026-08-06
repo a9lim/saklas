@@ -226,7 +226,9 @@ def test_naturalness_preflight_does_not_hash_fitted_payloads(
         raise StopAfterPreflight
 
     monkeypatch.setattr(integrity, "hash_file", track_hash)
-    monkeypatch.setattr(runners, "_load_effective_config", lambda _args: None)
+    monkeypatch.setattr(
+        runners, "_load_effective_config", lambda _args, **_kw: None,
+    )
     monkeypatch.setattr(runners, "_print_startup", stop)
     with pytest.raises(StopAfterPreflight):
         runners._run_experiment_naturalness(Namespace(manifold=str(folder)))

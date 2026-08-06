@@ -7,7 +7,7 @@ import sys
 
 import saklas.cli.runners as _pkg
 from saklas.cli.parsers import _SAE_VERBS
-from saklas.cli.runners.shared import _saklas_error_exit
+from saklas.cli.runners.shared import _print_verb_menu, _saklas_error_exit
 
 
 def _load_sae_training_corpus(args: argparse.Namespace) -> tuple[list[str], str]:
@@ -103,6 +103,13 @@ def _run_sae_fetch(args: argparse.Namespace) -> None:
         args.model, device=args.device, quantize=args.quantize, probes=[],
     ) as session:
         _pkg._print_model_info(session)
+        if not args.json_output:
+            # Mirror ``lens fetch``: announce before the provider download,
+            # which is otherwise silent when hub progress bars are off.
+            print(
+                f"Fetching {args.source} into Hugging Face cache...",
+                flush=True,
+            )
         info = session.load_sae(release, layer=args.layer)
     if args.json_output:
         print(json.dumps({"model": args.model, "source": args.source, **info}, indent=2))
@@ -242,14 +249,7 @@ _SAE_RUNNERS = {
 def _run_sae(args: argparse.Namespace) -> None:
     cmd = getattr(args, "sae_cmd", None)
     if cmd is None:
-        print("usage: saklas sae <verb> [...]")
-        print()
-        width = max(len(verb) for verb, _ in _SAE_VERBS)
-        for verb, desc in _SAE_VERBS:
-            print(f"  {verb:<{width}}  {desc}")
+        _print_verb_menu("sae", _SAE_VERBS)
         sys.exit(0)
-    runner = _SAE_RUNNERS.get(cmd)
-    if runner is None:
-        print(f"unknown sae verb {cmd!r}", file=sys.stderr)
-        sys.exit(2)
-    runner(args)
+    # Registered-subparser invariant: argparse rejects an unknown verb.
+    _SAE_RUNNERS[cmd](args)
