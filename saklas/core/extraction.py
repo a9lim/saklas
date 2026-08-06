@@ -1941,7 +1941,6 @@ class ManifoldExtractionPipeline:
                 "capture_sha256": capture_sha,
                 "fitted_layers": list(fit_layers),
                 "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
-                "monopolar": True,
                 # The fold keeps the raw δ̂ basis (``concept − ν`` cancels
                 # common-mode like DiM by differencing), so the subspace is
                 # metric-free: ``subspace_metric`` is "euclidean" as a basis

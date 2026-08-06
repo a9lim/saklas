@@ -1785,13 +1785,18 @@ def test_run_manifold_show_json_uses_summary_keys(monkeypatch: pytest.MonkeyPatc
 
 
 def test_run_manifold_show_json_matches_summary_helper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    """CLI ``show -j`` output is byte-equivalent to ``manifold_summary``."""
+    """CLI ``show -j`` output is byte-equivalent to ``manifold_summary``.
+
+    ``show`` is an inspection surface, so it opts into the per-tensor
+    ``fitted`` block; the light listing surfaces do not.
+    """
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     folder = _author_circumplex_lite(tmp_path)
     from saklas.io import selectors
     selectors.invalidate()
     from saklas.io.manifolds import manifold_summary
-    expected = manifold_summary(folder)
+    expected = manifold_summary(folder, include_fits=True)
+    assert "fitted" in expected
     cli.main(["pack", "show", "local/moodlite", "-j"])
     out = capsys.readouterr().out
     assert _json.loads(out) == expected

@@ -84,6 +84,7 @@ from saklas.io.manifold_authoring import (
 from saklas.io.manifold_lifecycle import (
     TransferSourceProof,
     clear_manifold_tensors,
+    manifold_fit_summary,
     manifold_summary,
     preflight_transfer_manifold,
     refresh_manifold,
@@ -429,6 +430,7 @@ __all__ = [
     "TransferSourceProof",
     "preflight_transfer_manifold",
     "transfer_manifold",
+    "manifold_fit_summary",
     "manifold_summary",
     "domain_label",
     "bundled_manifold_names",

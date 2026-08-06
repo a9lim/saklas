@@ -30,6 +30,7 @@ from saklas.io.manifold_folder import (
     BakedManifoldError,
     ManifoldFolder,
     ManifoldFormatError,
+    ManifoldSidecar,
     domain_label,
     manifold_pair_lock,
     min_nodes,
@@ -865,7 +866,50 @@ def _transfer_manifold_locked(
 # ============================================================ shared summary serializer ===
 
 
-def manifold_summary(folder: Path) -> dict[str, Any]:
+def manifold_fit_summary(sidecar: ManifoldSidecar, stem: str) -> dict[str, Any]:
+    """Serialize one fitted tensor's sidecar for inspection surfaces.
+
+    The single per-tensor detail block behind ``pack show`` and the manifold
+    inspector.  Everything here is provenance the fit stamped and nothing
+    branches on at runtime, which is exactly why it needs a *reader*: an
+    ``auto`` fit's ``resolved_fit_mode`` / ``topology_winner`` /
+    ``topology_candidates`` are the ranked GCV + persistent-homology evidence
+    behind its flat-vs-curved-vs-periodic decision, and ``share_metric`` /
+    ``subspace_metric`` say how the share was weighted and the basis selected.
+    Empty/absent fields are omitted so an authored or pinned-discover fit
+    stays terse.
+
+    Metadata-only: one small sidecar JSON, no payload hashing.
+    """
+    entry: dict[str, Any] = {
+        "stem": stem,
+        "method": sidecar.method,
+        "feature_space": sidecar.feature_space,
+        "node_count": sidecar.node_count,
+        "nodes_sha256": sidecar.nodes_sha256,
+        "fit_mode": sidecar.fit_mode,
+        "fitted_layers": list(sidecar.fitted_layers),
+    }
+    for key, value in (
+        ("hyperparams", sidecar.hyperparams),
+        ("diagnostics", sidecar.diagnostics),
+        ("node_spread", sidecar.node_spread_per_layer),
+        ("share_metric", sidecar.share_metric),
+        ("subspace_metric", sidecar.subspace_metric),
+        ("resolved_fit_mode", sidecar.resolved_fit_mode),
+        ("topology_winner", sidecar.topology_winner),
+        ("topology_candidates", sidecar.topology_candidates),
+        ("rbf_smoothing", sidecar.rbf_smoothing_per_layer),
+        ("sigma_field", sidecar.sigma_field_per_layer),
+    ):
+        if value:
+            entry[key] = value
+    return entry
+
+
+def manifold_summary(
+    folder: Path, *, include_fits: bool = False,
+) -> dict[str, Any]:
     """Session-independent summary of a manifold folder.
 
     The shared serializer behind ``manifold show -j`` (CLI) and
@@ -885,10 +929,23 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
     summary).
 
     Returns a dict with keys: ``namespace`` / ``name`` / ``description`` /
-    ``source`` / ``tags`` / ``fit_mode`` / ``is_discover`` / ``domain`` /
-    ``domain_label`` / ``intrinsic_dim`` / ``min_nodes`` / ``node_count`` /
-    ``node_labels`` / ``node_coords`` / ``node_roles`` / ``hyperparams`` /
-    ``fitted_models`` / ``tensor_variants``.
+    ``source`` / ``tags`` / ``template_ref`` / ``fit_mode`` / ``is_discover`` /
+    ``domain`` / ``domain_label`` / ``intrinsic_dim`` / ``min_nodes`` /
+    ``node_count`` / ``node_labels`` / ``node_coords`` / ``node_roles`` /
+    ``node_kinds`` / ``hyperparams`` / ``fitted_models`` / ``tensor_variants`` /
+    ``fitted``.
+
+    ``template_ref`` is the standalone template a templated manifold derives
+    its corpus from (``None`` for a hand-authored folder) — the fact a user
+    needs before editing ``nodes/`` by hand, since the template is the
+    authoring source of truth and a re-derive would overwrite the edit.
+
+    ``fitted`` is present only under ``include_fits`` — one
+    :func:`manifold_fit_summary` block per fitted tensor *stem* (so SAE and
+    transferred variants each get their own), with unreadable sidecars
+    skipped rather than failing the whole summary.  It is opt-in because it costs one sidecar
+    read per fitted model: an inspection surface (``pack show``) wants it,
+    a listing that renders many folders does not.
 
     ``namespace`` is read off the folder's parent directory name.  Raises
     :class:`ManifoldFormatError` on a malformed folder.
@@ -926,12 +983,23 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
         if safe_model not in fitted_models:
             fitted_models.append(safe_model)
 
-    return {
+    fitted: list[dict[str, Any]] = []
+    if include_fits:
+        # ``tensor_models`` carries full stems, so SAE and transferred variants
+        # each get their own block rather than collapsing onto the base model.
+        for stem in mf.tensor_models():
+            try:
+                fitted.append(manifold_fit_summary(mf.sidecar(stem), stem))
+            except (KeyError, ManifoldFormatError, OSError):
+                continue
+
+    out: dict[str, Any] = {
         "namespace": namespace,
         "name": mf.name,
         "description": mf.description,
         "source": mf.source,
         "tags": list(mf.tags),
+        "template_ref": mf.template_ref,
         "fit_mode": mf.fit_mode,
         "is_discover": mf.is_discover,
         "domain": domain,
@@ -947,3 +1015,6 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
         "fitted_models": fitted_models,
         "tensor_variants": tensor_variants,
     }
+    if include_fits:
+        out["fitted"] = fitted
+    return out

@@ -680,6 +680,50 @@ def test_manifold_sidecar_topology_provenance_round_trips(tmp_path: Path):
     assert loaded.metadata["topology_winner"] == "flat-pca"
 
 
+def test_save_manifold_rejects_unknown_metadata_key(tmp_path: Path):
+    """A provenance key outside the schema must fail loudly, not vanish.
+
+    The canonical-shape assert after the copy loop catches a *missing* sidecar
+    field but is structurally blind to an extra one: extras are dropped before
+    it runs.  A fit author adding a key would get no error and no persisted
+    field.  The read-side ``_tensor_sha256`` annotation stays tolerated so a
+    load → transfer → save round-trip still works.
+    """
+    import torch
+    from saklas.core.manifold import (
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace,
+    )
+    from saklas.io.manifold_tensors import load_manifold, save_manifold
+
+    g = torch.Generator().manual_seed(0)
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
+    coords = torch.tensor([[0.0], [0.5], [1.0]])
+    sub, _ = fit_layer_subspace(torch.randn(3, 6, generator=g), domain.embed(coords))
+    man = Manifold(
+        name="unknownmeta", domain=domain, node_labels=["a", "b", "c"],
+        node_coords=coords, layers={4: sub}, mahalanobis_share={4: 1.0},
+        origin={4: torch.zeros(domain.intrinsic_dim)}, feature_space="sae-test",
+    )
+    sae_provenance = {
+        "sae_release": "test", "sae_revision": "rev-1",
+        "sae_fingerprint": "fingerprint", "sae_ids_by_layer": {"4": "mock-4"},
+    }
+    out = tmp_path / "unknownmeta.safetensors"
+    with pytest.raises(ValueError, match="unknown key"):
+        save_manifold(man, out, {
+            "method": "manifold_sae", "fit_mode": "authored",
+            "monopolar": True, **sae_provenance,
+        })
+    assert not out.exists()
+
+    save_manifold(man, out, {
+        "method": "manifold_sae", "fit_mode": "authored",
+        "_tensor_sha256": "0" * 64, **sae_provenance,
+    })
+    assert "_tensor_sha256" not in json.loads(out.with_suffix(".json").read_text())
+    assert load_manifold(out).name == "unknownmeta"
+
+
 # --------------------------------------------------- authoring (create/update) ---
 
 def _author_nodes(labels: list[str]) -> list[dict[str, Any]]:
@@ -2975,7 +3019,104 @@ def test_manifold_summary_reports_transfer_variant(
     assert summ["tensor_variants"][tgt_safe] == [
         f"from-{encode_release_id('src/m')}"
     ]
+    # The transfer provenance is on the per-tensor block, opt-in. It keys on
+    # the full tensor *stem*, so the variant gets its own entry.
+    assert "fitted" not in summ
+    detail = manifold_summary(folder, include_fits=True)
+    stems = {f["stem"]: f for f in detail["fitted"]}
+    variant_stem = f"{tgt_safe}_from-{encode_release_id('src/m')}"
+    assert set(stems) == {src_safe, variant_stem}
+    assert stems[variant_stem]["method"] == "manifold_procrustes_transfer"
+    assert stems[variant_stem]["share_metric"] == "mahalanobis"
 
+
+def test_manifold_summary_reports_template_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A templated manifold must be distinguishable from a hand-authored one.
+
+    Its corpus is a derived materialization whose authoring source of truth
+    lives in the template — exactly what a user needs to know before editing
+    ``nodes/`` by hand.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    from saklas.io.manifolds import create_manifold_from_template
+    from saklas.io.templates import create_template_folder
+
+    create_template_folder(
+        "local", "weekday", slot="[DAY]",
+        values=["Monday", "Tuesday", "Wednesday"],
+        contexts=[{
+            "turns": [{"role": "user", "content": "what day is it?"}],
+            "assistant": "today is [DAY]",
+        }],
+    )
+    plain = create_discover_manifold_folder(
+        "local", "handmade", "d", fit_mode="pca",
+        node_corpora={"a": ["x"], "b": ["y"], "c": ["z"]},
+    )
+    assert manifold_summary(plain)["template_ref"] is None
+
+    derived = create_manifold_from_template(
+        "local", "fromtmpl", "d", template_ref="weekday", fit_mode="pca",
+    )
+    assert manifold_summary(derived)["template_ref"] == "local/weekday"
+
+
+def test_manifold_fit_summary_surfaces_auto_topology_evidence(tmp_path: Path):
+    """An ``auto`` fit's flat-vs-curved evidence must be readable, not just stored.
+
+    ``resolved_fit_mode`` / ``topology_winner`` / ``topology_candidates`` are
+    the whole record of why ``select_topology`` chose the geometry it did;
+    they were written and schema-validated but no reader lifted them.
+    """
+    import torch
+    from saklas.core.manifold import (
+        BoxAxis, BoxDomain, Manifold, fit_layer_subspace,
+    )
+    from saklas.io.manifold_folder import ManifoldSidecar
+    from saklas.io.manifold_tensors import save_manifold
+    from saklas.io.manifolds import manifold_fit_summary
+
+    g = torch.Generator().manual_seed(0)
+    domain = BoxDomain([BoxAxis("t", periodic=False, lo=0.0, hi=1.0)])
+    coords = torch.tensor([[0.0], [0.5], [1.0]])
+    sub, _ = fit_layer_subspace(torch.randn(3, 6, generator=g), domain.embed(coords))
+    man = Manifold(
+        name="autotopo2", domain=domain, node_labels=["a", "b", "c"],
+        node_coords=coords, layers={4: sub}, mahalanobis_share={4: 1.0},
+        origin={4: torch.zeros(domain.intrinsic_dim)}, feature_space="sae-test",
+    )
+    candidates = [
+        {"name": "flat-pca", "fit_mode": "pca", "intrinsic_dim": 2,
+         "score": 12.5, "viable": True, "reason": None},
+    ]
+    out = tmp_path / "autotopo2.safetensors"
+    save_manifold(man, out, {
+        "method": "manifold_discover_auto", "fit_mode": "auto",
+        "resolved_fit_mode": "pca", "topology_winner": "flat-pca",
+        "topology_candidates": candidates,
+        "share_metric": "mahalanobis", "subspace_metric": "mahalanobis",
+        "sae_release": "test", "sae_revision": "rev-1",
+        "sae_fingerprint": "fingerprint", "sae_ids_by_layer": {"4": "mock-4"},
+    })
+
+    sc = ManifoldSidecar.load(out.with_suffix(".json"))
+    assert sc.resolved_fit_mode == "pca"
+    assert sc.topology_winner == "flat-pca"
+    assert [c["name"] for c in sc.topology_candidates] == ["flat-pca"]
+    assert sc.share_metric == "mahalanobis"
+    assert sc.subspace_metric == "mahalanobis"
+
+    entry = manifold_fit_summary(sc, "autotopo2")
+    assert entry["resolved_fit_mode"] == "pca"
+    assert entry["topology_winner"] == "flat-pca"
+    assert [c["name"] for c in entry["topology_candidates"]] == ["flat-pca"]
+    assert entry["share_metric"] == "mahalanobis"
+    assert entry["subspace_metric"] == "mahalanobis"
+    # Empty diagnostics stay omitted so a pinned/authored fit reads terse.
+    assert "rbf_smoothing" not in entry
+    assert "sigma_field" not in entry
 
 
 # --------------------------------------------- streaming discover writers ---

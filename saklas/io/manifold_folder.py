@@ -811,6 +811,32 @@ class ManifoldSidecar:
     # Per-node conceptual kind ("abstract"/"concrete"), ``node_labels`` order.
     # Mirrors ``node_roles``' independent-copy rationale; generation provenance.
     node_kinds: list[str | None] = field(default_factory=list)
+    # Metric labels: how the per-layer share was weighted and how the subspace
+    # basis was selected.  Both read ``"mahalanobis"`` on an ordinary fit; a
+    # monopolar fold labels its raw-δ̂ basis ``"euclidean"`` (a basis-selection
+    # label, not a metric fallback — ``concept − ν`` cancels common-mode by
+    # differencing, like DiM).
+    share_metric: Optional[str] = None
+    subspace_metric: Optional[str] = None
+    # Topology-selection evidence, stamped for ``fit_mode="auto"`` only (all
+    # three are ``None``/empty otherwise — the payload validator enforces that
+    # consistency).  ``resolved_fit_mode`` is the geometry ``select_topology``
+    # picked for *this* model (``pca`` flat / ``spectral`` curved),
+    # ``topology_winner`` names the winning candidate, and
+    # ``topology_candidates`` is the full ranked field — each
+    # ``{name, fit_mode, intrinsic_dim, score, viable, reason}`` — i.e. the GCV
+    # + persistent-homology evidence behind the flat-vs-curved-vs-periodic call.
+    resolved_fit_mode: Optional[str] = None
+    topology_winner: Optional[str] = None
+    topology_candidates: list[dict[str, Any]] = field(default_factory=list)
+    # Curved-fit per-layer summaries.  ``rbf_smoothing_per_layer``
+    # ``{L: {lambda, edf, gcv}}`` records the GCV-selected penalized-RBF
+    # smoothing; ``sigma_field_per_layer``
+    # ``{L: {sigma_mean, sigma_min, sigma_max, lambda}}`` summarizes the
+    # fuzzy-manifold tube thickness.  The σ-RBF tensors themselves ride the
+    # safetensors — these are the inspector summaries.  Empty on flat fits.
+    rbf_smoothing_per_layer: dict[str, Any] = field(default_factory=dict)
+    sigma_field_per_layer: dict[str, Any] = field(default_factory=dict)
 
     @property
     def evaluated_layers(self) -> list[int]:
@@ -853,87 +879,35 @@ class ManifoldSidecar:
             node_kinds=list(data["node_kinds"]),
             components=data["components"],
             bake_policy=data["bake_policy"],
+            share_metric=data["share_metric"],
+            subspace_metric=data["subspace_metric"],
+            resolved_fit_mode=data["resolved_fit_mode"],
+            topology_winner=data["topology_winner"],
+            topology_candidates=list(data["topology_candidates"]),
+            rbf_smoothing_per_layer=dict(data["rbf_smoothing_per_layer"]),
+            sigma_field_per_layer=dict(data["sigma_field_per_layer"]),
         )
 
 
 def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
-    """Read and validate the exact current fitted-manifold sidecar shape."""
+    """Read and validate the exact current fitted-manifold sidecar shape.
+
+    The reader half of :func:`validate_manifold_sidecar_payload` — one
+    validator gates writer and reader, so a sidecar that loads is exactly a
+    sidecar the writer could have produced.  Only the version check is hoisted
+    ahead of it: an artifact from an older format should say so rather than
+    report whichever field the current schema happens to miss first.
+    """
+    location = f"manifold sidecar {path}"
     try:
         with open(path) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} is unreadable: {exc}"
-        ) from exc
+        raise ManifoldFormatError(f"{location} is unreadable: {exc}") from exc
     if not isinstance(data, dict):
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} must be a JSON object"
-        )
-    validate_manifold_format_version(
-        data.get("format_version"), location=f"manifold sidecar {path}",
-    )
-    if set(data) != MANIFOLD_SIDECAR_FIELDS:
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} does not match the current exact schema"
-        )
-    validate_manifold_sidecar_payload(data, location=f"manifold sidecar {path}")
-    required_types: dict[str, type] = {
-        "name": str,
-        "method": str,
-        "saklas_version": str,
-        "domain": dict,
-        "node_count": int,
-        "node_labels": list,
-        "feature_space": str,
-        "fit_mode": str,
-        "hyperparams": dict,
-        "diagnostics": dict,
-        "node_spread_per_layer": dict,
-    }
-    for key, expected in required_types.items():
-        value = data.get(key)
-        if not isinstance(value, expected) or (
-            expected is int and isinstance(value, bool)
-        ):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} field {key!r} must be "
-                f"{expected.__name__}"
-            )
-    if data["fit_mode"] not in {
-        "authored", "pca", "spectral", "auto", "baked",
-    }:
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} has invalid "
-            f"fit_mode={data['fit_mode']!r}"
-        )
-    labels = data["node_labels"]
-    if any(not isinstance(label, str) for label in labels):
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} node_labels must contain only strings"
-        )
-    if data["node_count"] != len(labels):
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} node_count does not match node_labels"
-        )
-    for key in (
-        "sae_ids_by_layer", "hyperparams", "diagnostics",
-        "node_spread_per_layer", "mahalanobis_share_per_layer",
-        "origin_per_layer", "rbf_smoothing_per_layer", "sigma_field_per_layer",
-    ):
-        if not isinstance(data[key], dict):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} field {key!r} must be an object"
-            )
-    for key in ("fitted_layers", "node_roles", "node_kinds", "topology_candidates"):
-        if not isinstance(data[key], list):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} field {key!r} must be an array"
-            )
-    if len(data["node_roles"]) != len(labels) or len(data["node_kinds"]) != len(labels):
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} node provenance does not match node_labels"
-        )
-    return data
+        raise ManifoldFormatError(f"{location} must be a JSON object")
+    validate_manifold_format_version(data.get("format_version"), location=location)
+    return validate_manifold_sidecar_payload(data, location=location)
 
 
 @dataclass

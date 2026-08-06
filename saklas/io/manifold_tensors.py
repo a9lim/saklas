@@ -298,6 +298,57 @@ def _replace_manifold_file(source: Path, target: Path) -> None:
 
     os.replace(source, target)
 
+# Provenance the *fit* stamps into ``metadata`` and the writer copies straight
+# through to the sidecar.  All of it is informational — the runtime hot path
+# reads the tensor and never the sidecar — but each field is what lets a later
+# reader prove a cached fit is current, or lets `manifold show` / the webui
+# inspector explain how the fit was reached:
+#
+# - identity/staleness: ``nodes_sha256`` (corpus+geometry key), ``capture_sha256``,
+#   ``model_fingerprint``, ``fit_policy_version``;
+# - SAE-space fits: ``sae_release`` / ``sae_revision`` / ``sae_fingerprint`` /
+#   ``sae_ids_by_layer`` / ``sae_full_coverage``;
+# - metric labels: ``share_metric`` (share weighting) and ``subspace_metric``
+#   (``mahalanobis`` = whitened/Fisher PCA, ``euclidean`` = a raw-δ̂ basis);
+# - curved-fit summaries: ``rbf_smoothing_per_layer`` ``{L: {lambda, edf, gcv}}``
+#   and ``sigma_field_per_layer`` ``{L: {sigma_mean, sigma_min, sigma_max,
+#   lambda}}`` — the σ-RBF tensors themselves ride the safetensors;
+# - discover-mode: ``fit_mode`` + ``hyperparams`` + ``diagnostics`` (lifted by
+#   ``canonical_manifold_sidecar_payload``), plus, for ``fit_mode="auto"`` only,
+#   ``resolved_fit_mode`` / ``topology_winner`` / ``topology_candidates`` — the
+#   ranked GCV+persistence evidence behind the flat-vs-curved-vs-periodic call;
+# - per-node provenance aligned index-by-index with ``node_labels``:
+#   ``node_roles`` (``None`` = standard assistant baseline) and ``node_kinds``;
+# - baked merges: ``components`` / ``bake_policy``; cross-model transfers:
+#   ``source_model_id`` / ``source_model_fingerprint`` /
+#   ``transfer_quality_estimate`` (written in the initial sidecar so pair
+#   publication has no post-save patch crash window).
+#
+# Deliberately absent: everything the writer derives from the ``Manifold``
+# itself (identity, ``fitted_layers``, ``mahalanobis_share_per_layer``,
+# ``origin_per_layer``). Those are computed from the fitted object above and
+# must win over anything a caller happens to pass.
+_WRITER_PROVENANCE_KEYS = (
+    "nodes_sha256", "capture_sha256", "model_fingerprint", "fit_policy_version",
+    "sae_release", "sae_revision", "sae_fingerprint", "sae_ids_by_layer",
+    "sae_full_coverage",
+    "share_metric", "subspace_metric",
+    "rbf_smoothing_per_layer", "sigma_field_per_layer",
+    "resolved_fit_mode", "topology_winner", "topology_candidates",
+    "node_roles", "node_kinds",
+    "components", "bake_policy",
+    "source_model_id", "source_model_fingerprint", "transfer_quality_estimate",
+)
+
+# Read-side annotations ``_load_manifold_locked`` stamps onto a loaded
+# manifold's ``metadata`` that must never reach disk.  ``_tensor_sha256`` is the
+# digest the integrity manifest proved for the payload just read;
+# ``io.bake.merge_into_manifold`` consumes it as component provenance.  A
+# round-trip (load → transfer → save) carries them along, so the unknown-key
+# guard has to tolerate exactly these.
+_TRANSIENT_METADATA_KEYS = frozenset({"_tensor_sha256"})
+
+
 def save_manifold(
     manifold: Manifold, path: str | Path, metadata: dict[str, object],
 ) -> None:
@@ -323,6 +374,17 @@ def save_manifold(
         MANIFOLD_SIDECAR_FIELDS, canonical_manifold_sidecar_payload,
         validate_manifold_sidecar_payload,
     )
+
+    # A key outside the exact sidecar schema would be dropped before the
+    # canonical-shape assert below ever sees it, so that assert catches a
+    # *missing* field but is structurally blind to an extra one.  Reject up
+    # front: a fit author adding a provenance key must add it to the schema
+    # (a format-version bump) rather than watch it vanish silently.
+    unknown = set(metadata) - MANIFOLD_SIDECAR_FIELDS - _TRANSIENT_METADATA_KEYS
+    if unknown:
+        raise ValueError(
+            f"manifold writer metadata has unknown key(s): {sorted(unknown)}"
+        )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,70 +465,7 @@ def save_manifold(
             str(idx): [float(c) for c in o.reshape(-1).tolist()]
             for idx, o in manifold.origin.items()
         }
-    for key in (
-        "nodes_sha256", "sae_release", "sae_revision", "sae_fingerprint",
-        "sae_ids_by_layer",
-        "sae_full_coverage",
-        "model_fingerprint", "capture_sha256",
-        "fit_policy_version",
-        # Share-weighting metric ("mahalanobis" / "euclidean") — the
-        # manifold analogue of the vector sidecar's ``bake`` field.
-        "share_metric",
-        # PCA subspace-selection metric ("mahalanobis" => whitened/Fisher
-        # PCA, "euclidean" => ordinary centroid PCA).  Provenance only —
-        # the fitted basis is baked into the tensor, so the runtime hot
-        # path needs nothing from this field; surfaced by `manifold show`
-        # and the inspector.
-        "subspace_metric",
-        # Per-layer whitened between-node spread ``{str(L): tr(G_L)}`` — the
-        # concept's signal-concentration profile across the stack (the
-        # consensus Gram's per-layer summand traces).  Diagnostic only;
-        # surfaced by `manifold show`.
-        # Penalized-RBF provenance ``{str(L): {lambda, edf, gcv}}`` (curved
-        # discover fits) and the fuzzy-manifold σ-field summary
-        # ``{str(L): {sigma_mean, sigma_min, sigma_max, lambda}}`` (curved fits
-        # run with the within-node spread pass).  Diagnostic only — the σ-RBF
-        # tensors themselves ride the safetensors; these are the inspector
-        # summaries.  Absent on fits without them (load as empty dicts).
-        "rbf_smoothing_per_layer",
-        "sigma_field_per_layer",
-        # Discover-mode fields.  ``fit_mode`` discriminates authored vs
-        # discover at read time; ``hyperparams`` records the knobs the
-        # fitter was called with (max_dim / var_threshold / k_nn /
-        # bandwidth) for reproducibility; ``diagnostics`` carries the
-        # per-method PCA variance bars or spectral spectrum for the
-        # CLI / webui inspector.  All absent for authored fits.
-        # Topology-selection provenance (``fit_mode="auto"`` only): the
-        # geometry ``select_topology`` resolved to (``resolved_fit_mode`` ∈
-        # pca/spectral + the winning ``topology_winner`` name) and the full
-        # ranked candidate field (``topology_candidates`` — each
-        # ``{name, fit_mode, intrinsic_dim, score, viable, reason}``, the
-        # GCV scores behind the flat-vs-curved-vs-periodic decision).  Built
-        # in ``extraction.py``; absent for pinned (non-auto) discover and
-        # authored fits.
-        "resolved_fit_mode", "topology_winner", "topology_candidates",
-        # Per-node role-augmented fit metadata.  Aligned with
-        # ``node_labels`` index-by-index; ``None`` for a given node means
-        # "pooled under the standard assistant baseline" (the legacy
-        # shape, what every pre-role-differential manifold carries).
-        # Absent on non-role manifolds — the pipeline only stamps it
-        # when at least one node opts into role substitution.
-        "node_roles",
-        # Per-node conceptual kind ("abstract"/"concrete"), aligned with
-        # ``node_labels``.  Generation-time provenance (system template +
-        # elicitation role label); absent when no node carries a kind.
-        "node_kinds",
-        # Merge provenance ({coord: {alpha, tensor_sha256}}),
-        # carried on a ``fit_mode="baked"`` manifold produced by
-        # :func:`saklas.io.bake.merge_into_manifold`.  Informational only — a
-        # baked manifold never re-fits, so nothing branches on it; surfaced
-        # by the inspector. Absent on every non-merge fit.
-        "components", "bake_policy",
-        # Cross-model transfer provenance. Persisted in the initial sidecar so
-        # pair publication has no post-save patch crash window.
-        "source_model_id", "source_model_fingerprint",
-        "transfer_quality_estimate",
-    ):
+    for key in _WRITER_PROVENANCE_KEYS:
         if key in metadata:
             sidecar[key] = metadata[key]
 
