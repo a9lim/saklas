@@ -48,6 +48,18 @@ class TokenProbePayload:
     sae_readings: dict[str, ScalarReading] | None = None
 
     @property
+    def has_readings(self) -> bool:
+        """Whether any family slot is populated — the cheap guard.
+
+        Distinct from :attr:`all_readings` on purpose: the per-token payload
+        gate must not pay for the cross-family ``ProbeReading`` projection
+        just to answer "is there anything here".
+        """
+        return bool(
+            self.geometry_readings or self.lens_readings or self.sae_readings
+        )
+
+    @property
     def all_readings(self) -> dict[str, ProbeReading]:
         """The three family slots merged into one ``ProbeReading`` dict.
 

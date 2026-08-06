@@ -14,6 +14,7 @@ from saklas.core.generation import (
     _PenaltyState,
     generate_steered,
 )
+from saklas.core.instruments.types import ScalarReading
 from saklas.core.results import GenerationResult, ProbeReading
 from saklas.core.sampling import SamplingConfig
 from saklas.core.session import (
@@ -25,6 +26,7 @@ from saklas.core.session import (
     SaklasSession,
 )
 from saklas.core.steering import Steering
+from saklas.core.token_payloads import TokenProbePayload
 
 
 class _StopTokenizer:
@@ -860,7 +862,9 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     result = GenerationResult(
         text="ok", tokens=[7], token_count=1, tok_per_sec=1.0, elapsed=1.0,
     )
-    reading = ProbeReading(0.0, [], coords=(0.7,))
+    # A pinned SAE probe reads the family's native one-channel shape; the
+    # compat ``ProbeReading`` projection happens at the stream consumer.
+    reading = ScalarReading(value=0.7, unit="raw_activation")
     flags: dict[str, bool] = {}
     # The readout-suppression mechanism now lives at the tap: ``live_readouts``
     # gates the consumer's ``lens_readout`` / ``sae_readout`` compute flags, so
@@ -876,7 +880,9 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
         on_token = kwargs["on_token"]
         flags["lens"] = on_token.options.lens_readout
         flags["sae"] = on_token.options.sae_readout
-        session._last_token_probe_readings = {"sae/0": reading}
+        session._last_token_payload = TokenProbePayload(
+            sae_readings={"sae/0": reading},
+        )
         session._last_token_probe_payload = {"measurements": envelope}
         on_token("ok", False, 7, None, None, None)
         return result
@@ -889,7 +895,7 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     session._lens_instrument.probes = {}
     session._sae_instrument.probes = {"sae/0": {"feature_id": 0}}
     session._last_token_probe_payload = {}
-    session._last_token_probe_readings = None
+    session._last_token_payload = None
     session._generate_core = _fake_generate_core
 
     events = list(session.generate_stream(
@@ -897,7 +903,9 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     ))
 
     assert flags == {"lens": False, "sae": False}
-    assert events[0].probe_readings == {"sae/0": reading}
+    assert events[0].probe_readings == {
+        "sae/0": reading.to_probe_reading(),
+    }
     assert events[0].measurements is envelope
 
 

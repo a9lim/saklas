@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     from saklas.core.instruments.sae import SaeInstrument
     from saklas.core.scoring import ChoiceScores
     from saklas.core.steering_composer import SteeringComposer
+    from saklas.core.token_payloads import TokenProbePayload
     from saklas.io.templates import TemplateFolder
 from saklas.core.triggers import Trigger
 
@@ -1291,7 +1292,11 @@ class SaklasSession:
         # keeps the live objects so ``generate_stream`` can populate
         # ``TokenEvent.probe_readings`` (the compat vendor-extension / traits
         # channel) without reconstructing them from the envelope.
-        self._last_token_probe_readings: dict[str, "ProbeReading"] | None = None
+        # The token tap's payload, retained UN-PROJECTED: the cross-family
+        # ``ProbeReading`` dict (``all_readings``) is the compat channel for
+        # ``TokenEvent.probe_readings``, so it is built at the stream
+        # consumer, not per token in the tap.
+        self._last_token_payload: "TokenProbePayload | None" = None
 
         # Probe content-hash cache for transcript export / replay.
         # Keyed by probe name → sha256 hex of the baked tensor
@@ -5616,7 +5621,7 @@ class SaklasSession:
                         # longer live.
                         self._active_gen_reservation = None
                         self._last_token_probe_payload = None
-                        self._last_token_probe_readings = None
+                        self._last_token_payload = None
                     finally:
                         # Run closure and capture-state resets must survive a
                         # teardown failure above (a raising hook detach must
@@ -8908,7 +8913,7 @@ class SaklasSession:
                 # the public six-argument TokenCallback shape (invoked below).
                 nonlocal mean_logprob_sum, mean_logprob_count
                 self._last_token_probe_payload = None
-                self._last_token_probe_readings = None
+                self._last_token_payload = None
                 if logprobs_list is not None and tid is not None and tid >= 0 and not is_thinking:
                     logprobs_list.append((tid, lp if lp is not None else 0.0, top_alts or []))
                 if lp is not None and tid is not None and tid >= 0 and not is_thinking:
@@ -9005,13 +9010,13 @@ class SaklasSession:
                         and (
                             payload.scores
                             or payload.per_layer_scores
-                            or payload.all_readings
+                            or payload.has_readings
                         )
                     )
                 ):
                     if payload is None:
                         payload = TokenProbePayload()
-                    self._last_token_probe_readings = payload.all_readings or None
+                    self._last_token_payload = payload
                     recipe_steering = None
                     if assistant_node_id is not None:
                         node = self.tree.nodes.get(assistant_node_id)
@@ -9617,18 +9622,24 @@ class SaklasSession:
             probe_readings: dict[str, "ProbeReading"] | None = None
             # Monitor probes AND pinned lens/SAE probes (readout channels) all
             # land in the merged per-family readings — a lens-only roster still
-            # carries per-token readings while the live lens is on.  This is the
-            # ``TokenEvent.probe_readings`` compat channel (the OpenAI/Ollama
-            # vendor extension), kept as live :class:`ProbeReading` objects; the
-            # serialized envelope rides ``measurements``.
+            # carries per-token readings while the live lens is on.  This is
+            # the ``TokenEvent.probe_readings`` compat channel (the
+            # OpenAI/Ollama vendor extension), kept as live
+            # :class:`ProbeReading` objects; the serialized envelope rides
+            # ``measurements`` with each family's NATIVE reading shape.
+            #
+            # The single-axis families' ``ScalarReading -> ProbeReading``
+            # projection happens HERE, per stream consumer — never in the
+            # token tap, so a generation nobody streams pays nothing for a
+            # compatibility shape nobody reads.
             if live_scores and (
                 self._monitor.probe_names
                 or self._lens_instrument.probes
                 or self._sae_instrument.probes
             ):
-                raw_readings = self._last_token_probe_readings
-                if isinstance(raw_readings, dict) and raw_readings:
-                    probe_readings = raw_readings
+                last_payload = self._last_token_payload
+                if last_payload is not None and last_payload.has_readings:
+                    probe_readings = last_payload.all_readings
             event = TokenEvent(
                 text=text, token_id=tid if tid is not None else -1, index=idx_counter[0],
                 thinking=is_thinking, logprob=lp, top_alts=top_alts,
