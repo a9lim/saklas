@@ -505,7 +505,7 @@ class ReadDemand:
     gated" demand a bare capture attach wants.
 
     - ``need_per_token`` — anything consumes a per-token reading (a probe
-      gate, a loom token row, a trait stream, a live-scores client).  False
+      gate, a loom token row, a live-scores client).  False
       means aggregate-only: a bounded tail ring, no per-token scoring, one
       pooled read at finalize.
     - ``per_token_full_consumer`` — a per-token consumer wants the FULL
@@ -1302,12 +1302,6 @@ class SaklasSession:
         # :meth:`_probe_hash`.
         self._probe_hash_cache: dict[str, str] = {}
 
-        # Live trait SSE subscribers.  Each entry is (event_loop, asyncio.Queue).
-        # The generation thread pushes tagged tuples via loop.call_soon_threadsafe;
-        # SSE handlers drain the queue asynchronously.
-        self._trait_queues: list[tuple[Any, ...]] = []
-        self._trait_lock = threading.Lock()
-
         # Ensure bundled concepts are materialized in the user cache and the
         # selector index reflects them.  ``_bootstrap_manifold_probes`` does
         # this transitively via ``load_default_manifolds``, but is skipped
@@ -1745,18 +1739,6 @@ class SaklasSession:
         roles, no chat bubbles, the whole buffer is a prefill.
         """
         return detect_base_model(self._tokenizer)
-
-    # -- Live trait SSE subscribers --
-
-    def register_trait_queue(self, loop: Any, q: Any) -> None:
-        """Register an ``(event_loop, asyncio.Queue)`` pair for live trait events."""
-        with self._trait_lock:
-            self._trait_queues.append((loop, q))
-
-    def unregister_trait_queue(self, loop: Any, q: Any) -> None:
-        """Remove a previously registered trait queue."""
-        with self._trait_lock, suppress(ValueError):
-            self._trait_queues.remove((loop, q))
 
     # -- Neutral baseline (v2.1) --
 
@@ -5871,7 +5853,6 @@ class SaklasSession:
         live_scores_on: bool,
         has_monitor_probes: bool,
         loom_attached: bool,
-        has_trait_consumer: bool,
         wants_live_token_scores: bool,
         persists_layer_scores: bool,
         persists_probe_row: bool,
@@ -5895,14 +5876,13 @@ class SaklasSession:
         sae_gating_probe_keys = (
             composer.gated_sae_probe_keys() if needs_gating else None
         )
-        # The five UI / trait / loom / persist consumers each need a per-token
+        # The four UI / loom / persist consumers each need a per-token
         # reading for the FULL roster.  When NONE of them is live but a probe
         # gate is, gating is the SOLE per-token consumer: the step sink can
         # score just the gated probes per token and leave the big-K roster to
         # the one-shot full aggregate at finalize.
         per_token_full_consumer = bool(
             (live_scores_on and loom_attached)
-            or has_trait_consumer
             or wants_live_token_scores
             or persists_layer_scores
             or persists_probe_row
@@ -5920,7 +5900,7 @@ class SaklasSession:
             else None
         )
         # Lean-incremental: the live consumers present read ONLY the axis-0
-        # coord (the SSE trait stream, the loom probe row, the loom node
+        # coord (the loom probe row, the loom node
         # text/aggregate) — none of the consumers that genuinely need a richer
         # per-token reading is live, and there is no probe gate.  Then
         # per-token scoring drops the nearest / assignment / per-layer work
@@ -6131,7 +6111,7 @@ class SaklasSession:
             and demand.need_per_token and demand.lean_per_token
         ):
             # Lean-incremental: the only per-token consumers read just
-            # the axis-0 coord (the trait stream / loom probe row) — no nearest /
+            # the axis-0 coord (the loom probe row) — no nearest /
             # assignment / per-layer trace, no probe gate.  Score each token
             # ``coords_only`` (skips the big-K nearest norm + assignment softmax +
             # per-layer host reconstruction), store the lean rows for the per-token
@@ -9087,7 +9067,6 @@ class SaklasSession:
             # — i.e. the loom path or an explicit logprobs request).
             mean_logprob_sum: float = 0.0
             mean_logprob_count: int = 0
-            trait_token_counter = [0]
             # CAA live toggle: when off, every per-token monitor consumer is
             # masked at the source — generations run aggregate-only capture
             # (probes still report the end-of-gen aggregate) and only probe
@@ -9149,7 +9128,6 @@ class SaklasSession:
                     and _has_monitor_probes
                     and (
                         assistant_node_id is not None
-                        or _has_trait_consumer
                         or _wants_live_token_scores
                         or _persists_subspace_coords
                     )
@@ -9308,31 +9286,18 @@ class SaklasSession:
                     )
                 if on_token is not None:
                     on_token(text, is_thinking, tid, lp, top_alts, perplexity)
-                # Inline per-token scoring for live SSE trait subscribers.
-                if self._trait_queues and _has_monitor_probes and scores:
-                    event = ("token", trait_token_counter[0], text, is_thinking, scores)
-                    trait_token_counter[0] += 1
-                    with self._trait_lock:
-                        for lp_ref, q in list(self._trait_queues):
-                            with suppress(Exception):
-                                lp_ref.call_soon_threadsafe(q.put_nowait, event)
 
             # Pass _token_tap into generate_steered only when at least one of its
             # branches is live: caller-supplied on_token, logprobs collection, or
-            # live trait subscribers.  When all three are inactive, _token_tap
+            # the loom probe row.  When all are inactive, _token_tap
             # would be a no-op called once per generated token, AND its presence
             # forces generate_steered to compute the unconditional fp32
             # log_softmax + entropy sync per step (gate at generation.py:571).
             # Skipping it here trims that cost from the stateless prefill
             # workload (800 back-to-back gens of ~16 tokens each, no logprobs,
-            # no streaming, no SSE).  Stop-sequence behavior is preserved by
+            # no streaming).  Stop-sequence behavior is preserved by
             # not wiring _token_tap=None when stop_list is set — the tokenizer-
             # decode + stop-match in generation.py only runs under on_token.
-            _has_trait_consumer = bool(
-                _live_scores_on
-                and self._trait_queues
-                and _has_monitor_probes
-            )
             # The tap also writes per-token ``probes`` / ``per_layer_scores``
             # onto the loom row when probes are loaded and the gen is loom-
             # attached — required so a webui refresh can rehydrate highlight
@@ -9346,7 +9311,6 @@ class SaklasSession:
             _need_tap = (
                 on_token is not None
                 or logprobs_list is not None
-                or _has_trait_consumer
                 or _persists_probe_row
                 or stop_list is not None
             )
@@ -9364,7 +9328,6 @@ class SaklasSession:
             _tap_has_text_consumer = bool(
                 on_token is not None
                 or (logprobs_list is not None and (lp_count or 0) > 0)
-                or _has_trait_consumer
                 or _persists_probe_row
             )
 
@@ -9493,8 +9456,8 @@ class SaklasSession:
             )
             # Fold every consumer of this generation into one read demand.
             # Per-token scoring is only needed when something consumes a
-            # per-token reading: a probe gate, a loom token row, an SSE trait
-            # stream, a live-scores client, or a per-layer-heatmap persist.
+            # per-token reading: a probe gate, a loom token row,
+            # a live-scores client, or a per-layer-heatmap persist.
             # Otherwise (probes attached but only the aggregate wanted, e.g. a
             # stateless server gen) the capture skips per-token scoring
             # entirely and pools the aggregate once at finalize.
@@ -9503,7 +9466,6 @@ class SaklasSession:
                 live_scores_on=_live_scores_on,
                 has_monitor_probes=_has_monitor_probes,
                 loom_attached=assistant_node_id is not None,
-                has_trait_consumer=_has_trait_consumer,
                 wants_live_token_scores=_wants_live_token_scores,
                 persists_layer_scores=_persists_layer_scores,
                 persists_probe_row=_persists_probe_row,
@@ -9865,8 +9827,8 @@ class SaklasSession:
             # Monitor probes AND pinned lens/SAE probes (readout channels) all
             # land in the merged per-family readings — a lens-only roster still
             # carries per-token readings while the live lens is on.  This is the
-            # ``TokenEvent.probe_readings`` compat channel (vendor extension /
-            # traits SSE), kept as live :class:`ProbeReading` objects; the
+            # ``TokenEvent.probe_readings`` compat channel (the OpenAI/Ollama
+            # vendor extension), kept as live :class:`ProbeReading` objects; the
             # serialized envelope rides ``measurements``.
             if live_scores and (
                 self._monitor.probe_names
@@ -9976,8 +9938,6 @@ class SaklasSession:
         if len(prompts) < 2 or not stateless:
             return None
         if self._batch_fast_sampling_blocked(sampling):
-            return None
-        if self._trait_queues:
             return None
         return_probe_readings = bool(
             sampling is None or sampling.return_probe_readings

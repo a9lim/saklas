@@ -32,7 +32,7 @@ class CaptureMode(Enum):
     - ``INCREMENTAL`` — a full-reading live consumer wants per-token readings:
       score each token live (full roster) into ``_incremental_readings``.
     - ``LEAN_INCREMENTAL`` — the only per-token consumers read axis-0 coords
-      (trait stream / loom probe row): score each token ``coords_only`` and
+      (the loom probe row): score each token ``coords_only`` and
       re-score the full aggregate once at finalize from a bounded tail ring.
     - ``AGGREGATE_ONLY`` — nothing consumes a per-token reading (a stateless
       server gen, or a lens/SAE-only capture with no monitor probes): NO

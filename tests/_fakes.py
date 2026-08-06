@@ -24,7 +24,6 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-import threading
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -69,13 +68,6 @@ def make_mock_session(**overrides: Any) -> Any:
 
     session.lock = asyncio.Lock()
     session.build_readings.return_value = {}
-
-    # Trait queue infrastructure — minimal stubs (real logic stays in
-    # test_saklas_api.py which overrides these with the actual callbacks).
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
-    session.register_trait_queue = lambda *_a, **_kw: None
-    session.unregister_trait_queue = lambda *_a, **_kw: None
 
     # Minimal events stub so routes that call ``events.subscribe`` don't error.
     session.events = MagicMock()

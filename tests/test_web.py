@@ -12,7 +12,6 @@ artifact under test.
 from __future__ import annotations
 
 import asyncio
-import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -84,11 +83,6 @@ def _mock_session_with_vectors(vectors: dict[str, Profile]):
     session._gen_state.finish_reason = "stop"
     session.whitener = _IdentityWhitener()
     session.lock = asyncio.Lock()
-
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
-    session.register_trait_queue = lambda loop, q: session._trait_queues.append((loop, q))
-    session.unregister_trait_queue = lambda loop, q: None
 
     session.events = MagicMock()
     session.events.subscribe = lambda cb: (lambda: None)

@@ -928,8 +928,6 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
         end_live=lambda: None,
     )
     session._live_probe_scores = True
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
     composer = SimpleNamespace(
         _stack=[],
         steering_needs_probe_gating=lambda: False,
@@ -2075,7 +2073,6 @@ def _resolve_demand(*, gated: bool = False, **kwargs: Any) -> ReadDemand:
         live_scores_on=True,
         has_monitor_probes=True,
         loom_attached=False,
-        has_trait_consumer=False,
         wants_live_token_scores=False,
         persists_layer_scores=False,
         persists_probe_row=False,

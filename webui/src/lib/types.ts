@@ -909,24 +909,6 @@ export interface PairwiseCompareResponse {
   model: string | null;
 }
 
-// ----------------------------------------------------- traits SSE --
-
-export type TraitsEvent =
-  | { type: "start"; generation_id: string }
-  | {
-      type: "token";
-      idx: number;
-      text: string;
-      thinking: boolean;
-      probes: Record<string, number>;
-    }
-  | {
-      type: "done";
-      generation_id: string | null;
-      finish_reason: string;
-      aggregate: Record<string, number>;
-    };
-
 // ----------------------------------------------------- WS protocol --
 
 export interface WSSampling {

@@ -103,10 +103,6 @@ class _StubSession:
 
         self.lock = asyncio.Lock()
 
-        # Trait queue infrastructure (used by SSE traits/stream endpoint).
-        self._trait_queues = []
-        self._trait_lock = threading.Lock()
-
         self._next_token_stream: list[str] = ["hi"]
         self._fail_next: bool = False
         self._block_until_stop = False
@@ -127,17 +123,6 @@ class _StubSession:
 
     def probe_hashes(self) -> dict[str, str]:
         return {}
-
-    def register_trait_queue(self, loop: Any, q: Any) -> None:
-        with self._trait_lock:
-            self._trait_queues.append((loop, q))
-
-    def unregister_trait_queue(self, loop: Any, q: Any) -> None:
-        with self._trait_lock:
-            try:
-                self._trait_queues.remove((loop, q))
-            except ValueError:
-                pass
 
     def stop(self) -> None:
         self._stop_event.set()

@@ -1404,7 +1404,7 @@ class Monitor:
             seen.update(ent["cols_list"])
             if coords_only:
                 # A live consumer that reads only the axis-0 coord /
-                # fraction (the trait stream, the loom probe row) doesn't need the
+                # fraction (the loom probe row) doesn't need the
                 # nearest-distance norm over ``Kmax`` candidates, the assignment
                 # softmax, or the host-side per-layer trace reconstruction — skip
                 # them.  The full aggregate (which DOES need them) is re-scored

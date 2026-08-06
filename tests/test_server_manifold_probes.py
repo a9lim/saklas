@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import time
 from typing import Any, Callable
 from unittest.mock import MagicMock
@@ -155,9 +154,6 @@ def _mock_session():
 
     session.build_readings.return_value = {}
     session.lock = asyncio.Lock()
-
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
     return session
 
 
