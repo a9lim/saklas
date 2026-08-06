@@ -120,11 +120,25 @@ classifies subspace-vs-manifold on; `node_coords` backs the 2-D mini-map.
 ```
 webui/src/
   main.ts                     # bootstrap: mount <App />, install the tooltip layer
-  App.svelte                  # shell + drawer host; NARROW_DRAWERS size class
+  App.svelte                  # shell + drawer host; renders the DRAWERS registry row
   lib/
     api.ts                    # typed REST + WS + SSE clients; ApiError + describeError
-    stores.svelte.ts          # runes-based shared state + cross-cutting WS/tree/chat state
-    stores/                   # slices: drawers, inputHistory, palette, preparations, toasts
+    stores.svelte.ts          # THE barrel: re-exports every stores/ slice, nothing else
+    stores/                   # one slice per concern; slices import each other directly
+      session.svelte.ts       # the mirror of GET /sessions/current
+      sampling.svelte.ts      # sampling controls + the wire payload they build
+      steering.svelte.ts      # the unified steer rack (subspace / manifold / atom terms)
+      probes.svelte.ts        # the unified probe rack + the transcript-highlight target
+      instruments.svelte.ts   # lens / SAE / geometry live state, sources, preparations
+      ws.svelte.ts            # the singleton socket, its dispatcher, the send primitives
+      loom.svelte.ts          # the client mirror of the server's LoomTree
+      loomUi.svelte.ts        # threads column: modals, edge labels, filter, selection
+      chat.svelte.ts          # the chat-log projection + per-generation counters
+      ab.svelte.ts            # the A/B shadow generation + auto-regen recipe-override
+      pending.svelte.ts       # the deferred-mutation queue
+      persistence.svelte.ts   # the localStorage half of the presentation preferences
+      bootstrap.svelte.ts     # the mount-time fan-out over all of the above
+      drawers, inputHistory, palette, preparations, toasts
     types.ts                  # shared wire + UI interfaces; DrawerName union
     highlight.ts              # THE per-token highlight implementation (score lookup + style)
     tokens.ts                 # pure ramp math: HIGHLIGHT_SAT, scoreToRgb, two-stripe/blend
@@ -132,7 +146,7 @@ webui/src/
     expression.ts             # serialize the steer rack to a steering expression
     readouts.ts               # the one shared readout top-k resolution
     concepts.ts               # concept-catalog helpers (category / poles / recommended α)
-    commands.ts               # ⌘K registry: RAIL_CATEGORIES + paletteCommands()
+    commands.ts               # ⌘K index: paletteCommands() over the drawer registry
     tooltips.ts               # delegated tooltip layer; `title` stays the authoring API
     charts/{Bar,Sparkline,HeatmapCell}.svelte
     charts/probeGeometry.ts   # hand-rolled canvas renderer for the probe-inspector plot
@@ -178,6 +192,11 @@ webui/src/
      TokenDrilldown,Correlation,Compare,NodeCompare,Transcript,SaveConversation,
      LoadConversation,Cast,SystemPrompt,AdvancedSampling,Health,SessionAdmin,
      Help}Drawer.svelte
+    manifold/                 # builder internals (ManifoldBuilderDrawer is the shell)
+      shared.ts               # identity slugs + the shared discover tuning/hyperparams
+      form.css                # the builder's field/step/node rules, scoped `.mb-form`
+      FitMethodPicker.svelte, DiscoverTuningFields.svelte
+      {Authored,Discover,Templated}Form.svelte
     token/                    # drilldown internals (TokenDrilldownDrawer is the shell)
       cursor.ts               # conversation-walking cursor: segments, step/jump/clamp
       readout.svelte.ts       # ReplayReadout — one captured-or-replay resource per family
@@ -186,8 +205,17 @@ webui/src/
       DetailCardHeader.svelte, DetailSection.svelte, EvidenceChips.svelte
       TokenRibbon.svelte, PinnedReadings.svelte, EmptyState.svelte
       {Geometry,Logits,Sae,Lens}Tab.svelte
-    index.ts                  # barrel re-exports for App.svelte's drawer switch
+    index.ts                  # THE drawer registry: Record<DrawerName, DrawerEntry>
 ```
+
+`lib/stores.svelte.ts` is a re-export barrel and nothing else — every component
+keeps importing `from "./lib/stores.svelte"` and sees one flat surface, while the
+state lives one slice per concern under `lib/stores/`. Slices import each other
+*directly*, never through the barrel: the graph is genuinely cyclic in places
+(loom ↔ ws, chat ↔ pending), which ES modules handle because every cross-slice
+reference happens inside a function body — no module-level initializer reads an
+imported binding. When adding state, add a slice and a barrel line rather than
+growing an unrelated one.
 
 ## Shell + layout
 
@@ -203,11 +231,19 @@ Drawers are modal: the bench columns are `inert` while one is open, focus is
 trapped inside and restored to the launcher on close (`lib/stores/drawers`
 remembers the opener). The host paints the floating sheet — `--bg-alt` fill,
 `--glass-line` hairline, `--radius-lg`, overlay shadow — so every drawer interior
-is transparent with no border of its own. `NARROW_DRAWERS` (`subspace`,
-`manifolds`, `manifold_builder`, `system_prompt`, `save_conversation`,
-`load_conversation`) sizes forms and pickers to `min(480px, 92%)` instead of the
-wide analysis panel. The switch itself is a hand-written `{#if}` chain over
-`DrawerName`, backed by the `drawers/index.ts` barrel.
+is transparent with no border of its own.
+
+Every drawer is one row of `drawers/index.ts`'s `DRAWERS: Record<DrawerName,
+DrawerEntry>` — component, fixed `params` (how one `RackDrawer` serves both the
+`subspace` and `manifolds` names), `narrow` sizing (forms and pickers get
+`min(480px, 92%)` instead of the wide analysis panel), and reachability. The host
+renders `DRAWERS[drawerState.open]` through one dynamic component; there is no
+per-drawer branch, and a name added to the `DrawerName` union without a row is a
+compile error. Reachability is a typed either/or: a `launcher` (palette group +
+label + keywords) or `launcher: null` plus a `via` string naming the surface that
+opens it. `RAIL_CATEGORIES` is **derived** from those launchers, so a drawer
+cannot be declared, rendered, and still unreachable — the failure the
+hand-maintained list allowed.
 
 Sheet-interior grammar (`ProbeInspectorDrawer` and `TokenDrilldownDrawer` are the
 reference implementations): header = eyebrow (tracked caps `--text-xs` /
@@ -376,21 +412,32 @@ families — a flat fit is just a `pca` manifold, so there is no separate
 vector-extraction form in the dashboard; `POST /extract` remains the server route
 and `saklas manifold extract` the scripted path.
 
-`ManifoldBuilderDrawer` has `auto-generated` / `custom nodes` / `templated` tabs
-(the internal `AuthoringMode` values are `discover` / `authored` / `templated`).
-**Custom nodes** is the authored path — label + statements + optional per-node
-coords and `role`, validated live against `min_nodes = 2n+1` and in-domain
-coordinates, `POST /manifolds` — with an `auto-domain` checkbox that hides the
-domain picker and coord inputs, exposes a `pca`/`spectral` radio, and posts to
-`POST /manifolds/discover` so the fitter derives coords per-model.
-**Auto-generated** is a concept-slug textarea plus a `kind` (abstract/concrete)
-radio and a `samples_per_prompt` count, calling `apiManifoldGenerateStream` (SSE)
-and optionally chaining `apiManifoldFitStream` with the same hyperparams; both
-legs drive one sticky progress toast. **Templated** is the one-step single-turn
-shortcut — it creates canonical single-turn contexts through `apiTemplates.create`
-then derives the manifold through `apiManifolds.createFromTemplate`. A shared
+`ManifoldBuilderDrawer` is a shell — header, `auto` / `template` / `custom` mode
+tabs, and the shared identity fields (namespace / name / description) — over three
+disjoint sibling forms in `drawers/manifold/`. The internal `AuthoringMode` values
+are `discover` / `templated` / `authored`; the shell hands each form the raw
+identity and each slugs it at submit. `manifold/form.css` carries the field / step
+/ node-card rules under the `.mb-form` class on the shell's body, so the forms
+share one visual surface without duplicating it, and `FitMethodPicker` +
+`DiscoverTuningFields` are the two blocks more than one form needs.
+
+**`AuthoredForm`** (custom) is the authored path — label + statements + optional
+per-node coords and `role`, validated live against `min_nodes = 2n+1` and
+in-domain coordinates, `POST /manifolds` — with an `auto-domain` checkbox that
+hides the domain picker and coord inputs, exposes the `pca`/`spectral`/`auto`
+radio, and posts to `POST /manifolds/discover` so the fitter derives coords
+per-model. **`DiscoverForm`** (auto) is a concept-slug textarea plus a `kind`
+(abstract/concrete/custom) radio and a `samples_per_prompt` count, calling
+`apiManifoldGenerateStream` (SSE) and optionally chaining `apiManifoldFitStream`
+with the same hyperparams; both legs drive one sticky progress toast.
+**`TemplatedForm`** picks an existing template and derives a manifold from it
+(`apiManifolds.createFromTemplate` + the optional fit). It does **not** author
+templates — `TemplateLabDrawer`'s build tab is the one editor, deep-linked from
+here via `openDrawer("template_lab", { tab: "build" })`. A per-form
 `AdvancedSection` carries the hyperparams (`max_dim`, `var_threshold`, `k_nn`,
-`bandwidth`) and the fit-immediately / persona-manifold / overwrite toggles.
+`bandwidth`) and the fit-immediately / persona-manifold / overwrite toggles;
+`manifold/shared.ts` owns the slugging and the tuning → hyperparams mapping so
+the two discover-routed forms build the same request body.
 
 `ManifoldMergeDrawer` unions discover-mode node corpora (checkbox list, target
 name, a `fit_mode` picker defaulting to inherit-from-sources and demanding an
@@ -402,8 +449,9 @@ line under the row. Both launch from the ⌘K palette's Steering group.
 `TemplateLabDrawer` is the standalone templated-completion surface. **score** —
 pick a template, an optional steering expression, `rank by` sum/mean; runs
 `apiTemplates.score` twice (baseline + steered) and renders per-context
-distribution bars. **build** — author name, slot, values and a multi-turn contexts
-editor. Both authoring surfaces (this and the builder's templated tab) validate
+distribution bars. **build** — THE template editor: name, slot, values and a
+multi-turn contexts editor, opened directly or deep-linked with `params: { tab:
+"build" }` from the builder's template form. It validates
 through the one `lib/templates.ts::validateTemplateDraft`, which mirrors
 `saklas/io/templates.py::_validate_body` / `_validate_context` one-for-one — slot
 exactly once in the final assistant turn and absent from history turns, last turn
@@ -656,14 +704,15 @@ String(e)` fallback.
 ## Adding a panel or a drawer
 
 **Panel:** write the `.svelte`, wire state into the smallest matching
-`lib/stores/` slice (or `stores.svelte.ts` for cross-cutting WS/tree/chat state),
-mount it from `App.svelte`, `npm run build`, commit the regenerated `dist/`.
+`lib/stores/` slice (add a slice + a barrel line rather than growing an unrelated
+one), mount it from `App.svelte`, `npm run build`, commit the regenerated `dist/`.
 
 **Drawer:** write it under `drawers/`, add the name to the `DrawerName` union in
-`lib/types.ts` (and to `NARROW_DRAWERS` in `App.svelte` for forms/pickers),
-add an `App.svelte` switch branch, re-export from `drawers/index.ts`, and — if it
-should be palette-launchable rather than opened from a specific surface — add it
-to a `RAIL_CATEGORIES` group in `lib/commands.ts`.
+`lib/types.ts`, then add its row to `DRAWERS` in `drawers/index.ts` — the compiler
+demands it. The row carries `narrow: true` for forms/pickers and either a
+`launcher` (which lands it in the palette automatically) or `launcher: null` with
+a `via` string naming the surface that opens it. Nothing else needs touching:
+there is no switch branch, no barrel export, and no separate palette list.
 
 ## Deliberately absent
 
