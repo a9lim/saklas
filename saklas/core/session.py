@@ -468,6 +468,28 @@ class GenState(IntEnum):
     FINALIZING = 3
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedCall:
+    """The per-call generation controls, normalized before any model work.
+
+    Produced once by :meth:`SaklasSession._prepare_generation_call` and read by
+    both the ordinary and the batched entry points.  Named fields rather than a
+    positional tuple: several members share a type (two ``int | None``, two
+    ``float``), so a reordering would rebind silently at every unpack site.
+    """
+
+    steering_obj: "Steering | None"
+    use_thinking_req: bool
+    gen_config: GenerationConfig
+    lp_count: int | None
+    seed: int | None
+    stop_list: list[str] | None
+    logit_bias: dict[int, float] | None
+    presence_penalty: float
+    frequency_penalty: float
+    logprobs_list: list[Any] | None
+
+
 class ConcurrentGenerationError(RuntimeError, SaklasError):
     """Raised when a generation call is made while another is in progress."""
 
@@ -8303,18 +8325,7 @@ class SaklasSession:
         steering: "str | Steering | None",
         sampling: SamplingConfig | None,
         thinking: bool | None,
-    ) -> tuple[
-        Steering | None,
-        bool,
-        GenerationConfig,
-        int | None,
-        int | None,
-        list[str] | None,
-        dict[int, float] | None,
-        float,
-        float,
-        list[Any] | None,
-    ]:
+    ) -> "PreparedCall":
         """Normalize per-call generation controls before model work."""
         steering_obj = Steering.from_value(
             steering, profile_names=set(self._profiles),
@@ -8349,17 +8360,17 @@ class SaklasSession:
             sampling.frequency_penalty if sampling is not None else 0.0
         )
         logprobs_list: list[Any] | None = [] if raw_lp is not None else None
-        return (
-            steering_obj,
-            use_thinking_req,
-            gen_config,
-            lp_count,
-            seed,
-            stop_list,
-            logit_bias,
-            presence_penalty,
-            frequency_penalty,
-            logprobs_list,
+        return PreparedCall(
+            steering_obj=steering_obj,
+            use_thinking_req=use_thinking_req,
+            gen_config=gen_config,
+            lp_count=lp_count,
+            seed=seed,
+            stop_list=stop_list,
+            logit_bias=logit_bias,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            logprobs_list=logprobs_list,
         )
 
     def _snapshot_steering_alphas(self) -> dict[str, float]:
@@ -8798,18 +8809,20 @@ class SaklasSession:
                     # not a request to open a fresh thinking channel.
                     thinking = False
 
-            (
-                steering_obj,
-                use_thinking_req,
-                gen_config,
-                lp_count,
-                seed,
-                stop_list,
-                logit_bias,
-                presence_penalty,
-                frequency_penalty,
-                logprobs_list,
-            ) = self._prepare_generation_call(steering, sampling, thinking)
+            # Bound out by name (not unpacked positionally) because the body
+            # below reads all ten deep in the transaction and reassigns
+            # ``stop_list`` after the seat augmentation.
+            prepared = self._prepare_generation_call(steering, sampling, thinking)
+            steering_obj = prepared.steering_obj
+            use_thinking_req = prepared.use_thinking_req
+            gen_config = prepared.gen_config
+            lp_count = prepared.lp_count
+            seed = prepared.seed
+            stop_list = prepared.stop_list
+            logit_bias = prepared.logit_bias
+            presence_penalty = prepared.presence_penalty
+            frequency_penalty = prepared.frequency_penalty
+            logprobs_list = prepared.logprobs_list
             readout_top_k = self._effective_readout_top_k(sampling)
             # Steering synthesis is Mahalanobis-normalized and therefore needs
             # the session whitener.  On a cold ``probes=[]`` session it may not
@@ -9850,29 +9863,21 @@ class SaklasSession:
         if has_sae_probes and self._sae_layer is None:
             return None
 
-        (
-            steering_obj,
-            use_thinking_req,
-            gen_config,
-            lp_count,
-            seed,
-            stop_list,
-            logit_bias,
-            presence_penalty,
-            frequency_penalty,
-            logprobs_list,
-        ) = self._prepare_generation_call(steering, sampling, thinking)
+        prepared = self._prepare_generation_call(steering, sampling, thinking)
         if (
-            use_thinking_req
-            or gen_config.max_new_tokens < 1
-            or lp_count is not None
-            or (seed is not None and gen_config.temperature > 0)
-            or stop_list is not None
-            or logit_bias is not None
-            or presence_penalty != 0.0
-            or frequency_penalty != 0.0
-            or logprobs_list is not None
-            or not self._batch_fast_steering_is_always_on(steering_obj)
+            prepared.use_thinking_req
+            or prepared.gen_config.max_new_tokens < 1
+            or prepared.lp_count is not None
+            or (
+                prepared.seed is not None
+                and prepared.gen_config.temperature > 0
+            )
+            or prepared.stop_list is not None
+            or prepared.logit_bias is not None
+            or prepared.presence_penalty != 0.0
+            or prepared.frequency_penalty != 0.0
+            or prepared.logprobs_list is not None
+            or not self._batch_fast_steering_is_always_on(prepared.steering_obj)
         ):
             return None
 
@@ -9883,9 +9888,9 @@ class SaklasSession:
         return self._run_generate_batch_fast(
             prompts,
             model=model,
-            steering_obj=steering_obj,
+            steering_obj=prepared.steering_obj,
             sampling=sampling,
-            gen_config=gen_config,
+            gen_config=prepared.gen_config,
             stateless=stateless,
             raw=raw,
             on_result=on_result,

@@ -16,7 +16,13 @@ from saklas.core.generation import (
 )
 from saklas.core.results import GenerationResult, ProbeReading
 from saklas.core.sampling import SamplingConfig
-from saklas.core.session import CaptureMode, CaptureState, GenState, SaklasSession
+from saklas.core.session import (
+    CaptureMode,
+    CaptureState,
+    GenState,
+    PreparedCall,
+    SaklasSession,
+)
 from saklas.core.steering import Steering
 
 
@@ -288,20 +294,17 @@ def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.Mo
     session.config = GenerationConfig(thinking=False)
     monkeypatch.setattr("saklas.core.session.supports_thinking", lambda _tok: True)
 
-    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+    assert SaklasSession._prepare_generation_call(
         session, None, None, None,
-    )
-    assert use_thinking is False
+    ).use_thinking_req is False
 
-    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+    assert SaklasSession._prepare_generation_call(
         session, Steering(alphas={}, thinking=True), None, None,
-    )
-    assert use_thinking is True
+    ).use_thinking_req is True
 
-    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+    assert SaklasSession._prepare_generation_call(
         session, None, None, True,
-    )
-    assert use_thinking is True
+    ).use_thinking_req is True
 
 
 def test_readout_top_k_shares_logit_alternative_width() -> None:
@@ -901,17 +904,19 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
             thinking,
         )
     )
-    session._prepare_generation_call = lambda *_args: (
-        None,
-        False,
-        GenerationConfig(max_new_tokens=1, temperature=0.0, top_p=1.0, top_k=None),
-        None,
-        None,
-        None,
-        None,
-        0.0,
-        0.0,
-        None,
+    session._prepare_generation_call = lambda *_args: PreparedCall(
+        steering_obj=None,
+        use_thinking_req=False,
+        gen_config=GenerationConfig(
+            max_new_tokens=1, temperature=0.0, top_p=1.0, top_k=None,
+        ),
+        lp_count=None,
+        seed=None,
+        stop_list=None,
+        logit_bias=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logprobs_list=None,
     )
     session._whitener = None
     session._seat_stop_augmentation = lambda stop_list, **_kwargs: stop_list
