@@ -551,12 +551,6 @@ export interface CreateManifoldRequest {
   nodes: ManifoldNodeSpec[];
 }
 
-/** Body for PATCH /saklas/v1/manifolds/{ns}/{name}. */
-export interface UpdateManifoldRequest {
-  description?: string;
-  nodes?: ManifoldNodeSpec[];
-}
-
 /** One node of a discover-mode manifold — label + statements only.
  *  Coords are derived per-model at fit time, so the authoring shape
  *  carries no ``coords`` field. */
@@ -744,13 +738,6 @@ export interface ExtractRequest {
   force?: boolean;
 }
 
-export interface ExtractResponse {
-  canonical: string;
-  profile: VectorInfo;
-  progress: string[];
-}
-
-
 // ----------------------------------------------------- probes --
 
 /** One attached probe — any rank.  The unified read-side row the server's
@@ -898,10 +885,6 @@ export interface ProbeGeometryResponse {
   layers: Record<string, ProbeLayerGeometry>;
 }
 
-export interface ProbeDefaultsResponse {
-  defaults: string[];
-}
-
 // ----------------------------------------------------- correlation --
 
 export interface CorrelationData {
@@ -978,9 +961,20 @@ export interface WSSampling {
   assistant_role?: string | null;
 }
 
+/** One message of an explicit conversation replay on the ``generate``
+ *  frame's ``input`` list. */
+export interface WSInputMessage {
+  role: ChatRole;
+  content: string;
+  label?: string | null;
+}
+
 export interface WSGenerateRequest {
   type: "generate";
-  input?: string | unknown;
+  /** ``null`` is a continue — no committed turn, the model speaks next
+   *  from ``parent_node_id`` (or the active leaf).  A messages list is the
+   *  explicit-conversation replay the unsteered shadow uses. */
+  input?: WSInputMessage[] | null;
   steering?: string | null;
   sampling?: WSSampling | null;
   thinking?: boolean | null;
@@ -1003,29 +997,6 @@ export interface WSGenerateRequest {
   fork_node_id?: string | null;
   fork_raw_index?: number | null;
   fork_alt_token_id?: number | null;
-  /** Answer-prefill: seed an assistant reply under a user node.  When
-   *  ``prefill_node_id`` is set the server ignores ``input`` and the
-   *  ``fork_*`` fields, tokenizes ``prefill_text`` into a forced decode
-   *  prefix, and lands the result as a sibling assistant under the user
-   *  node (``thinking`` forced off — the text is the start of the
-   *  answer).  ``steering`` / ``sampling`` / ``n`` ride through. */
-  prefill_node_id?: string | null;
-  prefill_text?: string | null;
-  /** Commit (Ctrl+Enter on either surface): land a turn under
-   *  ``parent_node_id`` without running a decode.  ``commit_role="user"``
-   *  routes to ``session.append_user_turn`` (active node must not be a
-   *  user node); ``commit_role="assistant"`` routes to
-   *  ``session.append_assistant_turn`` (``parent_node_id`` must be the
-   *  user node the authored turn hangs off).  Mutually exclusive with
-   *  prefill and fork; ``input`` / ``steering`` / ``sampling`` /
-   *  ``thinking`` / ``n`` are ignored.  Both fields must travel
-   *  together. */
-  commit_role?: "user" | "assistant" | null;
-  commit_text?: string | null;
-  /** Optional committed thinking block riding a commit (any seat) —
-   *  stored on the node's ``thinking_text`` and rendered through the
-   *  family think delimiters (400 when the family can't carry it). */
-  commit_thinking?: string | null;
   /** Cast model: which seat the generated turn occupies.  ``"user"``
    *  renders the generation prompt as a user-seat header (labeled by
    *  ``sampling.user_role``) and lands the node with ``role="user"`` +
@@ -1401,9 +1372,8 @@ export type WSServerMessage =
 
 // ----------------------------------------------------- chat / UI --
 
-/** Per-token score row for chat highlighting.  ``perToken`` is the
- * canonical projected score from ``last_per_token_scores``; ``live`` is
- * the inline streamed value (overwritten on finalize). */
+/** Per-token score row for chat highlighting — the text + whichever
+ * probe scores are known for the token, filled at render time. */
 export interface TokenScore {
   text: string;
   thinking: boolean;
@@ -1468,9 +1438,6 @@ export interface ChatTurn {
   /** Generation timing summary, populated at done. */
   finishReason?: string;
   tokensSoFar?: number;
-  maxTokens?: number;
-  tokPerSec?: number;
-  elapsedSec?: number;
   perplexity?: number;
   /** Logit-pass: per-turn mean chosen-token logprob (response span only,
    *  thinking excluded).  Populated from the WS ``done`` event; absent for
@@ -1569,22 +1536,22 @@ export interface SaeSteerEntry {
   enabled: boolean;
 }
 
+/** The two single-direction *atom* families — a J-lens token direction
+ *  and an SAE decoder row.  Both rack as ``α <prefix><id>`` with one
+ *  per-card coefficient and no geometry, so they share a card and a
+ *  mutator set; only the key prefix, the accent hue, and the marker
+ *  glyph differ. */
+export type AtomMode = "jlens" | "sae";
+
+export type AtomSteerEntry = JLensSteerEntry | SaeSteerEntry;
+
 /** A racked steering term — subspace (flat), manifold (curved), or a
- *  J-lens token atom. */
+ *  single-direction atom. */
 export type SteerEntry =
   | SubspaceSteerEntry
   | ManifoldSteerEntry
   | JLensSteerEntry
   | SaeSteerEntry;
-
-// ----------------------------------------------------- extract pairs --
-
-/** One contrastive statement pair for custom-statement vector
- *  extraction.  Mirrors the server's ``{positive, negative}`` shape. */
-export interface StatementPair {
-  positive: string;
-  negative: string;
-}
 
 // ----------------------------------------------------- probe rack --
 
@@ -1741,7 +1708,6 @@ export type DrawerName =
   | "advanced_sampling"
   | "health"
   | "session_admin"
-  | "export"
   | "help"
   /** Cross-branch diff drawer — phase 5.  ``params`` carries the
    * selected node ids (1 user node → compare its children, 2+

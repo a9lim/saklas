@@ -1,19 +1,14 @@
 <script lang="ts">
   // Context ribbon — a windowed strip of the current segment's tokens
   // around the inspected position.  Orientation + navigation in one:
-  // tokens tint with the active highlight probe (same scoreToRgb ramp as
-  // the transcript), the inspected token wears a ring, and clicking any
+  // tokens tint with the active highlight probe (through the shared
+  // ``lib/highlight`` renderer, so a ribbon token and its transcript
+  // twin always paint the same — compare-two included), the inspected
+  // token wears a ring, and clicking any
   // token moves the cursor there.  Ribbon tokens are mouse targets only
   // (tabindex -1) so the drawer's focus order stays walkable.
 
-  import { highlightState, highlightScale } from "../../lib/stores.svelte";
-  import {
-    SURPRISE_TARGET,
-    surpriseScore,
-    probeScoreForTarget,
-    scoreToRgb,
-    highlightHue,
-  } from "../../lib/tokens";
+  import { highlightStyleString } from "../../lib/highlight";
   import type { TokenScore } from "../../lib/types";
 
   let {
@@ -34,17 +29,6 @@
   const slice = $derived(
     tokens.slice(start, end).map((tok, k) => ({ tok, i: start + k })),
   );
-
-  function tint(tok: TokenScore): string {
-    const target = highlightState.target;
-    if (!target) return "";
-    const score =
-      target === SURPRISE_TARGET
-        ? surpriseScore(tok.logprob)
-        : (probeScoreForTarget(tok, target) ?? tok.score);
-    const bg = scoreToRgb(score, highlightScale(target), highlightHue(target));
-    return bg === "transparent" ? "" : `background-color: ${bg}`;
-  }
 
   /** One-line rendering — newlines become a visible return glyph. */
   function label(text: string): string {
@@ -75,7 +59,7 @@
         type="button"
         class="rtok"
         class:current={i === index}
-        style={tint(tok)}
+        style={highlightStyleString(tok)}
         tabindex="-1"
         aria-current={i === index}
         title={`token ${i + 1} / ${tokens.length}`}

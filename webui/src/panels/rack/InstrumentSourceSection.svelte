@@ -75,6 +75,20 @@
     if (!prepared.has("local")) result.push({ value: "local", label: "local" });
     return result;
   });
+  // The picker owns the *validity* of the bound selection; the panels own
+  // what a selection means.  An empty or no-longer-offered value falls
+  // back to the active prepared source, then the first prepared source,
+  // then the first provider option — which is also what makes a fresh
+  // mount land on the active source without the panel arranging it.
+  $effect(() => {
+    if (value && options.some((option) => option.value === value)) return;
+    value =
+      sources.find((source) => source.active)?.source ??
+      sources[0]?.source ??
+      providerOptions[0]?.value ??
+      "";
+  });
+
   const localSelected = $derived(value === "local");
   const selectedSource = $derived(sources.find((source) => source.source === value));
   const selectedProviderOption = $derived(

@@ -184,7 +184,7 @@
 </RackCard>
 
 <style>
-  /* ----- statline (mirrors JLensProbeCard / JLensTokenCard) ----- */
+  /* ----- statline (mirrors JLensProbeCard) ----- */
   .name {
     color: var(--fg-strong);
     font-family: var(--font-mono);

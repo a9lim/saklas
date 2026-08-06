@@ -61,7 +61,6 @@
     roleGlyphLetter,
     samplingState,
     sessionState,
-    highlightScale,
     beginTokenHover,
     endTokenHover,
   } from "../lib/stores.svelte";
@@ -69,15 +68,14 @@
   import { togglePalette } from "../lib/stores/palette.svelte";
   import type { ChatRole, ChatTurn, TokenScore } from "../lib/types";
   import {
-    scoreToRgb,
-    highlightHue,
-    twoStripeStyle,
-    twoBlendStyle,
     formatScoreTooltip,
-    surpriseScore,
     SURPRISE_TARGET,
     probeScoreForTarget,
   } from "../lib/tokens";
+  import {
+    highlightStyleString,
+    latestLayerScores,
+  } from "../lib/highlight";
   import Select from "../lib/Select.svelte";
   import Checkbox from "../lib/Checkbox.svelte";
   import Button from "../lib/ui/Button.svelte";
@@ -451,11 +449,10 @@
 
   // ------------------------------------------------------------- A/B split --
 
-  /** v2.3: the standalone A/B toggle is gone.  The right column renders
-   *  either a pinned sibling's path or — when auto-regen is on — the
-   *  most recent auto-generated shadow / sibling.  The
-   *  ``autoRegenState.enabled`` flag drives both branches; mode
-   *  ``"unsteered"`` is the bit-identical fold of the old A/B. */
+  /** The right column renders either a pinned sibling's path or — when
+   *  auto-regen is on — the most recent auto-generated shadow / sibling.
+   *  The ``autoRegenState.enabled`` flag drives both branches; mode
+   *  ``"unsteered"`` is the unsteered-shadow A/B. */
   const autoRegenActive = $derived(autoRegenState.enabled);
 
   /** Phase-5: the right column renders either the pinned sibling's
@@ -594,71 +591,6 @@
   });
 
   // ----------------------------------------------------------- token render --
-
-  /** Score lookup for a single token against the currently-selected
-   * highlight target.  Handles the logit-pass ``SURPRISE_TARGET`` sentinel
-   * by routing to ``surpriseScore``; for real probe names, reads
-   * ``t.probes`` first and falls back to the cached single-probe
-   * ``score`` field (live tokens before done). */
-  function latestLayerScores(
-    t: TokenScore,
-  ): Record<string, number> | undefined {
-    const pls = t.perLayerScores;
-    if (!pls) return undefined;
-    const layers = Object.keys(pls).sort((a, b) => Number(a) - Number(b));
-    const last = layers[layers.length - 1];
-    return last === undefined ? undefined : pls[last];
-  }
-
-  function pickScore(t: TokenScore, target: string | null): number | undefined {
-    if (!target) return undefined;
-    if (target === SURPRISE_TARGET) return surpriseScore(t.logprob);
-    // Probe / per-axis lookup: the live per-PC coords first, then the
-    // axis-0 ``probes`` row (the channel ``done`` + reload restore).
-    const direct = probeScoreForTarget(t, target);
-    if (direct !== undefined) return direct;
-    const latest = latestLayerScores(t);
-    if (latest && target in latest) return latest[target];
-    return t.score;
-  }
-
-  /** Build the inline-style object for one token's background.  Compare-
-   * two needs both probes set; if only one of the two is configured we
-   * gracefully fall back to single-probe rendering.  ``SURPRISE_TARGET``
-   * works in either slot — it reads in the logit-space blue ramp
-   * (distinct from any probe's signed green/red), per-slot. */
-  function tokenStyle(
-    t: TokenScore,
-  ): { backgroundColor?: string; backgroundImage?: string } {
-    const a = highlightState.target;
-    if (!a) return {};
-    const aScore = pickScore(t, a);
-    const scaleA = highlightScale(a);
-    if (highlightState.compareTwo && highlightState.compareTarget) {
-      const b = highlightState.compareTarget;
-      const bScore = pickScore(t, b);
-      const scaleB = highlightScale(b);
-      return highlightState.smoothBlend
-        ? twoBlendStyle(aScore, bScore, scaleA, scaleB, highlightHue(a), highlightHue(b))
-        : twoStripeStyle(aScore, bScore, scaleA, scaleB, highlightHue(a), highlightHue(b));
-    }
-    const bg = scoreToRgb(aScore, scaleA, highlightHue(a));
-    return bg === "transparent" ? {} : { backgroundColor: bg };
-  }
-
-  function styleString(style: {
-    backgroundColor?: string;
-    backgroundImage?: string;
-  }): string {
-    const parts: string[] = [];
-    if (style.backgroundColor) {
-      parts.push(`background-color: ${style.backgroundColor}`);
-    }
-    if (style.backgroundImage) {
-      parts.push(`background-image: ${style.backgroundImage}`);
-    }
-    return parts.join(";");
-  }
 
   /** Format the logprob suffix for the surprise-mode tooltip.  Includes
    *  the rank-of-K readout when ``top_alts`` was captured for this
@@ -1113,7 +1045,7 @@
               <span
                 class="tok"
                 class:tinted={highlightState.target !== null}
-                style={styleString(tokenStyle(tok))}
+                style={highlightStyleString(tok)}
                 title={tooltipFor(tok)}
                 onpointerenter={() => beginTokenHover(tok, turn.nodeId)}
                 onpointerleave={endTokenHover}
@@ -1142,7 +1074,7 @@
           <span
             class="tok"
             class:tinted={highlightState.target !== null}
-            style={styleString(tokenStyle(tok))}
+            style={highlightStyleString(tok)}
             title={tooltipFor(tok)}
             onpointerenter={() => beginTokenHover(tok, turn.nodeId)}
             onpointerleave={endTokenHover}

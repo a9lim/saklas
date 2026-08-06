@@ -1,5 +1,12 @@
 // Typed REST + WS + SSE client for the native /saklas/v1/* API.
 //
+// Scope policy: this is a client for the routes the dashboard actually
+// calls, NOT an exhaustive mirror of the native API.  A route with no
+// dashboard consumer has no method here — an absent method means "no
+// surface needs it yet", never "the server lacks it".  Add the method in
+// the same change that adds its caller, and drop it when the last caller
+// goes; the server's own route tree (server/AGENTS.md) is the catalogue.
+//
 // Single source of truth for HTTP shapes; types live in types.ts so panels
 // and drawers can `import type` without dragging the fetch helpers along.
 //
@@ -14,7 +21,6 @@ import type {
   CreateTemplateRequest,
   CreateManifoldFromTemplateRequest,
   ExtractRequest,
-  ExtractResponse,
   FilterMatchesJSON,
   FitManifoldRequest,
   GenerateManifoldRequest,
@@ -33,7 +39,6 @@ import type {
   PairwiseCompareResponse,
   PreparationOp,
   PreparationStatusJSON,
-  ProbeDefaultsResponse,
   ProbeGeometryResponse,
   ProbeInfo,
   ProbeListResponse,
@@ -47,7 +52,6 @@ import type {
   TemplateSummary,
   TraitsEvent,
   TranscriptLoadResponseJSON,
-  UpdateManifoldRequest,
   VectorInfo,
   WSClientMessage,
   WSServerMessage,
@@ -65,7 +69,6 @@ export type {
   FitManifoldRequest,
   GenerateManifoldRequest,
   ExtractRequest,
-  ExtractResponse,
   FilterMatchesJSON,
   InstallManifoldRequest,
   JointLogprobRowJSON,
@@ -82,7 +85,6 @@ export type {
   PairwiseCompareResponse,
   PreparationOp,
   PreparationStatusJSON,
-  ProbeDefaultsResponse,
   ProbeGeometryResponse,
   ProbeInfo,
   ProbeListResponse,
@@ -96,7 +98,6 @@ export type {
   TemplateSummary,
   TraitsEvent,
   TranscriptLoadResponseJSON,
-  UpdateManifoldRequest,
   VectorInfo,
   WSClientMessage,
   WSServerMessage,
@@ -180,6 +181,27 @@ export class ApiError extends Error {
   }
 }
 
+/** THE error → user-facing message formatter.  Every surface that shows
+ *  a failed request — toast, inline form error, empty-state reason —
+ *  goes through this one, so the same backend failure reads identically
+ *  wherever it surfaces.
+ *
+ *  An :class:`ApiError` renders as ``"<status>: <detail>"``, preferring
+ *  the saklas error body's structured ``detail`` over the generic HTTP
+ *  message.  The status code carries real meaning across this API (400
+ *  malformed vs 404 missing vs 409 busy vs 503 unavailable), so it is
+ *  always shown.  Anything else falls back to its ``message``. */
+export function describeError(e: unknown): string {
+  if (e instanceof ApiError) {
+    const detail =
+      e.body && typeof e.body === "object" && "detail" in (e.body as object)
+        ? String((e.body as { detail: unknown }).detail)
+        : e.message;
+    return `${e.status}: ${detail}`;
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
 // --------------------------------------------------------- core fetch --
 
 async function parseBody(r: Response): Promise<{ text: string; json: unknown }> {
@@ -232,13 +254,6 @@ export const apiSessions = {
   list(): Promise<{ sessions: SessionInfo[] }> {
     return request("/saklas/v1/sessions");
   },
-  /** POST /sessions — single-session impl; calling with a different
-   * model logs a server warning but returns the existing session. */
-  create(body: { model?: string; device?: string; dtype?: string } = {}): Promise<
-    SessionInfo
-  > {
-    return request("/saklas/v1/sessions", jsonBody(body));
-  },
   get(id: string = SESSION): Promise<SessionInfo> {
     return request(SESSION_BASE(id));
   },
@@ -254,15 +269,6 @@ export const apiSessions = {
     id: string = SESSION,
   ): Promise<SessionInfo> {
     return request(SESSION_BASE(id), { ...jsonBody(body), method: "PATCH" });
-  },
-  delete(id: string = SESSION): Promise<void> {
-    return request<void>(SESSION_BASE(id), { method: "DELETE" });
-  },
-  clear(id: string = SESSION): Promise<void> {
-    return request<void>(`${SESSION_BASE(id)}/clear`, { method: "POST" });
-  },
-  rewind(id: string = SESSION): Promise<void> {
-    return request<void>(`${SESSION_BASE(id)}/rewind`, { method: "POST" });
   },
   validateSteering(
     expression: string,
@@ -283,17 +289,6 @@ export const apiProfiles = {
   },
   get(name: string, id: string = SESSION): Promise<VectorInfo> {
     return request(`${SESSION_BASE(id)}/profiles/${encodeURIComponent(name)}`);
-  },
-  delete(name: string, id: string = SESSION): Promise<void> {
-    return request<void>(
-      `${SESSION_BASE(id)}/profiles/${encodeURIComponent(name)}`,
-      { method: "DELETE" },
-    );
-  },
-  /** Synchronous extract.  For SSE progress pass ``onProgress`` to
-   * ``apiExtractStream`` instead. */
-  extract(req: ExtractRequest, id: string = SESSION): Promise<ExtractResponse> {
-    return request(`${SESSION_BASE(id)}/extract`, jsonBody(req));
   },
   correlation(
     names?: string[] | null,
@@ -320,9 +315,6 @@ export const apiProfiles = {
 export const apiProbes = {
   list(id: string = SESSION): Promise<ProbeListResponse> {
     return request(`${SESSION_BASE(id)}/probes`);
-  },
-  defaults(id: string = SESSION): Promise<ProbeDefaultsResponse> {
-    return request(`${SESSION_BASE(id)}/probes/defaults`);
   },
   /** Attach any probe shape by selector — the same ``[ns/]name[:variant]``
    *  the ``%`` steering term consumes (a 2-node concept axis is the rank-1
@@ -379,16 +371,6 @@ export const apiManifolds = {
     req: CreateManifoldFromTemplateRequest,
   ): Promise<ManifoldInfo> {
     return request(`${MANIFOLDS_BASE}/from-template`, jsonBody(req));
-  },
-  update(
-    namespace: string,
-    name: string,
-    req: UpdateManifoldRequest,
-  ): Promise<ManifoldInfo> {
-    return request(
-      `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
-      { ...jsonBody(req), method: "PATCH" },
-    );
   },
   delete(
     namespace: string,
@@ -832,15 +814,9 @@ export interface InstrumentFamilyJSON {
  *  polled preparations resource, and token-readout replay all live here; the
  *  store slices adapt these to the panel-facing state. */
 export const apiInstruments = {
-  /** Enumerate the three families (live state, active source, probes,
-   *  capabilities). */
-  list(id: string = SESSION): Promise<{ instruments: InstrumentFamilyJSON[] }> {
-    return request(`${SESSION_BASE(id)}/instruments`);
-  },
-
   /** Uniform live toggle.  geometry = the CAA per-token monitor scoring
-   *  switch (``POST /probes/live`` before 5.x); lens = the workspace
-   *  readout (``layers`` optional); sae = the feature-discovery readout.
+   *  switch; lens = the workspace readout (``layers`` optional); sae =
+   *  the feature-discovery readout.
    *  Readout width follows the generation's alts field. */
   setLive(
     family: InstrumentFamily,
@@ -871,7 +847,7 @@ export const apiInstruments = {
     return request(`${SESSION_BASE(id)}/instruments/${family}/sources`);
   },
 
-  /** Synchronous lens source switch (the old ``POST /lens/use`` — lock +
+  /** Synchronous lens source switch (lock +
    *  derived-state eviction + auto-enable live).  lens only. */
   setLensSource(
     source: string,
@@ -979,21 +955,6 @@ export const apiInstruments = {
     );
   },
 };
-
-// =========================================================== traits ====
-
-/** Open the live traits SSE stream.  Returns the underlying ``Response``
- * so the caller owns lifecycle (cancel via ``response.body.cancel()``). */
-export async function apiTraitsStream(id: string = SESSION): Promise<Response> {
-  const r = await fetch(`${SESSION_BASE(id)}/traits/stream`, {
-    headers: authHeaders({ Accept: "text/event-stream" }),
-  });
-  if (!r.ok) {
-    const { text, json } = await parseBody(r);
-    throw new ApiError(r.status, `${SESSION_BASE(id)}/traits/stream`, text, json);
-  }
-  return r;
-}
 
 // ============================================================ SSE util =
 

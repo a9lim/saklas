@@ -31,7 +31,6 @@ export { default as LoadConversation } from "./LoadConversationDrawer.svelte";
 export { default as Compare } from "./CompareDrawer.svelte";
 export { default as SystemPrompt } from "./SystemPromptDrawer.svelte";
 export { default as Help } from "./HelpDrawer.svelte";
-export { default as Export } from "./ExportDrawer.svelte";
 export { default as Correlation } from "./CorrelationDrawer.svelte";
 export { default as ProbeInspector } from "./ProbeInspectorDrawer.svelte";
 export { default as TokenDrilldown } from "./TokenDrilldownDrawer.svelte";

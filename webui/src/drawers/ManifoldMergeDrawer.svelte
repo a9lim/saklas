@@ -12,7 +12,7 @@
 
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
-  import { ApiError, apiManifolds } from "../lib/api";
+  import { apiManifolds, describeError } from "../lib/api";
   import {
     closeDrawer,
     steerRack,
@@ -23,17 +23,6 @@
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => { void _drawerProps.params; });
-
-  function describeError(e: unknown): string {
-    if (e instanceof ApiError) {
-      const detail =
-        e.body && typeof e.body === "object" && "detail" in (e.body as object)
-          ? String((e.body as { detail: unknown }).detail)
-          : e.message;
-      return `${e.status}: ${detail}`;
-    }
-    return e instanceof Error ? e.message : String(e);
-  }
 
   function rowKey(m: ManifoldInfo): string {
     return `${m.namespace}/${m.name}`;

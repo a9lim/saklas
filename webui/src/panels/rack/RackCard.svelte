@@ -54,8 +54,8 @@
 </div>
 
 <style>
-  /* The dense variant of the v2 glass material (lib/ui/GlassCard is the
-   * roomy one). Borderless: the fill carries the card, the family accent lives in the glyph/text,
+  /* The rack's glass card material. Borderless: the fill carries the
+   * card, the family accent lives in the glyph/text,
    * and the border slot exists only for the active ring (state, not
    * chrome). Hover lifts the fill instead of drawing a line. No backdrop
    * blur: rack cards sit on the opaque panel, so blur would cost

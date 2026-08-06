@@ -1,12 +1,12 @@
-// Cross-component state for the v1.7 dashboard.
+// Cross-component state for the dashboard.
 //
 // Svelte 5 runes-based.  Each slice is a $state-backed object exported as
 // a named const; components import the slice and read/write its fields
 // directly — Svelte's compiler tracks dependencies automatically.
 //
-// Cross-cutting actions (open the WS, send a generate, queue a pending
+// Cross-cutting actions (open the WS, send a submission, queue a pending
 // rack edit during in-flight gen) live in this file as functions so panels
-// don't need to coordinate amongst themselves; they call ``sendGenerate(...)``
+// don't need to coordinate amongst themselves; they call ``sendSubmit(...)``
 // or ``setSubspaceAlong(value)`` and the slice updates propagate.
 //
 // One singleton WS owned at the module level — the chat panel is no
@@ -27,7 +27,6 @@ import {
 } from "./api";
 import type {
   CorrelationData,
-  InstrumentFamily,
   LoomNodeJSON,
   LoomTreeJSON,
   ManifoldInfo,
@@ -37,16 +36,15 @@ import type {
   WSServerMessage,
 } from "./api";
 import type {
+  AtomMode,
+  AtomSteerEntry,
   CastMemberJSON,
   ChatTurn,
   GenStatus,
   InstrumentSourceJSON,
-  JLensSteerEntry,
   LensReadoutBlockJSON,
   MeasurementsEnvelopeJSON,
-  PreparationStatusJSON,
   SaeFeatureJSON,
-  SaeSteerEntry,
   ManifoldSteerEntry,
   PendingAction,
   ProbeInfo,
@@ -70,6 +68,7 @@ import {
   parseProbeTarget,
 } from "./tokens";
 import { pushToast } from "./stores/toasts.svelte";
+import { createPreparationSlice } from "./stores/preparations.svelte";
 
 export * from "./stores/drawers.svelte";
 export * from "./stores/inputHistory.svelte";
@@ -234,9 +233,6 @@ export interface SaeState {
    *  workspace sorter. */
   sortMode: SaeSortMode;
   busy: boolean;
-  loading: boolean;
-  loadMessage: string | null;
-  loadError: string | null;
 }
 
 export const saeState: SaeState = $state({
@@ -248,9 +244,6 @@ export const saeState: SaeState = $state({
   layer: null,
   sortMode: "strength",
   busy: false,
-  loading: false,
-  loadMessage: null,
-  loadError: null,
 });
 
 // ================================================= token hover readout ====
@@ -555,167 +548,39 @@ export async function setLiveSae(enabled: boolean): Promise<void> {
   }
 }
 
-/** Generic poll loop over a family's unified ``/instruments/{family}/
- *  preparations`` resource.  The four background jobs (lens fetch/fit, sae
- *  load/train) share one status shape, so each wrapper supplies only its
- *  state adapter (``apply``, every tick) + completion handler (``onSettled``,
- *  once the job leaves ``running``) and this drives the interval. */
-async function pollPreparationJob(
-  family: InstrumentFamily,
-  apply: (st: PreparationStatusJSON) => void,
-  onSettled: (st: PreparationStatusJSON) => void | Promise<void>,
-  intervalMs: number,
-): Promise<void> {
-  for (;;) {
-    const st = await apiInstruments.preparationStatus(family);
-    apply(st);
-    if (st.state !== "running") {
-      await onSettled(st);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-}
-
-function _applySaeLoadStatus(st: PreparationStatusJSON): void {
-  saeState.loading = st.state === "running";
-  saeState.loadMessage = st.message;
-  saeState.loadError = st.error;
-}
-
-async function pollSaeLoad(): Promise<void> {
-  await pollPreparationJob("sae", _applySaeLoadStatus, async (st) => {
+/** The four background preparations, one slice each — see
+ *  ``lib/stores/preparations.svelte.ts`` for the shared contract.  Each
+ *  supplies only its poll cadence, its toast wording, and the refreshes
+ *  its result invalidates. */
+export const saeLoad = createPreparationSlice("sae", "load", {
+  label: "SAE load",
+  intervalMs: 1000,
+  successMessage: "SAE loaded",
+  onSettled: async () => {
     await refreshSession();
     await refreshSaeSources();
     await refreshProbeList();
-    if (!st.error && st.finished_at !== null) {
-      pushToast("SAE loaded", { kind: "info" });
-    }
-  }, 1000);
-}
-
-export async function loadSae(
-  release: string,
-  layer: number | null = null,
-): Promise<void> {
-  if (saeState.loading || !release.trim()) return;
-  try {
-    _applySaeLoadStatus(
-      await apiInstruments.startPreparation("sae", {
-        operation: "load",
-        release: release.trim(),
-        layer,
-      }),
-    );
-    await pollSaeLoad();
-  } catch (e) {
-    saeState.loading = false;
-    saeState.loadError = e instanceof Error ? e.message : String(e);
-    pushToast(`SAE load: ${saeState.loadError}`, { kind: "error" });
-  }
-}
-
-export interface SaeTrainState {
-  running: boolean;
-  tokensDone: number;
-  tokensTotal: number;
-  message: string | null;
-  error: string | null;
-  polling: boolean;
-  cancelling: boolean;
-}
-
-export const saeTrainState: SaeTrainState = $state({
-  running: false,
-  tokensDone: 0,
-  tokensTotal: 0,
-  message: null,
-  error: null,
-  polling: false,
-  cancelling: false,
+  },
 });
 
-function _applySaeTrainStatus(st: PreparationStatusJSON): void {
-  saeTrainState.running = st.state === "running";
-  saeTrainState.tokensDone = st.progress?.current ?? 0;
-  saeTrainState.tokensTotal = st.progress?.total ?? 0;
-  saeTrainState.message = st.message;
-  saeTrainState.error = st.error;
-  if (st.state !== "running") saeTrainState.cancelling = false;
-}
+export const saeTrain = createPreparationSlice("sae", "train", {
+  label: "SAE train",
+  intervalMs: 1500,
+  successMessage: "SAE trained · live",
+  onSettled: async () => {
+    await refreshSession();
+    await refreshSaeSources();
+    await refreshProbeList();
+  },
+});
 
-export async function pollSaeTrain(): Promise<void> {
-  if (saeTrainState.polling) return;
-  saeTrainState.polling = true;
-  try {
-    await pollPreparationJob("sae", _applySaeTrainStatus, async (st) => {
-      await refreshSession();
-      await refreshSaeSources();
-      await refreshProbeList();
-      if (st.finished_at !== null) {
-        if (st.message === "cancelled") {
-          pushToast("SAE train cancelled", { kind: "info" });
-        } else {
-          pushToast(
-            st.error ? `SAE train: ${st.error}` : "SAE trained · live",
-            { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
-          );
-        }
-      }
-    }, 1500);
-  } catch (e) {
-    saeTrainState.error = e instanceof Error ? e.message : String(e);
-  } finally {
-    saeTrainState.polling = false;
-  }
-}
-
-export async function startSaeTrain(body: {
-  name: string;
-  layer?: number | null;
-  tokens?: number;
-  width?: number | null;
-}): Promise<void> {
-  if (saeTrainState.running || saeTrainState.polling) return;
-  try {
-    _applySaeTrainStatus(
-      await apiInstruments.startPreparation("sae", { operation: "train", ...body }),
-    );
-    void pollSaeTrain();
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    saeTrainState.error = message;
-    pushToast(`SAE train: ${message}`, { kind: "error" });
-  }
-}
-
-export async function cancelSaeTrain(): Promise<void> {
-  if (!saeTrainState.running || saeTrainState.cancelling) return;
-  saeTrainState.cancelling = true;
-  try {
-    _applySaeTrainStatus(await apiInstruments.cancelPreparation("sae"));
-  } catch (e) {
-    saeTrainState.cancelling = false;
-    pushToast(
-      `SAE cancel: ${e instanceof Error ? e.message : String(e)}`,
-      { kind: "error" },
-    );
-  }
-}
-
-export async function checkSaeTrain(): Promise<void> {
-  if (saeTrainState.polling) return;
-  try {
-    // The SAE family shares one preparations resource across load + train,
-    // so only reflect it when the running-or-last job is actually a train.
-    const st = await apiInstruments.preparationStatus("sae");
-    if (st.operation === "train") {
-      _applySaeTrainStatus(st);
-      if (st.state === "running") void pollSaeTrain();
-    }
-  } catch {
-    // Source setup remains usable when no background status is available.
-  }
+/** Load a resident SAE — ``local:<name>`` or ``saelens:<release>``, with an
+ *  optional hook layer.  Thin wrapper over the slice: the release is the
+ *  only field that needs trimming + an empty check. */
+export function loadSae(release: string, layer: number | null = null): void {
+  const trimmed = release.trim();
+  if (!trimmed) return;
+  void saeLoad.start({ release: trimmed, layer });
 }
 
 // ================================================== CAA live toggle ====
@@ -788,198 +653,30 @@ export async function setLiveLens(enabled: boolean): Promise<void> {
   }
 }
 
-export interface LensFetchState {
-  running: boolean;
-  message: string | null;
-  error: string | null;
-  polling: boolean;
-}
-
-export const lensFetchState: LensFetchState = $state({
-  running: false,
-  message: null,
-  error: null,
-  polling: false,
+export const lensFetch = createPreparationSlice("lens", "fetch", {
+  label: "J-lens fetch",
+  intervalMs: 1000,
+  successMessage: "J-lens active · live",
+  onSettled: async () => {
+    await refreshSession();
+    await refreshLensSources();
+  },
 });
 
-function _applyLensFetchStatus(st: PreparationStatusJSON): void {
-  lensFetchState.running = st.state === "running";
-  lensFetchState.message = st.message;
-  lensFetchState.error = st.error;
-}
-
-export async function pollLensFetch(): Promise<void> {
-  if (lensFetchState.polling) return;
-  lensFetchState.polling = true;
-  try {
-    await pollPreparationJob("lens", _applyLensFetchStatus, async (st) => {
-      await refreshSession();
-      await refreshLensSources();
-      if (st.finished_at !== null) {
-        pushToast(
-          st.error ? `J-lens fetch: ${st.error}` : "J-lens active · live",
-          { kind: st.error ? "error" : "info", ttlMs: st.error ? null : undefined },
-        );
-      }
-    }, 1000);
-  } catch (e) {
-    lensFetchState.error = e instanceof Error ? e.message : String(e);
-  } finally {
-    lensFetchState.polling = false;
-  }
-}
-
-export async function startLensFetch(
-  source: string = "neuronpedia",
-): Promise<void> {
-  if (lensFetchState.running || lensFetchState.polling) return;
-  try {
-    _applyLensFetchStatus(
-      await apiInstruments.startPreparation("lens", { operation: "fetch", source }),
-    );
-    void pollLensFetch();
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    lensFetchState.error = message;
-    pushToast(`J-lens fetch: ${message}`, { kind: "error" });
-  }
-}
-
-export async function checkLensFetch(): Promise<void> {
-  if (lensFetchState.polling) return;
-  try {
-    // The lens family shares one preparations resource across fetch + fit,
-    // so only reflect it when the running-or-last job is actually a fetch.
-    const st = await apiInstruments.preparationStatus("lens");
-    if (st.operation === "fetch") {
-      _applyLensFetchStatus(st);
-      if (st.state === "running") void pollLensFetch();
-    }
-  } catch {
-    // A fetch status is optional setup state; leave the rest of the panel live.
-  }
-}
-
-// ------------------------------------------------- lens fit (button) --
-
-export interface LensFitState {
-  /** Mirrors the server's background-fit status (polled). */
-  running: boolean;
-  promptsDone: number;
-  promptsTotal: number;
-  message: string | null;
-  error: string | null;
-  /** Poll-loop guard — one interval regardless of how many panels ask. */
-  polling: boolean;
-  cancelling: boolean;
-}
-
-export const lensFitState: LensFitState = $state({
-  running: false,
-  promptsDone: 0,
-  promptsTotal: 0,
-  message: null,
-  error: null,
-  polling: false,
-  cancelling: false,
+/** The background Jacobian-lens fit.  On completion the session info is
+ *  refreshed (``jlens_fitted`` flips, and the server's post-fit
+ *  auto-enable lands in ``live_lens_layers`` → the WORKSPACE toggle reads
+ *  on).  A cancel stops the worker after its current estimator pass; any
+ *  prior complete checkpoint stays resumable. */
+export const lensFit = createPreparationSlice("lens", "fit", {
+  label: "J-lens fit",
+  intervalMs: 3000,
+  successMessage: "J-lens fitted · live",
+  onSettled: async () => {
+    await refreshSession();
+    await refreshLensSources();
+  },
 });
-
-const LENS_FIT_POLL_MS = 3000;
-
-function _applyFitStatus(st: PreparationStatusJSON): void {
-  lensFitState.running = st.state === "running";
-  lensFitState.promptsDone = st.progress?.current ?? 0;
-  lensFitState.promptsTotal = st.progress?.total ?? 0;
-  lensFitState.message = st.message;
-  lensFitState.error = st.error;
-  if (st.state !== "running") lensFitState.cancelling = false;
-}
-
-/** Poll the background lens fit until it settles.  On completion the
- *  session info is refreshed (``jlens_fitted`` flips, and the server's
- *  post-fit auto-enable lands in ``live_lens_layers`` → the WORKSPACE
- *  toggle reads on). */
-export async function pollLensFit(): Promise<void> {
-  if (lensFitState.polling) return;
-  lensFitState.polling = true;
-  try {
-    await pollPreparationJob("lens", _applyFitStatus, async (st) => {
-      if (st.finished_at !== null) {
-        if (st.message === "cancelled") {
-          pushToast("J-lens fit cancelled", { kind: "info" });
-        } else if (st.error) {
-          pushToast(`J-lens fit: ${st.error}`, {
-            kind: "error",
-            ttlMs: null,
-          });
-        } else {
-          pushToast("J-lens fitted · live", { kind: "info" });
-        }
-        await refreshSession();
-        await refreshLensSources();
-      }
-    }, LENS_FIT_POLL_MS);
-  } catch (e) {
-    lensFitState.error = e instanceof Error ? e.message : String(e);
-  } finally {
-    lensFitState.polling = false;
-  }
-}
-
-/** Kick off the background Jacobian-lens fit (the "fit j-lens" button) and
- *  start polling. Server defaults: 100 fineweb-edu prompts, all source
- *  layers, resume-if-matching. */
-export async function startLensFit(
-  body: { prompts?: number; layers?: string } = {},
-): Promise<void> {
-  if (lensFitState.running || lensFitState.polling) return;
-  try {
-    const st = await apiInstruments.startPreparation("lens", {
-      operation: "fit",
-      ...body,
-    });
-    _applyFitStatus(st);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`J-lens fit: ${msg}`, { kind: "error" });
-    return;
-  }
-  void pollLensFit();
-}
-
-/** Ask the background worker to stop after its current provider read or
- * estimator pass. Any prior complete checkpoint remains resumable. */
-export async function cancelLensFit(): Promise<void> {
-  if (!lensFitState.running || lensFitState.cancelling) return;
-  lensFitState.cancelling = true;
-  try {
-    const st = await apiInstruments.cancelPreparation("lens");
-    _applyFitStatus(st);
-    pushToast("J-lens cancelling…", { kind: "info" });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`J-lens cancel: ${msg}`, { kind: "error" });
-    lensFitState.cancelling = false;
-  }
-}
-
-/** Resume-visibility check for panel mount: if a fit is already running
- *  server-side (page reload mid-fit), pick up the polling loop. */
-export async function checkLensFit(): Promise<void> {
-  if (lensFitState.polling) return;
-  try {
-    // The lens family shares one preparations resource across fetch + fit,
-    // so only reflect it when the running-or-last job is actually a fit.
-    const st = await apiInstruments.preparationStatus("lens");
-    if (st.operation === "fit") {
-      _applyFitStatus(st);
-      if (st.state === "running") void pollLensFit();
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    pushToast(`J-lens status: ${msg}`, { kind: "error" });
-  }
-}
 
 /** Mirror the server's session.config defaults into the local
  * ``samplingState``.  The local store was previously pre-seeded with its
@@ -1109,20 +806,6 @@ export function clearChat(): void {
   }
 }
 
-export async function rewindSession(): Promise<void> {
-  await apiSessions.rewind();
-  await refreshSession();
-  // Drop the trailing user→assistant pair from the local log so the UI
-  // stays in lockstep with server-side history.
-  const t = chatLog.turns;
-  for (let i = t.length - 1; i >= 0; i--) {
-    if (t[i].role === "user") {
-      chatLog.turns = t.slice(0, i);
-      return;
-    }
-  }
-}
-
 // =========================================================== steering ===
 //
 // One unified steer rack.  A steering vector is the K=2 flat case of a
@@ -1193,12 +876,6 @@ export async function refreshVectorList(): Promise<void> {
   for (const v of r.profiles) {
     steerRack.profiles.set(v.name, v);
   }
-}
-
-export async function refreshVector(name: string): Promise<VectorInfo> {
-  const info = await apiProfiles.get(name);
-  steerRack.profiles.set(name, info);
-  return info;
 }
 
 export async function refreshCorrelation(
@@ -1333,12 +1010,6 @@ export function applyCustomSteeringExpression(expression: string): void {
   });
 }
 
-export function useVisualSteeringRack(): void {
-  enqueueOrApply("use visual steering rack", () => {
-    steerRack.customExpression = null;
-  });
-}
-
 // ------------------------------------------------------ manifold catalog
 
 /** Fetch the manifold catalog. */
@@ -1411,107 +1082,103 @@ export function removeManifoldFromRack(name: string): void {
   steerRack.entries.delete(name);
 }
 
-// ---------------------------------------------------- j-lens-mode mutators
+// ------------------------------------------------------- atom mutators
+//
+// The two single-direction atom families (``jlens/<word>``, ``sae/<id>``)
+// rack identically — one α, one trigger, one enable, no geometry — so they
+// share one mutator set parameterised by ``AtomMode``.  Only the two adds
+// stay family-specific: they differ in key construction and validation.
 
-/** Default α for a fresh J-lens token chip — lens atoms run hotter than
- *  concept vectors (a single sharp token direction, not a distributed
- *  contrast): ≈0.3 is the coherent sweet spot, ≥0.5 over-steers into
- *  repetition. */
-export const JLENS_DEFAULT_ALPHA = 0.3;
+/** Default α for a fresh atom chip.  Atoms run hotter than concept vectors
+ *  (a single sharp direction, not a distributed contrast): ≈0.3 is the
+ *  coherent sweet spot, ≥0.5 over-steers into repetition. */
+export const ATOM_DEFAULT_ALPHA = 0.3;
 
-/** Reassign a jlens-mode entry through ``fn``; no-op on absent / other-mode. */
-function mutateJLens(
-  name: string,
-  fn: (e: JLensSteerEntry) => JLensSteerEntry,
-): void {
-  const e = steerRack.entries.get(name);
-  if (e && e.mode === "jlens") steerRack.entries.set(name, fn(e));
+/** Rack-key prefix per family — the atom's namespace segment in the
+ *  steering grammar. */
+export const ATOM_PREFIX: Record<AtomMode, string> = {
+  jlens: "jlens/",
+  sae: "sae/",
+};
+
+/** The rack mutations one atom card drives. */
+export interface AtomRackActions {
+  remove(name: string): void;
+  setAlpha(name: string, alpha: number): void;
+  setEnabled(name: string, enabled: boolean): void;
+  setTrigger(name: string, trigger: Trigger): void;
+}
+
+/** Build the mutator set for one atom family.  ``label`` is the word the
+ *  pending-queue bubble shows. */
+function buildAtomActions(mode: AtomMode, label: string): AtomRackActions {
+  /** Reassign an entry of this family through ``fn``; no-op on an absent
+   *  key or an entry of another mode. */
+  const mutate = (
+    name: string,
+    fn: (e: AtomSteerEntry) => AtomSteerEntry,
+  ): void => {
+    const e = steerRack.entries.get(name);
+    if (e && e.mode === mode) steerRack.entries.set(name, fn(e));
+  };
+  return {
+    remove(name) {
+      steerRack.entries.delete(name);
+    },
+    setAlpha(name, alpha) {
+      enqueueOrApply(`${label} alpha ${name} ${alpha.toFixed(3)}`, () => {
+        mutate(name, (e) => ({ ...e, alpha }));
+      });
+    },
+    setEnabled(name, enabled) {
+      enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
+        mutate(name, (e) => ({ ...e, enabled }));
+      });
+    },
+    setTrigger(name, trigger) {
+      enqueueOrApply(`${label} trigger ${name} ${trigger}`, () => {
+        mutate(name, (e) => ({ ...e, trigger }));
+      });
+    },
+  };
+}
+
+const ATOM_ACTIONS: Record<AtomMode, AtomRackActions> = {
+  jlens: buildAtomActions("jlens", "jlens"),
+  sae: buildAtomActions("sae", "SAE"),
+};
+
+/** The rack mutators for one atom family. */
+export function atomActions(mode: AtomMode): AtomRackActions {
+  return ATOM_ACTIONS[mode];
+}
+
+function addAtomToRack(mode: AtomMode, id: string): void {
+  const name = `${ATOM_PREFIX[mode]}${id}`;
+  if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
+  steerRack.entries.set(name, {
+    mode,
+    alpha: ATOM_DEFAULT_ALPHA,
+    trigger: "BOTH",
+    enabled: true,
+  } as AtomSteerEntry);
 }
 
 /** Add a J-lens token steering chip (``α jlens/<word>``).  Accepts a bare
  *  word or a full ``jlens/…`` atom; the rack key is the full atom.
- *  Dashboard callers validate through ``apiInstruments.validateLensToken`` before this
- *  local mutation; the engine revalidates when it resolves the atom. */
+ *  Dashboard callers validate through ``apiInstruments.validateLensToken``
+ *  before this local mutation; the engine revalidates when it resolves the
+ *  atom. */
 export function addJLensToRack(word: string): void {
   const bare = word.trim().replace(/^jlens\//, "");
   if (!bare) return;
-  const name = `jlens/${bare}`;
-  if (steerRack.entries.has(name)) return;
-  steerRack.customExpression = null;
-  steerRack.entries.set(name, {
-    mode: "jlens",
-    alpha: JLENS_DEFAULT_ALPHA,
-    trigger: "BOTH",
-    enabled: true,
-  });
+  addAtomToRack("jlens", bare);
 }
 
-export function removeJLensFromRack(name: string): void {
-  steerRack.entries.delete(name);
-}
-
-export function setJLensAlpha(name: string, alpha: number): void {
-  enqueueOrApply(`jlens alpha ${name} ${alpha.toFixed(3)}`, () => {
-    mutateJLens(name, (e) => ({ ...e, alpha }));
-  });
-}
-
-export function setJLensEnabled(name: string, enabled: boolean): void {
-  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
-    mutateJLens(name, (e) => ({ ...e, enabled }));
-  });
-}
-
-export function setJLensTrigger(name: string, trigger: Trigger): void {
-  enqueueOrApply(`jlens trigger ${name} ${trigger}`, () => {
-    mutateJLens(name, (e) => ({ ...e, trigger }));
-  });
-}
-
-// -------------------------------------------------------- SAE mutators
-
-export const SAE_DEFAULT_ALPHA = 0.3;
-
-function mutateSae(
-  name: string,
-  fn: (entry: SaeSteerEntry) => SaeSteerEntry,
-): void {
-  const entry = steerRack.entries.get(name);
-  if (entry?.mode === "sae") steerRack.entries.set(name, fn(entry));
-}
-
+/** Add a resident-SAE decoder-row steering chip (``α sae/<id>``). */
 export function addSaeToRack(featureId: number): void {
-  const name = `sae/${featureId}`;
-  if (steerRack.entries.has(name)) return;
-  steerRack.customExpression = null;
-  steerRack.entries.set(name, {
-    mode: "sae",
-    alpha: SAE_DEFAULT_ALPHA,
-    trigger: "BOTH",
-    enabled: true,
-  });
-}
-
-export function removeSaeFromRack(name: string): void {
-  steerRack.entries.delete(name);
-}
-
-export function setSaeAlpha(name: string, alpha: number): void {
-  enqueueOrApply(`SAE alpha ${name} ${alpha.toFixed(3)}`, () => {
-    mutateSae(name, (entry) => ({ ...entry, alpha }));
-  });
-}
-
-export function setSaeEnabled(name: string, enabled: boolean): void {
-  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
-    mutateSae(name, (entry) => ({ ...entry, enabled }));
-  });
-}
-
-export function setSaeTrigger(name: string, trigger: Trigger): void {
-  enqueueOrApply(`SAE trigger ${name} ${trigger}`, () => {
-    mutateSae(name, (entry) => ({ ...entry, trigger }));
-  });
+  addAtomToRack("sae", String(featureId));
 }
 
 export function setManifoldBlend(name: string, blend: number): void {
@@ -2046,9 +1713,6 @@ export function snapshotProbeBaseline(): void {
     probeRack.entries.set(name, { ...e, previous: e.current });
   }
 }
-
-/** Sentinel for the layer strip when a probe has no token yet. */
-export const EMPTY_PER_LAYER: Readonly<Record<string, number>> = Object.freeze({});
 
 // ============================================================ chat ======
 
@@ -2609,7 +2273,7 @@ export async function loomRegenerateNode(
   const parentId = node.parent_id;
   if (!parentId) return;
   try {
-    await sendGenerate(null, {
+    await sendGenerate({
       parent_node_id: parentId,
       n,
       recipe_override: opts.recipe_override ?? undefined,
@@ -2642,7 +2306,7 @@ export async function loomContinueFromCommitted(
   const node = loomTree.nodes.get(nodeId);
   if (!node || node.role === "system" || node.recipe !== null) return;
   try {
-    await sendGenerate(null, {
+    await sendGenerate({
       parent_node_id: node.id,
       n: opts.n ?? 1,
       recipe_override: opts.recipe_override ?? undefined,
@@ -3029,10 +2693,6 @@ export function cancelPendingAction(id: string): void {
   pendingActions.queue = pendingActions.queue.filter((p) => p.id !== id);
 }
 
-export function discardPendingActions(): void {
-  pendingActions.queue = [];
-}
-
 /** Apply immediately if no gen is in flight AND the queue is empty;
  *  queue otherwise.  The queue check matters: with one or more items
  *  already pending, applying a fresh rack mutation immediately would
@@ -3093,8 +2753,8 @@ export function isPendingBusy(): boolean {
  *  returns ``null`` when no queued item changes the role (e.g. the
  *  queue is empty or only carries rack mutations).  Drives the chat
  *  input's role-aware placeholder + send-button label so a queued
- *  ``commit user`` flips the next submission into prefill /
- *  commit-assistant mode without waiting for the queue to drain. */
+ *  user-seat submission flips the next one's predicted seat without
+ *  waiting for the queue to drain. */
 export function predictedQueueEndOnUserNode(): boolean | null {
   for (let i = pendingActions.queue.length - 1; i >= 0; i--) {
     const e = pendingActions.queue[i].endsOnUserNode;
@@ -3575,14 +3235,12 @@ function handleWsMessage(msg: WSServerMessage): void {
       // generation.  Between generations only, never per token.
       void backfillSaeMeta();
 
-      // v2.3: the legacy standalone A/B toggle is gone — auto-regen with
-      // ``mode === "unsteered"`` *is* the A/B shadow.  Branch on the
-      // resolved recipe-override:
+      // Auto-regen with ``mode === "unsteered"`` *is* the A/B shadow.
+      // Branch on the resolved recipe-override:
       //
       //   * ``"unsteered"`` → fire the shadow-replay path
       //     (``_sendShadowGenerate``).  Tokens land on the steered turn's
       //     ``abPair`` so the chat's right column renders them in place.
-      //     Bit-identical to the pre-v2.3 A/B behaviour.
       //
       //   * any other override → fire a loom regen with the override.
       //     The engine drops the result as a sibling under the same
@@ -3823,71 +3481,17 @@ async function sendSubmitNow(
   else sock.addEventListener("open", send, { once: true });
 }
 
-/** Build a :class:`PendingAction` for a queued chat send.  The
- *  ``rebuild`` factory preserves ``opts`` across an ↑-pull-and-edit so
- *  the slot's parent_node_id / steering override / n stay attached.
- *  ``endsOnUserNode=false`` — a send lands a user turn then an assistant
- *  reply, so the post-drain active node is always assistant. */
-function buildSendPending(
-  text: string, opts: SendGenerateOpts,
-): PendingAction {
-  return {
-    id: `pa-${_pendingCounter++}`,
-    label: "send",
-    text,
-    apply: () => sendGenerateNow(text, opts),
-    awaitsGen: true,
-    rebuild: (newText: string) => buildSendPending(newText, opts),
-    createdAt: Date.now(),
-    endsOnUserNode: false,
-  };
-}
-
-/** Send a generate request over the WS.  Builds the steering expression
- * from the rack live, layers the SamplingConfig overrides when one-shot
- * mode is on, and routes everything through the singleton connection.
+/** Send a bare-continuation generate request over the WS — the
+ * regenerate / continue-from-committed path.  No authored text travels:
+ * the model speaks next from ``opts.parent_node_id`` (or the active
+ * leaf) in ``opts.generate_seat``.  Builds the steering expression from
+ * the rack live, layers the SamplingConfig overrides when one-shot mode
+ * is on, and routes everything through the singleton connection.
  *
- * When a gen is in flight (or earlier items are queued) the request
- * lands on the pending queue and waits for FIFO drain — the in-flight
- * gen is *not* interrupted.  ``replaceSlot`` keeps a pulled-and-edited
- * item at its original slot. */
+ * Fires immediately even mid-generation: these are internal
+ * store-to-store calls behind an explicit user gesture on a specific
+ * node, not composer sends, so they carry no pending-queue slot. */
 export async function sendGenerate(
-  input: string | unknown,
-  opts: SendGenerateOpts & { replaceSlot?: number | null } = {},
-): Promise<void> {
-  // Strings route through the pending queue when busy.  Non-string
-  // ``input`` (the A/B shadow path's messages array) always fires
-  // immediately — it's an internal store-to-store call that doesn't
-  // come from a user gesture and can't be pulled or re-edited.
-  if (typeof input === "string" && isPendingBusy()) {
-    const { replaceSlot, ...sendOpts } = opts;
-    const item = buildSendPending(input, sendOpts);
-    enqueuePending(
-      {
-        label: item.label,
-        text: item.text,
-        apply: item.apply,
-        awaitsGen: item.awaitsGen,
-        rebuild: item.rebuild,
-        // A send lands an assistant turn, so the post-drain active node is an
-        // assistant.  Forward the factory's value (mirrors sendPrefill /
-        // sendCommit); omitting it left the queued send as ``undefined``, so
-        // ``predictedQueueEndOnUserNode`` skipped it and the input mode
-        // mispredicted while a gen was in flight.
-        endsOnUserNode: item.endsOnUserNode,
-      },
-      { replaceSlot: replaceSlot ?? null },
-    );
-    return;
-  }
-  return sendGenerateNow(input, opts);
-}
-
-/** Immediate-fire core for ``sendGenerate``.  Bypasses the queue
- *  check — called by ``sendGenerate`` itself when not busy and by
- *  ``drainNextPendingAction`` via the queued item's ``apply``. */
-async function sendGenerateNow(
-  input: string | unknown,
   opts: SendGenerateOpts = {},
 ): Promise<void> {
   // The first server snapshot may legitimately be revision 0.  Require the
@@ -3913,21 +3517,11 @@ async function sendGenerateNow(
   // Update genStatus.maxTokens locally so the progress bar widths know
   // their target before the first token lands.
   genStatus.maxTokens = sampling?.max_tokens ?? samplingState.max_tokens;
-  // Push the user turn so the UI has something to render before the WS
-  // started event lands.  Skip the optimistic push when the server owns
-  // the tree (it will emit ``tree_mutated`` with the added user node
-  // and we'll sync from there) or when ``input`` is a messages list
-  // (A/B shadow path — no fresh user turn to display).
-  if (!loomTree.loaded && typeof input === "string") {
-    chatLog.turns = [...chatLog.turns, { role: "user", text: input }];
-  }
-  // Remember the input verbatim so the auto-regen shadow path can replay
-  // it as an unsteered run.  Only meaningful when auto-regen is on with
-  // ``mode === "unsteered"``; otherwise it's dead weight that's free to
-  // keep up to date.
   const payload: WSClientMessage = {
     type: "generate",
-    input,
+    // A continue: no committed turn, the model speaks next from the
+    // anchor node.
+    input: null,
     steering: steeringPayload,
     sampling,
     // Coerce the current family-level automatic setting to explicit ``false`` so the
@@ -3979,205 +3573,6 @@ export async function sendFork(
   else sock.addEventListener("open", send, { once: true });
 }
 
-function buildPrefillPending(
-  nodeId: string | "active@drain",
-  text: string,
-  opts: { n?: number },
-): PendingAction {
-  return {
-    id: `pa-${_pendingCounter++}`,
-    label: "prefill",
-    text,
-    apply: () => {
-      // Deferred resolution: when the parent user node was itself queued
-      // (queue-role-aware dispatch), the literal id at enqueue time was
-      // a sentinel — read the active node fresh at drain time, by which
-      // point the previous drained action has landed the right user node.
-      const parent = nodeId === "active@drain"
-        ? loomTree.active_node_id
-        : nodeId;
-      if (!parent) return;
-      return sendPrefillNow(parent, text, opts);
-    },
-    awaitsGen: true,
-    rebuild: (newText: string) => buildPrefillPending(nodeId, newText, opts),
-    createdAt: Date.now(),
-    endsOnUserNode: false,
-  };
-}
-
-/** Answer-prefill — seed an assistant reply under a user node.  The
- *  server tokenizes ``text`` into a forced decode prefix, emits it as
- *  the opening of the assistant turn, then samples the continuation.
- *  The prefilled sibling streams in via the WS ``tree_mutated`` /
- *  ``token`` / ``done`` events and becomes the active branch.  Steering
- *  and sampling ride from the current rack exactly like a normal
- *  ``sendGenerate``; ``thinking`` is forced off server-side (the text is
- *  the start of the answer, not a thought).
- *
- *  Queues behind in-flight gens / earlier pending items; the in-flight
- *  gen is not interrupted. */
-export async function sendPrefill(
-  nodeId: string | "active@drain",
-  text: string,
-  opts: { n?: number; replaceSlot?: number | null } = {},
-): Promise<void> {
-  if (isPendingBusy()) {
-    const { replaceSlot, ...prefillOpts } = opts;
-    const item = buildPrefillPending(nodeId, text, prefillOpts);
-    enqueuePending(
-      {
-        label: item.label,
-        text: item.text,
-        apply: item.apply,
-        awaitsGen: item.awaitsGen,
-        rebuild: item.rebuild,
-        endsOnUserNode: item.endsOnUserNode,
-      },
-      { replaceSlot: replaceSlot ?? null },
-    );
-    return;
-  }
-  // Immediate fire: resolve the sentinel against the live active node;
-  // an empty resolution is a no-op (nothing to anchor under).
-  const resolved = nodeId === "active@drain"
-    ? loomTree.active_node_id
-    : nodeId;
-  if (!resolved) return;
-  return sendPrefillNow(resolved, text, opts);
-}
-
-async function sendPrefillNow(
-  nodeId: string,
-  text: string,
-  opts: { n?: number } = {},
-): Promise<void> {
-  const sock = await ensureWebSocket();
-  const steering = currentSteeringExpression();
-  const sampling = buildSamplingPayload();
-  genStatus.maxTokens = sampling?.max_tokens ?? samplingState.max_tokens;
-  const payload: WSClientMessage = {
-    type: "generate",
-    prefill_node_id: nodeId,
-    prefill_text: text,
-    steering: steering || null,
-    sampling,
-    ...(opts.n !== undefined ? { n: opts.n } : {}),
-  };
-  const send = () => sock.send(JSON.stringify(payload));
-  if (sock.readyState === WebSocket.OPEN) send();
-  else sock.addEventListener("open", send, { once: true });
-}
-
-function buildCommitPending(
-  role: "user" | "assistant",
-  parentNodeId: string | null | "active@drain",
-  text: string,
-  raw: boolean = false,
-  thinking: string | null = null,
-): PendingAction {
-  return {
-    id: `pa-${_pendingCounter++}`,
-    label: role === "assistant" ? "commit assistant" : "commit user",
-    text,
-    apply: () => {
-      // Deferred resolution for queue-role-aware dispatch: a commit
-      // queued behind another that creates its own user node needs to
-      // hang under that not-yet-existing node — read the active node
-      // fresh at drain time.
-      const parent = parentNodeId === "active@drain"
-        ? loomTree.active_node_id
-        : parentNodeId;
-      return sendCommitNow(role, parent, text, raw, thinking);
-    },
-    awaitsGen: true,
-    rebuild: (newText: string) =>
-      buildCommitPending(role, parentNodeId, newText, raw, thinking),
-    createdAt: Date.now(),
-    endsOnUserNode: role === "user",
-  };
-}
-
-/** Commit — land a turn without generating.  ``role`` decides which
- *  session method routes: ``"user"`` for ``append_user_turn`` (called
- *  on an assistant/root active node — ``parentNodeId`` is that node, or
- *  null to fall through to the active node server-side); ``"assistant"``
- *  for ``append_assistant_turn`` (``parentNodeId`` is the user node the
- *  authored turn hangs off — required).  The server emits a single
- *  ``done`` event with the new node id; the loom's ``tree_mutated`` /
- *  ``tree_mutated`` subscriptions land the node in the UI.  No token
- *  streaming, no steering, no sampling — just a tree mutation.
- *
- *  Queues behind in-flight gens / earlier pending items. */
-export async function sendCommit(
-  role: "user" | "assistant",
-  parentNodeId: string | null | "active@drain",
-  text: string,
-  opts: {
-    replaceSlot?: number | null;
-    raw?: boolean;
-    /** Committed thinking block riding this turn (rendered through the
-     *  family think delimiters; 400 when the family can't carry it). */
-    thinking?: string | null;
-  } = {},
-): Promise<void> {
-  if (isPendingBusy()) {
-    const item = buildCommitPending(
-      role, parentNodeId, text, opts.raw ?? false, opts.thinking ?? null,
-    );
-    enqueuePending(
-      {
-        label: item.label,
-        text: item.text,
-        apply: item.apply,
-        awaitsGen: item.awaitsGen,
-        rebuild: item.rebuild,
-        endsOnUserNode: item.endsOnUserNode,
-      },
-      { replaceSlot: opts.replaceSlot ?? null },
-    );
-    return;
-  }
-  // Immediate fire: resolve the sentinel against the live active node.
-  // ``role === "user"`` accepts a null parent (server falls through to
-  // the live active); ``role === "assistant"`` requires a real id.
-  const resolved = parentNodeId === "active@drain"
-    ? loomTree.active_node_id
-    : parentNodeId;
-  return sendCommitNow(
-    role, resolved, text, opts.raw ?? false, opts.thinking ?? null,
-  );
-}
-
-async function sendCommitNow(
-  role: "user" | "assistant",
-  parentNodeId: string | null,
-  text: string,
-  raw: boolean = false,
-  thinking: string | null = null,
-): Promise<void> {
-  const sock = await ensureWebSocket();
-  // Per-message role labels ride the commit too (roleplay scaffold), so an
-  // authored turn is stamped with the box value just like a generated one.
-  // Raw / flat commits carry no chat-template role — the server suppresses
-  // labels there regardless, but we still omit them for clarity.
-  const commitSampling = raw ? null : buildSamplingPayload();
-  const payload: WSClientMessage = {
-    type: "generate",
-    commit_role: role,
-    commit_text: text,
-    parent_node_id: parentNodeId,
-    ...(thinking ? { commit_thinking: thinking } : {}),
-    ...(commitSampling ? { sampling: commitSampling } : {}),
-    // ``raw`` lifts the user-under-user guard server-side — a flat
-    // (base-model) commit's authored span may hang under any role.
-    raw,
-  };
-  const send = () => sock.send(JSON.stringify(payload));
-  if (sock.readyState === WebSocket.OPEN) send();
-  else sock.addEventListener("open", send, { once: true });
-}
-
 export function sendStop(): void {
   if (
     wsConn.socket &&
@@ -4189,38 +3584,23 @@ export function sendStop(): void {
 
 // =========================================== A/B compare metadata =======
 
-/** A/B compare state.  ``enabled`` is the user-visible toggle.  The
- * remaining fields drive the dual-roundtrip dance:
- *
- * - ``pendingTurnIdx`` — the steered-turn index waiting for its unsteered
- *   pair.  Set the moment the shadow gen is dispatched; cleared on shadow
- *   ``done`` or ``error``.
- * - ``processingAb`` — when true, the next stream of WS events
- *   (``started``/``token``/``done``) routes into ``turn.abPair`` on
- *   ``chatLog.turns[pendingTurnIdx]`` instead of allocating a fresh turn.
- *   This is the WS-side flag the message handler keys off.
- *
- * The shadow's prompt is reconstructed from ``chatLog.turns`` at fire
- * time (see ``_buildShadowMessages``) — no per-turn input string is
- * cached on this state, so toggling A/B mid-conversation works for any
- * turn, not only the just-sent one.
- *
- * Mid-flight toggle-off semantics: once a shadow gen is in flight, we let
- * it finish writing into ``abPair`` even if the user toggles A/B off — the
- * turn is harmless when not rendered, and tearing the WS state down mid-
- * stream is more error-prone than letting it complete.  Toggling off only
- * prevents the *next* steered gen from spawning a shadow.  If the steered
- * gen errors before the shadow fires, we never enter ``processingAb`` and
- * the abPair stays unset on that turn.
- */
 /** Transient routing state for the unsteered-shadow generation.
  *
- *  v2.3: the standalone ``abState.enabled`` toggle is gone — the legacy
- *  "A/B" semantic has been folded into ``autoRegenState`` with
- *  ``mode === "unsteered"`` as the default.  The remaining
- *  ``processingAb`` / ``pendingTurnIdx`` fields are load-bearing for the
- *  WS dispatcher (they route shadow tokens into the steered turn's
- *  ``abPair`` instead of appending a fresh top-level turn). */
+ *  The shadow is ``autoRegenState`` with ``mode === "unsteered"``; there
+ *  is no standalone toggle.  ``processingAb`` / ``pendingTurnIdx`` are
+ *  load-bearing for the WS dispatcher — while ``processingAb`` is set the
+ *  next ``started``/``token``/``done`` stream routes into
+ *  ``chatLog.turns[pendingTurnIdx].abPair`` instead of appending a fresh
+ *  top-level turn.  ``pendingTurnIdx`` is set when the shadow gen is
+ *  dispatched and cleared on its ``done`` / ``error``.
+ *
+ *  The shadow's prompt is reconstructed from ``chatLog.turns`` at fire
+ *  time (see ``_buildShadowMessages``), so the comparison works for any
+ *  turn, not only the just-sent one.  Turning auto-regen off mid-flight
+ *  lets the in-flight shadow finish writing into ``abPair`` — the turn is
+ *  harmless when not rendered, and tearing the WS state down mid-stream
+ *  is more error-prone than letting it complete; it only prevents the
+ *  *next* steered gen from spawning a shadow. */
 export interface AbState {
   pendingTurnIdx: number | null;
   processingAb: boolean;
@@ -4723,10 +4103,9 @@ export function toggleAutoRegen(): void {
   const wasOff = !autoRegenState.enabled;
   autoRegenState.enabled = !autoRegenState.enabled;
   // Off → on with the "unsteered" mode: replay the conversation through
-  // the unsteered model for the most recent generated turn that
-  // doesn't already carry an ``abPair``.  Mirrors the pre-v2.3 A/B
-  // toggle's retroactive-shadow behaviour, so users who flip the toggle
-  // on after-the-fact see the right column populate immediately rather
+  // the unsteered model for the most recent generated turn that doesn't
+  // already carry an ``abPair``, so users who flip the toggle on
+  // after-the-fact see the right column populate immediately rather
   // than waiting for the next send.  Other modes use the loom-regen
   // path — they take effect on the next ``done`` event by design.
   if (!wasOff) return;

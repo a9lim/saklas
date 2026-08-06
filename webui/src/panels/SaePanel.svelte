@@ -24,7 +24,9 @@
   import Button from "../lib/ui/Button.svelte";
   import { onMount } from "svelte";
   import SaeProbeCard from "./rack/SaeProbeCard.svelte";
-  import SaeSteerCard from "./rack/SaeSteerCard.svelte";
+  import { mergeInstrumentProbeRows } from "./rack/probeRows";
+  import type { InstrumentProbeRow } from "./rack/probeRows";
+  import AtomSteerCard from "./rack/AtomSteerCard.svelte";
   import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import { apiInstruments } from "../lib/api";
@@ -32,21 +34,19 @@
     activeProbeNames,
     addSaeToRack,
     attachProbe,
-    cancelSaeTrain,
-    checkSaeTrain,
     loadSae,
+    saeLoad,
+    saeTrain,
     probeRack,
     probeEntryForDisplay,
     saeState,
     saeSourceState,
-    saeTrainState,
     saeRawFallbackScale,
     saeReadoutForDisplay,
     seedProbeDisplay,
     sessionState,
     setLiveSae,
     setSaeSortMode,
-    startSaeTrain,
     steerRack,
     tokenHoverState,
     refreshSaeSources,
@@ -76,7 +76,7 @@
     label: row.release,
   })));
   const sourceBusy = $derived(
-    saeSourceState.loading || saeState.loading || saeTrainState.running,
+    saeSourceState.loading || saeLoad.state.running || saeTrain.state.running,
   );
   const selectedPreparedSource = $derived(
     saeSourceState.sources.find((source) => source.source === selectedSource),
@@ -108,26 +108,9 @@
   );
 
   onMount(() => {
-    void refreshSaeSources().then(() => {
-      const active = saeSourceState.sources.find((source) => source.active);
-      if (active) selectedSource = active.source;
-    });
-    void checkSaeTrain();
-  });
-
-  $effect(() => {
-    const active = saeSourceState.sources.find((source) => source.active);
-    const known = saeSourceState.sources.some(
-      (source) => source.source === selectedSource,
-    ) || providerOptions.some((source) => source.value === selectedSource) ||
-      selectedSource === "local";
-    if (
-      !selectedSource ||
-      !known
-    ) {
-      selectedSource = active?.source ?? saeSourceState.sources[0]?.source ??
-        providerOptions[0]?.value ?? "";
-    }
+    void refreshSaeSources();
+    void saeTrain.check();
+    void saeLoad.check();
   });
 
   $effect(() => {
@@ -169,14 +152,14 @@
   });
 
   function requestTrain(): void {
-    if (!localName.trim() || saeTrainState.running) return;
+    if (!localName.trim() || saeTrain.state.running) return;
     if (!trainConfirm) {
       trainConfirm = true;
       return;
     }
     trainConfirm = false;
     const parsedLayer = trainLayer.trim() === "" ? null : Number(trainLayer);
-    void startSaeTrain({
+    void saeTrain.start({
       name: localName.trim(),
       tokens: trainTokens,
       layer: parsedLayer != null && Number.isInteger(parsedLayer)
@@ -200,7 +183,7 @@
   }
 
   function loadSelectedSae(source: string): void {
-    void loadSae(source, selectedLayerNumber);
+    loadSae(source, selectedLayerNumber);
   }
 
   // ---------- STEER: sae-mode rack entries (by feature id) ----------
@@ -246,71 +229,19 @@
     return maxAct != null && maxAct > 0 ? value / maxAct : value / fallbackScale;
   }
 
-  const pinned = $derived.by(() => {
-    const rows = [...pinnedBase];
-    if (saeState.sortMode === "name") {
-      rows.sort((a, b) => {
-        const aid = Number(a.name.slice(4));
-        const bid = Number(b.name.slice(4));
-        const an = a.entry?.info.label || String(aid);
-        const bn = b.entry?.info.label || String(bid);
-        return an.localeCompare(bn, undefined, { numeric: true });
-      });
-    } else {
-      rows.sort((a, b) => {
-        const ae = a.entry!;
-        const be = b.entry!;
-        const av = ae.aggregate?.coords?.[0] ?? ae.reading?.coords?.[0] ?? ae.current;
-        const bv = be.aggregate?.coords?.[0] ?? be.reading?.coords?.[0] ?? be.current;
-        // Pinned values with max_act are already normalized by the server.
-        const as = ae.info.max_act != null ? av : av / fallbackScale;
-        const bs = be.info.max_act != null ? bv : bv / fallbackScale;
-        return bs - as;
-      });
-    }
-    return rows;
-  });
-
-  const discovery = $derived.by(() => {
-    const rows = [...discoveryBase];
-    if (saeState.sortMode === "name") {
-      rows.sort((a, b) =>
-        (a.label || String(a.id)).localeCompare(
-          b.label || String(b.id),
-          undefined,
-          { numeric: true },
-        ),
-      );
-    } else {
-      rows.sort((a, b) =>
-        visibleStrength(b.activation, b.max_act ?? null) -
-        visibleStrength(a.activation, a.max_act ?? null),
-      );
-    }
-    return rows;
-  });
-
   type VisibleProbeCard =
-    | {
+    | ({
         kind: "pinned";
-        key: string;
         name: string;
         entry: NonNullable<(typeof pinnedBase)[number]["entry"]>;
-        sortName: string;
-        strength: number;
-      }
-    | {
+      } & InstrumentProbeRow)
+    | ({
         kind: "discovery";
-        key: string;
         feature: (typeof discoveryBase)[number];
-        sortName: string;
-        strength: number;
-      };
+      } & InstrumentProbeRow);
 
-  /** One visible list, one sort order. Pinning changes persistence/actions,
-   *  never a card's position outside the selected sort. */
-  const probeCards = $derived.by((): VisibleProbeCard[] => {
-    const rows: VisibleProbeCard[] = pinned.map((row) => {
+  const pinnedRows = $derived.by((): VisibleProbeCard[] =>
+    pinnedBase.map((row) => {
       const entry = row.entry!;
       const value = entry.aggregate?.coords?.[0] ??
         entry.reading?.coords?.[0] ?? entry.current;
@@ -321,26 +252,30 @@
         name: row.name,
         entry,
         sortName: entry.info.label || String(id),
+        // Pinned values with max_act are already normalized server-side.
         strength: entry.info.max_act != null ? value : value / fallbackScale,
       };
-    });
-    if (saeState.live || tokenHoverState.active) {
-      rows.push(...discovery.map((feature) => ({
-        kind: "discovery" as const,
-        key: `sae/${feature.id}`,
-        feature,
-        sortName: feature.label || String(feature.id),
-        strength: visibleStrength(feature.activation, feature.max_act ?? null),
-      })));
-    }
-    rows.sort(saeState.sortMode === "name"
-      ? (a, b) => a.sortName.localeCompare(
-          b.sortName, undefined, { numeric: true },
-        ) || b.strength - a.strength
-      : (a, b) => b.strength - a.strength ||
-          a.sortName.localeCompare(b.sortName, undefined, { numeric: true }));
-    return rows;
-  });
+    }));
+
+  const discoveryRows = $derived.by((): VisibleProbeCard[] =>
+    discoveryBase.map((feature) => ({
+      kind: "discovery",
+      key: `sae/${feature.id}`,
+      feature,
+      sortName: feature.label || String(feature.id),
+      strength: visibleStrength(feature.activation, feature.max_act ?? null),
+    })));
+
+  /** One visible list, one sort order. Pinning changes persistence/actions,
+   *  never a card's position outside the selected sort. */
+  const probeCards = $derived(
+    mergeInstrumentProbeRows(
+      pinnedRows,
+      saeState.live || tokenHoverState.active ? discoveryRows : [],
+      saeState.sortMode,
+      { numericNames: true },
+    ),
+  );
 
   let steerInput = $state("");
   let probeInput = $state("");
@@ -431,7 +366,7 @@
     busy={sourceBusy}
     accent="var(--pillar-sae)"
     sourceError={saeSourceState.error}
-    working={saeTrainState.running}
+    working={saeTrain.state.running}
     selectionCurrent={sourceSelectionCurrent}
     onuse={loadSelectedSae}
     providerOptions={providerOptions}
@@ -486,14 +421,14 @@
     {#snippet progress()}
       <div class="train-progress" role="status" aria-live="polite">
         <div class="train-line">
-          <span class="work-status">{saeTrainState.message ?? "training…"}</span>
+          <span class="work-status">{saeTrain.state.message ?? "training…"}</span>
           <span class="train-count">
-            {saeTrainState.tokensDone.toLocaleString()}/{saeTrainState.tokensTotal.toLocaleString()}
+            {saeTrain.state.current.toLocaleString()}/{saeTrain.state.total.toLocaleString()}
           </span>
         </div>
         <Bar
-          value={saeTrainState.tokensDone}
-          max={Math.max(saeTrainState.tokensTotal, 1)}
+          value={saeTrain.state.current}
+          max={Math.max(saeTrain.state.total, 1)}
           width={160}
           height={8}
           color="var(--pillar-sae)"
@@ -501,10 +436,10 @@
         <Button
           size="sm"
           variant="danger"
-          disabled={saeTrainState.cancelling}
-          onclick={() => void cancelSaeTrain()}
+          disabled={saeTrain.state.cancelling}
+          onclick={() => void saeTrain.cancel()}
         >
-          {saeTrainState.cancelling ? "cancelling…" : "cancel"}
+          {saeTrain.state.cancelling ? "cancelling…" : "cancel"}
         </Button>
       </div>
     {/snippet}
@@ -516,14 +451,14 @@
       {/if}
     {/snippet}
     {#snippet messages()}
-      {#if saeState.loading && saeState.loadMessage}
-        <p class="hint" role="status" aria-live="polite">{saeState.loadMessage}</p>
+      {#if saeLoad.state.running && saeLoad.state.message}
+        <p class="hint" role="status" aria-live="polite">{saeLoad.state.message}</p>
       {/if}
-      {#if saeState.loadError}
-        <p class="hint load-error" role="alert">{saeState.loadError}</p>
+      {#if saeLoad.state.error}
+        <p class="hint load-error" role="alert">{saeLoad.state.error}</p>
       {/if}
-      {#if saeTrainState.error}
-        <p class="hint load-error" role="alert">local train: {saeTrainState.error}</p>
+      {#if saeTrain.state.error}
+        <p class="hint load-error" role="alert">local train: {saeTrain.state.error}</p>
       {/if}
       {#if discoverError}
         <p class="hint" role="alert">registry: {discoverError}</p>
@@ -544,7 +479,7 @@
         <div class="cards steer-cards" role="list">
           {#each steerCards as [name, entry] (name)}
             <div role="listitem">
-              <SaeSteerCard {name} {entry} />
+              <AtomSteerCard mode="sae" {name} {entry} />
             </div>
           {/each}
         </div>
@@ -574,7 +509,7 @@
     <section class="section probe">
       <RackSectionHeader
         title="PROBE"
-        count={`${pinned.length} pinned`}
+        count={`${pinnedBase.length} pinned`}
         live={saeState.live}
         liveBusy={saeState.busy}
         liveTitle={saeState.live
@@ -633,7 +568,7 @@
             <p class="hint">no SAE score for this token</p>
           {/if}
         {:else if saeState.live}
-          {#if discovery.length === 0}
+          {#if discoveryBase.length === 0}
             <p class="hint">run to discover</p>
           {/if}
         {:else}
