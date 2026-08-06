@@ -1,13 +1,11 @@
 """Whitening surfaces added in the tier-1/tier-2 sweep.
 
-Pure-CPU verification of the four new Mahalanobis integration points, all
+Pure-CPU verification of the Mahalanobis integration points, all
 checked against the *definitional* formula (not just "runs"):
 
 * ``Monitor`` whitened readout — the M-orthogonal subspace
   projection fraction + Mahalanobis nearest-node distance, vs a reference
   implementation built from ``LayerWhitener.apply_inv`` / ``subspace_gram``.
-* ``transfer_profile`` target-metric re-bake — per-layer magnitude becomes
-  the target Mahalanobis norm; all-or-nothing gate; ``bake`` provenance.
 """
 from __future__ import annotations
 
@@ -23,17 +21,8 @@ from saklas.core.manifold import (
     fit_layer_subspace,
 )
 from saklas.core.monitor import Monitor, _layer_geometry
-from saklas.io.alignment import LayerAlignment
 from tests._whitener import isotropic_whitener
 
-
-def _identity_alignments(
-    layers: tuple[int, ...], dim: int,
-) -> dict[int, LayerAlignment]:
-    return {
-        layer: LayerAlignment(torch.eye(dim), torch.eye(dim), torch.zeros(dim))
-        for layer in layers
-    }
 
 
 # --------------------------------------------------------------------------- #
@@ -208,64 +197,3 @@ class TestMonitorWhitened:
         assert set(mon.attached_probes()["toy"].whitened.keys()) == {0}
 
 
-def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
-    return float(torch.dot(a / a.norm(), b / b.norm()).item())
-
-
-# --------------------------------------------------------------------------- #
-# transfer_profile target-metric re-bake                                      #
-# --------------------------------------------------------------------------- #
-
-
-class TestTransferProfileRebake:
-    def _src_profile(self, d: int, layers: tuple[int, ...]):
-        from saklas.core.profile import Profile
-        torch.manual_seed(5)
-        return Profile({L: torch.randn(d) for L in layers})
-
-    def test_rebake_magnitude_is_target_mahalanobis_norm(self) -> None:
-        from saklas.io.alignment import transfer_profile
-        d, layers = 6, (0, 1, 2)
-        src = self._src_profile(d, layers)
-        # Identity alignment (orthogonal) so v_tgt == v_src — isolates the
-        # re-bake effect from the rotation.
-        align = _identity_alignments(layers, d)
-        w = _make_whitener(
-            layers=layers, d=d,
-            cov_scale=torch.tensor([1.0, 3.0, 0.5, 2.0, 1.0, 4.0]),
-        )
-        out = transfer_profile(
-            src, align, source_model_id="src/m", whitener=w,
-        )
-        assert out.metadata["bake"] == "mahalanobis"
-        for L in layers:
-            v_tgt = align[L].apply_vector(src[L].float())
-            expected_norm = w.mahalanobis_norm(L, v_tgt)
-            assert float(out[L].norm()) == pytest.approx(expected_norm, abs=1e-4)
-            # Direction preserved (only magnitude re-scaled).
-            assert abs(_cos(out[L].float(), src[L].float())) == pytest.approx(
-                1.0, abs=1e-5,
-            )
-
-    def test_no_whitener_raises(self) -> None:
-        """Transfer is Mahalanobis-only: no target whitener is a hard error
-        (the Euclidean transfer path is gone)."""
-        from saklas.core.mahalanobis import WhitenerError
-        from saklas.io.alignment import transfer_profile
-        d, layers = 6, (0, 1, 2)
-        src = self._src_profile(d, layers)
-        align = _identity_alignments(layers, d)
-        with pytest.raises(WhitenerError, match="TARGET"):
-            transfer_profile(src, align, source_model_id="src/m")
-
-    def test_partial_coverage_raises(self) -> None:
-        from saklas.core.mahalanobis import WhitenerError
-        from saklas.io.alignment import transfer_profile
-        d, layers = 6, (0, 1, 2)
-        src = self._src_profile(d, layers)
-        align = _identity_alignments(layers, d)
-        w_partial = _make_whitener(layers=(0, 1), d=d)  # missing layer 2
-        with pytest.raises(WhitenerError, match="TARGET"):
-            transfer_profile(
-                src, align, source_model_id="src/m", whitener=w_partial,
-            )

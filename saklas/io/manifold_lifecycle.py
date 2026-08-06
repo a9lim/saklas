@@ -712,8 +712,8 @@ def _transfer_manifold_locked(
     is orthonormalized and the affine/RBF reduced coefficients are transformed
     exactly into that new frame; a rank collapse is rejected.  ``node_coords``
     (the intrinsic authoring layout) remains model-independent.  Layers the
-    alignment doesn't cover are dropped,
-    mirroring :func:`saklas.io.alignment.transfer_profile`.
+    alignment doesn't cover are dropped — partial transfer is the only sensible
+    behavior, since a subspace with no map can't be lifted into target space.
 
     ``alignment`` is supplied by the caller (building it needs both
     models loaded — a session/CLI concern), keeping this function

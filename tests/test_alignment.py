@@ -1,8 +1,7 @@
 """Cross-model probe alignment via compact per-layer affine maps.
 
 Covers ``fit_alignment`` (matched + mismatched dim, layer-count
-mismatch), ``transfer_profile`` (provenance + dropping uncovered
-layers), ``alignment_quality`` (R² metric), and the disk cache shape.
+mismatch), ``alignment_quality`` (R² metric), and the disk cache shape.
 
 CPU-only, no model load — alignment math runs over synthetic
 activation tensors.
@@ -15,7 +14,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from saklas.core.profile import Profile, ProfileError
 from saklas.io.alignment import (
     AlignmentError,
     LayerAlignment,
@@ -24,7 +22,6 @@ from saklas.io.alignment import (
     fit_alignment,
     load_alignment_map,
     save_alignment_map,
-    transfer_profile,
 )
 
 
@@ -146,100 +143,6 @@ class TestFitAlignment:
         }
         M = fit_alignment(src, tgt, min_shared_layers=10)
         assert sorted(M.keys()) == list(range(5, 15))
-
-
-# ---------------------------------------------------------------------------
-# transfer_profile.
-# ---------------------------------------------------------------------------
-
-
-class TestTransferProfile:
-    # Transfer is Mahalanobis-only (4.0 collapse): the target-metric share
-    # re-bake is mandatory, so every transfer needs a target whitener covering
-    # the transferred layers (there is no Euclidean transfer).
-    @staticmethod
-    def _whitener(dim: int, layers: list[int]) -> object:
-        from saklas.core.mahalanobis import LayerWhitener
-        g = torch.Generator().manual_seed(7)
-        acts = {L: torch.randn(120, dim, generator=g) for L in layers}
-        means = {L: torch.zeros(dim) for L in layers}
-        return LayerWhitener.from_neutral_activations(acts, means)
-
-    def test_applies_per_layer_map_and_records_provenance(self) -> None:
-        torch.manual_seed(0)
-        # Identity alignment — direction preserved (magnitude re-baked to the
-        # target Mahalanobis norm).
-        D = 4
-        eye = torch.eye(D)
-        M = _alignments({0: eye, 2: eye, 5: eye})
-
-        src_profile = Profile(
-            {0: torch.tensor([1.0, 0.0, 0.0, 0.0]),
-             2: torch.tensor([0.5, 0.5, 0.0, 0.0]),
-             5: torch.tensor([0.0, 0.0, 1.0, 0.0])},
-            metadata={"method": "contrastive_pca"},
-        )
-
-        transferred = transfer_profile(
-            src_profile, M,
-            source_model_id="google/gemma-3-4b-it",
-            transfer_quality_estimate=0.85,
-            whitener=self._whitener(D, [0, 2, 5]),
-        )
-
-        assert transferred.layers == [0, 2, 5]
-        # Identity alignment ⇒ direction preserved (only magnitude re-baked).
-        for layer in transferred.layers:
-            sv = src_profile[layer].float()
-            tv = transferred[layer].float()
-            cos = torch.dot(sv / sv.norm(), tv / tv.norm())
-            assert abs(float(cos)) == pytest.approx(1.0, abs=1e-5)
-
-        # Provenance survives the wrap; the re-bake is Mahalanobis.
-        assert transferred.metadata["method"] == "procrustes_transfer"
-        assert transferred.metadata["source_model_id"] == "google/gemma-3-4b-it"
-        assert transferred.metadata["transfer_quality_estimate"] == pytest.approx(0.85)
-        assert transferred.metadata["bake"] == "mahalanobis"
-
-    def test_drops_uncovered_layers(self) -> None:
-        D = 4
-        M = _alignments({0: torch.eye(D), 5: torch.eye(D)})  # Layer 2 not covered.
-        src_profile = Profile(
-            {0: torch.ones(D), 2: torch.ones(D), 5: torch.ones(D)},
-            metadata={"method": "contrastive_pca"},
-        )
-        # The whitener covers the transferred (alignment-covered) layers {0, 5};
-        # layer 2 is dropped by the alignment before the whitener gate.
-        transferred = transfer_profile(
-            src_profile, M, source_model_id="src/model",
-            whitener=self._whitener(D, [0, 5]),
-        )
-        assert transferred.layers == [0, 5]
-
-    def test_affine_offset_never_enters_direction_transfer(self) -> None:
-        direction = torch.tensor([1.0, -2.0, 0.5, 0.25])
-        alignment = LayerAlignment(
-            torch.eye(4), torch.eye(4), torch.full((4,), 10_000.0),
-        )
-        transferred = transfer_profile(
-            Profile({0: direction}, metadata={}), {0: alignment},
-            source_model_id="src/model", whitener=self._whitener(4, [0]),
-        )[0]
-        assert torch.nn.functional.cosine_similarity(
-            transferred.float(), direction.float(), dim=0,
-        ) == pytest.approx(1.0, abs=1e-6)
-
-    def test_empty_alignment_raises(self) -> None:
-        src_profile = Profile({0: torch.ones(4)}, metadata={})
-        with pytest.raises(ProfileError, match="empty"):
-            transfer_profile(src_profile, {}, source_model_id="src/model")
-
-    def test_fully_disjoint_layers_raises(self) -> None:
-        src_profile = Profile({0: torch.ones(4)}, metadata={})
-        # Alignment covers layers 5-9; profile is only at layer 0.
-        M = _alignments({layer: torch.eye(4) for layer in range(5, 10)})
-        with pytest.raises(ProfileError, match="covered no layers"):
-            transfer_profile(src_profile, M, source_model_id="src/model")
 
 
 # ---------------------------------------------------------------------------
