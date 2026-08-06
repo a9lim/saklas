@@ -56,12 +56,12 @@ class SaeRun:
     Owns the generation-scoped state (``protocol.py``): the immutable
     :class:`InstrumentBinding` — probe specs frozen at bind with the
     normalization unit (``max_act``) **resolved** into the snapshot — the
-    live-active flag, the per-forward encode stash, and the ``observe``
-    memo.  The frozen specs are the fix for the metadata-backfill race:
-    ``fetch_sae_feature_meta`` mutates attached specs and the meta cache
-    without the generation lock, so a running generation must measure
-    against its bind-time snapshot, never the live registry.  An idle run
-    (``bound=False``) reads the live registry — between generations a
+    live-discovery snapshot, the live-active flag, the per-forward encode
+    stash, and the ``observe`` memo.  The frozen specs close the
+    metadata-backfill race: ``fetch_sae_feature_meta`` mutates attached specs
+    and the meta cache without the generation lock, so a running generation
+    must measure against its bind-time snapshot, never the live registry.  An
+    idle run (``bound=False``) reads the live registry — between generations a
     Neuronpedia refresh still changes the unit immediately.
     """
 
@@ -71,11 +71,17 @@ class SaeRun:
         binding: InstrumentBinding,
         *,
         active: bool = True,
+        live_state: "Mapping[str, Any] | None" = None,
         bound: bool = False,
     ) -> None:
         self._instrument = instrument
         self.binding = binding
         self.active = active
+        #: The live-discovery config snapshotted at prepare — a library
+        #: caller on another thread can toggle the instrument-level ``live``
+        #: mid-decode, and a bound run must keep reading the state its
+        #: generation started with (idle runs pass through instead).
+        self.live_state = live_state
         self.bound = bound
         self.step_stash: dict[str, Any] | None = None
         self.last_step_readings: dict[str, "ProbeReading"] | None = None
@@ -144,12 +150,13 @@ class SaeRun:
         return self._instrument.score_probes(pooled)
 
     def close(self) -> None:
-        """Release generation-scoped state (stash, memo)."""
+        """Release generation-scoped state (stash, memo, live snapshot)."""
         self.step_stash = None
         self.last_step_readings = None
         self._memo_step = None
         self._memo_readings = None
         self.active = True
+        self.live_state = None
 
 
 class SaeInstrument:
@@ -169,12 +176,14 @@ class SaeInstrument:
         # generation's resolved readout width is shared with logit alts and
         # J-lens, so it is deliberately not session-lifetime instrument state.
         self.live: dict[str, Any] | None = None
-        # The SAE registry boundary (round-6 P2, the lens state_lock's
-        # sibling): one reentrant leaf lock covering registry mutation
-        # (attach/detach, the session's metadata backfill and load/unload
-        # probe eviction) and the coherent snapshots (specs/names/
-        # probe_hash, the idle _measurement_specs copy).  Never held on
-        # per-token paths — bound runs read their frozen binding.
+        # THE SAE-state boundary, the lens ``state_lock``'s sibling: one
+        # reentrant leaf lock covering registry mutation (attach/detach, the
+        # session's metadata backfill and load/unload probe eviction), the
+        # live toggles, and the coherent snapshots (specs/names/probe_hash,
+        # the plan roster read, the idle ``_measurement_specs`` /
+        # ``_measurement_live`` copies).  An un-locked reader iterating the
+        # registry tears under a concurrent detach.  Never held on per-token
+        # paths — bound runs read their frozen binding and live snapshot.
         self.state_lock = threading.RLock()
         # The current per-generation run (idle passthrough until bind()).
         self.current_run = SaeRun(
@@ -237,6 +246,12 @@ class SaeInstrument:
         session metadata cache at bind time, so a mid-generation
         Neuronpedia backfill (which mutates specs and cache without the
         generation lock) cannot change what a running generation measures.
+
+        The live-discovery config is snapshotted in the same ``state_lock``
+        hold, for the same reason the lens snapshots its live state: the
+        toggles are reachable from any thread (the HTTP routes serialize
+        behind the session lock, a library caller does not), and a flip
+        landing mid-decode must not change what the running generation reads.
         """
         if prep.family != self.family:
             raise TypeError(
@@ -262,6 +277,7 @@ class SaeInstrument:
         specs: dict[str, dict[str, Any]] = {}
         with self.state_lock:
             probe_items = list(self.probes.items())
+            live_state = dict(self.live) if self.live is not None else None
         for name, spec in probe_items:
             frozen = dict(spec)
             max_act = frozen.get("max_act")
@@ -281,6 +297,7 @@ class SaeInstrument:
                 specs=specs,
             ),
             active=live_active,
+            live_state=live_state,
             bound=True,
         )
         self.current_run = run
@@ -296,9 +313,9 @@ class SaeInstrument:
     def _measurement_specs(self) -> "Mapping[str, Mapping[str, Any]]":
         """The spec source for measurement: a bound run's frozen binding
         (race-immune), else a per-call coherent snapshot of the live
-        registry (idle passthrough) — handing out the live dict let one
-        idle read tear mid-iteration under the un-locked detach, and a
-        metadata backfill could rewrite a unit mid-read (round-6 P2)."""
+        registry (idle passthrough).  Handing out the live dict lets an idle
+        read tear mid-iteration under a concurrent detach, and a metadata
+        backfill can rewrite a unit mid-read."""
         run = self.current_run
         if run.bound:
             return run.binding.specs
@@ -306,6 +323,16 @@ class SaeInstrument:
             return {
                 name: dict(spec) for name, spec in self.probes.items()
             }
+
+    def _measurement_live(self) -> "Mapping[str, Any] | None":
+        """The live-discovery state for measurement: a bound run's bind-time
+        snapshot (a toggle from another thread must not change what a running
+        generation reads), else a coherent copy of the live config."""
+        run = self.current_run
+        if run.bound:
+            return run.live_state
+        with self.state_lock:
+            return dict(self.live) if self.live is not None else None
 
     # -------------------------------------------------------------- registry
 
@@ -367,10 +394,11 @@ class SaeInstrument:
         runtime layer whenever a finalize aggregate or an active gate will
         read them (the resident layer is session-side runtime state shared
         with steering atoms, consulted only when probes are attached).
-        The prep carries the request; unlike the lens there is no
-        registry↔source identity coupling to snapshot, so demand reads the
-        live registry (a racing detach only shrinks or widens capture — the
-        binding still freezes what the run measures).
+        The prep carries the request.  Unlike the lens there is no
+        registry↔source identity to snapshot at prepare, so demand reads the
+        live registry and live config under one ``state_lock`` hold; a detach
+        or toggle racing that read only shrinks or widens capture, because
+        ``bind`` freezes what the run actually measures.
         """
         if prep.family != self.family:
             raise TypeError(
@@ -378,8 +406,12 @@ class SaeInstrument:
                 f"prepare() returned, got family={prep.family!r}"
             )
         request = prep.request
-        live = self.live if request.live else None
-        probes = self.probes
+        with self.state_lock:
+            live = (
+                dict(self.live)
+                if (request.live and self.live is not None) else None
+            )
+            probes = dict(self.probes)
         gate_keys = frozenset(
             key for key in request.gate_keys
             if parse_gate_ref(key).probe in probes
@@ -582,7 +614,12 @@ class SaeInstrument:
         *,
         pooled: dict[int, torch.Tensor] | None = None,
     ) -> dict[str, "ProbeReading"]:
-        """End-of-gen aggregate pooled at the last content token."""
+        """End-of-gen aggregate pooled at the last content token.
+
+        Shares the session's ``_pooled_aggregate_slice`` with the monitor
+        roster and the lens family, so all three aggregates read the same
+        position under every retention mode.
+        """
         session = self._session
         # Binding-authoritative guard: a probe detached mid-generation
         # stays in this generation's aggregate roster (mutations apply
@@ -590,17 +627,7 @@ class SaeInstrument:
         if not self._measurement_specs() or not generated_ids:
             return {}
         if pooled is None:
-            agg_fwd = session._aggregate_forward_index(generated_ids)
-            if agg_fwd is None:
-                return {}
-            pooled = session._capture.tail_slice_at(agg_fwd)
-            if not pooled:
-                stacked = session._capture.stacked()
-                pooled = {
-                    layer: rows[agg_fwd]
-                    for layer, rows in stacked.items()
-                    if rows.shape[0] > agg_fwd
-                }
+            pooled = session._pooled_aggregate_slice(generated_ids)
         return self.current_run.observe_aggregate(pooled) if pooled else {}
 
     # ----------------------------------------------------------- live readout
@@ -615,18 +642,21 @@ class SaeInstrument:
             if release.startswith(("local:", "saelens:"))
             else f"saelens:{release}"
         )
-        self.live = {
-            "layer": layer,
-            "source": source,
-        }
+        with self.state_lock:
+            self.live = {
+                "layer": layer,
+                "source": source,
+            }
         return {"layer": layer}
 
     def disable_live(self) -> None:
-        self.live = None
+        with self.state_lock:
+            self.live = None
 
     @property
     def is_live(self) -> bool:
-        return self.live is not None
+        with self.state_lock:
+            return self.live is not None
 
     def live_readout_step(
         self, *, top_k: int = 8, step_id: int = -1,
@@ -636,11 +666,11 @@ class SaeInstrument:
         Reuses the gate callback's encoded activations + raw values when the
         stash came from THIS forward (``stash["step"] == step_id`` — one
         encode shared by gates, pinned probes, and the live display on a
-        step; step identity replaced the ``fresh`` consume-once flag, so
-        reuse is idempotent and ``step_id < 0`` never matches).
+        step; staleness is structural, so reuse is idempotent and
+        ``step_id < 0`` never matches).
         """
         session = self._session
-        state = self.live
+        state = self._measurement_live()
         if state is None or not self.active_for_generation:
             return None
         layer = int(state["layer"])
@@ -712,7 +742,7 @@ class SaeInstrument:
         session's authored-prefill path.
         """
         session = self._session
-        state = self.live
+        state = self._measurement_live()
         if state is None or not self.active_for_generation:
             return None
         layer = int(state["layer"])

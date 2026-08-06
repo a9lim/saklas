@@ -6161,6 +6161,35 @@ class SaklasSession:
         from saklas.core.capture import last_content_index
         return last_content_index(generated_ids, self._tokenizer)
 
+    def _pooled_aggregate_slice(
+        self, generated_ids: list[int],
+    ) -> dict[int, torch.Tensor]:
+        """Per-layer ``[D]`` slice at the end-of-generation aggregate position.
+
+        The ONE finalize-pooling resolution, shared by all three families
+        (geometry's ``_score_aggregate_only`` and the lens/SAE instruments'
+        ``score_aggregate``).  Empty when there is no aggregate position or
+        nothing was captured.
+
+        Retention decides how the position is reached.  Every bounded-ring
+        mode counts decode forwards, so :meth:`HiddenCapture.tail_slice_at`
+        maps an absolute forward index into the ring.  FULL retention keeps
+        every forward but never advances that counter, so the ring mapping
+        would clamp to the last slice; there the stack is indexed directly,
+        which is what makes the aggregate land on the last *content* token in
+        every mode rather than only in the ring modes.
+        """
+        agg_fwd = self._aggregate_forward_index(generated_ids)
+        if agg_fwd is None:
+            return {}
+        if self._capture_state.mode is CaptureMode.FULL:
+            return {
+                layer: rows[agg_fwd]
+                for layer, rows in self._capture.stacked().items()
+                if rows.shape[0] > agg_fwd
+            }
+        return self._capture.tail_slice_at(agg_fwd)
+
     def _empty_readings(self, names: list[str]) -> dict[str, "ProbeReading"]:
         """A zero ``ProbeReading`` per probe — the no-tokens / missing-pool
         fallback shared by the incremental and aggregate-only score paths."""
@@ -6221,21 +6250,17 @@ class SaklasSession:
         The aggregate-only capture path (``CaptureMode.AGGREGATE_ONLY``, shared by
         ``GATING_SUBSET`` whose per-token rows feed only the gate) scored nothing
         of the full roster per token; here we pool the last content token's slice
-        from the
-        tail ring and run one :meth:`Monitor.score_aggregate`.  ``generated_ids``
-        token ``k`` was produced by decode forward ``k``, so the last content
-        token's forward index is ``last_content_index(generated_ids)`` — which
-        :meth:`HiddenCapture.tail_slice_at` maps into the ring.
+        (:meth:`_pooled_aggregate_slice`) and run one
+        :meth:`Monitor.score_aggregate`.  ``generated_ids`` token ``k`` was
+        produced by decode forward ``k``, so the last content token's forward
+        index is ``last_content_index(generated_ids)``.
         """
         names = list(self._monitor.probe_names)
         empty = self._empty_readings(names)
         if not generated_ids:
             return empty
         if pooled is None:
-            agg_fwd = self._aggregate_forward_index(generated_ids)
-            if agg_fwd is None:
-                return empty
-            pooled = self._capture.tail_slice_at(agg_fwd)
+            pooled = self._pooled_aggregate_slice(generated_ids)
         if not pooled:
             return empty
         # One-shot pooled read over the full roster — keep curved probes on the

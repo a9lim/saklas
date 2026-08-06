@@ -698,6 +698,34 @@ def test_detach_during_bound_generation_keeps_aggregate_roster() -> None:
     assert readings == {}  # the removal applies at the next boundary
 
 
+def test_bound_run_reads_its_bind_time_live_snapshot() -> None:
+    """The lens's live-state discipline, mirrored: a bound run reads the
+    live-discovery config its generation started with, so a toggle from
+    another thread cannot flip a running generation mid-stream.  Idle runs
+    pass the current config through."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _session()
+    inst = session._sae_instrument
+    inst.enable_live()
+    live_at_bind = dict(inst.live or {})
+    assert live_at_bind
+
+    prep = inst.prepare(ReadRequest(final_aggregate=True, live=True))
+    inst.bind(inst.plan(prep), prep)
+    assert inst._measurement_live() == live_at_bind
+
+    # A concurrent library caller flips the toggle mid-generation.
+    inst.disable_live()
+    assert inst.live is None
+    assert inst._measurement_live() == live_at_bind
+    assert inst.live_readout_step(top_k=2, step_id=0) is not None
+
+    inst.close_run()  # generation boundary: the idle run passes through
+    assert inst._measurement_live() is None
+    assert inst.live_readout_step(top_k=2, step_id=0) is None
+
+
 def test_idle_observe_never_memoizes_stale_readings() -> None:
     """The idle passthrough run persists indefinitely, so ``observe`` must
     not key a memo on ``step_id`` alone — a repeated step with different

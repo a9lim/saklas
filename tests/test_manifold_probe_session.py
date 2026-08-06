@@ -926,6 +926,38 @@ def test_geometry_run_observe_aggregate_matches_live_read():
     assert via_run["toy"].nearest == live["toy"].nearest
 
 
+def test_pooled_aggregate_slice_is_one_position_for_every_family():
+    """All three families finalize through ``_pooled_aggregate_slice``, and it
+    lands on the aggregate *forward index* in FULL retention too.
+
+    FULL retention never advances the capture's forward counter (only the
+    bounded-ring modes do), so a ring lookup would clamp to the last forward —
+    the trailing special — instead of the last content token.
+    """
+    session = _stub_session()
+    rows = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
+    session._capture = types.SimpleNamespace(
+        stacked=lambda: {0: rows},
+        tail_slice_at=lambda _idx: {0: rows[-1]},
+    )
+    session._aggregate_forward_index = types.MethodType(
+        lambda _self, _ids: 1, session,
+    )
+
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
+    full = SaklasSession._pooled_aggregate_slice(session, [1, 2, 3, 4])
+    assert torch.equal(full[0], rows[1])
+
+    session._capture_state = CaptureState(mode=CaptureMode.AGGREGATE_ONLY)
+    ring = SaklasSession._pooled_aggregate_slice(session, [1, 2, 3, 4])
+    assert torch.equal(ring[0], rows[-1])
+
+    session._aggregate_forward_index = types.MethodType(
+        lambda _self, _ids: None, session,
+    )
+    assert SaklasSession._pooled_aggregate_slice(session, [1, 2]) == {}
+
+
 # ===================================================== gating callback ===
 
 def test_gating_callback_emits_probe_scalars():

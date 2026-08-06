@@ -841,9 +841,9 @@ class LensInstrument:
     ) -> dict[str, "ProbeReading"]:
         """End-of-gen aggregate pooled at the last content token.
 
-        Mirrors the monitor's ``_score_aggregate_only``: one readout at the
-        pooled slice from the capture tail ring (or the FULL-mode stack), so
-        the aggregate semantics match the monitor probes' exactly.
+        Shares the session's ``_pooled_aggregate_slice`` with the monitor
+        roster and the SAE family, so all three aggregates read the same
+        position under every retention mode.
         """
         session = self._session
         # Binding-authoritative guard: a probe detached mid-generation
@@ -852,17 +852,7 @@ class LensInstrument:
         if not self._measurement_specs() or not generated_ids:
             return {}
         if pooled is None:
-            agg_fwd = session._aggregate_forward_index(generated_ids)
-            if agg_fwd is None:
-                return {}
-            pooled = session._capture.tail_slice_at(agg_fwd)
-            if not pooled:
-                stacked = session._capture.stacked()
-                pooled = {
-                    l: t[agg_fwd]
-                    for l, t in stacked.items()
-                    if t.shape[0] > agg_fwd
-                }
+            pooled = session._pooled_aggregate_slice(generated_ids)
         if not pooled:
             return {}
         return self.current_run.observe_aggregate(pooled)
