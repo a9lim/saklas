@@ -158,7 +158,7 @@
   interface WorkspaceCard extends InstrumentProbeRow {
     token: string;
     strength: number;
-    com: number;
+    com: number | null;
     spread: number | null;
     series: number[];
     cells: { layer: number; p: number | null }[];
@@ -212,7 +212,7 @@
         sortName: word,
         token: word,
         strength: latest?.coords?.[0] ?? entry.current ?? 0,
-        com: latest?.depth_com?.[0] ?? 0,
+        com: latest?.depth_com?.[0] ?? null,
         spread: latest?.depth_spread?.[0] ?? null,
         series: entry.sparkline ?? [],
         cells: pinnedCells(entry),

@@ -18,7 +18,7 @@ export interface InstrumentProbeRow {
   strength: number;
   /** Depth centre of mass (J-lens only).  Rows without it sort last
    *  under `depth`, which the SAE pillar never offers. */
-  com?: number;
+  com?: number | null;
 }
 
 /** Merge the pinned and discovered rows into one roster in `sortMode`
