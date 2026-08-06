@@ -922,7 +922,7 @@ class SaklasSession:
         _cg_reason: str | None = None
         device_obj = next(model.parameters()).device
         if cuda_graphs:
-            from saklas.core.cuda_graphs import is_cuda_graphs_supported
+            from saklas.core.static_cache import is_cuda_graphs_supported
             cg_supported, _cg_reason = is_cuda_graphs_supported(
                 model, device_obj,
             )
@@ -1082,14 +1082,14 @@ class SaklasSession:
         # only consults a boolean.  Off when (a) user opted out, (b)
         # device != cuda, or (c) the model's StaticCache constructor
         # raises (architecture-specific quirks).  The fallback reason
-        # is logged once via :func:`saklas.core.cuda_graphs.warn_once`
+        # is logged once via :func:`saklas.core.static_cache.warn_once`
         # which dedupes on ``id(model)``, so when ``from_pretrained``
         # already probed for its compile_mode decision and we re-probe
         # here, the user only sees one message.
         cuda_graphs_requested = bool(cuda_graphs)
         self._cuda_graphs_active: bool = False
         if cuda_graphs_requested:
-            from saklas.core.cuda_graphs import (
+            from saklas.core.static_cache import (
                 is_cuda_graphs_supported, warn_once,
             )
             supported, reason = is_cuda_graphs_supported(
@@ -1115,7 +1115,7 @@ class SaklasSession:
         self._compile_owner_thread: int = threading.get_ident()
         self._static_cache_active: bool = False
         if self._compiled or self._cuda_graphs_active:
-            from saklas.core.cuda_graphs import (
+            from saklas.core.static_cache import (
                 is_static_cache_supported, warn_once,
             )
             sc_supported, sc_reason = is_static_cache_supported(
@@ -7619,7 +7619,7 @@ class SaklasSession:
         cache_position: torch.Tensor | None = None
         if use_static:
             try:
-                from saklas.core.cuda_graphs import make_static_cache
+                from saklas.core.static_cache import make_static_cache
 
                 model_dtype = next(self._model.parameters()).dtype
                 headroom = int(
@@ -8723,7 +8723,7 @@ class SaklasSession:
             self._generation_static_cache = None
             self._generation_static_cache_len = 0
 
-        from saklas.core.cuda_graphs import make_static_cache
+        from saklas.core.static_cache import make_static_cache
 
         model_dtype = next(model.parameters()).dtype
         cache = make_static_cache(
@@ -10341,9 +10341,14 @@ class SaklasSession:
                     _SessionStopCriteria(self._gen_state),
                 ]),
             }
-            eos_token_id = getattr(self._tokenizer, "eos_token_id", None)
-            if eos_token_id is not None:
-                generate_kwargs["eos_token_id"] = eos_token_id
+            # The full EOS set (generation_config + tokenizer + added
+            # end-of-turn specials), matching the ordinary decode loop —
+            # the tokenizer's single ``eos_token_id`` alone misses e.g.
+            # Gemma's ``<end_of_turn>`` and would generate past it to the
+            # token cap.
+            eos_ids = _get_eos_ids(model, self._tokenizer)
+            if eos_ids:
+                generate_kwargs["eos_token_id"] = sorted(eos_ids)
             do_sample = gen_config.temperature > 0
             generate_kwargs["do_sample"] = do_sample
             if do_sample:
@@ -10365,7 +10370,6 @@ class SaklasSession:
                     "a [batch, sequence] tensor"
                 )
 
-            eos_ids = _get_eos_ids(model, self._tokenizer)
             max_prompt_len = int(input_ids.shape[1])
             self._gen_phase = GenState.FINALIZING
             results: list[GenerationResult] = []

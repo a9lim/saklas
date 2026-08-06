@@ -711,7 +711,7 @@ def _run_compile_probes(compiled: Any, model: PreTrainedModel, device: str | tor
         _ = out.logits[:, -1, :].argmax().item()
 
     def _probe_static(prefill_len: int) -> None:
-        from saklas.core.cuda_graphs import make_static_cache
+        from saklas.core.static_cache import make_static_cache
         dtype = next(model.parameters()).dtype
         try:
             cache = make_static_cache(

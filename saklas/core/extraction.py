@@ -419,8 +419,8 @@ def _capture_pointer_sha256(path: pathlib.Path) -> str | None:
 
 def _capture_payload_files(payload: Mapping[str, object]) -> set[str]:
     keep: set[str] = set()
-    for field in ("centroid_files", "row_files"):
-        mapping = payload.get(field, {})
+    for key in ("centroid_files", "row_files"):
+        mapping = payload.get(key, {})
         if isinstance(mapping, Mapping):
             keep.update(
                 str(filename)

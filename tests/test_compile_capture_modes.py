@@ -38,7 +38,7 @@ def test_compiled_explicit_no_probes_skips_persistent_capture_hooks(
     """``probes=[]`` should take the no-capture compiled accelerator mode."""
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
-    from saklas.core import cuda_graphs
+    from saklas.core import static_cache
     from saklas.core import model as model_mod
     from saklas.core import session as session_mod
     from saklas.core.session import SaklasSession
@@ -79,7 +79,7 @@ def test_compiled_explicit_no_probes_skips_persistent_capture_hooks(
         lambda model, tokenizer, device, mode=None: _FakeCompiled(model),
     )
     monkeypatch.setattr(
-        cuda_graphs,
+        static_cache,
         "is_static_cache_supported",
         lambda model, device: (True, None),
     )

@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from saklas.core import cuda_graphs as cg
+from saklas.core import static_cache as cg
 
 
 @pytest.fixture(autouse=True)
@@ -303,7 +303,7 @@ def test_session_reuses_and_resets_generation_static_cache(
         return cache
 
     monkeypatch.setattr(
-        "saklas.core.cuda_graphs.make_static_cache",
+        "saklas.core.static_cache.make_static_cache",
         _make_static_cache,
     )
     session = SaklasSession.__new__(SaklasSession)

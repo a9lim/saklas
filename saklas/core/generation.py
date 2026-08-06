@@ -921,7 +921,7 @@ def generate_steered(
     so the kernel shapes the compiled artifact saw on warmup don't
     change as the cache grows.  Caller must guarantee CUDA + a
     StaticCache-compatible architecture (see
-    :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported`); we
+    :func:`saklas.core.static_cache.is_cuda_graphs_supported`); we
     don't re-probe here.  When ``past_key_values`` is non-None (a prefix-cache
     hit or a reset session-resident cache), it's expected to *already* be a
     StaticCache sized to fit the upcoming decode; we don't re-allocate.  When
@@ -993,7 +993,7 @@ def generate_steered(
 
     # ---- StaticCache ---------------------------------------------------
     # Caller flips ``use_static_cache`` after probing
-    # :func:`saklas.core.cuda_graphs.is_cuda_graphs_supported` at session
+    # :func:`saklas.core.static_cache.is_cuda_graphs_supported` at session
     # construction time.  When the caller supplies ``past_key_values`` (a
     # prefix-cache hit or reset session-resident cache), it's expected to have
     # enough headroom.  Otherwise we allocate a fresh fallback covering the
@@ -1009,7 +1009,7 @@ def generate_steered(
     next_cache_pos: int = cache_position_offset + input_ids.shape[1]
     if use_static_cache:
         try:
-            from saklas.core.cuda_graphs import make_static_cache
+            from saklas.core.static_cache import make_static_cache
         except ImportError:  # pragma: no cover — saklas is its own package
             use_static_cache = False
         else:

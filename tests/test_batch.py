@@ -102,13 +102,13 @@ class _BatchModel:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.config = SimpleNamespace(vocab_size=200)
+        self.generation_config = SimpleNamespace(eos_token_id=99)
 
     def named_parameters(self):
         return iter(())
 
     def named_buffers(self):
         return iter(())
-        self.generation_config = SimpleNamespace(eos_token_id=99)
 
     def generate(self, **kwargs: Any):
         import torch
@@ -359,6 +359,27 @@ class TestGenerateBatch:
         assert runset.metrics["batch_elapsed"] > 0.0
         assert "batch_tok_per_sec" in runset.metrics
         assert s.last_result is runset[-1]
+
+    def test_fast_path_passes_full_eos_set_to_model_generate(self) -> None:
+        # ``model.generate`` must stop on every EOS id the ordinary decode
+        # loop recognizes (generation_config + tokenizer + added
+        # end-of-turn specials) — the tokenizer's single ``eos_token_id``
+        # alone misses e.g. Gemma's ``<end_of_turn>``, and the batch would
+        # generate past it to the token cap.
+        s, model = _fast_batch_session()
+        # A distinct tokenizer identity keyed away from the shared
+        # ``_get_eos_ids`` cache, carrying an added end-of-turn special
+        # beyond the plain eos.
+        tok = _BatchTokenizer()
+        tok.name_or_path = "batch-test-tokenizer-eos-set"
+        tok.added_tokens_encoder = {"<end_of_turn>": 42}
+        cast(Any, s)._tokenizer = tok
+        model.generation_config = SimpleNamespace(eos_token_id=[99, 98])
+
+        s.generate_batch(["alpha", "beta", "gamma"], thinking=False)
+
+        assert len(model.calls) == 1
+        assert model.calls[0]["eos_token_id"] == [42, 98, 99]
 
     def test_greedy_batch_allows_seeded_sampling_config(self) -> None:
         from saklas.core.sampling import SamplingConfig
@@ -868,7 +889,7 @@ class TestPrefixCacheEligibility:
             return static_cache
 
         monkeypatch.setattr(
-            "saklas.core.cuda_graphs.make_static_cache", _make_static_cache,
+            "saklas.core.static_cache.make_static_cache", _make_static_cache,
         )
 
         class _Model:
