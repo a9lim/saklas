@@ -4083,19 +4083,6 @@ class SaklasSession:
             hidden, activations=activations, only=only, raw_by_fid=raw_by_fid,
         )
 
-    def _sae_probe_values(
-        self,
-        activations: torch.Tensor,
-        *,
-        only: "set[str] | None" = None,
-        raw_by_fid: Mapping[int, float] | None = None,
-    ) -> list[tuple[str, int, float, float]]:
-        """Pinned SAE probe values (delegates to
-        :meth:`SaeInstrument.probe_values`)."""
-        return self._sae_instrument.probe_values(
-            activations, only=only, raw_by_fid=raw_by_fid,
-        )
-
     def _score_sae_gate_scalars(
         self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
     ) -> dict[str, float]:
@@ -6060,24 +6047,6 @@ class SaklasSession:
         )
         return _score_template(
             self, tmpl, steering=steering, system_prompt=system_prompt,
-        )
-
-    def score_captured(
-        self, generated_ids: list[int], *, accumulate: bool = True,
-    ) -> tuple[dict[str, "ProbeReading"], dict[str, list[float]]]:
-        """Score probes from the last hidden-state capture.
-
-        Returns ``(aggregate_readings, per_token_scores)`` — the aggregate is a
-        per-probe :class:`ProbeReading` (coordinate reading), and
-        ``per_token_scores`` is the per-probe axis-0 coordinate stream. Both
-        dicts are empty when the capture was never attached or the generation
-        produced no tokens.
-        """
-        captured = self._capture.stacked()
-        if not captured or not generated_ids:
-            return {}, {}
-        return self._monitor.score_per_token(
-            captured, generated_ids, self._tokenizer, accumulate=accumulate,
         )
 
     def _aggregate_forward_index(self, generated_ids: list[int]) -> int | None:
@@ -10782,9 +10751,32 @@ class SaklasSession:
     # -- Lifecycle --
 
     def close(self) -> None:
+        """Detach everything this session attached to the model.
+
+        ``from_pretrained`` installs two families of *permanent* forward hooks
+        before ``torch.compile`` — the persistent steering offsets and the
+        persistent capture buffers — and ``SaklasSession.__init__`` accepts a
+        pre-loaded model the caller may keep using, so the model does not
+        necessarily die with the session.  Both families come off here
+        alongside the transient steering hooks, releasing their
+        ``2 x n_layers x hidden_size`` of device buffers with them.
+        """
         self._steering.clear_all()
+        self._steering.detach_compiled_offsets()
+        self.detach_persistent_capture()
         self._profiles.clear()
         self._manifolds.clear()
+
+    def detach_persistent_capture(self) -> None:
+        """Remove the persistent capture hooks and drop their buffers.
+
+        The capture-side sibling of
+        :meth:`SteeringManager.detach_compiled_offsets`.  Idempotent.
+        """
+        for handle in self._capture_handles:
+            handle.remove()
+        self._capture_handles = []
+        self._capture_buffers = {}
 
     def __enter__(self) -> "SaklasSession":
         return self
