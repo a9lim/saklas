@@ -14,12 +14,15 @@ if TYPE_CHECKING:
     from saklas.core.results import GenerationResult
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
+from fastapi.utils import is_body_allowed_for_status_code
 from pydantic import BaseModel, model_validator
 from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from saklas.core.errors import SaklasError
 from saklas.core.session import ConcurrentGenerationError, GenerationStream, SaklasSession
@@ -41,6 +44,12 @@ from saklas.server.streaming import (
 
 
 SESSION_LOCK_TIMEOUT_SECONDS = 300
+
+#: Route-prefix discriminators for the three protocols served on one port.
+#: Each owns an error envelope: OpenAI ``{"error": {message, type, param,
+#: code}}``, Ollama ``{"error": "<msg>"}``, native ``{"detail": "<msg>"}``.
+NATIVE_PREFIX = "/saklas/v1/"
+OLLAMA_PREFIX = "/api/"
 
 
 @asynccontextmanager
@@ -184,6 +193,20 @@ def _make_id() -> str:
     return f"saklas-{uuid.uuid4().hex[:12]}"
 
 
+def openai_error_type(status: int) -> str:
+    """Map an HTTP status onto OpenAI's ``error.type`` vocabulary.
+
+    One table for both OpenAI surfaces — the non-streaming exception handler
+    and the in-band SSE error frame — so a 404 / 409 / 422 reads the same on
+    either.
+    """
+    if status == 409:
+        return "conflict"
+    if 400 <= status < 500:
+        return "invalid_request_error"
+    return "server_error"
+
+
 def _error(status: int, message: str, error_type: str = "error",
            param: str | None = None) -> JSONResponse:
     return JSONResponse(
@@ -191,6 +214,30 @@ def _error(status: int, message: str, error_type: str = "error",
         content={"error": {"message": message, "type": error_type,
                            "param": param, "code": status}},
     )
+
+
+def _detail_text(detail: Any) -> str:
+    """Flatten an ``HTTPException.detail`` to the native envelope's string."""
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict):
+        for key in ("message", "msg", "detail"):
+            value = detail.get(key)
+            if isinstance(value, str):
+                return value
+        return json.dumps(detail, default=str)
+    if isinstance(detail, (list, tuple)):
+        return "; ".join(_detail_text(item) for item in detail)
+    return str(detail)
+
+
+def _protocol_error(path: str, status: int, message: str) -> JSONResponse:
+    """Render one error message in the envelope the request's protocol owns."""
+    if path.startswith(OLLAMA_PREFIX):
+        return JSONResponse(status_code=status, content={"error": message})
+    if path.startswith(NATIVE_PREFIX):
+        return JSONResponse(status_code=status, content={"detail": message})
+    return _error(status, message, openai_error_type(status))
 
 
 _bearer = HTTPBearer(auto_error=False)
@@ -380,10 +427,29 @@ async def _stream_generation(
     client is gone, so the GPU isn't spent on a stream nobody reads.
     """
     created_ts = int(time.time())
+
+    def _error_frames(status: int, message: str) -> list[str]:
+        """One in-band error frame plus the terminating ``[DONE]`` sentinel.
+
+        ``openai-python``'s ``Stream`` and LangChain's ``ChatOpenAI`` treat an
+        SSE body that ends without ``[DONE]`` the way ollama-python treats a
+        missing terminating ``done`` frame — they wait for it.  The Ollama
+        NDJSON path already terminates after an in-band error chunk; this is
+        the same contract on the SSE side.
+        """
+        err = {
+            "error": {
+                "message": message,
+                "type": openai_error_type(status),
+                "code": status,
+            },
+        }
+        return [f"data: {json.dumps(err)}\n\n", "data: [DONE]\n\n"]
+
     async with acquire_session_lock(session) as acquired:
         if not acquired:
-            err = {"error": {"message": "Server busy", "type": "server_error", "code": 503}}
-            yield f"data: {json.dumps(err)}\n\n"
+            for frame in _error_frames(503, "Server busy"):
+                yield frame
             return
 
         if role_delta:
@@ -420,24 +486,13 @@ async def _stream_generation(
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
         except ConcurrentGenerationError:
-            err = {"error": {"message": "Generation already in progress", "type": "conflict", "code": 409}}
-            yield f"data: {json.dumps(err)}\n\n"
+            for frame in _error_frames(409, "Generation already in progress"):
+                yield frame
             return
         except SaklasError as e:
             status, msg = e.user_message()
-            err_type = (
-                "conflict" if status == 409
-                else "invalid_request_error" if 400 <= status < 500
-                else "server_error"
-            )
-            err = {
-                "error": {
-                    "message": msg,
-                    "type": err_type,
-                    "code": status,
-                }
-            }
-            yield f"data: {json.dumps(err)}\n\n"
+            for frame in _error_frames(status, msg):
+                yield frame
             return
         finally:
             # Deterministically tear down the engine worker thread (stop-flag
@@ -507,21 +562,46 @@ def create_app(session: SaklasSession,
     @app.exception_handler(SaklasError)
     async def _on_saklas_error(request: Request, exc: SaklasError):
         status, msg = exc.user_message()
-        path = request.url.path
-        if path.startswith("/api/"):
-            # Ollama error shape: {"error": "<msg>"}
-            return JSONResponse(status_code=status, content={"error": msg})
-        err_type = "conflict" if status == 409 else "invalid_request_error" if status == 400 else "server_error"
-        return _error(status, msg, err_type)
+        return _protocol_error(request.url.path, status, msg)
 
     @app.exception_handler(RequestValidationError)
-    async def _on_validation_error(_request: Request, exc: RequestValidationError):
+    async def _on_validation_error(request: Request, exc: RequestValidationError):
         errs = exc.errors()
         first = errs[0] if errs else {}
         loc = first.get("loc", ())
         param = ".".join(str(p) for p in loc[1:]) if len(loc) > 1 else (str(loc[0]) if loc else None)
         msg = first.get("msg", "Invalid request")
+        path = request.url.path
+        if path.startswith(NATIVE_PREFIX) or path.startswith(OLLAMA_PREFIX):
+            # The native tree and the Ollama shim each own an envelope; a
+            # body-validation failure has to speak the same one the rest of
+            # that protocol's failures do.
+            return _protocol_error(
+                path, 400, f"{param}: {msg}" if param else msg,
+            )
         return _error(400, msg, "invalid_request_error", param=param)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _on_http_exception(request: Request, exc: StarletteHTTPException):
+        """Normalize the native tree's ``HTTPException``s to one envelope.
+
+        Almost every native route raises a bare ``HTTPException``, which
+        Starlette renders as ``{"detail": …}`` — but ``detail`` could be a
+        string, the auth dependency's dict, or a list of pydantic error dicts,
+        so a client had to guess.  On ``/saklas/v1/*`` it is always a string;
+        every other prefix keeps FastAPI's default rendering.
+        """
+        if (
+            request.url.path.startswith(NATIVE_PREFIX)
+            and not isinstance(exc.detail, str)
+            and is_body_allowed_for_status_code(exc.status_code)
+        ):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": _detail_text(exc.detail)},
+                headers=getattr(exc, "headers", None),
+            )
+        return await http_exception_handler(request, exc)
 
     _register_routes(app)
 

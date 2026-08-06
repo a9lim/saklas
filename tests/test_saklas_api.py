@@ -151,12 +151,18 @@ class TestSessions:
         assert resp.json()["id"] == "default"
 
     def test_create_rejects_unknown_fields(self, session_and_client: Any) -> None:
+        """A native body-validation failure speaks the native envelope.
+
+        Every ``/saklas/v1/*`` failure — typed ``SaklasError``, bare
+        ``HTTPException``, body validation — renders as ``{"detail": "<str>"}``
+        so a client never has to guess which of three shapes it got.
+        """
         _, client = session_and_client
         resp = client.post("/saklas/v1/sessions", json={"legacy_id": "old"})
         assert resp.status_code == 400
-        error = resp.json()["error"]
-        assert error["param"] == "legacy_id"
-        assert error["message"] == "Extra inputs are not permitted"
+        assert resp.json() == {
+            "detail": "legacy_id: Extra inputs are not permitted",
+        }
 
     def test_create_model_mismatch_logs_warning(self, session_and_client: Any, caplog: Any) -> None:
         _, client = session_and_client
@@ -1427,6 +1433,47 @@ class TestManifoldRoutes:
         assert body["feature_space"] == "raw"
         assert session.fit.call_args.kwargs["layers"] == [1, 2]
 
+    def test_fit_authoring_conflict_is_a_retryable_409(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        """Re-authoring under an in-flight fit is a conflict, not a 500.
+
+        ``ManifoldAuthoringChangedError`` is the same conflict
+        ``ConcurrentExtractionError`` models, reached from the other side.
+        """
+        from saklas.core.extraction import ManifoldAuthoringChangedError
+
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        session, client = session_and_client
+        client.post("/saklas/v1/manifolds", json=_box1d_payload())
+        session.fit.side_effect = ManifoldAuthoringChangedError(
+            "manifold authoring changed during fit"
+        )
+        resp = client.post("/saklas/v1/manifolds/local/mood/fit", json={})
+        assert resp.status_code == 409
+
+    def test_fit_sse_authoring_conflict_is_a_typed_frame(
+        self, session_and_client: Any, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        from saklas.core.extraction import ManifoldAuthoringChangedError
+
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        session, client = session_and_client
+        client.post("/saklas/v1/manifolds", json=_box1d_payload())
+        session.fit.side_effect = ManifoldAuthoringChangedError(
+            "manifold authoring changed during fit"
+        )
+        with client.stream(
+            "POST",
+            "/saklas/v1/manifolds/local/mood/fit",
+            json={},
+            headers={"accept": "text/event-stream"},
+        ) as resp:
+            text = b"".join(resp.iter_bytes()).decode("utf-8")
+        assert "event: error" in text
+        assert '"code": "Conflict"' in text
+        assert "authoring changed during fit" in text
+
 
 # ---- templates (standalone artifact + scorer) ----------------------------
 
@@ -1690,3 +1737,84 @@ class TestAnalyticsMultiNodeProbe:
         _, client = self._wire(session_and_client)
         r = client.get("/saklas/v1/sessions/default/profiles/pairwise?a=fan&b=vx")
         assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Native error envelope
+# ---------------------------------------------------------------------------
+
+
+class TestNativeErrorEnvelope:
+    """Every ``/saklas/v1/*`` failure renders as ``{"detail": "<string>"}``.
+
+    The three shapes a native route can fail in — a typed ``SaklasError``, a
+    bare ``HTTPException`` (with a string, dict, or list detail), and a body
+    validation error — used to emit three different envelopes, so the client
+    had to probe for whichever one it got.
+    """
+
+    def test_bare_http_exception_detail_is_a_string(
+        self, session_and_client: Any,
+    ) -> None:
+        _, client = session_and_client
+        resp = client.get("/saklas/v1/sessions/nope")
+        assert resp.status_code == 404
+        body = resp.json()
+        assert set(body) == {"detail"}
+        assert isinstance(body["detail"], str)
+
+    def test_typed_saklas_error_uses_the_native_envelope(
+        self, session_and_client: Any,
+    ) -> None:
+        from saklas.core.errors import SaklasError
+
+        class _Nope(RuntimeError, SaklasError):
+            def user_message(self) -> tuple[int, str]:
+                return (422, "geometry instrument is unavailable")
+
+        session, client = session_and_client
+        session.set_live_probe_scores.side_effect = _Nope()
+        resp = client.post(
+            "/saklas/v1/sessions/default/instruments/geometry/live",
+            json={"enabled": True},
+        )
+        assert resp.status_code == 422
+        assert resp.json() == {"detail": "geometry instrument is unavailable"}
+
+    def test_dict_detail_is_flattened(self) -> None:
+        """The auth dependency's OpenAI-shaped 401 detail flattens too."""
+        from saklas.server import create_app
+
+        session = _mock_session()
+        client = TestClient(create_app(session, api_key="s3cret"))
+        resp = client.get("/saklas/v1/sessions")
+        assert resp.status_code == 401
+        assert resp.json() == {"detail": "Invalid API key"}
+
+    def test_openai_routes_keep_their_own_envelope(self) -> None:
+        from saklas.server import create_app
+
+        session = _mock_session()
+        client = TestClient(create_app(session, api_key="s3cret"))
+        resp = client.get("/v1/models")
+        assert resp.status_code == 401
+        assert set(resp.json()["detail"]) == {"message", "type", "param", "code"}
+
+    def test_protocol_error_renders_each_envelope(self) -> None:
+        import json as _json
+
+        from saklas.server.app import _protocol_error
+
+        native = _protocol_error("/saklas/v1/sessions", 409, "busy")
+        assert _json.loads(bytes(native.body)) == {"detail": "busy"}
+
+        ollama = _protocol_error("/api/chat", 400, "busy")
+        assert _json.loads(bytes(ollama.body)) == {"error": "busy"}
+
+        openai = _protocol_error("/v1/chat/completions", 409, "busy")
+        assert _json.loads(bytes(openai.body)) == {
+            "error": {
+                "message": "busy", "type": "conflict",
+                "param": None, "code": 409,
+            },
+        }

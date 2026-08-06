@@ -160,6 +160,22 @@ def _parse_layers(layers: str | None) -> list[int] | str | None:
         ) from e
 
 
+def _validation_message(exc: ValidationError) -> str:
+    """Flatten a pydantic ``ValidationError`` into one ``detail`` string.
+
+    The preparation bodies are re-parsed into per-operation models after the
+    ``{operation, …}`` envelope is split, so their failures arrive as a raw
+    ``exc.errors()`` list.  The native envelope's ``detail`` is always a
+    string, so render the field paths here rather than shipping the list.
+    """
+    parts: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()))
+        msg = str(err.get("msg", "invalid value"))
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts) or "invalid preparation fields"
+
+
 def _require_family(family: str) -> str:
     if family not in _FAMILIES:
         raise HTTPException(
@@ -844,7 +860,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         try:
             return starter(fields)
         except ValidationError as exc:
-            raise HTTPException(400, exc.errors()) from exc
+            raise HTTPException(400, _validation_message(exc)) from exc
 
     @app.get(
         "/saklas/v1/sessions/{session_id}/instruments/{family}/preparations",

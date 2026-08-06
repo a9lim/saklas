@@ -52,15 +52,17 @@ def extraction_error_frame(exc: Exception) -> dict[str, Any] | None:
 
     ``POST /extract`` and ``POST /manifolds/{ns}/{name}/fit`` drive the one
     :class:`~saklas.core.extraction.ManifoldExtractionPipeline`, so they share
-    the same two safe-to-surface failures: a concurrent run holding the engine
-    (conflict) and an authoring-grade ``ValueError`` — the RBF poisedness
-    failure among them, which gets its own code so the client can offer the
-    "spread your nodes" hint.  ``None`` for anything else, which routes the
-    exception to the shared catch-all scrubber.
+    its safe-to-surface failures: the two retryable conflicts (another run
+    holding the engine; the folder re-authored under an in-flight fit) and an
+    authoring-grade ``ValueError`` — the RBF poisedness failure among them,
+    which gets its own code so the client can offer the "spread your nodes"
+    hint.  ``None`` for anything else, which routes the exception to the
+    shared catch-all scrubber.
     """
+    from saklas.core.extraction import ManifoldAuthoringChangedError
     from saklas.core.session import ConcurrentExtractionError
 
-    if isinstance(exc, ConcurrentExtractionError):
+    if isinstance(exc, (ConcurrentExtractionError, ManifoldAuthoringChangedError)):
         return {"message": str(exc), "code": "Conflict"}
     if isinstance(exc, ValueError):
         return {
@@ -77,10 +79,14 @@ def extraction_error_frame(exc: Exception) -> dict[str, Any] | None:
 def extraction_json_errors() -> tuple[tuple[Any, int], ...]:
     """JSON-branch status mapping matching :func:`extraction_error_frame`.
 
-    Conflict first: ``ConcurrentExtractionError`` is a ``RuntimeError`` and
-    ``ManifoldFormatError`` is a ``ValueError``, so the ordered table lands
-    both on the status their SSE counterparts report.
+    Conflicts first: they are ``RuntimeError``s and ``ManifoldFormatError``
+    is a ``ValueError``, so the ordered table lands each on the status its SSE
+    counterpart reports.
     """
+    from saklas.core.extraction import ManifoldAuthoringChangedError
     from saklas.core.session import ConcurrentExtractionError
 
-    return ((ConcurrentExtractionError, 409), (ValueError, 400))
+    return (
+        ((ConcurrentExtractionError, ManifoldAuthoringChangedError), 409),
+        (ValueError, 400),
+    )

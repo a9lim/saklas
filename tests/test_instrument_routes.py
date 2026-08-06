@@ -327,6 +327,25 @@ class TestPreparations:
         )
         assert resp.status_code == 400  # 'load' is an sae op, not lens
 
+    def test_invalid_op_fields_render_a_string_detail(
+        self, session_and_client: Any,
+    ) -> None:
+        """Op bodies are re-parsed after the envelope split — flatten those.
+
+        The per-operation models are validated by hand here, so their failure
+        arrives as a raw ``exc.errors()`` list; the native envelope's
+        ``detail`` is always a string.
+        """
+        _session, client = session_and_client
+        resp = client.post(
+            f"{_BASE}/lens/preparations",
+            json={"operation": "fit", "prompts": 999_999},
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert isinstance(detail, str)
+        assert "prompts" in detail
+
     def test_lens_fit_status_mapping_and_mutual_exclusion(
         self, session_and_client: Any, monkeypatch: Any,
     ) -> None:
