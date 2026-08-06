@@ -170,16 +170,6 @@ def _require_family(family: str) -> str:
     return family
 
 
-def _active_lens_source(session: Any) -> str | None:
-    """The active J-lens source label, from the public source listing."""
-    from saklas.io.lens_sources import list_lens_sources
-
-    for row in list_lens_sources(session.model_id):
-        if row.get("active"):
-            return row.get("source")
-    return None
-
-
 def _sae_source_label(session: Any) -> str | None:
     """The resident SAE's source string (``local:``/``saelens:``), or None."""
     info = session.sae_info
@@ -401,7 +391,12 @@ def register_instrument_routes(app: FastAPI) -> None:
         return {
             "family": "lens",
             "live": {"enabled": layers is not None, "layers": layers},
-            "source": _active_lens_source(session),
+            # The same resolver that stamps the source onto every lens
+            # measurement binding — a listing that answered from the
+            # prepared-sources scan instead would report ``null`` for an
+            # active pointer whose artifact is gone while the persisted
+            # rows still carry its label.
+            "source": session._active_jlens_source_label(),
             "probes": list(session.lens_probe_names),
             "capabilities": {
                 "sources": True,
@@ -1003,7 +998,7 @@ def register_instrument_routes(app: FastAPI) -> None:
             lens_readout=lens_readout,
             lens_aggregate=lens_aggregate,
             lens_token_ids=lens_token_ids,
-            lens_source=_active_lens_source(session),
+            lens_source=session._active_jlens_source_label(),
             steering=(out.get("steering") if steered else None),
         )
         return {"measurements": measurements}
