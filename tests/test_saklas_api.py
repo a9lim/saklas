@@ -817,13 +817,35 @@ class TestWebSocket:
             assert "unknown message type" in msg["message"]
 
     def test_generate_rejects_nonpositive_n(self, session_and_client: Any) -> None:
+        """``n`` is a declared schema bound now (``Field(ge=1)``), so the
+        rejection is a ``ValidationError`` naming the field rather than a
+        hand-rolled handler check."""
         session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({"type": "generate", "input": "hi", "n": 0})
             msg = ws.receive_json()
             assert msg["type"] == "error"
             assert msg["status"] == 400
-            assert "n must be >= 1" in msg["message"]
+            assert msg["code"] == "ValidationError"
+            assert msg["message"].startswith("n: ")
+        session.generate.assert_not_called()
+
+    def test_submit_rejects_nonpositive_n(self, session_and_client: Any) -> None:
+        """``submit`` carries the same bound — ``_normalize_submit`` forwards
+        ``n`` into a ``WSGenerateMessage`` construction that sits outside the
+        handler's error-frame guard, so the reader has to catch it first."""
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit", "text": "hi",
+                "authored_role": "user", "generated_role": "assistant",
+                "n": 0,
+            })
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["status"] == 400
+            assert msg["code"] == "ValidationError"
+            assert msg["message"].startswith("n: ")
         session.generate.assert_not_called()
 
     def test_multi_turn_no_recv_race(self, session_and_client: Any) -> None:

@@ -112,6 +112,27 @@ def _error_frame(
     }
 
 
+def _validation_message(exc: ValidationError) -> str:
+    """Render a pydantic rejection as one line, the native tree's convention.
+
+    Each error reads ``"<field path>: <message>"``, the shape
+    ``app._on_validation_error`` gives native REST bodies; a model-level rule
+    has no path, so its message stands alone (``"a generate message cannot be
+    both a fork and a prefill"``) — ``PydanticCustomError`` in ``ws_models``
+    is what keeps that verbatim rather than ``"Value error, …"``.
+
+    Every error is reported, not just the first: ``input`` is a union, so its
+    real failure (a bad key inside a message object) is the *second* branch
+    error and a first-only render would name the wrong problem.
+    """
+    parts: list[str] = []
+    for error in exc.errors():
+        message = str(error.get("msg", "invalid request"))
+        loc = ".".join(str(part) for part in error.get("loc", ()))
+        parts.append(f"{loc}: {message}" if loc else message)
+    return "; ".join(parts) or str(exc)
+
+
 class _WSRequestError(Exception):
     """A request-shape problem to report as an error frame, not a close.
 
@@ -186,7 +207,9 @@ def register_ws_stream(app: FastAPI) -> None:
                             )
                             await incoming.put(message)
                         except ValidationError as exc:
-                            await incoming.put(_InvalidInbound(str(exc)))
+                            await incoming.put(
+                                _InvalidInbound(_validation_message(exc))
+                            )
                     elif raw.get("type") == "stop":
                         await incoming.put(_Stop())
                     else:
@@ -437,39 +460,6 @@ def _normalize_submit(
     )
 
 
-def _validate_generate(msg: WSGenerateMessage) -> None:
-    """Check the fields a ``generate`` frame's mode must carry together.
-
-    Fork and prefill are mutually exclusive, and each is selected by one
-    field while needing others alongside it — relationships the flat pydantic
-    schema can't express.  Raises :class:`_WSRequestError` on a violation;
-    returns on a well-formed frame.
-    """
-    if msg.n < 1:
-        raise _WSRequestError(f"n must be >= 1, got {msg.n}")
-
-    # Logit fork: the worker calls ``session.fork_from_token`` instead of
-    # ``session.generate``, which needs all three fork fields.
-    is_fork = msg.fork_node_id is not None
-    if is_fork and (msg.fork_raw_index is None or msg.fork_alt_token_id is None):
-        raise _WSRequestError(
-            "fork requires fork_node_id, fork_raw_index, and "
-            "fork_alt_token_id together"
-        )
-
-    # Answer-prefill: the worker calls ``session.prefill_assistant``, which
-    # needs the seed text alongside the anchor node.
-    is_prefill = msg.prefill_node_id is not None
-    if is_prefill and not msg.prefill_text:
-        raise _WSRequestError(
-            "prefill requires prefill_node_id and prefill_text together"
-        )
-    if is_prefill and is_fork:
-        raise _WSRequestError(
-            "a generate message cannot be both a fork and a prefill"
-        )
-
-
 async def _ws_handle_commit(
     session: SaklasSession,
     msg: WSGenerateMessage,
@@ -553,10 +543,12 @@ async def _ws_handle_generate(
 ) -> None:
     """Validate one inbound turn and dispatch it to its mode handler.
 
-    ``submit`` frames lower onto the specialist ``generate`` schema
-    (:func:`_normalize_submit`), the field-consistency rules run once
-    (:func:`_validate_generate`), the steering expression is composed over the
-    server default, and then the turn goes to exactly one of two handlers:
+    ``generate``'s own field-consistency rules already ran in the schema
+    (``WSGenerateMessage`` model validators, rejected by the reader), so the
+    only checks left here are ``submit``'s cross-field rules, which have no
+    schema home: they decide *which* generate frame to lower onto
+    (:func:`_normalize_submit`).  Then the steering expression is composed
+    over the server default and the turn goes to exactly one of two handlers:
     :func:`_ws_handle_commit` (no decode) or :func:`_ws_stream_generation`
     (the token fan-out).  Every rejection here is an error frame on a
     connection that stays open — a 400-grade user mistake must not close the
@@ -564,13 +556,12 @@ async def _ws_handle_generate(
     """
     authored: _AuthoredTurn | None = None
     commit_only = False
-    try:
-        if isinstance(msg, WSSubmitMessage):
+    if isinstance(msg, WSSubmitMessage):
+        try:
             msg, authored, commit_only = _normalize_submit(msg)
-        _validate_generate(msg)
-    except _WSRequestError as e:
-        await send_json(e.frame)
-        return
+        except _WSRequestError as e:
+            await send_json(e.frame)
+            return
 
     if commit_only:
         assert authored is not None  # set together by ``_normalize_submit``

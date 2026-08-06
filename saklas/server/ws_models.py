@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from pydantic import Field, model_validator
+from pydantic_core import PydanticCustomError
+
 from saklas.core.results import GenerationResult
 from saklas.core.sampling import SamplingConfig
 from saklas.server import request_helpers
@@ -51,7 +54,7 @@ class WSGenerateMessage(NativeRequest):
     stateless: bool = True
     raw: bool = False
     parent_node_id: str | None = None
-    n: int = 1
+    n: int = Field(default=1, ge=1)
     recipe_override: str | None = None
     fork_node_id: str | None = None
     fork_raw_index: int | None = None
@@ -65,6 +68,40 @@ class WSGenerateMessage(NativeRequest):
     # Pair with ``input: null`` for a continue — no committed turn, the
     # model speaks next from the current leaf (a/a and u/u sequences).
     generate_seat: Literal["user", "assistant"] | None = None
+
+    @model_validator(mode="after")
+    def _check_mode_fields(self) -> "WSGenerateMessage":
+        """Fork and prefill are mutually exclusive, and each needs its whole
+        field group.
+
+        These live here rather than in a hand-rolled handler pass so the
+        schema is the single description of a well-formed frame: one
+        validation layer, one error shape (a ``ValidationError`` the WS
+        reader renders through the shared error-frame builder).
+        :class:`PydanticCustomError` keeps the message verbatim — a plain
+        ``ValueError`` would reach the wire as ``"Value error, …"``.
+        """
+        is_fork = self.fork_node_id is not None
+        if is_fork and (
+            self.fork_raw_index is None or self.fork_alt_token_id is None
+        ):
+            raise PydanticCustomError(
+                "fork_fields",
+                "fork requires fork_node_id, fork_raw_index, and "
+                "fork_alt_token_id together",
+            )
+        is_prefill = self.prefill_node_id is not None
+        if is_prefill and not self.prefill_text:
+            raise PydanticCustomError(
+                "prefill_fields",
+                "prefill requires prefill_node_id and prefill_text together",
+            )
+        if is_fork and is_prefill:
+            raise PydanticCustomError(
+                "mode_conflict",
+                "a generate message cannot be both a fork and a prefill",
+            )
+        return self
 
 
 class WSSubmitMessage(NativeRequest):
@@ -85,7 +122,11 @@ class WSSubmitMessage(NativeRequest):
     authored_thinking: str | None = None
     raw: bool = False
     parent_node_id: str | None = None
-    n: int = 1
+    # Constrained here as well as on ``WSGenerateMessage``: the reader must
+    # reject a bad fan width at parse time, because ``_normalize_submit``
+    # forwards this value into a ``WSGenerateMessage`` construction that is
+    # not inside the handler's error-frame guard.
+    n: int = Field(default=1, ge=1)
     recipe_override: str | None = None
 
 

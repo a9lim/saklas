@@ -122,6 +122,67 @@ class TestWsAdapterSharesTheConstructor:
         assert ws_build_sampling_config(None) is None
 
 
+class TestWSGenerateSchemaValidation:
+    """Mode consistency is a schema property of ``WSGenerateMessage``.
+
+    These rules used to be a hand-rolled pass in the WS handler, so a
+    programmatic construction could build a frame the wire would reject.
+    """
+
+    @staticmethod
+    def _errors(**kwargs: Any) -> list[dict[str, Any]]:
+        import pydantic
+
+        from saklas.server.ws_models import WSGenerateMessage
+
+        with pytest.raises(pydantic.ValidationError) as excinfo:
+            WSGenerateMessage(type="generate", **kwargs)
+        return list(excinfo.value.errors())
+
+    def test_fork_requires_its_whole_field_group(self) -> None:
+        errors = self._errors(fork_node_id="n1", fork_raw_index=3)
+        assert errors[0]["type"] == "fork_fields"
+        # ``PydanticCustomError`` keeps the message verbatim — a plain
+        # ValueError would reach the wire as ``"Value error, fork ..."``.
+        assert errors[0]["msg"].startswith("fork requires ")
+
+    def test_prefill_requires_text(self) -> None:
+        for text in (None, ""):
+            errors = self._errors(prefill_node_id="n1", prefill_text=text)
+            assert errors[0]["type"] == "prefill_fields", text
+
+    def test_fork_and_prefill_are_exclusive(self) -> None:
+        errors = self._errors(
+            fork_node_id="n1", fork_raw_index=0, fork_alt_token_id=7,
+            prefill_node_id="n2", prefill_text="Sure",
+        )
+        assert errors[0]["type"] == "mode_conflict"
+
+    def test_n_is_bounded_on_both_frames(self) -> None:
+        import pydantic
+
+        from saklas.server.ws_models import WSGenerateMessage, WSSubmitMessage
+
+        assert self._errors(n=0)[0]["loc"] == ("n",)
+        # ``submit`` needs the same bound: ``_normalize_submit`` forwards ``n``
+        # into a ``WSGenerateMessage`` construction outside the handler's
+        # error-frame guard, so an unbounded submit would close the socket.
+        with pytest.raises(pydantic.ValidationError):
+            WSSubmitMessage(type="submit", generated_role="assistant", n=0)
+        assert WSGenerateMessage(type="generate", n=1).n == 1
+
+    def test_well_formed_modes_construct(self) -> None:
+        from saklas.server.ws_models import WSGenerateMessage
+
+        assert WSGenerateMessage(
+            type="generate",
+            fork_node_id="n1", fork_raw_index=0, fork_alt_token_id=7,
+        ).fork_node_id == "n1"
+        assert WSGenerateMessage(
+            type="generate", prefill_node_id="n1", prefill_text="Sure",
+        ).prefill_text == "Sure"
+
+
 class TestProbeMeasurementsAggregate:
     """The native WS ``done`` frame's aggregate-scope measurement envelope."""
 

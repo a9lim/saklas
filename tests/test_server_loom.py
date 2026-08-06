@@ -1458,15 +1458,35 @@ class TestWSErrorFrameShape:
         assert set(msg) == self._KEYS
         assert msg["code"] == "ValidationError"
 
-    def test_hand_validated_mode_rejection(self, session_and_client: Any) -> None:
+    def test_mode_consistency_rejection(self, session_and_client: Any) -> None:
+        """A ``generate`` mode-consistency failure is a schema rejection now
+        (``WSGenerateMessage`` model validator), so it lands on the SAME
+        ``ValidationError``/400 convention as a type or extra-field error —
+        it used to be a hand-rolled ``ValueError`` in the handler.  The
+        message stays verbatim (no ``"Value error, "`` prefix)."""
         _session, client = session_and_client
         msg = self._first_error(
             client, {"type": "generate", "fork_node_id": "n1"},
         )
         assert set(msg) == self._KEYS
         assert msg["status"] == 400
+        assert msg["code"] == "ValidationError"
+        assert msg["message"] == (
+            "fork requires fork_node_id, fork_raw_index, and "
+            "fork_alt_token_id together"
+        )
         assert msg["node_id"] is None
         assert msg["sibling_index"] == 0
+
+    def test_field_path_prefixes_a_field_level_rejection(
+        self, session_and_client: Any,
+    ) -> None:
+        """Field-level errors carry their path, the native REST convention."""
+        _session, client = session_and_client
+        msg = self._first_error(
+            client, {"type": "generate", "input": "hi", "legacy": True},
+        )
+        assert msg["message"] == "legacy: Extra inputs are not permitted"
 
     def test_submit_rejection(self, session_and_client: Any) -> None:
         _session, client = session_and_client
