@@ -1290,14 +1290,17 @@ class TestLensProbeRoutes:
         resp = client.get("/saklas/v1/sessions/default/probes")
         assert resp.status_code == 200
         (row,) = resp.json()["probes"]
-        assert row["name"] == "jlens/fake"
-        assert row["lens"] is True
-        assert row["word"] == "fake"
-        assert row["token_id"] == 42
-        assert row["layers"] == [12, 14, 18]
-        assert row["feature_space"] == "readout"
-        assert row["intrinsic_dim"] == 1  # the one strength axis
-        assert row["node_coords"] is None
+        # An explicit family discriminator, and only fields this family can
+        # actually produce — no invented manifold/domain/node geometry.
+        assert row == {
+            "family": "lens",
+            "name": "jlens/fake",
+            "layers": [12, 14, 18],
+            "intrinsic_dim": 1,  # the one strength axis
+            "feature_space": "readout",
+            "word": "fake",
+            "token_id": 42,
+        }
 
     def test_attach_returns_lens_info(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -1314,7 +1317,7 @@ class TestLensProbeRoutes:
             json={"selector": "jlens/fake"},
         )
         assert resp.status_code == 201
-        assert resp.json()["lens"] is True
+        assert resp.json()["family"] == "lens"
         assert resp.json()["name"] == "jlens/fake"
 
     def test_attach_lens_not_fitted_404(self, session_and_client: Any) -> None:
