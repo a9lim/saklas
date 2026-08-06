@@ -4,7 +4,7 @@ Parser shape + runner dispatch for the parity verbs added alongside the
 fit/discover/generate/ls/show block: install / search / merge / push /
 rm / clear / refresh / transfer, plus the ``ls -v`` and ``show -j``
 changes.  The io-layer backends are mocked the way ``test_cli_flags``
-mocks ``cache_ops`` / ``hf`` — these tests exercise the CLI plumbing
+mocks the io lifecycle / HF layer — these tests exercise the CLI plumbing
 (arg parsing, runner→backend call shape, output idioms), not the
 backends themselves (those live in ``test_manifolds_io`` /
 ``test_hf``).

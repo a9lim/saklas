@@ -1524,7 +1524,7 @@ def test_underscore_and_hyphen_labels_still_valid(tmp_path: Path, monkeypatch: p
 # ============================================================ B3: lifecycle ===
 #
 # remove_manifold_folder / clear_manifold_tensors / refresh_manifold —
-# the manifold analogue of pack rm / clear / refresh in cache_ops.
+# the folder-addressed rm / clear / refresh lifecycle.
 
 
 def _fake_fit_tensor(folder: Path, model_id: str, *, release: str | None = None) -> Path:
@@ -1990,7 +1990,7 @@ def test_refresh_manifold_model_scope_clears_fit_no_repull(
 ):
     """A scoped refresh drops just the model's fit pair, never re-pulling.
 
-    Mirrors ``cache_ops.refresh``'s scoped path: HF pulls are whole-repo,
+    Scoped refresh drops tensors only: HF pulls are whole-repo,
     so a single-model refresh is a tensors-only delete (re-fits on next
     use), even on an ``hf://``-sourced manifold.
     """

@@ -349,9 +349,10 @@ class TestCLIParsing:
         args = parse_args(["serve", "m", "--no-web"])
         assert args.no_web is True
 
-    # Cache-op coverage lives in tests/test_cache_ops.py (delete_tensors
-    # across concept/tag/model selectors) and tests/test_cli_flags.py
-    # (the -r/-x/-i/-l/-m cache-ops flag grammar).
+    # Manifold lifecycle coverage (rm / clear / refresh, and the GGUF
+    # export driver) lives in tests/test_manifolds_io.py and
+    # tests/test_cli_manifold_fold.py; the CLI flag grammar around them is
+    # in tests/test_cli_flags.py.
 
 
 # ---------------------------------------------------------------------------

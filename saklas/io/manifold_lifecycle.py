@@ -44,28 +44,23 @@ from saklas.io.selectors import invalidate as invalidate_selector_index
 
 # ============================================================ lifecycle (rm/clear/refresh) ===
 #
-# The manifold analogue of pack lifecycle in ``saklas.io.cache_ops``
-# (``uninstall`` / ``delete_tensors`` / ``refresh``).  Manifolds don't
-# go through the concept ``Selector``/``resolve`` machinery — they're
-# addressed by ``(namespace, name)`` and discovered through
-# ``iter_manifold_folders`` — so these are folder-level functions rather
-# than selector-driven sweeps.  Source-tier semantics mirror packs: the
+# ``rm`` / ``clear`` / ``refresh``.  Manifolds don't go through the
+# ``Selector``/``resolve`` machinery — they're addressed by
+# ``(namespace, name)`` and discovered through ``iter_manifold_folders`` — so
+# these are folder-level functions rather than selector-driven sweeps.  The
 # ``manifold.json::source`` field (``"local"`` / ``"bundled"`` /
-# ``"hf://..."``) decides refresh behavior.
+# ``"hf://..."``) is the source tier that decides refresh behavior.
 
 
 def _manifold_tensor_variant_matches(key: str, filter_: str) -> bool:
-    """Mirror ``cache_ops._variant_matches_key`` for manifold tensors.
+    """Whether a parsed tensor variant slug passes a clear/push filter.
 
     ``key`` is the variant slug a manifold tensor filename parses to:
     ``"raw"`` (unsuffixed, canonical), ``"sae-<release>"``, or
     ``"from-<safe_src>"`` (transferred).  ``filter_`` is one of ``"raw"``
     / ``"sae"`` / ``"from"`` / ``"all"`` — ``"from"`` selects transferred
     tensors, so a ``clear --variant from`` drops only the cross-model
-    transfer variants while keeping the native fit.  Twin of
-    ``cache_ops._variant_matches_key`` — kept in sync so the pack and
-    manifold clear-filters recognize the same variant slugs (both match
-    the ``_from-<safe_src>`` variant transfers produce).
+    transfer variants while keeping the native fit.
     """
     if filter_ == "all":
         return True
@@ -92,9 +87,8 @@ def _manifold_tensor_files(
     ``model_scope`` (a raw model id, e.g. ``"google/gemma-3-4b-it"``)
     narrows the result to a single model's tensors — the filename's
     parsed safe-model-id must equal ``safe_model_id(model_scope)``.
-    ``None`` (default) keeps every model's tensors.  Mirrors the
-    ``model_scope`` filter in :func:`saklas.io.cache_ops._tensor_files_for`,
-    which does the same safe-id conversion at the io boundary.
+    ``None`` (default) keeps every model's tensors; the raw-id → safe-id
+    conversion happens here, at the io boundary.
     """
     from saklas.io.paths import parse_tensor_filename, safe_model_id
 
@@ -241,15 +235,15 @@ def _clear_manifold_tensors_locked(
 ) -> int:
     """Delete a manifold's per-model fitted tensors, keeping the corpus.
 
-    Mirrors ``saklas.io.cache_ops.delete_tensors`` for packs: removes the
+    Removes the
     fitted ``<safe>*.safetensors`` + ``.json`` sidecars (so they re-fit
     on next use) while leaving ``manifold.json`` and the ``nodes/`` corpus
     in place.  ``variant`` filters by tensor flavor — ``"raw"`` only the
     unsuffixed canonical tensors, ``"sae"`` only ``_sae-*`` variants,
     ``"from"`` only ``_from-*`` transfer variants, ``"all"`` (default)
     every flavor.  ``model_scope`` (a raw model id) narrows
-    deletion to that one model's tensors (safe-id-matched, the same
-    convention ``delete_tensors`` uses); ``None`` (default) clears every
+    deletion to that one model's tensors (safe-id-matched); ``None``
+    (default) clears every
     model.  Returns the number of files deleted.
 
     Re-hashes ``manifold.json::files`` afterward (via ``write_metadata``)
@@ -375,11 +369,10 @@ def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
 def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
     """Remove a whole manifold folder (rm), bundled-respawn semantics.
 
-    The manifold analogue of ``saklas.io.cache_ops.uninstall`` for a
-    single concept: ``rmtree`` the folder so the manifold ceases to
+    ``rmtree`` the folder so the manifold ceases to
     exist.  Bundled manifolds (``default/`` namespace) re-materialize on
-    next session init via :func:`materialize_bundled_manifolds`, exactly
-    as bundled concepts do — the returned ``rematerializes_on_restart``
+    next session init via :func:`materialize_bundled_manifolds` — the
+    returned ``rematerializes_on_restart``
     flag lets a caller pick a friendlier message for that case.
 
     Returns ``{namespace, name, source, removed, rematerializes_on_restart}``.
@@ -475,7 +468,7 @@ def _refresh_manifold_locked(
 ) -> str:
     """Re-pull / re-materialize a manifold from its source.
 
-    Mirrors ``saklas.io.cache_ops.refresh`` per source tier:
+    Dispatches on the ``manifold.json::source`` tier:
 
     - ``local`` (or any source other than the two below) — nothing
       upstream to re-pull from; silently skipped, returns ``"skipped"``.
@@ -487,8 +480,7 @@ def _refresh_manifold_locked(
       :func:`saklas.io.hf_manifolds.pull_manifold`; returns ``"hf"``.
 
     When ``model_scope`` (a raw model id) is given the source tier is
-    *bypassed* — exactly as ``cache_ops.refresh``'s scoped path does for
-    packs: delete just that model's fitted tensor pair (via
+    *bypassed*: delete just that model's fitted tensor pair (via
     :func:`clear_manifold_tensors`) so it re-fits on next use, and do NOT
     re-pull from the upstream source.  Returns ``"scoped"``.
 
@@ -502,9 +494,9 @@ def _refresh_manifold_locked(
 
     if model_scope is not None:
         # Scoped refresh: drop just that model's fitted tensor pair so it
-        # re-fits from the node corpus on next use.  Mirrors the pack-side
-        # tensors-only scoped refresh — a whole-repo re-pull for one model
-        # makes no sense (HF pulls are whole-folder).
+        # re-fits from the node corpus on next use.  Tensors only — a
+        # whole-repo re-pull for one model makes no sense (HF pulls are
+        # whole-folder).
         clear_manifold_tensors(namespace, name, model_scope, variant="all")
         return "scoped"
 

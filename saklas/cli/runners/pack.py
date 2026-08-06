@@ -248,10 +248,9 @@ def _run_pack_push(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # The coord follows pack push's resolution: ``--as owner/name`` wins,
-    # else ``<whoami>/<name>``.  ``push_manifold`` takes the resolved
-    # coord directly (no internal selector machinery), so the runner owns
-    # the resolution the way ``cache_ops.push`` does for packs.
+    # Coord resolution: ``--as owner/name`` wins, else ``<whoami>/<name>``.
+    # ``push_manifold`` takes the resolved coord directly (no internal
+    # selector machinery), so the runner owns the resolution.
     try:
         coord = resolve_target_coord(name, args.as_target)
     except Exception as e:
@@ -323,8 +322,7 @@ def _run_pack_refresh(args: argparse.Namespace) -> None:
 
     ns, name = _resolve_manifold_ns_name(args.selector)
     # ``args.model`` is the raw model id; ``refresh_manifold`` converts to
-    # a safe id at the io boundary (via ``clear_manifold_tensors``), the
-    # same convention ``cache_ops.refresh``'s scoped path uses.
+    # a safe id at the io boundary (via ``clear_manifold_tensors``).
     try:
         tier = refresh_manifold(ns, name, model_scope=args.model)
     except FileNotFoundError as e:
