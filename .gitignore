@@ -46,3 +46,6 @@ docs/superpowers/
 /scratch_*/
 **/scratch_*.py
 scripts/out/
+
+# Local research experiments (scripts + results live outside version control)
+scripts/experiments/
