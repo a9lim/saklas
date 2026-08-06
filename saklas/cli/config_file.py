@@ -257,8 +257,8 @@ def _bare_concept_resolves(concept: str) -> bool:
     """True when a bare (un-namespaced) concept reference resolves to a manifold.
 
     Mirrors the steering read path (:mod:`saklas.core.steering_expr`): a bare
-    pole or node label resolves via :func:`resolve_manifold_label`, and a composite
-    name (``happy.sad``) resolves to its 2-node ``pca`` manifold via
+    pole or node label resolves via :func:`resolve_manifold_label`, and a
+    composite name (``happy.sad``) resolves to its 2-node ``pca`` manifold via
     :func:`resolve_manifold_name`.  An ambiguity counts as resolved (the
     reference matches more than one installed artifact, not zero).
     """

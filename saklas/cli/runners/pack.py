@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Any
 
 from saklas.cli.parsers import _PACK_VERBS
 from saklas.cli.runners.shared import (
