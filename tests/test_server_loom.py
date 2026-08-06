@@ -1066,63 +1066,53 @@ class TestPrefill:
 
 
 # ---------------------------------------------------------------------------
-# WS: commit (Ctrl+Enter — no-generation send)
+# WS: commit (Ctrl+Enter — no-generation send).  ``submit`` is the ONE
+# authored-turn vocabulary; ``generate`` carries no ``commit_*`` fields.
 # ---------------------------------------------------------------------------
 
 
 class TestCommit:
+    def test_generate_rejects_the_retired_commit_vocabulary(
+        self, session_and_client: Any,
+    ):
+        """``commit_role``/``commit_text``/``commit_thinking`` are gone from
+        ``generate`` — ``WSGenerateMessage`` forbids extras, so the reader
+        rejects them instead of silently accepting a second commit door."""
+        _session, client = session_and_client
+        for field, value in (
+            ("commit_role", "user"),
+            ("commit_text", "manual"),
+            ("commit_thinking", "hmm"),
+        ):
+            with client.websocket_connect(
+                "/saklas/v1/sessions/default/stream",
+            ) as ws:
+                ws.send_json({"type": "generate", field: value})
+                msg = ws.receive_json()
+            assert msg["type"] == "error", (field, msg)
+            assert field in msg["message"], (field, msg)
+
     def test_missing_text_400(self, session_and_client: Any):
-        """commit_role without commit_text is rejected before dispatch."""
+        """``authored_role`` without text is rejected before dispatch."""
         _session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
-            ws.send_json({"type": "generate", "commit_role": "user"})
+            ws.send_json({"type": "submit", "authored_role": "user"})
             msg = ws.receive_json()
         assert msg["type"] == "error"
         assert msg["status"] == 400
-        assert "commit" in msg["message"].lower()
+        assert "text" in msg["message"].lower()
 
     def test_invalid_role_400(self, session_and_client: Any):
         _session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "system",
-                "commit_text": "anything",
+                "type": "submit",
+                "authored_role": "system",
+                "text": "anything",
             })
             msg = ws.receive_json()
         # Pydantic rejects the Literal-mismatch at parse time before the
-        # handler runs, so the error frame source can be either layer —
-        # both surface 400.
-        assert msg["type"] == "error"
-
-    def test_assistant_commit_requires_parent_400(self, session_and_client: Any):
-        """``commit_role='assistant'`` without parent_node_id is rejected —
-        the authored turn has to hang off a known user node."""
-        _session, client = session_and_client
-        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
-            ws.send_json({
-                "type": "generate",
-                "commit_role": "assistant",
-                "commit_text": "the answer",
-            })
-            msg = ws.receive_json()
-        assert msg["type"] == "error"
-        assert msg["status"] == 400
-        assert "parent_node_id" in msg["message"]
-
-    def test_conflicts_with_prefill_400(self, session_and_client: Any):
-        """A message can't be both a commit and a prefill."""
-        session, client = session_and_client
-        uid = session.tree.add_user_turn("seed me")
-        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
-            ws.send_json({
-                "type": "generate",
-                "commit_role": "user",
-                "commit_text": "manual",
-                "prefill_node_id": uid,
-                "prefill_text": "It is",
-            })
-            msg = ws.receive_json()
+        # handler runs.
         assert msg["type"] == "error"
         assert msg["status"] == 400
 
@@ -1137,9 +1127,9 @@ class TestCommit:
         done = None
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "user",
-                "commit_text": "manual user input",
+                "type": "submit",
+                "authored_role": "user",
+                "text": "manual user input",
             })
             while True:
                 msg = ws.receive_json()
@@ -1153,7 +1143,8 @@ class TestCommit:
         assert started is not None
         assert started["node_id"] is None
         assert done is not None
-        assert done["result"]["kind"] == "commit"
+        # No ``kind`` discriminator: one door, so nothing to discriminate.
+        assert "kind" not in done["result"]
         assert done["result"]["role"] == "user"
         assert done["result"]["text"] == "manual user input"
         assert done["node_id"] == done["result"]["node_id"]
@@ -1199,7 +1190,6 @@ class TestSubmit:
                     break
                 assert msg["type"] != "error", msg
         assert msg["result"]["role"] == "assistant"
-        assert msg["result"]["kind"] == "append"
         path = session.tree.active_path()[1:]
         assert [node.role for node in path] == ["assistant"]
         assert path[0].recipe is None
@@ -1306,14 +1296,14 @@ class TestSubmit:
 
 class TestCommitContinued:
     def test_commit_user_appends_under_user_node(self, session_and_client: Any):
-        """The compatibility commit adapter shares same-role append semantics."""
+        """An append-only submit shares same-role append semantics."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("first")  # active = uid
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "user",
-                "commit_text": "second",
+                "type": "submit",
+                "authored_role": "user",
+                "text": "second",
                 "parent_node_id": uid,
             })
             while True:
@@ -1333,9 +1323,9 @@ class TestCommitContinued:
         done = None
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "user",
-                "commit_text": "second",
+                "type": "submit",
+                "authored_role": "user",
+                "text": "second",
                 "parent_node_id": uid,
                 "raw": True,
             })
@@ -1360,9 +1350,9 @@ class TestCommitContinued:
         done = None
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "assistant",
-                "commit_text": "the canned answer",
+                "type": "submit",
+                "authored_role": "assistant",
+                "text": "the canned answer",
                 "parent_node_id": uid,
             })
             while True:

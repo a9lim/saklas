@@ -36,6 +36,13 @@ class WSInputMessage(NativeRequest):
 
 
 class WSGenerateMessage(NativeRequest):
+    """The specialist generation frame: fork, prefill, shadow, seat.
+
+    Authored turns are ``submit``'s job alone — this frame carries no
+    ``commit_*`` vocabulary.  ``submit`` lowers onto this schema for its
+    generating branch (:func:`saklas.server.ws_stream._normalize_submit`).
+    """
+
     type: Literal["generate"]
     input: str | list[WSInputMessage] | None = None
     steering: str | None = None
@@ -51,12 +58,6 @@ class WSGenerateMessage(NativeRequest):
     fork_alt_token_id: int | None = None
     prefill_node_id: str | None = None
     prefill_text: str | None = None
-    commit_role: Literal["user", "assistant"] | None = None
-    commit_text: str | None = None
-    # Optional committed thinking block riding a commit (any seat) —
-    # rendered through the family think delimiters by the scene
-    # stitcher; rejected with 400 when the family can't carry it.
-    commit_thinking: str | None = None
     # Cast model: which seat the generated turn occupies.  ``"user"``
     # renders the generation prompt as a user-seat header and lands the
     # node with ``role="user"`` + a stamped recipe (generated is
