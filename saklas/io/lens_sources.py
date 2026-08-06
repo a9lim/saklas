@@ -539,6 +539,19 @@ def list_lens_sources(model_id: str) -> list[dict[str, Any]]:
     return rows
 
 
+def lens_source_label(active: dict[str, Any]) -> str:
+    """Render a selection back into the public source grammar.
+
+    ``local:<name>`` for a Saklas-fitted lens, the bare provider name for an
+    external binding — the inverse of :func:`use_lens_source`, and the SAE
+    family's :func:`saklas.io.sae.sae_source_release` twin.  This is the ONE
+    place the lens prefix convention is applied.
+    """
+    if active["kind"] == "local":
+        return f"{LOCAL_SOURCE_PREFIX}{active['name']}"
+    return str(active["name"])
+
+
 def use_lens_source(model_id: str, source: str) -> Path:
     """Select a source from the public ``local:NAME`` / ``neuronpedia`` grammar."""
     source = source.strip()

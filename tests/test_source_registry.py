@@ -228,3 +228,45 @@ def test_removing_a_different_source_keeps_the_selection() -> None:
     _save_local("drop", activate=False)
     assert remove_local_sae("org/model", "drop") is True
     assert load_active_sae_source("org/model")["name"] == "keep"
+
+
+def test_the_engine_does_not_respell_the_local_source_prefix() -> None:
+    """The engine reads the source grammars; io owns spelling them.
+
+    SAE: ``load_active_sae`` renders a selection, and
+    ``is_local_sae_release`` / ``normalize_local_sae_name`` /
+    ``local_sae_release`` parse and build one.  Lens: ``lens_source_label``
+    is its twin.  So no module that resolves an artifact needs a literal
+    ``local:``, and the convention cannot drift in one place and not the
+    others.
+
+    Scoped to artifact resolution: the *qualified* two-prefix display label
+    (``local:<name>`` / ``saelens:<release>``) the instrument, the instrument
+    routes, and the CLI render for clients is a separate grammar with its own
+    duplication.
+    """
+    import saklas.core.sae as sae_mod
+    import saklas.core.session as session_mod
+
+    offenders = [
+        f"{Path(mod.__file__).name}:{lineno}: {line.strip()}"
+        for mod in (sae_mod, session_mod)
+        for lineno, line in enumerate(
+            Path(mod.__file__).read_text(encoding="utf-8").splitlines(), start=1,
+        )
+        if '"local:' in line or "'local:" in line
+    ]
+    assert offenders == []
+
+
+def test_lens_source_label_inverts_use_lens_source() -> None:
+    from saklas.io.lens_sources import (
+        lens_source_label, load_active_lens_source, local_lens_dir,
+        set_active_lens_source,
+    )
+
+    manifest = local_lens_dir("org/model") / "manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text("{}", encoding="utf-8")
+    set_active_lens_source("org/model", "local", "default")
+    assert lens_source_label(load_active_lens_source("org/model")) == "local:default"

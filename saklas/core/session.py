@@ -1436,23 +1436,17 @@ class SaklasSession:
         # payloads are expected to be present in their own cache already;
         # failure is non-fatal so an offline cache eviction cannot prevent the
         # model itself from starting.
-        from saklas.io.sae import load_active_sae_source, load_sae_metadata
+        from saklas.io.sae import load_active_sae
 
-        active_sae = load_active_sae_source(self.model_id)
+        # ``load_active_sae`` owns the source grammar: it renders the
+        # selection into the public ``local:<name>`` / bare-release form and
+        # reads the provider binding only when there is one.  Provider
+        # bindings remember the last explicitly selected hook layer, so the
+        # restore lands that exact measurement surface rather than silently
+        # returning to the release's automatic default.
+        active_sae = load_active_sae(self.model_id)
         if active_sae is not None:
-            release = (
-                f"local:{active_sae['name']}"
-                if active_sae["kind"] == "local"
-                else active_sae["name"]
-            )
-            # Provider bindings remember the last explicitly selected hook
-            # layer. Restore that exact measurement surface rather than
-            # silently returning to the release's automatic default.
-            metadata = (
-                load_sae_metadata(self.model_id, release)
-                if active_sae["kind"] == "saelens"
-                else None
-            )
+            release, metadata = active_sae
             layer = metadata.get("layer") if metadata is not None else None
             try:
                 self.load_sae(release, layer=layer)
@@ -3632,14 +3626,12 @@ class SaklasSession:
 
     def _active_jlens_source_label(self) -> str | None:
         """Return the active J-lens source in the public source syntax."""
-        from saklas.io.lens_sources import load_active_lens_source
+        from saklas.io.lens_sources import (
+            lens_source_label, load_active_lens_source,
+        )
 
         active = load_active_lens_source(self.model_id)
-        if active is None:
-            return None
-        if active["kind"] == "local":
-            return f"local:{active['name']}"
-        return str(active["name"])
+        return None if active is None else lens_source_label(active)
 
     def disable_live_lens(self) -> None:
         """Stop streaming the live lens readout and free the device J_l copies."""
@@ -3787,6 +3779,7 @@ class SaklasSession:
             save_sae_metadata,
             set_active_sae_source,
         )
+        from saklas.io.sae_artifacts import normalize_local_sae_name
 
         release = release.strip()
         if not release:
@@ -3829,7 +3822,7 @@ class SaklasSession:
             # provider backend.
             if isinstance(backend, LocalSaeBackend):
                 set_active_sae_source(
-                    self.model_id, "local", release.removeprefix("local:"),
+                    self.model_id, "local", normalize_local_sae_name(release),
                 )
             else:
                 save_sae_metadata(self.model_id, release, {
