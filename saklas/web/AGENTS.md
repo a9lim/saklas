@@ -1,516 +1,693 @@
 # web/
 
-Static Svelte 5 + Vite dashboard mounted at `/` by `saklas serve`. CLI default is on (`--no-web` opts out); `create_app(..., web=False)` is the library default so embedded API surfaces don't pick up the dashboard.
+Static Svelte 5 + Vite dashboard mounted at `/` by `saklas serve`. The CLI mounts
+it by default (`--no-web` opts out); `create_app(..., web=False)` is the library
+default so embedded API surfaces don't pick up the dashboard.
 
-## Layout
+## Package + build
 
 ```
 saklas/web/
   __init__.py        # re-exports: register_web_routes, dist_path
   routes.py          # mount logic + SPA fallback
   dist/              # COMMITTED build artifact, ships in the wheel
-    index.html
-    assets/index.css
-    assets/saklas.js
+    index.html  favicon.ico  LICENSE-Recursive.txt
+    assets/{index.css, saklas.js, Recursive_VF.woff2}
 ```
 
-The Svelte source lives at the repo's `webui/` directory (peer of `saklas/`). `cd webui && npm run build` emits straight to `saklas/web/dist/` — no intermediate copy. The committed bundle is the source of truth; CI rebuilds it and fails when source and `dist/` drift.
+Svelte source lives at the repo's `webui/` (peer of `saklas/`); `cd webui && npm
+run build` emits straight into `saklas/web/dist/` — no intermediate copy. CI runs
+`npm ci`, `npm run check`, `npm run build`, then `git diff --exit-code
+saklas/web/dist/`, so a source change that isn't accompanied by a rebuilt bundle
+fails. `npm run check` is `svelte-check` plus `scripts/check-theme.mjs`, which
+fails when a referenced CSS custom property has no declaration in the style
+tokens.
 
-## Mount
+## Mount (`routes.py`)
 
-`register_web_routes(app)` mounts `/assets/*` on `StaticFiles` with hard cache headers, registers `GET /` → `index.html`, and a catch-all `GET /{full_path:path}` that serves the allowlisted top-level dist files (every top-level file except `index.html` — currently `favicon.ico` and the Recursive font license) and otherwise falls back to `index.html` for SPA routing. (Caveat: the bundle filenames are *fixed* — `assets/saklas.js` / `assets/index.css`, not content-hashed — so a rebuilt bundle can stale-cache under the hard headers; a shipping concern, not a mount bug.) The catch-all is registered last by `create_app` so it never shadows `/v1/*`, `/api/*`, `/saklas/v1/*`. `full_path` is only ever used as a dict key, never a path component — `..` traversal is structurally impossible.
+`register_web_routes(app)` mounts `/assets/*` on `StaticFiles` with its default
+ETag / Last-Modified revalidation — Vite emits fixed filenames
+(`assets/saklas.js`, `assets/index.css`), not content-hashed ones, so an
+immutable long-lived cache would serve a stale rebuild. It registers `GET /` →
+`index.html` and a catch-all `GET /{full_path:path}` that 404s `styleguide[/…]`
+and anything under `api`/`v1`/`saklas`, serves the allowlisted top-level dist
+files (every top-level file except `index.html` — `favicon.ico` and the Recursive
+licence), and otherwise falls back to `index.html` for SPA routing. `full_path` is
+only ever a dict key, never a path component, so `..` traversal is structurally
+impossible. `create_app` registers the catch-all last so it never shadows
+`/v1/*`, `/api/*`, `/saklas/v1/*`. Repeat calls append a second mount and
+duplicate routes that the first ones shadow — harmless, not rejected.
 
-`dist_path()` resolves through `importlib.resources` (editable + wheel). `WebUINotBuilt` is raised on mount when the dist directory is empty — only fires in source installs that haven't run `npm run build`.
+`dist_path()` resolves through `importlib.resources` (editable + wheel).
+`WebUINotBuilt` raises on mount when the dist directory is empty — only in source
+installs that haven't run `npm run build`.
 
 ## Wire protocol
 
-The dashboard speaks the native `/saklas/v1/*` API (registered by
-`saklas/server/native_routes.py`):
+The dashboard is the sole client of the native `/saklas/v1/*` API;
+`server/AGENTS.md` is the route catalogue. `lib/api.ts` is a client for the routes
+the dashboard actually calls, **not** an exhaustive mirror — an absent method
+means "no surface needs it yet", never "the server lacks it". Session id is the
+literal `default`; the bearer key is read once from `<meta name="api-key">` and
+kept in memory.
 
-**Current composer contract (supersedes the legacy generate/seat wording
-below):** `Chat.svelte` sends `type:"submit"` with explicit native
-`authored_role` / `generated_role` (`user|assistant`). Two visible role controls
-select those roles independently while displaying their chat-template labels;
-the continuation control also accepts `none` for authored-only append, and a
-one-shot swap action exchanges the current pair. The template-channel seat stays
-an implementation detail in the composer. Selected-node role never changes
-composer semantics. Empty text generates the selected continuation role. The
-visible actions remain the compact `send`, `generate`, and `append`; there is no
-append modifier shortcut.
-Matching structural role + effective role label coalesces into one message.
-`type:"generate"` remains for specialist fork/prefill and compatibility.
-Result actions/rendering key off artifacts (`recipe`, token rows,
-`raw_token_ids`, logprobs), not assistant role. The cast is structural
-user/assistant plus labels observed anywhere in the tree, overlaid by configured
-recipes/notes; effective roster rows carry `origin`.
+**WS `/sessions/{id}/stream`** carries generation. Three client frames:
 
-- **WS `/saklas/v1/sessions/{id}/stream`** — token + probe co-stream. Every measured `token` event carries the 5.x **`measurements`** envelope — the single JSON-safe read-side record, byte-for-byte the same object stored on its loom token row: `version` / `scope:"token"` / `provenance`, the flat `scores` / `per_layer_scores` cross-family views, and per-family `instruments` — `geometry` (attached-probe `readings`), `lens` (`readings` for pinned probes plus the native `readout`: endpoint-shaped `layers[].tokens[]` with token/id/logprob and the `aggregate` chip list, plus a `binding` recording `source` + recipe `steering`), and `sae` (`readings` plus the native `readout.features` and a `binding` with `source` / `steering` / resident `layer`). The envelope **replaces** the former `captured` record and the six top-level per-token aliases (`scores`, `per_layer_scores`, `probe_readings`, `lens_readout`, `lens_aggregate`, `sae_readout`) — those are gone from the token frame; the WebUI consumes `measurements` directly. `raw_index` is the decode-step join into the backing node's `raw_token_ids`. The `done` event's `result` carries the aggregate `probe_readings` (same `ProbeReading` shape) **and** an aggregate-scope `measurements` envelope (families split by attachment). The composer uses `type:"submit"`; authored-only submissions return `result.kind="append"`. A `generate` message with `fork_node_id`/`fork_raw_index`/`fork_alt_token_id` is the **logit fork** — replays the node's raw decode prefix with one token swapped, resampling the continuation as a sibling. A `generate` with `prefill_node_id`/`prefill_text` is the compatibility **answer-prefill** path. Legacy `commit_role`/`commit_text` fields remain accepted for older clients and keep their legacy `result.kind="commit"`; new UI code must not use them for the composer.
-- **GET `/sessions/{id}/correlation[?names=…]`** — N×N magnitude-weighted cosine matrix; default pool unions steering vectors + active probes.
-- **GET `/sessions/{id}/profiles/pairwise?a=…&b=…`** — cross-layer cosine matrix between two named profiles / probes. Distinct from `correlation`: one pair, two-axis matrix indexed by layer rather than by name; backs the pairwise-compare analysis drawer. Registered *before* `GET /profiles/{name}` so the literal path wins the routing match.
-- **GET `/sessions/{id}/profiles`** — registered steering profiles. Profile authoring rides the session routes (`POST /extract`, `/profiles/bake`); discover-manifold union is `POST /manifolds/merge`, alongside the manifold install/browse routes. There is **no `/saklas/v1/packs*` surface**, **no `/manifold-probes`**, **no `/extract/preview`**, and **no `/profiles/clone`** — all removed in the 4.0 collapse.
-- **`/manifolds`** — `GET` list (each row carries `tags` (category) alongside `fit_mode` / `is_discover` / `hyperparams` / `fitted_for_session` / `stale`), `GET /{ns}/{name}` detail (nodes + statements; discover-mode fits carry derived coords + `diagnostics`), `POST` create (authored), `POST /discover` create (discover-mode, label-only nodes), `POST /from-template` derives a discover manifold from an existing standalone template, `POST /merge` unions discover node corpora, `POST /install` installs local/HF packs, `POST /generate` (SSE; LLM-authors a discover folder via `session.generate_responses` — A2 conversational extraction, body `kind: "abstract"|"concrete"` + `samples_per_prompt`, not scenario counts), `PATCH /{ns}/{name}`, `DELETE /{ns}/{name}`, `POST /{ns}/{name}/fit` (SSE; accepts discover-mode `fit_mode` / `hyperparams` overrides on discover folders). Steering a fitted manifold is just a `%` term in the WS `steering` string — no separate route.
-- **`/templates`** — the standalone templated-completion artifact. `GET` list, `GET /{ns}/{name}` detail (incl. `contexts`), `POST` create (`{slot, values, contexts:[{turns, assistant}]}`), `DELETE /{ns}/{name}`, `POST /{ns}/{name}/score` (`{steering?}` → per-context restricted-choice value distribution, under the session lock). `apiTemplates` in `lib/api.ts`; backs `TemplateLabDrawer`.
-- **`/sessions/{id}/probes`** — one unified read-side probe collection. The pre-4.0 split of vector probes vs manifold probes collapsed onto a single route over the session's single `Monitor`. `GET` lists every attached probe as a `ProbeInfo` (`name`, `manifold`, `top_n`, `layers`, `node_labels`, `node_count`, `domain`, `intrinsic_dim`, `feature_space`, `is_affine`, `node_coords`); `GET /defaults` returns the default roster; `POST` body `{selector, name?, top_n?}` attaches any probe shape by selector (a 2-node concept axis is the rank-1 case); `DELETE /{name}` detaches. `is_affine` is the flat-vs-curved discriminator the client classifies subspace-vs-manifold on; `node_coords` backs the 2-D mini-map. Per-token readings ride the WS `token` frame inside the `measurements` envelope (`instruments.<family>.readings`); the aggregate rides the WS `done` `result`'s `probe_readings` field (and its own aggregate-scope `measurements`) — the same `ProbeReading` shape throughout.
-- **POST `/sessions/{id}/profiles/bake`** (JSON), **POST `/sessions/{id}/extract`** (SSE progress on `Accept: text/event-stream`, JSON otherwise).
-- **Loom tree** under `/sessions/{id}/tree` — full-tree GET plus atomic full-tree PUT restore (model-bound, the dashboard v4 save/load inverse), `tree/active` GET; `navigate`/`edit`/`branch`/`delete`/`star`/`note`/`reset` mutations; `edge_label`, `filter`, `diff`, `joint_logprobs`; `transcript` export/import.
-- **GET `/sessions/{id}/traits/stream`** — live per-token probe SSE.
-> **5.x instrument routes.** The lens / sae / CAA-live lifecycle lives under
-> **`/sessions/{id}/instruments/{family}/*`** (`family` ∈ `geometry`/`lens`/`sae`)
-> — the 5.x unification that replaced the former per-family `/lens/*` and
-> `/sae/*` groups and `POST /probes/live` (see `server/AGENTS.md`). The dashboard
-> calls these paths and consumes the `measurements` envelope directly. The bullets
-> below describe each endpoint under its current `/instruments/…` path; for
-> reference, the 5.x consolidation mapped the pre-5.x paths as: `POST /probes/live`
-> / `POST /lens/live` / `POST /sae/live` → `POST /instruments/{family}/live`;
-> `GET /lens/sources` / `GET /sae/sources` → `GET /instruments/{family}/sources`;
-> `POST /lens/use` → `PUT /instruments/lens/source`; the polled `/lens/fetch` /
-> `/lens/fit` / `/sae/load` / `/sae/train` jobs → the unified
-> `POST/GET/DELETE /instruments/{family}/preparations` (`{operation}` body);
-> `GET /lens/token-readout` / `GET /sae/token-readout` →
-> `GET /instruments/{family}/token-readout` (wrapped in the `measurements`
-> replay envelope); `POST /lens/token/validate` /
-> `POST /sae/feature{,s}/validate` / `POST /sae/features/metadata` → the
-> `/instruments/{family}/…` extras.
+- `submit` — the composer's one door: `{text, authored_role, generated_role,
+  steering, sampling, thinking, authored_thinking?, raw, parent_node_id?, n?,
+  recipe_override?}`. `generated_role: null` is an authored-only append; `text:
+  null` continues from the selected leaf. Both roles are structural
+  (`user | assistant`) and independent.
+- `generate` — the specialist door: a bare continuation (`input: null`, used by
+  regenerate / continue-from-committed), an explicit `WSInputMessage[]` replay
+  (`{role, content, label?}` — the unsteered A/B shadow), the **logit fork**
+  (`fork_node_id` / `fork_raw_index` / `fork_alt_token_id` travel together and
+  replay the node's raw decode prefix with one token swapped), and
+  `generate_seat`. The client has no commit/prefill fields to emit.
+- `stop`.
 
-- **GET `/sessions/{id}/instruments/lens/token-readout?node_id=&raw_index=…`** — the J-lens
-  readout at one decode step: per-layer top-k matrix
-  (`layers: [{layer, tokens:[{token, id, logprob}]}]`) plus the
-  layer-aggregated `aggregate: [{token, strength, com, spread}]` block
-  (per-layer softmax → mean fitted-layer probability + probability-mass-weighted
-  depth center of mass across all requested layers) at the forward that produced
-  the clicked token,
-  recomputed on demand server-side (node prompt render + raw prefix replay
-  under the node's recipe steering; `steered=false` for the unsteered
-  counterfactual, `raw=true` for flat-buffer nodes — the client's render mode
-  supplies raw-ness). Backs `TokenDrilldownDrawer`'s **j-lens** tab via
-  `apiInstruments.tokenReadout`; gated on the session-info `jlens_fitted` flag
-  (unfitted → the tab shows the `saklas lens fit` hint).
-  `apiInstruments.tokenReadout` accepts every `InstrumentFamily`: the geometry
-  replay (`instruments.geometry.readings` + `binding: {source: null,
-  steering}` — readings, not a `readout` discovery block) backs the drilldown's
-  **geometry** tab (`GeometryInstrumentJSON.binding?` carries the replay's
-  applied steering).
-- **POST `/sessions/{id}/instruments/lens/token/validate`** — read-only `{word}` →
-  `{word, token_id}` single-token check (`apiInstruments.validateLensToken`).
-  Both J-LENS add forms call it before
-  mutating the steering rack or attaching a probe; a rejected word remains in
-  the input and is surfaced as an error toast.
-- **POST `/sessions/{id}/instruments/lens/live`** — toggle the *live* J-lens readout
-  (`{enabled, layers?}` → `{enabled, layers}`; layers omitted picks every
-  fitted layer). The generation's logit-alternative `return_top_k` sets one
-  shared read-side width for J-lens and SAE live capture, authored prefill,
-  hover, and token replay (8 when alts are disabled). While on, each WS `token` frame carries
-  the per-layer matrix + aggregate chip list inside its `measurements` envelope
-  (`instruments.lens.readout`) and session info
-  reports `live_lens_layers` (`null` while off — the J-LENS tab's rehydration
-  read). `apiInstruments.setLive("lens", …)`; backs the live toggle on
-  `JLensPanel`'s merged PROBE section.
-- **POST `/sessions/{id}/instruments/geometry/live`** — the CAA live toggle (`{enabled}` →
-  `{enabled}`): off ⇒ per-token monitor scoring is disabled for UI/trait/loom
-  consumers (probes settle to end-of-gen aggregates; gates still fire).
-  Session info reports `live_probe_scores` (default-on). `apiInstruments.setLive("geometry", …)`
-  + `probesLiveState`/`setLiveProbes`; backs the live toggle on `ProbeRack`'s
-  PROBE header — with it and the lens toggle both off, a compute-constrained
-  session pays no per-token scoring at all.
-- **J-LENS source lifecycle** — `GET /sessions/{id}/instruments/lens/sources`,
-  `PUT /instruments/lens/source`, and the polled
-  `POST/GET /instruments/lens/preparations` (`{operation:"fetch"}`) back the tab's
-  SOURCE section. Fetch leaves official payloads in the Hugging Face cache and
-  writes only the binding; source switch / fetch activation turns the live
-  workspace on. The polled/cancellable `{operation:"fit"}` preparation is the
-  Saklas-owned local sibling.
-- **SAE source lifecycle** — `GET /sessions/{id}/instruments/sae/sources`,
-  background `POST/GET /instruments/sae/preparations` (`{operation:"load"}`), and
-  the polled/cancellable `POST/GET/DELETE /instruments/sae/preparations`
-  (`{operation:"train"}`) back
-  the symmetric SOURCE section. Load accepts `local:<name>` or
-  `saelens:<release>` plus an optional hook `layer`; the SAE tab's second
-  dropdown selects that resident measurement layer, and the selection is
-  restored from cached provider metadata. Local training reports token progress
-  and activates the resulting Saklas-owned source. In both instrument tabs, local fit/train fields
-  are hidden until the synthetic `local` selector option is chosen; that same
-  source-row action changes from fetch/use to fit/train, while prepared
-  `local:<name>` sources remain separately selectable. Prepared cached sources
-  win the default selector choice; the duplicate lower SOURCE label and passive
-  source-summary lines are omitted so SOURCE flows directly into STEER.
+Server frames are `started` / `token` / `done` / `error` / `tree_mutated`.
+
+**The measurements envelope** is the single read-side record. Every measured
+`token` frame carries `measurements`: `version`, `scope`, `provenance`, the flat
+cross-family `scores` / `per_layer_scores` views, and per-family `instruments` —
+`geometry` (attached-probe `readings`), `lens` and `sae` (`readings` plus the
+native `readout` discovery block and a `binding` recording source + recipe
+steering, plus the resident `layer` for sae). It is byte-for-byte the object
+stored on the backing loom token row, and `done.result.measurements` is its
+`scope: "aggregate"` sibling; the native `done` frame carries no flat
+`probe_readings`. `_mergedReadings` folds the three families' `readings` into one
+name-keyed dict, because the probe rack keys by name across families.
+
+Reading shapes differ by family and the shape is the discriminator
+(`isScalarReading`): geometry emits `ProbeReadingJSON` (`coords` / `fraction` /
+`nearest` / `residual` + per-layer traces), lens and SAE emit `ScalarReadingJSON`
+(`value`, an explicit `unit` — `mean_token_probability` /
+`activation_over_max` / `raw_activation` — `per_layer`, and `depth: {center,
+spread, basis}`). `_primaryScalar` / `_primaryPerLayer` branch on that shape, not
+on probe-info flags. `raw_index` is the decode-step join into the node's
+`raw_token_ids`.
+
+**Instruments** live under `/sessions/{id}/instruments/{family}/…`, `family ∈
+geometry | lens | sae`: `POST live` (geometry = the per-token monitor scoring
+switch, lens = the workspace readout with an optional layer list, sae = feature
+discovery), `GET sources`, `PUT source` (lens), the polled/cancellable
+`POST/GET/DELETE preparations` job (lens `fetch` | `fit`, sae `fetch` | `train`),
+`GET token-readout` (a `scope="replay"` measurements envelope for any family),
+plus the family extras `POST lens/token/validate`, `POST sae/features/validate`
+and `POST sae/features/metadata`. `apiInstruments` is the single client;
+`lib/stores/preparations.svelte.ts` adapts the job resource.
+
+**Session info** carries `instruments: InstrumentFamilyBlock[]` — `{family, live,
+source, probes, capabilities}`, the same block `GET .../instruments` lists, so
+there is one representation of instrument state. `instrumentFamily(f)` reads it;
+`refreshSession` rehydrates `lensState.layers`, `saeState.live` / `release` /
+`layer`, and `probesLiveState` from it, resetting SAE discovery + metadata when
+the resident release or layer changes. `saeLoaded()` is "the sae block has a
+source". `jlens_fitted` stays its own flat key — it is a sidecar/weight-identity
+path check rather than instrument state, and it gates the drilldown's j-lens tab.
+
+**Probe rows** (`GET /probes`) are a `family`-discriminated union:
+`GeometryProbeInfo` (`manifold`, `top_n`, `layers`, `node_labels`, `node_count`,
+`domain`, `intrinsic_dim`, `feature_space`, `is_affine`, `node_coords`),
+`LensProbeInfo` (`layers`, `word`, `token_id`), `SaeProbeInfo` (`layers`,
+`feature_id`, `label`, `max_act`). The readout families carry no invented
+geometry fields. `is_affine` is the flat-vs-curved discriminator the client
+classifies subspace-vs-manifold on; `node_coords` backs the 2-D mini-map.
 
 ## Source layout
 
 ```
 webui/src/
-  main.ts                     # bootstrap: mounts <App /> via Svelte 5 mount()
-  App.svelte                  # shell + drawer switch; NARROW_DRAWERS size class
+  main.ts                     # bootstrap: mount <App />, install the tooltip layer
+  App.svelte                  # shell + drawer host; NARROW_DRAWERS size class
   lib/
-    api.ts                    # typed REST + WS + SSE clients
-    stores.svelte.ts          # runes-based shared state + cross-cutting WS/tree state
-    tooltips.ts               # delegated Saklas tooltip layer; `title` remains
-                              # the authoring API, native bubbles are suppressed
-    stores/                   # split slices: drawers, inputHistory, toasts (.svelte.ts)
-    types.ts                  # shared interfaces; DrawerName union
-    expression.ts             # parse/serialize the steering grammar
+    api.ts                    # typed REST + WS + SSE clients; ApiError + describeError
+    stores.svelte.ts          # runes-based shared state + cross-cutting WS/tree/chat state
+    stores/                   # slices: drawers, inputHistory, palette, preparations, toasts
+    types.ts                  # shared wire + UI interfaces; DrawerName union
+    highlight.ts              # THE per-token highlight implementation (score lookup + style)
+    tokens.ts                 # pure ramp math: HIGHLIGHT_SAT, scoreToRgb, two-stripe/blend
+    templates.ts              # THE client mirror of the template artifact's invariants
+    expression.ts             # serialize the steer rack to a steering expression
+    readouts.ts               # the one shared readout top-k resolution
     concepts.ts               # concept-catalog helpers (category / poles / recommended α)
-    tokens.ts                 # HIGHLIGHT_SAT + scoreToRgb + twoStripeStyle
+    commands.ts               # ⌘K registry: RAIL_CATEGORIES + paletteCommands()
+    tooltips.ts               # delegated tooltip layer; `title` stays the authoring API
     charts/{Bar,Sparkline,HeatmapCell}.svelte
-    charts/probeGeometry.ts   # hand-rolled canvas renderer for the probe-inspector geometry plot
-    manifolds/diagnostics.ts  # pure helpers — classify/bars/summary for discover fits
-    manifolds/DiagnosticsPanel.svelte  # variance-bars / eigenvalue-spectrum renderer
-    Slider.svelte             # shared range slider
-    Select.svelte             # themed dropdown — replaces native <select> everywhere
-    Checkbox.svelte           # themed checkbox — square accent fill on checked
-    Radio.svelte              # themed radio — generic over value, bind:group
-    NumberInput.svelte        # themed numeric input — hover-revealed steppers,
-                              # exported focus()/select() for modal hosts,
-                              # onkeydown forwarding, onchange + oninput
-    Disclosure.svelte         # themed collapsible — ▸/▾ caret pattern
-    builder/                  # shared layout helpers for the two builder drawers
-      ModeTabs.svelte         # the auto-generated / custom-statements|nodes tab strip
-      AdvancedSection.svelte  # collapsible "Advanced options" wrapper around Disclosure
-      ValidationBlock.svelte  # "not ready to <verb>:" + bulleted reasons
-    Toaster.svelte            # toast host (bottom-right, TTL-dismissed)
+    charts/probeGeometry.ts   # hand-rolled canvas renderer for the probe-inspector plot
+    manifolds/diagnostics.ts  # pure classify/bars/summary helpers for discover fits
+    manifolds/DiagnosticsPanel.svelte
+    {Slider,Select,Checkbox,Radio,Combobox,NumberInput,Disclosure,Toaster}.svelte
+    builder/{ModeTabs,AdvancedSection,ValidationBlock}.svelte
+    ui/{Button,Chip,SegmentedTabs,DrawerCloseButton}.svelte
     style/{fonts.css,tokens.css,global.css}
-                              # fonts.css: Recursive VF self-hosted (src/assets/
-                              # fonts/), ONE woff2 exposed as TWO families —
-                              # "Recursive Sans" (MONO 0, CASL .35) for chrome,
-                              # "Recursive Mono" (MONO 1) for data — axes pinned
-                              # per-family in @font-face, so a font-family switch
-                              # alone flips the voice
-    ui/                       # v2 primitives (Observatory+ redesign, 2026-07-10):
-      Button.svelte           # solid / ghost / danger; ``accent`` retints to a pillar hue
-      Chip.svelte             # mono capsule, hue wash; recipe terms, badges, tags
-      SegmentedTabs.svelte    # pillar tab strip (hue dot + glass active)
-      GlassCard.svelte        # the v2 card material; exposes --card-accent like RackCard
+                              # fonts.css: Recursive VF self-hosted, ONE woff2 as TWO
+                              # families — "Recursive Sans" (MONO 0, CASL .35) for chrome,
+                              # "Recursive Mono" (MONO 1) for data; axes pinned per-family
+                              # in @font-face, so a font-family switch flips the voice
   panels/
-    CommandPalette.svelte     # ⌘K palette — THE tool launcher (the former left
-                              # rail is gone; a ⌘K chip in the chat header is the
-                              # visible hint): instrument-tab jumps + every registry
-                              # tool (lib/commands.ts) + pages; state in
-                              # lib/stores/palette.svelte.ts
-    RecipeBar.svelte          # persistent cross-pillar expression bar atop the
-                              # inspector: every racked term as a pillar-colored
-                              # chip (click → jump to its tab, × → remove, ⧉ →
-                              # copy the canonical expression)
-    SaePanel.svelte           # SAE pillar — SOURCE picker + provider fetch and
-                              # cancellable local train; loaded: identity +
-                              # decoder-row STEER cards + pinned/live-discovery
-                              # feature PROBE cards (▲ unpins / △ pins — same
-                              # merged-PROBE shape and strength/name sort as the
-                              # lens tab), cards in
-                              # rack/{SaeSteerCard,SaeProbeCard} (gold, ▲/△).
-                              # Cards read normalized strength — activation /
-                              # Neuronpedia maxActApprox, absolute 0..1 bar
-                              # like the lens cards (saeState.meta, fed by
-                              # token-frame max_act + the between-generation
-                              # POST sae/features/metadata backfill in
-                              # backfillSaeMeta); metadata-less features fall
-                              # back to raw activation on a panel-shared
-                              # scale so bars always rank with the numbers
-    InspectorPanel.svelte     # right rack: THE INSTRUMENT STACK — RecipeBar +
-                              # four pillar tabs (subspace/manifold/sae/lens via
-                              # ui/SegmentedTabs). subspace + manifold tabs each
-                              # render SteeringRack+ProbeRack filtered by a
-                              # family prop (the tab IS the group; the old CAA
-                              # two-group split is gone), sae = SaePanel,
-                              # lens = JLensPanel. InspectorTab union is the four
-                              # pillar names (the pre-4.2 "probes"/"jlens" values
-                              # are gone). Hovering a transcript/raw-buffer token
-                              # overlays that token's probe/J-LENS/SAE readings;
-                              # every channel emitted by a live frame is retained
-                              # for the page session; channels absent at generation
-                              # use the existing historical token endpoints
-    JLensPanel.svelte         # J-LENS pillar — SOURCE picker + official fetch
-                              # and cancellable local fit; then STEER + merged
-                              # PROBE cards with live workspace discovery
-    rack/InstrumentSourceSection.svelte # one shared prepared/provider selector
-                              # plus the canonical labelled custom lifecycle
-                              # row for the SAE and J-LENS pillars
-    WorkbenchCard.svelte      # active-workbench card (model + device); bottom of threads column
-    StatusFooter.svelte       # gen progress · t/s · elapsed · ppl + pending-queue count badge; mounted inside Chat above the input row
-    PendingBubbles.svelte     # ghosted bubbles for queued sends/commits/mutations + per-item × cancel; mounted between StatusFooter and the input row
-    Chat.svelte               # cast-model turn cards (neutral glass, role chips,
-                              # ppl provenance, system = stage directions),
-                              # thinking-collapsible, probe-tinted tokens, the
-                              # cast row (speaking as / reply as chips), inline
-                              # actions, status footer, pending bubbles
-    SamplingStrip.svelte      # T / P / K / max / pres / freq / seed / thinking /
-                              # alts + advanced/system-prompt buttons (role boxes
-                              # moved to Chat's cast row); foot of the threads
-                              # column, below WorkbenchCard
-    SteeringRack.svelte       # STEER section of one instrument tab — takes a
-                              # ``family`` prop ("subspace" | "manifold") and renders
-                              # only that family's cards (+ the shared "subspace
-                              # along" master on the subspace tab); footer keeps the
-                              # family's single "+ … steer" launcher
-    ProbeRack.svelte          # PROBE section of one instrument tab — same ``family``
-                              # prop (subspace ⇔ info.is_affine); header live toggle
-                              # (probesLiveState → apiInstruments.setLive("geometry") — the ONE
-                              # monitor per-token scoring switch, rendered in both
-                              # tabs driving the same state); footer keeps the
-                              # family's single "+ … probe" launcher
-    rack/RackCard.svelte      # shared card chrome: statline on top, controls/meters stacked below
-    rack/RackSectionHeader.svelte # shared STEER/PROBE title + live/count/sort row across all pillars
-    rack/RackMarker.svelte    # optically matched 18 px family markers: ●/◆/■/▲
-    rack/ProbePinButton.svelte # shared 24 px pin/unpin action for every probe family
-    rack/ProbeHighlightButton.svelte # pinned SAE/J-LENS transcript-highlight action
-    rack/LayerStrip.svelte    # shared borderless, high-contrast per-layer cells + endcaps
-    rack/ProbeReadingRow.svelte # canonical four-column label/bar/context/value meter grid
-    rack/SteerCard.svelte     # unified steer card — branches on entry.mode (snap-to-node + XYPad both):
-                              #   subspace → position only (magnitude = shared subspace-along master)
-                              #   manifold → position + per-card along / onto
-    rack/ProbeCard.svelte     # unified probe card — branches on is_affine / node_count===2:
-                              #   bipolar bar OR scalar/fraction + nearest; curved adds coords / residual / mini-map
-    manifold/XYPad.svelte     # position picker: 2D xy-pad / 1D-3D sliders, periodic axes wrap
-    RawBuffer.svelte          # base-model flat completion buffer (replaces Chat's bubbles)
-    manifold/ManifoldMiniMap.svelte  # SVG mini-map: node labels at authoring coords + per-token trajectory polyline + bold settled-aggregate dot
-    loom/{LoomSidebar,LoomNode,LoomEdge}.svelte  # permanent "threads" column
+    InspectorPanel.svelte     # the instrument stack: RecipeBar + four pillar tabs
+    RecipeBar.svelte          # persistent expression bar — every term as a pillar chip
+    SteeringRack.svelte       # STEER section of one geometry tab (family prop)
+    ProbeRack.svelte          # PROBE section of one geometry tab (family prop)
+    JLensPanel.svelte         # lens pillar: SOURCE + STEER + merged PROBE
+    SaePanel.svelte           # sae pillar: same shape, gold
+    CommandPalette.svelte     # ⌘K — THE tool launcher (state in lib/stores/palette)
+    Chat.svelte               # cast-model turn cards, composer, highlight controls
+    RawBuffer.svelte          # base-model flat completion buffer
+    StatusFooter.svelte       # gen progress · t/s · elapsed · ppl + queued-count badge
+    PendingBubbles.svelte     # ghosted queued-action chips + per-item × cancel
+    WorkbenchCard.svelte      # model + device card, foot of the threads column
+    SamplingStrip.svelte      # T / P / K / max / penalties / seed / thinking / alts
+    loom/{LoomSidebar,LoomNode,LoomEdge}.svelte  # the permanent "threads" column
+    manifold/{XYPad,ManifoldMiniMap}.svelte
+    rack/
+      RackCard.svelte         # shared card chrome (statline over stacked controls/meters)
+      RackSectionHeader.svelte, RackMarker.svelte, LayerStrip.svelte
+      ProbeReadingRow.svelte, ProbePinButton.svelte, ProbeHighlightButton.svelte
+      SteerCard.svelte        # geometry steer card (subspace | manifold)
+      AtomSteerCard.svelte    # jlens/sae steer card (one component, family table)
+      ProbeCard.svelte        # geometry probe card
+      JLensProbeCard.svelte, SaeProbeCard.svelte   # pinned + discovery rows
+      InstrumentSourceSection.svelte  # shared SOURCE selector + custom lifecycle row
+      probeRows.ts            # mergeInstrumentProbeRows(pinned, discovered, sort)
+      triggers.ts             # trigger pill labels + cycle order
   drawers/
-    {SaveConversation,LoadConversation,Compare,SystemPrompt,
-     Help,Export,Rack,ManifoldBuilder,ProbeInspector,TemplateLab,
-     ManifoldMerge,ManifoldPacks,TokenDrilldown,AdvancedSampling,Health,SessionAdmin,Correlation,
-     NodeCompare,Transcript}Drawer.svelte
+    {Rack,ManifoldBuilder,ManifoldMerge,ManifoldPacks,TemplateLab,ProbeInspector,
+     TokenDrilldown,Correlation,Compare,NodeCompare,Transcript,SaveConversation,
+     LoadConversation,Cast,SystemPrompt,AdvancedSampling,Health,SessionAdmin,
+     Help}Drawer.svelte
     token/                    # drilldown internals (TokenDrilldownDrawer is the shell)
       cursor.ts               # conversation-walking cursor: segments, step/jump/clamp
       readout.svelte.ts       # ReplayReadout — one captured-or-replay resource per family
       drilldown.svelte.ts     # page-session sticky tab state (default: lens)
       InstrumentHeader.svelte # shared provenance · source · steering · apply-recipe row
-      DetailCardHeader.svelte # fixed lead slot + shared primary/meta/tail statline type scale
-      EvidenceChips.svelte    # shared quiet pills for geometry + SAE supporting facts
-      TokenRibbon.svelte      # windowed clickable context strip (highlight-probe tinted)
-      PinnedReadings.svelte   # instruments.<family>.readings rows for the lens/sae tabs
-      EmptyState.svelte       # standardized reason + action empty state
-      {Geometry,Logits,Sae,Lens}Tab.svelte  # the four presentational tab bodies
-    index.ts                  # barrel re-exports for App.svelte's switch
+      DetailCardHeader.svelte, DetailSection.svelte, EvidenceChips.svelte
+      TokenRibbon.svelte, PinnedReadings.svelte, EmptyState.svelte
+      {Geometry,Logits,Sae,Lens}Tab.svelte
+    index.ts                  # barrel re-exports for App.svelte's drawer switch
 ```
 
-The rack split is **subspace (flat/affine) vs manifold (curved)**, not vector vs manifold — the post-4.0 vocabulary where a steering vector is the 2-node flat case of a manifold and "manifold" means a genuinely curved fit. Every row in either rack wears one `RackCard` chrome — dense, quiet glass (`--radius-lg`, borderless at rest; hover lifts the fill, and the border slot exists only for the `active` hue ring; no backdrop blur — cards sit on an opaque panel): a statline on top (marker glyph · name · status chips · actions, all one row) with the controls (steer cards) or meters (probe cards) stacked **vertically below** — never inline. The cards differ only by accent colour + marker glyph: subspace is `--accent` + ●/○, manifold is `--accent-purple` + ◆/◇ — and the other two pillars continue the vocabulary (lens `--accent-blue` + ■/□, sae `--pillar-sae` + ▲/△), so every card in the instrument stack reads family from hue + marker alone. That sameness is the steer/probe + subspace/manifold harmonisation made visible.
+## Shell + layout
 
-Classification. The steer rack is one `steerRack` of tagged `SteerEntry` (`mode: "subspace" | "manifold"`) — every term is a position on a fitted geometry (a steering vector is the K=2 flat case of a manifold), so all terms share one rack, one card, one serializer. `mode` is the geometry family itself: **subspace** (a flat affine fit — a 2-node bipolar axis through the rank-8 `personas` fan) vs **manifold** (a curved fit). It is set at add time (`RackDrawer` reads the catalog `fit_mode`: `pca`/`baked` → subspace, `spectral`/`authored` → manifold) and at parse time, never flipped in the UI. `SteeringRack` groups by `entry.mode` directly (no catalog lookup) — the subspace group then the manifold group (empty groups hidden), sorted within each. Every subspace term shares the rack-level **`subspaceAlong`** master (the merged affine subspace slides once) — one slider in the subspace group header, default 0.5; manifold terms keep a per-card along/onto. A probe entry is subspace iff `info.is_affine` (probes are unchanged by the 4.1 steer-rack collapse).
+`App.svelte` is three permanent columns — threads `376px` · chat `minmax(0,1fr)` ·
+rack `432px` — with a 1280px design floor (1280 − 376 − 432 ≈ 472px of chat).
+Below `1279px` the same three surfaces become explicit full-width views behind a
+`threads / chat / instruments` nav, so every workflow stays reachable without
+shrinking dense scientific controls into illegibility. It also owns the boot
+gate, the global accelerators (Esc priority: palette → loom modal → drawer → stop
+gen; ⌘K; ⌘R/E/B/N/D loom ops), and the drawer host.
 
-`SteerCard` (every `steerRack` entry; accent + glyph follow the subspace/manifold family — subspace `--accent` ●/○, manifold `--accent-purple` ◆/◇). It branches its body on `entry.mode` via narrowed `s` / `m` deriveds (so svelte-check enforces mode-correct field access). Statline (both modes): enable glyph · name · `unfitted`/`stale` warn chip · trigger pill · `✕` remove. Body: a snap-to-node `Select` (with a `(free position)` escape hatch) + the `XYPad` (rendered `locked` while a label is bound, so the pad reads out but rejects input until `(free position)` unsnaps). **Subspace** adds no per-card magnitude control — its strength is the shared `subspaceAlong` master in the group header (a hint line points there), and relative weight between subspace terms lives in how far each position sits from neutral. **Manifold** adds a per-card `along` slider plus an `onto` slider (the second coefficient that collapses the off-surface in-subspace residual onto the surface). Picking a node sets the entry's `label` (label form, `<m>%<label>`); pulling the pad authors a free coord and clears it. The `XYPad` renders a 2-D draggable pad at intrinsic dim 2 and one slider per axis otherwise (so a 2-node concept is one slider, `personas`'s 8-D fit is eight sliders). The pre-4.1 `~`/`|` projection, `!` ablation, and the `:variant` chip are gone from the card — the grammar forbids `%` composing with projection/ablation, and `:variant` survives on the entry (round-trip) but isn't authored here. (Reconciliation note: a 2-node concept renders the generic 1-axis XYPad + pole snap, not a dedicated bipolar signed slider — a candidate follow-up.)
+Drawers are modal: the bench columns are `inert` while one is open, focus is
+trapped inside and restored to the launcher on close (`lib/stores/drawers`
+remembers the opener). The host paints the floating sheet — `--bg-alt` fill,
+`--glass-line` hairline, `--radius-lg`, overlay shadow — so every drawer interior
+is transparent with no border of its own. `NARROW_DRAWERS` (`subspace`,
+`manifolds`, `manifold_builder`, `system_prompt`, `save_conversation`,
+`load_conversation`) sizes forms and pickers to `min(480px, 92%)` instead of the
+wide analysis panel. The switch itself is a hand-written `{#if}` chain over
+`DrawerName`, backed by the `drawers/index.ts` barrel.
 
-`ProbeCard` (every `probeRack` entry; the store normalises `current` / `sparkline` / `perLayer` per family, so the card reads those uniformly and branches only on presentation). Statline: highlight-select glyph (●/○ flat, ◆/◇ curved — filled when this probe is the highlight target; click the identity cluster to toggle it) · name · sparkline · `✕` detach. The identity cluster is highlight-selectable for **every** family — the per-token score map is keyed by probe name regardless of geometry (the top-bar dropdown already lists curved probes, and this wires the click too). Body branches: a 2-node flat probe (`is_affine && node_count === 2`) renders a signed **bipolar reading bar** (axis-0 `coords[0]`) with poles; every higher-rank flat fan and every curved fit renders a scalar/fraction bar + nearest-node readout. A curved probe additionally shows the settled `coords` + `residual` meta (from the end-of-gen aggregate) and a `ManifoldMiniMap` for 2-D `BoxDomain` probes with attached node coords (`intrinsic_dim == 2`, `domain.type == "box"`, `node_coords` populated; higher-dim and sphere / custom probes skip the map). The per-layer heatmap strip sits below for all.
+Sheet-interior grammar (`ProbeInspectorDrawer` and `TokenDrilldownDrawer` are the
+reference implementations): header = eyebrow (tracked caps `--text-xs` /
+`--weight-medium` / `0.08em`) over a name row (mono `--text-md` subject +
+`--fg-subtle` meta) with a 26px circle close button; body padding
+`--space-5/--space-6`; data wells recessed into a `--bg` container. Chrome speaks
+`--font-ui`; every value / identifier / expression / number sits in `--font-mono`.
+**Borderless:** the fill step against the sheet is the well boundary, spacing +
+eyebrow typography are the seams, and sticky header/label cells separate with
+`--shadow-sticky`. Hairlines survive only as meaning — focus rings,
+active/selected/invalid state, floating-surface outer edges, dashed pending
+ghosts, control glyph strokes. Exclusive-choice strips are `lib/ui/SegmentedTabs`,
+actions are `lib/ui/Button`. Hue stays ontological: at most one pillar-owned
+surface per drawer carries its hue; everything else is achromatic.
 
-The probe data layer is one `probeRack` keyed by registered name (the pre-4.0 `probeRack` + `manifoldProbeRack` fused into one). Each `ProbeRackEntry` carries the `ProbeInfo` (with `is_affine`, and `lens: true` for a pinned J-lens token probe), a sparkline of the primary scalar (signed `coords[0]` for a flat probe, the `[0,1]` readout strength `coords[0]` for a lens probe, `fraction` for a curved one), the latest per-token `reading` + the end-of-gen `aggregate` (both the single `ProbeReadingJSON` shape), the recent `nearest`, and a 2-D `trajectory`. `refreshProbeList` / `attachProbe(selector, opts?)` / `detachProbe(name)` cover the REST surface over `apiProbes`; `updateProbesFromReadings` (WS `token`) / `setProbeAggregates` (WS `done`) read `msg.probe_readings`; `scores` feeds the highlight tinting only. Peripheral drawers reading `probeRack.active` / `.entries` are untouched by the fusion.
+## The instrument stack
 
-**Sheet interiors (v2).** The drawer host (`App.svelte`) paints the floating sheet — `--bg-alt` fill, `--glass-line` hairline, `--radius-lg`, overlay shadow — so every drawer interior is `background: transparent` with **no** `border-left` (the pre-v2 full-height-wall chrome is gone). Chrome speaks sans (`--font-ui`); every value / identifier / expression / number sits in `--font-mono` locally. The shared grammar, with `ProbeInspectorDrawer` and `TokenDrilldownDrawer` as the reference implementations: header = eyebrow (tracked caps `--text-xs` / `--weight-medium` / `0.08em`) over a name-row (mono `--text-md` subject + `--fg-subtle` meta), a 26 px circle glass-fill close button, body padding `--space-5/--space-6`, and data wells — tables / matrices / plots recessed into a `--bg` container with `--radius`, sticky label cells kept opaque `--bg` so they occlude scrolled content. **Borderless (Phase 6):** none of that carries a resting hairline — the fill step against the sheet's `--bg-alt` is the well boundary, spacing + eyebrow typography are the header/footer seams, and sticky header/label cells separate with `--shadow-sticky` (elevation that only reads once content scrolls under) instead of a rule. Hairlines survive only as meaning: focus rings, active/selected/invalid state rings, floating-surface outer edges (the sheet itself, popover menus, toasts), dashed pending-ghosts, and control glyph strokes. Exclusive-choice strips are `lib/ui/SegmentedTabs`, actions are `lib/ui/Button` (ghost default, `sm` in dense rows), micro-scrubbers stay custom pills. Hue stays ontological: the one pillar-owned surface in a drawer may carry its hue (the drilldown's j-lens tab dot, the inspector's family accent); everything else is achromatic.
+`InspectorPanel` is four coequal pillars over the ONE steering expression and
+probe roster, each with the same verbs (observe / steer / gate) and its own hue +
+marker: **subspace** (flat/affine fits — concept axes, `personas`;
+`--pillar-subspace`, ●/○), **manifold** (curved fits; `--pillar-manifold`, ◆/◇),
+**sae** (`--pillar-sae`, ▲/△), **lens** (`--pillar-lens`, ■/□). `InspectorTab` is
+exactly those four names. The subspace and manifold tabs render
+`SteeringRack` + `ProbeRack` filtered by a `family` prop — the tab *is* the group;
+`sae` is `SaePanel` and `lens` is `JLensPanel`. `RecipeBar` sits above the tabs and
+keeps every racked term visible as a pillar-colored chip regardless of which tab
+is open (click → jump to its pillar, × → remove, ⧉ → copy the canonical
+expression, i.e. the exact text the WS `steering` field carries). Hovering a
+transcript or raw-buffer token overlays that token's readings into the same cards.
 
-`ProbeInspectorDrawer` (`probe_inspector`, launched from the `ProbeCard` statline's `[ⓘ]`) is the per-probe geometry inspector with a rank-aware plot in the whitened (Mahalanobis) frame, rendered by the hand-rolled canvas in `lib/charts/probeGeometry.ts` (zero 3-D dep). The plot branches on the selected layer's subspace `rank`: rank 1 → a line (poles + neutral + sliding live dot), rank 2 → a 2-D node scatter (+ a curve overlay when `intrinsic_dim == 1`), rank 3+ → a drag-orbit 3-D scatter on the top-3 PCs (+ curve / wireframe-surface overlay). Geometry is fetched once for all layers (`Monitor.probe_geometry(name)` → `GET /sessions/{id}/probes/{name}/geometry`, returning per-layer `node_white` / `neutral_white`, a top-3 PCA rotation at rank ≥ 3, and the sampled overlay, all whitened) and reprojected client-side on scrub; the per-layer `‖share‖` bars double as the layer scrubber (the former redundant layer `Select` is gone — the rows are the picker), with the active layer echoed by a chip pinned to the plot's top-left. **Camera (rank ≥ 3):** the scale is a rotation-invariant constant derived once from the static framing set (nodes + neutral + overlay) with the orbit a rigid spin about the **neutral anchor** (the whitened origin), so neutral sits at the plot center, the cloud shows its real displacement from neutral, and dragging never changes the cloud's size — this replaced the per-frame rescale off the rotated 2-D silhouette that made the view zoom while rotating. (Pivoting on neutral rather than the node centroid pairs with the backend's neutral-centered `node_coords` layout — both surfaces share neutral as origin.) Zoom is now an explicit `orbit.zoom` driven by the scroll wheel (clamped `0.3–6×`); rank 2 likewise frames from the static geometry so a moving live point can't rescale it. **Colour** follows the hue ontology: node centroids wear the probe's *family* hue — flat = subspace white, curved = manifold violet, the same `is_affine` split the racks use — supplied by the drawer through the `--geom-node` custom property on the plot well (the canvas renderer reads its palette off CSS vars, so `probeGeometry.ts` stays hue-agnostic; `--geom-neutral` likewise). The neutral anchor is a hollow *grey* ring (neutral is the absence of concept, so it carries no hue; the old amber is gone), the live hidden-state point a white core with a green rim, and the fading trajectory trail a green time ramp (along-axis gradient allowed: the gradient *is* the data). Canvas labels render in Recursive Mono. The drawer itself is the v2 sheet-interior reference (see §Sheet interiors below): the family hue also accents the header dot, the active share row, the bars, and the plot well's quiet fill.
+The rack split is **subspace (flat/affine) vs manifold (curved)** — a steering
+vector is the 2-node flat case of a manifold, and "manifold" means a genuinely
+curved fit. Every row wears one `RackCard`: dense quiet glass (`--radius-lg`,
+borderless at rest; hover lifts the fill, the border slot exists only for the
+`active` hue ring; no backdrop blur — cards sit on an opaque panel), a statline on
+top (marker · name · status chips · actions, one row) with controls or meters
+stacked **vertically below**, never inline. `RackMarker` gives all four glyph
+shapes one optical box so family reads from hue + marker alone.
 
-The live point + trail ride the probe's per-token `subspace_coords_per_layer` (the whitened query coords, same frame as `node_white`), gated on by the `persist_subspace_coords` sampling flag — `buildSamplingPayload` sets it only while this drawer is open, so the default generate path keeps the cheaper reading shape. Each token's coords are stored across **all** probed layers in `ProbeRackEntry.subspaceTrail` (`MAX_SUBSPACE_TRAIL` cap, reset per generation), so scrubbing layers is a pure read; the live point is the last sample at the scrubbed layer, the trail the rest. A small `N trail pts` readout on the plot surfaces the trail depth (and doubles as a flow check — climbing means coords are arriving). The inspector's `‖share‖` bars source `mahalanobis_share` from the geometry payload, not `/diagnostics` (which only resolves rank-1 probes).
+**Steer classification.** One `steerRack` of tagged entries keyed by name.
+`mode` is the family itself: `subspace` / `manifold` (geometry positions) and
+`jlens` / `sae` (single-direction atoms). It is set at add time — `RackDrawer`
+reads the catalog `fit_mode` (`pca`/`baked` → subspace, `spectral`/`authored` →
+manifold) — and never flipped in the UI. `SteeringRack` groups by `entry.mode`
+directly. Every subspace term shares the rack-level **`subspaceAlong`** master
+(the merged affine subspace slides once) — one slider in the subspace group
+header; manifold terms keep a per-card `along` + `onto`.
 
-**Default probes.** Session construction bootstraps the requested tagged concept-axis categories. When the caller leaves the roster unset, it also attaches every already-fitted bundled multi-node manifold (for example `default/personas` and `default/emotions`) under its qualified selector. This policy is frontend-independent: `--no-web` does not change the geometry roster. An unfitted manifold is skipped with a one-line hint because fitting it would require startup forwards. The client does not initiate the work — `refreshProbeList()` simply fetches the session's already-attached set, so the rack opens populated.
+`SteerCard` (geometry) branches its body on `entry.mode` via narrowed `s` / `m`
+deriveds so svelte-check enforces mode-correct field access. Statline: enable
+glyph · name · `unfitted`/`stale` chip · trigger pill · ✕. Body: a snap-to-node
+`Select` with a `(free position)` escape hatch plus the `XYPad` (rendered `locked`
+while a label is bound). Subspace adds no per-card magnitude — a hint line points
+at the shared master. Manifold adds `along` + `onto`. Picking a node sets the
+entry's `label` (`<m>%<label>`); pulling the pad authors free coords and clears it.
+`XYPad` is a 2-D draggable pad at intrinsic dim 2 and one slider per axis
+otherwise, so a 2-node concept is one slider and an 8-D `personas` fit is eight.
+Non-box (sphere / custom) axes get symmetric `[-R, R]` bounds where
+`R = max(1, ceil(max|v|))` over that axis's `node_coords` column, so 0 sits at the
+visual center — the flat layout is neutral-centered at fit time, so a persona node
+lands wherever its displacement from neutral falls. `[-1, 1]` is the fallback
+before a fit exists.
 
-`RackDrawer` is the one shared browser for both families — the former `VectorsDrawer` + `ManifoldDrawer` folded into a single component parameterised by `family: "subspace" | "manifold"` (read off `params`, default subspace) and `mode: "steer" | "probe"`. Its rack `+ …` launchers route here. It lists `steerRack.catalog` filtered by family — subspace admits every flat affine fit (`fit_mode` `pca`/`baked`, so the 2-node concept axes *and* higher-rank flats like `personas`), manifold admits only curved fits (`spectral`/`authored`) — then splits on `fitted_for_session` into Fitted vs Unfitted and groups by `categoryOf(m.tags)`. `family` drives one `--family-accent` custom property (white `--accent` vs purple `--accent-purple`) colouring the title / section headers / row actions / launcher, plus the title text (`subspace` / `manifold`, `· probe` in probe mode) and the authoring launcher, which now routes to `ManifoldBuilderDrawer` for both families (`+ build manifold` — a flat fit is just a `pca` manifold, so there is no separate vector-extraction form).
+`AtomSteerCard` is the one card for both single-direction families (`jlens/<word>`,
+`sae/<id>`); a small family table supplies the accent, marker and noun. Statline:
+enable marker · atom id · trigger pill · ✕; body: one per-card α slider. Atoms run
+hotter than concept vectors — `ATOM_DEFAULT_ALPHA = 0.3` is the coherent sweet
+spot, `≥ 0.5` over-steers into repetition — which is why they carry their own dial
+rather than the shared master. `atomActions(mode)` returns the five mutators;
+`addJLensToRack(word)` / `addSaeToRack(id)` stay family-specific because they
+differ in key construction and validation.
 
-Per Fitted row: `[ⓘ] [+steer] [+probe] [re-fit] [delete]`; Unfitted: `[fit] [delete]`. `+steer` routes by the drawer `family`: a flat fit joins as a subspace term (`addSubspaceToRack` — a 2-node concept defaults to its positive pole, a higher-rank flat to the domain centroid; magnitude is the shared `subspaceAlong` master), a curved fit as a manifold term (`addManifoldToRack`, own along/onto). A node-chip click (`onSteerNode`) racks-and-pins to that label the same way, by family (`setSubspaceLabel` / `setManifoldLabel`). `[+probe]` calls `attachProbe("ns/name")` for both; the steer/probe buttons short-circuit when already racked. `[ⓘ]` renders `lib/manifolds/DiagnosticsPanel.svelte` inline (PCA variance bars / spectral eigenvalue spectrum, picked-k cut in accent) plus metadata; in `probe` mode the `+probe`/`-probe` actions and the `attach by selector` form go through `attachProbe`/`detachProbe`/`probeRack`. Delete is a 2-step confirm (the button flips to `confirm?` for ~3 s). The pre-4.0 pack-backed `packsState` / `has_tensor` plumbing is gone — the drawer reads the live manifold catalog directly.
+**Probes.** One `probeRack` keyed by registered name across all three families.
+Each entry carries the server `ProbeInfo`, a sparkline of the primary scalar, the
+latest per-token `reading`, the end-of-gen `aggregate`, the recent `nearest`, and
+a 2-D `trajectory`. `refreshProbeList` / `attachProbe(selector, opts?)` /
+`detachProbe(name)` cover the REST surface; `updateProbesFromReadings` (WS
+`token`) and `setProbeAggregates` (WS `done`) both read the merged
+`instruments.*.readings`. `probeEntryForDisplay(name)` is the hover overlay,
+synthesizing a family-native reading when only a flat score row is available.
 
-Flat-vector authoring forms were removed: a 2-node concept axis is just a `pca` manifold, so authoring folds into `ManifoldBuilderDrawer`'s auto-generated (`pca`) path, and the subspace `RackDrawer`'s `+ build manifold` launcher routes there. The backend retains `POST /extract` and `/profiles/bake`; discover-node union is `POST /manifolds/merge`. SAE / `role` / `namespace` / DLS / overwrite options live on `ManifoldBuilderDrawer`'s `AdvancedSection`. CLI `saklas manifold extract` remains the scripted path.
+`ProbeCard` renders the **geometry** family only (`ProbeRack` filters the readout
+families out to their own tabs). Statline: pin marker (click detaches) · name ·
+`@com ±spread` · ⓘ inspect · highlight action · sparkline. Body: the subspaceness
+row (white 0→1 `fraction` bar · nearest node), then one signed bar per intrinsic
+axis — pole labels only when the fit is rank-1 with ≤ 2 nodes, `c0…cR-1`
+otherwise — then the curved-only `residual` meta, the per-layer `LayerStrip`, and a
+`ManifoldMiniMap` for 2-D `BoxDomain` probes with node coords. The heatmap /
+tint saturation scale is the axis-0 node extent for a flat probe and the fixed
+unit scale for a curved probe's `[0,1]` fraction.
 
-`ManifoldMergeDrawer` and `ManifoldPacksDrawer` are the peer manifold tools. Both launch from the ⌘K palette's `steering manifolds` group; the `RackDrawer` browser itself stays reachable from the rack `+` launchers. **`ManifoldMergeDrawer`** is the discover-only node-union surface — checkbox list of discover-mode catalog rows, target-name input, and a `fit_mode` picker that defaults to inherit-from-sources when they agree and requires an explicit override when they don't, with a yellow warning naming the mixed modes. Submits `apiManifolds.merge` and closes back to the catalog on success. **`ManifoldPacksDrawer`** is the local-catalog + HF-search surface — two tabs (installed local rows from the shared `steerRack.catalog` store; HF `saklas-manifold` search debounced at 300 ms against `apiManifolds.search`, per-row `install` button calling `apiManifolds.install` and refreshing the local list on success). Both drawers' purple action accents echo the manifold-family colour the rack uses.
+`JLensProbeCard` and `SaeProbeCard` render both the pinned probe rows and the
+unpinned live-discovery rows of their pillar — pinning changes persistence and
+actions, never shape or position. `mergeInstrumentProbeRows(pinned, discovered,
+sortMode)` in `rack/probeRows.ts` is the one merge + sort for both panels
+(`strength` / `name` / `depth`, with natural-number name collation for SAE
+feature ids so `sae/9` precedes `sae/10`; rows with no depth CoM sort last).
 
-`ManifoldBuilderDrawer` has top-of-form `auto-generated` / `custom nodes` tabs (the internal `AuthoringMode` values stay `discover` / `authored` — only the labels rename). **Custom nodes** is the user-authored path: node editor with labels + statements + optional per-node coords, validated live against `min_nodes = 2n+1` and in-domain coordinates; Save posts to `POST /manifolds`. **Auto-generated** is concept-list + method-picker: a textarea of whitespace/comma-separated concept slugs, a `kind` (abstract / concrete) radio + a `samples_per_prompt` count (the A2 conversational corpus knobs — no scenario counts), a `pca` / `spectral` toggle. Both tabs share an `AdvancedSection` carrying hyperparams (`max_dim`, `var_threshold` for PCA / `k_nn` + `bandwidth` blank-means-auto for spectral) and toggles (`fit immediately after generating corpora`, `persona manifold (use each concept slug as that node's role)`, `overwrite an existing manifold`). Auto-generated save calls `apiManifoldGenerateStream` (SSE-streamed corpus generation) then optionally chains `apiManifoldFitStream` with the same hyperparams — both legs use sticky progress toasts. The diagnostics renderer in `lib/manifolds/diagnostics.ts` is pure helpers (`classifyDiagnostics`, `pcaBars`, `spectralBars`, `diagnosticsSummary`, `pickDiscoverFit`); the `DiagnosticsPanel.svelte` shell consumes them.
+`LayerStrip` is the one per-layer view across every pillar: `HeatmapCell` marks
+with no outlines, a one-pixel gap between layers, endpoints at least 3:1 from
+neutral and from the card. A focused strip is an arrow-key layer scrubber with an
+exact-value readout. `ProbeReadingRow` owns the shared four-column
+label/bar/context/value grid. `Select`, `RackCard`, `SteerCard` and `XYPad` all
+carry explicit `min-width: 0` shrink boundaries so unsnapping a position cannot
+expand the rack past the inspector edge; each `Select` places its listbox in the
+browser top layer with viewport-clamped fixed coordinates so rack scrollers can't
+crop it. Global `:focus-visible` owns one opaque `--focus-ring` that dense local
+field styles cannot suppress; shared pointer controls have a 24px minimum target.
 
-The custom-nodes tab grows an `auto-domain (let the fitter derive coords from corpora)` checkbox at the top. **Unchecked** (default) is the historical authored flow — box/sphere domain picker → per-node coord inputs → `POST /manifolds`. **Checked** hides the domain picker + the per-node coord inputs and exposes a `pca` / `spectral` fit-method radio (same hyperparams as the auto-generated tab, exposed via `AdvancedSection`); Save posts to `POST /manifolds/discover` with `{name, namespace, description, fit_mode, nodes: [{label, statements, role?}], hyperparams}` and the fitter derives node coordinates per-model. Reuses the same `discoverFitMode` / `discoverMaxDim` / `discoverVarThreshold` / `discoverKNN` / `discoverBandwidth` state slots as the auto-generated tab. The submit label changes to `build manifold (auto-domain <fit_mode>) → return to list` so the routing is visible.
+**Live toggles.** The geometry PROBE header carries the CAA live switch
+(`probesLiveState` → `apiInstruments.setLive("geometry")`, rendered in both
+geometry tabs driving the same state): off ⇒ no per-token monitor scoring for UI /
+loom consumers (probes settle to end-of-gen aggregates; gates still force the
+subset they need). The lens and SAE PROBE headers carry their own. With all three
+off a compute-constrained session pays no per-token read cost at all.
 
-`SteerCard`'s `XYPad` per-axis bounds for non-box (sphere / custom) domains are symmetric `[-R, R]` where `R = max(1, ceil(max|v|))` over each axis's `manifold.node_coords` column (clean whole-number ceiling over the per-axis max magnitude). 0 sits at the visual center, so the pad's crosshair gridlines + the slider midpoint align with the (0, 0, ...) **neutral** origin (the flat `node_coords` layout is neutral-centered at fit time, so the node centroid sits off-center and a persona node lands wherever its displacement from neutral falls — e.g. `c0 = -10` at the left endpoint with `R = 10`). Falls back to `[-1, 1]` when no fitted coords are on the wire (the unfitted-manifold pre-fit state). The store side: `setSubspaceLabel` / `setManifoldLabel(name, label|null)` toggle label-form, `formatSubspaceTerm` / `formatManifoldTerm` emit `<m>%<label>` when `label` is set otherwise the comma-joined coord list, and `lib/expression.ts`'s parser produces a `ManifoldTerm.label` (string) or `ManifoldTerm.coords` (number[]) that rides into the rack entry. Each snap-to-node option shows the node's optional `role` tag (`pirate [role=pirate]`) when set, surfacing persona manifolds.
+**Instrument SOURCE sections.** `InstrumentSourceSection` is one shared
+prepared/provider selector plus the canonical labelled custom lifecycle row, used
+by both JLensPanel and SaePanel; it owns the `selectedSource` reconciliation
+because it owns the options list. Behind it,
+`createPreparationSlice(family, operation, {label, intervalMs, successMessage,
+onSettled})` builds all four background jobs (lens `fetch`/`fit`, sae
+`fetch`/`train`) on one contract: `start` posts, reflects the returned status and
+fires the poll loop without awaiting completion; the loop is re-entrancy-guarded
+so N panels asking share one interval; `cancel` no-ops unless running; `check` is
+the mount-time resume probe and only reflects a job when it is *this* operation
+(the two operations of a family share one resource); settle toasts are uniform
+(cancelled → info, error → sticky, else the success line) and run after
+`onSettled` so the panel is consistent first. Local fit/train fields stay hidden
+until the synthetic `local` selector option is chosen, and prepared cached sources
+win the default selection.
 
-Rack layer views are one `rack/LayerStrip.svelte` across CAA and pinned/live
-J-LENS cards. Its `HeatmapCell` data marks have no outlines: a one-pixel gap
-separates layers, neutral stays visible against the card, and the full-scale
-green/red/J-LENS-blue endpoints stay at least 3:1 from neutral as well as the
-card. The same cells in matrix drawers use one-pixel physical table spacing so
-borderless neighbors never merge. A focused strip is an arrow-key layer scrubber
-with a visible exact-value readout.
-Every probe meter uses `rack/ProbeReadingRow.svelte`, which owns the exact shared
-four-column grid across CAA, J-LENS, and SAE cards. `Select.svelte`, `RackCard`,
-`SteerCard`, and `XYPad` all carry explicit `min-width: 0` shrink boundaries, so
-switching a snapped position to `(free position)` cannot expand the rack or clip
-past the inspector edge. Each `Select` instance owns unique option ids, lets Tab
-follow native focus order, and places its listbox in the browser top layer with
-viewport-clamped fixed coordinates so rack scrollers cannot crop it. App drawers
-and the command palette are modal dialogs: the bench is inert while one is open,
-focus is trapped inside and restored to the launcher on close. Global
-`:focus-visible` owns one opaque `--focus-ring` that local dense-field styles
-cannot suppress. Shared pointer controls have a 24 px minimum target.
+## Steering expression
 
-The leading marker on every PROBE card means the same thing: persistence. It
-pins/unpins J-LENS/SAE discovery cards and detaches an attached CAA/manifold
-probe; transcript highlighting is a separate labelled action on CAA/manifold
-cards. Disabled steer cards keep readable text and the re-enable action at full
-contrast, using the hollow marker, struck name, and quieter surface instead of
-whole-card opacity. Starting a background J-LENS fit is a two-step confirmation,
-and a running fit exposes the server's cooperative cancel route while preserving
-its resumable checkpoint.
+`lib/expression.ts` is **serialize-only** — the dashboard emits the grammar and
+the server parses it; there is no client-side parser. `serializeExpression(rack,
+subspaceAlong)` emits subspace terms first (each at the shared master), then
+jlens, then sae, then manifold terms (each at its own `along[,onto]` — `onto`
+rides the coefficient slot only when > 0), picking the production from
+`entry.mode` and skipping disabled entries. Position is the label form
+(`personas%hacker`) when `entry.label` is set, else the comma-joined coord list.
+`:variant` rides the atom and survives round-trip; keep the variant list in parity
+with the Python grammar (`raw`, `sae`, `sae-*`, `role`, `role-*`, `from`,
+`from-*`). `currentSteeringExpression()` returns `steerRack.customExpression` when
+one is set, else the serialized rack; `applyCustomSteeringExpression` clears the
+visual rack, because a rack that can't represent every projection/gate form would
+lie about what generation uses.
 
-`ManifoldBuilderDrawer`'s custom-nodes tab grows a per-node `role` input alongside coords (validated client-side against the same `[a-z0-9._-]+` slug regex the engine uses); the auto-generated tab grows a "persona manifold (use each concept slug as that node's role)" checkbox inside `AdvancedSection` that sets `GenerateManifoldRequest.role_per_node`. `RackDrawer` rows carry a `persona` `fit-badge` when any node in `node_roles` is non-null, parallel to the `pca` / `spectral` badges.
+## Drawers
 
-`TemplateLabDrawer` (⌘K `templates…`, `template_lab`) is the standalone templated-completion surface, two tabs. **score** — pick a template, optional steering expression, `rank by` sum/mean; runs `apiTemplates.score` twice (baseline + steered when an expression is set) and renders per-context distribution bars (base accent + steered purple, `N% → M%`), rows sorted by max prob. **build** — author a template: name, slot, values textarea (newline/comma split), and a multi-turn contexts editor (per context: role-tagged turn rows with add/remove + the slotted assistant field), validated client-side against the same invariants the server enforces (slot once in the assistant, not in a history turn, last turn user, ≥2 values). An `installed` catalog footer lists/deletes templates. The `ManifoldBuilderDrawer`'s `templated` tab remains as a one-step *single-turn* shortcut: it creates canonical single-turn contexts through `apiTemplates.create`, then derives the manifold through `apiManifolds.createFromTemplate`; `TemplateLabDrawer` is the multi-turn + scoring surface.
+`RackDrawer` is the one catalog browser for both geometry families, parameterised
+by `family` (read off `params`, default subspace) and reached from every rack `+`
+launcher. It filters `steerRack.catalog` — subspace admits every flat affine fit
+(`pca`/`baked`, so 2-node concept axes *and* higher-rank flats like `personas`),
+manifold only curved fits (`spectral`/`authored`) — splits on `fitted_for_session`
+into Fitted vs Unfitted, groups by `categoryOf(m.tags)`, and searches over
+manifolds and their node labels. `family` drives one `--family-accent` custom
+property plus the title text. Per Fitted row: `[ⓘ] [+steer] [+probe] [re-fit]
+[delete]`; Unfitted: `[fit] [delete]` (delete is a two-step confirm). `+steer`
+routes by family (`addSubspaceToRack` — a 2-node concept defaults to its positive
+pole, a higher-rank flat to the domain centroid — vs `addManifoldToRack`); a node
+chip click racks-and-pins that label. `[ⓘ]` renders `DiagnosticsPanel` inline
+(PCA variance bars / spectral eigenvalue spectrum, picked-`k` cut in accent). The
+`+ build manifold` launcher routes to `ManifoldBuilderDrawer` for **both**
+families — a flat fit is just a `pca` manifold, so there is no separate
+vector-extraction form in the dashboard; `POST /extract` remains the server route
+and `saklas manifold extract` the scripted path.
 
-`RawBuffer` is the base-model surface.  `SessionInfo.is_base_model` (a non-chat model has no chat template) drives `genUiMode.effectiveRawMode()`; the `genUiMode.override` (`auto`/`chat`/`raw`, persisted per `model_id`, set from the AdvancedSamplingDrawer control or the cycling badge in the Chat header) wins when not `auto`.  In raw mode `Chat.svelte` renders `<RawBuffer />` instead of role bubbles — one continuous editable `pre-wrap` surface with the loom active path joined as plain text, no roles.
+`ManifoldBuilderDrawer` has `auto-generated` / `custom nodes` / `templated` tabs
+(the internal `AuthoringMode` values are `discover` / `authored` / `templated`).
+**Custom nodes** is the authored path — label + statements + optional per-node
+coords and `role`, validated live against `min_nodes = 2n+1` and in-domain
+coordinates, `POST /manifolds` — with an `auto-domain` checkbox that hides the
+domain picker and coord inputs, exposes a `pca`/`spectral` radio, and posts to
+`POST /manifolds/discover` so the fitter derives coords per-model.
+**Auto-generated** is a concept-slug textarea plus a `kind` (abstract/concrete)
+radio and a `samples_per_prompt` count, calling `apiManifoldGenerateStream` (SSE)
+and optionally chaining `apiManifoldFitStream` with the same hyperparams; both
+legs drive one sticky progress toast. **Templated** is the one-step single-turn
+shortcut — it creates canonical single-turn contexts through `apiTemplates.create`
+then derives the manifold through `apiManifolds.createFromTemplate`. A shared
+`AdvancedSection` carries the hyperparams (`max_dim`, `var_threshold`, `k_nn`,
+`bandwidth`) and the fit-immediately / persona-manifold / overwrite toggles.
 
-Flat mode is non-linear: editing text anywhere in the buffer and appending past its end are the *same* operation. `resolveDivergence()` diffs the draft against the settled buffer, finds the first changed character, and the tail from there becomes one new span. **send** submits that tail as `user` and generates `assistant`; a clean buffer shows **generate** and omits the authored half; the explicit **append** button submits only the `user` tail. There is no append modifier shortcut. All three use the same native `sendSubmit(..., {raw:true})` contract as chat. The divergence node and its subtree are preserved as the original branch—an edit never overwrites a generated span in place. The internal `committing` latch holds the buffer→draft sync across the server round trip so the typed tail does not flash out; it releases on a content check (`bufferText.startsWith(draft)`) and suppresses the tinted mirror while held. Toggling the mode never mutates the tree. Per-token tinting rides a read-only mirror layer behind the transparent-text textarea (a textarea cannot tint spans) and shows only when not actively editing.
+`ManifoldMergeDrawer` unions discover-mode node corpora (checkbox list, target
+name, a `fit_mode` picker defaulting to inherit-from-sources and demanding an
+explicit override when sources disagree). `ManifoldPacksDrawer` is the local
+catalog plus HF `saklas-manifold` search (debounced 300ms, server-capped at 20
+rows), installing through `apiManifoldInstallStream` and rendering the SSE stage
+line under the row. Both launch from the ⌘K palette's Steering group.
 
-`lib/expression.ts` — every term is a `%` position. `serializeExpression(rack, subspaceAlong = 1)` emits subspace terms first (each at the shared `subspaceAlong` magnitude) then manifold terms (each at its own `along[,onto]`), picking the production from `entry.mode`. `parseExpression(expr, { isFlat? })` returns `{ rack, subspaceAlong, warnings }`: a `%` term with an `onto` coeff or a non-flat catalog `fit_mode` lands `manifold`, else `subspace` (magnitude collected into `subspaceAlong`; a later subspace term whose magnitude differs folds onto the shared value with a warning); a bare-pole term (`0.5 formal.casual`) becomes a label-form subspace term toward the signed pole. The pre-4.1 `~`/`|` projection and `!` ablation still **parse** (so pasted expressions don't throw) but the operator is dropped with a `warnings` entry. The `%` coefficient slot is `along[,onto]`: serialize emits `<along>,<onto>` when `onto > 0` and `<along>` alone otherwise; the parser reads a pre-selector comma-run of ≤ 2 (mirroring the engine's `coeff := signed_float ("," signed_float)?`), lexically unambiguous from the post-`%` coord commas. `:variant` rides the atom (`name:sae%pos`) and survives on every term shape; keep the variant list in parity with the Python grammar (`raw`, `sae`, `sae-*`, `role`, `role-*`, `from`, `from-*`) — there is no `pca` variant. The round-trip invariant is parse(serialize(rack, G)) reproducing `rack` + `G` for any serializer output.
+`TemplateLabDrawer` is the standalone templated-completion surface. **score** —
+pick a template, an optional steering expression, `rank by` sum/mean; runs
+`apiTemplates.score` twice (baseline + steered) and renders per-context
+distribution bars. **build** — author name, slot, values and a multi-turn contexts
+editor. Both authoring surfaces (this and the builder's templated tab) validate
+through the one `lib/templates.ts::validateTemplateDraft`, which mirrors
+`saklas/io/templates.py::_validate_body` / `_validate_context` one-for-one — slot
+exactly once in the final assistant turn and absent from history turns, last turn
+`user`, ≥ 2 values, distinct non-empty value slugs under the engine's
+`_slug_value` — so a draft that passes locally is a draft the server accepts.
 
-The current composer is role-neutral. Its two structural roles are always
-`user` and `assistant`; `samplingState.user_role` / `assistant_role` are the editable
-chat-template labels for those roles and seed once per model from
-`SessionInfo.default_user_role` / `default_assistant_role` (Gemma therefore
-shows `user` / `model`). Only genuine overrides lower to protocol `user_role` /
-`assistant_role` in `buildSamplingPayload`. `CastDrawer` owns those two editable
-labels through the Saklas `Combobox`, whose themed list combines both model
-defaults with every genuinely custom role observed in the auto-derived tree cast;
-the structural `user` / `assistant` roster keys are presented through those model
-defaults instead of leaking into the list as extra roles. The composer
-shows the resulting labels in ordinary `Select` controls; never reintroduce a native
-`datalist`.
+`ProbeInspectorDrawer` (`probe_inspector`, from a `ProbeCard`'s `[ⓘ]`) is the
+per-probe geometry inspector in the whitened (Mahalanobis) frame, rendered by the
+hand-rolled canvas in `lib/charts/probeGeometry.ts` (zero 3-D dependency). The
+plot branches on the selected layer's subspace rank: 1 → a line (poles + neutral +
+sliding live dot), 2 → a node scatter (+ curve overlay at `intrinsic_dim == 1`),
+3+ → a drag-orbit 3-D scatter on the top-3 PCs (+ curve / wireframe overlay).
+Geometry is fetched once for all layers (`GET /probes/{name}/geometry` →
+per-layer `node_white` / `neutral_white`, a top-3 PCA rotation at rank ≥ 3, the
+sampled overlay, all whitened) and reprojected client-side on scrub; the per-layer
+`‖share‖` bars are the layer scrubber. At rank ≥ 3 the scale is a
+rotation-invariant constant from the static framing set and the orbit is a rigid
+spin about the **neutral anchor**, so neutral sits at the plot center, the cloud
+shows its real displacement, and dragging never resizes it; zoom is an explicit
+scroll-wheel `orbit.zoom` clamped `0.3–6×`. Colour follows the hue ontology: node
+centroids wear the probe's family hue via the `--geom-node` custom property (the
+renderer reads its palette off CSS vars and stays hue-agnostic), neutral is a
+hollow grey ring (neutral is the absence of concept, so it carries no hue), the
+live point is a white core with a green rim, and the trail is a green time ramp —
+the one place a gradient is allowed, because the gradient *is* the data. The live
+point and trail ride the probe's per-token `subspace_coords_per_layer`, gated on
+by the `persist_subspace_coords` sampling flag that `buildSamplingPayload` sends
+whenever any probe is attached — so opening the inspector *after* a generation
+still shows that run's path. Samples are stored across **all** probed layers in
+`subspaceTrail` (a bounded ring, reset per generation), so scrubbing layers is a
+pure read.
 
-`Chat.svelte` exposes a visible two-part turn plan. **you write** selects the
-authored role; **model writes** independently selects a generated role or `none`
-for an authored-only append. Each visible role option carries its canonical
-user/assistant role internally. A one-shot `⇄` exchanges the two selected roles; it
-is not a persistent mode. Non-empty text with a generated role is **send**, empty
-text with a generated role is **generate**, and selecting `none` is **append**.
-There is no append shortcut. Selection chooses the branch anchor but never
-changes these meanings. Scene mode gates nonstandard role choices because legacy
-templates cannot open a user-role generation header or freely commit
-assistant-role text.
+Other drawers: `CastDrawer` (tree-scoped roster of labels + standing recipes, and
+the two editable structural-role labels through `Combobox`), `Correlation` (N×N
+magnitude-weighted cosine), `Compare` (cross-layer pairwise cosine),
+`NodeCompare` (cross-branch diff, from the loom sidebar), `Transcript`
+(export/import), `Save`/`LoadConversation` (the v6 whole-tree file),
+`SystemPrompt` and `AdvancedSampling` (from `SamplingStrip`), `Health`,
+`SessionAdmin`, `Help`.
 
-Same effective roles coalesce throughout the engine. `append_user_turn` /
-`append_assistant_turn` append authored text in place when the selected leaf has
-the same structural role and `role_label`; `_generate_core` reuses such a leaf
-for a one-shot generation, forcing its existing text as the prefix and sampling
-the tail into the same message. This is the general prefill mechanism: append a
-model-role prefix, then generate the model role. Explicit fan-out, regeneration,
-logit forks, and the compatibility prefill endpoint retain sibling semantics.
-An authored tail clears stale node-level generation receipts; a generated tail
-rebuilds the receipt for the whole forced-prefix result. Exact draft whitespace
-is preserved—only the emptiness test trims.
+## Composer, cast, raw buffer
 
-The composer footer has only the green primary action and red stop action. Both
-use the same tinted-glass `Button` treatment; the action label changes among
-`send` / `generate` / `append`. Regeneration is message-local: every non-system
-bubble renders a small flat `↻` button immediately after its role chip and calls
-`loomRegenerateNode(node_id)`. The replacement is a generated sibling in the
-same structural role, so every non-system message is rerollable without
-consulting provenance.
+The composer is role-neutral. Its two structural roles are always `user` and
+`assistant`; `samplingState.user_role` / `assistant_role` are the editable
+chat-template labels, seeded once per model from `SessionInfo.default_user_role` /
+`default_assistant_role` (Gemma therefore shows `user` / `model`), and only
+genuine overrides lower to protocol `user_role` / `assistant_role` in
+`buildSamplingPayload`. `CastDrawer` owns those two labels through the Saklas
+`Combobox`, whose list combines the model defaults with every genuinely custom
+label observed in the auto-derived tree cast; the composer shows the resulting
+labels in ordinary `Select` controls (never a native `datalist`).
 
-Every speaker still renders as one neutral glass card with identity in the role
-chip; system nodes are stage directions. The cast manager (`cast…`) owns the
-tree-scoped roster and standing recipes, and `+ thinking` drafts an authored
-thinking block for the next line. Composer actions use shared Saklas controls
-(`Button`, `Checkbox`, `Combobox`), as does the raw buffer's action surface.
+`Chat.svelte` exposes a visible two-part turn plan: **you write** selects the
+authored role, **model writes** independently selects a generated role or `none`
+for an authored-only append, and a one-shot `⇄` exchanges the two (not a
+persistent mode). Non-empty text with a generated role is **send**, empty text
+with a generated role is **generate**, `none` is **append**; there is no append
+modifier shortcut, and node selection chooses the branch anchor without changing
+those meanings. Scene mode gates nonstandard role choices, because a family
+without a validated scene grammar cannot open a user-role generation header or
+freely commit assistant-role text. `+ thinking` drafts an authored thinking block
+for the next line. Every speaker renders as one neutral glass card with identity
+in the role chip; system nodes are stage directions. Regeneration is
+message-local — a small
+`↻` after each non-system role chip calls `loomRegenerateNode(node_id)` and the
+replacement is a generated sibling in the same structural role. The footer has
+only the green primary action (label `send` / `generate` / `append`) and the red
+stop action.
 
-Adding a panel: write the `.svelte`, wire state into the smallest matching `lib/stores/` slice (or `stores.svelte.ts` for cross-cutting WS/tree/chat state), mount from `App.svelte`, `npm run build`, commit the regenerated `dist/`. Adding a drawer: write it under `drawers/`, add the name to the `DrawerName` union in `lib/types.ts` (and to `NARROW_DRAWERS` in `App.svelte` for forms/pickers), add an `App.svelte` switch branch, re-export from `drawers/index.ts`, and add it to the command registry's `RAIL_CATEGORIES` group in `lib/commands.ts` so the ⌘K palette can launch it.
+Same effective roles coalesce throughout the engine: authored text appends in
+place when the selected leaf shares its structural role and `role_label`, and a
+one-shot generation reuses such a leaf by forcing its text as the prefix — the
+general prefill mechanism. Explicit fan-out, regeneration, logit forks and the
+compatibility prefill endpoint keep sibling semantics.
+
+`RawBuffer` is the base-model surface. `SessionInfo.is_base_model` drives
+`genUiMode.effectiveRawMode()`; the `genUiMode.override` (`auto`/`chat`/`raw`,
+persisted per `model_id`, set from `AdvancedSamplingDrawer` or the cycling badge
+in the chat header) wins when not `auto`. In raw mode `Chat.svelte` renders
+`<RawBuffer />` instead of role bubbles — one continuous editable `pre-wrap`
+surface with the loom active path joined as plain text. Flat mode is non-linear:
+editing anywhere in the buffer and appending past its end are the same operation.
+`resolveDivergence()` diffs the draft against the settled buffer and the tail from
+the first changed character becomes one new span — **send** submits it as `user`
+and generates `assistant`, a clean buffer shows **generate**, and **append**
+submits only the tail; all three go through the same `sendSubmit(..., {raw:true})`
+contract as chat. The divergence node and its subtree survive as the original
+branch — an edit never overwrites a generated span in place. The internal
+`committing` latch holds the buffer→draft sync across the round trip so the typed
+tail doesn't flash out, releasing on a content check. Toggling render mode never
+mutates the tree. Per-token tinting rides a read-only mirror behind the
+transparent-text textarea (a textarea cannot tint spans) and shows only when not
+actively editing.
 
 ## Pending queue
 
 Submissions during an in-flight gen (or behind earlier queued items) defer rather
-than racing the WS. `sendGenerate` / `sendCommit` / `sendPrefill` check
-`isPendingBusy()` (gen active OR `pendingActions.queue.length > 0`) and, when
-busy, append a `PendingAction` (defined in `lib/types.ts`) carrying a `rebuild`
-factory the `↑`-pull-and-edit path uses to re-encode the same kind/role/target
-with new text. Instant mutations from the chat header (`/clear`, regen) and the
-rack/sampling sites also queue via `enqueuePending` with `awaitsGen: false` so
-the drain chains through them without waiting on a `done` that never fires.
+than racing the WS. `sendSubmit` checks `isPendingBusy()` (gen active OR a
+non-empty queue) and appends a `PendingAction` carrying a `rebuild` factory the
+`↑`-pull-and-edit path uses to re-encode the same plan with new text. Rack and
+sampling mutations queue through `enqueueOrApply` with `awaitsGen: false`, so the
+drain chains through them without waiting on a `done` that never fires.
 
-Queued rack mutations coalesce. `enqueueOrApply` tags each rack-mutation item with `coalesceKey: "rack"`; when the queue tail already carries that key, a fresh mutation chains its `apply` onto the tail item rather than appending a new slot, and the bubble's label updates to the latest action. A slider drag firing 30+ intermediate `setSubspaceAlong` calls mid-gen therefore leaves one queued bubble carrying the net effect. Coalescing stops at any non-rack item — rack changes before and after a queued send form distinct groups, so FIFO ordering relative to the send holds.
+Queued rack mutations coalesce: each is tagged `coalesceKey: "rack"`, and when the
+queue tail already carries that key a fresh mutation chains its `apply` onto the
+tail item instead of taking a new slot, with the bubble's label updating to the
+latest action. A slider drag firing 30+ intermediate `setSubspaceAlong` calls
+mid-gen therefore leaves one bubble carrying the net effect. Coalescing stops at
+any non-rack item, so rack changes before and after a queued send form distinct
+groups and FIFO ordering relative to the send holds.
 
-The WS `done` / `error` handlers call `drainNextPendingAction()` — one item per event — instead of the old v1 `applyPendingActions` (which drained everything at once). `PendingBubbles.svelte` renders the live queue above the input as dim chips; the per-bubble `×` calls `cancelPendingAction(id)` to remove a single slot. The bubble whose slot the user is currently editing via ↑ gets the `.editing` class — brighter amber background, thicker border, full-strength text, and a leading `✎` marker — driven off `inputHistory.pulledSlot`. The StatusFooter shows a `N queued` readout but no "apply now" button — under the FIFO model there's no skip-ahead semantics.
+The WS `done` / `error` handlers call `drainNextPendingAction()` — one item per
+event; a failed apply surfaces as a system turn rather than stalling the queue.
+`PendingBubbles.svelte` renders the live queue above the input as dim chips with a
+per-bubble `×` (`cancelPendingAction(id)`); the bubble whose slot the user is
+editing via `↑` gets the `.editing` treatment off `inputHistory.pulledSlot`.
+`StatusFooter` shows an `N queued` readout and no "apply now" — under FIFO there
+are no skip-ahead semantics.
 
-Up-arrow walks the combined ring `[editable pending (most-recent first), input history (newest first)]`. Pulling a queued item sets `inputHistory.pulledSlot`; Chat.svelte forwards that to `sendGenerate` / `sendCommit` / `sendPrefill` as `replaceSlot` so a re-edited send lands at its original slot. `Esc` while pulled cancels the edit (slot stays, input restores the stash); empty `Enter` while pulled removes the slot — keyboard equivalent of the `×` button. Non-editable items (`rebuild === null`, e.g. queued `/clear` and regen) sit in the queue but the up-arrow walks past them.
+`↑` walks the combined ring `[editable pending (most-recent first), input history
+(newest first)]`, with an edge-only multi-line policy (recall only when the cursor
+is on the draft's first/last line). Pulling a queued item sets
+`inputHistory.pulledSlot`, forwarded to `sendSubmit` as `replaceSlot` so a
+re-edited send lands at its original slot. `Esc` while pulled cancels the edit
+(slot stays, input restores the stash); an empty `Enter` while pulled removes the
+slot. Non-editable items (`rebuild === null`) sit in the queue and `↑` walks past
+them.
 
-## Reactivity gotcha
+## Per-token highlighting and the drilldown
 
-Svelte 5's `$state` does NOT track `Map.set` / `Set.add` / inner-object property writes inside collections. Cross-component collections in `stores.svelte.ts` use `SvelteMap` / `SvelteSet` from `svelte/reactivity`. Inner-object mutations on map values are still untracked, so every rack mutator reassigns: `entries.set(name, {...e, coords})` — steerRack and probeRack alike (the `setSubspace*` / `setManifold*` setters are mode-guarded `mutateSubspace` / `mutateManifold` wrappers over the one `steerRack.entries`; the shared `subspaceAlong` is a scalar on the slice). `updateProbeFromScores` (driven by every WS `token` event) is the hot path here — a bare `entry.current = val` would freeze probe sparklines at zero through a whole generation.
+`lib/highlight.ts` is THE per-token highlight implementation — the chat
+transcript, the raw-buffer mirror and the drilldown's context ribbon all render
+through `highlightStyleFor` / `highlightStyleString`, so they agree on the score
+lookup, the per-probe scale, the hue family and compare-two. `lib/tokens.ts` owns
+the pure ramp math and stays store-free. `highlightScoreFor` resolves a target in
+order: the surprise sentinel → live per-axis coords (`<probe>[i]` mirrors the gate
+grammar) → the collapsed axis-0 `probes` row → the deepest per-layer row → the
+cached single-probe score, returning `undefined` so the caller renders
+transparent.
+
+Highlighting is driven by one probe dropdown in the chat header with an optional
+compare-two mode, and it tints **live** as tokens stream: the `token` frame's
+`scores` view feeds the same ramp the settled pass uses. `scoreToRgb` emits
+**constant-hue alpha ramps** — tint strength is opacity, hue is meaning — with
+`signed` green/red probe poles, blue surprise / J-lens and gold SAE. Pinned
+SAE/J-LENS cards expose the same explicit `highlight` action as geometry probes;
+both read their native `[0,1]` strength on a unit saturation scale. Authored spans
+gain token rows when a later generation's prefill consumes them: the engine emits
+a `capture_authored` tree mutation carrying their measurements, so user-written
+and model-written text share hover, highlight and drawer behavior. An
+authored-only append stays plain until something actually forward-passes it.
+
+Hover and drawer history read the loom-owned `token.measurements` envelopes
+directly, so refreshes, source switches and explicit loom save/load preserve the
+original generation's measurements with no browser retention cache and no
+token-count cap. A channel that was off during that generation can still use its
+replay endpoint after the hover dwell; replayed values are never written back or
+relabelled as capture.
+
+Clicking any token opens `token_drilldown` regardless of whether a highlight probe
+is selected. The drawer is a shell over four tabs — **geometry** (the whitened
+Monitor readings: coords, fraction, residual, membership, nearest/assignment
+chips, per-layer strip, depth CoM), **logits** (ranked top-K alts with
+absolute-probability bars + the logit fork), **sae**, **j-lens** (each: pinned
+readings from `instruments.<family>.readings` when captured live, then the native
+readout — SAE feature meters in the panel's strength unit, lens aggregate chips +
+the all-fitted-layer matrix). Only j-lens and sae carry a pillar hue; the
+steered/unsteered A/B branch toggle sits on the tab row when the turn has an
+`abPair`. The selected tab is **sticky for the page session**
+(`drilldown.svelte.ts`, default `lens`). All three replay families share one
+`ReplayReadout` (captured-envelope-preferred, request-sequenced so a stale
+response can't clobber a newer view) and one `InstrumentHeader` provenance row —
+origin · source · steering chip · `apply recipe steering` toggle — so every
+replay-capable tab has the unsteered counterfactual. Captured rows show their
+provenance and source even when that instrument is not currently active.
+
+Every evidence-card statline goes through `DetailCardHeader`: a fixed 24px leading
+slot puts ranks and family markers on one x-origin, and the primary identifier is
+uniformly `--text-sm` with one line-height and baseline across all four tabs.
+`EvidenceChips` gives geometry distances / tube facts and SAE
+activation / maxActApprox one supporting-fact grammar. Statlines omit the value
+already present beside the canonical meter; that meter value carries the pillar
+hue instead. Geometry cards use the same responsive two-column desktop grid as the
+other card views (one column below 820px). The J-lens layer × vocabulary matrix
+has no fixed height and no nested scroller — it expands to full table height, the
+drawer body owns the scroll, and the matrix header stays sticky in that outer
+flow.
+
+The shell header carries the token's identity chips (turn · role · segment — the
+segment chip jumps thinking ⇄ response — vocabulary `id`, `raw` decode index or a
+`no replay` marker, and the chosen `p / logp / rank` when captured) over a
+**context ribbon** (a windowed, highlight-tinted, clickable strip of the
+surrounding segment). Navigation is the conversation-walking cursor
+(`token/cursor.ts`): the whole conversation is ONE walkable token sequence — each
+turn contributes a thinking and a response segment — so `◀ ▶` / `←`/`→` step
+tokens and roll across segment and turn boundaries exactly as the raw buffer
+shows them, `▲ ▼` / `↑`/`↓` jump turns, Home/End jump segment bounds, and `↩`
+snaps back to the clicked anchor. Keys are ignored inside focusable fields and
+`role="slider"` layer strips.
 
 ## Persistence
 
-The server loom tree is authoritative. The browser keeps a first-paint cache of the latest `LoomTreeJSON` plus `highlightState` in `localStorage` under `saklas.chat.v3.<model_id>`; only that exact version and the server's list-shaped `nodes` wire are accepted. There is no flat-log migration or synthetic tree hydration. Saves are debounced ~250 ms after mutations, and `refreshLoomTree()` overwrites the cache with server state once the required tree endpoint responds. `pendingIndex` is force-cleared on restore so an in-flight turn from a killed tab can't ghost the UI.
+The server loom tree is authoritative and is never first-painted from cache: after
+a server restart the cached node ids are invalid, and rendering them fires
+requests against nonexistent edges before the authoritative fetch lands.
+`localStorage` therefore holds only lightweight presentation preferences —
+`saklas.chat.v4.<model_id>`, a `{version: 4, model_id, saved_at, highlight}`
+snapshot, accepted only at that exact version and shape and dropped otherwise.
+Writes are debounced ~250ms; the bootstrap read also reaps the older tree-bearing
+key for the same model, which could occupy most of the origin quota.
 
-Downloaded conversations likewise use one exact schema (`version: 6` — bumped in 5.x because embedded loom token rows carry `measurements` instead of `captured`; no migration, a v5 file is a visible load error): complete Loom tree, visual steering rack (or an authoritative custom full-grammar expression), probe rack, highlight, and sampling sections are required. Loading an older or partial file is a visible error; the client never guesses at missing state.
+Durable conversation persistence is the explicit Save/Load flow: a browser-
+downloaded JSON file at **`version: 6`** carrying the complete loom tree
+(`tree_format`, `saklas_version`, `root_id`, `active_node_id`, `rev`, `nodes`,
+`children_of`, `cast`), the visual steer rack plus `subspaceAlong` (or an
+authoritative custom full-grammar expression), the probe rack, highlight and
+sampling sections. Every field is required and validated exactly — including a
+key-for-key match on the sampling section — and loading an older or partial file
+is a visible error. The client never guesses at missing state.
 
-## Per-token highlighting
+## Reactivity gotcha
 
-Highlighting lives on the chat token spans, driven by a single highlight-probe
-dropdown in the chat header with an optional two-stripe compare-two mode. It
-tints **live** as tokens stream: the WS `token` event's `scores` aggregate feeds
-the same `scoreToRgb` ramp the post-generation pass uses, so streaming and
-finalized tints match. Authored spans gain the same token rows when their next
-generation prefill consumes them: the engine emits a `capture_authored` tree
-mutation carrying their original probe/J-LENS/SAE payloads, so user-written and
-model-written text share hover, highlight, and drawer behavior without an extra
-browser path. An authored-only append remains plain until a later generation
-actually forward-passes it. `scoreToRgb` emits **constant-hue alpha ramps** —
-tint strength = opacity, hue = meaning — with `signed` green/red probe poles,
-blue surprise/J-LENS, and gold SAE families. Pinned SAE/J-LENS cards expose the
-same explicit `highlight` action as geometry probes; both read their native
-`[0,1]` strength on a unit saturation scale. Hover and drawer history read the
-loom-owned `token.measurements` envelopes directly, so refreshes, source switches,
-and explicit loom save/load preserve the original generation measurements
-without a browser retention cache or token-count cap. A channel disabled during
-that generation may still use its loom replay endpoint after the hover dwell;
-the drawer also replays for the explicit unsteered J-LENS counterfactual.
-Replayed values are never written back or mislabeled as original capture.
-Clicking any token opens the `token_drilldown` drawer regardless of whether a
-highlight probe is selected. The drawer is a shell (`drawers/token/`) over four
-family tabs — **geometry** (the full whitened Monitor readings: per-probe cards
-with coords, fraction, residual, membership, nearest/assignment chips,
-per-layer strip, depth CoM; captured envelopes render directly, the geometry
-token-readout replay covers aggregate-only generations and late-attached
-probes), **logits** (ranked top-K alts with absolute-probability bars + the
-logit fork), **sae**, and **j-lens** (each: pinned-probe readings from
-`instruments.<family>.readings` when captured live, then the native readout —
-sae feature meters in the panel's strength unit, lens aggregate chips + the
-all-fitted-layer matrix). Only **j-lens** and **sae** carry their pillar hue;
-the steered/unsteered A/B branch toggle sits on the tab row when the turn has
-an `abPair`. The selected tab is **sticky for the page session**
-(`drilldown.svelte.ts`, default j-lens) — a fresh token click keeps it. The
-pre-5.x **probes** heatmap tab is gone (the geometry cards subsume it). All
-three replay families share one `ReplayReadout` resource
-(captured-envelope-preferred, request-sequenced) and one `InstrumentHeader`
-provenance row — origin · source · steering chip · `apply recipe steering`
-toggle, so the sae tab now has the unsteered counterfactual too. Captured rows
-show their provenance and source even if that instrument is no longer active.
-The tabs intentionally start with this compact provenance row rather than a
-hero summary / metric grid; the evidence cards already carry the useful values.
-The drawer header likewise keeps the generation recipe but omits the redundant
-model / loom-node / perplexity / finish facts. Geometry probe cards use the same
-responsive two-column desktop grid as the other card-based drilldown views
-(collapsing to one column below 820 px); their statline does not repeat the
-subspace percentage, and the fraction row keeps only the nearest label while
-the detailed distances remain in the chips below. Every evidence-card statline
-now goes through `DetailCardHeader`: a fixed 24 px leading slot puts ranks and
-family markers on one x-origin, while the primary identifier is uniformly
-`--text-sm` with one line-height and baseline across geometry, logits, SAE,
-J-lens aggregate, and pinned cards. `EvidenceChips` likewise gives geometry
-distances / tube facts and SAE activation / maxActApprox metadata one compact
-supporting-fact grammar; SAE does not repeat the already-explicit `unit
-strength` label. Logit and J-lens aggregate statlines likewise omit the
-probability / strength value already present beside the canonical meter (pinned
-probe cards follow the same rule); that meter value carries the pillar hue
-instead (blue for logits / lens, gold for SAE). The J-lens layer × vocabulary
-matrix has no fixed height or nested
-vertical scroller: it expands to its full table height and the drawer body owns
-the scroll, with the matrix header staying sticky in that outer flow.
-The header carries the token's identity chips (turn · role · segment — the
-segment chip jumps thinking ⇄ response — vocabulary `id`, `raw` decode index
-or a `no replay` marker, and the chosen `p / logp / rank` when captured) over a
-**context ribbon** (a windowed, highlight-tinted, clickable strip of the
-segment around the inspected token). Navigation is a conversation-walking
-cursor: `◀ ▶` / `←`/`→` step tokens and roll across segment and turn
-boundaries (thinking → response → next turn — chat mode walks the same flat
-stream the raw buffer shows), `▲ ▼` / `↑`/`↓` jump turns, Home/End jump
-segment bounds, and `↩` snaps back to the clicked anchor; keys are ignored
-inside focusable fields and `role="slider"` layer strips.
+Svelte 5's `$state` does NOT track `Map.set` / `Set.add` / inner-object property
+writes inside collections. Cross-component collections use `SvelteMap` /
+`SvelteSet` from `svelte/reactivity`. Inner-object mutations on map values are
+still untracked, so every rack mutator reassigns — `entries.set(name, {...e,
+coords})` — for `steerRack` and `probeRack` alike (the `mutateSubspace` /
+`mutateManifold` / atom `mutate` wrappers are mode-guarded views over the one
+`steerRack.entries`; the shared `subspaceAlong` is a scalar on the slice). The
+per-token probe update is the hot path here: a bare `entry.current = val` would
+freeze every sparkline at zero for a whole generation.
 
 ## Toasts
 
-`lib/stores/toasts.svelte.ts` toasts carry `kind`, `message`, optional dim `detail` sub-line, and `ttlMs: number | null` — `null` is sticky (no auto-dismiss; caller owns dismissal).  `updateToast(id, patch)` mutates a live toast in place so long-running async work (manifold generate / fit) can drive a single chip from kickoff to completion without spawning new ones.  `Toaster.svelte` only schedules a dismissal timer the first time it sees a non-null TTL, so flipping sticky → ttl mid-flight is a no-op; callers that want a finite TTL at the end should `dismissToast` + `pushToast` instead.  `ManifoldBuilderDrawer`'s generate / fit legs are the canonical users — sticky progress on submit, dismissed and replaced with a 6 s success toast (or sticky error toast) when the SSE `done` / `error` lands.
+`lib/stores/toasts.svelte.ts` toasts carry `kind`, `message`, an optional dim
+`detail` sub-line, and `ttlMs: number | null` — `null` is sticky and the caller
+owns dismissal. `updateToast(id, patch)` mutates a live toast in place so
+long-running async work drives one chip from kickoff to completion.
+`Toaster.svelte` only schedules a dismissal timer the first time it sees a
+non-null TTL, so flipping sticky → ttl mid-flight is a no-op; a caller wanting a
+finite TTL at the end should `dismissToast` + `pushToast`.
+`ManifoldBuilderDrawer`'s generate / fit legs are the canonical users. When a
+message is rendered from a failed request, use `describeError(e)` from
+`lib/api.ts` — it lives next to `ApiError` because it is the only thing that
+knows the error body shape, and it always prefixes `<status>: ` since
+400/404/409/503 carry distinct meaning across this API. A surface that only ever
+sees local failures can keep the plain `e instanceof Error ? e.message :
+String(e)` fallback.
 
-## Out of scope
+## Adding a panel or a drawer
 
-- True multi-session switching — server URL-paths support it; the client still assumes `default`. `SessionAdminDrawer` inspects the collection and sets an in-memory bearer key but is not a session router.
-- Persistent credential management — the bearer key stays in memory for the page session, never written to `localStorage`.
-- Mobile / touch-first layout — desktop research tool, min-width 1280px.
-- Combobox autocomplete on the projection-target picker (free-form name input).
-- Pagination on HF pack search (capped at 20 results).
+**Panel:** write the `.svelte`, wire state into the smallest matching
+`lib/stores/` slice (or `stores.svelte.ts` for cross-cutting WS/tree/chat state),
+mount it from `App.svelte`, `npm run build`, commit the regenerated `dist/`.
+
+**Drawer:** write it under `drawers/`, add the name to the `DrawerName` union in
+`lib/types.ts` (and to `NARROW_DRAWERS` in `App.svelte` for forms/pickers),
+add an `App.svelte` switch branch, re-export from `drawers/index.ts`, and — if it
+should be palette-launchable rather than opened from a specific surface — add it
+to a `RAIL_CATEGORIES` group in `lib/commands.ts`.
+
+## Deliberately absent
+
+- **No client-side expression parser.** `lib/expression.ts` serializes only; the
+  server's grammar is the single parser.
+- **No composer commit/prefill wire fields.** `submit` is the one authored-turn
+  door and `WSGenerateRequest` has no `commit_*` / `prefill_*` to emit.
+- **No flat per-token aliases.** `measurements` is the only read-side record on
+  the `token` and `done` frames — no top-level `captured` / `scores` /
+  `probe_readings` / `lens_readout` / `lens_aggregate` / `sae_readout` beside it.
+  (The flat `scores` / `per_layer_scores` views live *inside* the envelope.)
+- **No flat instrument keys in session info.** One `instruments` block list.
+- **No `~`/`|` projection or `!` ablation authoring in the rack.** The grammar
+  forbids composing them with `%`, so the cards don't offer them.
+- **No pack-backed catalog plumbing in the drawers** — they read the live manifold
+  catalog. There is no `/saklas/v1/packs*`, `/manifold-probes`, `/extract/preview`
+  or `/profiles/clone` surface, and no traits SSE stream (the dashboard reads
+  every per-token channel off the WS).
+- **No true multi-session switching.** The server's URL paths support it; the
+  client assumes `default`. `SessionAdminDrawer` inspects the collection and sets
+  an in-memory bearer key — it is not a session router.
+- **No persistent credential storage.** The bearer key lives in memory for the
+  page session only.
+- **No touch-first layout.** This is a desktop research cockpit designed at a
+  1280px floor; below that the columns become full-width views, but the dense
+  controls are not resized for touch.
+- **No pagination on HF pack search** (server-capped at 20 rows).
