@@ -973,7 +973,7 @@ def test_direct_ablation_construction_round_trips():
 # ``<manifold>@<label>`` for the label-similarity channel.  The parser
 # stores the full namespaced string verbatim as ``ProbeGate.probe`` so
 # the gate looks up ``TriggerContext.probe_scores`` against the matching
-# key that ``ManifoldMonitor.flat_scalars`` already emits — no runtime
+# key that ``Monitor.flat_scalars`` already emits — no runtime
 # gate changes, only parsing and format round-trip.
 
 

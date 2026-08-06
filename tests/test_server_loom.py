@@ -126,9 +126,6 @@ class _StubSession:
     def rewind(self) -> None:
         self.tree.rewind()
 
-    def build_readings(self):  # pragma: no cover - unused by these tests
-        return {}
-
     def probe_hashes(self) -> dict[str, str]:
         return {}
 

@@ -181,7 +181,6 @@ def test_server_routes_user_message_status_codes():
         s._last_result = None
         s._tokenizer = MagicMock()
         s._tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
-        s.build_readings.return_value = {}
         s.lock = asyncio.Lock()
         return s
 

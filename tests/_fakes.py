@@ -1,25 +1,34 @@
-"""Shared mock-session factory for server-layer CPU tests.
+"""Shared mock-session factory for the native-API CPU tests.
 
-Four server test files used to each define a near-identical local
-``_mock_session()`` factory.  This module provides ONE canonical factory that
-the files import, so wiring changes land in one place.
+``test_saklas_api.py``, ``test_server_manifold_probes.py`` and
+``test_profiles_bake_api.py`` each opened their local ``_mock_session()``
+with the same block — model identity, the device/dtype/created-at scalars,
+the default sampling config, empty ``profiles``/``probes``, and a real
+``asyncio.Lock``.  That block lives here once; each file calls
+:func:`make_mock_session` and layers its own wiring on top.
 
-Only the genuinely shared wiring lives here.  Per-file extras stay local:
-- ``test_saklas_api.py``:  real trait-queue logic, real EventBus subscribe/emit
-  callbacks, ``session.monitor`` (public property), ``session.manifolds``.  These
-  are integral to the WebSocket + SSE tests and can't be naively lifted out
-  without coupling this module to those tests.  ``test_saklas_api.py`` imports
-  ``make_mock_session`` and layers its extras on top.
-- ``test_web.py``:  ``_mock_session_with_vectors`` has a completely different
-  shape (takes a ``vectors`` dict, exposes analytics helpers, wires ``whitener``)
-  and is not a variant of the common factory — it stays local.
+The remaining sibling factories deliberately stay local — their shapes are
+not variants of this one:
+
+- ``test_server.py``:  a seven-key ``model_info`` (``vram_used_gb`` /
+  ``param_count``), a ``config`` carrying ``thinking``, a 26-entry
+  ``layers`` list, and none of the identity scalars.
+- ``test_instrument_routes.py``:  real ``GeometryInstrument`` /
+  ``LensInstrument`` / ``SaeInstrument`` objects over a faked source
+  lifecycle, and no probe/profile collections at all.
+- ``test_user_message.py``:  a nested single-test helper wired on the
+  private attribute names (``_gen_state`` / ``_last_result`` /
+  ``_tokenizer``).
+- ``test_web.py``:  ``_mock_session_with_vectors`` has a different signature
+  (takes a ``vectors`` dict), exposes analytics helpers, and wires
+  ``whitener``.
 
 Usage::
 
     from tests._fakes import make_mock_session
 
-    session = make_mock_session()
-    # add per-test extras...
+    session = make_mock_session()             # or (config=GenerationConfig())
+    # add per-file extras...
 """
 from __future__ import annotations
 
@@ -31,16 +40,19 @@ from unittest.mock import MagicMock
 def make_mock_session(**overrides: Any) -> Any:
     """Return a ``MagicMock`` pre-wired to look like a ``SaklasSession``.
 
-    The minimal shared wiring covers what every server route touches:
+    The shared wiring covers what the native routes touch on every one of
+    its three consumers:
+
     - model identity / info
-    - per-session config scalars
-    - empty ``vectors`` / ``probes`` / ``history``
+    - the ``_device`` / ``_dtype`` / ``_created_ts`` scalars
+    - the default sampling config
+    - empty ``profiles`` / ``probes``
     - a real ``asyncio.Lock`` so ``async with session.lock`` works under
       ``TestClient``'s event loop
-    - ``session.build_readings.return_value = {}``
 
-    Callers may pass keyword overrides to patch specific attributes after
-    construction; they take effect as ``setattr(session, k, v)``.
+    Keyword overrides are applied last as ``setattr(session, k, v)``, so a
+    caller wanting a real ``GenerationConfig`` passes ``config=...`` rather
+    than reassigning after the call.
     """
     session = MagicMock()
     session.model_id = "test/model"
@@ -64,15 +76,8 @@ def make_mock_session(**overrides: Any) -> Any:
 
     session.profiles = {}
     session.probes = {}
-    session.history = []
 
     session.lock = asyncio.Lock()
-    session.build_readings.return_value = {}
-
-    # Minimal events stub so routes that call ``events.subscribe`` don't error.
-    session.events = MagicMock()
-    session.events.subscribe = lambda cb: (lambda: None)
-    session.events.emit = lambda event: None
 
     for k, v in overrides.items():
         setattr(session, k, v)

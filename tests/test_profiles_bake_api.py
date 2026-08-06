@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from types import MethodType
 from typing import Any, cast
@@ -16,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from saklas.core.model import loaded_model_fingerprint
 from saklas.core.session import SaklasSession
+from tests._fakes import make_mock_session
 
 
 # ---------------------------------------------------------------------------
@@ -24,29 +24,8 @@ from saklas.core.session import SaklasSession
 
 
 def _mock_session():
-    session = MagicMock()
-    session.model_id = "test/model"
-    session.model_info = {
-        "model_type": "gemma2",
-        "num_layers": 26,
-        "hidden_dim": 2304,
-        "device": "cpu",
-        "dtype": "torch.bfloat16",
-    }
-    session._device = "cpu"
-    session._dtype = "torch.bfloat16"
-    session._created_ts = 1_700_000_000
-
-    session.config = MagicMock()
-    session.config.temperature = 1.0
-    session.config.top_p = 0.9
-    session.config.top_k = None
-    session.config.max_new_tokens = 1024
-    session.config.system_prompt = None
-
-    session.profiles = {}
-    session.probes = {}
-    session.history = []
+    # Shared native-API wiring lives in tests/_fakes.py.
+    session = make_mock_session()
 
     monitor = MagicMock()
     monitor.probe_names = []
@@ -54,7 +33,6 @@ def _mock_session():
     session._monitor = monitor
     session._tokenizer = MagicMock()
     session._layers = []
-    session.lock = asyncio.Lock()
     session.events = MagicMock()
     session.events.subscribe = lambda cb: (lambda: None)
     # ``POST /profiles/bake`` is a thin wrapper over ``SaklasSession.bake`` —

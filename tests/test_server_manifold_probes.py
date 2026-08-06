@@ -21,7 +21,6 @@ and the end-of-gen aggregate are the same shape — ``fraction`` /
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from typing import Any, Callable
@@ -36,6 +35,7 @@ from saklas.core.results import (
     RunSet,
     TokenEvent,
 )
+from tests._fakes import make_mock_session
 from tests._generation_stream import TestGenerationStream
 
 
@@ -96,28 +96,8 @@ def _mock_probe(name: str, manifold: MagicMock, top_n: int = 3) -> MagicMock:
 
 
 def _mock_session():
-    session = MagicMock()
-    session.model_id = "test/model"
-    session.model_info = {
-        "model_type": "gemma2",
-        "num_layers": 26,
-        "hidden_dim": 2304,
-        "device": "cpu",
-        "dtype": "torch.bfloat16",
-    }
-    session._device = "cpu"
-    session._dtype = "torch.bfloat16"
-    session._created_ts = 1_700_000_000
-
-    session.config = MagicMock()
-    session.config.temperature = 1.0
-    session.config.top_p = 0.9
-    session.config.top_k = None
-    session.config.max_new_tokens = 1024
-    session.config.system_prompt = None
-
-    session.profiles = {}
-    session.probes = {}
+    # Shared native-API wiring lives in tests/_fakes.py.
+    session = make_mock_session()
     session.manifolds = {}
     session.tree = MagicMock()
     session.tree.messages_for.return_value = []
@@ -140,8 +120,6 @@ def _mock_session():
     session._layers = []
     session.last_per_token_scores = None
     session.last_result = None
-    session.last_per_token_scores = None
-    session.last_result = None
     # The WS token-frame builder consults this first; a real None lets the
     # inline ``_monitor`` / ``_capture`` scoring branch run (a bare
     # MagicMock would shadow it with a truthy child mock).
@@ -151,9 +129,6 @@ def _mock_session():
     gen_state.finish_reason = "stop"
     gen_state.emit_map = []
     session.generation_state = gen_state
-
-    session.build_readings.return_value = {}
-    session.lock = asyncio.Lock()
     return session
 
 

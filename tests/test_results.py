@@ -361,7 +361,7 @@ def test_generation_result_hidden_states_can_be_set_and_is_omitted_from_to_dict(
     assert d["tokens"] == [1, 2]
 
 
-class TestTraitMonitorScoring:
+class TestMonitorScoring:
     """Tests for unified ``Monitor`` probe scoring — runs anywhere (no GPU).
 
     Mahalanobis-only (4.0 collapse): probe scoring requires a covering

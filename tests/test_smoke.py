@@ -259,7 +259,7 @@ class TestSaveLoad:
                 )
 
 
-class TestTraitMonitor:
+class TestMonitor:
     def test_monitor_records_history(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         from saklas.core.hooks import SteeringManager
         from saklas.core.monitor import Monitor

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import pytest
 import torch
@@ -27,6 +27,7 @@ from saklas.core.session import (
 )
 from saklas.core.steering import Steering
 from saklas.core.token_payloads import TokenProbePayload
+from tests.conftest import FakeLogitsModel
 
 
 class _StopTokenizer:
@@ -380,31 +381,49 @@ def test_prepare_input_raw_feeds_flat_active_path():
     assert _decode_echo(ids) == "once upon a time"
 
 
-class _StopModel:
-    config = SimpleNamespace(vocab_size=4)
-    generation_config = SimpleNamespace(eos_token_id=3)
+def _scripted_logits(
+    tokens: list[int], vocab_size: int,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """A scripted-argmax ``logits_fn``: forward *i* forces ``tokens[i]``
+    (clamped at the last entry), ignoring ``input_ids`` entirely."""
+    step = 0
 
-    def __init__(self):
-        self._tokens = [0, 1, 2]
-        self._idx = 0
+    def _logits(_input_ids: torch.Tensor) -> torch.Tensor:
+        nonlocal step
+        tid = tokens[min(step, len(tokens) - 1)]
+        step += 1
+        out = torch.full((1, 1, vocab_size), -100.0)
+        out[0, 0, tid] = 100.0
+        return out
 
-    def __call__(self, **_kwargs: Any) -> Any:
-        tid = self._tokens[min(self._idx, len(self._tokens) - 1)]
-        self._idx += 1
-        logits = torch.full((1, 1, self.config.vocab_size), -100.0)
-        logits[0, 0, tid] = 100.0
-        return SimpleNamespace(logits=logits, past_key_values=object())
+    return _logits
 
 
-class _NoCacheModel(_StopModel):
-    def __init__(self):
-        super().__init__()
-        self._tokens = [0, 1, 3]
+class _NoCacheModel(FakeLogitsModel):
+    """The scripted model with its KV cache withheld — the modeling files
+    that ignore ``past_key_values`` and drive the O(N²) fallback."""
 
-    def __call__(self, **_kwargs: Any) -> Any:
-        out = super().__call__(**_kwargs)
+    def __call__(self, **kwargs: Any) -> Any:
+        out = super().__call__(**kwargs)
         out.past_key_values = None
         return out
+
+
+def _scripted_model(
+    tokens: list[int],
+    *,
+    vocab_size: int = 4,
+    eos_token_id: int = 3,
+    model_cls: type[FakeLogitsModel] = FakeLogitsModel,
+) -> Any:
+    """A decode stub forcing a fixed token sequence, with a fresh KV-cache
+    sentinel per forward.  ``model_cls=_NoCacheModel`` withholds the cache."""
+    return model_cls(
+        _scripted_logits(tokens, vocab_size),
+        with_past_key_values=True,
+        config=SimpleNamespace(vocab_size=vocab_size),
+        generation_config=SimpleNamespace(eos_token_id=eos_token_id),
+    )
 
 
 class _SplitStopTokenizer(_StopTokenizer):
@@ -418,16 +437,9 @@ class _SplitStopTokenizer(_StopTokenizer):
     }
 
 
-class _SplitStopModel(_StopModel):
-    config = SimpleNamespace(vocab_size=5)
-
-    def __init__(self):
-        self._tokens = [0, 1, 3]
-        self._idx = 0
-
 
 def test_stop_sequence_trimmed_text_is_final_result_text():
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     emitted: list[str] = []
@@ -456,7 +468,6 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     session._capture_state = CaptureState(mode=CaptureMode.FULL)
     session._last_per_token_scores = None
     session._last_result = None
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -478,7 +489,7 @@ def test_decode_loop_hands_one_step_id_to_sink_gate_and_tap():
     forward's gate and display reads."""
     from saklas.core.triggers import TriggerContext
 
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     sink_steps: list[int] = []
@@ -527,20 +538,13 @@ class _Utf8SplitTokenizer(_StopTokenizer):
         return super().decode(ids, skip_special_tokens)
 
 
-class _Utf8SplitModel(_StopModel):
-    config = SimpleNamespace(vocab_size=5)
-    generation_config = SimpleNamespace(eos_token_id=4)
-
-    def __init__(self, tokens: list[int]):
-        self._tokens = tokens
-        self._idx = 0
-
-
 def test_buffered_utf8_group_emits_carry_the_flush_forwards_step():
     """Partial-UTF-8 tokens buffer in ``pending_ids`` and flush as a group
     — every emit in the group carries the FLUSHING forward's step (the
     group's readings semantics: they all read that forward's captures)."""
-    model: Any = _Utf8SplitModel([0, 1, 2, 3])
+    model: Any = _scripted_model(
+        [0, 1, 2, 3], vocab_size=5, eos_token_id=4,
+    )
     tokenizer: Any = _Utf8SplitTokenizer()
     state = GenerationState()
     emits: list[tuple[str, int]] = []
@@ -566,7 +570,7 @@ def test_buffered_utf8_group_emits_carry_the_flush_forwards_step():
 def test_post_loop_utf8_flush_uses_the_last_forwards_step():
     """A generation ending with a still-buffered partial flushes post-loop
     with ``last_forward_step`` (no fresh forward ran since)."""
-    model: Any = _Utf8SplitModel([0, 1])
+    model: Any = _scripted_model([0, 1], vocab_size=5, eos_token_id=4)
     tokenizer: Any = _Utf8SplitTokenizer()
     state = GenerationState()
     emits: list[tuple[str, int]] = []
@@ -594,7 +598,9 @@ def test_alt_token_decode_does_not_break_partial_utf8_buffering():
     """Top-K alternative decoding shares the lazy decode cache with the emit
     path; a partial-UTF-8 id decoded as an alternative must still buffer when
     it is emitted (no replacement character reaches the stream)."""
-    model: Any = _Utf8SplitModel([0, 1, 2, 3])
+    model: Any = _scripted_model(
+        [0, 1, 2, 3], vocab_size=5, eos_token_id=4,
+    )
     tokenizer: Any = _Utf8SplitTokenizer()
     state = GenerationState()
     emits: list[tuple[str, int]] = []
@@ -620,7 +626,7 @@ def test_alt_token_decode_does_not_break_partial_utf8_buffering():
 def test_perplexity_is_none_when_not_requested():
     """``want_perplexity=False`` reports ``None`` (not computed), never NaN —
     the value every ``float | None`` consumer is typed for."""
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     ppls: list[float | None] = []
@@ -640,7 +646,7 @@ def test_perplexity_is_none_when_not_requested():
 
 
 def test_perplexity_is_a_float_when_requested():
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     ppls: list[float | None] = []
@@ -660,7 +666,7 @@ def test_perplexity_is_a_float_when_requested():
 
 
 def test_stop_sequence_split_across_tokens_trims_final_text():
-    model: Any = _SplitStopModel()
+    model: Any = _scripted_model([0, 1, 3], vocab_size=5)
     tokenizer: Any = _SplitStopTokenizer()
     state = GenerationState()
     emitted: list[str] = []
@@ -683,7 +689,7 @@ def test_stop_sequence_split_across_tokens_trims_final_text():
 
 
 def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     generated_ids = generate_steered(
@@ -718,7 +724,6 @@ def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -744,7 +749,7 @@ def test_stop_sequence_only_tap_can_skip_full_token_table():
             self.batch_decode_calls += 1
             return super().batch_decode(ids)
 
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer = CountingStopTokenizer()
     state = GenerationState()
     emitted: list[str] = []
@@ -821,7 +826,6 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1091,7 +1095,6 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1187,7 +1190,6 @@ def test_finalize_lean_incremental_probe_path() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1271,7 +1273,6 @@ def test_finalize_gating_subset_probe_path() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1615,9 +1616,6 @@ def test_stateless_zero_token_probe_result_does_not_use_history() -> None:
     session._last_per_token_scores = {"toy": [99.0]}
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {
-        "toy": SimpleNamespace(mean=(42.0,), to_dict=lambda: {})
-    }
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1654,9 +1652,6 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {
-        "toy": SimpleNamespace(mean=(42.0,), to_dict=lambda: {})
-    }
     session._score_lens_probes_aggregate = lambda _ids: (
         (_ for _ in ()).throw(AssertionError("lens finalization disabled"))
     )
@@ -2467,7 +2462,7 @@ def test_penalty_state_applies_sparse_counts_on_device():
 
 
 def test_no_cache_fallback_does_not_cat_each_step(monkeypatch: pytest.MonkeyPatch) -> None:
-    model: Any = _NoCacheModel()
+    model: Any = _scripted_model([0, 1, 3], model_cls=_NoCacheModel)
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
 
@@ -2486,3 +2481,141 @@ def test_no_cache_fallback_does_not_cat_each_step(monkeypatch: pytest.MonkeyPatc
 
     assert generated_ids == [0, 1]
     assert state.finish_reason == "stop"
+
+# ---------------------------------------------------------------------------
+# The generation-concurrency guard: ``_gen_lock`` / ``_gen_phase`` /
+# ``_generation_transaction``.  Extraction runs forward passes, so it takes
+# the same exclusive section generation does; the transaction is the shared
+# teardown backstop both sides rely on.
+# ---------------------------------------------------------------------------
+
+
+def _stub_session_with_lock() -> Any:
+    """A ``__new__``-bypass stub carrying the minimum state the extract gate
+    touches."""
+    import threading
+
+    s: Any = SaklasSession.__new__(SaklasSession)
+    s._gen_phase = GenState.IDLE
+    s._gen_lock = threading.Lock()
+    return s
+
+
+def test_extract_acquires_gen_lock_against_concurrent_generation():
+    """If ``_gen_lock`` is already held (generation in flight), extract
+    must raise ``ConcurrentExtractionError`` rather than reading
+    ``_gen_phase`` and racing the generation that's about to flip it."""
+    from saklas.core.session import ConcurrentExtractionError
+
+    s = _stub_session_with_lock()
+    # Simulate "generation just acquired the lock" — phase still IDLE
+    # because the flip happens after acquire on the generation side.
+    assert s._gen_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(ConcurrentExtractionError):
+            s.extract("honest.deceptive")
+    finally:
+        s._gen_lock.release()
+
+
+def test_extract_releases_lock_on_path_through_phase_gate():
+    """When extract bails on the phase gate (RUNNING from a stub), the
+    lock it acquired must be released so subsequent extract attempts
+    can proceed once the phase clears."""
+    import threading
+
+    from saklas.core.session import ConcurrentExtractionError
+
+    s: Any = SaklasSession.__new__(SaklasSession)
+    s._gen_phase = GenState.RUNNING
+    s._gen_lock = threading.Lock()
+    s._extraction = SimpleNamespace(extract=lambda *a, **kw: ("x", None))
+
+    with pytest.raises(ConcurrentExtractionError):
+        s.extract("honest.deceptive")
+
+    # Lock is back to free — caller can try again.
+    assert s._gen_lock.acquire(blocking=False)
+    s._gen_lock.release()
+
+
+def _transaction_stub_session() -> Any:
+    """A stub carrying only what ``_generation_transaction`` touches."""
+    import threading
+
+    s: Any = SaklasSession.__new__(SaklasSession)
+    s._gen_phase = GenState.IDLE
+    s._gen_lock = threading.Lock()
+    s._end_capture_calls = 0
+
+    def _end_capture() -> None:
+        s._end_capture_calls += 1
+
+    s._end_capture = _end_capture
+    s._monitor = SimpleNamespace(set_subspace_coords=lambda _flag: None)
+    s._close_instrument_runs = lambda: None
+    s._capture_state = CaptureState()
+    s._steering = SimpleNamespace(has_compiled_offsets=lambda: False)
+    return s
+
+
+def test_generation_transaction_detaches_capture_when_the_body_never_does():
+    """A BaseException before the body's own teardown (a preamble failure,
+    a KeyboardInterrupt) must still leave no capture hooks attached — the
+    transaction's teardown is the backstop, and it also frees the phase and
+    the lock."""
+    s = _transaction_stub_session()
+
+    with pytest.raises(KeyboardInterrupt):
+        with s._generation_transaction():
+            raise KeyboardInterrupt
+
+    assert s._end_capture_calls == 1
+    assert s._gen_phase is GenState.IDLE
+    assert s._gen_lock.acquire(blocking=False)
+    s._gen_lock.release()
+
+
+def test_generation_transaction_pops_a_scope_the_body_left_open():
+    """The body assigns ``txn.steering_cm`` before entering the scope; if it
+    throws before popping it, the transaction pops it — swallowing a teardown
+    failure so it can't mask the error already propagating."""
+    exits: list[bool] = []
+    s = _transaction_stub_session()
+    s._exit_internal_steering = (
+        lambda _cm, *, swallow: exits.append(swallow)
+    )
+
+    with pytest.raises(RuntimeError):
+        with s._generation_transaction() as txn:
+            txn.steering_cm = object()
+            raise RuntimeError("preamble blew up")
+
+    assert exits == [True]
+
+
+def test_generation_transaction_leaves_a_popped_scope_alone():
+    """The ordinary path pops its own scope before finalizing and clears the
+    slot; the transaction must not pop it a second time."""
+    exits: list[bool] = []
+    s = _transaction_stub_session()
+    s._exit_internal_steering = (
+        lambda _cm, *, swallow: exits.append(swallow)
+    )
+
+    with s._generation_transaction() as txn:
+        txn.steering_cm = object()
+        txn.steering_cm = None
+
+    assert exits == []
+    assert s._gen_phase is GenState.IDLE
+
+
+def test_generation_transaction_rejects_a_reentrant_generation():
+    from saklas.core.session import ConcurrentGenerationError
+
+    s = _transaction_stub_session()
+    with s._generation_transaction():
+        with pytest.raises(ConcurrentGenerationError):
+            with s._generation_transaction():
+                pass  # pragma: no cover - the guard raises on entry
