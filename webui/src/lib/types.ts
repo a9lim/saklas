@@ -1536,8 +1536,17 @@ export interface SaeSteerEntry {
   enabled: boolean;
 }
 
+/** The two single-direction *atom* families — a J-lens token direction
+ *  and an SAE decoder row.  Both rack as ``α <prefix><id>`` with one
+ *  per-card coefficient and no geometry, so they share a card and a
+ *  mutator set; only the key prefix, the accent hue, and the marker
+ *  glyph differ. */
+export type AtomMode = "jlens" | "sae";
+
+export type AtomSteerEntry = JLensSteerEntry | SaeSteerEntry;
+
 /** A racked steering term — subspace (flat), manifold (curved), or a
- *  J-lens token atom. */
+ *  single-direction atom. */
 export type SteerEntry =
   | SubspaceSteerEntry
   | ManifoldSteerEntry

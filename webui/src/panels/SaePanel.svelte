@@ -24,7 +24,7 @@
   import Button from "../lib/ui/Button.svelte";
   import { onMount } from "svelte";
   import SaeProbeCard from "./rack/SaeProbeCard.svelte";
-  import SaeSteerCard from "./rack/SaeSteerCard.svelte";
+  import AtomSteerCard from "./rack/AtomSteerCard.svelte";
   import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import { apiInstruments } from "../lib/api";
@@ -544,7 +544,7 @@
         <div class="cards steer-cards" role="list">
           {#each steerCards as [name, entry] (name)}
             <div role="listitem">
-              <SaeSteerCard {name} {entry} />
+              <AtomSteerCard mode="sae" {name} {entry} />
             </div>
           {/each}
         </div>

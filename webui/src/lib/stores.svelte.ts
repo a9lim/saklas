@@ -37,16 +37,16 @@ import type {
   WSServerMessage,
 } from "./api";
 import type {
+  AtomMode,
+  AtomSteerEntry,
   CastMemberJSON,
   ChatTurn,
   GenStatus,
   InstrumentSourceJSON,
-  JLensSteerEntry,
   LensReadoutBlockJSON,
   MeasurementsEnvelopeJSON,
   PreparationStatusJSON,
   SaeFeatureJSON,
-  SaeSteerEntry,
   ManifoldSteerEntry,
   PendingAction,
   ProbeInfo,
@@ -1385,107 +1385,103 @@ export function removeManifoldFromRack(name: string): void {
   steerRack.entries.delete(name);
 }
 
-// ---------------------------------------------------- j-lens-mode mutators
+// ------------------------------------------------------- atom mutators
+//
+// The two single-direction atom families (``jlens/<word>``, ``sae/<id>``)
+// rack identically — one α, one trigger, one enable, no geometry — so they
+// share one mutator set parameterised by ``AtomMode``.  Only the two adds
+// stay family-specific: they differ in key construction and validation.
 
-/** Default α for a fresh J-lens token chip — lens atoms run hotter than
- *  concept vectors (a single sharp token direction, not a distributed
- *  contrast): ≈0.3 is the coherent sweet spot, ≥0.5 over-steers into
- *  repetition. */
-export const JLENS_DEFAULT_ALPHA = 0.3;
+/** Default α for a fresh atom chip.  Atoms run hotter than concept vectors
+ *  (a single sharp direction, not a distributed contrast): ≈0.3 is the
+ *  coherent sweet spot, ≥0.5 over-steers into repetition. */
+export const ATOM_DEFAULT_ALPHA = 0.3;
 
-/** Reassign a jlens-mode entry through ``fn``; no-op on absent / other-mode. */
-function mutateJLens(
-  name: string,
-  fn: (e: JLensSteerEntry) => JLensSteerEntry,
-): void {
-  const e = steerRack.entries.get(name);
-  if (e && e.mode === "jlens") steerRack.entries.set(name, fn(e));
+/** Rack-key prefix per family — the atom's namespace segment in the
+ *  steering grammar. */
+export const ATOM_PREFIX: Record<AtomMode, string> = {
+  jlens: "jlens/",
+  sae: "sae/",
+};
+
+/** The rack mutations one atom card drives. */
+export interface AtomRackActions {
+  remove(name: string): void;
+  setAlpha(name: string, alpha: number): void;
+  setEnabled(name: string, enabled: boolean): void;
+  setTrigger(name: string, trigger: Trigger): void;
+}
+
+/** Build the mutator set for one atom family.  ``label`` is the word the
+ *  pending-queue bubble shows. */
+function buildAtomActions(mode: AtomMode, label: string): AtomRackActions {
+  /** Reassign an entry of this family through ``fn``; no-op on an absent
+   *  key or an entry of another mode. */
+  const mutate = (
+    name: string,
+    fn: (e: AtomSteerEntry) => AtomSteerEntry,
+  ): void => {
+    const e = steerRack.entries.get(name);
+    if (e && e.mode === mode) steerRack.entries.set(name, fn(e));
+  };
+  return {
+    remove(name) {
+      steerRack.entries.delete(name);
+    },
+    setAlpha(name, alpha) {
+      enqueueOrApply(`${label} alpha ${name} ${alpha.toFixed(3)}`, () => {
+        mutate(name, (e) => ({ ...e, alpha }));
+      });
+    },
+    setEnabled(name, enabled) {
+      enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
+        mutate(name, (e) => ({ ...e, enabled }));
+      });
+    },
+    setTrigger(name, trigger) {
+      enqueueOrApply(`${label} trigger ${name} ${trigger}`, () => {
+        mutate(name, (e) => ({ ...e, trigger }));
+      });
+    },
+  };
+}
+
+const ATOM_ACTIONS: Record<AtomMode, AtomRackActions> = {
+  jlens: buildAtomActions("jlens", "jlens"),
+  sae: buildAtomActions("sae", "SAE"),
+};
+
+/** The rack mutators for one atom family. */
+export function atomActions(mode: AtomMode): AtomRackActions {
+  return ATOM_ACTIONS[mode];
+}
+
+function addAtomToRack(mode: AtomMode, id: string): void {
+  const name = `${ATOM_PREFIX[mode]}${id}`;
+  if (steerRack.entries.has(name)) return;
+  steerRack.customExpression = null;
+  steerRack.entries.set(name, {
+    mode,
+    alpha: ATOM_DEFAULT_ALPHA,
+    trigger: "BOTH",
+    enabled: true,
+  } as AtomSteerEntry);
 }
 
 /** Add a J-lens token steering chip (``α jlens/<word>``).  Accepts a bare
  *  word or a full ``jlens/…`` atom; the rack key is the full atom.
- *  Dashboard callers validate through ``apiInstruments.validateLensToken`` before this
- *  local mutation; the engine revalidates when it resolves the atom. */
+ *  Dashboard callers validate through ``apiInstruments.validateLensToken``
+ *  before this local mutation; the engine revalidates when it resolves the
+ *  atom. */
 export function addJLensToRack(word: string): void {
   const bare = word.trim().replace(/^jlens\//, "");
   if (!bare) return;
-  const name = `jlens/${bare}`;
-  if (steerRack.entries.has(name)) return;
-  steerRack.customExpression = null;
-  steerRack.entries.set(name, {
-    mode: "jlens",
-    alpha: JLENS_DEFAULT_ALPHA,
-    trigger: "BOTH",
-    enabled: true,
-  });
+  addAtomToRack("jlens", bare);
 }
 
-export function removeJLensFromRack(name: string): void {
-  steerRack.entries.delete(name);
-}
-
-export function setJLensAlpha(name: string, alpha: number): void {
-  enqueueOrApply(`jlens alpha ${name} ${alpha.toFixed(3)}`, () => {
-    mutateJLens(name, (e) => ({ ...e, alpha }));
-  });
-}
-
-export function setJLensEnabled(name: string, enabled: boolean): void {
-  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
-    mutateJLens(name, (e) => ({ ...e, enabled }));
-  });
-}
-
-export function setJLensTrigger(name: string, trigger: Trigger): void {
-  enqueueOrApply(`jlens trigger ${name} ${trigger}`, () => {
-    mutateJLens(name, (e) => ({ ...e, trigger }));
-  });
-}
-
-// -------------------------------------------------------- SAE mutators
-
-export const SAE_DEFAULT_ALPHA = 0.3;
-
-function mutateSae(
-  name: string,
-  fn: (entry: SaeSteerEntry) => SaeSteerEntry,
-): void {
-  const entry = steerRack.entries.get(name);
-  if (entry?.mode === "sae") steerRack.entries.set(name, fn(entry));
-}
-
+/** Add a resident-SAE decoder-row steering chip (``α sae/<id>``). */
 export function addSaeToRack(featureId: number): void {
-  const name = `sae/${featureId}`;
-  if (steerRack.entries.has(name)) return;
-  steerRack.customExpression = null;
-  steerRack.entries.set(name, {
-    mode: "sae",
-    alpha: SAE_DEFAULT_ALPHA,
-    trigger: "BOTH",
-    enabled: true,
-  });
-}
-
-export function removeSaeFromRack(name: string): void {
-  steerRack.entries.delete(name);
-}
-
-export function setSaeAlpha(name: string, alpha: number): void {
-  enqueueOrApply(`SAE alpha ${name} ${alpha.toFixed(3)}`, () => {
-    mutateSae(name, (entry) => ({ ...entry, alpha }));
-  });
-}
-
-export function setSaeEnabled(name: string, enabled: boolean): void {
-  enqueueOrApply(`${enabled ? "enable" : "disable"} ${name}`, () => {
-    mutateSae(name, (entry) => ({ ...entry, enabled }));
-  });
-}
-
-export function setSaeTrigger(name: string, trigger: Trigger): void {
-  enqueueOrApply(`SAE trigger ${name} ${trigger}`, () => {
-    mutateSae(name, (entry) => ({ ...entry, trigger }));
-  });
+  addAtomToRack("sae", String(featureId));
 }
 
 export function setManifoldBlend(name: string, blend: number): void {

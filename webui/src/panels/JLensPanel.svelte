@@ -32,7 +32,7 @@
   import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
-  import JLensSteerCard from "./rack/JLensSteerCard.svelte";
+  import AtomSteerCard from "./rack/AtomSteerCard.svelte";
   import JLensTokenCard from "./rack/JLensTokenCard.svelte";
   import { apiInstruments, describeError } from "../lib/api";
   import {
@@ -508,7 +508,7 @@
         <div class="cards steer-cards" role="list">
           {#each steerCards as [name, entry] (name)}
             <div role="listitem">
-              <JLensSteerCard {name} {entry} />
+              <AtomSteerCard mode="jlens" {name} {entry} />
             </div>
           {/each}
         </div>
