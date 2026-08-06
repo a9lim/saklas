@@ -44,25 +44,129 @@ a source switch.
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, NotRequired, TypedDict, cast
 
+from saklas.core.instruments.types import Reading, ScalarReading, reading_axis0
 from saklas.core.results import ProbeReading
 
 MEASUREMENTS_VERSION = 1
 
+MeasurementScope = Literal["token", "aggregate", "replay"]
+MeasurementProvenance = Literal["captured", "replayed"]
 
-def _axis0(readings: Mapping[str, ProbeReading]) -> dict[str, float]:
+
+# --------------------------------------------------------------------------
+# The envelope, declared
+# --------------------------------------------------------------------------
+# The wire contract used to live only in hand-mirrored TypeScript, which is
+# how `probe_measurements_aggregate`'s output went unread and how a unit no
+# producer held ended up on the wire.  These TypedDicts are the Python-side
+# declaration; ``tests/test_measurements_envelope.py`` pins the exact key
+# sets of a token frame, a done aggregate, and all three replay envelopes,
+# so wire drift is a test failure rather than a dashboard bug.
+
+class MeasurementBinding(TypedDict):
+    """What a family was measuring: source identity + recipe steering."""
+
+    source: str | None
+    steering: str | None
+    layer: NotRequired[int | None]
+
+
+class LensReadoutToken(TypedDict):
+    token: str
+    id: int
+    logprob: float
+
+
+class LensReadoutLayer(TypedDict):
+    layer: int
+    tokens: list[LensReadoutToken]
+
+
+class LensAggregateToken(TypedDict):
+    token: str
+    strength: float
+    com: float
+    spread: float
+
+
+class LensReadout(TypedDict):
+    layers: list[LensReadoutLayer]
+    aggregate: list[LensAggregateToken]
+
+
+class SaeFeature(TypedDict):
+    id: int
+    activation: float
+    label: str | None
+    max_act: float | None
+
+
+class SaeReadout(TypedDict):
+    features: list[SaeFeature]
+
+
+class GeometryChannel(TypedDict):
+    readings: dict[str, Any] | None
+    binding: NotRequired[MeasurementBinding]
+
+
+class LensChannel(TypedDict):
+    binding: MeasurementBinding
+    readings: NotRequired[dict[str, Any]]
+    readout: NotRequired[LensReadout]
+
+
+class SaeChannel(TypedDict):
+    binding: MeasurementBinding
+    readings: NotRequired[dict[str, Any]]
+    readout: NotRequired[SaeReadout]
+
+
+class Instruments(TypedDict):
+    geometry: NotRequired[GeometryChannel]
+    lens: NotRequired[LensChannel]
+    sae: NotRequired[SaeChannel]
+
+
+class Measurements(TypedDict):
+    """The one versioned read-side wire record."""
+
+    version: int
+    scope: MeasurementScope
+    provenance: MeasurementProvenance
+    instruments: Instruments
+    scores: NotRequired[dict[str, float]]
+    per_layer_scores: NotRequired[dict[str, dict[str, float]]]
+
+
+class MeasurementsEnvelope(TypedDict):
+    """The replay endpoints' response body."""
+
+    measurements: Measurements | None
+
+
+def _axis0(readings: Mapping[str, Reading]) -> dict[str, float]:
     return {
-        str(name): round(
-            float(reading.coords[0] if reading.coords else 0.0), 6,
-        )
+        str(name): round(reading_axis0(reading), 6)
         for name, reading in readings.items()
     }
 
 
 def _readings_dict(
-    readings: Mapping[str, ProbeReading] | None,
+    readings: Mapping[str, Reading] | None,
 ) -> dict[str, Any] | None:
+    """Serialize a family's attached-probe readings in ITS OWN shape.
+
+    Geometry emits the full ``ProbeReading``; the single-axis families emit
+    the native ``ScalarReading`` (``{value, unit, per_layer, depth}``).  The
+    eight constant geometry fields a synthesized ``ProbeReading`` used to
+    carry for lens/SAE probes — ``fraction`` 0, ``residual`` 0, empty
+    ``nearest``/``assignment``, ``membership`` 1.0 and three empty per-layer
+    maps — are off the wire: they were constants masquerading as
+    measurements, and the client had to infer the unit they omitted.
+    """
     if not readings:
         return None
     return {str(name): reading.to_dict() for name, reading in readings.items()}
@@ -74,8 +178,8 @@ def build_measurements(
     provenance: str = "captured",
     geometry_readings: Mapping[str, ProbeReading] | None = None,
     geometry_binding: Mapping[str, Any] | None = None,
-    lens_readings: Mapping[str, ProbeReading] | None = None,
-    sae_readings: Mapping[str, ProbeReading] | None = None,
+    lens_readings: Mapping[str, ScalarReading] | None = None,
+    sae_readings: Mapping[str, ScalarReading] | None = None,
     per_layer_scores: Mapping[str, Mapping[str, float]] | None = None,
     lens_readout: Mapping[int, list[tuple[str, float]]] | None = None,
     lens_aggregate: list[tuple[str, float, float, float]] | None = None,
@@ -85,7 +189,7 @@ def build_measurements(
     sae_source: str | None = None,
     sae_layer: int | None = None,
     steering: str | None = None,
-) -> dict[str, Any] | None:
+) -> Measurements | None:
     """Build one measurement envelope; ``None`` when nothing measured.
 
     JSON-safe throughout (floats rounded/floored exactly as the historical
@@ -181,11 +285,11 @@ def build_measurements(
     if not instruments:
         return None
 
-    envelope: dict[str, Any] = {
+    envelope: Measurements = {
         "version": MEASUREMENTS_VERSION,
-        "scope": scope,
-        "provenance": provenance,
-        "instruments": instruments,
+        "scope": cast(MeasurementScope, scope),
+        "provenance": cast(MeasurementProvenance, provenance),
+        "instruments": cast(Instruments, instruments),
     }
     if scores:
         envelope["scores"] = scores
@@ -196,4 +300,22 @@ def build_measurements(
     return envelope
 
 
-__all__ = ["MEASUREMENTS_VERSION", "build_measurements"]
+__all__ = [
+    "GeometryChannel",
+    "Instruments",
+    "LensAggregateToken",
+    "LensChannel",
+    "LensReadout",
+    "LensReadoutLayer",
+    "LensReadoutToken",
+    "MEASUREMENTS_VERSION",
+    "MeasurementBinding",
+    "MeasurementProvenance",
+    "MeasurementScope",
+    "Measurements",
+    "MeasurementsEnvelope",
+    "SaeChannel",
+    "SaeFeature",
+    "SaeReadout",
+    "build_measurements",
+]

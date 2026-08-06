@@ -38,12 +38,18 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, TYPE_CHECKING, Union
+from typing import Any, ClassVar, Literal, Mapping, TYPE_CHECKING, Union
 
 from saklas.core.errors import UnsupportedProbeChannelError
 
 if TYPE_CHECKING:
     from saklas.core.results import ProbeReading
+
+
+#: The three read families.  THE enumeration — ``session.instruments`` is
+#: keyed by it, the server validates ``{family}`` against that registry, and
+#: the payload layer's per-family slots are pinned to it by test.
+InstrumentFamily = Literal["geometry", "lens", "sae"]
 
 
 #: Depth of the bounded capture tail ring finalize aggregates pool from —
@@ -220,6 +226,14 @@ class DepthSummary:
     basis: DepthBasis
 
 
+#: The lens strength unit — ``mean_l p_l(v)`` over the fitted layers.
+UNIT_MEAN_TOKEN_PROBABILITY = "mean_token_probability"
+#: The SAE strength unit when Neuronpedia ``maxActApprox`` is cached.
+UNIT_ACTIVATION_OVER_MAX = "activation_over_max"
+#: The SAE strength unit with no metadata (offline / unlisted feature).
+UNIT_RAW_ACTIVATION = "raw_activation"
+
+
 @dataclass
 class ScalarReading:
     """One-channel reading for the lens and SAE families.
@@ -240,6 +254,35 @@ class ScalarReading:
     per_layer: dict[int, float] = field(default_factory=dict)
     depth: DepthSummary | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """The family-native wire shape carried inside the measurement
+        envelope's ``instruments.lens.readings`` / ``.sae.readings``.
+
+        Deliberately NOT the ``ProbeReading`` shape: a one-channel reading
+        has no fraction / nearest / residual / assignment / membership, and
+        shipping those as constants is the "constants masquerading as
+        measurements" pattern the 5.x break removed from the gate path.
+        """
+        out: dict[str, Any] = {
+            "value": round(float(self.value), 6),
+            "unit": str(self.unit),
+            "per_layer": {
+                str(layer): round(float(v), 6)
+                for layer, v in self.per_layer.items()
+            },
+        }
+        if self.depth is not None:
+            out["depth"] = {
+                "center": [round(float(c), 6) for c in self.depth.center],
+                "spread": [round(float(s), 6) for s in self.depth.spread],
+                "basis": str(self.depth.basis),
+            }
+        else:
+            out["depth"] = None
+        if self.meta:
+            out["meta"] = dict(self.meta)
+        return out
 
     def to_probe_reading(self) -> "ProbeReading":
         """Project this reading into the shared ``ProbeReading`` shape
@@ -263,6 +306,130 @@ class ScalarReading:
             depth_com=tuple(self.depth.center) if self.depth else (),
             depth_spread=tuple(self.depth.spread) if self.depth else (),
         )
+
+
+#: What a family's ``score_probes`` returns: the geometry family's full
+#: whitened :class:`~saklas.core.results.ProbeReading`, or the single-axis
+#: families' :class:`ScalarReading`.  The three helpers below are the only
+#: places a consumer needs to care which.
+Reading = Union["ProbeReading", ScalarReading]
+
+
+def reading_axis0(reading: "Reading") -> float:
+    """The reading's primary scalar — a ``ScalarReading``'s ``value`` or a
+    ``ProbeReading``'s coordinate axis 0.  This is the number the flat
+    cross-family ``scores`` view and the loom's aggregate row carry."""
+    if isinstance(reading, ScalarReading):
+        return float(reading.value)
+    coords = reading.coords
+    return float(coords[0]) if coords else 0.0
+
+
+def reading_per_layer_axis0(reading: "Reading") -> dict[int, float]:
+    """The per-layer trace of :func:`reading_axis0`."""
+    if isinstance(reading, ScalarReading):
+        return {
+            int(layer): float(value)
+            for layer, value in reading.per_layer.items()
+        }
+    return {
+        int(layer): float(coord[0] if coord else 0.0)
+        for layer, coord in reading.coords_per_layer.items()
+    }
+
+
+def as_probe_reading(reading: "Reading") -> "ProbeReading":
+    """Project any reading into the shared ``ProbeReading`` shape.
+
+    The COMPATIBILITY boundary, and only that: ``TokenEvent.probe_readings``
+    (a cross-family dict keyed by one reading type) and the OpenAI/Ollama
+    ``x-saklas-probe-readings`` vendor extension, whose shape is a user
+    contract.  It must not run on the native per-token path — the versioned
+    measurement envelope carries each family's own reading shape, which is
+    the whole point of :class:`ScalarReading`.
+    """
+    if isinstance(reading, ScalarReading):
+        return reading.to_probe_reading()
+    return reading
+
+
+def scalar_gate_keys(values: Mapping[str, float]) -> dict[str, float]:
+    """Flatten one-channel probe values into gate scalars.
+
+    The :meth:`Monitor.flat_scalars` counterpart for the single-axis
+    families: ONLY the real strength channel (``<name>`` and its explicit
+    ``<name>[0]`` spelling).  No ``:fraction`` / ``:membership`` constants —
+    a gate on a channel the family cannot produce is a composition-preflight
+    error (``validate_gate``), never a silently-constant comparison.
+    """
+    out: dict[str, float] = {}
+    for name, value in values.items():
+        scalar = float(value)
+        out[name] = scalar
+        out[f"{name}[0]"] = scalar
+    return out
+
+
+# --------------------------------------------------------------------------
+# Live state
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LiveState:
+    """One family's live-readout intent — the return of ``set_live`` and
+    the value of ``live_state``.
+
+    The three families genuinely differ in what "live" carries (the lens
+    resolves a layer list, the SAE reports its resident layer + source,
+    geometry is a bare all-or-nothing switch), so the shape is a small
+    frozen per-family record rather than a bare bool.  ``to_dict`` is the
+    wire block every surface (the ``/live`` route, the ``/instruments``
+    listing, session info) emits for the family.
+    """
+
+    enabled: bool
+    family: ClassVar[InstrumentFamily]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"enabled": bool(self.enabled)}
+
+
+@dataclass(frozen=True)
+class GeometryLiveState(LiveState):
+    """The CAA per-token monitor-scoring switch — all-or-nothing."""
+
+    family: ClassVar[InstrumentFamily] = "geometry"
+
+
+@dataclass(frozen=True)
+class LensLiveState(LiveState):
+    """The workspace readout: ``layers`` is the resolved live layer list
+    (``None`` when off)."""
+
+    family: ClassVar[InstrumentFamily] = "lens"
+    layers: tuple[int, ...] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "layers": list(self.layers) if self.layers is not None else None,
+        }
+
+
+@dataclass(frozen=True)
+class SaeLiveState(LiveState):
+    """The feature-discovery readout at the resident hook layer."""
+
+    family: ClassVar[InstrumentFamily] = "sae"
+    layer: int | None = None
+    source: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "layer": int(self.layer) if self.layer is not None else None,
+            "source": self.source,
+        }
 
 
 # --------------------------------------------------------------------------
@@ -407,11 +574,24 @@ __all__ = [
     "Fraction",
     "GateChannel",
     "GateRef",
+    "GeometryLiveState",
     "InstrumentBinding",
+    "InstrumentFamily",
     "InstrumentPlan",
+    "LensLiveState",
+    "LiveState",
     "Membership",
     "ReadRequest",
+    "Reading",
+    "SaeLiveState",
     "ScalarReading",
+    "UNIT_ACTIVATION_OVER_MAX",
+    "UNIT_MEAN_TOKEN_PROBABILITY",
+    "UNIT_RAW_ACTIVATION",
+    "as_probe_reading",
     "parse_gate_ref",
+    "reading_axis0",
+    "reading_per_layer_axis0",
+    "scalar_gate_keys",
     "validate_gate_channels",
 ]

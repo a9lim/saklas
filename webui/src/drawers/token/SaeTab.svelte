@@ -11,7 +11,7 @@
   import ProbeReadingRow from "../../panels/rack/ProbeReadingRow.svelte";
   import RackCard from "../../panels/rack/RackCard.svelte";
   import type {
-    ProbeReadingJSON,
+    ScalarReadingJSON,
     SaeFeatureJSON,
     SaeTokenReadoutJSON,
   } from "../../lib/types";
@@ -35,7 +35,7 @@
     saeLoaded: boolean;
     hasReplayContext: boolean;
     /** Live-captured pinned-probe readings from the token's envelope. */
-    pinned: Record<string, ProbeReadingJSON> | null;
+    pinned: Record<string, ScalarReadingJSON> | null;
   } = $props();
 
   const showToggle = $derived(

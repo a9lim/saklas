@@ -73,11 +73,20 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "AmbiguousSelectorError": ("saklas.io.selectors", "AmbiguousSelectorError"),
     "ManifoldNotRegisteredError": ("saklas.core.session", "ManifoldNotRegisteredError"),
     "ProfileNotRegisteredError": ("saklas.core.session", "ProfileNotRegisteredError"),
-    # Jacobian lens (the verbalizable-workspace readout)
+    # Read-side instrument facades: the contract, the three families, and
+    # the per-family live-state records ``set_live``/``live_state`` return.
+    "Instrument": ("saklas.core.instruments.protocol", "Instrument"),
+    "InstrumentRun": ("saklas.core.instruments.protocol", "InstrumentRun"),
     "GeometryInstrument": ("saklas.core.instruments.geometry", "GeometryInstrument"),
     "LensInstrument": ("saklas.core.instruments.lens", "LensInstrument"),
     "SaeInstrument": ("saklas.core.instruments.sae", "SaeInstrument"),
+    "LiveState": ("saklas.core.instruments.types", "LiveState"),
+    "GeometryLiveState": ("saklas.core.instruments.types", "GeometryLiveState"),
+    "LensLiveState": ("saklas.core.instruments.types", "LensLiveState"),
+    "SaeLiveState": ("saklas.core.instruments.types", "SaeLiveState"),
+    "ScalarReading": ("saklas.core.instruments.types", "ScalarReading"),
     "UnsupportedProbeChannelError": ("saklas.core.errors", "UnsupportedProbeChannelError"),
+    # Jacobian lens (the verbalizable-workspace readout)
     "JacobianLens": ("saklas.core.jlens", "JacobianLens"),
     "JSpaceDecomposition": ("saklas.core.jlens", "JSpaceDecomposition"),
     "JacobianLensError": ("saklas.core.jlens", "JacobianLensError"),
@@ -151,11 +160,19 @@ __all__ = [
     "AmbiguousSelectorError",
     "ManifoldNotRegisteredError",
     "ProfileNotRegisteredError",
-    # Jacobian lens (the verbalizable-workspace readout)
+    # Read-side instrument facades
+    "Instrument",
+    "InstrumentRun",
     "GeometryInstrument",
     "LensInstrument",
     "SaeInstrument",
+    "LiveState",
+    "GeometryLiveState",
+    "LensLiveState",
+    "SaeLiveState",
+    "ScalarReading",
     "UnsupportedProbeChannelError",
+    # Jacobian lens (the verbalizable-workspace readout)
     "JacobianLens",
     "JSpaceDecomposition",
     "JacobianLensError",
@@ -274,6 +291,17 @@ if TYPE_CHECKING:
     from saklas.core.instruments.lens import (
         LensInstrument as LensInstrument,
     )
+    from saklas.core.instruments.protocol import (
+        Instrument as Instrument,
+        InstrumentRun as InstrumentRun,
+    )
     from saklas.core.instruments.sae import (
         SaeInstrument as SaeInstrument,
+    )
+    from saklas.core.instruments.types import (
+        GeometryLiveState as GeometryLiveState,
+        LensLiveState as LensLiveState,
+        LiveState as LiveState,
+        SaeLiveState as SaeLiveState,
+        ScalarReading as ScalarReading,
     )

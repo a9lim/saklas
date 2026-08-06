@@ -47,14 +47,19 @@
     (readout.data?.steering ?? null) !== null || !steered,
   );
 
+  /** The attached row's flat/curved flag; a reading with no off-surface
+   *  residual is the fallback when the probe is no longer attached. */
   function affineOf(name: string, reading: ProbeReadingJSON): boolean {
-    return probeRack.entries.get(name)?.info?.is_affine ?? reading.residual === 0;
+    const info = probeRack.entries.get(name)?.info;
+    if (info?.family === "geometry") return info.is_affine;
+    return reading.residual === 0;
   }
 
   /** Axis label: the positive pole for a rank-1 two-node concept axis
    *  (coords axis 0 is pole-normalized, +1 at node 0), ``c<i>`` otherwise. */
   function axisLabel(name: string, axis: number, rank: number): string {
-    const labels = probeRack.entries.get(name)?.info?.node_labels;
+    const info = probeRack.entries.get(name)?.info;
+    const labels = info?.family === "geometry" ? info.node_labels : undefined;
     if (rank === 1 && axis === 0 && labels && labels.length === 2) {
       return labels[0];
     }
@@ -68,8 +73,7 @@
     name: string,
     reading: ProbeReadingJSON,
   ): { layer: number; value: number | null; title: string }[] {
-    const info = probeRack.entries.get(name)?.info;
-    const curved = info ? !info.is_affine : reading.residual !== 0;
+    const curved = !affineOf(name, reading);
     const source: Record<string, number> = {};
     if (curved) {
       Object.assign(source, reading.fraction_per_layer ?? {});
@@ -92,9 +96,7 @@
   }
 
   function stripScale(name: string, reading: ProbeReadingJSON): number {
-    const info = probeRack.entries.get(name)?.info;
-    const curved = info ? !info.is_affine : reading.residual !== 0;
-    if (curved) return 1; // fraction strip is already in [0, 1]
+    if (!affineOf(name, reading)) return 1; // fraction strip is [0, 1]
     return probeAxisScale(name, 0);
   }
 

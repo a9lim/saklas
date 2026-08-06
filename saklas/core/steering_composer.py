@@ -676,46 +676,41 @@ class SteeringComposer:
             if ref.probe in attached
         }
 
-    def _gated_instrument_probe_keys(
-        self, registry_attr: str, instrument_attr: str,
-    ) -> set[str]:
-        """Gate scalar keys referencing one non-Monitor family's probes.
+    def gated_family_probe_keys(self, family: str) -> set[str]:
+        """Exact gate scalar keys referencing one read family's probes.
 
+        Driven by ``session.instruments`` — the registry IS the family
+        enumeration, so this is one loop rather than a per-family copy.
         Lens and SAE probes live in their instruments' own registries (the
         readout channels), not the Monitor, so :meth:`gated_probe_keys`'
-        attachment test doesn't see them.  A key whose base name is attached
-        to the named family is also **channel-validated** here: both families
-        produce only the strength axis, so ``@when:jlens/word:membership``
-        raises ``UnsupportedProbeChannelError`` at generation preflight rather
-        than sitting silently inactive.
+        attachment test doesn't see them.
 
-        ``registry_attr`` is the historical private registry name (duck-typed
-        stubs supply a plain dict); ``instrument_attr`` names the instrument
-        that does the channel validation when one is present.
+        A key whose base name is attached to the family is also
+        **channel-validated** here (``Instrument.validate_gate``): the
+        single-axis families produce only the strength channel, so
+        ``@when:jlens/word:membership`` raises
+        ``UnsupportedProbeChannelError`` at generation preflight rather than
+        sitting silently inactive.  Geometry accepts every channel, so the
+        same call is a no-op there.
         """
-        attached = set(getattr(self._session, registry_attr))
+        instrument = self._session.instruments[family]
+        attached = set(instrument.names)
         if not attached:
             return set()
-        instrument = getattr(self._session, instrument_attr, None)
         out: set[str] = set()
         for key, ref in self._gated_refs():
             if ref.probe in attached:
-                if instrument is not None:
-                    instrument.validate_gate(ref)
+                instrument.validate_gate(ref)
                 out.add(key)
         return out
 
     def gated_lens_probe_keys(self) -> set[str]:
         """Exact gate scalar keys referencing attached J-lens token probes."""
-        return self._gated_instrument_probe_keys(
-            "_lens_probes", "_lens_instrument",
-        )
+        return self.gated_family_probe_keys("lens")
 
     def gated_sae_probe_keys(self) -> set[str]:
         """Exact gate scalar keys referencing attached SAE feature probes."""
-        return self._gated_instrument_probe_keys(
-            "_sae_probes", "_sae_instrument",
-        )
+        return self.gated_family_probe_keys("sae")
 
     def steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.

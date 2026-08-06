@@ -243,9 +243,11 @@ def test_every_family_carries_the_uniform_instrument_surface() -> None:
 
 
 def test_gate_validation_is_only_where_a_channel_can_be_refused() -> None:
-    """Lens and SAE read one strength axis, so a geometry-channel gate is a
-    composition-preflight error there.  Geometry produces every channel, so it
-    carries no capability list to check against."""
+    """Every family answers ``validate_gate`` — that is what lets the
+    composer walk ``session.instruments`` uniformly.  Lens and SAE read one
+    strength axis, so a geometry-channel gate is a composition-preflight
+    error there; geometry produces every channel, so its implementation
+    accepts unconditionally."""
     from saklas.core.session import SaklasSession
 
     session = SaklasSession.__new__(SaklasSession)
@@ -253,4 +255,4 @@ def test_gate_validation_is_only_where_a_channel_can_be_refused() -> None:
     for family in ("lens", "sae"):
         with pytest.raises(UnsupportedProbeChannelError):
             session.instruments[family].validate_gate(ref)
-    assert not hasattr(session.instruments["geometry"], "validate_gate")
+    assert session.instruments["geometry"].validate_gate(ref) is None

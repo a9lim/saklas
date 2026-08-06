@@ -12,8 +12,66 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from saklas.core.instruments.geometry import GeometryInstrument
+from saklas.core.instruments.lens import LensInstrument
+from saklas.core.instruments.sae import SaeInstrument
+
 _SID = "default"
 _BASE = f"/saklas/v1/sessions/{_SID}/instruments"
+
+
+class _FakeLens(LensInstrument):
+    """The real lens instrument with only its artifact-touching surface
+    faked, so the routes exercise the genuine ``set_live`` / ``live_state``
+    / ``active_source`` / ``token_readout`` contract."""
+
+    def __init__(self, session: Any) -> None:
+        super().__init__(session)
+        self.layers: "list[int] | None" = None
+        self.source: "str | None" = None
+        self.default_layers = [10, 14, 18]
+        self.enable_calls: list[Any] = []
+        self.disable_calls = 0
+        self.enable_error: "BaseException | None" = None
+
+    def enable_live(self, *, layers: Any = None) -> list[int]:
+        self.enable_calls.append(layers)
+        if self.enable_error is not None:
+            raise self.enable_error
+        self.layers = list(layers) if layers else list(self.default_layers)
+        return list(self.layers)
+
+    def disable_live(self) -> None:
+        self.disable_calls += 1
+        self.layers = None
+
+    @property
+    def live_layers(self) -> "list[int] | None":
+        return list(self.layers) if self.layers is not None else None
+
+    @property
+    def active_source(self) -> "str | None":
+        return self.source
+
+
+class _FakeSae(SaeInstrument):
+    """The real SAE instrument with residency faked."""
+
+    def __init__(self, session: Any) -> None:
+        super().__init__(session)
+        self.layer = 14
+        self.source: "str | None" = None
+
+    def enable_live(self) -> dict[str, Any]:
+        self.live = {"layer": self.layer, "source": self.source}
+        return {"layer": self.layer}
+
+    def disable_live(self) -> None:
+        self.live = None
+
+    @property
+    def active_source(self) -> "str | None":
+        return self.source
 
 
 def _mock_session() -> Any:
@@ -31,14 +89,18 @@ def _mock_session() -> Any:
     session.config.thinking = None
     session.tokenizer = MagicMock()
 
-    # instrument state reads
-    session.monitor.probe_names = []
-    session.lens_probe_names = []
-    session.sae_probe_names = []
-    session.live_probe_scores = True
-    session.live_lens_layers = None
-    session.live_sae = False
-    session._live_sae = None
+    # The read plane: real instruments over a faked source lifecycle, keyed
+    # by the registry the routes validate ``{family}`` against.
+    session._monitor.probe_names = []
+    geometry = GeometryInstrument(session)
+    lens = _FakeLens(session)
+    sae = _FakeSae(session)
+    session.instruments = {
+        "geometry": geometry, "lens": lens, "sae": sae,
+    }
+    session.geometry = geometry
+    session.lens = lens
+    session.sae = sae
     session.sae_info = None
 
     session.lock = asyncio.Lock()
@@ -65,9 +127,9 @@ class TestListing:
         session, client = session_and_client
         # The listing answers from the canonical active-source resolver, the
         # same one that stamps lens measurement bindings.
-        session._active_jlens_source_label.return_value = "local:default"
-        session.lens_probe_names = ["jlens/fake"]
-        session.sae_info = {"release": "scope", "layer": 14, "width": 16_384}
+        session.lens.source = "local:default"
+        session.lens.probes["jlens/fake"] = {"word": "fake"}
+        session.sae.source = "saelens:scope"
         resp = client.get(_BASE)
         assert resp.status_code == 200
         fams = {f["family"]: f for f in resp.json()["instruments"]}
@@ -91,10 +153,12 @@ class TestListing:
         }
 
         sae = fams["sae"]
-        assert sae["live"] == {"enabled": False, "layer": None}
+        assert sae["live"] == {
+            "enabled": False, "layer": None, "source": None,
+        }
         assert sae["source"] == "saelens:scope"
         assert sae["capabilities"] == {
-            "sources": True, "preparations": ["load", "train"],
+            "sources": True, "preparations": ["fetch", "train"],
             "token_readout": True, "source_switch": False,
         }
 
@@ -113,20 +177,22 @@ class TestListing:
         monkeypatch.setattr(
             "saklas.io.lens_sources.list_lens_sources", lambda _m: [],
         )
-        session._active_jlens_source_label.return_value = "local:default"
+        session.lens.source = "local:default"
         fams = {f["family"]: f for f in client.get(_BASE).json()["instruments"]}
         assert fams["lens"]["source"] == "local:default"
 
     def test_live_states_reflect_runtime(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.live_probe_scores = False
-        session.live_lens_layers = [10, 14]
-        session.live_sae = True
-        session._live_sae = {"layer": 14, "source": "saelens:x"}
+        session.geometry.set_live(False)
+        session.lens.enable_live(layers=[10, 14])
+        session.sae.source = "saelens:x"
+        session.sae.enable_live()
         fams = {f["family"]: f for f in client.get(_BASE).json()["instruments"]}
         assert fams["geometry"]["live"] == {"enabled": False}
         assert fams["lens"]["live"] == {"enabled": True, "layers": [10, 14]}
-        assert fams["sae"]["live"] == {"enabled": True, "layer": 14}
+        assert fams["sae"]["live"] == {
+            "enabled": True, "layer": 14, "source": "saelens:x",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +202,10 @@ class TestListing:
 class TestLiveToggle:
     def test_geometry_toggle(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.set_live_probe_scores.return_value = False
         resp = client.post(f"{_BASE}/geometry/live", json={"enabled": False})
         assert resp.status_code == 200
         assert resp.json() == {"enabled": False}
-        session.set_live_probe_scores.assert_called_once_with(False)
+        assert session.geometry.live_state.enabled is False
 
     def test_geometry_rejects_layers(self, session_and_client: Any) -> None:
         _session, client = session_and_client
@@ -158,23 +223,23 @@ class TestLiveToggle:
 
     def test_lens_enable_returns_layers(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.enable_live_lens.return_value = [10, 14, 18]
         resp = client.post(f"{_BASE}/lens/live", json={"enabled": True})
         assert resp.status_code == 200
         assert resp.json() == {"enabled": True, "layers": [10, 14, 18]}
-        assert session.enable_live_lens.call_args.kwargs["layers"] is None
+        assert session.lens.enable_calls == [None]
 
     def test_lens_disable(self, session_and_client: Any) -> None:
         session, client = session_and_client
+        session.lens.enable_live()
         resp = client.post(f"{_BASE}/lens/live", json={"enabled": False})
         assert resp.status_code == 200
         assert resp.json() == {"enabled": False, "layers": None}
-        session.disable_live_lens.assert_called_once()
+        assert session.lens.disable_calls == 1
 
     def test_lens_not_fitted_404(self, session_and_client: Any) -> None:
         from saklas.core.jlens import LensNotFittedError
         session, client = session_and_client
-        session.enable_live_lens.side_effect = LensNotFittedError("no lens")
+        session.lens.enable_error = LensNotFittedError("no lens")
         resp = client.post(f"{_BASE}/lens/live", json={"enabled": True})
         assert resp.status_code == 404
 
@@ -187,18 +252,22 @@ class TestLiveToggle:
 
     def test_sae_enable(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.enable_live_sae.return_value = {"layer": 14}
+        session.sae.source = "saelens:scope"
         resp = client.post(f"{_BASE}/sae/live", json={"enabled": True})
         assert resp.status_code == 200
-        assert resp.json() == {"enabled": True, "layer": 14}
-        session.enable_live_sae.assert_called_once_with()
+        assert resp.json() == {
+            "enabled": True, "layer": 14, "source": "saelens:scope",
+        }
 
     def test_sae_disable(self, session_and_client: Any) -> None:
         session, client = session_and_client
+        session.sae.enable_live()
         resp = client.post(f"{_BASE}/sae/live", json={"enabled": False})
         assert resp.status_code == 200
-        assert resp.json() == {"enabled": False, "layer": None}
-        session.disable_live_sae.assert_called_once()
+        assert resp.json() == {
+            "enabled": False, "layer": None, "source": None,
+        }
+        assert session.sae.live is None
 
     def test_sae_rejects_layers(self, session_and_client: Any) -> None:
         _session, client = session_and_client
@@ -279,13 +348,13 @@ class TestSources:
 class TestSourceSwitch:
     def test_lens_switch(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.enable_live_lens.return_value = [10, 11]
+        session.lens.default_layers = [10, 11]
         resp = client.put(
             f"{_BASE}/lens/source", json={"source": "neuronpedia"},
         )
         assert resp.status_code == 200
         assert resp.json() == {"source": "neuronpedia", "live_layers": [10, 11]}
-        session.disable_live_lens.assert_called_once()
+        assert session.lens.disable_calls == 1
         session.select_jlens_source.assert_called_once_with("neuronpedia")
 
     def test_sae_409_points_at_preparations(
@@ -432,10 +501,10 @@ class TestPreparations:
         session.load_sae.return_value = {"layer": 14, "width": 4096}
         resp = client.post(
             f"{_BASE}/sae/preparations",
-            json={"operation": "load", "release": "saelens:scope"},
+            json={"operation": "fetch", "release": "saelens:scope"},
         )
         assert resp.status_code == 202
-        assert resp.json()["operation"] == "load"
+        assert resp.json()["operation"] == "fetch"
         assert resp.json()["progress"] is None
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -551,7 +620,7 @@ class TestTokenReadout:
 
     def test_lens_replay_envelope(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session._active_jlens_source_label.return_value = "local:default"
+        session.lens.source = "local:default"
         session.jlens_token_readout.return_value = dict(self._LENS_OUT)
         resp = client.get(
             f"{_BASE}/lens/token-readout",
@@ -605,7 +674,7 @@ class TestTokenReadout:
 
     def test_sae_replay_envelope(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.sae_info = {"release": "scope", "layer": 14, "width": 4096}
+        session.sae.source = "saelens:scope"
         session.sae_token_readout.return_value = {
             "node_id": "n1", "raw_index": 2, "token_id": 7, "token_text": "x",
             "steering": None, "layer": 14,

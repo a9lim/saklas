@@ -35,14 +35,10 @@ from pathlib import Path
 # Do NOT add a site here to silence a fixable reach-in — only one with no
 # public accessor belongs.
 ALLOWLIST: list[str] = [
-    # The canonical active-J-lens-source resolver.  It is what stamps the
-    # source onto every lens measurement binding
-    # (core/instruments/lens.py), so the `/instruments` listing and the
-    # token-readout replay must call exactly it — the route previously
-    # re-derived the answer from the prepared-sources scan and diverged
-    # whenever the active pointer named a removed artifact.  There is no
-    # public accessor for it yet; promoting one is an engine-side change.
-    "server/instrument_routes.py:session._active_jlens_source_label",
+    # Empty, and meant to stay that way.  The last entry was the active
+    # J-lens source resolver, which the routes reached for privately; it is
+    # now the public ``session.lens.active_source`` on the instrument
+    # interface, so the reach-in no longer exists to excuse.
 ]
 
 _FRONTEND_DIRS = ("server",)

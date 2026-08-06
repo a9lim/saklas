@@ -8,6 +8,7 @@ import pytest
 
 from saklas import cli
 from saklas.cli import runners as cli_runners
+from saklas.core.instruments.types import LensLiveState, SaeLiveState
 
 
 @pytest.mark.parametrize(
@@ -499,37 +500,46 @@ def test_no_dls_reaches_session_construction(
 
 
 def test_serve_stale_lens_gate_uses_weight_compatibility() -> None:
-    class _Session:
+    class _Lens:
         enabled = False
+
+        def set_live(self, enabled: bool, **_kwargs: Any) -> Any:
+            self.enabled = enabled
+            return LensLiveState(enabled=enabled, layers=())
+
+    class _Session:
+        lens = _Lens()
 
         def has_compatible_jlens(self) -> bool:
             return False
 
-        def enable_live_lens(self, **_kwargs: Any) -> None:
-            self.enabled = True
-
     session = _Session()
     assert not cli_runners._enable_serve_live_lens_if_compatible(session)
-    assert not session.enabled
+    assert not _Session.lens.enabled
 
 
 def test_serve_selects_cached_lens_when_active_pointer_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _Lens:
+        live_enabled = False
+
+        def set_live(self, enabled: bool, **_kwargs: Any) -> Any:
+            self.live_enabled = enabled
+            return LensLiveState(enabled=enabled, layers=(4, 5))
+
     class _Session:
         model_id = "org/model"
         selected: str | None = None
-        live_enabled = False
+
+        def __init__(self) -> None:
+            self.lens = _Lens()
 
         def has_compatible_jlens(self) -> bool:
             return self.selected == "local:default"
 
         def select_jlens_source(self, source: str) -> None:
             self.selected = source
-
-        def enable_live_lens(self) -> list[int]:
-            self.live_enabled = True
-            return [4, 5]
 
     monkeypatch.setattr(
         "saklas.io.lens_sources.list_lens_sources",
@@ -540,7 +550,7 @@ def test_serve_selects_cached_lens_when_active_pointer_is_missing(
     session = _Session()
     assert cli_runners._enable_serve_live_lens_if_compatible(session)
     assert session.selected == "local:default"
-    assert session.live_enabled
+    assert session.lens.live_enabled
 
 
 def test_best_serve_sae_release_prefers_official_canonical_provider() -> None:
@@ -566,19 +576,24 @@ def test_best_serve_sae_release_prefers_official_canonical_provider() -> None:
 def test_serve_attaches_best_sae_and_enables_live(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _Sae:
+        live_enabled = False
+
+        def set_live(self, enabled: bool, **_kwargs: Any) -> Any:
+            self.live_enabled = enabled
+            return SaeLiveState(enabled=enabled, layer=22)
+
     class _Session:
         model_id = "google/gemma-3-4b-it"
         sae_info = None
         loaded: str | None = None
-        live_enabled = False
+
+        def __init__(self) -> None:
+            self.sae = _Sae()
 
         def load_sae(self, release: str) -> dict[str, Any]:
             self.loaded = release
             return {"release": release, "layer": 22, "width": 16_384}
-
-        def enable_live_sae(self) -> dict[str, int]:
-            self.live_enabled = True
-            return {"layer": 22}
 
     monkeypatch.setattr(
         "saklas.io.sae.list_sae_sources",
@@ -596,23 +611,27 @@ def test_serve_attaches_best_sae_and_enables_live(
     session = _Session()
     assert cli_runners._enable_serve_live_sae_if_available(session)
     assert session.loaded == "gemma-scope-2-4b-it-res"
-    assert session.live_enabled
+    assert session.sae.live_enabled
 
 
 def test_serve_prefers_cached_sae_over_registry_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _Sae:
+        def set_live(self, enabled: bool, **_kwargs: Any) -> Any:
+            return SaeLiveState(enabled=enabled, layer=22)
+
     class _Session:
         model_id = "google/gemma-3-4b-it"
         sae_info = None
         loaded: str | None = None
 
+        def __init__(self) -> None:
+            self.sae = _Sae()
+
         def load_sae(self, release: str) -> dict[str, Any]:
             self.loaded = release
             return {"release": release, "layer": 22, "width": 16_384}
-
-        def enable_live_sae(self) -> dict[str, int]:
-            return {"layer": 22}
 
     monkeypatch.setattr(
         "saklas.io.sae.list_sae_sources",

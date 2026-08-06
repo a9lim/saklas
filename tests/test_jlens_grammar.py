@@ -105,7 +105,7 @@ def test_add_probe_routes_jlens_to_lens_registry() -> None:
 
     name = SaklasSession.add_probe(session, "jlens/g")  # type: ignore[arg-type]
     assert name == "jlens/g"
-    spec = session._lens_probes["jlens/g"]
+    spec = session._lens_instrument.probes["jlens/g"]
     assert spec["word"] == "g"
     assert spec["layers"] == session.jlens.source_layers
     # No direction fold, no profile registration — the readout channel is
@@ -131,17 +131,18 @@ def test_lens_probe_scores_strength_channel() -> None:
         l: torch.randn(d_model, generator=torch.Generator().manual_seed(l))
         for l in layers
     }
-    readings = session._score_lens_probes(hidden)
+    readings = session._lens_instrument.score_probes(hidden)
     reading = readings["jlens/g"]
-    (strength,) = reading.coords
+    strength = reading.value
+    assert reading.unit == "mean_token_probability"
     assert 0.0 <= strength <= 1.0
-    assert sorted(reading.coords_per_layer) == layers
+    assert sorted(reading.per_layer) == layers
     # Cross-check against the pure math on the same logits.
     logits = session._jlens_logits_rows(
         session.jlens, [(l, hidden[l]) for l in layers],
     )
     depths = [l / (len(session._layers) - 1) for l in layers]
-    token_id = session._lens_probes["jlens/g"]["token_id"]
+    token_id = session._lens_instrument.probes["jlens/g"]["token_id"]
     ((exp_str, exp_com, exp_spread, per_layer),) = token_readout_stats(
         logits.float(), depths, [token_id],
     )
@@ -149,23 +150,32 @@ def test_lens_probe_scores_strength_channel() -> None:
     # strength is the mean of the per-layer probabilities — the objective
     # apples-to-apples identity a within-layer normalization can't satisfy.
     assert strength == pytest.approx(sum(per_layer) / len(per_layer))
-    assert reading.depth_com == pytest.approx((exp_com,))
-    assert reading.depth_spread == pytest.approx((exp_spread,))
+    assert reading.depth is not None
+    assert reading.depth.center == pytest.approx((exp_com,))
+    assert reading.depth.spread == pytest.approx((exp_spread,))
+    # The depth mass names its own basis — ``depth_com`` means three
+    # unrelated things across families, so a bare float invites a
+    # meaningless cross-family comparison.
+    assert reading.depth.basis == "readout_probability_mass"
     for l, p_l in zip(layers, per_layer):
-        assert reading.coords_per_layer[l] == pytest.approx((p_l,))
+        assert reading.per_layer[l] == pytest.approx(p_l)
         assert 0.0 <= p_l <= 1.0
-    # Geometry fields are defaulted — there is no subspace behind a readout
-    # probe.
-    assert reading.fraction == 0.0
-    assert reading.residual == 0.0
-    assert reading.nearest == []
-    assert reading.membership == 1.0
+    # There are no geometry fields to default: a readout probe has no
+    # subspace behind it, so the native reading simply doesn't carry
+    # fraction / residual / nearest / assignment / membership.  They
+    # reappear only at the explicit compatibility projection.
+    for absent in ("fraction", "residual", "nearest", "membership", "coords"):
+        assert not hasattr(reading, absent)
+    compat = reading.to_probe_reading()
+    assert compat.coords == (strength,)
+    assert compat.fraction == 0.0
+    assert compat.membership == 1.0
 
 
 def test_gated_lens_probe_keys_and_gate_scalars() -> None:
     """Composer detection + the gate scalar key space: ``jlens/<word>`` =
-    strength (the one channel), emitted by ``Monitor.flat_scalars`` over
-    the synthesized reading."""
+    strength (the one channel), emitted by ``scalar_gate_keys`` over the
+    native readings — no ``:fraction`` / ``:membership`` constants."""
     from saklas.core.session import SaklasSession
 
     session = _StubSession()
@@ -192,9 +202,9 @@ def test_gated_lens_probe_keys_and_gate_scalars() -> None:
     assert scalars["jlens/g"] == scalars["jlens/g[0]"]
     # The stash is armed for the display step to reuse this forward's logits —
     # keyed by the forward's step id (step identity replaced ``fresh``).
-    assert session._lens_step_stash is not None
-    assert session._lens_step_stash["step"] == 7
-    assert session._lens_step_stash["layers"] == tuple(layers)
+    assert session._lens_instrument.step_stash is not None
+    assert session._lens_instrument.step_stash["step"] == 7
+    assert session._lens_instrument.step_stash["layers"] == tuple(layers)
 
     # Composer-side detection: a gate on the pinned lens probe is recognized
     # from the steering stack without monitor attachment.
@@ -217,8 +227,8 @@ def test_lens_gate_scalar_scores_only_referenced_probe(
     session.fit_jlens(_PROMPTS)
     SaklasSession.add_probe(session, "jlens/g")  # type: ignore[arg-type]
     SaklasSession.add_probe(session, "jlens/a")  # type: ignore[arg-type]
-    session.enable_live_lens(layers=[1])
-    setattr(session, "_live_lens_active_for_generation", False)
+    session._lens_instrument.enable_live(layers=[1])
+    session._lens_instrument.active_for_generation = False
 
     class _FlatCapture:
         def __init__(self, latest: dict[int, torch.Tensor]) -> None:
@@ -246,8 +256,8 @@ def test_lens_gate_scalar_scores_only_referenced_probe(
     assert "jlens/g" in scalars
     assert "jlens/g[0]" in scalars
     assert "jlens/a" not in scalars
-    assert session._lens_step_stash is not None
-    assert "probabilities" not in session._lens_step_stash
+    assert session._lens_instrument.step_stash is not None
+    assert "probabilities" not in session._lens_instrument.step_stash
 
 
 # -------------------------------------------------------------- ns reservation

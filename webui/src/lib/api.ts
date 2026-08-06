@@ -27,6 +27,9 @@ import type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  InstrumentFamily,
+  InstrumentFamilyBlock,
+  InstrumentLiveState,
   InstrumentSourceJSON,
   LensTokenValidationJSON,
   LoomNodeJSON,
@@ -72,6 +75,9 @@ export type {
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  InstrumentFamily,
+  InstrumentFamilyBlock,
+  InstrumentLiveState,
   InstrumentSourceJSON,
   LensTokenValidationJSON,
   LoomNodeJSON,
@@ -785,27 +791,11 @@ export const apiTree = {
 
 // ========================================================= instruments ==
 
-/** The three read-side instrument families the ``/instruments`` route tree
- *  unifies (the 5.x replacement for the per-family ``/lens/*`` / ``/sae/*``
- *  groups and ``POST /probes/live``). */
-export type InstrumentFamily = "geometry" | "lens" | "sae";
-
-/** Per-family listing row from ``GET /instruments``. */
-export interface InstrumentFamilyJSON {
-  family: InstrumentFamily;
-  live:
-    | { enabled: boolean }
-    | { enabled: boolean; layers: number[] | null }
-    | { enabled: boolean; layer: number | null };
-  source: string | null;
-  probes: string[];
-  capabilities: {
-    sources: boolean;
-    preparations: PreparationOp[];
-    token_readout: boolean;
-    source_switch: boolean;
-  };
-}
+// The read-side families and their per-family block live in ``types.ts``
+// with the rest of the wire shapes: the SAME block is listed by
+// ``GET /instruments`` and embedded in ``session_info.instruments``, so
+// there is exactly one declaration of it on the client.
+export type InstrumentFamilyJSON = InstrumentFamilyBlock;
 
 /** The unified read-side instrument client — one surface over geometry /
  *  lens / sae.  The former per-family live toggles, source lifecycle, the
@@ -820,11 +810,7 @@ export const apiInstruments = {
     family: InstrumentFamily,
     body: { enabled: boolean; layers?: number[] | null },
     id: string = SESSION,
-  ): Promise<{
-    enabled: boolean;
-    layers?: number[] | null;
-    layer?: number | null;
-  }> {
+  ): Promise<InstrumentLiveState> {
     return request(`${SESSION_BASE(id)}/instruments/${family}/live`, jsonBody(body));
   },
 

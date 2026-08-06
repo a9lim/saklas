@@ -31,7 +31,6 @@ from saklas.core.steering import Steering
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 from saklas.server.native_common import SINGLE_SESSION_ID
 from saklas.server.request_helpers import merge_steering, parse_request_steering
-from saklas.server.streaming import probe_measurements_aggregate
 from saklas.server.tree_models import cast_json, node_json
 from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
@@ -949,9 +948,12 @@ async def _ws_stream_generation(
             # the OpenAI / Ollama ``x-saklas-probe-readings`` extension, which
             # is a real external contract).  Result-parameterized so each n>1
             # sibling reports its own result.
-            mf_measurements = probe_measurements_aggregate(session, result)
-            if mf_measurements:
-                result_json["measurements"] = mf_measurements
+            # Built once by the engine at finalize (``GenerationResult.
+            # measurements``), so the server does not re-split readings by
+            # family — and the lens/SAE channels keep their native
+            # ``ScalarReading`` shape instead of a reprojection.
+            if result is not None and result.measurements:
+                result_json["measurements"] = result.measurements
             # Phase 1 logit pass: stamp the per-turn logprob rollup on the
             # ``done`` event so subscribers (loom sidebar's sort-by-surprise,
             # webui chat-header summary) don't need to re-fetch the node.

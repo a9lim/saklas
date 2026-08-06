@@ -4,9 +4,11 @@ Owns everything lens-probe-shaped: the probe registry, the live-readout
 runtime state, the per-forward stash, the per-generation disk-identity pin,
 and the six read surfaces (attach / per-step scoring / gate scalars /
 finalize aggregate / live display step / authored-prefill computation).
-The session re-exposes these state fields as delegating properties, under the
-private names ``_begin_capture``, the steering composer, the token tap, and
-the wire layers read them by.
+The instrument IS the addressing scheme for that state: ``_begin_capture``,
+the steering composer, the token tap, and the wire layers read
+``session._lens_instrument.<field>`` (or the public ``session.lens``); the
+transitional delegating properties that re-exposed it under historical
+private session names are gone.
 
 Division of labor (see ``protocol.py``): shared J-lens *primitives* —
 ``_jlens_logits_rows`` / depth caches / decode memo / transport stack /
@@ -29,14 +31,20 @@ import torch
 
 from saklas.core.instruments.types import (
     Axis,
+    DepthSummary,
     GateRef,
     InstrumentBinding,
+    InstrumentFamily,
     InstrumentPlan,
     InstrumentPrep,
+    LensLiveState,
     LensPrep,
     ReadRequest,
+    ScalarReading,
+    UNIT_MEAN_TOKEN_PROBABILITY,
     next_prep_token,
     parse_gate_ref,
+    scalar_gate_keys,
     validate_gate_channels,
 )
 # The readout half of the lens module is import-light by construction (the
@@ -52,7 +60,6 @@ from saklas.core.jlens import (
 )
 
 if TYPE_CHECKING:
-    from saklas.core.results import ProbeReading
     from saklas.core.session import SaklasSession
 
 
@@ -95,15 +102,15 @@ class LensRun:
         #: True for a generation-bound run (idle runs pass through).
         self.bound = bound
         self.step_stash: dict[str, Any] | None = None
-        self.last_step_readings: dict[str, "ProbeReading"] | None = None
+        self.last_step_readings: dict[str, ScalarReading] | None = None
         self._memo_step: int | None = None
-        self._memo_readings: dict[str, "ProbeReading"] | None = None
+        self._memo_readings: dict[str, ScalarReading] | None = None
 
     # ------------------------------------------------------------ protocol
 
     def observe(
         self, step_id: int, hidden: dict[int, torch.Tensor],
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """Readings for every attached probe at this step, memoized by
         ``step_id`` while bound.  The workers' full-roster reads prime
         this memo (``prime_observation``); the matrix-granular
@@ -146,7 +153,7 @@ class LensRun:
         )
 
     def prime_observation(
-        self, step_id: int, readings: dict[str, "ProbeReading"],
+        self, step_id: int, readings: dict[str, ScalarReading],
     ) -> None:
         """Prime the step memo with FULL-roster readings a hot-path worker
         already computed this forward — a later ``observe(step_id, …)``
@@ -159,7 +166,7 @@ class LensRun:
 
     def observe_aggregate(
         self, pooled: dict[int, Any],
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """End-of-generation aggregate at the pooled last-content slice."""
         return self._instrument.score_probes(pooled)
 
@@ -178,7 +185,7 @@ class LensRun:
 class LensInstrument:
     """Session-lifetime handle for the J-lens read family."""
 
-    family = "lens"
+    family: InstrumentFamily = "lens"
 
     #: Gate channels a lens probe can produce: the one strength axis.
     _GATE_CHANNELS: tuple[type, ...] = (Axis,)
@@ -223,12 +230,12 @@ class LensInstrument:
         self.current_run.step_stash = value
 
     @property
-    def last_step_readings(self) -> "dict[str, ProbeReading] | None":
+    def last_step_readings(self) -> "dict[str, ScalarReading] | None":
         return self.current_run.last_step_readings
 
     @last_step_readings.setter
     def last_step_readings(
-        self, value: "dict[str, ProbeReading] | None",
+        self, value: "dict[str, ScalarReading] | None",
     ) -> None:
         self.current_run.last_step_readings = value
 
@@ -635,7 +642,7 @@ class LensInstrument:
         hidden: dict[int, torch.Tensor],
         *,
         only: "set[str] | None" = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """Score every attached probe from capture hidden slices.
 
         The capture-slice entry: computes the lens logits itself over the
@@ -667,7 +674,7 @@ class LensInstrument:
         logits: torch.Tensor | None = None,
         probabilities: torch.Tensor | None = None,
         only: "set[str] | None" = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """Score attached probes from precomputed lens rows aligned to
         ``layers`` — exactly one of ``logits`` / ``probabilities``.
 
@@ -711,15 +718,17 @@ class LensInstrument:
         logits: torch.Tensor | None = None,
         probabilities: torch.Tensor | None = None,
         only: "set[str] | None" = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """Synthesize the readout-channel readings for ``layers``' rows.
 
-        Returns ``{name: ProbeReading}`` with ``coords = (strength,)`` — the
-        ONE readout channel, mean layer probability — ``coords_per_layer[l] =
-        (p_l,)``, and the depth CoM (geometry fields defaulted).
+        Returns the family-native :class:`ScalarReading`: ONE channel, the
+        mean fitted-layer probability ``mean_l p_l(v)``, its explicit
+        ``unit``, the per-layer ``p_l`` trace, and a depth summary that
+        names its own mass basis.  Not a ``ProbeReading`` with eight
+        neutralized geometry fields — a readout probe has no fraction,
+        nearest, residual, assignment or membership to report, and shipping
+        those as constants is measurement-shaped noise.
         """
-        from saklas.core.results import ProbeReading
-
         session = self._session
         names = [
             name for name in probes
@@ -745,18 +754,19 @@ class LensInstrument:
                 token_ids_tensor=token_ids_tensor,
                 depth_tensor=depth_tensor,
             )
-        out: dict[str, ProbeReading] = {}
+        out: dict[str, ScalarReading] = {}
         for name, (strength, com, spread, per_layer) in zip(names, stats):
-            out[name] = ProbeReading(
-                fraction=0.0,
-                nearest=[],
-                coords=(strength,),
-                residual=0.0,
-                coords_per_layer={
-                    l: (p_l,) for l, p_l in zip(layers, per_layer)
+            out[name] = ScalarReading(
+                value=float(strength),
+                unit=UNIT_MEAN_TOKEN_PROBABILITY,
+                per_layer={
+                    int(l): float(p_l) for l, p_l in zip(layers, per_layer)
                 },
-                depth_com=(com,),
-                depth_spread=(spread,),
+                depth=DepthSummary(
+                    center=(float(com),),
+                    spread=(float(spread),),
+                    basis="readout_probability_mass",
+                ),
             )
         return out
 
@@ -778,8 +788,6 @@ class LensInstrument:
         full-roster readings prime the run's ``observe`` memo.  Empty
         when nothing is capturable yet.
         """
-        from saklas.core.monitor import Monitor
-
         session = self._session
         lens, probes = self._measurement_state()
         if not probes or lens is None:
@@ -857,10 +865,10 @@ class LensInstrument:
             )
             if probe_read_only is None:
                 self.current_run.prime_observation(step_id, readings)
-        if only is None:
-            return Monitor.flat_scalars(readings)
-        return Monitor.flat_scalars({
-            name: reading for name, reading in readings.items() if name in only
+        return scalar_gate_keys({
+            name: reading.value
+            for name, reading in readings.items()
+            if only is None or name in only
         })
 
     def score_aggregate(
@@ -868,7 +876,7 @@ class LensInstrument:
         generated_ids: list[int],
         *,
         pooled: dict[int, torch.Tensor] | None = None,
-    ) -> dict[str, "ProbeReading"]:
+    ) -> dict[str, ScalarReading]:
         """End-of-gen aggregate pooled at the last content token.
 
         Shares the session's ``_pooled_aggregate_slice`` with the monitor
@@ -943,7 +951,7 @@ class LensInstrument:
                 "layer_rows": {l: i for i, l in enumerate(layer_list)},
                 "unembed": get_unembedding(session._model),
                 "norm": get_final_norm(session._model),
-                "source": session._active_jlens_source_label(),
+                "source": self.active_source,
             }
             return list(layers)
 
@@ -959,6 +967,107 @@ class LensInstrument:
             if self.live is None:
                 return None
             return list(self.live["layers"])
+
+    @property
+    def active_source(self) -> str | None:
+        """The active J-lens source in the public source syntax.
+
+        THE resolver — one ``active.json`` read, the same label that stamps
+        every lens measurement binding.  A listing that answered from the
+        prepared-sources scan instead would report ``null`` for an active
+        pointer whose artifact is gone while persisted rows still carry its
+        label.
+        """
+        from saklas.io.lens_sources import (
+            lens_source_label, load_active_lens_source,
+        )
+
+        active = load_active_lens_source(self._session.model_id)
+        return None if active is None else lens_source_label(active)
+
+    @property
+    def live_state(self) -> LensLiveState:
+        layers = self.live_layers
+        return LensLiveState(
+            enabled=layers is not None,
+            layers=tuple(layers) if layers is not None else None,
+        )
+
+    def set_live(self, enabled: bool, **kwargs: Any) -> LensLiveState:
+        """Toggle the live workspace readout.
+
+        ``layers`` (the family extra) selects the live layer set; omitted
+        means every fitted layer.  Disabling with an explicit layer list is
+        a caller error, not a silent no-op.
+        """
+        layers = kwargs.pop("layers", None)
+        if kwargs:
+            raise TypeError(
+                f"lens live takes only 'layers', got {sorted(kwargs)}"
+            )
+        if not enabled:
+            if layers is not None:
+                raise TypeError("lens live disable takes no 'layers'")
+            self.disable_live()
+            return LensLiveState(enabled=False, layers=None)
+        resolved = self.enable_live(layers=layers)
+        return LensLiveState(enabled=True, layers=tuple(resolved))
+
+    # -------------------------------------------------------------- replay
+
+    def token_readout(
+        self,
+        node_id: str,
+        raw_index: int,
+        *,
+        top_k: int | None = None,
+        layers: "list[int] | str | None" = None,
+        apply_steering: bool = True,
+        raw: bool = False,
+    ) -> dict[str, Any]:
+        """The loom-anchored J-lens replay, as the finished
+        ``scope="replay"`` measurement envelope.
+
+        The session owns the replay itself (prompt rebuild, one capture
+        forward under the node's recipe steering); this method owns the
+        envelope, so the route never reshapes a family-native dict.  The
+        session hands back per-layer *probabilities*, which is exactly what
+        ``build_measurements`` takes — there is no exp/log round-trip on
+        this hop.
+        """
+        from saklas.core.measurements import build_measurements
+
+        width = 8 if top_k is None else int(top_k)
+        if not 1 <= width <= 256:
+            raise ValueError("top_k must be in [1, 256]")
+        out = self._session.jlens_token_readout(
+            node_id,
+            raw_index,
+            layers=layers if layers is not None else "all",
+            top_k=width,
+            apply_steering=apply_steering,
+            raw=raw,
+        )
+        readout = out.get("readout", {})
+        measurements = build_measurements(
+            scope="replay",
+            provenance="replayed",
+            lens_readout={
+                int(layer): [(str(tok), float(p_l)) for tok, p_l, _tid in rows]
+                for layer, rows in readout.items()
+            },
+            lens_token_ids={
+                int(layer): [int(tid) for _tok, _p_l, tid in rows]
+                for layer, rows in readout.items()
+            },
+            lens_aggregate=[
+                (str(tok), float(strength), float(com), float(spread))
+                for tok, strength, com, spread in out.get("aggregate", [])
+            ],
+            lens_source=self.active_source,
+            steering=(out.get("steering") if apply_steering else None),
+        )
+        return {"measurements": measurements}
 
     def live_readout_step(
         self, *, top_k: int = 8, step_id: int = -1,
@@ -1120,7 +1229,7 @@ class LensInstrument:
                 )
                 if reading_layers == tuple(layers_present):
                     self.last_step_readings = cast(
-                        "dict[str, ProbeReading]",
+                        "dict[str, ScalarReading]",
                         stash.get("readings") or {},
                     )
                     readings_reused = True
@@ -1191,7 +1300,7 @@ class LensInstrument:
         dict[int, list[tuple[str, float]]],
         list[tuple[str, float, float, float]],
         dict[int, list[int]],
-        dict[str, "ProbeReading"],
+        dict[str, ScalarReading],
     ] | None:
         """Live J-LENS payload for one retained authored producer row.
 

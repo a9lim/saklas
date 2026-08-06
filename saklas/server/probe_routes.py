@@ -35,7 +35,13 @@ class ProbeRequest(NativeRequest):
 
 
 def _probe_info(name: str, probe: AttachedManifoldProbe) -> dict[str, Any]:
-    """Serialize one attached probe (any rank) to JSON for the wire."""
+    """Serialize one attached geometry probe (any rank) to JSON for the wire.
+
+    Rows are discriminated by an explicit ``family`` key and carry only what
+    their family can actually produce.  A client keys off ``family``, not off
+    an out-of-band ``lens: true`` flag against an otherwise geometry-shaped
+    row.
+    """
     manifold = probe.manifold
     domain_spec = manifold.domain.to_spec()
     intrinsic_dim = int(manifold.domain.intrinsic_dim)
@@ -43,6 +49,7 @@ def _probe_info(name: str, probe: AttachedManifoldProbe) -> dict[str, Any]:
     node_coords = nc.tolist() if nc is not None else None
     is_affine = manifold_is_affine(manifold)
     return {
+        "family": "geometry",
         "name": name,
         "manifold": manifold.name,
         "top_n": int(probe.top_n),
@@ -66,24 +73,19 @@ def _probe_info(name: str, probe: AttachedManifoldProbe) -> dict[str, Any]:
 def _lens_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     """Serialize one pinned J-lens token probe (readout channel) to JSON.
 
-    Shape-compatible with :func:`_probe_info` (the client keys off the
-    ``lens`` discriminator): the ONE coordinate axis is ``strength`` (mean
-    band probability, [0, 1]), per-layer traces are ``(p_l,)`` over the
-    workspace band — there is no subspace geometry behind a readout probe.
+    There is no subspace behind a readout probe, so the row carries no
+    geometry fields: the invented ``manifold: "jlens"`` (no such manifold
+    exists), ``top_n: 0``, ``domain: {}``, ``is_affine``, ``node_coords``,
+    ``node_count`` and the ``node_labels: [word]`` stand-in are gone.  What
+    remains is real: the fitted layer set, the one strength axis, and the
+    word / vocabulary id the channel reads.
     """
     return {
+        "family": "lens",
         "name": name,
-        "manifold": "jlens",
-        "top_n": 0,
         "layers": sorted(int(l) for l in spec.get("layers", ())),
-        "node_labels": [spec.get("word", "")],
-        "node_count": 1,
-        "domain": {},
         "intrinsic_dim": 1,
         "feature_space": "readout",
-        "is_affine": False,
-        "node_coords": None,
-        "lens": True,
         "word": spec.get("word", ""),
         "token_id": spec.get("token_id"),
     }
@@ -91,36 +93,32 @@ def _lens_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
 
 def _lens_probe_specs(session: SaklasSession) -> dict[str, dict[str, Any]]:
     """Snapshot the session's pinned lens-probe registry."""
-    return session.lens_probe_specs
+    return session.lens.specs()
 
 
 def _sae_probe_info(name: str, spec: dict[str, Any]) -> dict[str, Any]:
-    """Serialize one pinned SAE feature probe (encoder readout channel)."""
-    feature_id = int(spec.get("feature_id", -1))
-    label = spec.get("label")
+    """Serialize one pinned SAE feature probe (encoder readout channel).
+
+    Same discipline as the lens row: no invented ``manifold``/``domain``/
+    ``node_*`` geometry.  A feature probe reads one encoder channel at one
+    resident layer.
+    """
     return {
+        "family": "sae",
         "name": name,
-        "manifold": "sae",
-        "top_n": 0,
         "layers": [int(spec.get("layer", 0))],
-        "node_labels": [str(label) if label else str(feature_id)],
-        "node_count": 1,
-        "domain": {},
         "intrinsic_dim": 1,
         "feature_space": "sae-readout",
-        "is_affine": False,
-        "node_coords": None,
-        "sae": True,
-        "feature_id": feature_id,
-        "label": label,
-        # The strength unit — coords are ``activation / max_act`` when set,
-        # raw activation when null (no Neuronpedia metadata).
+        "feature_id": int(spec.get("feature_id", -1)),
+        "label": spec.get("label"),
+        # The strength unit — the reading is ``activation / max_act`` when
+        # set, raw activation when null (no Neuronpedia metadata).
         "max_act": spec.get("max_act"),
     }
 
 
 def _sae_probe_specs(session: SaklasSession) -> dict[str, dict[str, Any]]:
-    return session.sae_probe_specs
+    return session.sae.specs()
 
 
 def register_probe_routes(app: FastAPI) -> None:
