@@ -22,19 +22,12 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from saklas.core.instruments.types import (
-    Assignment,
-    Axis,
-    Distance,
-    Fraction,
-    GateRef,
     InstrumentBinding,
     InstrumentPlan,
     InstrumentPrep,
-    Membership,
     ReadRequest,
     next_prep_token,
     parse_gate_ref,
-    validate_gate_channels,
 )
 
 if TYPE_CHECKING:
@@ -116,37 +109,6 @@ class GeometryRun:
         self._memo_step = step_id
         self._memo_readings = readings
 
-    def gate_scalars(
-        self,
-        step_id: int,
-        hidden: dict[int, torch.Tensor] | None,
-        gate_keys: frozenset[str] | set[str] | None,
-    ) -> dict[str, float]:
-        """The gated subset's scalar channels at this step (idle reads
-        hold the state lock; the bound path is the per-token hot path).
-        Uniform None semantics (the protocol contract): ``hidden=None``
-        reads the capture's latest slices; ``gate_keys=None`` scores the
-        full roster (``flat_scalars`` over ``observe``, sharing its step
-        memo)."""
-        session = self._instrument._session
-        monitor = session._monitor
-        if hidden is None:
-            hidden = session._capture.latest_per_layer()
-        if gate_keys is None:
-            from saklas.core.monitor import Monitor
-
-            return Monitor.flat_scalars(self.observe(step_id, hidden))
-        if not self.bound:
-            with self._instrument.state_lock:
-                plan = monitor.plan_gate_scalars(set(gate_keys))
-                if not plan:
-                    return {}
-                return monitor.score_planned_gate_scalars(hidden, plan)
-        plan = monitor.plan_gate_scalars(set(gate_keys))
-        if not plan:
-            return {}
-        return monitor.score_planned_gate_scalars(hidden, plan)
-
     def observe_aggregate(
         self, pooled: dict[int, torch.Tensor],
     ) -> dict[str, Any]:
@@ -166,11 +128,6 @@ class GeometryRun:
                 )
         return self._instrument._session._monitor.score_aggregate(pooled)
 
-    def observe_many(
-        self, pooled_rows: "list[dict[int, torch.Tensor]]",
-    ) -> list[dict[str, Any]]:
-        return [self.observe_aggregate(rows) for rows in pooled_rows]
-
     def close(self) -> None:
         self._memo_step = None
         self._memo_readings = None
@@ -181,11 +138,11 @@ class GeometryInstrument:
 
     family = "geometry"
 
-    #: Every gate channel: axes, fraction, membership, label distance,
-    #: soft assignment — the full whitened-reading key family.
-    _GATE_CHANNELS: tuple[type, ...] = (
-        Axis, Fraction, Membership, Distance, Assignment,
-    )
+    # No gate-channel capability list: the whitened reading produces EVERY
+    # channel in the key family (axes, fraction, membership, label distance,
+    # soft assignment), so there is nothing for a composition preflight to
+    # reject.  The lens/SAE families carry one because their single strength
+    # axis genuinely cannot answer a geometry channel.
 
     def __init__(self, session: "SaklasSession") -> None:
         self._session = session
@@ -361,9 +318,6 @@ class GeometryInstrument:
         with self.state_lock:
             return self._session._monitor.manifolds
 
-    def validate_gate(self, ref: GateRef) -> None:
-        validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
-
     # ---------------------------------------------------------------- planning
 
     def plan(self, prep: InstrumentPrep) -> InstrumentPlan:
@@ -378,8 +332,8 @@ class GeometryInstrument:
 
         When probe gates are the family's *sole* per-token consumer and
         the caller disabled final probe readings, demand narrows to the
-        gated probes' layer union — dormant pinned probes must not keep
-        capture alive (FIX #4's layer-union half).
+        gated probes' layer union — a dormant pinned probe must not keep
+        capture alive for a layer nothing this generation reads.
         """
         if prep.family != self.family:
             raise TypeError(
@@ -431,10 +385,8 @@ class GeometryInstrument:
         return InstrumentPlan(
             family=self.family,
             latest_layers=latest,
-            per_step=per_token,
             gate_keys=gate_keys,
             final_aggregate=bool(request.final_aggregate),
-            batch_aggregate=bool(request.batch and request.final_aggregate),
             prep_token=prep.token,
         )
 

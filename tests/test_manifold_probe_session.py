@@ -865,26 +865,6 @@ def test_token_payload_consumes_the_full_incremental_memo():
     session._geometry_instrument.close_run()
 
 
-def test_geometry_gate_keys_none_vs_empty_contract():
-    """The protocol's sentinel semantics: ``gate_keys=None`` scores the
-    full roster, an explicit ``set()`` means "no gated probes" and scores
-    nothing.  The geometry member of the three-family contract pin."""
-    session = _stub_session()
-    m = _toy_manifold()
-    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
-        {key: m},
-    )
-    session.add_probe("toy")
-    run = session._geometry_instrument.current_run
-    hidden = {
-        layer_idx: sub.mean + sub.basis[0]
-        for layer_idx, sub in m.layers.items()
-    }
-    full = run.gate_scalars(0, hidden, None)
-    assert "toy" in full and "toy:fraction" in full
-    assert run.gate_scalars(0, hidden, set()) == {}
-
-
 def test_batch_geometry_aggregate_routes_through_the_run():
     """``_batch_probe_aggregate_for_row`` reaches the roster through
     ``current_run.observe_aggregate`` — this exact site was the round-2

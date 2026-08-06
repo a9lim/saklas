@@ -30,7 +30,6 @@ from typing import Any, Mapping, Sequence, TYPE_CHECKING, cast
 import torch
 
 from saklas.core.instruments.types import (
-    AGG_TAIL_DEPTH,
     Axis,
     GateRef,
     InstrumentBinding,
@@ -165,12 +164,6 @@ class LensRun:
     ) -> dict[str, "ProbeReading"]:
         """End-of-generation aggregate at the pooled last-content slice."""
         return self._instrument.score_probes(pooled)
-
-    def observe_many(
-        self, pooled_rows: "list[dict[int, Any]]",
-    ) -> list[dict[str, "ProbeReading"]]:
-        """Batch-generation aggregates: one reading set per row."""
-        return [self.observe_aggregate(rows) for rows in pooled_rows]
 
     def close(self) -> None:
         """Release generation-scoped state (stash, memo, pin)."""
@@ -508,18 +501,15 @@ class LensInstrument:
                 }
         return name
 
-    def detach(self, name: str) -> None:
-        with self.state_lock:
-            del self.probes[name]
-
     def try_detach(self, name: str) -> bool:
-        """Atomic membership-check + detach under the lens-state lock.
+        """Atomic membership-check + detach under the lens-state lock — the
+        family's only removal surface.
 
-        The session's ``remove_probe`` dispatch routes lens removals here
-        — a bare ``name in probes`` check followed by a delete is two
-        un-serialized registry touches (round-5: the direct
-        ``del _lens_probes[name]`` bypassed the boundary entirely).
-        Returns False when the name isn't a lens probe.
+        The session's ``remove_probe`` dispatch routes lens removals here: a
+        bare ``name in probes`` check followed by a delete is two
+        un-serialized registry touches, so membership and removal have to
+        land inside one hold.  Returns False when the name isn't a lens
+        probe.
         """
         with self.state_lock:
             if name not in self.probes:
@@ -614,13 +604,8 @@ class LensInstrument:
             family=self.family,
             latest_layers=frozenset(latest),
             tail_layers=frozenset(tail),
-            tail_depth=AGG_TAIL_DEPTH if tail else 0,
-            per_step=bool(live is not None or gate_keys),
             gate_keys=gate_keys,
             final_aggregate=bool(probes and request.final_aggregate),
-            batch_aggregate=bool(
-                request.batch and probes and request.final_aggregate
-            ),
             prep_token=prep.token,
         )
 

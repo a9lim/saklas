@@ -5822,21 +5822,18 @@ class SaklasSession:
             gate_keys=frozenset(gating_probe_keys or ()),
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
-            return_hidden=widen,
         ))
         lens_prep = self._lens_instrument.prepare(ReadRequest(
             gate_keys=frozenset(lens_gating_probe_keys or ()),
             live=live_lens_active,
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
-            return_hidden=widen,
         ))
         sae_prep = self._sae_instrument.prepare(ReadRequest(
             gate_keys=frozenset(sae_gating_probe_keys or ()),
             live=live_sae_active,
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
-            return_hidden=widen,
         ))
         geometry_plan = self._geometry_instrument.plan(geometry_prep)
         lens_plan = self._lens_instrument.plan(lens_prep)
@@ -10282,7 +10279,6 @@ class SaklasSession:
             self._close_instrument_runs()
             batch_request = ReadRequest(
                 final_aggregate=return_probe_readings,
-                batch=True,
             )
             geometry_prep = self._geometry_instrument.prepare(batch_request)
             lens_prep = self._lens_instrument.prepare(batch_request)

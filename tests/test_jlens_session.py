@@ -896,7 +896,7 @@ def test_prepare_pin_demand_formula() -> None:
     session._lens_probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0],
     }
-    prep = inst.prepare(ReadRequest(final_aggregate=True, batch=True))
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
     assert prep.pinned is True and prep.lens is not None
 
     # Final readings disabled: dormant probes do not pin — a lens gate does.
