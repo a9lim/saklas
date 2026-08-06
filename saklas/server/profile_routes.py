@@ -18,14 +18,19 @@ from fastapi.responses import Response
 
 from saklas.core.profile import Profile
 from saklas.server.app import acquire_session_lock
-from saklas.server.native_common import refuse_if_busy, resolve_session_id
+from saklas.server.native_common import (
+    extraction_error_frame,
+    extraction_json_errors,
+    refuse_if_busy,
+    resolve_session_id,
+)
 from saklas.server.profile_models import (
     BakeProfileRequest,
     ExtractRequest,
     extract_registry_name,
     profile_to_json,
 )
-from saklas.server.sse import ProgressCallback, progress_sse_response
+from saklas.server.sse import ProgressCallback, sse_or_json
 
 
 def register_profile_routes(app: FastAPI) -> None:
@@ -340,6 +345,12 @@ def register_profile_routes(app: FastAPI) -> None:
 
     @app.post("/saklas/v1/sessions/{session_id}/extract")
     async def extract_profile(session_id: str, req: ExtractRequest, request: Request):
+        """Fit a concept and register its folded profile on the live session.
+
+        SSE progress on ``Accept: text/event-stream``, one JSON body
+        otherwise; the JSON branch additionally returns the collected
+        ``progress`` lines the SSE branch streams as frames.
+        """
         resolve_session_id(session_id)
 
         def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
@@ -350,37 +361,28 @@ def register_profile_routes(app: FastAPI) -> None:
                 role=req.role, namespace=req.namespace, force=req.force,
             )
 
-        accept = request.headers.get("accept", "application/json")
-        if "text/event-stream" in accept:
-            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
-                canonical, profile = await asyncio.to_thread(_run, on_progress)
-                registry_name = extract_registry_name(canonical, req.namespace)
-                session.steer(registry_name, profile)
-                return {
-                    "done": True,
-                    "profile": profile_to_json(registry_name, profile),
-                    "canonical": registry_name,
-                }
-
-            return progress_sse_response(
-                session.lock,
-                _job,
-                error_message="extract failed",
-                log_message=f"extract failed for session={session_id}",
-            )
-
-        progress_msgs: list[str] = []
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            canonical, profile = await asyncio.to_thread(_run, progress_msgs.append)
+        async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+            canonical, profile = await asyncio.to_thread(_run, on_progress)
             registry_name = extract_registry_name(canonical, req.namespace)
             session.steer(registry_name, profile)
-        return {
-            "canonical": registry_name,
-            "profile": profile_to_json(registry_name, profile),
-            "progress": progress_msgs,
-        }
+            return {
+                "done": True,
+                "profile": profile_to_json(registry_name, profile),
+                "canonical": registry_name,
+            }
+
+        # Extract and manifold ``fit`` drive the same extraction pipeline, so
+        # they share its typed error policy rather than diverging by accident.
+        return await sse_or_json(
+            request,
+            session,
+            _job,
+            error_message="extract failed",
+            log_message=f"extract failed for session={session_id}",
+            error_formatter=extraction_error_frame,
+            json_errors=extraction_json_errors(),
+            json_progress_key="progress",
+        )
 
     @app.post("/saklas/v1/sessions/{session_id}/profiles/bake")
     async def bake_profile(session_id: str, req: BakeProfileRequest):

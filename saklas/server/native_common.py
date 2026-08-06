@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -45,3 +45,42 @@ def refuse_if_busy(session: "SaklasSession") -> None:
             409, "a model operation is in flight; retry shortly",
         )
     session.gen_lock.release()
+
+
+def extraction_error_frame(exc: Exception) -> dict[str, Any] | None:
+    """SSE ``error``-frame body for a typed extraction-pipeline failure.
+
+    ``POST /extract`` and ``POST /manifolds/{ns}/{name}/fit`` drive the one
+    :class:`~saklas.core.extraction.ManifoldExtractionPipeline`, so they share
+    the same two safe-to-surface failures: a concurrent run holding the engine
+    (conflict) and an authoring-grade ``ValueError`` — the RBF poisedness
+    failure among them, which gets its own code so the client can offer the
+    "spread your nodes" hint.  ``None`` for anything else, which routes the
+    exception to the shared catch-all scrubber.
+    """
+    from saklas.core.session import ConcurrentExtractionError
+
+    if isinstance(exc, ConcurrentExtractionError):
+        return {"message": str(exc), "code": "Conflict"}
+    if isinstance(exc, ValueError):
+        return {
+            "message": str(exc),
+            "code": (
+                "PoisednessError"
+                if "poisedness" in str(exc).lower()
+                else type(exc).__name__
+            ),
+        }
+    return None
+
+
+def extraction_json_errors() -> tuple[tuple[Any, int], ...]:
+    """JSON-branch status mapping matching :func:`extraction_error_frame`.
+
+    Conflict first: ``ConcurrentExtractionError`` is a ``RuntimeError`` and
+    ``ManifoldFormatError`` is a ``ValueError``, so the ordered table lands
+    both on the status their SSE counterparts report.
+    """
+    from saklas.core.session import ConcurrentExtractionError
+
+    return ((ConcurrentExtractionError, 409), (ValueError, 400))

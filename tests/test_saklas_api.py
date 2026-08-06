@@ -451,6 +451,76 @@ class TestExtract:
         assert session.extract.call_args.args == ("angry", "calm")
         session.steer.assert_called_once_with("angry.calm", profile)
 
+    def test_extract_json_still_reports_progress_lines(
+        self, session_and_client: Any,
+    ) -> None:
+        """The JSON branch returns what the SSE branch streams as frames."""
+        import torch
+        from saklas.core.profile import Profile
+        session, client = session_and_client
+        profile = Profile({0: torch.zeros(4)})
+
+        def _extract(*_args: Any, on_progress: Any = None, **_kwargs: Any) -> Any:
+            if on_progress is not None:
+                on_progress("capturing")
+                on_progress("fitting")
+            return ("angry.calm", profile)
+
+        session.extract.side_effect = _extract
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={"concept": "angry", "baseline": "calm"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["progress"] == ["capturing", "fitting"]
+
+    def test_extract_json_maps_a_value_error_to_400(
+        self, session_and_client: Any,
+    ) -> None:
+        """Extract shares manifold ``fit``'s typed error policy.
+
+        Both drive the one extraction pipeline; the JSON branch used to map
+        nothing, so an authoring-grade ``ValueError`` surfaced as a 500.
+        """
+        session, client = session_and_client
+        session.extract.side_effect = ValueError("nodes are not poised")
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={"concept": "angry", "baseline": "calm"},
+        )
+        assert resp.status_code == 400
+        assert "poised" in resp.text
+
+    def test_extract_json_maps_a_concurrent_run_to_409(
+        self, session_and_client: Any,
+    ) -> None:
+        from saklas.core.session import ConcurrentExtractionError
+
+        session, client = session_and_client
+        session.extract.side_effect = ConcurrentExtractionError("busy")
+        resp = client.post(
+            "/saklas/v1/sessions/default/extract",
+            json={"concept": "angry", "baseline": "calm"},
+        )
+        assert resp.status_code == 409
+
+    def test_extract_sse_surfaces_a_typed_safe_message(
+        self, session_and_client: Any,
+    ) -> None:
+        """A typed failure keeps its message instead of the generic frame."""
+        session, client = session_and_client
+        session.extract.side_effect = ValueError("poisedness check failed")
+        with client.stream(
+            "POST",
+            "/saklas/v1/sessions/default/extract",
+            json={"concept": "angry", "baseline": "calm"},
+            headers={"accept": "text/event-stream"},
+        ) as resp:
+            text = b"".join(resp.iter_bytes()).decode("utf-8")
+        assert "event: error" in text
+        assert "poisedness check failed" in text
+        assert '"code": "PoisednessError"' in text
+
     def test_extract_json_registers_returned_variant_and_namespace(
         self, session_and_client: Any,
     ) -> None:

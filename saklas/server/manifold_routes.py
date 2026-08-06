@@ -22,10 +22,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import ConfigDict, Field
 
 from saklas.core.manifold import domain_from_spec
-from saklas.core.session import (
-    ConcurrentExtractionError,
-    SaklasSession,
-)
+from saklas.core.session import SaklasSession
 from saklas.io.hf_manifolds import (
     HFError as ManifoldHFError,
     ManifoldInstallConflict,
@@ -51,8 +48,13 @@ from saklas.io.manifolds import (
 from saklas.io.paths import manifold_dir
 from saklas.io.templates import AmbiguousTemplateError, TemplateNotFoundError
 from saklas.server.app import acquire_session_lock
-from saklas.server.native_common import NativeRequest, refuse_if_busy
-from saklas.server.sse import ProgressCallback, progress_sse_response
+from saklas.server.native_common import (
+    NativeRequest,
+    extraction_error_frame,
+    extraction_json_errors,
+    refuse_if_busy,
+)
+from saklas.server.sse import ProgressCallback, sse_or_json
 
 log = logging.getLogger("saklas.api")
 
@@ -774,44 +776,36 @@ def register_manifold_routes(app: FastAPI) -> None:
             body["done"] = True
             return body
 
-        accept = request.headers.get("accept", "application/json")
-        if "text/event-stream" in accept:
-            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
-                return await asyncio.to_thread(_gen, on_progress)
+        async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+            return await asyncio.to_thread(_gen, on_progress)
 
-            def _format_error(e: Exception) -> dict[str, Any] | None:
-                if isinstance(e, HTTPException):
-                    http_error = cast(HTTPException, e)
-                    # The generate job only raises HTTPException to wrap a
-                    # ManifoldFormatError, whose detail embeds the on-disk
-                    # manifold path.  Log the detail server-side and surface a
-                    # path-free frame (SSE info-disclosure discipline — see
-                    # server/AGENTS.md).
-                    log.warning("manifold generate: format error: %s", http_error.detail)
-                    return {
-                        "message": "manifold has an unsupported on-disk format",
-                        "code": "ManifoldFormatError",
-                    }
-                if isinstance(e, ValueError):
-                    return {"message": str(e), "code": "ValueError"}
-                return None
+        def _format_error(e: Exception) -> dict[str, Any] | None:
+            if isinstance(e, HTTPException):
+                http_error = cast(HTTPException, e)
+                # The generate job only raises HTTPException to wrap a
+                # ManifoldFormatError, whose detail embeds the on-disk
+                # manifold path.  Log the detail server-side and surface a
+                # path-free frame (SSE info-disclosure discipline — see
+                # server/AGENTS.md).
+                log.warning("manifold generate: format error: %s", http_error.detail)
+                return {
+                    "message": "manifold has an unsupported on-disk format",
+                    "code": "ManifoldFormatError",
+                }
+            if isinstance(e, ValueError):
+                return {"message": str(e), "code": "ValueError"}
+            return None
 
-            return progress_sse_response(
-                session.lock,
-                _job,
-                error_message="generate failed",
-                log_message="manifold generate crashed",
-                error_formatter=_format_error,
-                logger=log,
-            )
-
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            try:
-                return await asyncio.to_thread(_gen, lambda _msg: None)
-            except ValueError as e:
-                raise HTTPException(400, str(e)) from e
+        return await sse_or_json(
+            request,
+            session,
+            _job,
+            error_message="generate failed",
+            log_message="manifold generate crashed",
+            error_formatter=_format_error,
+            json_errors=((ValueError, 400),),
+            logger=log,
+        )
 
     @app.patch("/saklas/v1/manifolds/{namespace}/{name}")
     async def update_manifold(
@@ -923,40 +917,16 @@ def register_manifold_routes(app: FastAPI) -> None:
             body["feature_space"] = manifold.feature_space
             return body
 
-        accept = request.headers.get("accept", "application/json")
-        if "text/event-stream" in accept:
-            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
-                return await asyncio.to_thread(_fit, on_progress)
+        async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
+            return await asyncio.to_thread(_fit, on_progress)
 
-            def _format_error(e: Exception) -> dict[str, Any] | None:
-                if isinstance(e, ConcurrentExtractionError):
-                    return {"message": str(e), "code": "Conflict"}
-                if isinstance(e, (ValueError, ManifoldFormatError)):
-                    return {
-                        "message": str(e),
-                        "code": (
-                            "PoisednessError"
-                            if "poisedness" in str(e).lower()
-                            else type(e).__name__
-                        ),
-                    }
-                return None
-
-            return progress_sse_response(
-                session.lock,
-                _job,
-                error_message="fit failed",
-                log_message="manifold fit crashed",
-                error_formatter=_format_error,
-                logger=log,
-            )
-
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            try:
-                return await asyncio.to_thread(_fit, lambda _msg: None)
-            except ConcurrentExtractionError as e:
-                raise HTTPException(409, str(e)) from e
-            except (ValueError, ManifoldFormatError) as e:
-                raise HTTPException(400, str(e)) from e
+        return await sse_or_json(
+            request,
+            session,
+            _job,
+            error_message="fit failed",
+            log_message="manifold fit crashed",
+            error_formatter=extraction_error_frame,
+            json_errors=extraction_json_errors(),
+            logger=log,
+        )
