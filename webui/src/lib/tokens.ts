@@ -74,7 +74,7 @@ export function surpriseScore(
  *  ramp (green +pole ↔ red −pole); ``surprise`` is the logit-space blue
  *  — surprise is a vocabulary-distribution quantity, so it shares the
  *  J-lens hue family and is unmistakably distinct from any probe
- *  reading (pre-v2 it reused the positive green band). */
+ *  reading. */
 export type TintHue = "signed" | "surprise" | "sae";
 
 /* Ramp poles (tokens.css: --highlight-pos / --highlight-neg /

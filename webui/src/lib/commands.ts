@@ -16,9 +16,6 @@ export interface RailTool {
 export interface RailCategory {
   key: string;
   label: string;
-  /** SVG path data for a 24×24 category glyph (currently unrendered —
-   *  kept for a future launcher surface). */
-  icon: string;
   tools: RailTool[];
 }
 
@@ -31,9 +28,6 @@ export const RAIL_CATEGORIES: RailCategory[] = [
     // (family-split), reached from the rack "+" buttons.
     key: "manifolds",
     label: "Steering",
-    // Undulating spline curve — reads as "manifold" and is visually
-    // distinct from analysis' line graph.
-    icon: "M3 17c4-8 6-8 9-4s2 8 9 0",
     tools: [
       {
         label: "build…",
@@ -65,7 +59,6 @@ export const RAIL_CATEGORIES: RailCategory[] = [
   {
     key: "analysis",
     label: "Analysis",
-    icon: "M4 18l5-12 4 8 3-5 4 9",
     tools: [
       {
         label: "correlation…",
@@ -82,7 +75,6 @@ export const RAIL_CATEGORIES: RailCategory[] = [
   {
     key: "session",
     label: "Session",
-    icon: "M5 21v-6M5 11V3M12 21v-9M12 8V3M19 21v-4M19 13V3M2 15h6M9 8h6M16 13h6",
     tools: [
       { label: "health…", drawer: "health", keywords: "device dtype" },
       {

@@ -100,7 +100,7 @@
       try {
         await ensureWebSocket();
       } catch {
-        /* ignore — sendGenerate will retry */
+        /* ignore — the send paths reopen the socket on demand */
       }
       bootStatus = "ready";
     } catch (e) {
@@ -334,8 +334,6 @@
             <Drawers.SystemPrompt params={drawerState.params} />
           {:else if drawerState.open === "help"}
             <Drawers.Help params={drawerState.params} />
-          {:else if drawerState.open === "export"}
-            <Drawers.Export params={drawerState.params} />
           {:else if drawerState.open === "token_drilldown"}
             <Drawers.TokenDrilldown params={drawerState.params} />
           {:else if drawerState.open === "correlation"}

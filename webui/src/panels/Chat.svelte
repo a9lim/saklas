@@ -451,11 +451,10 @@
 
   // ------------------------------------------------------------- A/B split --
 
-  /** v2.3: the standalone A/B toggle is gone.  The right column renders
-   *  either a pinned sibling's path or — when auto-regen is on — the
-   *  most recent auto-generated shadow / sibling.  The
-   *  ``autoRegenState.enabled`` flag drives both branches; mode
-   *  ``"unsteered"`` is the bit-identical fold of the old A/B. */
+  /** The right column renders either a pinned sibling's path or — when
+   *  auto-regen is on — the most recent auto-generated shadow / sibling.
+   *  The ``autoRegenState.enabled`` flag drives both branches; mode
+   *  ``"unsteered"`` is the unsteered-shadow A/B. */
   const autoRegenActive = $derived(autoRegenState.enabled);
 
   /** Phase-5: the right column renders either the pinned sibling's

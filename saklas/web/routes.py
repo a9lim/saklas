@@ -46,10 +46,13 @@ def dist_path() -> Path:
 def register_web_routes(app: FastAPI) -> None:
     """Mount the SPA bundle at ``/`` with an SPA-fallback to index.html.
 
-    Idempotent — calling it twice on the same app is a no-op (the second
-    mount would shadow the first).  CLI default-on (``saklas serve``);
-    ``--no-web`` opts out for production / proxied deployments.
-    Library callers using ``create_app`` directly default-off.
+    Call it once per app.  A repeat call appends a second ``/assets``
+    mount and duplicate ``/`` + catch-all routes; FastAPI matches in
+    registration order, so the first set keeps serving and the extras sit
+    shadowed — harmless but not rejected.  CLI default-on
+    (``saklas serve``); ``--no-web`` opts out for production / proxied
+    deployments.  Library callers using ``create_app`` directly
+    default-off.
     """
     from fastapi import HTTPException
     from fastapi.responses import FileResponse

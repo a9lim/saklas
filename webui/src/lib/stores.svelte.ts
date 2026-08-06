@@ -1,12 +1,12 @@
-// Cross-component state for the v1.7 dashboard.
+// Cross-component state for the dashboard.
 //
 // Svelte 5 runes-based.  Each slice is a $state-backed object exported as
 // a named const; components import the slice and read/write its fields
 // directly — Svelte's compiler tracks dependencies automatically.
 //
-// Cross-cutting actions (open the WS, send a generate, queue a pending
+// Cross-cutting actions (open the WS, send a submission, queue a pending
 // rack edit during in-flight gen) live in this file as functions so panels
-// don't need to coordinate amongst themselves; they call ``sendGenerate(...)``
+// don't need to coordinate amongst themselves; they call ``sendSubmit(...)``
 // or ``setSubspaceAlong(value)`` and the slice updates propagate.
 //
 // One singleton WS owned at the module level — the chat panel is no
@@ -1109,20 +1109,6 @@ export function clearChat(): void {
   }
 }
 
-export async function rewindSession(): Promise<void> {
-  await apiSessions.rewind();
-  await refreshSession();
-  // Drop the trailing user→assistant pair from the local log so the UI
-  // stays in lockstep with server-side history.
-  const t = chatLog.turns;
-  for (let i = t.length - 1; i >= 0; i--) {
-    if (t[i].role === "user") {
-      chatLog.turns = t.slice(0, i);
-      return;
-    }
-  }
-}
-
 // =========================================================== steering ===
 //
 // One unified steer rack.  A steering vector is the K=2 flat case of a
@@ -1193,12 +1179,6 @@ export async function refreshVectorList(): Promise<void> {
   for (const v of r.profiles) {
     steerRack.profiles.set(v.name, v);
   }
-}
-
-export async function refreshVector(name: string): Promise<VectorInfo> {
-  const info = await apiProfiles.get(name);
-  steerRack.profiles.set(name, info);
-  return info;
 }
 
 export async function refreshCorrelation(
@@ -1330,12 +1310,6 @@ export function applyCustomSteeringExpression(expression: string): void {
   enqueueOrApply("apply custom steering expression", () => {
     steerRack.entries.clear();
     steerRack.customExpression = expression;
-  });
-}
-
-export function useVisualSteeringRack(): void {
-  enqueueOrApply("use visual steering rack", () => {
-    steerRack.customExpression = null;
   });
 }
 
@@ -2047,9 +2021,6 @@ export function snapshotProbeBaseline(): void {
   }
 }
 
-/** Sentinel for the layer strip when a probe has no token yet. */
-export const EMPTY_PER_LAYER: Readonly<Record<string, number>> = Object.freeze({});
-
 // ============================================================ chat ======
 
 export interface ChatLogState {
@@ -2609,7 +2580,7 @@ export async function loomRegenerateNode(
   const parentId = node.parent_id;
   if (!parentId) return;
   try {
-    await sendGenerate(null, {
+    await sendGenerate({
       parent_node_id: parentId,
       n,
       recipe_override: opts.recipe_override ?? undefined,
@@ -2642,7 +2613,7 @@ export async function loomContinueFromCommitted(
   const node = loomTree.nodes.get(nodeId);
   if (!node || node.role === "system" || node.recipe !== null) return;
   try {
-    await sendGenerate(null, {
+    await sendGenerate({
       parent_node_id: node.id,
       n: opts.n ?? 1,
       recipe_override: opts.recipe_override ?? undefined,
@@ -3029,10 +3000,6 @@ export function cancelPendingAction(id: string): void {
   pendingActions.queue = pendingActions.queue.filter((p) => p.id !== id);
 }
 
-export function discardPendingActions(): void {
-  pendingActions.queue = [];
-}
-
 /** Apply immediately if no gen is in flight AND the queue is empty;
  *  queue otherwise.  The queue check matters: with one or more items
  *  already pending, applying a fresh rack mutation immediately would
@@ -3093,8 +3060,8 @@ export function isPendingBusy(): boolean {
  *  returns ``null`` when no queued item changes the role (e.g. the
  *  queue is empty or only carries rack mutations).  Drives the chat
  *  input's role-aware placeholder + send-button label so a queued
- *  ``commit user`` flips the next submission into prefill /
- *  commit-assistant mode without waiting for the queue to drain. */
+ *  user-seat submission flips the next one's predicted seat without
+ *  waiting for the queue to drain. */
 export function predictedQueueEndOnUserNode(): boolean | null {
   for (let i = pendingActions.queue.length - 1; i >= 0; i--) {
     const e = pendingActions.queue[i].endsOnUserNode;
@@ -3575,14 +3542,12 @@ function handleWsMessage(msg: WSServerMessage): void {
       // generation.  Between generations only, never per token.
       void backfillSaeMeta();
 
-      // v2.3: the legacy standalone A/B toggle is gone — auto-regen with
-      // ``mode === "unsteered"`` *is* the A/B shadow.  Branch on the
-      // resolved recipe-override:
+      // Auto-regen with ``mode === "unsteered"`` *is* the A/B shadow.
+      // Branch on the resolved recipe-override:
       //
       //   * ``"unsteered"`` → fire the shadow-replay path
       //     (``_sendShadowGenerate``).  Tokens land on the steered turn's
       //     ``abPair`` so the chat's right column renders them in place.
-      //     Bit-identical to the pre-v2.3 A/B behaviour.
       //
       //   * any other override → fire a loom regen with the override.
       //     The engine drops the result as a sibling under the same
@@ -3823,71 +3788,17 @@ async function sendSubmitNow(
   else sock.addEventListener("open", send, { once: true });
 }
 
-/** Build a :class:`PendingAction` for a queued chat send.  The
- *  ``rebuild`` factory preserves ``opts`` across an ↑-pull-and-edit so
- *  the slot's parent_node_id / steering override / n stay attached.
- *  ``endsOnUserNode=false`` — a send lands a user turn then an assistant
- *  reply, so the post-drain active node is always assistant. */
-function buildSendPending(
-  text: string, opts: SendGenerateOpts,
-): PendingAction {
-  return {
-    id: `pa-${_pendingCounter++}`,
-    label: "send",
-    text,
-    apply: () => sendGenerateNow(text, opts),
-    awaitsGen: true,
-    rebuild: (newText: string) => buildSendPending(newText, opts),
-    createdAt: Date.now(),
-    endsOnUserNode: false,
-  };
-}
-
-/** Send a generate request over the WS.  Builds the steering expression
- * from the rack live, layers the SamplingConfig overrides when one-shot
- * mode is on, and routes everything through the singleton connection.
+/** Send a bare-continuation generate request over the WS — the
+ * regenerate / continue-from-committed path.  No authored text travels:
+ * the model speaks next from ``opts.parent_node_id`` (or the active
+ * leaf) in ``opts.generate_seat``.  Builds the steering expression from
+ * the rack live, layers the SamplingConfig overrides when one-shot mode
+ * is on, and routes everything through the singleton connection.
  *
- * When a gen is in flight (or earlier items are queued) the request
- * lands on the pending queue and waits for FIFO drain — the in-flight
- * gen is *not* interrupted.  ``replaceSlot`` keeps a pulled-and-edited
- * item at its original slot. */
+ * Fires immediately even mid-generation: these are internal
+ * store-to-store calls behind an explicit user gesture on a specific
+ * node, not composer sends, so they carry no pending-queue slot. */
 export async function sendGenerate(
-  input: string | unknown,
-  opts: SendGenerateOpts & { replaceSlot?: number | null } = {},
-): Promise<void> {
-  // Strings route through the pending queue when busy.  Non-string
-  // ``input`` (the A/B shadow path's messages array) always fires
-  // immediately — it's an internal store-to-store call that doesn't
-  // come from a user gesture and can't be pulled or re-edited.
-  if (typeof input === "string" && isPendingBusy()) {
-    const { replaceSlot, ...sendOpts } = opts;
-    const item = buildSendPending(input, sendOpts);
-    enqueuePending(
-      {
-        label: item.label,
-        text: item.text,
-        apply: item.apply,
-        awaitsGen: item.awaitsGen,
-        rebuild: item.rebuild,
-        // A send lands an assistant turn, so the post-drain active node is an
-        // assistant.  Forward the factory's value (mirrors sendPrefill /
-        // sendCommit); omitting it left the queued send as ``undefined``, so
-        // ``predictedQueueEndOnUserNode`` skipped it and the input mode
-        // mispredicted while a gen was in flight.
-        endsOnUserNode: item.endsOnUserNode,
-      },
-      { replaceSlot: replaceSlot ?? null },
-    );
-    return;
-  }
-  return sendGenerateNow(input, opts);
-}
-
-/** Immediate-fire core for ``sendGenerate``.  Bypasses the queue
- *  check — called by ``sendGenerate`` itself when not busy and by
- *  ``drainNextPendingAction`` via the queued item's ``apply``. */
-async function sendGenerateNow(
-  input: string | unknown,
   opts: SendGenerateOpts = {},
 ): Promise<void> {
   // The first server snapshot may legitimately be revision 0.  Require the
@@ -3913,21 +3824,11 @@ async function sendGenerateNow(
   // Update genStatus.maxTokens locally so the progress bar widths know
   // their target before the first token lands.
   genStatus.maxTokens = sampling?.max_tokens ?? samplingState.max_tokens;
-  // Push the user turn so the UI has something to render before the WS
-  // started event lands.  Skip the optimistic push when the server owns
-  // the tree (it will emit ``tree_mutated`` with the added user node
-  // and we'll sync from there) or when ``input`` is a messages list
-  // (A/B shadow path — no fresh user turn to display).
-  if (!loomTree.loaded && typeof input === "string") {
-    chatLog.turns = [...chatLog.turns, { role: "user", text: input }];
-  }
-  // Remember the input verbatim so the auto-regen shadow path can replay
-  // it as an unsteered run.  Only meaningful when auto-regen is on with
-  // ``mode === "unsteered"``; otherwise it's dead weight that's free to
-  // keep up to date.
   const payload: WSClientMessage = {
     type: "generate",
-    input,
+    // A continue: no committed turn, the model speaks next from the
+    // anchor node.
+    input: null,
     steering: steeringPayload,
     sampling,
     // Coerce the current family-level automatic setting to explicit ``false`` so the
@@ -3979,205 +3880,6 @@ export async function sendFork(
   else sock.addEventListener("open", send, { once: true });
 }
 
-function buildPrefillPending(
-  nodeId: string | "active@drain",
-  text: string,
-  opts: { n?: number },
-): PendingAction {
-  return {
-    id: `pa-${_pendingCounter++}`,
-    label: "prefill",
-    text,
-    apply: () => {
-      // Deferred resolution: when the parent user node was itself queued
-      // (queue-role-aware dispatch), the literal id at enqueue time was
-      // a sentinel — read the active node fresh at drain time, by which
-      // point the previous drained action has landed the right user node.
-      const parent = nodeId === "active@drain"
-        ? loomTree.active_node_id
-        : nodeId;
-      if (!parent) return;
-      return sendPrefillNow(parent, text, opts);
-    },
-    awaitsGen: true,
-    rebuild: (newText: string) => buildPrefillPending(nodeId, newText, opts),
-    createdAt: Date.now(),
-    endsOnUserNode: false,
-  };
-}
-
-/** Answer-prefill — seed an assistant reply under a user node.  The
- *  server tokenizes ``text`` into a forced decode prefix, emits it as
- *  the opening of the assistant turn, then samples the continuation.
- *  The prefilled sibling streams in via the WS ``tree_mutated`` /
- *  ``token`` / ``done`` events and becomes the active branch.  Steering
- *  and sampling ride from the current rack exactly like a normal
- *  ``sendGenerate``; ``thinking`` is forced off server-side (the text is
- *  the start of the answer, not a thought).
- *
- *  Queues behind in-flight gens / earlier pending items; the in-flight
- *  gen is not interrupted. */
-export async function sendPrefill(
-  nodeId: string | "active@drain",
-  text: string,
-  opts: { n?: number; replaceSlot?: number | null } = {},
-): Promise<void> {
-  if (isPendingBusy()) {
-    const { replaceSlot, ...prefillOpts } = opts;
-    const item = buildPrefillPending(nodeId, text, prefillOpts);
-    enqueuePending(
-      {
-        label: item.label,
-        text: item.text,
-        apply: item.apply,
-        awaitsGen: item.awaitsGen,
-        rebuild: item.rebuild,
-        endsOnUserNode: item.endsOnUserNode,
-      },
-      { replaceSlot: replaceSlot ?? null },
-    );
-    return;
-  }
-  // Immediate fire: resolve the sentinel against the live active node;
-  // an empty resolution is a no-op (nothing to anchor under).
-  const resolved = nodeId === "active@drain"
-    ? loomTree.active_node_id
-    : nodeId;
-  if (!resolved) return;
-  return sendPrefillNow(resolved, text, opts);
-}
-
-async function sendPrefillNow(
-  nodeId: string,
-  text: string,
-  opts: { n?: number } = {},
-): Promise<void> {
-  const sock = await ensureWebSocket();
-  const steering = currentSteeringExpression();
-  const sampling = buildSamplingPayload();
-  genStatus.maxTokens = sampling?.max_tokens ?? samplingState.max_tokens;
-  const payload: WSClientMessage = {
-    type: "generate",
-    prefill_node_id: nodeId,
-    prefill_text: text,
-    steering: steering || null,
-    sampling,
-    ...(opts.n !== undefined ? { n: opts.n } : {}),
-  };
-  const send = () => sock.send(JSON.stringify(payload));
-  if (sock.readyState === WebSocket.OPEN) send();
-  else sock.addEventListener("open", send, { once: true });
-}
-
-function buildCommitPending(
-  role: "user" | "assistant",
-  parentNodeId: string | null | "active@drain",
-  text: string,
-  raw: boolean = false,
-  thinking: string | null = null,
-): PendingAction {
-  return {
-    id: `pa-${_pendingCounter++}`,
-    label: role === "assistant" ? "commit assistant" : "commit user",
-    text,
-    apply: () => {
-      // Deferred resolution for queue-role-aware dispatch: a commit
-      // queued behind another that creates its own user node needs to
-      // hang under that not-yet-existing node — read the active node
-      // fresh at drain time.
-      const parent = parentNodeId === "active@drain"
-        ? loomTree.active_node_id
-        : parentNodeId;
-      return sendCommitNow(role, parent, text, raw, thinking);
-    },
-    awaitsGen: true,
-    rebuild: (newText: string) =>
-      buildCommitPending(role, parentNodeId, newText, raw, thinking),
-    createdAt: Date.now(),
-    endsOnUserNode: role === "user",
-  };
-}
-
-/** Commit — land a turn without generating.  ``role`` decides which
- *  session method routes: ``"user"`` for ``append_user_turn`` (called
- *  on an assistant/root active node — ``parentNodeId`` is that node, or
- *  null to fall through to the active node server-side); ``"assistant"``
- *  for ``append_assistant_turn`` (``parentNodeId`` is the user node the
- *  authored turn hangs off — required).  The server emits a single
- *  ``done`` event with the new node id; the loom's ``tree_mutated`` /
- *  ``tree_mutated`` subscriptions land the node in the UI.  No token
- *  streaming, no steering, no sampling — just a tree mutation.
- *
- *  Queues behind in-flight gens / earlier pending items. */
-export async function sendCommit(
-  role: "user" | "assistant",
-  parentNodeId: string | null | "active@drain",
-  text: string,
-  opts: {
-    replaceSlot?: number | null;
-    raw?: boolean;
-    /** Committed thinking block riding this turn (rendered through the
-     *  family think delimiters; 400 when the family can't carry it). */
-    thinking?: string | null;
-  } = {},
-): Promise<void> {
-  if (isPendingBusy()) {
-    const item = buildCommitPending(
-      role, parentNodeId, text, opts.raw ?? false, opts.thinking ?? null,
-    );
-    enqueuePending(
-      {
-        label: item.label,
-        text: item.text,
-        apply: item.apply,
-        awaitsGen: item.awaitsGen,
-        rebuild: item.rebuild,
-        endsOnUserNode: item.endsOnUserNode,
-      },
-      { replaceSlot: opts.replaceSlot ?? null },
-    );
-    return;
-  }
-  // Immediate fire: resolve the sentinel against the live active node.
-  // ``role === "user"`` accepts a null parent (server falls through to
-  // the live active); ``role === "assistant"`` requires a real id.
-  const resolved = parentNodeId === "active@drain"
-    ? loomTree.active_node_id
-    : parentNodeId;
-  return sendCommitNow(
-    role, resolved, text, opts.raw ?? false, opts.thinking ?? null,
-  );
-}
-
-async function sendCommitNow(
-  role: "user" | "assistant",
-  parentNodeId: string | null,
-  text: string,
-  raw: boolean = false,
-  thinking: string | null = null,
-): Promise<void> {
-  const sock = await ensureWebSocket();
-  // Per-message role labels ride the commit too (roleplay scaffold), so an
-  // authored turn is stamped with the box value just like a generated one.
-  // Raw / flat commits carry no chat-template role — the server suppresses
-  // labels there regardless, but we still omit them for clarity.
-  const commitSampling = raw ? null : buildSamplingPayload();
-  const payload: WSClientMessage = {
-    type: "generate",
-    commit_role: role,
-    commit_text: text,
-    parent_node_id: parentNodeId,
-    ...(thinking ? { commit_thinking: thinking } : {}),
-    ...(commitSampling ? { sampling: commitSampling } : {}),
-    // ``raw`` lifts the user-under-user guard server-side — a flat
-    // (base-model) commit's authored span may hang under any role.
-    raw,
-  };
-  const send = () => sock.send(JSON.stringify(payload));
-  if (sock.readyState === WebSocket.OPEN) send();
-  else sock.addEventListener("open", send, { once: true });
-}
-
 export function sendStop(): void {
   if (
     wsConn.socket &&
@@ -4189,38 +3891,23 @@ export function sendStop(): void {
 
 // =========================================== A/B compare metadata =======
 
-/** A/B compare state.  ``enabled`` is the user-visible toggle.  The
- * remaining fields drive the dual-roundtrip dance:
- *
- * - ``pendingTurnIdx`` — the steered-turn index waiting for its unsteered
- *   pair.  Set the moment the shadow gen is dispatched; cleared on shadow
- *   ``done`` or ``error``.
- * - ``processingAb`` — when true, the next stream of WS events
- *   (``started``/``token``/``done``) routes into ``turn.abPair`` on
- *   ``chatLog.turns[pendingTurnIdx]`` instead of allocating a fresh turn.
- *   This is the WS-side flag the message handler keys off.
- *
- * The shadow's prompt is reconstructed from ``chatLog.turns`` at fire
- * time (see ``_buildShadowMessages``) — no per-turn input string is
- * cached on this state, so toggling A/B mid-conversation works for any
- * turn, not only the just-sent one.
- *
- * Mid-flight toggle-off semantics: once a shadow gen is in flight, we let
- * it finish writing into ``abPair`` even if the user toggles A/B off — the
- * turn is harmless when not rendered, and tearing the WS state down mid-
- * stream is more error-prone than letting it complete.  Toggling off only
- * prevents the *next* steered gen from spawning a shadow.  If the steered
- * gen errors before the shadow fires, we never enter ``processingAb`` and
- * the abPair stays unset on that turn.
- */
 /** Transient routing state for the unsteered-shadow generation.
  *
- *  v2.3: the standalone ``abState.enabled`` toggle is gone — the legacy
- *  "A/B" semantic has been folded into ``autoRegenState`` with
- *  ``mode === "unsteered"`` as the default.  The remaining
- *  ``processingAb`` / ``pendingTurnIdx`` fields are load-bearing for the
- *  WS dispatcher (they route shadow tokens into the steered turn's
- *  ``abPair`` instead of appending a fresh top-level turn). */
+ *  The shadow is ``autoRegenState`` with ``mode === "unsteered"``; there
+ *  is no standalone toggle.  ``processingAb`` / ``pendingTurnIdx`` are
+ *  load-bearing for the WS dispatcher — while ``processingAb`` is set the
+ *  next ``started``/``token``/``done`` stream routes into
+ *  ``chatLog.turns[pendingTurnIdx].abPair`` instead of appending a fresh
+ *  top-level turn.  ``pendingTurnIdx`` is set when the shadow gen is
+ *  dispatched and cleared on its ``done`` / ``error``.
+ *
+ *  The shadow's prompt is reconstructed from ``chatLog.turns`` at fire
+ *  time (see ``_buildShadowMessages``), so the comparison works for any
+ *  turn, not only the just-sent one.  Turning auto-regen off mid-flight
+ *  lets the in-flight shadow finish writing into ``abPair`` — the turn is
+ *  harmless when not rendered, and tearing the WS state down mid-stream
+ *  is more error-prone than letting it complete; it only prevents the
+ *  *next* steered gen from spawning a shadow. */
 export interface AbState {
   pendingTurnIdx: number | null;
   processingAb: boolean;
@@ -4723,10 +4410,9 @@ export function toggleAutoRegen(): void {
   const wasOff = !autoRegenState.enabled;
   autoRegenState.enabled = !autoRegenState.enabled;
   // Off → on with the "unsteered" mode: replay the conversation through
-  // the unsteered model for the most recent generated turn that
-  // doesn't already carry an ``abPair``.  Mirrors the pre-v2.3 A/B
-  // toggle's retroactive-shadow behaviour, so users who flip the toggle
-  // on after-the-fact see the right column populate immediately rather
+  // the unsteered model for the most recent generated turn that doesn't
+  // already carry an ``abPair``, so users who flip the toggle on
+  // after-the-fact see the right column populate immediately rather
   // than waiting for the next send.  Other modes use the loom-regen
   // path — they take effect on the next ``done`` event by design.
   if (!wasOff) return;

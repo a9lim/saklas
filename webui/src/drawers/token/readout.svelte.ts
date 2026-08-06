@@ -5,9 +5,7 @@
 // way: prefer the token's loom-owned ``measurements`` envelope (original
 // capture), otherwise hit the family's ``token-readout`` replay endpoint
 // — request-sequenced so a stale response can never clobber a newer
-// view.  Pre-refactor each tab hand-rolled this ~50-line dance and they
-// drifted (the sae tab lost the steered toggle); this class is the one
-// implementation.
+// view.  This class is the one implementation the three tabs share.
 
 import { ApiError, apiInstruments } from "../../lib/api";
 import type { InstrumentFamily } from "../../lib/api";
