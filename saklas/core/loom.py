@@ -1407,9 +1407,9 @@ class LoomTree:
         role slug (it is rendered into turn headers); validation mirrors
         the per-turn ``role_label`` rules.
         """
-        from saklas.core.role_templates import _validate_role
+        from saklas.core.role_templates import validate_role
 
-        _validate_role(label)
+        validate_role(label)
         with self._lock:
             if self.cast.get(label) == member:
                 return
@@ -1603,7 +1603,7 @@ class LoomTree:
         tree.root_id = data["root_id"]
         tree.active_node_id = data["active_node_id"]
         tree.cast = {}
-        from saklas.core.role_templates import _validate_role
+        from saklas.core.role_templates import validate_role
         for label, raw in raw_cast.items():
             if not isinstance(label, str) or not isinstance(raw, dict):
                 raise LoomTreeError("cast must map string labels to member objects")
@@ -1614,7 +1614,7 @@ class LoomTree:
                 raise LoomTreeError(f"invalid cast member origin {origin!r}")
             if origin in ("structural", "observed"):
                 continue
-            _validate_role(label)
+            validate_role(label)
             tree.cast[label] = CastMember.from_dict(raw)
         tree._validate_structure()
         return tree

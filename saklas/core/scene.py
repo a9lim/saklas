@@ -15,10 +15,9 @@ wrappers (open / label site / close), the system-block shape (real turn vs
 gemma-style fold into the first turn), and the generation-prompt appendix.
 A scene then renders as pure **stitching**: ``open(seat, label) + content +
 close(seat)`` per turn, plus a trailing generation header for whichever seat
-speaks next.  Labels are placed in headers we *construct*, so the
-occurrence-matching collision class of ``_splice_occurrences`` (a cast label
-equal to the other seat's standard label corrupting the splice) is
-structurally impossible here.
+speaks next.  Labels are placed in headers we *construct*, so the stitcher
+never occurrence-matches a rendered string at all — the label→turn binding is
+positional by construction rather than recovered after the fact.
 
 ``validate_turn_grammar`` is the load-bearing check: stitch canonical
 alternating conversations and byte-compare against the template's own render.
@@ -45,8 +44,8 @@ from saklas.core.role_templates import (
     ROLE_HEADERS,
     USER_ROLE_HEADERS,
     RoleHeader,
-    _render_label,
-    _validate_role,
+    render_role_label,
+    validate_role,
 )
 
 Seat = Literal["user", "assistant"]
@@ -131,7 +130,7 @@ class SeatWrapper:
 
     def open(self, label: str | None = None) -> str:
         rendered = (
-            self.label if label is None else _render_label(self.label, label)
+            self.label if label is None else render_role_label(self.label, label)
         )
         return f"{self.open_before}{rendered}{self.open_after}"
 
@@ -579,14 +578,14 @@ def render_scene(
     """
     for turn in turns:
         if turn.label is not None:
-            _validate_role(turn.label)
+            validate_role(turn.label)
         if turn.thinking is not None and grammar.think_open is None:
             raise SceneThinkingUnsupportedError(
                 f"model_type {grammar.model_type!r} has no thinking "
                 f"delimiters; a scene turn cannot carry a thinking block"
             )
     if gen_label is not None:
-        _validate_role(gen_label)
+        validate_role(gen_label)
 
     parts: list[str] = []
     fold: str | None = None
@@ -674,8 +673,8 @@ def render_scene_raw(
 
     def display(label: str | None, seat: Seat) -> str:
         if label is not None:
-            _validate_role(label)
-            return _render_label(seat, label).capitalize()
+            validate_role(label)
+            return render_role_label(seat, label).capitalize()
         return seat.capitalize()
 
     parts = [] if system is None else [system]

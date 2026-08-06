@@ -223,10 +223,10 @@ def test_cast_labels_in_constructed_headers():
 def test_label_collision_with_standard_label_is_safe():
     """A user turn labeled ``model`` cannot corrupt turn attribution.
 
-    The splice path's ``_splice_occurrences`` had an ordering hazard here (a
-    substituted label creating fake occurrences of the other seat's
-    pattern); construction places every label positionally, so the collision
-    class does not exist.
+    Construction places every label positionally, so the stitcher never has
+    to recover a label→turn binding from the rendered bytes.  (The fallback
+    splice path handles the same collision by scanning both seats in one
+    pass; see ``tests/test_role_templates.py``.)
     """
     _, grammar = _grammar(GEMMA_STRICT_TEMPLATE, "gemma3")
     got = render_scene(
