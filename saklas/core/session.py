@@ -3090,13 +3090,20 @@ class SaklasSession:
         top_k: int,
         logits: torch.Tensor | None = None,
     ) -> list[list[tuple[str, float, int]]]:
-        from saklas.core.jlens import topk_logprobs
+        """Per-row top-k as ``[(token, p_l, vocab_id), ...]``.
+
+        The value is the per-layer readout **probability** — the one unit
+        every lens surface reports (the aggregate's ``strength`` is its mean
+        over layers).  Callers hold probabilities end to end; the measurement
+        envelope owns the single conversion into its wire unit.
+        """
+        from saklas.core.jlens import topk_probabilities
 
         if not rows:
             return []
         if logits is None:
             logits = self._jlens_logits_rows(lens, rows)
-        vals, idxs = topk_logprobs(logits, top_k)
+        vals, idxs = topk_probabilities(logits, top_k)
         all_vals = vals.cpu()
         all_idxs = idxs.cpu()
         out: list[list[tuple[str, float, int]]] = []
@@ -3149,11 +3156,13 @@ class SaklasSession:
         ]
     ):
         """Jacobian-lens readout on a raw prompt: the top-``top_k`` vocabulary
-        tokens per (layer, position), with log-probabilities.
+        tokens per (layer, position), with their per-layer probabilities.
 
         ``layers`` defaults to every fitted layer; ``positions`` defaults to
         the final position only (pass explicit indices, negative ok, for
-        more). Returns ``{layer: [per-position [(token, logprob), ...]]}``.
+        more). Returns ``{layer: [per-position [(token, p_l), ...]]}`` —
+        ``p_l(v)``, the same unit the aggregate's ``strength`` averages, so
+        one number means one thing across every lens surface.
         One vocab-sized matvec per (layer, position row) — full-position
         sweeps over all layers are an offline-analysis cost, not a decode
         cost.
@@ -3212,7 +3221,7 @@ class SaklasSession:
             for layer in req:
                 out[layer] = [[] for _ in pos]
             for (layer, pos_idx, _), row in zip(row_refs, decoded):
-                out[layer][pos_idx] = [(tok, lp) for tok, lp, _ in row]
+                out[layer][pos_idx] = [(tok, p_l) for tok, p_l, _ in row]
             if not aggregate:
                 return out
             agg: list[list[tuple[str, float, float, float]]] = []
@@ -3262,10 +3271,12 @@ class SaklasSession:
         the caller supplies it.
 
         Returns ``{node_id, raw_index, token_id, token_text, steering,
-        readout: {layer: [(token, logprob, id), ...]},
-        aggregate: [(token, strength, com, spread), ...]}`` — ``aggregate``
-        is the layer-aggregated view of the same logits (per-layer softmax
-        → mean-probability strength + probability-mass-weighted depth
+        readout: {layer: [(token, p_l, id), ...]},
+        aggregate: [(token, strength, com, spread), ...]}`` — one unit
+        throughout: ``p_l`` is the per-layer readout probability and
+        ``strength`` is its mean over the fitted layers, the
+        layer-aggregated view of the same logits (per-layer softmax →
+        mean-probability strength + probability-mass-weighted depth
         center of mass; :func:`saklas.core.jlens.aggregate_readout`).
         Raises :class:`~saklas.core.jlens.LensNotFittedError` with no
         fitted lens, :class:`UnknownNodeError` /

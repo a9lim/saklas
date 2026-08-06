@@ -329,17 +329,20 @@ def lens_logits(
     return out
 
 
-def topk_logprobs(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Top-k log-probabilities without materializing a full log-softmax tensor.
+def topk_probabilities(
+    logits: torch.Tensor, k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k readout probabilities without a full softmax tensor.
 
-    ``topk(log_softmax(x))`` has the same indices as ``topk(x)``.  Computing
-    only the selected log-probabilities saves one vocab-sized tensor allocation
-    per readout row, which matters for large vocabularies and multi-layer
-    J-lens sweeps.
+    ``topk(softmax(x))`` has the same indices as ``topk(x)``, so only the
+    selected columns need normalizing — saving one vocab-sized allocation per
+    readout row, which matters for large vocabularies and multi-layer J-lens
+    sweeps.  The unit is the per-layer probability ``p_l(v)``, the same one
+    ``readout_probabilities`` produces and every other lens surface reports.
     """
     logits_f = logits.float()
     vals, idxs = logits_f.topk(k, dim=-1)
-    vals = vals - logits_f.logsumexp(dim=-1, keepdim=True)
+    vals = (vals - logits_f.logsumexp(dim=-1, keepdim=True)).exp()
     return vals, idxs
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from typing import Any
@@ -421,12 +422,14 @@ class TestPreparations:
 # ---------------------------------------------------------------------------
 
 class TestTokenReadout:
+    # ``jlens_token_readout`` hands back per-layer PROBABILITIES p_l — the
+    # unit the aggregate's ``strength`` averages.
     _LENS_OUT = {
         "node_id": "n1", "raw_index": 3, "token_id": 42, "token_text": " magic",
         "steering": "0.3 formal.casual",
         "readout": {
-            18: [(" b", -0.5, 7), (" c", -1.2, 9)],
-            12: [(" a", -0.25, 5), (" d", -2.0, 3)],
+            18: [(" b", 0.6, 7), (" c", 0.3, 9)],
+            12: [(" a", 0.78, 5), (" d", 0.13, 3)],
         },
         "aggregate": [(" a", 0.41, 0.31, 0.05), (" b", 0.2, 0.8, 0.1)],
     }
@@ -532,6 +535,17 @@ class TestTokenReadout:
         assert [row["layer"] for row in lens["readout"]["layers"]] == [12, 18]
         assert lens["readout"]["aggregate"][0]["token"] == " a"
         assert session.jlens_token_readout.call_args.kwargs["top_k"] == 2
+        # ONE conversion on the whole path: the session's p_l reaches the
+        # envelope untouched and ``build_measurements`` logs it exactly once,
+        # so exponentiating the wire value returns the original probability.
+        by_layer = {
+            row["layer"]: row["tokens"] for row in lens["readout"]["layers"]
+        }
+        for layer, rows in self._LENS_OUT["readout"].items():
+            for wire, (token, p_l, token_id) in zip(by_layer[layer], rows):
+                assert wire["token"] == token
+                assert wire["id"] == token_id
+                assert math.exp(wire["logprob"]) == pytest.approx(p_l)
 
     def test_lens_unsteered_nulls_binding_steering(
         self, session_and_client: Any,

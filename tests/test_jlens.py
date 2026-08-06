@@ -25,7 +25,7 @@ from saklas.core.jlens import (
     lens_logits,
     readout_probabilities,
     resolve_word_token,
-    topk_logprobs,
+    topk_probabilities,
     token_readout_stats,
     token_readout_stats_from_probabilities,
 )
@@ -810,10 +810,12 @@ def test_token_direction_can_restrict_layers() -> None:
     assert torch.allclose(dirs[1], unembed[5] @ J[1])
 
 
-def test_topk_logprobs_matches_full_log_softmax() -> None:
+def test_topk_probabilities_matches_full_softmax() -> None:
+    """The selected-column shortcut agrees with a full softmax, and reports
+    the same unit ``readout_probabilities`` does — the one lens unit."""
     logits = torch.randn(4, _VOCAB)
-    vals, idxs = topk_logprobs(logits, 7)
-    expected = torch.log_softmax(logits, dim=-1)
+    vals, idxs = topk_probabilities(logits, 7)
+    expected = readout_probabilities(logits)
     exp_vals, exp_idxs = expected.topk(7, dim=-1)
     assert torch.equal(idxs, exp_idxs)
     assert torch.allclose(vals, exp_vals)

@@ -1875,8 +1875,10 @@ def test_jlens_readout_shape_and_default_position() -> None:
     for rows in out.values():
         assert len(rows) == 1  # default: final position only
         assert len(rows[0]) == 3
-        token, logprob = rows[0][0]
-        assert isinstance(token, str) and logprob <= 0.0
+        # One unit end to end: the per-layer readout PROBABILITY p_l, the
+        # same quantity the aggregate's ``strength`` averages.
+        token, p_l = rows[0][0]
+        assert isinstance(token, str) and 0.0 <= p_l <= 1.0
 
 
 def test_jlens_readout_aggregate_rides_same_logits() -> None:
@@ -2442,8 +2444,11 @@ def test_jlens_token_readout_shape_and_position() -> None:
     assert set(out["readout"]) == {0, 1}  # fitted sources of the 3-layer toy
     for rows in out["readout"].values():
         assert len(rows) == 4
-        tok, lp, tid = rows[0]
-        assert isinstance(tok, str) and lp <= 0.0 and isinstance(tid, int)
+        # Per-layer rows and the aggregate share one unit: the readout
+        # probability, so ``strength`` is literally the mean of these.
+        tok, p_l, tid = rows[0]
+        assert isinstance(tok, str) and 0.0 <= p_l <= 1.0
+        assert isinstance(tid, int)
     # The aggregate block rides the same logits across both fitted layers.
     assert len(out["aggregate"]) == 4
     for tok, strength, com, spread in out["aggregate"]:
