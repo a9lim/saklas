@@ -144,6 +144,56 @@ def test_mixed_affine_lowrank_matches_unified_kernel(kappa: torch.Tensor) -> Non
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_mixed_affine_lowrank_recast_is_memoized_and_exact() -> None:
+    """A block output whose dtype differs from the recompose dtype recasts once.
+
+    ``apply_to_model`` threads in ``next(model.parameters()).dtype``; a
+    wrapper model can emit a narrower block output than that.  The recast must
+    land back on the hook so the per-token path allocates nothing after the
+    first fire, and the result must still match the unified kernel.
+    """
+    basis = torch.eye(2, _DIM)
+    mean = torch.linspace(-0.2, 0.3, _DIM)
+    sub = LayerSubspace.affine(mean, basis)
+    target = torch.tensor([0.7, -0.25])
+    origin = torch.zeros(2)
+    kappa = torch.tensor([0.0, 1.0])
+    along = 0.65
+    domain = CustomDomain(2)
+    hook = SteeringHook()
+    # Recompose in fp32; drive it with an fp16 hidden state.
+    hook.recompose(
+        [(sub, domain, target, origin, along, 0.0, kappa, Trigger.BOTH)],
+        TriggerContext(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    lowrank = hook._single_affine_lowrank
+    assert lowrank is not None
+    assert lowrank[0].dtype is torch.float32
+
+    hidden = torch.randn(1, 3, _DIM).to(torch.float16)
+    expected, _ = subspace_inject(
+        hidden.to(torch.float32), sub, domain, target, origin, along, 0.0,
+        mean_proj=mean @ basis.T, kappa=kappa,
+    )
+    actual = hidden.clone()
+    hook.hook_fn(None, None, actual)
+    assert torch.allclose(
+        actual.to(torch.float32), expected, atol=2e-3, rtol=2e-3,
+    )
+
+    # The recast is stored, so the next fire finds the payload already in the
+    # hidden dtype — no second round of ``.to()`` allocations.
+    recast = hook._single_affine_lowrank
+    assert recast is not None
+    assert all(t.dtype is torch.float16 for t in recast[:5])
+    second = hidden.clone()
+    hook.hook_fn(None, None, second)
+    assert hook._single_affine_lowrank is recast
+    assert torch.allclose(second, actual, atol=0, rtol=0)
+
+
 def test_non_both_skips_when_inactive():
     hook = SteeringHook()
     ctx = TriggerContext()
