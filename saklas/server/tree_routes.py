@@ -320,9 +320,11 @@ def register_tree_routes(app: FastAPI) -> None:
         """Apply a filter-grammar expression and return matching node ids.
 
         Grammar in :mod:`saklas.core.tree_filter` — comma-AND'd
-        ``agg:|any:|last:<probe> <op> <threshold>`` clauses.  Empty
-        ``expr`` returns every node id (clears the filter).  Bad
-        expressions land as 400 via :class:`FilterParseError`.
+        ``agg:|any:|last:<probe> <op> <threshold>`` clauses.  ``agg:``
+        reads a node's aggregate readings; ``any:`` / ``last:`` read its
+        persisted per-token measurement rows.  Empty ``expr`` returns
+        every node id (clears the filter).  Bad expressions land as 400
+        via :class:`FilterParseError`.
         """
         from saklas.core.tree_filter import FilterParseError
 

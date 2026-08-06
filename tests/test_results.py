@@ -49,6 +49,33 @@ class TestProbeReadings:
         assert isinstance(d["per_generation"], list)
         assert isinstance(d["mean"], tuple)
 
+    def test_from_coords_folds_a_series(self):
+        readings = ProbeReadings.from_coords([(0.0, 1.0), (1.0, 1.0), (2.0, 4.0)])
+        assert readings.per_generation == [(0.0, 1.0), (1.0, 1.0), (2.0, 4.0)]
+        assert readings.mean == (1.0, 2.0)
+        assert readings.min == (0.0, 1.0)
+        assert readings.max == (2.0, 4.0)
+        # Drift rate: (last - first) / (n - 1) per axis.
+        assert readings.delta_per_gen == (1.0, 1.5)
+        assert readings.std[0] == pytest.approx((2 / 3) ** 0.5)
+
+    def test_from_coords_single_run_has_zero_drift(self):
+        readings = ProbeReadings.from_coords([(0.4,)])
+        assert readings.mean == (0.4,)
+        assert readings.std == (0.0,)
+        assert readings.delta_per_gen == (0.0,)
+
+    def test_from_coords_empty_series(self):
+        readings = ProbeReadings.from_coords([])
+        assert readings.per_generation == []
+        assert readings.mean == ()
+        assert readings.delta_per_gen == ()
+
+    def test_from_coords_truncates_to_narrowest_rank(self):
+        readings = ProbeReadings.from_coords([(0.1, 0.2, 0.3), (0.5, 0.6)])
+        assert readings.per_generation == [(0.1, 0.2), (0.5, 0.6)]
+        assert len(readings.mean) == 2
+
 
 class TestGenerationResult:
     def test_to_dict_no_probes(self):
@@ -277,6 +304,40 @@ class TestRunSet:
         assert d["node_ids"] == ["n1"]
         assert d["grid"] == [{"concept": "happy.sad"}]
         assert d["results"][0]["text"] == "a"
+
+    def _with_readings(self, **coords: tuple[float, ...]) -> GenerationResult:
+        result = self._make_result()
+        result.probe_readings = {
+            name: ProbeReading(fraction=0.5, nearest=[], coords=value)
+            for name, value in coords.items()
+        }
+        return result
+
+    def test_probe_summary_folds_runs_into_probe_readings(self):
+        """The producer ``ProbeReadings`` was missing — the plot input shape."""
+        runset = RunSet([
+            self._with_readings(calm=(0.1,), formal=(1.0, 2.0)),
+            self._with_readings(calm=(0.3,), formal=(3.0, 4.0)),
+        ])
+        summary = runset.probe_summary()
+        assert set(summary) == {"calm", "formal"}
+        assert summary["calm"].per_generation == [(0.1,), (0.3,)]
+        assert summary["calm"].mean == pytest.approx((0.2,))
+        assert summary["calm"].delta_per_gen == pytest.approx((0.2,))
+        assert summary["formal"].mean == pytest.approx((2.0, 3.0))
+
+    def test_probe_summary_skips_runs_without_the_probe(self):
+        runset = RunSet([
+            self._with_readings(calm=(0.1,)),
+            self._make_result(),
+            self._with_readings(calm=(0.5,), warm=(0.9,)),
+        ])
+        summary = runset.probe_summary()
+        assert summary["calm"].per_generation == [(0.1,), (0.5,)]
+        assert summary["warm"].per_generation == [(0.9,)]
+
+    def test_probe_summary_empty_without_probes(self):
+        assert RunSet([self._make_result()]).probe_summary() == {}
 
 
 def test_generation_result_hidden_states_default_none():

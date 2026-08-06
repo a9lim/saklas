@@ -40,7 +40,13 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 import pytest
 
-from saklas.core.model import _LAYER_ACCESSORS, get_layers
+from saklas.core.model import (
+    _ARCH_PROFILES,
+    _LAYER_ACCESSORS,
+    _SUPPORTED_TYPES,
+    _TESTED_ARCHS,
+    get_layers,
+)
 from saklas.core.hooks import HiddenCapture, SteeringManager
 from saklas.core.manifold import synthesize_subspace
 from tests._whitener import isotropic_whitener
@@ -114,6 +120,54 @@ def test_guaranteed_archs_are_in_accessor_table():
     """
     missing = [mt for mt in GUARANTEED_ARCHS if mt not in _LAYER_ACCESSORS]
     assert not missing, f"guaranteed archs missing from _LAYER_ACCESSORS: {missing}"
+
+
+def test_every_tested_arch_has_an_accessor():
+    """A "tested" arch with no accessor is a dead entry.
+
+    ``get_layers`` raises on the missing accessor *before* it reaches the
+    tested check, so such an entry can never suppress a warning — it just
+    reads as coverage that isn't there.  ``mistral3`` was one.
+    """
+    assert _TESTED_ARCHS <= set(_LAYER_ACCESSORS)
+
+
+def test_registry_views_derive_from_one_table():
+    """Accessor / tested / supported are views over ``_ARCH_PROFILES``."""
+    assert set(_LAYER_ACCESSORS) == set(_ARCH_PROFILES)
+    assert _SUPPORTED_TYPES == sorted(_ARCH_PROFILES)
+    for model_type, profile in _ARCH_PROFILES.items():
+        assert _LAYER_ACCESSORS[model_type] is profile.layers
+        assert (model_type in _TESTED_ARCHS) is profile.tested
+
+
+def test_mistral_loads_as_its_text_submodel_and_is_marked_tested():
+    """Mistral-3's composite type never reaches ``get_layers``.
+
+    ``AutoConfig.for_model("mistral3").text_config.model_type == "mistral"``,
+    so ``extract_text_model`` fires and the loaded model reports ``mistral``.
+    Marking the composite type tested left the type users actually load
+    warning "wired up but untested" on every session.
+    """
+    assert AutoConfig.for_model("mistral3").text_config.model_type == "mistral"
+    assert "mistral" in _TESTED_ARCHS
+    assert "mistral3" not in _ARCH_PROFILES
+    # Ministral-3 has no text_config, so its composite type is what loads.
+    assert getattr(AutoConfig.for_model("ministral3"), "text_config", None) is None
+    assert "ministral3" in _TESTED_ARCHS
+
+
+def test_layer_accessors_are_named_defs():
+    """Shared and one-off shapes alike are named ``def``s, not lambdas.
+
+    A traceback out of a wrong accessor should name the block shape it
+    tried, not read ``<lambda>``.
+    """
+    anonymous = sorted(
+        model_type for model_type, accessor in _LAYER_ACCESSORS.items()
+        if getattr(accessor, "__name__", "<lambda>") == "<lambda>"
+    )
+    assert not anonymous, f"lambda layer accessors: {anonymous}"
 
 
 @pytest.mark.parametrize("model_type", GUARANTEED_ARCHS)

@@ -141,3 +141,34 @@ def test_events_are_frozen_dataclasses():
     ev = SteeringCleared()
     with _p.raises(Exception):
         ev.foo = "x"  # pyright: ignore[reportAttributeAccessIssue]  # frozen dataclass: assignment must raise
+
+
+def test_loom_mutated_is_in_the_event_union():
+    """``LoomTree`` emits on this bus, so its payload belongs to ``Event``.
+
+    It used to be defined in ``loom.py`` and absent from the union, which
+    only looked consistent because ``LoomTree._events`` was typed ``Any`` —
+    a subscriber written against ``Callable[[Event], None]`` was receiving a
+    type the union said could not arrive.
+    """
+    import typing
+
+    from saklas.core.events import LoomMutated
+
+    assert LoomMutated in typing.get_args(Event)
+    # ``saklas.core.loom`` re-exports it, so the historical import path and
+    # the owning module hand back the same class.
+    from saklas.core.loom import LoomMutated as ReExported
+
+    assert ReExported is LoomMutated
+
+
+def test_loom_mutated_rides_the_bus_as_an_event():
+    from saklas.core.loom import LoomTree
+
+    bus = EventBus()
+    seen: list[Event] = []
+    bus.subscribe(seen.append)
+    tree = LoomTree(events=bus)
+    tree.add_user_turn("hi")
+    assert [type(e).__name__ for e in seen] == ["LoomMutated"]

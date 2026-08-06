@@ -53,14 +53,58 @@ class RoleHeader:
     label: str
 
 
-# Map ``model.config.model_type`` → header, or ``None`` for families that
-# can't support role substitution (positional templates, untested architectures).
-#
-# Sub-variant model types (``qwen3_text``, ``gemma3_text``, ...) inherit from
-# their parent family — same chat template, same byte sequence.
-def _build_role_headers() -> dict[str, RoleHeader | None]:
-    qwen = RoleHeader(before="<|im_start|>", after="\n", label="assistant")
-    gemma = RoleHeader(before="<start_of_turn>", after="\n", label="model")
+@dataclass(frozen=True)
+class SeatHeaders:
+    """A family's headers for both seats (``None`` = substitution unsupported).
+
+    One entry per ``model.config.model_type``.  The two seats are stored
+    together because they are the *same* fact about a family — every live
+    family except gpt-oss shares ``before``/``after`` across seats and differs
+    only in ``label``, so splitting them into two parallel tables meant one
+    family edit in two places with nothing enforcing agreement.
+    """
+
+    assistant: RoleHeader | None
+    user: RoleHeader | None
+
+
+def _seat_headers(
+    before: str,
+    after: str,
+    *,
+    assistant_label: str = "assistant",
+    user_after: str | None = None,
+) -> SeatHeaders:
+    """Build both seats' headers from one family's delimiter pair.
+
+    ``assistant_label`` is the family's standard assistant-turn label
+    (``model`` on gemma); the user seat is always labelled ``user``.
+    ``user_after`` overrides the user seat's trailing delimiter for the one
+    family whose seats diverge (gpt-oss Harmony: ``<|start|>user<|message|>``
+    against ``<|start|>assistant<|channel|>``).
+    """
+    return SeatHeaders(
+        assistant=RoleHeader(before=before, after=after, label=assistant_label),
+        user=RoleHeader(
+            before=before,
+            after=after if user_after is None else user_after,
+            label="user",
+        ),
+    )
+
+
+# Families with positional / label-free templates: there is no role label in
+# the rendered string to swap, so the render-then-splice strategy doesn't apply
+# to either seat (Mistral's ``[INST]``/``[/INST]``).
+_NO_ROLE_LABEL = SeatHeaders(assistant=None, user=None)
+
+
+# Map ``model.config.model_type`` → both seats' headers.  Sub-variant model
+# types (``qwen3_text``, ``gemma3_text``, ...) inherit from their parent family
+# — same chat template, same byte sequence.
+def _build_seat_headers() -> dict[str, SeatHeaders]:
+    qwen = _seat_headers("<|im_start|>", "\n")
+    gemma = _seat_headers("<start_of_turn>", "\n", assistant_label="model")
     # Gemma-4 shipped a new turn-boundary scheme — ``<|turn>...<turn|>``
     # instead of the prior ``<start_of_turn>...<end_of_turn>``.  The label
     # stays ``model`` (gemma family convention), only the surrounding
@@ -70,22 +114,21 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
     # byte-identical ``<|turn>model\n`` turn open, so it reuses this header;
     # its only addition is an empty ``<|channel>thought\n<channel|>`` reasoning
     # scaffold after the generation prompt, which the label swap rides over.
-    gemma4 = RoleHeader(before="<|turn>", after="\n", label="model")
-    llama = RoleHeader(
-        before="<|start_header_id|>", after="<|end_header_id|>", label="assistant"
-    )
-    glm = RoleHeader(before="<|", after="|>", label="assistant")
-    gpt_oss = RoleHeader(
-        before="<|start|>", after="<|channel|>", label="assistant"
-    )
+    gemma4 = _seat_headers("<|turn>", "\n", assistant_label="model")
+    llama = _seat_headers("<|start_header_id|>", "<|end_header_id|>")
+    glm = _seat_headers("<|", "|>")
+    # gpt-oss is the one family whose seats diverge: the Harmony format renders
+    # user turns as ``<|start|>user<|message|>`` (verified against the real
+    # ``openai/gpt-oss-20b`` template, 2026-05).
+    gpt_oss = _seat_headers("<|start|>", "<|channel|>", user_after="<|message|>")
     # Talkie-1930 renders turns as ``<|role|>content<|end|>`` — the same
     # ``<|...|>`` role-label shape as GLM (no post-marker newline).  Verified
     # against the ``a9lim/talkie-1930-13b-it-hf-cached`` chat template
     # (model_type "talkie", 2026-06).  The opt-out was "untested", not
     # "label-free" — the label is present, so render-then-splice applies.
-    talkie = RoleHeader(before="<|", after="|>", label="assistant")
+    talkie = _seat_headers("<|", "|>")
 
-    table: dict[str, RoleHeader | None] = {
+    return {
         # Qwen family
         "qwen2": qwen,
         "qwen3": qwen,
@@ -94,8 +137,8 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
         "qwen3_5": qwen,
         "qwen3_5_text": qwen,
         "qwen3_5_moe": qwen,
-        # Gemma family — note label="model", not "assistant".  Gemma-4
-        # uses a different delimiter than 2/3 (see ``gemma4`` above).
+        # Gemma family — note the assistant label is "model", not "assistant".
+        # Gemma-4 uses a different delimiter than 2/3 (see ``gemma4`` above).
         "gemma2": gemma,
         "gemma3": gemma,
         "gemma3_text": gemma,
@@ -111,66 +154,26 @@ def _build_role_headers() -> dict[str, RoleHeader | None]:
         "gpt_oss": gpt_oss,
         # Talkie — <|role|> markers, GLM-shaped.
         "talkie": talkie,
-        # Mistral: positional [INST]/[/INST] in the rendered string — there is
-        # no role label to swap, so the strategy doesn't apply.
-        "mistral3": None,
-        "ministral3": None,
+        # Mistral: positional markers, no label to swap.  ``mistral`` is the
+        # text sub-model a Mistral-3 checkpoint actually loads as (the
+        # composite's ``text_config.model_type``), so it needs the same
+        # explicit opt-out as the composite type — the lookup is exact.
+        "mistral": _NO_ROLE_LABEL,
+        "mistral3": _NO_ROLE_LABEL,
+        "ministral3": _NO_ROLE_LABEL,
     }
-    return table
 
 
-ROLE_HEADERS: dict[str, RoleHeader | None] = _build_role_headers()
+SEAT_HEADERS: dict[str, SeatHeaders] = _build_seat_headers()
 
-
-# Map ``model.config.model_type`` → the header a family's chat template emits
-# around the *user* turn, or ``None`` for families that can't support
-# substitution.  For every family except gpt-oss the user header shares the
-# assistant header's delimiters — only the label differs (``user`` vs the
-# family's assistant label).  gpt-oss is the exception: the Harmony format
-# renders user turns as ``<|start|>user<|message|>`` (verified against the
-# real ``openai/gpt-oss-20b`` template, 2026-05), so its ``after`` is
-# ``<|message|>`` rather than the assistant header's ``<|channel|>``.
-def _build_user_role_headers() -> dict[str, RoleHeader | None]:
-    qwen = RoleHeader(before="<|im_start|>", after="\n", label="user")
-    gemma = RoleHeader(before="<start_of_turn>", after="\n", label="user")
-    gemma4 = RoleHeader(before="<|turn>", after="\n", label="user")
-    llama = RoleHeader(
-        before="<|start_header_id|>", after="<|end_header_id|>", label="user"
-    )
-    glm = RoleHeader(before="<|", after="|>", label="user")
-    # gpt-oss user turns use ``<|message|>``, not the assistant ``<|channel|>``.
-    gpt_oss = RoleHeader(before="<|start|>", after="<|message|>", label="user")
-    # Talkie user turns render as ``<|user|>`` — GLM-shaped, like its assistant side.
-    talkie = RoleHeader(before="<|", after="|>", label="user")
-
-    table: dict[str, RoleHeader | None] = {
-        "qwen2": qwen,
-        "qwen3": qwen,
-        "qwen3_text": qwen,
-        "qwen3_moe": qwen,
-        "qwen3_5": qwen,
-        "qwen3_5_text": qwen,
-        "qwen3_5_moe": qwen,
-        "gemma2": gemma,
-        "gemma3": gemma,
-        "gemma3_text": gemma,
-        "gemma4": gemma4,
-        "gemma4_text": gemma4,
-        "gemma4_unified": gemma4,
-        "gemma4_unified_text": gemma4,
-        "llama": llama,
-        "glm": glm,
-        "gpt_oss": gpt_oss,
-        "talkie": talkie,
-        # Same opt-outs as the assistant side: positional / label-free
-        # templates (Mistral's [INST]/[/INST] markers).
-        "mistral3": None,
-        "ministral3": None,
-    }
-    return table
-
-
-USER_ROLE_HEADERS: dict[str, RoleHeader | None] = _build_user_role_headers()
+# Per-seat views over the one registry, kept because they are the lookup shape
+# every call site already speaks (``_lookup_header`` takes a side's table).
+ROLE_HEADERS: dict[str, RoleHeader | None] = {
+    model_type: seats.assistant for model_type, seats in SEAT_HEADERS.items()
+}
+USER_ROLE_HEADERS: dict[str, RoleHeader | None] = {
+    model_type: seats.user for model_type, seats in SEAT_HEADERS.items()
+}
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +186,7 @@ USER_ROLE_HEADERS: dict[str, RoleHeader | None] = _build_user_role_headers()
 # user-provided string we splice into a rendered template and into a
 # ``:role-<slug>`` selector suffix, so this alphabet rules out whitespace,
 # uppercase, and punctuation that would corrupt either surface.  At render
-# time the underscore de-slugs to a space (``_render_label``), so
+# time the underscore de-slugs to a space (:func:`render_role_label`), so
 # ``someone_happy`` displays as ``someone happy``.
 _ROLE_SLUG_RE = re.compile(r"^[a-z0-9._-]+$")
 
@@ -224,7 +227,13 @@ class InvalidRoleError(SaklasError, ValueError):
         return (400, str(self) or self.__class__.__name__)
 
 
-def _validate_role(role: str) -> None:
+def validate_role(role: str) -> None:
+    """Reject a cast/role label that isn't a legal slug.
+
+    The module's public slug gate: every surface that accepts a user-authored
+    role label (extraction ``--role``, per-node manifold roles, loom cast
+    labels, scene turn labels) validates through this one function.
+    """
     if not role:
         raise InvalidRoleError("role must be a non-empty string")
     if not _ROLE_SLUG_RE.match(role):
@@ -239,20 +248,22 @@ def _validate_role(role: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _render_label(standard_label: str, role: str) -> str:
-    """Turn a role *slug* into the display label spliced into the template.
+def render_role_label(case_from: str, role: str) -> str:
+    """Turn a role *slug* into the display label a render places in a header.
 
     De-slugs ``_`` → space (hyphens are kept verbatim), then mirrors the case
-    of the family's ``standard_label`` so the substituted header matches the
-    casing the template emits.  Every live family label is lowercase
-    (``assistant``/``model``/``user``), so today this is de-slug + lowercase;
+    of ``case_from`` so the label matches the casing its context emits.
+    ``case_from`` is whatever lowercase-or-not reference string the caller
+    has: the family's standard header label on the splice path
+    (``assistant``/``model``/``user``), the seat name on the raw-marker path.
+    Every live reference is lowercase, so today this is de-slug + lowercase;
     the case-mirror is forward-proofing for a family whose role header renders
     in a different case.
     """
     label = role.replace("_", " ")
-    if standard_label.isupper():
+    if case_from.isupper():
         return label.upper()
-    if standard_label.istitle():
+    if case_from.istitle():
         return label.title()
     return label
 
@@ -297,7 +308,7 @@ def _splice_header(
                 f"from the live chat template"
             )
         return rendered
-    replacement = f"{header.before}{_render_label(header.label, role)}{header.after}"
+    replacement = f"{header.before}{render_role_label(header.label, role)}{header.after}"
     return rendered.replace(pattern, replacement)
 
 
@@ -387,11 +398,11 @@ def apply_with_role(
     # bad slug fails before we render anything.
     assistant_header: RoleHeader | None = None
     if role is not None:
-        _validate_role(role)
+        validate_role(role)
         assistant_header = _lookup_header(ROLE_HEADERS, model_type, side="assistant")
     user_header: RoleHeader | None = None
     if user_role is not None:
-        _validate_role(user_role)
+        validate_role(user_role)
         user_header = _lookup_header(USER_ROLE_HEADERS, model_type, side="user")
 
     rendered = tokenizer.apply_chat_template(
@@ -438,37 +449,67 @@ def apply_with_role(
 
 
 def _splice_occurrences(
-    rendered: str, header: RoleHeader, labels: list[str | None]
+    rendered: str, sides: list[tuple[RoleHeader, list[str | None]]]
 ) -> str:
-    """Replace the k-th occurrence of ``header``'s standard pattern with
-    ``labels[k]`` in render order (``None`` = leave the standard label).
+    """Replace each side's k-th header occurrence with ``labels[k]``.
 
-    Occurrence *k* corresponds to the *k*-th turn of that role, because the
+    Occurrence *k* corresponds to the *k*-th turn of that side, because the
     chat template emits turns in order.  Graceful degradation in two
     directions: extra labels beyond the occurrences found are ignored (the
     gpt-oss case — its ``<|start|>assistant`` generation prompt has no
     ``<|channel|>``, so the trailing ``gen_role`` simply never lands), and
-    occurrences beyond ``len(labels)`` are left standard.
+    occurrences beyond ``len(labels)`` are left standard (``None`` also
+    leaves the standard label).
+
+    Both sides splice in **one** left-to-right scan of the original string,
+    which is what makes the cast label a free string.  Splicing the sides in
+    sequence would let one side write the *other* side's standard header into
+    the buffer — a user turn labelled ``assistant`` renders GLM's
+    ``<|assistant|>`` — and the second pass would then claim that spliced
+    header as its own occurrence 0, shifting every real assistant label by
+    one.  A single scan only ever matches template bytes, never bytes this
+    function wrote.
     """
-    pattern = f"{header.before}{header.label}{header.after}"
-    if not labels:
+    patterns = [
+        (f"{header.before}{header.label}{header.after}", header, labels)
+        for header, labels in sides
+        if labels
+    ]
+    if not patterns:
         return rendered
+    counters = [0] * len(patterns)
     parts: list[str] = []
     cursor = 0
-    occ = 0
     while True:
-        idx = rendered.find(pattern, cursor)
-        if idx == -1:
+        # Earliest match across the sides; the longer pattern wins a tie so a
+        # family whose one header is a prefix of the other can't mis-slice.
+        best_idx = -1
+        best_side = -1
+        best_len = -1
+        for i, (pattern, _header, _labels) in enumerate(patterns):
+            idx = rendered.find(pattern, cursor)
+            if idx < 0:
+                continue
+            if best_side < 0 or idx < best_idx or (
+                idx == best_idx and len(pattern) > best_len
+            ):
+                best_idx, best_side, best_len = idx, i, len(pattern)
+        if best_side < 0:
             parts.append(rendered[cursor:])
             break
+        idx, side, width = best_idx, best_side, best_len
+        pattern, header, labels = patterns[side]
+        occ = counters[side]
+        counters[side] = occ + 1
         parts.append(rendered[cursor:idx])
         label = labels[occ] if occ < len(labels) else None
         if label is None:
             parts.append(pattern)
         else:
-            parts.append(f"{header.before}{_render_label(header.label, label)}{header.after}")
-        cursor = idx + len(pattern)
-        occ += 1
+            parts.append(
+                f"{header.before}{render_role_label(header.label, label)}{header.after}"
+            )
+        cursor = idx + width
     return "".join(parts)
 
 
@@ -500,6 +541,12 @@ def apply_with_per_turn_roles(
     error (user turns are data-dependent and gpt-oss's generation prompt
     diverges from its historical assistant header).  Slug validation and
     family-support checks still raise.
+
+    This is the fallback render path — it serves families whose chat template
+    defeats the scene autopsy (GLM-4.7-Flash) and label-carrying renders the
+    stitcher declines (a mid-conversation system turn).  A validated
+    :class:`~saklas.core.scene.TurnGrammar` places labels in headers it
+    *constructs* and never occurrence-matches at all.
     """
     user_labels = [m.get("label") for m in messages if m.get("role") == "user"]
     asst_labels = [m.get("label") for m in messages if m.get("role") == "assistant"]
@@ -529,12 +576,12 @@ def apply_with_per_turn_roles(
     if has_user:
         for lbl in user_labels:
             if lbl is not None:
-                _validate_role(lbl)
+                validate_role(lbl)
         user_header = _lookup_header(USER_ROLE_HEADERS, model_type, side="user")
     if has_asst:
         for lbl in asst_labels:
             if lbl is not None:
-                _validate_role(lbl)
+                validate_role(lbl)
         asst_header = _lookup_header(ROLE_HEADERS, model_type, side="assistant")
 
     rendered = tokenizer.apply_chat_template(
@@ -549,10 +596,12 @@ def apply_with_per_turn_roles(
             f"tokenize=False; role substitution expects a string"
         )
 
+    sides: list[tuple[RoleHeader, list[str | None]]] = []
     if user_header is not None:
-        rendered = _splice_occurrences(rendered, user_header, user_labels)
+        sides.append((user_header, user_labels))
     if asst_header is not None:
-        rendered = _splice_occurrences(rendered, asst_header, asst_labels)
+        sides.append((asst_header, asst_labels))
+    rendered = _splice_occurrences(rendered, sides)
 
     if not tokenize:
         return rendered

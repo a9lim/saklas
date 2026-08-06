@@ -7,8 +7,9 @@ import threading
 import warnings
 import weakref
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, cast
+from typing import Any, Callable, Iterable, cast
 
 import torch
 import torch.nn as nn
@@ -323,104 +324,141 @@ def patch_torch_for_mps() -> bool:
         installed = True
     return installed
 
+# Layer accessors — one named ``def`` per residual-block *shape*, shared by
+# every family that wears it.  Named rather than inline lambdas so a traceback
+# out of a wrong accessor names the shape it tried.
 def _MODEL_LAYERS(m: Any) -> Any: return m.model.layers
 def _TRANSFORMER_H(m: Any) -> Any: return m.transformer.h
 def _VLM_LANGUAGE_LAYERS(m: Any) -> Any: return m.model.language_model.layers
+def _GPT_NEOX_LAYERS(m: Any) -> Any: return m.gpt_neox.layers
+def _TRANSFORMER_BLOCKS(m: Any) -> Any: return m.transformer.blocks
+def _DECODER_LAYERS(m: Any) -> Any: return m.model.decoder.layers
+def _MODEL_BLOCKS(m: Any) -> Any: return m.model.blocks
 
-_LAYER_ACCESSORS = {
+
+@dataclass(frozen=True)
+class ArchProfile:
+    """What saklas knows about one ``model.config.model_type``.
+
+    ``layers`` is the accessor returning the sequential residual blocks;
+    ``tested`` marks an architecture with end-to-end coverage (smoke +
+    session).  Everything else in the registry is wired up optimistically —
+    it may work, but has not been exercised, and :func:`get_layers` warns
+    once on load.
+
+    Both facts live on one entry so a "tested" architecture with no accessor
+    is unrepresentable.  As two tables it was representable and it happened:
+    ``mistral3`` sat in the tested set with no accessor, which made the entry
+    dead (``get_layers`` raises on the missing accessor before ever reaching
+    the tested check) while the type a Mistral-3 checkpoint actually loads as
+    — its ``mistral`` text sub-model — went unmarked and warned on every load.
+    """
+
+    layers: Callable[[Any], Any]
+    tested: bool = False
+
+
+def _prof(accessor: Callable[[Any], Any], *, tested: bool = False) -> ArchProfile:
+    return ArchProfile(layers=accessor, tested=tested)
+
+
+_ARCH_PROFILES: dict[str, ArchProfile] = {
     # Llama family
-    "llama": _MODEL_LAYERS,
-    "llama4": _MODEL_LAYERS,
-    "llama4_text": _MODEL_LAYERS,
-    # Mistral / Mixtral / Ministral
-    "mistral": _MODEL_LAYERS,
-    "mistral4": _MODEL_LAYERS,
-    "ministral": _MODEL_LAYERS,
-    "ministral3": _MODEL_LAYERS,
-    "mixtral": _MODEL_LAYERS,
+    "llama": _prof(_MODEL_LAYERS, tested=True),
+    "llama4": _prof(_MODEL_LAYERS),
+    "llama4_text": _prof(_MODEL_LAYERS),
+    # Mistral / Mixtral / Ministral.  ``mistral`` is tested because that is
+    # what a Mistral-Small-3 checkpoint ends up as: the composite ``mistral3``
+    # config carries ``text_config.model_type == "mistral"``, so
+    # ``extract_text_model`` fires and the loaded model reports ``mistral``.
+    # There is deliberately no ``mistral3`` entry — the composite type never
+    # reaches ``get_layers``.
+    "mistral": _prof(_MODEL_LAYERS, tested=True),
+    "mistral4": _prof(_MODEL_LAYERS),
+    "ministral": _prof(_MODEL_LAYERS),
+    # Ministral-3 has no ``text_config``, so no extraction happens and the
+    # composite type is what loads.
+    "ministral3": _prof(_MODEL_LAYERS, tested=True),
+    "mixtral": _prof(_MODEL_LAYERS),
     # Gemma family
-    "gemma": _MODEL_LAYERS,
-    "gemma2": _MODEL_LAYERS,
-    "gemma3": _VLM_LANGUAGE_LAYERS,
-    "gemma3_text": _MODEL_LAYERS,
-    "gemma4": _VLM_LANGUAGE_LAYERS,
-    "gemma4_text": _MODEL_LAYERS,
+    "gemma": _prof(_MODEL_LAYERS),
+    "gemma2": _prof(_MODEL_LAYERS, tested=True),
+    "gemma3": _prof(_VLM_LANGUAGE_LAYERS, tested=True),
+    "gemma3_text": _prof(_MODEL_LAYERS, tested=True),
+    "gemma4": _prof(_VLM_LANGUAGE_LAYERS, tested=True),
+    "gemma4_text": _prof(_MODEL_LAYERS, tested=True),
     # Gemma-4 "unified" variant (gemma-4-12B-it, 2026-06): a multimodal
     # wrapper whose text submodel weights live under model.language_model.*,
     # so the VLM accessor + text-extraction prefix-strip both apply as-is.
-    "gemma4_unified": _VLM_LANGUAGE_LAYERS,
-    "gemma4_unified_text": _MODEL_LAYERS,
-    "recurrent_gemma": _MODEL_LAYERS,
+    "gemma4_unified": _prof(_VLM_LANGUAGE_LAYERS, tested=True),
+    "gemma4_unified_text": _prof(_MODEL_LAYERS, tested=True),
+    "recurrent_gemma": _prof(_MODEL_LAYERS),
     # Phi family
-    "phi": _MODEL_LAYERS,
-    "phi3": _MODEL_LAYERS,
-    "phimoe": _MODEL_LAYERS,
+    "phi": _prof(_MODEL_LAYERS),
+    "phi3": _prof(_MODEL_LAYERS),
+    "phimoe": _prof(_MODEL_LAYERS),
     # Qwen family
-    "qwen": _TRANSFORMER_H,
-    "qwen2": _MODEL_LAYERS,
-    "qwen2_moe": _MODEL_LAYERS,
-    "qwen3": _MODEL_LAYERS,
-    "qwen3_moe": _MODEL_LAYERS,
-    "qwen3_5": _MODEL_LAYERS,
-    "qwen3_5_text": _MODEL_LAYERS,
-    "qwen3_5_moe": _MODEL_LAYERS,
+    "qwen": _prof(_TRANSFORMER_H),
+    "qwen2": _prof(_MODEL_LAYERS, tested=True),
+    "qwen2_moe": _prof(_MODEL_LAYERS),
+    "qwen3": _prof(_MODEL_LAYERS, tested=True),
+    "qwen3_moe": _prof(_MODEL_LAYERS),
+    "qwen3_5": _prof(_MODEL_LAYERS, tested=True),
+    "qwen3_5_text": _prof(_MODEL_LAYERS, tested=True),
+    "qwen3_5_moe": _prof(_MODEL_LAYERS, tested=True),
     # Cohere (Command-R)
-    "cohere": _MODEL_LAYERS,
-    "cohere2": _MODEL_LAYERS,
+    "cohere": _prof(_MODEL_LAYERS),
+    "cohere2": _prof(_MODEL_LAYERS),
     # DeepSeek
-    "deepseek_v2": _MODEL_LAYERS,
-    "deepseek_v3": _MODEL_LAYERS,
+    "deepseek_v2": _prof(_MODEL_LAYERS),
+    "deepseek_v3": _prof(_MODEL_LAYERS),
     # Starcoder
-    "starcoder2": _MODEL_LAYERS,
+    "starcoder2": _prof(_MODEL_LAYERS),
     # OLMo
-    "olmo": _MODEL_LAYERS,
-    "olmo2": _MODEL_LAYERS,
-    "olmo3": _MODEL_LAYERS,
-    "olmoe": _MODEL_LAYERS,
+    "olmo": _prof(_MODEL_LAYERS),
+    "olmo2": _prof(_MODEL_LAYERS),
+    "olmo3": _prof(_MODEL_LAYERS),
+    "olmoe": _prof(_MODEL_LAYERS),
     # GLM (ChatGLM)
-    "glm": _MODEL_LAYERS,
-    "glm4": _MODEL_LAYERS,
-    "glm4_moe_lite": _MODEL_LAYERS,
+    "glm": _prof(_MODEL_LAYERS, tested=True),
+    "glm4": _prof(_MODEL_LAYERS),
+    "glm4_moe_lite": _prof(_MODEL_LAYERS),
     # Granite (IBM)
-    "granite": _MODEL_LAYERS,
-    "granitemoe": _MODEL_LAYERS,
+    "granite": _prof(_MODEL_LAYERS),
+    "granitemoe": _prof(_MODEL_LAYERS),
     # NVIDIA
-    "nemotron": _MODEL_LAYERS,
+    "nemotron": _prof(_MODEL_LAYERS),
     # StableLM
-    "stablelm": _MODEL_LAYERS,
+    "stablelm": _prof(_MODEL_LAYERS),
     # GPT-2 family
-    "gpt2": _TRANSFORMER_H,
-    "gpt_neo": _TRANSFORMER_H,
-    "gptj": _TRANSFORMER_H,
-    "gpt_bigcode": _TRANSFORMER_H,
+    "gpt2": _prof(_TRANSFORMER_H),
+    "gpt_neo": _prof(_TRANSFORMER_H),
+    "gptj": _prof(_TRANSFORMER_H),
+    "gpt_bigcode": _prof(_TRANSFORMER_H),
     # Bloom / Falcon
-    "bloom": _TRANSFORMER_H,
-    "falcon": _TRANSFORMER_H,
-    "falcon_h1": _MODEL_LAYERS,
+    "bloom": _prof(_TRANSFORMER_H),
+    "falcon": _prof(_TRANSFORMER_H),
+    "falcon_h1": _prof(_MODEL_LAYERS),
     # GPT-NeoX / Pythia / GPT-OSS
-    "gpt_neox": lambda m: m.gpt_neox.layers,
-    "gpt_oss": _MODEL_LAYERS,
+    "gpt_neox": _prof(_GPT_NEOX_LAYERS),
+    "gpt_oss": _prof(_MODEL_LAYERS, tested=True),
     # MPT / DBRX
-    "mpt": lambda m: m.transformer.blocks,
-    "dbrx": lambda m: m.transformer.blocks,
+    "mpt": _prof(_TRANSFORMER_BLOCKS),
+    "dbrx": _prof(_TRANSFORMER_BLOCKS),
     # OPT
-    "opt": lambda m: m.model.decoder.layers,
+    "opt": _prof(_DECODER_LAYERS),
     # Talkie (vintage pre-1931 model; embedding-skip + per-block actgain decoder)
-    "talkie": lambda m: m.model.blocks,
+    "talkie": _prof(_MODEL_BLOCKS, tested=True),
 }
 
-_SUPPORTED_TYPES = sorted(_LAYER_ACCESSORS)
-
-# Architectures with end-to-end testing (smoke + session). Everything else in
-# _LAYER_ACCESSORS is wired up optimistically — it may work, but has not been
-# exercised. See CLAUDE.md "Architecture" section.
-_TESTED_ARCHS: frozenset[str] = frozenset({
-    "qwen2", "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe",
-    "gemma2", "gemma3", "gemma3_text", "gemma4", "gemma4_text",
-    "gemma4_unified", "gemma4_unified_text",  # gemma-4-12B-it, time-experiment 2026-06-09
-    "mistral3", "ministral3", "gpt_oss", "llama", "glm",
-    "talkie",
-})
+# Views over the one registry — the lookup shapes call sites already speak.
+_LAYER_ACCESSORS: dict[str, Callable[[Any], Any]] = {
+    model_type: profile.layers for model_type, profile in _ARCH_PROFILES.items()
+}
+_SUPPORTED_TYPES = sorted(_ARCH_PROFILES)
+_TESTED_ARCHS: frozenset[str] = frozenset(
+    model_type for model_type, profile in _ARCH_PROFILES.items() if profile.tested
+)
 _warned: set[str] = set()
 
 
@@ -877,8 +915,57 @@ def load_model(
     device = detect_device(device)
     if device == "mps":
         patch_torch_for_mps()
-    resolved_dtype = _resolve_dtype(dtype, device)
     log.info("Device: %s", device)
+
+    plan = _resolve_load_plan(model_id, quantize=quantize, device=device, dtype=dtype)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, **plan.tokenizer_kwargs, **plan.pin_kwargs,
+    )
+    model = _materialize_model(plan)
+    model = _finalize_model(
+        model, tokenizer, plan, compile=compile, compile_mode=compile_mode,
+    )
+    return cast(PreTrainedModel, model), tokenizer
+
+
+@dataclass
+class LoadPlan:
+    """Every decision :func:`load_model` makes before a weight is read.
+
+    Produced by :func:`_resolve_load_plan` from the model id and the caller's
+    knobs plus two config reads — no weight I/O — so the decisions (which
+    attention impl, which dtype, whether to extract a text sub-model, whether
+    to trust remote code) are inspectable and unit-testable without loading a
+    checkpoint.  :func:`_materialize_model` consumes it and owns the fallback
+    ladder; :func:`_finalize_model` owns the post-load stamping.
+
+    ``load_kwargs`` is mutable on purpose: the materialize step's fallback
+    ladder rewrites ``attn_implementation`` / ``dtype`` / ``device_map`` in it
+    as each retry narrows.
+    """
+
+    model_id: str
+    device: str
+    dtype: torch.dtype
+    quantize: str | None
+    revision: str | None
+    pin_kwargs: dict[str, str]
+    tokenizer_kwargs: dict[str, Any]
+    load_kwargs: dict[str, Any]
+    config: Any
+    text_config: Any
+    extract_text_model: bool
+
+
+def _resolve_load_plan(
+    model_id: str,
+    *,
+    quantize: str | None,
+    device: str,
+    dtype: torch.dtype | str | None,
+) -> LoadPlan:
+    """Decide how to load ``model_id``; read configs, never weights."""
+    resolved_dtype = _resolve_dtype(dtype, device)
 
     # Resolve one config snapshot first, then pin every subsequent tokenizer,
     # config, custom shard, and model read to that immutable commit. Without a
@@ -904,9 +991,6 @@ def load_model(
     tokenizer_kwargs: dict[str, Any] = {"trust_remote_code": True}
     if "mistral" in model_id.lower():
         tokenizer_kwargs["fix_mistral_regex"] = True
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id, **tokenizer_kwargs, **pin_kwargs,
-    )
 
     # --- quantization config ---
     if quantize and device != "cuda":
@@ -958,8 +1042,8 @@ def load_model(
     # ``linear(): input and weight.T shapes cannot be multiplied``.
     # CPU SDPA returns the correct shape; CUDA SDPA also handles this
     # via the flash backend.  Narrowest-correct fix: force eager on MPS
-    # for these models.  The ``torch.histc`` MPS patch above already
-    # covers the MoE-routing issue eager would otherwise hit.
+    # for these models.  The ``torch.histc`` MPS patch already installed by
+    # ``load_model`` covers the MoE-routing issue eager would otherwise hit.
     _MLA_TYPES = {"deepseek_v2", "deepseek_v3"}
     if device == "mps" and (
         native_type in _MLA_TYPES or native_text_type in _MLA_TYPES
@@ -971,11 +1055,6 @@ def load_model(
         )
         attn_impl = "eager"
 
-    # --- check for multimodal configs wrapping a text-only model ---
-    # Some text-only models ship with a multimodal config whose
-    # model_type isn't registered with AutoModelForCausalLM (e.g.
-    # Ministral tagged as Mistral3).  If the config has a text_config
-    # that IS a known causal-LM type, use that instead.
     load_kwargs: dict[str, Any] = {
         "attn_implementation": attn_impl,
         "trust_remote_code": trust,
@@ -992,6 +1071,12 @@ def load_model(
         load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
     else:
         load_kwargs["dtype"] = resolved_dtype
+
+    # --- check for multimodal configs wrapping a text-only model ---
+    # Some text-only models ship with a multimodal config whose
+    # model_type isn't registered with AutoModelForCausalLM (e.g.
+    # Ministral tagged as Mistral3).  If the config has a text_config
+    # that IS a known causal-LM type, use that instead.
     config = AutoConfig.from_pretrained(
         model_id, trust_remote_code=trust, **pin_kwargs,
     )
@@ -1010,20 +1095,64 @@ def load_model(
         and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
     )
 
+    return LoadPlan(
+        model_id=model_id,
+        device=device,
+        dtype=resolved_dtype,
+        quantize=quantize,
+        revision=str(resolved_revision) if resolved_revision else None,
+        pin_kwargs=pin_kwargs,
+        tokenizer_kwargs=tokenizer_kwargs,
+        load_kwargs=load_kwargs,
+        config=config,
+        text_config=text_cfg,
+        extract_text_model=extract_text_model,
+    )
+
+
+def _load_with_fallbacks(plan: LoadPlan) -> Any:
+    """One ``from_pretrained`` attempt plus the attn / dtype retries.
+
+    Each retry narrows ``plan.load_kwargs`` in place so a caller that retries
+    this whole function (the device-conversion fallback) inherits the
+    already-narrowed kwargs rather than repeating a known-bad attempt.
+    """
+    load_kwargs = plan.load_kwargs
+    try:
+        return AutoModelForCausalLM.from_pretrained(plan.model_id, **load_kwargs)
+    except ValueError as e:
+        if "does not support an attention implementation" not in str(e):
+            raise
+        log.info("attn_implementation %r unsupported, falling back to eager",
+                 load_kwargs.get("attn_implementation"))
+        load_kwargs["attn_implementation"] = "eager"
+        return AutoModelForCausalLM.from_pretrained(plan.model_id, **load_kwargs)
+    except Exception:
+        if plan.quantize is not None:
+            raise
+        fallback = torch.float16 if plan.device == "cuda" else torch.float32
+        load_kwargs["dtype"] = fallback
+        return AutoModelForCausalLM.from_pretrained(plan.model_id, **load_kwargs)
+
+
+def _materialize_model(plan: LoadPlan) -> Any:
+    """Read weights per ``plan`` — text extraction, then the fallback ladder."""
     model = None
-    if extract_text_model:
+    text_cfg = plan.text_config
+    if plan.extract_text_model:
         # Weights live under a "language_model." path segment that doesn't
         # match the text-only model's parameter names.  Load manually.
         # Propagate _name_or_path so cache paths resolve correctly.
-        assert text_cfg is not None  # guaranteed by extract_text_model condition above
+        assert text_cfg is not None  # guaranteed by plan.extract_text_model
         if not getattr(text_cfg, "_name_or_path", ""):
-            text_cfg._name_or_path = model_id
+            text_cfg._name_or_path = plan.model_id
         log.info("extracting text model (%s) from multimodal checkpoint (%s)",
-                 text_cfg.model_type, config.model_type)
+                 text_cfg.model_type, plan.config.model_type)
         try:
             model = _load_text_from_multimodal(
-                model_id, text_cfg, load_kwargs.get("dtype", resolved_dtype),
-                device, revision=str(resolved_revision) if resolved_revision else None,
+                plan.model_id, text_cfg,
+                plan.load_kwargs.get("dtype", plan.dtype),
+                plan.device, revision=plan.revision,
             )
         except _NoTextWeightsExtracted as e:
             # Unexpected weight layout — don't ship random init; fall through
@@ -1031,37 +1160,32 @@ def load_model(
             log.warning("%s; falling back to full multimodal load", e)
             model = None
 
-    if model is None:
-        # --- standard load (with attention, dtype, and device fallbacks) ---
-        def _try_load_with_fallbacks():
-            try:
-                return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-            except ValueError as e:
-                if "does not support an attention implementation" not in str(e):
-                    raise
-                log.info("attn_implementation %r unsupported, falling back to eager",
-                         load_kwargs.get("attn_implementation"))
-                load_kwargs["attn_implementation"] = "eager"
-                return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-            except Exception:
-                if quantize is not None:
-                    raise
-                fallback = torch.float16 if device == "cuda" else torch.float32
-                load_kwargs["dtype"] = fallback
-                return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    if model is not None:
+        return model
 
-        try:
-            model = _try_load_with_fallbacks()
-        except (RuntimeError, ValueError) as e:
-            if device in ("cuda", "cpu") or "CONVERSION" not in str(e):
-                raise
-            log.info("weight conversion failed on %s, retrying on CPU", device)
-            load_kwargs["device_map"] = {"": "cpu"}
-            if "dtype" not in load_kwargs:
-                load_kwargs["dtype"] = torch.float32
-            model = _try_load_with_fallbacks()
-            model = model.to(device)  # pyright: ignore[reportArgumentType]  # transformers stub: .to(str) overload missing
+    # --- standard load (with attention, dtype, and device fallbacks) ---
+    try:
+        return _load_with_fallbacks(plan)
+    except (RuntimeError, ValueError) as e:
+        if plan.device in ("cuda", "cpu") or "CONVERSION" not in str(e):
+            raise
+        log.info("weight conversion failed on %s, retrying on CPU", plan.device)
+        plan.load_kwargs["device_map"] = {"": "cpu"}
+        if "dtype" not in plan.load_kwargs:
+            plan.load_kwargs["dtype"] = torch.float32
+        model = _load_with_fallbacks(plan)
+        return model.to(plan.device)  # pyright: ignore[reportArgumentType]  # transformers stub: .to(str) overload missing
 
+
+def _finalize_model(
+    model: Any,
+    tokenizer: PreTrainedTokenizerBase,
+    plan: LoadPlan,
+    *,
+    compile: bool,
+    compile_mode: str,
+) -> Any:
+    """Stamp identity, freeze, reconcile stop tokens, optionally compile."""
     # ``from_pretrained`` preserves the resolved Hub revision on an ordinary
     # model config, but the text-only multimodal path builds a fresh causal-LM
     # config via ``from_config``.  Transformers does not copy the composite
@@ -1070,13 +1194,13 @@ def load_model(
     # as Saklas compared it with the live text model.  The revision was already
     # resolved before any weights were read and every read above was pinned to
     # it, so stamp that proven identity onto the returned model uniformly.
-    if resolved_revision:
+    if plan.revision:
         live_config = getattr(model, "config", None)
         if live_config is not None:
-            live_config._commit_hash = str(resolved_revision)
+            live_config._commit_hash = plan.revision
             live_text_config = getattr(live_config, "text_config", None)
             if live_text_config is not None:
-                live_text_config._commit_hash = str(resolved_revision)
+                live_text_config._commit_hash = plan.revision
 
     model.requires_grad_(False)
     model.train(False)
@@ -1084,9 +1208,10 @@ def load_model(
     # configs merely claim the same commit must still take the exact full-state
     # fingerprint path.
     source_fingerprint = model_source_fingerprint(
-        model_id, quantize=quantize, device=device, config=config,
+        plan.model_id, quantize=plan.quantize, device=plan.device,
+        config=plan.config,
         parameter_dtype=(
-            "quantized" if quantize is not None
+            "quantized" if plan.quantize is not None
             else next(model.parameters()).dtype
         ),
     )
@@ -1118,7 +1243,7 @@ def load_model(
         gen_cfg.eos_token_id = chat_eos if len(chat_eos) > 1 else chat_eos[0]
 
     # --- memory report ---
-    mem_gb = _get_memory_gb(device)
+    mem_gb = _get_memory_gb(plan.device)
     if mem_gb > 0:
         log.info("Memory used: %.2f GB", mem_gb)
 
@@ -1137,16 +1262,17 @@ def load_model(
     # installed by :func:`install_persistent_offset_hooks`), so compile sees
     # no structural change and never retraces across α changes between
     # generations.
-    if compile and device == "cuda":
-        model = _compile_with_probe(model, tokenizer, device, mode=compile_mode)
-    elif compile and device != "cuda":
+    if compile and plan.device == "cuda":
+        model = _compile_with_probe(
+            model, tokenizer, plan.device, mode=compile_mode,
+        )
+    elif compile and plan.device != "cuda":
         log.info(
             "compile=True but device=%s — skipping torch.compile "
             "(supported only on CUDA)",
-            device,
+            plan.device,
         )
-
-    return cast(PreTrainedModel, model), tokenizer
+    return model
 
 
 def _get_memory_gb(device: str) -> float:

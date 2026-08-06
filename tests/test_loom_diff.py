@@ -202,6 +202,25 @@ def test_steering_delta_unparseable_returns_empty():
     assert steering_delta("???", "???") == ""
 
 
+def test_steering_delta_has_no_sentinel_outputs():
+    """The empty string is the only non-term output.
+
+    The docstring used to promise ``"(unsteered)"`` / ``"(unparsed)"``
+    sentinels for the unparseable edge cases; the implementation can't emit
+    either (``_parse_or_empty`` collapses both empty and unparseable to
+    ``None``), and the value goes straight to the client as
+    ``{"label": ...}``.
+    """
+    for parent, child in (
+        ("???", None),
+        (None, "???"),
+        ("???", "0.3 honest.deceptive"),
+        ("0.3 honest.deceptive", "???"),
+    ):
+        label = steering_delta(parent, child)
+        assert "(" not in label, label
+
+
 def test_steering_delta_manifold_coord_term():
     # A `%` manifold term lands in Steering.alphas as a ManifoldTerm, not a
     # bare float — the edge-label formatter must read its .coeff rather than

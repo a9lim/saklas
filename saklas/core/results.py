@@ -25,7 +25,14 @@ class TokenAlt:
 
 @dataclass
 class ProbeReadings:
-    """Probe monitor readings across a generation run, per coordinate axis.
+    """One probe's aggregate readings across a *series* of generations.
+
+    The multi-run summary shape (:class:`ProbeReading`, singular, is the
+    single-read shape — per token or the end-of-generation aggregate).
+    Produced by :meth:`RunSet.probe_summary` — which returns exactly the
+    ``dict[str, ProbeReadings]`` that
+    ``saklas.notebook.plots.plot_trait_history`` consumes, so the plot is
+    one call off a batch or sweep.
 
     Vectorized for the coordinate readout: a probe is a rank-``R`` flat
     subspace (``R = 1`` for a 2-node concept axis), so each per-generation
@@ -35,6 +42,10 @@ class ProbeReadings:
     ``R``-tuple aligned with the coordinate axes; ``per_generation`` is
     the list of per-run coordinate tuples.  A scalar consumer reads axis
     0 (``mean[0]``).
+
+    ``delta_per_gen`` is the **drift rate**: ``(last − first) / (n − 1)``
+    per axis, the mean change per generation across the series (``0.0`` for
+    a single run).  ``std`` is the population standard deviation.
     """
     per_generation: list[tuple[float, ...]]
     mean: tuple[float, ...]
@@ -42,6 +53,45 @@ class ProbeReadings:
     min: tuple[float, ...]
     max: tuple[float, ...]
     delta_per_gen: tuple[float, ...]
+
+    @classmethod
+    def from_coords(
+        cls, samples: Iterable[Iterable[float]],
+    ) -> "ProbeReadings":
+        """Fold a series of per-generation coordinate tuples into a summary.
+
+        Ragged input is truncated to the narrowest sample's rank so every
+        statistic stays axis-aligned — a probe re-attached at a different
+        rank mid-series is a caller error, not something to interpolate.
+        """
+        rows = [tuple(float(v) for v in sample) for sample in samples]
+        rows = [row for row in rows if row]
+        if not rows:
+            empty: tuple[float, ...] = ()
+            return cls(
+                per_generation=[], mean=empty, std=empty,
+                min=empty, max=empty, delta_per_gen=empty,
+            )
+        rank = min(len(row) for row in rows)
+        rows = [row[:rank] for row in rows]
+        n = len(rows)
+        columns = [[row[axis] for row in rows] for axis in range(rank)]
+        mean = tuple(sum(col) / n for col in columns)
+        std = tuple(
+            (sum((v - m) ** 2 for v in col) / n) ** 0.5
+            for col, m in zip(columns, mean)
+        )
+        delta = tuple(
+            (col[-1] - col[0]) / (n - 1) if n > 1 else 0.0 for col in columns
+        )
+        return cls(
+            per_generation=rows,
+            mean=mean,
+            std=std,
+            min=tuple(min(col) for col in columns),
+            max=tuple(max(col) for col in columns),
+            delta_per_gen=delta,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -265,6 +315,25 @@ class RunSet(list[GenerationResult]):
     @property
     def node_id(self) -> str | None:
         return self.node_ids[0] if self.node_ids else None
+
+    def probe_summary(self) -> dict[str, ProbeReadings]:
+        """Fold each probe's per-run aggregate coordinates into a summary.
+
+        The multi-run counterpart of ``GenerationResult.probe_readings``:
+        one :class:`ProbeReadings` per probe name, in run order, ready for
+        ``saklas.notebook.plots.plot_trait_history``.  Probes are keyed by
+        the name they were registered under; a probe attached partway
+        through the set contributes only the runs that measured it.
+        """
+        series: dict[str, list[tuple[float, ...]]] = {}
+        for result in self:
+            for name, reading in result.probe_readings.items():
+                if reading.coords:
+                    series.setdefault(name, []).append(tuple(reading.coords))
+        return {
+            name: ProbeReadings.from_coords(samples)
+            for name, samples in series.items()
+        }
 
     def to_collector(self) -> "ResultCollector":
         collector = ResultCollector()
