@@ -10,10 +10,12 @@
   //     more multi-turn contexts (history turns + the slotted final assistant
   //     turn). The slot lives only in the assistant turn.
   //
-  // Reached from the command palette. Templates also feed a manifold fit
-  // (`saklas manifold from-template`).
+  // Reached from the command palette, or deep-linked to the build tab
+  // (``params: { tab: "build" }``) from the manifold builder's template
+  // path — this is the ONE template editor, and the builder derives a
+  // manifold from what it authors (`saklas manifold from-template`).
 
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { apiTemplates, describeError } from "../lib/api";
   import { validateTemplateDraft } from "../lib/templates";
   import { closeDrawer } from "../lib/stores.svelte";
@@ -27,11 +29,20 @@
     TemplateTurn,
   } from "../lib/types";
 
-  let _drawerProps: { params?: unknown } = $props();
-  $effect(() => { void _drawerProps.params; });
+  let { params }: { params?: unknown } = $props();
 
   type Tab = "score" | "build";
-  let tab: Tab = $state("score");
+  // Opening tab: ``score`` unless a caller deep-linked the editor.  Read
+  // once at mount — the drawer host remounts this component on every
+  // open, so a later params change isn't a case that exists.
+  let tab: Tab = $state(
+    untrack(
+      () =>
+        (params as { tab?: unknown } | null | undefined)?.tab === "build"
+          ? "build"
+          : "score",
+    ),
+  );
 
   const TAB_ITEMS: Array<{ value: Tab; label: string; title: string }> = [
     { value: "score", label: "score", title: "Score a template's restricted-choice distribution" },

@@ -1,0 +1,288 @@
+/* Shared form surface for the manifold builder's three authoring tabs.
+ *
+ * Every rule is scoped under ``.mb-form`` — the class the drawer puts on
+ * its scrolling body — so the sibling form components inherit one visual
+ * language instead of each carrying its own copy of the same field,
+ * step, and node-card rules.  Nothing here is new: these are the builder
+ * drawer's rules, moved out of its scoped <style> so the split forms can
+ * share them verbatim. */
+
+.mb-form .muted {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  margin: 0;
+}
+.mb-form .grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+.mb-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.mb-form .label {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.mb-form .input {
+  background: var(--input-well);
+  color: var(--fg);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  font-family: var(--font-mono);
+}
+.mb-form .input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.mb-form .input.mini {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-sm);
+}
+.mb-form textarea.input {
+  resize: vertical;
+  line-height: 1.4;
+  min-height: 4em;
+}
+
+.mb-form .step {
+  padding-top: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.mb-form .step-title {
+  margin: 0;
+  color: var(--accent);
+  font-size: var(--text-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: var(--weight-medium);
+}
+
+.mb-form .domain-kind {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.mb-form .kind-btn {
+  background: var(--glass);
+  color: var(--fg-dim);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-4);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition:
+    background var(--dur) var(--ease-out),
+    color var(--dur) var(--ease-out);
+}
+.mb-form .kind-btn:hover {
+  color: var(--fg-strong);
+  background: var(--glass-strong);
+}
+.mb-form .kind-btn.active {
+  color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.mb-form .axes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.mb-form .axis-card {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr auto;
+  align-items: end;
+  gap: var(--space-2);
+  border-radius: var(--radius);
+  background: var(--glass);
+  box-shadow: var(--shadow-well);
+  padding: var(--space-3);
+}
+.mb-form .axis-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.mb-form .mini-label {
+  color: var(--fg-muted);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+}
+.mb-form .axis-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--fg-strong);
+  font-size: var(--text-xs);
+  padding-bottom: var(--space-1);
+}
+.mb-form .sphere-field {
+  max-width: 18em;
+}
+
+.mb-form .node-role {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3) 0;
+}
+.mb-form .role-hint {
+  margin: var(--space-1) 0 0 var(--space-5);
+  color: var(--fg-dim);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+.mb-form .dim-note {
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: var(--text-xs);
+}
+.mb-form .dim-note strong {
+  color: var(--accent);
+  font-family: var(--font-mono);
+}
+
+.mb-form .node-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.mb-form .node-card {
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  background: var(--bg-deep);
+}
+.mb-form .node-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.mb-form .node-expand {
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: var(--text-xs);
+  padding: 0 var(--space-1);
+}
+.mb-form .node-label {
+  flex: 0 0 8em;
+}
+.mb-form .node-coords {
+  display: flex;
+  gap: var(--space-1);
+  flex: 1 1 auto;
+}
+/* Wraps the themed NumberInput in the node-coords flex row. */
+.mb-form .coord-cell {
+  flex: 0 0 auto;
+  width: 4.5em;
+  display: inline-flex;
+}
+.mb-form .node-remove {
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: var(--text);
+  padding: 0 var(--space-2);
+}
+.mb-form .node-remove:hover {
+  color: var(--accent-red);
+}
+.mb-form .node-statements {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--input-well);
+  color: var(--fg);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  resize: vertical;
+  line-height: 1.4;
+}
+.mb-form .node-statements:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.mb-form .add-node {
+  background: var(--accent-subtle);
+  color: var(--accent);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-4);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  align-self: flex-start;
+}
+.mb-form .add-node:hover {
+  background: var(--accent-strong);
+}
+
+/* Radio pair for the fit-method picker. */
+.mb-form .radio-row {
+  display: flex;
+  gap: var(--space-5);
+  padding: var(--space-1) 0 var(--space-3);
+}
+/* Checkbox group at the bottom of an advanced flyout. */
+.mb-form .check-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+/* Spacing for the auto-domain checkbox row inside the custom-nodes tab. */
+.mb-form .auto-domain-toggle {
+  display: inline-flex;
+  padding: var(--space-3) 0;
+}
+
+.mb-form .save-btn {
+  background: var(--accent);
+  color: var(--text-on-accent);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-5);
+  font: inherit;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease-out);
+}
+.mb-form .save-btn:hover:not(:disabled) {
+  background: var(--accent-light);
+}
+.mb-form .save-btn:disabled {
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  cursor: not-allowed;
+}
+
+.mb-form .progress {
+  margin: 0;
+  color: var(--accent);
+  font-size: var(--text-xs);
+  font-style: italic;
+}
+
+/* Each form is a plain vertical stack inside the shared body rhythm. */
+.mb-form .form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
