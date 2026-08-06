@@ -15,16 +15,16 @@ from saklas.core.profile import load_profile, save_profile
 def test_save_profile_writes_format_version_in_sidecar(tmp_path: Path):
     profile = {0: torch.zeros(4), 1: torch.ones(4)}
     path = tmp_path / "x.safetensors"
-    save_profile(profile, str(path), {"method": "contrastive_pca"})
+    save_profile(profile, str(path), {"method": "profile"})
     sidecar = json.loads((path.with_suffix(".json")).read_text())
     assert sidecar["format_version"] == PROFILE_FORMAT_VERSION
-    assert sidecar["method"] == "contrastive_pca"
+    assert sidecar["method"] == "profile"
 
 
 def test_load_profile_rejects_missing_format_version(tmp_path: Path):
     profile = {0: torch.zeros(4)}
     path = tmp_path / "x.safetensors"
-    save_profile(profile, str(path), {"method": "contrastive_pca"})
+    save_profile(profile, str(path), {"method": "profile"})
 
     # The current reader never infers a version for an unstamped sidecar.
     sc_path = path.with_suffix(".json")
@@ -42,7 +42,7 @@ def test_load_profile_rejects_non_current_format_version(
 ):
     profile = {0: torch.zeros(4)}
     path = tmp_path / "x.safetensors"
-    save_profile(profile, str(path), {"method": "contrastive_pca"})
+    save_profile(profile, str(path), {"method": "profile"})
 
     sc_path = path.with_suffix(".json")
     data = json.loads(sc_path.read_text())

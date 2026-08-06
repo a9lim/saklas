@@ -14,14 +14,18 @@ from saklas.cli.config_file import ConfigFileError
 from saklas.io.selectors import AmbiguousSelectorError, SelectorError
 from saklas.core.errors import (
     AmbiguousVariantError,
+    ManifoldArityError,
+    OverlappingManifoldError,
+    ProfileError,
     SaeBackendImportError,
     SaeCoverageError,
     SaeModelMismatchError,
     SaeReleaseNotFoundError,
     SaklasError,
+    SteeringCompositionError,
     UnknownVariantError,
+    WhitenerError,
 )
-from saklas.core.profile import ProfileError
 from saklas.core.session import (
     ConcurrentGenerationError,
     ProfileNotRegisteredError,
@@ -54,11 +58,16 @@ _OVERRIDES: list[tuple[type[SaklasError], int]] = [
     (SaeCoverageError, 400),
     (AmbiguousVariantError, 400),
     (UnknownVariantError, 404),
+    (WhitenerError, 400),
+    (ProfileError, 400),
+    # A composition failure is syntactically valid but semantically
+    # unsatisfiable — 422, distinct from the parser's 400.
+    (SteeringCompositionError, 422),
+    (ManifoldArityError, 422),
+    (OverlappingManifoldError, 422),
     # core/session.py
     (ConcurrentGenerationError, 409),
     (ProfileNotRegisteredError, 404),
-    # core/profile.py
-    (ProfileError, 400),
     # core/steering_expr.py
     (SteeringExprError, 400),
     # io/selectors.py

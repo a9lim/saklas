@@ -61,17 +61,17 @@ def test_weight_at_missing_raises_profile_error():
 
 
 def test_metadata_is_copy():
-    meta = {"method": "contrastive_pca", "saklas_version": "1.4.0"}
+    meta = {"method": "profile", "saklas_version": "1.4.0"}
     p = Profile(_mk(), metadata=meta)
     out = p.metadata
     out["method"] = "mutated"
-    assert p.metadata["method"] == "contrastive_pca"
+    assert p.metadata["method"] == "profile"
 
 
 def test_save_load_roundtrip(tmp_path: Path):
     p = Profile(_mk(layers=(0, 3)))
     path = tmp_path / "cv.safetensors"
-    p.save(path, metadata={"method": "contrastive_pca"})
+    p.save(path, metadata={"method": "manifold_pca"})
     assert path.exists()
     assert path.with_suffix(".json").exists()
 
@@ -79,7 +79,7 @@ def test_save_load_roundtrip(tmp_path: Path):
     assert loaded.layers == [0, 3]
     for idx in loaded.layers:
         assert torch.allclose(loaded[idx], p[idx])
-    assert loaded.metadata["method"] == "contrastive_pca"
+    assert loaded.metadata["method"] == "manifold_pca"
     assert loaded.metadata["format_version"] == PROFILE_FORMAT_VERSION
 
 
@@ -349,14 +349,13 @@ def test_repr_long_form_shows_range_and_count():
 def test_save_metadata_override_merges_on_top_of_self_metadata(tmp_path: Path):
     """``metadata=`` kwarg to ``save`` overrides matching keys in ``self.metadata``.
 
-    The wire sidecar is deliberately slim (see ``saklas.core.profile.save_profile``)
-    — only the allowlisted provenance fields round-trip.  We verify the merge
-    via ``method`` (override wins) and ``statements_sha256`` (self-metadata
-    field that the override doesn't touch).
+    Verified via ``method`` (override wins) and ``statements_sha256``
+    (self-metadata that the override doesn't touch and that rides the
+    free-form provenance blob).
     """
     p = Profile(
         _mk(layers=(0, 1)),
-        metadata={"method": "contrastive_pca", "statements_sha256": "a" * 64},
+        metadata={"method": "manifold_pca", "statements_sha256": "a" * 64},
     )
     path = tmp_path / "cv.safetensors"
     p.save(path, metadata={"method": "profile"})
@@ -366,13 +365,13 @@ def test_save_metadata_override_merges_on_top_of_self_metadata(tmp_path: Path):
 
 
 @pytest.mark.parametrize("metadata", [
-    {"method": "invented"},
-    {"method": "profile", "diagnostics": {0: {"score": "1.0"}}},
-    {"method": "profile", "components": {"x": {}}},
-    {"method": "profile", "sae_release": "r"},
-    {"method": "profile", "source_model_id": "src"},
+    {"method": "invented"},                                   # unknown producer
+    {"method": "contrastive_pca"},                            # retired producer
+    {"method": "profile", "components": {0: {}}},             # non-string key
+    {"method": "profile", "score": float("nan")},             # not JSON
+    {"method": "profile", "tensor": torch.ones(2)},           # not JSON
 ])
-def test_invalid_nested_metadata_rejects_before_publication(
+def test_invalid_metadata_rejects_before_publication(
     tmp_path: Path, metadata: dict[str, Any],
 ) -> None:
     path = tmp_path / "invalid.safetensors"
@@ -392,12 +391,60 @@ def test_profile_digest_binds_tensor_pair(tmp_path: Path) -> None:
         Profile.load(path)
 
 
-def test_profile_per_layer_metadata_requires_exact_coverage(tmp_path: Path) -> None:
-    path = tmp_path / "profile.safetensors"
-    with pytest.raises(ProfileError, match="cover tensor layers"):
-        Profile(_mk(layers=(0, 1))).save(path, metadata={
-            "method": "profile", "diagnostics": {0: {"score": 1.0}},
-        })
+def test_sidecar_schema_is_exactly_five_fields(tmp_path: Path) -> None:
+    """The wire schema is closed: four identity fields + one provenance blob."""
+    path = tmp_path / "schema.safetensors"
+    Profile(_mk(layers=(0,))).save(path, metadata={
+        "method": "profile", "note": "hello",
+    })
+    sidecar = json.loads(path.with_suffix(".json").read_text())
+    assert set(sidecar) == {
+        "format_version", "saklas_version", "method",
+        "tensor_sha256", "provenance",
+    }
+    assert sidecar["provenance"] == {"note": "hello"}
+
+
+def test_extract_shaped_profile_round_trips(tmp_path: Path) -> None:
+    """The Profile ``SaklasSession.extract`` returns saves and loads.
+
+    ``extract`` stamps ``{"method": "manifold_pca", "name": ..., "share_metric":
+    ...}`` on the folded 2-node manifold view; the schema has to take that shape
+    verbatim, and the loaded metadata has to save again unchanged.
+    """
+    extract_metadata = {
+        "method": "manifold_pca",
+        "name": "confident.uncertain",
+        "share_metric": "mahalanobis",
+    }
+    profile = Profile(_mk(layers=(0, 3)), metadata=extract_metadata)
+    first = tmp_path / "extract.safetensors"
+    profile.save(first)
+
+    loaded = Profile.load(first)
+    assert loaded.metadata["method"] == "manifold_pca"
+    assert loaded.metadata["name"] == "confident.uncertain"
+    assert loaded.metadata["share_metric"] == "mahalanobis"
+
+    # load -> save round-trip: the writer-stamped identity fields the reader
+    # hands back must not read as unknown metadata on the way in again.
+    second = tmp_path / "extract-again.safetensors"
+    loaded.save(second)
+    again = Profile.load(second)
+    assert again.metadata["method"] == "manifold_pca"
+    assert again.metadata["name"] == "confident.uncertain"
+    assert again.layers == [0, 3]
+
+
+def test_merged_profile_saves(tmp_path: Path) -> None:
+    """``Profile.merged`` claims ``method="merge"``; that must be savable."""
+    merged = Profile.merged([
+        (Profile({0: torch.ones(4)}), 1.0),
+        (Profile({0: torch.ones(4) * 2}), 0.5),
+    ])
+    path = tmp_path / "merged.safetensors"
+    merged.save(path)
+    assert Profile.load(path).metadata["method"] == "merge"
 
 
 # ---------------------------------------------------------------------------

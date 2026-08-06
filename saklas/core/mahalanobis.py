@@ -25,8 +25,10 @@ is built from the immutable per-layer shards selected by the
 ``neutral_activations.json`` cache pointer under
 ``~/.saklas/models/<id>/`` (the per-layer centering mean is derived from
 those neutrals as ``X.mean(0)`` — there is no separate ``layer_means`` cache).
-The 90 neutral statements give ``X ∈ ℝ^(N=90, D)`` per layer; ``Σ`` is
-rank-deficient (rank ≤ N-1 = 89), so we ridge-regularize with
+The neutral corpus is a multiple of the 48 shared baseline prompts
+(``capture._neutral_pairs``), so ``X ∈ ℝ^(N, D)`` per layer with ``N`` in
+the low hundreds; ``Σ`` is rank-deficient (rank ≤ N-1), so we
+ridge-regularize with
 ``λ_L = (||X_L||_F² / (N · D)) · ridge_scale`` (mean diagonal of the
 sample covariance — a standard shrinkage target for the high-D, small-N
 regime).  The full ``D × D`` inverse is never materialized; we apply
@@ -36,8 +38,8 @@ regime).  The full ``D × D`` inverse is never materialized; we apply
         K = (NλI_N + X X^T)^{-1}     # small N×N inverse, cached
 
 Cost per ``Σ^{-1} v``: ``O(N D)`` (one ``X v`` matvec, one ``X^T (Kx)``
-matvec).  Storage cost: ``X`` already on disk; ``K`` is ``N × N`` (≈32 KB
-per layer at N=90), held in memory only.
+matvec).  Storage cost: ``X`` already on disk; ``K`` is ``N × N`` (tens of
+KB per layer at these N), held in memory only.
 
 Intended consumers (Mahalanobis-only as of 4.0 — there is no Euclidean
 fallback path):
@@ -60,16 +62,12 @@ from typing import Any, Iterable, Mapping
 
 import torch
 
-from saklas.core.errors import SaklasError
+# ``WhitenerError`` is defined in :mod:`saklas.core.errors` (the single home
+# for the engine's error taxonomy) and re-exported here so
+# ``from saklas.core.mahalanobis import WhitenerError`` keeps working.
+from saklas.core.errors import WhitenerError as WhitenerError
 
 log = logging.getLogger(__name__)
-
-
-class WhitenerError(ValueError, SaklasError):
-    """Raised when whitener construction or lookup fails."""
-
-    def user_message(self) -> tuple[int, str]:
-        return (400, str(self) or self.__class__.__name__)
 
 
 # Numerical guard for Mahalanobis denominators.  Mirrors the ``1e-12``
@@ -84,27 +82,6 @@ _NEAR_ZERO_DENOM = 1e-12
 # Σ extrapolates badly along null-space directions).  Tunable via
 # :meth:`LayerWhitener.from_neutral_activations`.
 DEFAULT_RIDGE_SCALE = 1.0
-
-
-def _decode_layer_tensor_map(
-    raw: Mapping[str, torch.Tensor],
-    *,
-    label: str,
-) -> dict[int, torch.Tensor]:
-    """Decode ``layer_<idx>`` safetensor maps and promote values to fp32."""
-    out: dict[int, torch.Tensor] = {}
-    for key, value in raw.items():
-        try:
-            prefix, raw_idx = key.split("_", 1)
-            if prefix != "layer":
-                raise ValueError
-            idx = int(raw_idx)
-        except ValueError as e:
-            raise WhitenerError(
-                f"{label}: expected tensor keys like 'layer_0', got {key!r}"
-            ) from e
-        out[idx] = value.to(dtype=torch.float32)
-    return out
 
 
 def _require_fp32_neutral_cache(
@@ -329,10 +306,11 @@ class LayerWhitener:
         # building a reduced-precision metric.  Checks the RAW on-disk dtype,
         # before the ``.float()`` promotion below would mask it.
         _require_fp32_neutral_cache(model_id, acts_raw)
-        # Tensors key by ``layer_<idx>`` (alignment.py shape), stored fp32; the
-        # ``.float()`` in ``_decode_layer_tensor_map`` is a defensive no-op
-        # promotion of any legacy in-memory dtype, since the small N×N inverse
-        # doesn't tolerate a reduced-precision condition number.
+        # ``load_validated_neutral_cache`` hands back an already-decoded
+        # ``{layer_idx: tensor}`` map, stored fp32; the ``.float()`` below is a
+        # defensive no-op promotion of any legacy in-memory dtype, since the
+        # small N×N inverse doesn't tolerate a reduced-precision condition
+        # number.
         # ``from_neutral_activations`` skips any layer whose values come back
         # non-finite (a legacy fp16 cache that overflowed on an extreme-
         # activation channel) rather than poisoning the inverse, leaving that

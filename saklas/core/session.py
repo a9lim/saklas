@@ -1390,8 +1390,10 @@ class SaklasSession:
         if probe_categories:
             self._whitener = self._build_whitener_from_cache_or_compute()
 
-        # DLS toggle stored on the session so ad-hoc ``session.extract``
-        # calls (via ``ExtractionPipeline``) inherit it without re-passing.
+        # DLS toggle stored on the session so ``session.extract`` / ``fit``
+        # inherit it without re-passing; both thread it into
+        # ``ManifoldExtractionPipeline.fit(dls=...)``, which gates the flat
+        # branch's straddle-pruning.
         self._dls: bool = bool(dls)
 
         # Steering-resolution collaborator is required while bootstrapping
@@ -5063,7 +5065,7 @@ class SaklasSession:
         # ``Profile`` and the variant-tailed name.
         manifold = pipe.fit(
             folder, sae=sae, sae_revision=sae_revision, on_progress=on_progress,
-            emit_event=False,
+            emit_event=False, dls=self._dls,
         )
         self._adopt_fitted_manifold(folder, manifold)
         if sae:
@@ -5268,7 +5270,7 @@ class SaklasSession:
                     folder, sae=sae, sae_revision=sae_revision,
                     layer_indices=layers, fit_mode=fit_mode,
                     hyperparams=hyperparams, force=force,
-                    on_progress=on_progress,
+                    on_progress=on_progress, dls=self._dls,
                 )
                 self._adopt_fitted_manifold(folder, manifold)
                 return manifold

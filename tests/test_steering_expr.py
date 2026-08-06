@@ -7,6 +7,7 @@ isolated SAKLAS_HOME with no packs installed.
 from __future__ import annotations
 
 from collections.abc import Generator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -1092,3 +1093,117 @@ def test_manifold_gate_does_not_break_other_trigger_parses():
     assert _gate_of(s, "happy.sad").probe == "angry.calm"
     assert _gate_of(s, "calm").probe == "circumplex:fraction"
     assert _gate_of(s, "honest").probe == "circumplex@elated"
+
+
+# ---------------------------------------------------------------------------
+# Trigger grammar totality: every publicly-constructible Trigger has a form.
+#
+# format_expr used to render an unnameable Trigger as the sentinel "@custom",
+# which parse_expr rejects — so a Steering built from Trigger.first/after (or
+# a gate narrowed to a phase) stamped an unparseable string onto
+# Recipe.steering / GenerationResult.applied_steering, and any regen /
+# transcript import / loom replay that re-parses it raised.
+# ---------------------------------------------------------------------------
+
+
+def _public_triggers() -> list[Trigger]:
+    """One Trigger per public factory, plus the documented gate compounds."""
+    gate = Trigger.when("angry.calm", ">", 0.4)
+    return [
+        # Presets.
+        Trigger.BOTH,
+        Trigger.GENERATED_ONLY,
+        Trigger.PROMPT_ONLY,
+        Trigger.AFTER_THINKING,
+        Trigger.THINKING_ONLY,
+        # Counted decode windows.
+        Trigger.first(0),
+        Trigger.first(5),
+        Trigger.after(3),
+        Trigger.after(128),
+        # Probe gates: a negative threshold (label-similarity channels read
+        # negative) and every comparison operator.
+        gate,
+        Trigger.when("angry.calm", ">=", 0.0),
+        Trigger.when("circumplex:fraction", "<", 0.25),
+        Trigger.when("circumplex@elated", "<=", -0.5),
+        # Gate narrowed to a phase — the compound shape Trigger.when's own
+        # docstring points callers at.
+        replace(gate, thinking=False),
+        replace(gate, response=False),
+        replace(gate, generated=False, prompt=True),
+        replace(Trigger.BOTH, gate=gate.gate),
+        # Gate on a counted window.
+        replace(Trigger.first(4), gate=gate.gate),
+        replace(Trigger.after(2), gate=gate.gate),
+    ]
+
+
+@pytest.mark.parametrize("trig", _public_triggers())
+def test_every_public_trigger_round_trips(trig: Trigger) -> None:
+    """``parse_expr(format_expr(s)) == s`` over every public Trigger factory."""
+    steering = Steering(alphas={"alice/probe": (0.5, trig)})
+    text = format_expr(steering)
+    back = parse_expr(text)
+    entry = back.alphas["alice/probe"]
+    # Trigger.BOTH renders without an "@" tag, so it lands as a bare float
+    # inheriting the Steering-level default.
+    got = entry[1] if isinstance(entry, tuple) else back.trigger
+    assert got == trig, text
+    # Re-rendering is a fixed point, so a stamped recipe string is stable.
+    assert format_expr(back) == text
+
+
+def _trigger_of(text: str, key: str = "alice/x") -> Trigger:
+    """The per-entry Trigger a one-term expression parses to."""
+    entry = parse_expr(text).alphas[key]
+    assert isinstance(entry, tuple)
+    return entry[1]
+
+
+def test_counted_window_forms_parse() -> None:
+    assert _trigger_of("0.5 alice/x@first:5") == Trigger.first(5)
+    assert _trigger_of("0.5 alice/x@after:3") == Trigger.after(3)
+    # The bare preset keeps its post-thinking meaning; only the ":N" form is
+    # the token window.
+    assert _trigger_of("0.5 alice/x@after") == Trigger.AFTER_THINKING
+
+
+def test_compound_trigger_keeps_phase_and_gate() -> None:
+    trig = _trigger_of("0.5 alice/x@after&when:angry.calm>0.4")
+    assert trig.thinking is False
+    assert trig.gate is not None
+    assert trig.gate.probe == "angry.calm"
+    assert trig.gate.threshold == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize("text", [
+    "0.5 alice/x@first",             # counted form needs ":N"
+    "0.5 alice/x@first:2.5",         # non-integer count
+    "0.5 alice/x@first:-1",          # negative count
+    "0.5 alice/x@after&both",        # compound's second clause must be a gate
+    "0.5 alice/x@invented",          # unknown keyword
+])
+def test_malformed_trigger_forms_rejected(text: str) -> None:
+    with pytest.raises(SteeringExprError):
+        parse_expr(text)
+
+
+def test_unknown_trigger_error_lists_the_new_forms() -> None:
+    with pytest.raises(SteeringExprError) as ei:
+        parse_expr("0.5 alice/x@invented")
+    msg = str(ei.value)
+    assert "first:<n>" in msg
+    assert "after:<n>" in msg
+    assert "&when:" in msg
+
+
+def test_unrepresentable_trigger_raises_instead_of_emitting_a_sentinel() -> None:
+    """A hand-built Trigger with no grammar form fails loudly at render.
+
+    Both counts at once is not something any public factory produces; the
+    alternative — emitting a sentinel — is what poisoned recipes before.
+    """
+    trig = Trigger(prompt=False, first_n=5, after_n=2)
+    with pytest.raises(SteeringExprError, match="programmatic-only"):
+        format_expr(Steering(alphas={"alice/x": (0.5, trig)}))

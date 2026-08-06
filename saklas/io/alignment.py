@@ -5,22 +5,21 @@ model isn't directly usable on a different model — different tokenizers,
 different hidden dims, different basis rotation in the residual stream.
 This module fits a per-layer linear map between two models' neutral
 activations (``Procrustes`` for matched dim, low-rank PCA-and-lift for
-mismatched dim) and uses it to transfer a probe's per-layer baked
-direction from source-space to target-space.
+mismatched dim); ``core.manifold.transfer_manifold_subspaces``, driven by
+``io.manifold_lifecycle.transfer_manifold``, is what applies it.
 
 Public surface:
 
 * :func:`load_or_compute_neutral_activations` — disk-cached per-model
-  neutral-statement activations; ``[N=90, D]`` per layer, stored fp32.
+  neutral-statement activations; ``[N, D]`` per layer, stored fp32.
   Its metadata-returning sibling lets dependent artifact builders reuse the
   sidecar validated in that same cache transaction instead of hashing the
   payload again merely to recover its identity.
 * :func:`fit_alignment` — per-layer alignment map ``M_L : ℝ^D_src → ℝ^D_tgt``.
-* :func:`transfer_profile` — apply the alignment map to a profile.
 * :func:`alignment_cache_path` — disk cache for the fitted map keyed by
   the source model id.
 
-The transferred profile lands at the target model's tensor path with a
+The transferred manifold lands at the target model's tensor path with a
 ``_from-<safe_src>`` suffix — uses the same variant-suffix machinery as
 SAE variants, so the rest of saklas (selectors, packs, monitor) sees a
 transferred probe as just another tensor on disk.
@@ -46,7 +45,6 @@ from safetensors.torch import (
 )
 
 from saklas.core.errors import SaklasError
-from saklas.core.profile import Profile
 from saklas.io.atomic import fsync_directory, write_bytes_atomic, write_json_atomic
 from saklas.io.paths import model_dir, safe_model_id
 from saklas.io.packs import hash_file
@@ -746,119 +744,6 @@ def alignment_quality(
         else:
             out[layer] = float(1.0 - residual / total)
     return out
-
-
-# ---------------------------------------------------------------------------
-# Profile transfer.
-# ---------------------------------------------------------------------------
-
-
-def transfer_profile(
-    profile: Profile,
-    alignment_map: AlignmentMap,
-    *,
-    source_model_id: str,
-    transfer_quality_estimate: float | None = None,
-    whitener: "Any | None" = None,
-) -> Profile:
-    """Apply the alignment map to a source-space profile.
-
-    For each layer in the profile that the alignment covers, computes
-    ``v_tgt = M_L @ v_src``.  Layers not covered by the alignment are
-    dropped — partial transfer is the only sensible behavior, since a
-    direction with no map can't be lifted into target space.
-
-    **Target-metric re-bake (mandatory).**  The source tensor is
-    share-baked in the *source* model's metric — its per-layer Euclidean
-    magnitude is the source Mahalanobis norm of the raw mean-diff (the
-    unified subspace hook reads ``‖baked_L‖₂ / Σ‖baked‖₂`` back out as
-    the layer share).  The orthogonal Procrustes map preserves Euclidean norm, so a
-    bare transfer would carry the *source* cross-layer share into target
-    space — where it no longer matches the target's anisotropy.  The
-    ``whitener`` for the **target** model is **required** and must cover
-    every transferred layer (all-or-nothing, mirroring the DiM-bake /
-    monitor / manifold-fit gate); each layer is rescaled so its magnitude
-    becomes its *target* Mahalanobis norm::
-
-        v_tgt'_L = v_tgt_L · (‖v_tgt_L‖_M(target) / ‖v_tgt_L‖₂)
-
-    The direction is untouched; only the per-layer magnitude — and hence
-    the hook-recovered share — changes.  ``‖v_tgt_L‖₂`` carries
-    the transported source-signal strength (the best target-signal proxy
-    available without target contrastive pairs) and ``‖v̂_tgt_L‖_M(target)``
-    applies the target anisotropy correction, so the composite is the
-    target-metric analogue of a native DiM bake.  ``bake: "mahalanobis"``
-    is stamped on the result.  A missing or non-covering whitener raises
-    :class:`WhitenerError` — there is no Euclidean transfer.
-
-    Carries provenance through ``Profile.metadata``:
-
-    * ``method = "procrustes_transfer"``
-    * ``source_model_id`` — HF coord of the source model.
-    * ``transfer_quality_estimate`` — median R² across shared layers, if
-      known.
-    * ``bake`` — always ``"mahalanobis"``.
-
-    Existing diagnostics fields on the source profile pass through
-    unchanged; users can still reason about source-side separation when
-    judging whether to trust a transferred probe.
-    """
-    if not alignment_map:
-        from saklas.core.profile import ProfileError
-
-        raise ProfileError("transfer_profile: alignment_map is empty")
-
-    # Stage the transferred directions in fp32 (keyed by layer) plus the
-    # original per-layer dtype, so the target re-bake operates at full
-    # precision before the dtype restore.
-    staged: dict[int, torch.Tensor] = {}
-    orig_dtype: dict[int, torch.dtype] = {}
-    for layer, src_vec in profile.items():
-        M_L = alignment_map.get(layer)
-        if M_L is None:
-            continue
-        staged[layer] = M_L.apply_vector(src_vec).cpu()
-        orig_dtype[layer] = src_vec.dtype
-
-    if not staged:
-        from saklas.core.profile import ProfileError
-
-        raise ProfileError(
-            "transfer_profile: alignment covered no layers in the source profile"
-        )
-
-    # Mahalanobis-only target re-bake: the per-layer ‖·‖_M and ‖·‖₂ scales
-    # differ by a 1/√λ_L factor that doesn't cancel from the cross-layer
-    # share, so the target whitener must cover every transferred layer.
-    # No Euclidean transfer — a missing / partial whitener is an error.
-    from saklas.core.mahalanobis import WhitenerError
-
-    if whitener is None or not whitener.covers_all(staged.keys()):
-        raise WhitenerError(
-            "transfer_profile requires a Mahalanobis whitener covering every "
-            f"transferred layer {sorted(staged.keys())}; generate neutral "
-            "activations for the TARGET model first (the Euclidean path is gone)"
-        )
-    for layer, v_tgt in staged.items():
-        eucl = float(v_tgt.norm().item())
-        if eucl < 1e-8:
-            # Degenerate direction — leave it; rescaling a zero vector
-            # is undefined and it carries no share anyway.
-            continue
-        m_norm = whitener.mahalanobis_norm(layer, v_tgt)
-        staged[layer] = v_tgt * (m_norm / eucl)
-
-    out_tensors = {
-        layer: v.to(dtype=orig_dtype[layer]) for layer, v in staged.items()
-    }
-
-    metadata = dict(profile.metadata)
-    metadata["method"] = "procrustes_transfer"
-    metadata["source_model_id"] = source_model_id
-    metadata["bake"] = "mahalanobis"
-    if transfer_quality_estimate is not None:
-        metadata["transfer_quality_estimate"] = float(transfer_quality_estimate)
-    return Profile(out_tensors, metadata=metadata)
 
 
 # ---------------------------------------------------------------------------
