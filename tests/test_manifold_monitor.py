@@ -53,6 +53,18 @@ def _iso_monitor(m: "Manifold", *, n_layers: int | None = None) -> Monitor:
     return Monitor(whitener=whitener, n_layers=n_layers)
 
 
+def _gate_scalars(
+    mon: Monitor, hidden: dict[int, torch.Tensor], keys: set[str],
+) -> dict[str, float]:
+    """The production gate path: parse the key space once, score the plan.
+
+    ``plan_gate_scalars`` + ``score_planned_gate_scalars`` is the pair the
+    composer and ``_begin_capture`` use (plan once per generation, score every
+    token); the tests below drive both halves through it.
+    """
+    return mon.score_planned_gate_scalars(hidden, mon.plan_gate_scalars(keys))
+
+
 def _node_world(m: Manifold, layer_idx: int) -> torch.Tensor:
     """World-space ``(K, D)`` node activations for a layer.
 
@@ -555,13 +567,13 @@ def test_gate_scalar_fraction_label_assignment_skip_curved_foot(
 
     monkeypatch.setattr("saklas.core.monitor.invert_parameterization", _fail_foot)
     keys = {"curve:fraction", "curve@c", "curve~c"}
-    scalars = mon.score_gate_scalars(hidden, keys)
+    scalars = _gate_scalars(mon, hidden, keys)
     assert scalars["curve:fraction"] == pytest.approx(full["curve:fraction"])
     assert scalars["curve@c"] == pytest.approx(full["curve@c"])
     assert scalars["curve~c"] == pytest.approx(full["curve~c"])
 
 
-def test_planned_gate_scalars_match_public_and_full_reading():
+def test_planned_gate_scalars_match_the_full_reading():
     m = _curved_toy(dim=8)
     _attach_const_sigma(m, 0.3)
     mon = _iso_monitor(m)
@@ -579,7 +591,6 @@ def test_planned_gate_scalars_match_public_and_full_reading():
 
     plan = mon.plan_gate_scalars(keys)
     planned = mon.score_planned_gate_scalars(hidden, plan)
-    public = mon.score_gate_scalars(hidden, keys)
     full = mon.flat_scalars(mon.score_single_token(hidden))
 
     assert len(plan) == 1
@@ -587,12 +598,30 @@ def test_planned_gate_scalars_match_public_and_full_reading():
     assert plan[0].assign_index is not None
     assert "curve@missing" not in planned
     assert "curve~missing" not in planned
-    assert planned == pytest.approx(public)
     for key in keys - {"curve@missing", "curve~missing"}:
         assert planned[key] == pytest.approx(full[key])
     axis_plan = mon.plan_gate_scalars({"curve[0]"})
     axis_planned = mon.score_planned_gate_scalars(hidden, axis_plan)
     assert axis_planned["curve[0]"] == pytest.approx(full["curve[0]"])
+
+
+def test_plan_gate_scalars_keeps_variant_suffixed_probe_names():
+    """Without ``probe_names=`` the plan recovers each probe name through
+    ``parse_gate_ref``.  A char-class split truncates ``pirate:role-x`` at
+    ``:role-x``, so the plan would be empty and the gate would never fire."""
+    m = _toy_manifold()
+    mon = _iso_monitor(m)
+    mon.add_probe("pirate:role-x", m, top_n=1)
+    hidden = {L: _node_world(m, L)[2] for L in m.layers}
+
+    plan = mon.plan_gate_scalars({"pirate:role-x", "pirate:role-x:fraction"})
+    assert len(plan) == 1
+    scalars = mon.score_planned_gate_scalars(hidden, plan)
+    full = mon.flat_scalars(mon.score_single_token(hidden))
+    assert scalars["pirate:role-x"] == pytest.approx(full["pirate:role-x"])
+    assert scalars["pirate:role-x:fraction"] == pytest.approx(
+        full["pirate:role-x:fraction"],
+    )
 
 
 def test_gate_scalar_requested_labels_ignore_probe_top_n():
@@ -606,7 +635,7 @@ def test_gate_scalar_requested_labels_ignore_probe_top_n():
     assert "toy@a" not in full
     assert "toy~a" not in full
 
-    scalars = mon.score_gate_scalars(hidden, {"toy@a", "toy~a"})
+    scalars = _gate_scalars(mon, hidden, {"toy@a", "toy~a"})
     assert "toy@a" in scalars
     assert scalars["toy@a"] < 0.0
     assert "toy~a" in scalars
@@ -627,7 +656,8 @@ def test_gate_label_plan_uses_attached_candidate_metadata():
         "c": 2,
         NEUTRAL_LABEL: 3,
     }
-    neutral_scalars = mon.score_gate_scalars(
+    neutral_scalars = _gate_scalars(
+        mon,
         {L: sub.mean for L, sub in m.layers.items()},
         {"tri@neutral", "tri~neutral"},
     )
@@ -654,7 +684,8 @@ def test_gate_label_plan_duplicate_labels_resolve_last_occurrence():
 
     probe = mon.attached_probes()["dup_probe"]
     assert probe.label_to_candidate_idx["dup"] == 2
-    scalars = mon.score_gate_scalars(
+    scalars = _gate_scalars(
+        mon,
         _flat_node_hidden(m, 2),
         {"dup_probe@dup", "dup_probe~dup"},
     )

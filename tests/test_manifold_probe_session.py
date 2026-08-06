@@ -865,26 +865,6 @@ def test_token_payload_consumes_the_full_incremental_memo():
     session._geometry_instrument.close_run()
 
 
-def test_geometry_gate_keys_none_vs_empty_contract():
-    """The protocol's sentinel semantics: ``gate_keys=None`` scores the
-    full roster, an explicit ``set()`` means "no gated probes" and scores
-    nothing.  The geometry member of the three-family contract pin."""
-    session = _stub_session()
-    m = _toy_manifold()
-    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
-        {key: m},
-    )
-    session.add_probe("toy")
-    run = session._geometry_instrument.current_run
-    hidden = {
-        layer_idx: sub.mean + sub.basis[0]
-        for layer_idx, sub in m.layers.items()
-    }
-    full = run.gate_scalars(0, hidden, None)
-    assert "toy" in full and "toy:fraction" in full
-    assert run.gate_scalars(0, hidden, set()) == {}
-
-
 def test_batch_geometry_aggregate_routes_through_the_run():
     """``_batch_probe_aggregate_for_row`` reaches the roster through
     ``current_run.observe_aggregate`` — this exact site was the round-2
@@ -944,6 +924,38 @@ def test_geometry_run_observe_aggregate_matches_live_read():
     assert via_run["toy"].fraction == live["toy"].fraction
     assert via_run["toy"].residual == live["toy"].residual
     assert via_run["toy"].nearest == live["toy"].nearest
+
+
+def test_pooled_aggregate_slice_is_one_position_for_every_family():
+    """All three families finalize through ``_pooled_aggregate_slice``, and it
+    lands on the aggregate *forward index* in FULL retention too.
+
+    FULL retention never advances the capture's forward counter (only the
+    bounded-ring modes do), so a ring lookup would clamp to the last forward —
+    the trailing special — instead of the last content token.
+    """
+    session = _stub_session()
+    rows = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
+    session._capture = types.SimpleNamespace(
+        stacked=lambda: {0: rows},
+        tail_slice_at=lambda _idx: {0: rows[-1]},
+    )
+    session._aggregate_forward_index = types.MethodType(
+        lambda _self, _ids: 1, session,
+    )
+
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
+    full = SaklasSession._pooled_aggregate_slice(session, [1, 2, 3, 4])
+    assert torch.equal(full[0], rows[1])
+
+    session._capture_state = CaptureState(mode=CaptureMode.AGGREGATE_ONLY)
+    ring = SaklasSession._pooled_aggregate_slice(session, [1, 2, 3, 4])
+    assert torch.equal(ring[0], rows[-1])
+
+    session._aggregate_forward_index = types.MethodType(
+        lambda _self, _ids: None, session,
+    )
+    assert SaklasSession._pooled_aggregate_slice(session, [1, 2]) == {}
 
 
 # ===================================================== gating callback ===

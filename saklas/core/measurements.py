@@ -120,9 +120,10 @@ def build_measurements(
             tokens: list[dict[str, Any]] = []
             for index, (token, probability) in enumerate(row):
                 token_id = token_ids[index] if index < len(token_ids) else -1
-                # The live display already calibrated this row once.  Convert
-                # that probability into the endpoint's logprob unit without a
-                # second softmax; the floor keeps strict JSON finite.
+                # Every producer holds the per-layer probability ``p_l`` (the
+                # readout's one unit) and every consumer wants it back; this
+                # is the ONE conversion into the wire's logprob key, and the
+                # floor keeps strict JSON finite.
                 logprob = math.log(max(float(probability), 1e-45))
                 tokens.append({
                     "token": str(token),

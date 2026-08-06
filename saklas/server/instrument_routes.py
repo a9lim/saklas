@@ -985,12 +985,14 @@ def register_instrument_routes(app: FastAPI) -> None:
                 status, text = e.user_message()
                 raise HTTPException(status, text) from e
         readout = out.get("readout", {})
+        # The session hands back per-layer probabilities, which is what
+        # ``build_measurements`` takes — no conversion on this hop.
         lens_readout = {
-            int(layer): [(str(tok), math.exp(float(lp))) for tok, lp, _tid in rows]
+            int(layer): [(str(tok), float(p_l)) for tok, p_l, _tid in rows]
             for layer, rows in readout.items()
         }
         lens_token_ids = {
-            int(layer): [int(tid) for _tok, _lp, tid in rows]
+            int(layer): [int(tid) for _tok, _p_l, tid in rows]
             for layer, rows in readout.items()
         }
         lens_aggregate = [

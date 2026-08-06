@@ -326,9 +326,7 @@ class TestTraitMonitorScoring:
         m = fold_directions_to_subspace(
             "test_probe", {0: probe_vec}, dict(cls._MEANS), whitener=whitener,
         )
-        return Monitor(
-            {"test_probe": m}, layer_means=dict(cls._MEANS), whitener=whitener,
-        )
+        return Monitor({"test_probe": m}, whitener=whitener)
 
     def test_measure_aligned_scores_positive(self):
         monitor = self._make_monitor()

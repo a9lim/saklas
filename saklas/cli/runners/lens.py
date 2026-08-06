@@ -425,9 +425,11 @@ def _run_lens_top(args: argparse.Namespace) -> None:
                 ]
                 for rows in agg
             ],
+            # Per-layer rows carry the same unit the aggregate averages: the
+            # per-layer readout probability p_l, not a logprob.
             "layers": {
                 str(layer): [
-                    [{"token": t, "logprob": round(lp, 4)} for t, lp in row]
+                    [{"token": t, "strength": round(p_l, 6)} for t, p_l in row]
                     for row in rows
                 ]
                 for layer, rows in out.items()

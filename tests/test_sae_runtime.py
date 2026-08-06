@@ -698,6 +698,55 @@ def test_detach_during_bound_generation_keeps_aggregate_roster() -> None:
     assert readings == {}  # the removal applies at the next boundary
 
 
+def test_score_probes_entries_are_disjoint() -> None:
+    """Two entries, no placeholder argument: ``score_probes`` takes capture
+    slices and encodes them, ``score_probes_from_activations`` takes this
+    forward's encode.  Both land the same reading."""
+    session = _session()
+    inst = session._sae_instrument
+    session._sae_probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": None, "max_act": 10.0,
+    }
+    hidden = session._capture.latest_per_layer()
+    acts = session._encode_sae_hidden(hidden[1])
+
+    from_slices = inst.score_probes(hidden)
+    from_acts = inst.score_probes_from_activations(acts)
+    assert from_slices["sae/2"].coords == pytest.approx(
+        from_acts["sae/2"].coords,
+    )
+    # A layer the resident hook does not cover reads nothing.
+    assert inst.score_probes({7: hidden[1]}) == {}
+
+
+def test_bound_run_reads_its_bind_time_live_snapshot() -> None:
+    """The lens's live-state discipline, mirrored: a bound run reads the
+    live-discovery config its generation started with, so a toggle from
+    another thread cannot flip a running generation mid-stream.  Idle runs
+    pass the current config through."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _session()
+    inst = session._sae_instrument
+    inst.enable_live()
+    live_at_bind = dict(inst.live or {})
+    assert live_at_bind
+
+    prep = inst.prepare(ReadRequest(final_aggregate=True, live=True))
+    inst.bind(inst.plan(prep), prep)
+    assert inst._measurement_live() == live_at_bind
+
+    # A concurrent library caller flips the toggle mid-generation.
+    inst.disable_live()
+    assert inst.live is None
+    assert inst._measurement_live() == live_at_bind
+    assert inst.live_readout_step(top_k=2, step_id=0) is not None
+
+    inst.close_run()  # generation boundary: the idle run passes through
+    assert inst._measurement_live() is None
+    assert inst.live_readout_step(top_k=2, step_id=0) is None
+
+
 def test_idle_observe_never_memoizes_stale_readings() -> None:
     """The idle passthrough run persists indefinitely, so ``observe`` must
     not key a memo on ``step_id`` alone — a repeated step with different

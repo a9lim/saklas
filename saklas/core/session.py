@@ -1418,7 +1418,7 @@ class SaklasSession:
         # ``TriggerContext.probe_scores`` so ``@when:`` gates fire on any probe
         # without grammar changes.
         self._monitor = Monitor(
-            probe_manifolds, self._layer_means, whitener=self._whitener,
+            probe_manifolds, whitener=self._whitener,
             n_layers=len(self._layers),
         )
 
@@ -3083,13 +3083,20 @@ class SaklasSession:
         top_k: int,
         logits: torch.Tensor | None = None,
     ) -> list[list[tuple[str, float, int]]]:
-        from saklas.core.jlens import topk_logprobs
+        """Per-row top-k as ``[(token, p_l, vocab_id), ...]``.
+
+        The value is the per-layer readout **probability** — the one unit
+        every lens surface reports (the aggregate's ``strength`` is its mean
+        over layers).  Callers hold probabilities end to end; the measurement
+        envelope owns the single conversion into its wire unit.
+        """
+        from saklas.core.jlens import topk_probabilities
 
         if not rows:
             return []
         if logits is None:
             logits = self._jlens_logits_rows(lens, rows)
-        vals, idxs = topk_logprobs(logits, top_k)
+        vals, idxs = topk_probabilities(logits, top_k)
         all_vals = vals.cpu()
         all_idxs = idxs.cpu()
         out: list[list[tuple[str, float, int]]] = []
@@ -3142,11 +3149,13 @@ class SaklasSession:
         ]
     ):
         """Jacobian-lens readout on a raw prompt: the top-``top_k`` vocabulary
-        tokens per (layer, position), with log-probabilities.
+        tokens per (layer, position), with their per-layer probabilities.
 
         ``layers`` defaults to every fitted layer; ``positions`` defaults to
         the final position only (pass explicit indices, negative ok, for
-        more). Returns ``{layer: [per-position [(token, logprob), ...]]}``.
+        more). Returns ``{layer: [per-position [(token, p_l), ...]]}`` —
+        ``p_l(v)``, the same unit the aggregate's ``strength`` averages, so
+        one number means one thing across every lens surface.
         One vocab-sized matvec per (layer, position row) — full-position
         sweeps over all layers are an offline-analysis cost, not a decode
         cost.
@@ -3205,7 +3214,7 @@ class SaklasSession:
             for layer in req:
                 out[layer] = [[] for _ in pos]
             for (layer, pos_idx, _), row in zip(row_refs, decoded):
-                out[layer][pos_idx] = [(tok, lp) for tok, lp, _ in row]
+                out[layer][pos_idx] = [(tok, p_l) for tok, p_l, _ in row]
             if not aggregate:
                 return out
             agg: list[list[tuple[str, float, float, float]]] = []
@@ -3255,10 +3264,12 @@ class SaklasSession:
         the caller supplies it.
 
         Returns ``{node_id, raw_index, token_id, token_text, steering,
-        readout: {layer: [(token, logprob, id), ...]},
-        aggregate: [(token, strength, com, spread), ...]}`` — ``aggregate``
-        is the layer-aggregated view of the same logits (per-layer softmax
-        → mean-probability strength + probability-mass-weighted depth
+        readout: {layer: [(token, p_l, id), ...]},
+        aggregate: [(token, strength, com, spread), ...]}`` — one unit
+        throughout: ``p_l`` is the per-layer readout probability and
+        ``strength`` is its mean over the fitted layers, the
+        layer-aggregated view of the same logits (per-layer softmax →
+        mean-probability strength + probability-mass-weighted depth
         center of mass; :func:`saklas.core.jlens.aggregate_readout`).
         Raises :class:`~saklas.core.jlens.LensNotFittedError` with no
         fitted lens, :class:`UnknownNodeError` /
@@ -4145,11 +4156,13 @@ class SaklasSession:
         only: "set[str] | None" = None,
         raw_by_fid: Mapping[int, float] | None = None,
     ) -> dict[str, "ProbeReading"]:
-        """Score attached SAE probes (delegates to
-        :meth:`SaeInstrument.score_probes`)."""
-        return self._sae_instrument.score_probes(
-            hidden, activations=activations, only=only, raw_by_fid=raw_by_fid,
-        )
+        """Score attached SAE probes (delegates to the instrument's
+        capture-slice or precomputed-activation entry)."""
+        if activations is not None:
+            return self._sae_instrument.score_probes_from_activations(
+                activations, only=only, raw_by_fid=raw_by_fid,
+            )
+        return self._sae_instrument.score_probes(hidden, only=only)
 
     def _sae_probe_values(
         self,
@@ -5815,21 +5828,18 @@ class SaklasSession:
             gate_keys=frozenset(gating_probe_keys or ()),
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
-            return_hidden=widen,
         ))
         lens_prep = self._lens_instrument.prepare(ReadRequest(
             gate_keys=frozenset(lens_gating_probe_keys or ()),
             live=live_lens_active,
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
-            return_hidden=widen,
         ))
         sae_prep = self._sae_instrument.prepare(ReadRequest(
             gate_keys=frozenset(sae_gating_probe_keys or ()),
             live=live_sae_active,
             per_token_consumers=per_token_full_consumer,
             final_aggregate=final_probe_aggregate,
-            return_hidden=widen,
         ))
         geometry_plan = self._geometry_instrument.plan(geometry_prep)
         lens_plan = self._lens_instrument.plan(lens_prep)
@@ -6157,6 +6167,35 @@ class SaklasSession:
         from saklas.core.capture import last_content_index
         return last_content_index(generated_ids, self._tokenizer)
 
+    def _pooled_aggregate_slice(
+        self, generated_ids: list[int],
+    ) -> dict[int, torch.Tensor]:
+        """Per-layer ``[D]`` slice at the end-of-generation aggregate position.
+
+        The ONE finalize-pooling resolution, shared by all three families
+        (geometry's ``_score_aggregate_only`` and the lens/SAE instruments'
+        ``score_aggregate``).  Empty when there is no aggregate position or
+        nothing was captured.
+
+        Retention decides how the position is reached.  Every bounded-ring
+        mode counts decode forwards, so :meth:`HiddenCapture.tail_slice_at`
+        maps an absolute forward index into the ring.  FULL retention keeps
+        every forward but never advances that counter, so the ring mapping
+        would clamp to the last slice; there the stack is indexed directly,
+        which is what makes the aggregate land on the last *content* token in
+        every mode rather than only in the ring modes.
+        """
+        agg_fwd = self._aggregate_forward_index(generated_ids)
+        if agg_fwd is None:
+            return {}
+        if self._capture_state.mode is CaptureMode.FULL:
+            return {
+                layer: rows[agg_fwd]
+                for layer, rows in self._capture.stacked().items()
+                if rows.shape[0] > agg_fwd
+            }
+        return self._capture.tail_slice_at(agg_fwd)
+
     def _empty_readings(self, names: list[str]) -> dict[str, "ProbeReading"]:
         """A zero ``ProbeReading`` per probe — the no-tokens / missing-pool
         fallback shared by the incremental and aggregate-only score paths."""
@@ -6217,21 +6256,17 @@ class SaklasSession:
         The aggregate-only capture path (``CaptureMode.AGGREGATE_ONLY``, shared by
         ``GATING_SUBSET`` whose per-token rows feed only the gate) scored nothing
         of the full roster per token; here we pool the last content token's slice
-        from the
-        tail ring and run one :meth:`Monitor.score_aggregate`.  ``generated_ids``
-        token ``k`` was produced by decode forward ``k``, so the last content
-        token's forward index is ``last_content_index(generated_ids)`` — which
-        :meth:`HiddenCapture.tail_slice_at` maps into the ring.
+        (:meth:`_pooled_aggregate_slice`) and run one
+        :meth:`Monitor.score_aggregate`.  ``generated_ids`` token ``k`` was
+        produced by decode forward ``k``, so the last content token's forward
+        index is ``last_content_index(generated_ids)``.
         """
         names = list(self._monitor.probe_names)
         empty = self._empty_readings(names)
         if not generated_ids:
             return empty
         if pooled is None:
-            agg_fwd = self._aggregate_forward_index(generated_ids)
-            if agg_fwd is None:
-                return empty
-            pooled = self._capture.tail_slice_at(agg_fwd)
+            pooled = self._pooled_aggregate_slice(generated_ids)
         if not pooled:
             return empty
         # One-shot pooled read over the full roster — keep curved probes on the
@@ -6514,20 +6549,11 @@ class SaklasSession:
         self,
         hidden: dict[int, torch.Tensor],
         *,
-        logits: torch.Tensor | None = None,
-        probabilities: torch.Tensor | None = None,
-        layers: "Sequence[int] | None" = None,
         only: "set[str] | None" = None,
     ) -> dict[str, "ProbeReading"]:
-        """Score attached lens probes (delegates to
+        """Score attached lens probes from capture slices (delegates to
         :meth:`LensInstrument.score_probes`)."""
-        return self._lens_instrument.score_probes(
-            hidden,
-            logits=logits,
-            probabilities=probabilities,
-            layers=layers,
-            only=only,
-        )
+        return self._lens_instrument.score_probes(hidden, only=only)
 
     def _score_lens_gate_scalars(
         self, gate_keys: "set[str] | None" = None, *, step_id: int = -1,
@@ -6602,7 +6628,6 @@ class SaklasSession:
         """
         if not self._layer_means:
             _ = self.layer_means
-            self._monitor.layer_means = self._layer_means
         from saklas.core.capture import fold_directions_to_subspace
         return fold_directions_to_subspace(
             name, dict(profile), self._layer_means, whitener=self.whitener,
@@ -10275,7 +10300,6 @@ class SaklasSession:
             self._close_instrument_runs()
             batch_request = ReadRequest(
                 final_aggregate=return_probe_readings,
-                batch=True,
             )
             geometry_prep = self._geometry_instrument.prepare(batch_request)
             lens_prep = self._lens_instrument.prepare(batch_request)

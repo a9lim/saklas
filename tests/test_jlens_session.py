@@ -896,7 +896,7 @@ def test_prepare_pin_demand_formula() -> None:
     session._lens_probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0],
     }
-    prep = inst.prepare(ReadRequest(final_aggregate=True, batch=True))
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
     assert prep.pinned is True and prep.lens is not None
 
     # Final readings disabled: dormant probes do not pin — a lens gate does.
@@ -1091,8 +1091,8 @@ def test_generation_lens_snapshot_avoids_per_token_disk_validation(
     vocab = int(session._model.lm_head.weight.shape[0])
     probabilities = torch.softmax(torch.randn(len(layers), vocab), dim=-1)
     for _ in range(3):
-        readings = session._score_lens_probes(
-            {}, probabilities=probabilities, layers=layers,
+        readings = session._lens_instrument.score_probes_from_rows(
+            layers=layers, probabilities=probabilities,
         )
         assert "jlens/a" in readings
 
@@ -1875,8 +1875,10 @@ def test_jlens_readout_shape_and_default_position() -> None:
     for rows in out.values():
         assert len(rows) == 1  # default: final position only
         assert len(rows[0]) == 3
-        token, logprob = rows[0][0]
-        assert isinstance(token, str) and logprob <= 0.0
+        # One unit end to end: the per-layer readout PROBABILITY p_l, the
+        # same quantity the aggregate's ``strength`` averages.
+        token, p_l = rows[0][0]
+        assert isinstance(token, str) and 0.0 <= p_l <= 1.0
 
 
 def test_jlens_readout_aggregate_rides_same_logits() -> None:
@@ -2122,7 +2124,11 @@ def test_jlens_row_selector_avoids_copy_for_identity_and_contiguous_rows() -> No
 def test_live_lens_step_normalizes_once_across_all_consumers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.jlens as jlens_module
+    # The instrument binds the readout primitives at module scope (the per-step
+    # surfaces must not re-import), so the counters patch its namespace.
+    import saklas.core.instruments.lens as lens_instrument_module
+
+    jlens_module = lens_instrument_module
 
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
@@ -2438,8 +2444,11 @@ def test_jlens_token_readout_shape_and_position() -> None:
     assert set(out["readout"]) == {0, 1}  # fitted sources of the 3-layer toy
     for rows in out["readout"].values():
         assert len(rows) == 4
-        tok, lp, tid = rows[0]
-        assert isinstance(tok, str) and lp <= 0.0 and isinstance(tid, int)
+        # Per-layer rows and the aggregate share one unit: the readout
+        # probability, so ``strength`` is literally the mean of these.
+        tok, p_l, tid = rows[0]
+        assert isinstance(tok, str) and 0.0 <= p_l <= 1.0
+        assert isinstance(tid, int)
     # The aggregate block rides the same logits across both fitted layers.
     assert len(out["aggregate"]) == 4
     for tok, strength, com, spread in out["aggregate"]:
@@ -2541,3 +2550,47 @@ def test_jlens_token_readout_errors() -> None:
     s.tree.finalize_assistant(bare, text="no raw record", finish_reason="stop")
     with pytest.raises(InvalidNodeOperationError, match="no raw token record"):
         s.jlens_token_readout(bare, 0)
+
+
+def test_score_probes_entries_are_disjoint_and_guarded() -> None:
+    """Two entries, no placeholder argument: ``score_probes`` takes capture
+    slices, ``score_probes_from_rows`` takes a precomputed matrix.  The
+    logits-xor-probabilities rule is a real guard, so ``python -O`` behaves
+    identically to a normal run."""
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s._add_lens_probe("jlens/g", as_name=None)
+    inst = s._lens_instrument
+    layers = [int(layer) for layer in s.jlens.source_layers]
+    d_model = next(iter(s.jlens.jacobians.values())).shape[0]
+    hidden = {
+        layer: torch.randn(
+            d_model, generator=torch.Generator().manual_seed(layer),
+        )
+        for layer in layers
+    }
+
+    from saklas.core.jlens import readout_probabilities
+
+    logits = s._jlens_logits_rows(
+        s.jlens, [(layer, hidden[layer]) for layer in layers],
+    )
+    from_slices = inst.score_probes(hidden)
+    from_logits = inst.score_probes_from_rows(layers=layers, logits=logits)
+    from_probs = inst.score_probes_from_rows(
+        layers=layers, probabilities=readout_probabilities(logits),
+    )
+    assert from_slices["jlens/g"].coords == pytest.approx(
+        from_logits["jlens/g"].coords,
+    )
+    assert from_logits["jlens/g"].coords == pytest.approx(
+        from_probs["jlens/g"].coords,
+    )
+
+    with pytest.raises(ValueError, match="logits OR probabilities"):
+        inst.score_probes_from_rows(layers=layers)
+    with pytest.raises(ValueError, match="logits OR probabilities"):
+        inst.score_probes_from_rows(
+            layers=layers, logits=logits,
+            probabilities=readout_probabilities(logits),
+        )
