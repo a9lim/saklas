@@ -1154,16 +1154,23 @@ def test_every_public_trigger_round_trips(trig: Trigger) -> None:
     assert format_expr(back) == text
 
 
+def _trigger_of(text: str, key: str = "alice/x") -> Trigger:
+    """The per-entry Trigger a one-term expression parses to."""
+    entry = parse_expr(text).alphas[key]
+    assert isinstance(entry, tuple)
+    return entry[1]
+
+
 def test_counted_window_forms_parse() -> None:
-    assert parse_expr("0.5 alice/x@first:5").alphas["alice/x"][1] == Trigger.first(5)
-    assert parse_expr("0.5 alice/x@after:3").alphas["alice/x"][1] == Trigger.after(3)
+    assert _trigger_of("0.5 alice/x@first:5") == Trigger.first(5)
+    assert _trigger_of("0.5 alice/x@after:3") == Trigger.after(3)
     # The bare preset keeps its post-thinking meaning; only the ":N" form is
     # the token window.
-    assert parse_expr("0.5 alice/x@after").alphas["alice/x"][1] == Trigger.AFTER_THINKING
+    assert _trigger_of("0.5 alice/x@after") == Trigger.AFTER_THINKING
 
 
 def test_compound_trigger_keeps_phase_and_gate() -> None:
-    trig = parse_expr("0.5 alice/x@after&when:angry.calm>0.4").alphas["alice/x"][1]
+    trig = _trigger_of("0.5 alice/x@after&when:angry.calm>0.4")
     assert trig.thinking is False
     assert trig.gate is not None
     assert trig.gate.probe == "angry.calm"

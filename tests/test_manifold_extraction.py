@@ -2871,7 +2871,9 @@ def test_dls_false_keeps_every_axis(
     seen: list[object] = []
     real = C.compute_dls_axes
 
-    def _spy(node_centroids, bases, layer_means):
+    def _spy(
+        node_centroids: Any, bases: Any, layer_means: Any,
+    ) -> Any:
         seen.append(layer_means)
         return real(node_centroids, bases, layer_means)
 
@@ -2905,7 +2907,9 @@ def test_dls_true_passes_the_real_baseline(
     seen: list[object] = []
     real = C.compute_dls_axes
 
-    def _spy(node_centroids, bases, layer_means):
+    def _spy(
+        node_centroids: Any, bases: Any, layer_means: Any,
+    ) -> Any:
         seen.append(layer_means)
         return real(node_centroids, bases, layer_means)
 
