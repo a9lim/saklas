@@ -1,14 +1,12 @@
 """The J-lens instrument: readout-channel probes, gates, live workspace.
 
-Owns everything lens-probe-shaped that used to live inline in
-``SaklasSession`` (the ~675-line lens region): the probe registry, the
-live-readout runtime state, the per-forward stash, the per-generation
-disk-identity pin, and the six read surfaces (attach / per-step scoring /
-gate scalars / finalize aggregate / live display step / authored-prefill
-computation).  The session re-exposes the state fields under their
-historical private names via delegating properties, so `_begin_capture`,
-the steering composer, the token tap, and the wire layers are unchanged
-until the plan/run split migrates them.
+Owns everything lens-probe-shaped: the probe registry, the live-readout
+runtime state, the per-forward stash, the per-generation disk-identity pin,
+and the six read surfaces (attach / per-step scoring / gate scalars /
+finalize aggregate / live display step / authored-prefill computation).
+The session re-exposes these state fields as delegating properties, under the
+private names ``_begin_capture``, the steering composer, the token tap, and
+the wire layers read them by.
 
 Division of labor (see ``protocol.py``): shared J-lens *primitives* —
 ``_jlens_logits_rows`` / depth caches / decode memo / transport stack /
@@ -196,11 +194,11 @@ class LensInstrument:
         # disabling drops this dict but transported stacks stay in the
         # session's device cache.
         self.live: dict[str, Any] | None = None
-        # THE lens-state boundary (sol's round-4 P1): one reentrant lock
-        # covering source refresh/adoption/eviction, registry and
-        # live-state mutation, and ``prepare``'s complete snapshot, so
-        # the snapshot cannot tear mid-``prepare`` under a concurrent
-        # un-locked getter read.  A leaf lock: nothing acquires
+        # THE lens-state boundary: one reentrant lock covering source
+        # refresh/adoption/eviction, registry and live-state mutation,
+        # and ``prepare``'s complete snapshot, so the snapshot cannot
+        # tear mid-``prepare`` under a concurrent un-locked getter
+        # read.  A leaf lock: nothing acquires
         # ``_gen_lock``/``_model_exclusive`` while holding it (callers
         # hold those first).  Reentrant because adoption runs inside the
         # getter and ``prepare`` reads the getter inside its own hold.
@@ -261,7 +259,7 @@ class LensInstrument:
     # ------------------------------------------------------------ run lifecycle
 
     def prepare(self, request: ReadRequest) -> LensPrep:
-        """The refresh/pin protocol step (sol's slice-B finding 2).
+        """The refresh/pin protocol step.
 
         Reads the disk-refreshing ``session.jlens`` getter under pin
         demand BEFORE any plan is taken: the adoption path rewrites the
@@ -270,7 +268,7 @@ class LensInstrument:
         the refreshed registry (a plan taken earlier pairs the new lens
         with stale layers and KeyErrors in the transport stack).
 
-        The prep is the **authoritative snapshot** (sol's round-3 P1):
+        The prep is the **authoritative snapshot**:
         spec ``layers`` are derived from the prepared lens identity
         itself — never left to a later registry reread — and the live
         runtime dict is captured by reference, because an interleaved
@@ -293,16 +291,16 @@ class LensInstrument:
                 "generation's run (_close_instrument_runs) before preparing "
                 "the next — a stale pin suppresses the lens disk refresh"
             )
-        # The WHOLE snapshot is one atomic lens-state transaction (sol's
-        # round-4 P1): items, gate demand, pin demand, the getter
-        # refresh, spec derivation, the live-state reference, and the
-        # sidecar fingerprint are all read under ``state_lock`` — the
-        # same lock the getter's refresh/adoption/eviction, the registry
-        # mutations, and the live toggles hold — so a concurrent
-        # ``has_compatible_jlens`` adoption can no longer land between
-        # the refresh and the live-state read (pairing lens A's specs
-        # with lens B's live device stack), and a concurrent detach can
-        # no longer split gate demand from the captured roster.
+        # The WHOLE snapshot is one atomic lens-state transaction:
+        # items, gate demand, pin demand, the getter refresh, spec
+        # derivation, the live-state reference, and the sidecar
+        # fingerprint are all read under ``state_lock`` — the same lock
+        # the getter's refresh/adoption/eviction, the registry
+        # mutations, and the live toggles hold.  A concurrent
+        # ``has_compatible_jlens`` adoption landing between the refresh
+        # and the live-state read would pair lens A's specs with lens
+        # B's live device stack; a concurrent detach would split gate
+        # demand from the captured roster.
         with self.state_lock:
             items = list(self.probes.items())
             names = {name for name, _spec in items}
@@ -444,10 +442,10 @@ class LensInstrument:
         Idle: ONE state-lock hold refreshes the resident lens and copies
         the registry, so an idle-passthrough read (``observe`` on the
         idle run, offline scoring) cannot pair lens A with a
-        concurrently adopted replacement's rewritten layers (round-6
-        P1: ``_measurement_specs`` handed out the live registry while
-        ``_resident_lens`` locked separately — scoring resumed with A's
-        lens and B's layers and KeyErrored).
+        concurrently adopted replacement's rewritten layers.  Resolving
+        the two separately — the registry un-locked, the resident lens
+        under its own hold — lets scoring run with A's lens and B's
+        layers, which KeyErrors in the transport stack.
         """
         run = self.current_run
         if run.bound:
@@ -553,9 +551,9 @@ class LensInstrument:
         Derived **solely from the prep** — the spec snapshot whose layers
         match the prepared lens identity, and the live state captured at
         prepare — never the live registry, which an interleaved adoption
-        may have rewritten since (sol's round-3 P1: a plan read off the
-        rewritten registry pairs the prep's older lens with the new
-        lens's layers and KeyErrors in the transport stack).
+        may have rewritten since: a plan read off the rewritten registry
+        pairs the prep's older lens with the new lens's layers and
+        KeyErrors in the transport stack.
 
         ``latest_layers`` — the live workspace readout's layer set plus the
         pinned probes' fitted band (full band when a finalize aggregate
@@ -771,8 +769,7 @@ class LensInstrument:
         before the token tap). Computes the referenced lens logits, stashes
         them for the display step to reuse (``step_stash``, keyed by
         ``step_id`` — the display reuses rows iff ``stash["step"]`` matches
-        its own forward index; step identity replaced the old ``fresh``
-        boolean handshake, making staleness structural and reuse
+        its own forward index, so staleness is structural and reuse is
         idempotent), and flattens
         the synthesized readings through :meth:`Monitor.flat_scalars` so the
         gate key space is uniform. Gate-only calls score exact
@@ -793,8 +790,8 @@ class LensInstrument:
         only = None
         if gate_keys is not None:
             # ``None`` is the full-roster sentinel; an explicit empty set
-            # means "no gated probes" and scores nothing (the protocol's
-            # None-vs-empty distinction — sol's round-3 P2).
+            # means "no gated probes" and scores nothing — the
+            # None-vs-empty distinction every family's gate entry keeps.
             only = {
                 key.split("[", 1)[0]
                 for key in gate_keys
@@ -981,9 +978,8 @@ class LensInstrument:
         unit every lens surface reports), the layer-aggregated chip list,
         and the vocabulary ids already selected by ``topk``.  Reuses the
         gate callback's stash rows when they came from THIS forward
-        (``stash["step"] == step_id`` — step identity replaced the old
-        ``fresh`` consume-once flag, so staleness is structural and reuse
-        is idempotent; ``step_id < 0`` never matches) and the layer sets
+        (``stash["step"] == step_id`` — staleness is structural, reuse is
+        idempotent, and ``step_id < 0`` never matches) and the layer sets
         overlap.
         """
         session = self._session

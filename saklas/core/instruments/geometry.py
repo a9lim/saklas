@@ -87,7 +87,7 @@ class GeometryRun:
         if step_id >= 0:
             # A negative step is the "no step identity" sentinel — caching
             # under it would serve one stale read to every later
-            # sentinel-stepped call (sol's round-1 P2).
+            # sentinel-stepped call.
             self._memo_step = step_id
             self._memo_readings = readings
         return readings
@@ -154,7 +154,7 @@ class GeometryInstrument:
         # ``manifolds``/``probe_hash``, the ``plan``/``bind`` roster reads,
         # and the idle-passthrough run reads) — an un-locked reader
         # iterating ``Monitor._probes`` RuntimeErrors under a concurrent
-        # idle detach, the same tear class the lens round-5 fix closed.
+        # idle detach — the same tear class the lens boundary closes.
         # A leaf lock: nothing acquires ``_gen_lock``/``_model_exclusive``
         # while holding it (callers take those first), and it is NEVER
         # taken on the bound per-token scoring path — mid-generation
@@ -314,7 +314,7 @@ class GeometryInstrument:
         """Locked snapshot of the attached probes' manifolds (name →
         :class:`Manifold`) — the geometry read behind ``session.probes``
         and the analytics roster; a raw ``Monitor.manifolds`` comprehension
-        tears under a concurrent detach (the round-7 class)."""
+        tears under a concurrent detach."""
         with self.state_lock:
             return self._session._monitor.manifolds
 

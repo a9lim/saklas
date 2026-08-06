@@ -242,11 +242,13 @@ class ScalarReading:
     meta: dict[str, Any] = field(default_factory=dict)
 
     def to_probe_reading(self) -> "ProbeReading":
-        """Return the exact synthesized-``ProbeReading`` compatibility shape
-        the lens/SAE families emitted historically (geometry fields
-        defaulted — ``fraction``/``residual`` 0, ``nearest``/``assignment``
-        empty, ``membership`` 1.0).  This is the compatibility projection;
-        the versioned measurement envelope carries the native scalar reading.
+        """Project this reading into the shared ``ProbeReading`` shape
+        (geometry fields defaulted — ``fraction``/``residual`` 0,
+        ``nearest``/``assignment`` empty, ``membership`` 1.0).
+
+        The compatibility channel for consumers that key probes across
+        families by one reading type; the versioned measurement envelope
+        carries the native single-channel scalar reading instead.
         """
         from saklas.core.results import ProbeReading
 
@@ -292,16 +294,16 @@ class InstrumentPrep:
     ``request`` carries the generation's read demand forward — ``plan``
     derives solely from the prep, so a live-registry mutation landing
     between prepare and bind cannot desynchronize the plan from the
-    binding (sol's round-3 P1).
+    binding.
 
     ``token`` is the per-preparation identity, drawn from ONE
-    process-wide sequence (``next_prep_token`` — per-instance sequences
-    collide across instrument instances, letting a plan from one
-    instrument bind with a prep from another; round-5): the plan a prep
-    derives echoes it as ``prep_token``, and ``bind`` refuses a
-    plan/prep pair from different prepare() calls — same-family crossing
-    would let the session's capture union retain one prep's layers while
-    the run measures another's (round-4 P2).
+    process-wide sequence (``next_prep_token``; per-instance sequences
+    would collide across instrument instances, letting a plan from one
+    instrument bind with a prep from another): the plan a prep derives
+    echoes it as ``prep_token``, and ``bind`` refuses a plan/prep pair
+    from different prepare() calls — same-family crossing would let the
+    session's capture union retain one prep's layers while the run
+    measures another's.
     """
 
     family: str
@@ -336,14 +338,14 @@ class LensPrep(InstrumentPrep):
       keep reading the one that matches its pin).
     * ``fingerprint`` — the resident sidecar identity captured in the
       same atomic snapshot, so the binding's provenance matches the
-      lens the run actually measures (round-4 P2: a bind-time live
-      read could stamp a concurrently adopted replacement's identity
-      onto a run pinned to the older lens).
+      lens the run actually measures.  A bind-time live read would
+      stamp a concurrently adopted replacement's identity onto a run
+      pinned to the older lens.
 
     The whole snapshot is taken under the instrument's ``state_lock``
     — the one lens-state boundary that also serializes the getter's
     refresh/adoption/eviction and the registry/live mutations — so it
-    cannot tear mid-``prepare`` (round-4 P1).
+    cannot tear mid-``prepare``.
     """
 
     lens: Any = None

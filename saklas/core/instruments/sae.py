@@ -1,28 +1,25 @@
 """The SAE instrument: feature probes, gates, live discovery.
 
-Owns everything SAE-probe-shaped that used to live inline in
-``SaklasSession`` (the ~560-line SAE region): the probe registry, the
-live-discovery config, the per-forward stash, the per-generation active
-flag, and the read surfaces (attach / per-step scoring / gate scalars /
-finalize aggregate / live display step / authored-prefill computation).
-The session re-exposes the state fields under their historical private
-names via delegating properties.
+Owns everything SAE-probe-shaped: the probe registry, the live-discovery
+config, the per-forward stash, the per-generation active flag, and the read
+surfaces (attach / per-step scoring / gate scalars / finalize aggregate /
+live display step / authored-prefill computation).  The session re-exposes
+the state fields as delegating properties under the private names its own
+call sites read.
 
 Backend *residency* stays session-side (``_sae_backend``/``_sae_layer``/
 ``_sae_width``, ``_require_sae``, ``_encode_sae_hidden``, the Neuronpedia
 metadata cache + fetchers, train/load/unload lifecycle): residency is
 runtime state shared with steering atoms and the offline token replay,
-not probe intent — the same RuntimeState/LiveConfig split the lens
+not probe intent — the same runtime-state / live-config split the lens
 family keeps.
 
-Deliberate semantics change riding this extraction (the 5.x clean
-break): **the fake gate channels die.**  SAE gate scalars historically
-emitted ``<name>:fraction = 0.0`` and ``<name>:membership = 1.0`` —
-constants masquerading as measurements, an artifact of pretending a
-feature activation is a geometry reading.  An SAE probe now emits only
-its one real channel (``<name>`` / ``<name>[0]``, the normalized
-strength); a gate on a channel the family can never produce is a
-composition-preflight error (``validate_gate``), not a silent constant.
+**An SAE probe emits exactly one channel**: ``<name>`` / ``<name>[0]``, the
+normalized strength.  There is no ``:fraction`` or ``:membership`` — a
+feature activation is not a geometry reading, and emitting constants under
+those names would be measurement-shaped noise.  A gate on a channel the
+family cannot produce is a composition-preflight error
+(:meth:`SaeInstrument.validate_gate`), never a silently-constant comparison.
 """
 
 from __future__ import annotations
@@ -77,8 +74,8 @@ class SaeRun:
         self._instrument = instrument
         self.binding = binding
         self.active = active
-        #: The live-discovery config snapshotted at prepare — a library
-        #: caller on another thread can toggle the instrument-level ``live``
+        #: The live-discovery config snapshotted at bind — a library caller
+        #: on another thread can toggle the instrument-level ``live``
         #: mid-decode, and a bound run must keep reading the state its
         #: generation started with (idle runs pass through instead).
         self.live_state = live_state
@@ -591,8 +588,8 @@ class SaeInstrument:
         a gate referencing a channel this family can never produce is a
         composition-preflight error (:meth:`validate_gate`), never a
         silently-constant comparison.  The encode stash is keyed by
-        ``step_id`` — the display step reuses it iff it came from the same
-        forward (step identity replaced the ``fresh`` handshake).
+        ``step_id``, so the display step reuses it iff it came from the
+        same forward: staleness is structural, reuse is idempotent.
         """
         session = self._session
         specs = self._measurement_specs()
@@ -602,8 +599,8 @@ class SaeInstrument:
         only = None
         if gate_keys is not None:
             # ``None`` is the full-roster sentinel; an explicit empty set
-            # means "no gated probes" and scores nothing (the protocol's
-            # None-vs-empty distinction — sol's round-3 P2).
+            # means "no gated probes" and scores nothing — the
+            # None-vs-empty distinction every family's gate entry keeps.
             only = {
                 key.split("[", 1)[0]
                 for key in gate_keys

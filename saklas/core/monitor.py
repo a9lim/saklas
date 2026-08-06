@@ -172,8 +172,8 @@ class Monitor:
         self._flat_keys: tuple[str, ...] = ()
         self._curved_keys: tuple[str, ...] = ()
         self._flat_cache_device: torch.device | None = None
-        # Dirty flag set by ``_invalidate_flat_cache`` on every roster / whitener
-        # mutation (FIX F5).  ``_ensure_flat_cache`` checks it instead of
+        # Dirty flag set by ``_invalidate_flat_cache`` on every roster /
+        # whitener mutation.  ``_ensure_flat_cache`` checks it instead of
         # rebuilding ``tuple(self._probes.keys())`` + comparing it every token —
         # the cache only changes when a mutation flips this, so the per-token
         # guard is a bool + a device compare, not a per-token tuple alloc.
@@ -316,7 +316,7 @@ class Monitor:
     ) -> ProbeReading:
         """Full per-probe reading for one state — flat or curved, all fields.
 
-        ``coords_only`` (FIX F2): when a live consumer reads only the axis-0
+        ``coords_only``: when a live consumer reads only the axis-0
         coord / fraction, skip the per-token nearest-distance ranking, the soft
         assignment, the off-surface residual / tube membership, and the per-layer
         trace transfer — return a reading carrying just ``coords`` + ``fraction``
@@ -385,12 +385,12 @@ class Monitor:
 
             if not coords_only:
                 # Neutral competes as a virtual candidate at the ``K``-th row of
-                # the precomputed ``node_white_aug`` (FIX F4 — appended once at
-                # attach, not re-``cat``-ed per token): its whitened coord is
+                # the precomputed ``node_white_aug`` (appended once at attach,
+                # never re-``cat``-ed per token): its whitened coord is
                 # ``wh.neutral_white`` (0 for an affine fit, the baked origin for
                 # a curved one), so the same cdist yields its distance with no
-                # special-casing downstream.  Skipped entirely under ``coords_only``
-                # (FIX F2) — nearest / assignment aren't read.
+                # special-casing downstream.  Skipped entirely under
+                # ``coords_only`` — nearest / assignment aren't read.
                 dists = torch.linalg.vector_norm(
                     wh.node_white_aug - cdist_query.reshape(1, -1), dim=-1,
                 )
@@ -466,8 +466,8 @@ class Monitor:
                 w * coord_t if coords_mean_t is None else coords_mean_t + w * coord_t
             )
             if coords_only:
-                # coords + fraction means are all the lean reading needs (FIX F2);
-                # skip the per-layer trace lists + residual / membership means.
+                # coords + fraction means are all the lean reading needs; skip
+                # the per-layer trace lists + residual / membership means.
                 continue
             resid_t = resid_t.reshape(1)
             mem_t = mem_t.reshape(1)
@@ -483,7 +483,7 @@ class Monitor:
             )
 
         if coords_only:
-            # Lean reading: one host transfer of (fraction, coords) (FIX F2).
+            # Lean reading: one host transfer of (fraction, coords).
             if frac_mean_t is None or coords_mean_t is None:
                 return ProbeReading(fraction=0.0, nearest=[], coords=())
             lean = torch.cat(
@@ -901,8 +901,8 @@ class Monitor:
                 )
 
             if need_dist:
-                # Neutral rides the precomputed ``node_white_aug`` (FIX F4 — no
-                # per-token ``cat``).
+                # Neutral rides the precomputed ``node_white_aug`` — no
+                # per-token ``cat``.
                 dists = torch.linalg.vector_norm(
                     wh.node_white_aug - cdist_query.reshape(1, -1), dim=-1,
                 )
@@ -1129,7 +1129,7 @@ class Monitor:
         Off the hot path; rebuilt only when the device, roster, or whitener
         changes (the cache-key guard short-circuits otherwise).
         """
-        # Per-token guard (FIX F5): a bool + a device compare.  ``_flat_cache_dirty``
+        # Per-token guard: a bool + a device compare.  ``_flat_cache_dirty``
         # is flipped True by ``_invalidate_flat_cache`` on every roster / whitener
         # change, so a clean cache on the same device short-circuits without
         # rebuilding + comparing a ``tuple(self._probes.keys())`` each token.
@@ -1403,7 +1403,7 @@ class Monitor:
             coords_acc.index_add_(0, ent["coords_gidx"], ent["wt_perdim"] * coords_all)
             seen.update(ent["cols_list"])
             if coords_only:
-                # FIX F2: a live consumer that reads only the axis-0 coord /
+                # A live consumer that reads only the axis-0 coord /
                 # fraction (the trait stream, the loom probe row) doesn't need the
                 # nearest-distance norm over ``Kmax`` candidates, the assignment
                 # softmax, or the host-side per-layer trace reconstruction — skip
@@ -1429,7 +1429,7 @@ class Monitor:
             gl["nd_counts"],
         ).clamp(min=_FRACTION_EPSILON)
         if coords_only:
-            # Minimal blob: per-probe fraction + domain coords only (FIX F2).
+            # Minimal blob: per-probe fraction + domain coords only.
             blob = torch.cat([frac_final, coords_final]).detach().cpu().tolist()
             frac_v = blob[:P]
             coords_v = blob[P:P + gl["nd_total"]]
@@ -1591,7 +1591,7 @@ class Monitor:
         in-flight per-token path passes False).  ``only`` restricts scoring to
         a subset (gate-only per-token path); a subset read never accumulates
         (the cross-gen stats want the full roster, not the gated probes alone).
-        ``coords_only`` (FIX F2) returns the lean coords+fraction reading.
+        ``coords_only`` returns the lean coords+fraction reading.
         """
         out = self._score_full(
             hidden_per_layer, only=only, coords_only=coords_only,
@@ -1638,7 +1638,7 @@ class Monitor:
         ``{name: ProbeReading}`` for the subset alone — the gate-only per-token
         path, where the step sink consumes just the gated probes' scalars and
         the big-K roster's nearest-distance work is pure waste.  ``only=None``
-        keeps the byte-identical full-roster behavior.  ``coords_only`` (FIX F2)
+        keeps the byte-identical full-roster behavior.  ``coords_only``
         returns the lean coords+fraction reading (no nearest / assignment /
         per-layer trace) for the axis-0-only live consumers.
         """
