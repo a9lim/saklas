@@ -27,13 +27,13 @@ import { pushToast } from "./toasts.svelte";
 import { createPreparationSlice } from "./preparations.svelte";
 import { effectiveRawMode } from "./chat.svelte";
 import { samplingState } from "./sampling.svelte";
+import { refreshProbeList } from "./probes.svelte";
 import {
   instrumentFamily,
-  refreshProbeList,
   refreshSession,
   saeLoaded,
   sessionState,
-} from "../stores.svelte";
+} from "./session.svelte";
 
 // ------------------------------------------------------ live lens ---
 

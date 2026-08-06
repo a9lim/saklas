@@ -20,16 +20,7 @@ import { mergedReadings } from "./instruments.svelte";
 import { invalidateEdgeLabels } from "./loomUi.svelte";
 import { hydrateProbeRackFromActiveNode } from "./probes.svelte";
 import { sessionState } from "./session.svelte";
-import { sendGenerate } from "../stores.svelte";
-
-//
-// Mirrors the server's LoomTree (phase 2 spec).  The slice is the
-// authoritative shape for the loom sidebar; ``chatLog.turns`` is sync'd
-// from the active path via ``syncChatLogFromTree`` whenever ``loomTree``
-// changes (rev-driven).
-//
-// The current server tree is authoritative.  ``chatLog.turns`` is a
-// projection of its active path; token deltas enrich that projection.
+import { sendGenerate } from "./ws.svelte";
 
 export interface LoomTreeState {
   /** True after the authoritative tree snapshot has loaded successfully.

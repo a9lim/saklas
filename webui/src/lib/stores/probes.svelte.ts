@@ -32,16 +32,7 @@ import {
   saeState,
   tokenHoverState,
 } from "./instruments.svelte";
-import { loomTree } from "../stores.svelte";
-
-//
-// One unified read-side rack — every probe shape (a 2-node concept axis is
-// the rank-1 case, a discover / curved fit the rank-R case).  Each entry
-// carries the server ``ProbeInfo`` (with the ``is_affine`` flat-vs-curved
-// flag the cards classify on), a sparkline of the primary scalar, the
-// latest per-token ``reading`` + end-of-gen ``aggregate`` (one
-// ``ProbeReadingJSON`` shape), the most-recent ``nearest`` list, and — for
-// 2-D box probes — an inferred per-token ``trajectory`` for the mini-map.
+import { loomTree } from "./loom.svelte";
 
 /** Sparkline depth (tokens).  Exported because the lens aggregate history
  *  and the SAE activation history are capped to the same window — the

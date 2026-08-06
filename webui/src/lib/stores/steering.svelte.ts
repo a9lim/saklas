@@ -27,16 +27,6 @@ import type {
 import { serializeExpression } from "../expression";
 import { enqueueOrApply } from "./pending.svelte";
 
-//
-// One unified steer rack.  A steering vector is the K=2 flat case of a
-// manifold, so every term is a position on a fitted geometry — one
-// ``entries`` map of tagged ``SteerEntry`` (``mode: "subspace" | "manifold"``),
-// one card, and one serializer.  Subspace (flat) terms share the rack-level
-// ``subspaceAlong`` master (the merged affine subspace slides once); manifold
-// (curved) terms keep their per-card along/onto.  The sidecars live here too:
-// ``profiles`` + ``correlation`` (vector metadata) and ``catalog`` +
-// ``loading`` / ``error`` (the required manifold HTTP surface).
-
 /** Default shared subspace-along master — the ~0.5 coherent sweet spot
  *  (matches the engine's ``_SUBSPACE_GAIN`` calibration so a freshly
  *  racked concept at its pole lands at a usable strength). */

@@ -16,19 +16,9 @@
 // through them, so quota / private-mode / SSR failures stay non-fatal in
 // one place.
 
-import { highlightState, loomTree, sessionState } from "../stores.svelte";
-
-//
-// Presentation preference cache:
-//   The server is the sole authority for the Loom tree.  In particular, do
-//   not first-paint a cached tree: after a server restart its node ids are
-//   invalid, and rendering it briefly triggers requests against nonexistent
-//   edges before the authoritative fetch arrives.  Durable conversation
-//   persistence is the explicit v4 whole-tree Save/Load flow; localStorage
-//   retains only lightweight highlight preferences.
-//
-// Preference changes persist through a short debounce so rapid highlight
-// switching does not issue redundant synchronous localStorage writes.
+import { loomTree } from "./loom.svelte";
+import { highlightState } from "./probes.svelte";
+import { sessionState } from "./session.svelte";
 
 const PERSIST_VERSION = 4;
 const PERSIST_KEY_PREFIX = "saklas.chat.v" + PERSIST_VERSION + ".";

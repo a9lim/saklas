@@ -11,7 +11,8 @@
 
 import { apiSessions } from "../api";
 import type { ChatRole, WSSampling } from "../types";
-import { probeRack, sessionState } from "../stores.svelte";
+import { probeRack } from "./probes.svelte";
+import { sessionState } from "./session.svelte";
 
 export interface SamplingState {
   temperature: number | null;

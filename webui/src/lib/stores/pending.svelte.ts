@@ -10,7 +10,7 @@
 // the trailing rack bubble when busy, so a slider drag leaves one queued
 // bubble carrying the net effect instead of thirty ghosts.
 
-import { chatLog, genStatus } from "../stores.svelte";
+import { chatLog, genStatus } from "./chat.svelte";
 import type { PendingAction } from "../types";
 import {
   onPendingQueueShift,

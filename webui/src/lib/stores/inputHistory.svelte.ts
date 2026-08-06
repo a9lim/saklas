@@ -1,6 +1,6 @@
 /** In-memory command/input recall ring. */
 
-import { pendingActions } from "../stores.svelte";
+import { pendingActions } from "./pending.svelte";
 
 export const INPUT_HISTORY_MAX = 200;
 

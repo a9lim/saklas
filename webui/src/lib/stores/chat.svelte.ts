@@ -9,7 +9,8 @@
 // per-model chat-vs-raw render mode.
 
 import type { ChatTurn, GenStatus, TokenScore } from "../types";
-import { loomNavigate, loomTree, sessionState } from "../stores.svelte";
+import { loomNavigate, loomTree } from "./loom.svelte";
+import { sessionState } from "./session.svelte";
 import { enqueuePending, pendingActions } from "./pending.svelte";
 import { safeLocalStorageGet, safeLocalStorageSet } from "./persistence.svelte";
 

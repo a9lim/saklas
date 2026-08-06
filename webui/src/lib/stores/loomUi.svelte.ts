@@ -11,7 +11,7 @@
 
 import { SvelteMap, SvelteSet } from "svelte/reactivity";
 import { apiTree, ApiError } from "../api";
-import { loomTree } from "../stores.svelte";
+import { loomTree } from "./loom.svelte";
 
 /** Sidebar-modal kind, also pokeable from App.svelte via the global
  *  Ctrl+R/E/B/N/D shortcuts.  ``null`` = no modal. */

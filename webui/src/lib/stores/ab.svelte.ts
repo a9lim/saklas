@@ -15,7 +15,7 @@
 import type { WSClientMessage } from "../api";
 import { chatLog, genStatus } from "./chat.svelte";
 import { buildSamplingPayload, samplingState } from "./sampling.svelte";
-import { ensureWebSocket } from "../stores.svelte";
+import { ensureWebSocket } from "./ws.svelte";
 
 /** Transient routing state for the unsteered-shadow generation.
  *
