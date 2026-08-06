@@ -195,11 +195,8 @@ def test_promoted_names_not_imported_by_old_underscore_form() -> None:
     cross-module import of the old name is a boundary violation.
 
     NOTE — blanket "no module-level underscore imports anywhere" would also flag
-    these pre-existing legitimate patterns (not enforced here, recorded for a
+    this pre-existing legitimate pattern (not enforced here, recorded for a
     future decision):
-      server/traits_routes.py:   _resolve_session_id  (internal server helper)
-      server/probe_routes.py:    _resolve_session_id  (internal server helper)
-      server/profile_routes.py:  _refuse_if_busy (internal)
       cli/main.py:               _build_root_parser, _COMMAND_RUNNERS (internal CLI)
     """
     offenders = _find_promoted_old_name_imports()
@@ -208,4 +205,43 @@ def test_promoted_names_not_imported_by_old_underscore_form() -> None:
         "Use the public name (manifold_is_affine / export_gguf_manifold / "
         "all_concepts / sanitize_hyperparams) instead.\n\n"
         + "\n".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Intra-server private-import guard
+# ---------------------------------------------------------------------------
+
+_SERVER_PRIVATE_IMPORT_RE = re.compile(
+    r"(?:^|\s)from\s+saklas\.server[\w.]*\s+import\s+[^#\n]*?(?<![\w.])"
+    r"(_[A-Za-z]\w*)"
+)
+
+
+def test_server_modules_do_not_import_each_others_privates() -> None:
+    """A route module must not reach into a sibling's underscore helper.
+
+    Shared native-tree primitives belong in ``server/native_common.py``
+    (``resolve_session_id``, ``refuse_if_busy``) or the shared plumbing
+    modules (``sse`` / ``streaming`` / ``request_helpers`` /
+    ``background_job``).  Importing ``manifold_routes._refuse_if_busy`` from
+    ``profile_routes`` — the pattern this guard retires — made a guard that is
+    not manifold-specific look like manifold-route internals, and made either
+    module's private rename break the other.
+    """
+    root = _saklas_root()
+    offenders: list[str] = []
+    for path in sorted((root / "server").rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        code = _strip_comments_and_strings(path.read_text(encoding="utf-8"))
+        for lineno, line in enumerate(code.splitlines(), start=1):
+            for m in _SERVER_PRIVATE_IMPORT_RE.finditer(line):
+                offenders.append(
+                    f"{rel}:{lineno}: imports private {m.group(1)!r} "
+                    "from another server module"
+                )
+    assert not offenders, (
+        "A server module imports a sibling module's private helper.\n"
+        "Promote the helper into server/native_common.py (or the relevant "
+        "shared plumbing module) instead.\n\n" + "\n".join(offenders)
     )

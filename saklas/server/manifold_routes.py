@@ -50,7 +50,7 @@ from saklas.io.manifolds import (
 from saklas.io.paths import manifold_dir
 from saklas.io.templates import AmbiguousTemplateError, TemplateNotFoundError
 from saklas.server.app import acquire_session_lock
-from saklas.server.native_common import NativeRequest
+from saklas.server.native_common import NativeRequest, refuse_if_busy
 from saklas.server.sse import ProgressCallback, progress_sse_response
 
 log = logging.getLogger("saklas.api")
@@ -452,22 +452,6 @@ def _find_manifold(
         ) from e
 
 
-def _refuse_if_busy(session: SaklasSession) -> None:
-    """Raise 409 when the engine gen-lock is held.
-
-    ``session.lock`` (the asyncio HTTP serializer) orders manifold
-    mutations against each other and the JSON fit path, but an SSE fit
-    whose request was cancelled leaves its worker thread — and the
-    ``gen_lock`` it holds — alive past the cancel.  A non-blocking probe
-    of ``gen_lock`` refuses a folder mutation while that thread runs.
-    """
-    if not session.gen_lock.acquire(blocking=False):
-        raise HTTPException(
-            409, "a model operation is in flight; retry shortly",
-        )
-    session.gen_lock.release()
-
-
 def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
     """Drop any cached in-memory ``Manifold`` for this artifact.
 
@@ -619,7 +603,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         refused with a clear error (rename in source folders first).
 
         Held under the session lock so a parallel fit on one of the
-        sources can't race the corpus read; ``_refuse_if_busy`` guards
+        sources can't race the corpus read; ``refuse_if_busy`` guards
         against an in-flight engine operation holding the gen-lock.
         """
         if len(req.sources) < 2:
@@ -631,7 +615,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
-            _refuse_if_busy(session)
+            refuse_if_busy(session)
             try:
                 folder = await asyncio.to_thread(
                     merge_discover_manifolds,
@@ -674,7 +658,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
-            _refuse_if_busy(session)
+            refuse_if_busy(session)
             try:
                 folder = await asyncio.to_thread(
                     install_manifold,
@@ -833,7 +817,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
-            _refuse_if_busy(session)
+            refuse_if_busy(session)
             try:
                 await asyncio.to_thread(
                     update_manifold_folder,
@@ -873,7 +857,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
-            _refuse_if_busy(session)
+            refuse_if_busy(session)
             _evict_manifold(session, namespace, name)
             try:
                 return await asyncio.to_thread(

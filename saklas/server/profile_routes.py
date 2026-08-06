@@ -18,7 +18,7 @@ from fastapi.responses import Response
 
 from saklas.core.profile import Profile
 from saklas.server.app import acquire_session_lock
-from saklas.server.native_common import resolve_session_id
+from saklas.server.native_common import refuse_if_busy, resolve_session_id
 from saklas.server.profile_models import (
     BakeProfileRequest,
     ExtractRequest,
@@ -396,7 +396,6 @@ def register_profile_routes(app: FastAPI) -> None:
         from saklas.io.paths import tensor_filename
         from saklas.io.manifold_tensors import load_manifold
         from saklas.core.capture import folded_directions
-        from saklas.server.manifold_routes import _refuse_if_busy
         resolve_session_id(session_id)
 
         async with acquire_session_lock(session) as acquired:
@@ -405,7 +404,7 @@ def register_profile_routes(app: FastAPI) -> None:
             # Refuse (409) while an in-flight extract holds the engine
             # gen-lock — parity with the manifold mutating routes, so a
             # merge can't race a concurrent extraction.
-            _refuse_if_busy(session)
+            refuse_if_busy(session)
             try:
                 dst_folder = await asyncio.to_thread(
                     merge_into_manifold,
