@@ -376,14 +376,14 @@ single non-thread-safe command buffer.
 schema validation to `LoomTree.from_dict` and refusing a model mismatch —
 saved token ids and stamped recipes are model-specific), active-path `GET`, and
 navigate / edit / branch / delete / star / note / reset mutations, plus
-`edge_label`, `filter`, branch `diff`, `joint_logprobs`, and `transcript` /
+`edge-label`, `filter`, branch `diff`, `joint-logprobs`, and `transcript` /
 `transcript/load`. Mutations run the tree's conflict checks (409 when they
 would corrupt an in-flight generation); navigate, star, and note are
 decoration-tier and never conflict. `tree/branch` takes an optional `role`
 override (`user|assistant|system`) — with the engine's scene mode this is the
 seat-swap branch primitive.
 
-`joint_logprobs` force-replays both branches under their stamped recipes and
+`joint-logprobs` force-replays both branches under their stamped recipes and
 returns per-aligned-position cross-evaluation records; results live in
 `session.joint_logprob_cache` keyed by the sorted `(a_id, b_id)` pair,
 double-checked under the lock, invalidated by edits/deletes/finalize.
