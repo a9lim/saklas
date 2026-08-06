@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ConfigDict, Field
 
-from saklas.core.manifold import domain_from_spec, manifold_is_affine
+from saklas.core.manifold import domain_from_spec
 from saklas.core.session import (
     ConcurrentExtractionError,
     SaklasSession,
@@ -267,8 +268,35 @@ def _resolve_intrinsic_dim(mf: ManifoldFolder, session_stem: str) -> tuple[int, 
     return 0, mf.domain
 
 
+def _fitted_geometry(path: Path) -> tuple[list[list[float]], bool | None]:
+    """Read a fitted tensor's shared layout + flat/curved family cheaply.
+
+    Returns ``(node_coords, is_affine)``.  Both answers live in the
+    safetensors *header* plus one small ``(K, n)`` entry, so this opens the
+    file lazily instead of deserializing the whole per-layer
+    ``mean``/``basis``/RBF payload the way ``load_manifold`` does — the list
+    route calls this once per installed manifold.
+
+    The flat/curved discriminator is the same one ``load_manifold`` keys on:
+    the *absence* of any ``layer_<L>.node_params`` entry marks an affine fit.
+    ``(=[], None)`` when the artifact is missing or unreadable — the caller
+    reports an unresolved geometry rather than failing the whole listing.
+    """
+    from safetensors import SafetensorError, safe_open
+
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            keys = set(tensors.keys())
+            if "node_coords" not in keys:
+                return [], None
+            is_affine = not any(k.endswith(".node_params") for k in keys)
+            coords = tensors.get_tensor("node_coords")
+    except (OSError, SafetensorError, ValueError, KeyError):
+        return [], None
+    return [[float(x) for x in row] for row in coords.tolist()], is_affine
+
+
 def _manifold_json(
-    namespace: str,
     mf: ManifoldFolder,
     session: SaklasSession,
     *,
@@ -293,8 +321,7 @@ def _manifold_json(
     ``full`` adds per-node statements and per-tensor fit detail — the
     list route omits both to stay light.
     """
-    folder = manifold_dir(namespace, mf.name)
-    out: dict[str, Any] = manifold_summary(folder)
+    out: dict[str, Any] = manifold_summary(mf.folder)
 
     from saklas.io.paths import tensor_filename
 
@@ -323,25 +350,19 @@ def _manifold_json(
     node_roles_padded = out["node_roles"]
 
     # For fitted discover folders the derived per-model coords live in
-    # the safetensors, not on the folder.  Load them once and share
+    # the safetensors, not on the folder.  Read them once and share
     # between the list-level ``node_coords`` field and the detail-level
     # ``nodes`` block — the list shape needs them so the manifold rack
     # strip's snap-to-node action can sync the position sliders to the
     # picked node's actual coords (otherwise label-form selections show
-    # zeros on every axis).  Cheap (one safetensors header read).
+    # zeros on every axis).  Header + one small entry, not a full
+    # per-layer deserialization (see :func:`_fitted_geometry`).
     derived_coords: list[list[float]] = []
     resolved_affine: bool | None = None
     if fitted_for_session and mf.is_discover:
-        from saklas.io.manifold_tensors import load_manifold
-        try:
-            m = load_manifold(mf.tensor_path(session_stem))
-            derived_coords = [
-                [float(x) for x in row]
-                for row in m.node_coords.tolist()
-            ]
-            resolved_affine = manifold_is_affine(m)
-        except (FileNotFoundError, KeyError, ValueError):
-            derived_coords = []
+        derived_coords, resolved_affine = _fitted_geometry(
+            mf.tensor_path(session_stem),
+        )
 
     # Session-aware geometry override.  ``manifold_summary`` reports the
     # empty/discover form for a discover folder (no session, no per-model
@@ -437,15 +458,18 @@ def _manifold_json(
     return out
 
 
-def _find_manifold(
-    namespace: str, name: str,
-) -> tuple[str, ManifoldFolder]:
-    """Locate one manifold by namespace + name, or 404."""
+def _find_manifold(namespace: str, name: str) -> ManifoldFolder:
+    """Locate one manifold by namespace + name, or 404.
+
+    The folder carries its own path (and therefore its namespace), so the
+    caller reads identity off the returned object rather than threading the
+    request's namespace string alongside it.
+    """
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
         raise HTTPException(404, f"manifold {namespace}/{name} not found")
     try:
-        return namespace, ManifoldFolder.load(folder, verify_manifest=False)
+        return ManifoldFolder.load(folder, verify_manifest=False)
     except ManifoldFormatError as e:
         raise HTTPException(
             400, f"manifold {namespace}/{name} is malformed: {e}",
@@ -478,16 +502,16 @@ def register_manifold_routes(app: FastAPI) -> None:
         """List every installed manifold with per-session fit status."""
         return {
             "manifolds": [
-                _manifold_json(ns, mf, session, full=False)
-                for ns, mf in iter_manifold_folders()
+                _manifold_json(mf, session, full=False)
+                for _ns, mf in iter_manifold_folders()
             ],
         }
 
     @app.get("/saklas/v1/manifolds/{namespace}/{name}")
     def get_manifold(namespace: str, name: str):
         """One manifold: domain, nodes with statements, per-tensor fit detail."""
-        ns, mf = _find_manifold(namespace, name)
-        return _manifold_json(ns, mf, session, full=True)
+        mf = _find_manifold(namespace, name)
+        return _manifold_json(mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds", status_code=201)
     def create_manifold(req: CreateManifoldRequest):
@@ -510,7 +534,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         except ManifoldFormatError as e:
             raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
-        body = _manifold_json(req.namespace, mf, session, full=True)
+        body = _manifold_json(mf, session, full=True)
         body["advisories"] = advisories
         return body
 
@@ -541,7 +565,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         except ManifoldFormatError as e:
             raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
-        return _manifold_json(req.namespace, mf, session, full=True)
+        return _manifold_json(mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds/from-template", status_code=201)
     def create_manifold_from_template_route(
@@ -565,7 +589,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         except ManifoldFormatError as e:
             raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
-        return _manifold_json(req.namespace, mf, session, full=True)
+        return _manifold_json(mf, session, full=True)
 
     @app.get("/saklas/v1/manifolds/search")
     def search_remote_manifolds(q: str = "", limit: int = 20):
@@ -587,7 +611,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         # the cap when ``limit`` is omitted or oversized.
         if limit and limit > 0:
             rows = rows[: int(limit)]
-        # Echo ``query`` for parity with ``GET /saklas/v1/packs/search``.
+        # The response echoes the query alongside the rows.
         return {"query": q, "results": rows}
 
     @app.post("/saklas/v1/manifolds/merge", status_code=201)
@@ -639,21 +663,19 @@ def register_manifold_routes(app: FastAPI) -> None:
             # target — paranoia in case the user is merging-over an
             # existing folder with the same name (force=True path).
             _evict_manifold(session, req.namespace, req.name)
-        ns, mf = _find_manifold(folder.parent.name, folder.name)
-        return _manifold_json(ns, mf, session, full=True)
+        mf = _find_manifold(folder.parent.name, folder.name)
+        return _manifold_json(mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds/install", status_code=201)
     async def install_remote_manifold(req: InstallManifoldRequest):
         """Install a manifold from an HF coord or local folder.
 
-        Mirrors ``POST /saklas/v1/packs`` for parity with the vector
-        pack side.  ``target`` is an HF coord (``owner/name[@revision]``)
-        or a local folder path; ``as_`` overrides the destination
-        namespace+name (must be fully qualified); ``force`` overwrites
-        an existing folder.  Held under the session lock so a parallel
-        delete / fit can't race the swap-into-place.  Returns the same
-        manifold-detail JSON shape ``GET /saklas/v1/manifolds/{ns}/{name}``
-        ships.
+        ``target`` is an HF coord (``owner/name[@revision]``) or a local
+        folder path; ``as_`` overrides the destination namespace+name
+        (must be fully qualified); ``force`` overwrites an existing
+        folder.  Held under the session lock so a parallel delete / fit
+        can't race the swap-into-place.  Returns the same manifold-detail
+        JSON shape ``GET /saklas/v1/manifolds/{ns}/{name}`` ships.
         """
         async with acquire_session_lock(session) as acquired:
             if not acquired:
@@ -682,8 +704,8 @@ def register_manifold_routes(app: FastAPI) -> None:
         # carries the destination identity even when ``as_`` re-routed it.
         dst_namespace = folder.parent.name
         dst_name = folder.name
-        ns, mf = _find_manifold(dst_namespace, dst_name)
-        return _manifold_json(ns, mf, session, full=True)
+        mf = _find_manifold(dst_namespace, dst_name)
+        return _manifold_json(mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds/generate", status_code=201)
     async def generate_manifold(req: GenerateManifoldRequest, request: Request):
@@ -747,8 +769,8 @@ def register_manifold_routes(app: FastAPI) -> None:
                     folder, plan.index_of[concept], concept, corpora[concept],
                 )
             _evict_manifold(session, req.namespace, req.name)
-            ns, mf = _find_manifold(req.namespace, req.name)
-            body = _manifold_json(ns, mf, session, full=True)
+            mf = _find_manifold(req.namespace, req.name)
+            body = _manifold_json(mf, session, full=True)
             body["done"] = True
             return body
 
@@ -828,8 +850,8 @@ def register_manifold_routes(app: FastAPI) -> None:
             except ManifoldFormatError as e:
                 raise HTTPException(400, str(e)) from e
             _evict_manifold(session, namespace, name)
-        ns, mf = _find_manifold(namespace, name)
-        return _manifold_json(ns, mf, session, full=True)
+        mf = _find_manifold(namespace, name)
+        return _manifold_json(mf, session, full=True)
 
     @app.delete("/saklas/v1/manifolds/{namespace}/{name}")
     async def delete_manifold(namespace: str, name: str):
@@ -894,8 +916,8 @@ def register_manifold_routes(app: FastAPI) -> None:
                 on_progress=on_progress,
             )
             _evict_manifold(session, namespace, name)
-            ns, mf = _find_manifold(namespace, name)
-            body = _manifold_json(ns, mf, session, full=True)
+            mf = _find_manifold(namespace, name)
+            body = _manifold_json(mf, session, full=True)
             body["done"] = True
             body["layers_fitted"] = len(manifold.layers)
             body["feature_space"] = manifold.feature_space
