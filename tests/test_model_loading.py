@@ -534,6 +534,74 @@ def test_load_text_from_multimodal_raises_when_no_text_weights(tmp_path: Path, m
 
 
 # ---------------------------------------------------------------------------
+# Source-fingerprint parity: pre-load recompute == post-load stamp.
+#
+# ``_finalize_model`` stamps ``model_source_fingerprint`` from ``plan.config``
+# *after* the weights loaded.  On the text-extraction path the load mutates
+# that object in place (``_materialize_model`` fills
+# ``text_config._name_or_path``; ``from_config`` writes the load dtype onto
+# ``text_config``), so a naive pre-load recompute hashed a different config
+# and every metadata-only fast path (manifold-fit preflight, lens-fit no-op,
+# alignment ``_proven_sidecar``) failed closed on gemma-3/gemma-4/mistral-3.
+# The fingerprint canonicalizes its config payload to the post-load view;
+# these tests pin recompute == stamp end-to-end for both checkpoint shapes.
+# ---------------------------------------------------------------------------
+
+
+def _stub_tokenizer(name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        name_or_path=name, vocab_size=128, eos_token_id=2,
+        added_tokens_encoder={},
+    )
+
+
+def _load_stamped(ckpt: Path, tok_name: str):
+    """Real ``load_model`` on a local checkpoint; only the tokenizer is stubbed."""
+    with patch.object(model_mod, "AutoTokenizer") as mock_tok:
+        mock_tok.from_pretrained.return_value = _stub_tokenizer(tok_name)
+        model, _ = model_mod.load_model(str(ckpt), device="cpu")
+    return model
+
+
+def test_source_fingerprint_recompute_matches_stamp_text_only(tmp_path: Path):
+    from transformers import AutoModelForCausalLM as _AM
+
+    text_cfg = _tiny_text_config(tie=True)
+    torch.manual_seed(0)
+    ckpt = tmp_path / "text-only"
+    _AM.from_config(text_cfg).save_pretrained(ckpt)
+
+    pre = model_mod.model_source_fingerprint(str(ckpt), device="cpu")
+    assert pre is not None
+    model = _load_stamped(ckpt, "text-only-stub")
+    assert getattr(model, "_saklas_source_fingerprint", None) == pre
+
+
+def test_source_fingerprint_recompute_matches_stamp_multimodal(tmp_path: Path):
+    from safetensors.torch import save_file
+    from transformers import AutoModelForCausalLM as _AM
+    from transformers import LlavaConfig
+
+    text_cfg = _tiny_text_config(tie=False)
+    torch.manual_seed(0)
+    ref = _AM.from_config(text_cfg)
+    ckpt = tmp_path / "vlm"
+    LlavaConfig(text_config=text_cfg.to_dict()).save_pretrained(ckpt)
+    save_file(
+        _remap_to_layout(ref.state_dict(), "mistral"),
+        str(ckpt / "model.safetensors"),
+    )
+
+    pre = model_mod.model_source_fingerprint(str(ckpt), device="cpu")
+    assert pre is not None
+    model = _load_stamped(ckpt, "vlm-stub")
+    # The extraction path must actually have fired (and with it the in-place
+    # plan-config mutations), else this asserts nothing.
+    assert type(model).__name__ == "LlamaForCausalLM"
+    assert getattr(model, "_saklas_source_fingerprint", None) == pre
+
+
+# ---------------------------------------------------------------------------
 # Routing: when does load_model prefer the text-only extraction path?
 # ---------------------------------------------------------------------------
 

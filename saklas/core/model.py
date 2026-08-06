@@ -142,10 +142,20 @@ def model_source_fingerprint(
     exact checkpoint/config/tokenizer file hashes.  ``None`` means the source
     cannot be proven without loading weights, so callers must decline any
     metadata-only cache shortcut.
+
+    The hashed config payload is canonicalized to the *post-load* view: on the
+    multimodal text-extraction path the load mutates the plan config in place
+    (``_materialize_model`` fills ``text_config._name_or_path`` and
+    ``from_config`` writes the load dtype onto ``text_config``), and
+    ``_finalize_model`` stamps from that mutated object.  Applying the same
+    two writes to the payload dict here is a no-op on the stamp side and makes
+    a pre-load recompute reproduce the stamp, so metadata-only preflights can
+    prove identity without loading weights.
     """
     try:
         resolved_device = detect_device(device)
         effective_quantize = quantize if resolved_device == "cuda" else None
+        resolved_load_dtype = _resolve_dtype(dtype, resolved_device)
         if config is None:
             config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         resolved_commit = (
@@ -163,21 +173,41 @@ def model_source_fingerprint(
             if parameter_dtype is not None
             else (
                 "quantized" if effective_quantize is not None
-                else _resolve_dtype(dtype, resolved_device)
+                else resolved_load_dtype
             )
         )
         canonical_id = (
             str(requested_path.resolve()) if requested_path.exists() else model_id
         )
+        config_payload: dict[str, Any] = (
+            config.to_dict() if hasattr(config, "to_dict")
+            else {"model_type": getattr(config, "model_type", None)}
+        )
+        text_cfg = getattr(config, "text_config", None)
+        text_payload = config_payload.get("text_config")
+        if (
+            text_cfg is not None
+            and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
+            and isinstance(text_payload, dict)
+        ):
+            # Same predicate as ``LoadPlan.extract_text_model``: this config
+            # takes the text-extraction path, whose in-place plan-config
+            # mutations the canonical payload must carry (see docstring).
+            # The extraction always hands ``from_config`` the plan-resolved
+            # dtype, even under quantization.
+            if not text_payload.get("_name_or_path"):
+                text_payload["_name_or_path"] = model_id
+            for key in ("dtype", "torch_dtype"):
+                if key in text_payload:
+                    text_payload[key] = str(resolved_load_dtype).removeprefix(
+                        "torch.",
+                    )
         payload = {
             "version": _SOURCE_FINGERPRINT_VERSION,
             "model_id": canonical_id,
             "resolved_commit": resolved_commit,
             "local_files": local_files,
-            "config": (
-                config.to_dict() if hasattr(config, "to_dict")
-                else {"model_type": getattr(config, "model_type", None)}
-            ),
+            "config": config_payload,
             "quantize": effective_quantize,
             "parameter_dtype": effective_dtype,
         }
@@ -1243,10 +1273,12 @@ def _finalize_model(
     model.train(False)
     # Mark only saklas-owned loads as source-trusted.  Arbitrary modules whose
     # configs merely claim the same commit must still take the exact full-state
-    # fingerprint path.
+    # fingerprint path.  ``dtype=plan.dtype`` is what the text-extraction path
+    # handed ``from_config`` (immutable against the fallback ladder), so the
+    # payload canonicalization's dtype write no-ops against the mutated config.
     source_fingerprint = model_source_fingerprint(
         plan.model_id, quantize=plan.quantize, device=plan.device,
-        config=plan.config,
+        dtype=plan.dtype, config=plan.config,
         parameter_dtype=(
             "quantized" if plan.quantize is not None
             else next(model.parameters()).dtype
