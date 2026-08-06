@@ -1493,23 +1493,18 @@ class LoomTree:
         with self._lock:
             return {nid for nid, node in self.nodes.items() if pred(node)}
 
-    def filter_by_expr(
-        self,
-        text: str,
-        *,
-        per_token_scores: Any = None,
-    ) -> set[str]:
+    def filter_by_expr(self, text: str) -> set[str]:
         """Apply a filter-grammar expression to every node.
 
         Thin wrapper over :func:`saklas.core.tree_filter.filter_tree` —
         the grammar (``agg:``/``any:``/``last:``) is documented in
-        :mod:`saklas.core.tree_filter`.  ``per_token_scores`` is an
-        optional ``{node_id: {probe: [scores]}}`` mapping needed for
-        ``any:`` / ``last:`` clauses; absent entries fail those clauses
-        per the documented missing-probe semantics.
+        :mod:`saklas.core.tree_filter`.  ``agg:`` reads a node's
+        ``aggregate_readings``; ``any:`` / ``last:`` read its own
+        ``thinking_tokens``/``tokens`` rows, so no side table is needed and
+        all three ops work from any caller.
         """
         from saklas.core.tree_filter import filter_tree
-        return filter_tree(self, text, per_token_scores=per_token_scores)
+        return filter_tree(self, text)
 
     # ------------------------------------------------------------------
     # Persistence

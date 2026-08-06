@@ -9,6 +9,7 @@ from saklas import (
     Recipe,
     parse_filter,
 )
+from saklas.core.tree_filter import node_token_series
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +123,34 @@ def test_invalid_probe_name():
 
 
 class _SyntheticNode:
-    """Tiny stand-in for LoomNode — only ``aggregate_readings`` is read."""
+    """Tiny stand-in for LoomNode — aggregates plus optional token rows."""
 
-    def __init__(self, readings: dict[str, float]) -> None:
+    def __init__(
+        self,
+        readings: dict[str, float],
+        *,
+        tokens: list[dict] | None = None,
+        thinking_tokens: list[dict] | None = None,
+    ) -> None:
         self.id = "n0"
         self.aggregate_readings = readings
+        self.tokens = tokens
+        self.thinking_tokens = thinking_tokens
+
+
+def _rows(probe: str, values: list[float]) -> list[dict]:
+    """Token rows carrying ``probe`` in the 5.x measurement envelope."""
+    return [
+        {
+            "text": f"t{i}",
+            "measurements": {
+                "version": 1,
+                "scope": "token",
+                "scores": {probe: v},
+            },
+        }
+        for i, v in enumerate(values)
+    ]
 
 
 def test_evaluate_agg_op_pass():
@@ -160,27 +184,82 @@ def test_evaluate_multi_clause_and():
 
 def test_evaluate_any_op_uses_per_token():
     fc = parse_filter("any:angry > 0.5")
-    node = _SyntheticNode({"angry": 0.2})
-    # No per-token table → any clause fails.
-    assert fc.evaluate(node) is False
-    # With per-token scores where max > 0.5.
-    assert fc.evaluate(node, per_token_scores={"angry": [0.1, 0.6, 0.2]}) is True
+    # No token rows → the clause fails.
+    assert fc.evaluate(_SyntheticNode({"angry": 0.2})) is False
+    # Rows whose max > 0.5.
+    node = _SyntheticNode({"angry": 0.2}, tokens=_rows("angry", [0.1, 0.6, 0.2]))
+    assert fc.evaluate(node) is True
     # All below.
-    assert fc.evaluate(node, per_token_scores={"angry": [0.1, 0.2]}) is False
+    node = _SyntheticNode({"angry": 0.2}, tokens=_rows("angry", [0.1, 0.2]))
+    assert fc.evaluate(node) is False
 
 
 def test_evaluate_last_op_uses_per_token():
     fc = parse_filter("last:refusal.compliant < 0")
-    node = _SyntheticNode({"refusal.compliant": 0.2})
-    assert fc.evaluate(node, per_token_scores={"refusal.compliant": [0.5, -0.2]}) is True
-    assert fc.evaluate(node, per_token_scores={"refusal.compliant": [0.5, 0.1]}) is False
+    node = _SyntheticNode(
+        {"refusal.compliant": 0.2},
+        tokens=_rows("refusal.compliant", [0.5, -0.2]),
+    )
+    assert fc.evaluate(node) is True
+    node = _SyntheticNode(
+        {"refusal.compliant": 0.2},
+        tokens=_rows("refusal.compliant", [0.5, 0.1]),
+    )
+    assert fc.evaluate(node) is False
 
 
 def test_evaluate_any_lt_uses_min():
     fc = parse_filter("any:angry < 0")
-    node = _SyntheticNode({"angry": 0.5})
-    assert fc.evaluate(node, per_token_scores={"angry": [0.3, -0.2, 0.4]}) is True
-    assert fc.evaluate(node, per_token_scores={"angry": [0.3, 0.2, 0.4]}) is False
+    node = _SyntheticNode({"angry": 0.5}, tokens=_rows("angry", [0.3, -0.2, 0.4]))
+    assert fc.evaluate(node) is True
+    node = _SyntheticNode({"angry": 0.5}, tokens=_rows("angry", [0.3, 0.2, 0.4]))
+    assert fc.evaluate(node) is False
+
+
+def test_token_series_reads_thinking_then_response_rows():
+    """Decode order is thinking rows first — ``last:`` sees the response tail."""
+    node = _SyntheticNode(
+        {"angry": 0.0},
+        thinking_tokens=_rows("angry", [0.9]),
+        tokens=_rows("angry", [0.1, -0.4]),
+    )
+    assert node_token_series(node, frozenset({"angry"})) == {
+        "angry": [0.9, 0.1, -0.4],
+    }
+    assert parse_filter("last:angry < 0").evaluate(node) is True
+    assert parse_filter("any:angry > 0.8").evaluate(node) is True
+
+
+def test_token_series_falls_back_to_flat_probes_alias():
+    """Rows written before the envelope carry the flat ``probes`` alias."""
+    node = _SyntheticNode(
+        {"angry": 0.0},
+        tokens=[{"text": "a", "probes": {"angry": 0.7}}],
+    )
+    assert node_token_series(node, frozenset({"angry"})) == {"angry": [0.7]}
+    assert parse_filter("any:angry > 0.5").evaluate(node) is True
+
+
+def test_token_series_skips_rows_missing_the_probe():
+    """A probe attached mid-generation yields the readings it actually has."""
+    node = _SyntheticNode(
+        {"angry": 0.0},
+        tokens=[
+            {"text": "a"},
+            {"text": "b", "measurements": {"scores": {"other": 1.0}}},
+            {"text": "c", "measurements": {"scores": {"angry": 0.3}}},
+        ],
+    )
+    assert node_token_series(node, frozenset({"angry"})) == {"angry": [0.3]}
+    assert parse_filter("last:angry > 0.2").evaluate(node) is True
+
+
+def test_agg_only_expression_skips_token_walk():
+    """``token_probes`` is empty for an ``agg:``-only filter."""
+    assert parse_filter("agg:angry > 0.1, honest < 0").token_probes == frozenset()
+    assert parse_filter("any:angry > 0.1, agg:honest < 0").token_probes == frozenset(
+        {"angry"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -205,3 +284,82 @@ def test_filter_by_expr_returns_matching_ids():
     assert a1 in ids
     assert a2 not in ids
     assert a3 not in ids
+
+
+def test_filter_by_expr_any_last_read_node_token_rows():
+    """``any:`` / ``last:`` match through the plain tree API — no side table.
+
+    Regression for the plumbing hole: the only caller that ever reached
+    ``filter_by_expr`` supplied no per-token table, so both ops used to
+    return an empty match set silently.
+    """
+    t = LoomTree()
+    u = t.add_user_turn("hi")
+
+    spiky = t.begin_assistant(u, recipe=Recipe())
+    for value in (0.1, 0.9, 0.1):
+        t.append_token(spiky, {"text": "x", "measurements": {"scores": {"a": value}}})
+    t.finalize_assistant(spiky, text="spiky", aggregate_readings={"a": 0.3})
+
+    flat = t.begin_assistant(u, recipe=Recipe())
+    for value in (0.1, 0.2, 0.8):
+        t.append_token(flat, {"text": "x", "measurements": {"scores": {"a": value}}})
+    t.finalize_assistant(flat, text="flat", aggregate_readings={"a": 0.3})
+
+    assert t.filter_by_expr("any:a > 0.85") == {spiky}
+    assert t.filter_by_expr("any:a > 0.75") == {spiky, flat}
+    assert t.filter_by_expr("last:a > 0.5") == {flat}
+    # AND across ops, mixing the aggregate and per-token tables.
+    assert t.filter_by_expr("agg:a > 0.2, last:a < 0.5") == {spiky}
+
+
+# ---------------------------------------------------------------------------
+# HTTP route — the only surface that exposes the grammar
+# ---------------------------------------------------------------------------
+
+
+def test_filter_route_matches_all_three_ops():
+    """``GET /tree/filter`` resolves ``agg:``/``any:``/``last:`` alike.
+
+    The route is the grammar's only caller and supplied no per-token table,
+    so ``any:``/``last:`` used to return an empty match set through it.
+    """
+    from typing import cast
+
+    from fastapi.testclient import TestClient
+
+    from saklas.core.session import SaklasSession
+    from saklas.server import create_app
+    from tests.test_server_loom import _StubSession
+
+    session = _StubSession()
+    client = TestClient(create_app(cast(SaklasSession, session), default_steering=None))
+    tree = session.tree
+
+    u = tree.add_user_turn("hi")
+    spiky = tree.begin_assistant(u, recipe=Recipe())
+    for value in (0.1, 0.9, 0.1):
+        tree.append_token(spiky, {"text": "x", "measurements": {"scores": {"a": value}}})
+    tree.finalize_assistant(spiky, text="spiky", aggregate_readings={"a": 0.3})
+
+    calm = tree.begin_assistant(u, recipe=Recipe())
+    for value in (0.1, 0.2, 0.2):
+        tree.append_token(calm, {"text": "x", "measurements": {"scores": {"a": value}}})
+    tree.finalize_assistant(calm, text="calm", aggregate_readings={"a": 0.1})
+
+    def matches(expr: str) -> set[str]:
+        resp = client.get(
+            "/saklas/v1/sessions/default/tree/filter", params={"expr": expr},
+        )
+        assert resp.status_code == 200, resp.text
+        return set(resp.json()["matching_node_ids"])
+
+    assert matches("agg:a > 0.2") == {spiky}
+    assert matches("any:a > 0.8") == {spiky}
+    assert matches("last:a > 0.15") == {calm}
+    assert matches("any:a > 0.05, last:a < 0.15") == {spiky}
+    # Bad expressions still land as 400.
+    bad = client.get(
+        "/saklas/v1/sessions/default/tree/filter", params={"expr": "mean:a > 1"},
+    )
+    assert bad.status_code == 400
