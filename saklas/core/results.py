@@ -395,7 +395,7 @@ class TokenEvent:
     # the loom-owned ``captured`` record.  ``None`` when nothing was measured
     # this step (no probes, live readouts off).  ``probe_readings`` above stays
     # a separate typed field: it feeds the OpenAI/Ollama
-    # ``x-saklas-probe-readings`` vendor extension and the traits SSE stream
+    # ``x-saklas-probe-readings`` vendor extension
     # (compat protocols), carrying the merged per-probe readings from all
     # families as :class:`ProbeReading` objects rather than the serialized
     # envelope shape.

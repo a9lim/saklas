@@ -210,7 +210,6 @@ def _fast_batch_session():
     s._lens_probes = {}
     s._sae_probes = {}
     s._sae_layer = None
-    s._trait_queues = []
     s._active_gen_reservation = None
     s._last_token_probe_payload = None
     s._capture_state = CaptureState()
@@ -275,12 +274,15 @@ def _probe_fast_batch_session():
 class TestGenerateBatch:
     def _session(self):
         # Construct a minimal SaklasSession by bypassing __init__; the
-        # batch methods only need ``_generate_core`` to exist.
+        # batch methods only need ``_generate_core`` to exist.  These tests
+        # pin the SERIAL fan-out contract (prompt order, per-row steering /
+        # sampling pass-through), so the one-shot fast path is declined
+        # outright rather than through some incidental engine attribute.
         from saklas.core.session import SaklasSession
 
         s = SaklasSession.__new__(SaklasSession)
         s._steering_composer = SteeringComposer(s)
-        cast(Any, s)._trait_queues = [object()]
+        cast(Any, s)._generate_batch_fast = lambda *_a, **_kw: None
         return s
 
     def test_returns_results_in_prompt_order(self) -> None:
@@ -417,10 +419,14 @@ class TestGenerateBatch:
         assert [r.text for r in runset] == ["out_0", "out_1"]
         assert [c["input"] for c in capture] == ["alpha", "beta"]
 
-    def test_probes_fall_back_to_serial_generation(self) -> None:
+    def test_sae_probes_without_layer_fall_back_to_serial_generation(self) -> None:
+        # Geometry probes ride the batched aggregate-only capture ring, but an
+        # SAE feature probe needs a resident SAE layer to encode against; with
+        # none the batch declines to the serial loop rather than reading
+        # nothing.
         s, model = _fast_batch_session()
-        cast(Any, s._monitor).probe_names = ["mood"]
-        cast(Any, s)._trait_queues = [object()]
+        cast(Any, s)._sae_probes = {"sae/17": {"feature_id": 17}}
+        cast(Any, s)._sae_layer = None
         capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 

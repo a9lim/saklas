@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 from pathlib import Path
 from types import MethodType
 from typing import Any, cast
@@ -56,11 +55,6 @@ def _mock_session():
     session._tokenizer = MagicMock()
     session._layers = []
     session.lock = asyncio.Lock()
-
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
-    session.register_trait_queue = lambda *_a, **_kw: None
-    session.unregister_trait_queue = lambda *_a, **_kw: None
     session.events = MagicMock()
     session.events.subscribe = lambda cb: (lambda: None)
     # ``POST /profiles/bake`` is a thin wrapper over ``SaklasSession.bake`` —

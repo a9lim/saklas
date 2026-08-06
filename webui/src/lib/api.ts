@@ -50,7 +50,6 @@ import type {
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
-  TraitsEvent,
   TranscriptLoadResponseJSON,
   VectorInfo,
   WSClientMessage,
@@ -96,7 +95,6 @@ export type {
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
-  TraitsEvent,
   TranscriptLoadResponseJSON,
   VectorInfo,
   WSClientMessage,
@@ -960,7 +958,7 @@ export const apiInstruments = {
 
 export interface SseEvent {
   /** SSE ``event:`` field — defaults to ``"message"`` per the spec when
-   * absent (which is also the wire format traits streaming uses). */
+   * absent. */
   event: string;
   /** Parsed JSON if the data line was JSON, otherwise the raw string. */
   data: unknown;

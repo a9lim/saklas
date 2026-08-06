@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import threading
 import time
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
@@ -72,23 +71,6 @@ def _mock_session():
 
     session.build_readings.return_value = {}
     session.lock = asyncio.Lock()
-
-    # Trait queue infrastructure (used by SSE traits/stream endpoint).
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
-
-    def _register_trait_queue(loop: Any, q: Any) -> None:
-        with session._trait_lock:
-            session._trait_queues.append((loop, q))
-    session.register_trait_queue = _register_trait_queue
-
-    def _unregister_trait_queue(loop: Any, q: Any) -> None:
-        with session._trait_lock:
-            try:
-                session._trait_queues.remove((loop, q))
-            except ValueError:
-                pass
-    session.unregister_trait_queue = _unregister_trait_queue
 
     # EventBus mock with subscribe/unsubscribe support.
     _event_subscribers = []
@@ -776,6 +758,38 @@ class TestWebSocket:
         assert msg["code"] == "ValidationError"
         assert "Extra inputs are not permitted" in msg["message"]
 
+    def test_generate_accepts_labelled_input_messages(
+        self, session_and_client: Any,
+    ) -> None:
+        """The dashboard's auto-regen shadow replays a conversation as an
+        explicit message list carrying each turn's cast ``label``.  The wire
+        message is the same shape a loom-derived message dict is, so the
+        label reaches ``_prepare_input`` verbatim — re-rendering the shadow
+        under default labels would be a different prompt than the one being
+        shadowed."""
+        session, client = session_and_client
+        self._attach_generate(session, ["ok"])
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "generate",
+                "input": [
+                    {"role": "user", "content": "hi", "label": "narrator"},
+                    {"role": "assistant", "content": "hello", "label": "deer"},
+                    {"role": "user", "content": "again", "label": None},
+                ],
+                "steering": "",
+                "stateless": True,
+            })
+            while (msg := ws.receive_json())["type"] != "done":
+                assert msg["type"] != "error", msg
+
+        sent = session.generate.call_args.args[0]
+        assert sent == [
+            {"role": "user", "content": "hi", "label": "narrator"},
+            {"role": "assistant", "content": "hello", "label": "deer"},
+            {"role": "user", "content": "again", "label": None},
+        ]
+
     def test_stale_n_way_token_callback_stays_on_original_queue(
         self, session_and_client: Any,
     ) -> None:
@@ -835,13 +849,35 @@ class TestWebSocket:
             assert "unknown message type" in msg["message"]
 
     def test_generate_rejects_nonpositive_n(self, session_and_client: Any) -> None:
+        """``n`` is a declared schema bound now (``Field(ge=1)``), so the
+        rejection is a ``ValidationError`` naming the field rather than a
+        hand-rolled handler check."""
         session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({"type": "generate", "input": "hi", "n": 0})
             msg = ws.receive_json()
             assert msg["type"] == "error"
             assert msg["status"] == 400
-            assert "n must be >= 1" in msg["message"]
+            assert msg["code"] == "ValidationError"
+            assert msg["message"].startswith("n: ")
+        session.generate.assert_not_called()
+
+    def test_submit_rejects_nonpositive_n(self, session_and_client: Any) -> None:
+        """``submit`` carries the same bound — ``_normalize_submit`` forwards
+        ``n`` into a ``WSGenerateMessage`` construction that sits outside the
+        handler's error-frame guard, so the reader has to catch it first."""
+        session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({
+                "type": "submit", "text": "hi",
+                "authored_role": "user", "generated_role": "assistant",
+                "n": 0,
+            })
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["status"] == 400
+            assert msg["code"] == "ValidationError"
+            assert msg["message"].startswith("n: ")
         session.generate.assert_not_called()
 
     def test_multi_turn_no_recv_race(self, session_and_client: Any) -> None:
@@ -1006,160 +1042,28 @@ class TestWebSocket:
             assert tokens == ["ok"]
 
 
-# ---- Live traits SSE stream -----------------------------------------------
+# ---- Deleted surfaces ------------------------------------------------------
 
 
-class TestTraitsStream:
-    def test_session_not_found_404(self, session_and_client: Any) -> None:
+class TestDeletedTraitsStream:
+    """The traits SSE stream is gone — the WS ``measurements`` envelope and the
+    OpenAI/Ollama ``x-saklas-probe-readings`` extension are the live per-token
+    delivery channels."""
+
+    def test_traits_stream_route_is_not_registered(
+        self, session_and_client: Any,
+    ) -> None:
         _, client = session_and_client
-        resp = client.get("/saklas/v1/sessions/nonexistent/traits/stream")
-        assert resp.status_code == 404
-
-    def test_auth_required(self):
-        """With api_key set, the SSE endpoint requires Bearer auth."""
-        from saklas.server import create_app
-        session = _mock_session()
-        app = create_app(session, default_steering=None, api_key="s3cret")
-        client = TestClient(app)
         resp = client.get("/saklas/v1/sessions/default/traits/stream")
-        assert resp.status_code == 401
-
-    def test_register_unregister_trait_queue(self, session_and_client: Any) -> None:
-        """Trait queue registration/unregistration works correctly."""
-        session, _ = session_and_client
-        loop = asyncio.new_event_loop()
-        q = asyncio.Queue()
-        assert len(session._trait_queues) == 0
-        session.register_trait_queue(loop, q)
-        assert len(session._trait_queues) == 1
-        session.unregister_trait_queue(loop, q)
-        assert len(session._trait_queues) == 0
-        # Double unregister is a no-op.
-        session.unregister_trait_queue(loop, q)
-        assert len(session._trait_queues) == 0
-        loop.close()
-
-    def test_trait_queue_receives_events_via_loop(self):
-        """Events pushed via loop.call_soon_threadsafe arrive on the queue."""
-        loop = asyncio.new_event_loop()
-        q = asyncio.Queue()
-
-        async def _run():
-            loop.call_soon_threadsafe(
-                q.put_nowait,
-                ("token", 0, "Hi", False, {"happy": 0.5}),
-            )
-            item = await asyncio.wait_for(q.get(), timeout=1.0)
-            assert item[0] == "token"
-            assert item[1] == 0
-            assert item[2] == "Hi"
-            assert item[4]["happy"] == 0.5
-
-        loop.run_until_complete(_run())
-        loop.close()
-
-
-    def test_route_registered(self, session_and_client: Any) -> None:
-        """SSE route is registered (valid path resolves, bad session 404s)."""
-        _, client = session_and_client
-        # Can't GET a valid session without hanging (infinite SSE generator),
-        # so verify route registration via the 404 path — confirms the URL
-        # pattern matches and the handler runs (session resolution fires).
-        # test_session_not_found_404 already covers this; this is a named alias
-        # for the "route exists" requirement.
-        resp = client.get("/saklas/v1/sessions/nonexistent/traits/stream")
         assert resp.status_code == 404
 
-    def test_event_ordering_start_token_done(self):
-        """Events are serialized correctly: start → token → done."""
-        from saklas.core.results import ProbeReading
+    def test_session_has_no_trait_queue_plumbing(self) -> None:
+        from saklas.core.session import SaklasSession
 
-        # Test the serialization logic directly rather than fighting TestClient
-        # SSE streaming semantics. Build the events as they'd arrive on the
-        # trait queue and verify the JSON output format.
-        readings = {
-            "probe_a": ProbeReading(fraction=0.2, nearest=[], coords=(0.30,))
-        }
-        fake_result = MagicMock()
-        fake_result.probe_readings = readings
-        fake_result.finish_reason = "stop"
-
-        # Simulate the tagged tuple protocol.
-        events = [
-            ("start", "hi", False),
-            ("token", 0, "Hello", False, {"probe_a": 0.35}),
-            ("token", 1, " world", False, {"probe_a": 0.40}),
-            ("done", fake_result),
-        ]
-
-        # Serialize using the same logic as the SSE generator.
-        output_lines = []
-        generation_id = None
-        for item in events:
-            tag = item[0]
-            if tag == "start":
-                generation_id = "test123"
-                output_lines.append(json.dumps({"type": "start", "generation_id": generation_id}))
-            elif tag == "token":
-                _, idx, text, thinking, scores = item
-                output_lines.append(json.dumps({
-                    "type": "token", "idx": idx, "text": text,
-                    "thinking": thinking,
-                    "probes": {k: round(v, 6) for k, v in scores.items()},
-                }))
-            elif tag == "done":
-                result = item[1]
-                agg = {}
-                rd = getattr(result, "probe_readings", None)
-                if rd:
-                    for name, r in rd.items():
-                        val = r.coords[0] if r.coords else 0.0
-                        agg[name] = round(val, 6)
-                output_lines.append(json.dumps({
-                    "type": "done", "generation_id": generation_id,
-                    "finish_reason": getattr(result, "finish_reason", "stop"),
-                    "aggregate": agg,
-                }))
-
-        assert len(output_lines) == 4
-        parsed = [json.loads(l) for l in output_lines]
-        assert parsed[0]["type"] == "start"
-        assert parsed[0]["generation_id"] == "test123"
-        assert parsed[1]["type"] == "token"
-        assert parsed[1]["idx"] == 0
-        assert parsed[1]["probes"]["probe_a"] == 0.35
-        assert parsed[2]["type"] == "token"
-        assert parsed[2]["idx"] == 1
-        assert parsed[3]["type"] == "done"
-        assert parsed[3]["aggregate"]["probe_a"] == 0.30
-        assert parsed[3]["finish_reason"] == "stop"
-
-    def test_multiple_queues_receive_same_event(self):
-        """Multiple registered trait queues all receive the same event."""
-        session = _mock_session()
-        loop = asyncio.new_event_loop()
-        q1 = asyncio.Queue()
-        q2 = asyncio.Queue()
-        session.register_trait_queue(loop, q1)
-        session.register_trait_queue(loop, q2)
-
-        async def _run():
-            # Simulate what _token_tap does: push to all queues.
-            event = ("token", 0, "Hi", False, {"p": 0.5})
-            with session._trait_lock:
-                for lp, q in list(session._trait_queues):
-                    lp.call_soon_threadsafe(q.put_nowait, event)
-            # Both queues should have the event.
-            item1 = await asyncio.wait_for(q1.get(), timeout=1.0)
-            item2 = await asyncio.wait_for(q2.get(), timeout=1.0)
-            assert item1 == event
-            assert item2 == event
-
-        loop.run_until_complete(_run())
-        session.unregister_trait_queue(loop, q1)
-        session.unregister_trait_queue(loop, q2)
-        assert len(session._trait_queues) == 0
-        loop.close()
+        for attr in (
+            "register_trait_queue", "unregister_trait_queue", "_trait_queues",
+        ):
+            assert not hasattr(SaklasSession, attr)
 
 
 # ---- score_single_token (monitor) ----------------------------------------

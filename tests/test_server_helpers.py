@@ -122,6 +122,105 @@ class TestWsAdapterSharesTheConstructor:
         assert ws_build_sampling_config(None) is None
 
 
+class TestWSInputMessageLabel:
+    """The wire message and a loom-derived message dict are the same shape.
+
+    ``build_chat_input`` reads a per-turn ``"label"`` key (rendered into the
+    constructed header by the scene stitcher; parity covered in
+    tests/test_scene_wiring.py), and ``_prepare_input`` forwards a list input
+    to it verbatim — so accepting the field here is what makes the dashboard's
+    labelled shadow replay render the prompt it is shadowing.
+    """
+
+    def test_label_survives_the_lowering(self) -> None:
+        from saklas.server.ws_models import WSInputMessage, build_input
+
+        lowered = build_input([
+            WSInputMessage(role="user", content="ahoy", label="captain"),
+            WSInputMessage(role="assistant", content="arr"),
+        ])
+        assert lowered == [
+            {"role": "user", "content": "ahoy", "label": "captain"},
+            {"role": "assistant", "content": "arr", "label": None},
+        ]
+
+    def test_label_is_optional_and_still_rejects_unknown_keys(self) -> None:
+        import pydantic
+
+        from saklas.server.ws_models import WSInputMessage
+
+        assert WSInputMessage(role="user", content="hi").label is None
+        with pytest.raises(pydantic.ValidationError):
+            WSInputMessage(role="user", content="hi", name="old")  # type: ignore[call-arg]
+
+    def test_string_and_none_inputs_pass_through(self) -> None:
+        from saklas.server.ws_models import build_input
+
+        assert build_input("plain prompt") == "plain prompt"
+        assert build_input(None) is None
+
+
+class TestWSGenerateSchemaValidation:
+    """Mode consistency is a schema property of ``WSGenerateMessage``.
+
+    These rules used to be a hand-rolled pass in the WS handler, so a
+    programmatic construction could build a frame the wire would reject.
+    """
+
+    @staticmethod
+    def _errors(**kwargs: Any) -> list[dict[str, Any]]:
+        import pydantic
+
+        from saklas.server.ws_models import WSGenerateMessage
+
+        with pytest.raises(pydantic.ValidationError) as excinfo:
+            WSGenerateMessage(type="generate", **kwargs)
+        return list(excinfo.value.errors())
+
+    def test_fork_requires_its_whole_field_group(self) -> None:
+        errors = self._errors(fork_node_id="n1", fork_raw_index=3)
+        assert errors[0]["type"] == "fork_fields"
+        # ``PydanticCustomError`` keeps the message verbatim — a plain
+        # ValueError would reach the wire as ``"Value error, fork ..."``.
+        assert errors[0]["msg"].startswith("fork requires ")
+
+    def test_prefill_requires_text(self) -> None:
+        for text in (None, ""):
+            errors = self._errors(prefill_node_id="n1", prefill_text=text)
+            assert errors[0]["type"] == "prefill_fields", text
+
+    def test_fork_and_prefill_are_exclusive(self) -> None:
+        errors = self._errors(
+            fork_node_id="n1", fork_raw_index=0, fork_alt_token_id=7,
+            prefill_node_id="n2", prefill_text="Sure",
+        )
+        assert errors[0]["type"] == "mode_conflict"
+
+    def test_n_is_bounded_on_both_frames(self) -> None:
+        import pydantic
+
+        from saklas.server.ws_models import WSGenerateMessage, WSSubmitMessage
+
+        assert self._errors(n=0)[0]["loc"] == ("n",)
+        # ``submit`` needs the same bound: ``_normalize_submit`` forwards ``n``
+        # into a ``WSGenerateMessage`` construction outside the handler's
+        # error-frame guard, so an unbounded submit would close the socket.
+        with pytest.raises(pydantic.ValidationError):
+            WSSubmitMessage(type="submit", generated_role="assistant", n=0)
+        assert WSGenerateMessage(type="generate", n=1).n == 1
+
+    def test_well_formed_modes_construct(self) -> None:
+        from saklas.server.ws_models import WSGenerateMessage
+
+        assert WSGenerateMessage(
+            type="generate",
+            fork_node_id="n1", fork_raw_index=0, fork_alt_token_id=7,
+        ).fork_node_id == "n1"
+        assert WSGenerateMessage(
+            type="generate", prefill_node_id="n1", prefill_text="Sure",
+        ).prefill_text == "Sure"
+
+
 class TestProbeMeasurementsAggregate:
     """The native WS ``done`` frame's aggregate-scope measurement envelope."""
 
@@ -134,8 +233,15 @@ class TestProbeMeasurementsAggregate:
         session.monitor.probe_names = monitor_names
         session.lens_probe_names = lens_names
         session.sae_probe_names = sae_names
-        session._live_lens = {"source": "local:default"}
-        session._live_sae = {"source": "saelens:rel", "layer": 17}
+        # The live source/layer binding is read through the PUBLIC instrument
+        # surface, not the session's delegating ``_live_lens``/``_live_sae``
+        # private aliases — a MagicMock would happily serve either, so the
+        # aliases are pinned to a sentinel that would fail the assertions if
+        # the helper ever reached for them again.
+        session.lens.live = {"source": "local:default"}
+        session.sae.live = {"source": "saelens:rel", "layer": 17}
+        session._live_lens = {"source": "WRONG-private-alias"}
+        session._live_sae = {"source": "WRONG-private-alias", "layer": -1}
         return session
 
     @staticmethod
@@ -201,6 +307,72 @@ class TestProbeMeasurementsAggregate:
         assert env is not None
         lens = env["instruments"].get("lens")
         assert lens is None or lens.get("readings") in (None, {})
+
+    def test_bindings_read_the_public_instrument_surface(self) -> None:
+        """``session.lens.live`` / ``session.sae.live``, not the private
+        session aliases the helper used to reach through."""
+        from unittest.mock import MagicMock
+
+        from saklas.server.streaming import probe_measurements_aggregate
+
+        reading = self._reading()
+        result = MagicMock()
+        result.probe_readings = {"jlens/fake": reading, "sae/12": reading}
+        result.applied_steering = None
+        session = self._session([], ["jlens/fake"], ["sae/12"])
+        # Any private-alias read would surface these sentinels instead.
+        del session._live_lens
+        del session._live_sae
+
+        env = probe_measurements_aggregate(session, result)
+        assert env is not None
+        instruments = env["instruments"]
+        assert instruments["lens"]["binding"]["source"] == "local:default"
+        assert instruments["sae"]["binding"]["source"] == "saelens:rel"
+        assert instruments["sae"]["binding"]["layer"] == 17
+
+    def test_readings_merge_by_name_across_families(self) -> None:
+        """The dashboard's ``done`` handler merges the three families into one
+        name-keyed rack update, exactly as the ``token`` path does — so the
+        envelope must key every attached probe uniquely."""
+        from unittest.mock import MagicMock
+
+        from saklas.server.streaming import probe_measurements_aggregate
+
+        reading = self._reading()
+        result = MagicMock()
+        result.probe_readings = {
+            "warm.clinical": reading, "jlens/fake": reading, "sae/12": reading,
+        }
+        result.applied_steering = None
+        session = self._session(["warm.clinical"], ["jlens/fake"], ["sae/12"])
+
+        instruments = (probe_measurements_aggregate(session, result) or {})[
+            "instruments"
+        ]
+        merged: dict[str, Any] = {}
+        for family in ("geometry", "lens", "sae"):
+            merged.update((instruments.get(family) or {}).get("readings") or {})
+        assert set(merged) == {"warm.clinical", "jlens/fake", "sae/12"}
+
+    def test_unattached_reading_is_dropped(self) -> None:
+        """A reading whose probe was detached mid-generation belongs to no
+        family and must not reach the rack."""
+        from unittest.mock import MagicMock
+
+        from saklas.server.streaming import probe_measurements_aggregate
+
+        result = MagicMock()
+        result.probe_readings = {
+            "warm.clinical": self._reading(), "detached": self._reading(),
+        }
+        result.applied_steering = None
+        session = self._session(["warm.clinical"], [], [])
+
+        instruments = (probe_measurements_aggregate(session, result) or {})[
+            "instruments"
+        ]
+        assert set(instruments["geometry"]["readings"]) == {"warm.clinical"}
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience

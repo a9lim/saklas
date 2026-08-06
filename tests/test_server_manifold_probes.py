@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import time
 from typing import Any, Callable
 from unittest.mock import MagicMock
@@ -155,9 +154,6 @@ def _mock_session():
 
     session.build_readings.return_value = {}
     session.lock = asyncio.Lock()
-
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
     return session
 
 
@@ -860,15 +856,11 @@ class TestWebSocketProbeReadings:
                     done = msg
                     break
 
-        agg_blob = done["result"].get("probe_readings")
-        assert agg_blob is not None
+        # The aggregate rides the 5.x envelope alone, split by family
+        # (geometry here).  The flat pre-5.x ``probe_readings`` block is gone
+        # from this frame — the same clean break the ``token`` frame made.
+        assert "probe_readings" not in done["result"]
         assert "per_token_probes" not in done["result"]
-        assert agg_blob["circumplex"]["fraction"] == pytest.approx(0.42)
-        assert agg_blob["circumplex"]["coords"] == [
-            pytest.approx(0.61), pytest.approx(0.42),
-        ]
-        # 5.x: the done frame additionally carries the aggregate-scope
-        # measurement envelope, split by family (geometry here).
         agg_env = done["result"].get("measurements")
         assert agg_env is not None
         assert agg_env["scope"] == "aggregate"

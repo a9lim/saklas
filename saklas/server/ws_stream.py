@@ -31,10 +31,7 @@ from saklas.core.steering import Steering
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 from saklas.server.native_common import SINGLE_SESSION_ID
 from saklas.server.request_helpers import merge_steering, parse_request_steering
-from saklas.server.streaming import (
-    probe_measurements_aggregate,
-    probe_reading_aggregate,
-)
+from saklas.server.streaming import probe_measurements_aggregate
 from saklas.server.tree_models import cast_json, node_json
 from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
@@ -115,6 +112,27 @@ def _error_frame(
     }
 
 
+def _validation_message(exc: ValidationError) -> str:
+    """Render a pydantic rejection as one line, the native tree's convention.
+
+    Each error reads ``"<field path>: <message>"``, the shape
+    ``app._on_validation_error`` gives native REST bodies; a model-level rule
+    has no path, so its message stands alone (``"a generate message cannot be
+    both a fork and a prefill"``) — ``PydanticCustomError`` in ``ws_models``
+    is what keeps that verbatim rather than ``"Value error, …"``.
+
+    Every error is reported, not just the first: ``input`` is a union, so its
+    real failure (a bad key inside a message object) is the *second* branch
+    error and a first-only render would name the wrong problem.
+    """
+    parts: list[str] = []
+    for error in exc.errors():
+        message = str(error.get("msg", "invalid request"))
+        loc = ".".join(str(part) for part in error.get("loc", ()))
+        parts.append(f"{loc}: {message}" if loc else message)
+    return "; ".join(parts) or str(exc)
+
+
 class _WSRequestError(Exception):
     """A request-shape problem to report as an error frame, not a close.
 
@@ -189,7 +207,9 @@ def register_ws_stream(app: FastAPI) -> None:
                             )
                             await incoming.put(message)
                         except ValidationError as exc:
-                            await incoming.put(_InvalidInbound(str(exc)))
+                            await incoming.put(
+                                _InvalidInbound(_validation_message(exc))
+                            )
                     elif raw.get("type") == "stop":
                         await incoming.put(_Stop())
                     else:
@@ -374,21 +394,20 @@ def register_ws_stream(app: FastAPI) -> None:
 
 def _normalize_submit(
     submit: WSSubmitMessage,
-) -> tuple[
-    WSGenerateMessage, _AuthoredTurn | None, Literal["user", "assistant"] | None,
-]:
+) -> tuple[WSGenerateMessage, _AuthoredTurn | None, bool]:
     """Lower a ``submit`` frame onto the specialist ``generate`` schema.
 
-    ``submit`` is the native composer contract: an explicit authored role plus
-    an optional generated role.  Append-only submissions take the established
-    no-decode commit path; append+generate keeps the authored turn for one
-    atomic commit inside the generation worker and generates from
+    ``submit`` is the ONE authored-turn contract on this wire: an explicit
+    authored role plus an optional generated role.  Append-only submissions
+    take the no-decode commit path; append+generate keeps the authored turn
+    for one atomic commit inside the generation worker and generates from
     ``input=None`` once that turn has landed.
 
-    Returns ``(generate_message, authored_turn, native_commit_role)``.
-    ``native_commit_role`` is set only on the append-only branch, where it
-    routes the commit through ``session.append_turn`` (free seating) rather
-    than the role-specific appenders.  Raises :class:`_WSRequestError` on any
+    Returns ``(generate_message, authored_turn, commit_only)``.  When
+    ``commit_only`` the authored turn is the whole request and the returned
+    generate message carries only the commit's context (parent, sampling
+    labels, raw); otherwise the authored turn — if any — is committed inside
+    the generation worker.  Raises :class:`_WSRequestError` on any
     field-consistency violation.
     """
     if submit.text is None:
@@ -415,15 +434,12 @@ def _normalize_submit(
         return (
             WSGenerateMessage(
                 type="generate",
-                commit_role=authored.role,
-                commit_text=authored.text,
-                commit_thinking=authored.thinking,
                 parent_node_id=submit.parent_node_id,
                 sampling=submit.sampling,
                 raw=submit.raw,
             ),
-            None,
-            authored.role,
+            authored,
+            True,
         )
     return (
         WSGenerateMessage(
@@ -440,76 +456,14 @@ def _normalize_submit(
             generate_seat=submit.generated_role,
         ),
         authored,
-        None,
+        False,
     )
-
-
-def _validate_generate(
-    msg: WSGenerateMessage,
-    native_commit_role: "Literal['user', 'assistant'] | None",
-) -> None:
-    """Check the fields a ``generate`` frame's mode must carry together.
-
-    Fork, prefill, and commit are mutually exclusive, and each is selected by
-    one field while needing others alongside it — relationships the flat
-    pydantic schema can't express.  Raises :class:`_WSRequestError` on a
-    violation; returns on a well-formed frame.
-    """
-    if msg.n < 1:
-        raise _WSRequestError(f"n must be >= 1, got {msg.n}")
-
-    # Logit fork: the worker calls ``session.fork_from_token`` instead of
-    # ``session.generate``, which needs all three fork fields.
-    is_fork = msg.fork_node_id is not None
-    if is_fork and (msg.fork_raw_index is None or msg.fork_alt_token_id is None):
-        raise _WSRequestError(
-            "fork requires fork_node_id, fork_raw_index, and "
-            "fork_alt_token_id together"
-        )
-
-    # Answer-prefill: the worker calls ``session.prefill_assistant``, which
-    # needs the seed text alongside the anchor node.
-    is_prefill = msg.prefill_node_id is not None
-    if is_prefill and not msg.prefill_text:
-        raise _WSRequestError(
-            "prefill requires prefill_node_id and prefill_text together"
-        )
-    if is_prefill and is_fork:
-        raise _WSRequestError(
-            "a generate message cannot be both a fork and a prefill"
-        )
-
-    if msg.commit_role is None:
-        return
-    # Commit (Ctrl+Enter on either surface): land a turn without a decode.
-    if not msg.commit_text:
-        raise _WSRequestError(
-            "commit requires commit_role and commit_text together"
-        )
-    if msg.commit_role not in ("user", "assistant"):
-        raise _WSRequestError(
-            f"commit_role must be 'user' or 'assistant', "
-            f"got {msg.commit_role!r}"
-        )
-    if is_fork or is_prefill:
-        raise _WSRequestError(
-            "a generate message cannot mix commit with fork or prefill"
-        )
-    if (
-        native_commit_role is None
-        and msg.commit_role == "assistant"
-        and msg.parent_node_id is None
-    ):
-        raise _WSRequestError(
-            "commit_role='assistant' requires parent_node_id "
-            "(the user node the authored turn hangs off)"
-        )
 
 
 async def _ws_handle_commit(
     session: SaklasSession,
     msg: WSGenerateMessage,
-    native_commit_role: "Literal['user', 'assistant'] | None",
+    authored: _AuthoredTurn,
     send_json: Callable[[JSONObject], Awaitable[None]],
 ) -> None:
     """Land one authored turn with no decode.
@@ -517,11 +471,11 @@ async def _ws_handle_commit(
     Short-circuits the n-way fan-out and the streaming worker entirely: one
     tree mutation, one ``started`` (``node_id`` null — the node id is only
     known after the append), one ``done`` carrying the new node.  No token
-    frames.
+    frames.  Seating is free: ``session.append_turn`` is the role-neutral
+    primitive, so an assistant-authored opening turn needs no parent.
     """
     parent_node_id = msg.parent_node_id
     generation_id = uuid.uuid4().hex[:12]
-    commit_text = str(msg.commit_text)
     await send_json({
         "type": "started",
         "generation_id": generation_id,
@@ -532,12 +486,13 @@ async def _ws_handle_commit(
     # Per-message role labels ride the commit's sampling block too
     # (roleplay scaffold).  Raw / flat commits carry no chat-template
     # role, so labels are suppressed there.
-    commit_user_role = (
-        msg.sampling.user_role if msg.sampling is not None else None
-    ) or None
-    commit_asst_role = (
-        msg.sampling.assistant_role if msg.sampling is not None else None
-    ) or None
+    commit_label = None
+    if msg.sampling is not None:
+        commit_label = (
+            msg.sampling.user_role
+            if authored.role == "user"
+            else msg.sampling.assistant_role
+        ) or None
     async with acquire_session_lock(session) as acquired:
         if not acquired:
             await send_json(_error_frame(
@@ -546,47 +501,15 @@ async def _ws_handle_commit(
             ))
             return
         try:
-            commit_thinking = (
-                None if msg.raw else (msg.commit_thinking or None)
+            new_id = await asyncio.to_thread(
+                session.append_turn,
+                parent_node_id,
+                authored.text,
+                role=authored.role,
+                raw=msg.raw,
+                role_label=None if msg.raw else commit_label,
+                thinking=None if msg.raw else (authored.thinking or None),
             )
-            if native_commit_role is not None:
-                commit_label = (
-                    commit_user_role
-                    if native_commit_role == "user"
-                    else commit_asst_role
-                )
-                new_id = await asyncio.to_thread(
-                    session.append_turn,
-                    parent_node_id,
-                    commit_text,
-                    role=native_commit_role,
-                    raw=msg.raw,
-                    role_label=None if msg.raw else commit_label,
-                    thinking=commit_thinking,
-                )
-            elif msg.commit_role == "user":
-                # ``raw`` flags a flat (base-model) commit — the
-                # authored span may hang under a node of any role,
-                # so the user-under-user guard is lifted.
-                new_id = await asyncio.to_thread(
-                    session.append_user_turn,
-                    parent_node_id,
-                    commit_text,
-                    allow_any_parent=msg.raw,
-                    role_label=None if msg.raw else commit_user_role,
-                    thinking=commit_thinking,
-                )
-            else:
-                # ``parent_node_id`` is non-None here (validated by
-                # ``_validate_generate``); narrow for the type-checker.
-                assert parent_node_id is not None
-                new_id = await asyncio.to_thread(
-                    session.append_assistant_turn,
-                    parent_node_id,
-                    commit_text,
-                    role_label=None if msg.raw else commit_asst_role,
-                    thinking=commit_thinking,
-                )
         except SaklasError as e:
             status, message = e.user_message()
             await send_json(_error_frame(
@@ -596,11 +519,8 @@ async def _ws_handle_commit(
     await send_json({
         "type": "done",
         "result": {
-            "kind": (
-                "append" if native_commit_role is not None else "commit"
-            ),
-            "role": msg.commit_role,
-            "text": commit_text,
+            "role": authored.role,
+            "text": authored.text,
             "node_id": new_id,
             "finish_reason": "stop",
             "mean_logprob": None,
@@ -623,23 +543,29 @@ async def _ws_handle_generate(
 ) -> None:
     """Validate one inbound turn and dispatch it to its mode handler.
 
-    ``submit`` frames lower onto the specialist ``generate`` schema
-    (:func:`_normalize_submit`), the field-consistency rules run once
-    (:func:`_validate_generate`), the steering expression is composed over the
-    server default, and then the turn goes to exactly one of two handlers:
+    ``generate``'s own field-consistency rules already ran in the schema
+    (``WSGenerateMessage`` model validators, rejected by the reader), so the
+    only checks left here are ``submit``'s cross-field rules, which have no
+    schema home: they decide *which* generate frame to lower onto
+    (:func:`_normalize_submit`).  Then the steering expression is composed
+    over the server default and the turn goes to exactly one of two handlers:
     :func:`_ws_handle_commit` (no decode) or :func:`_ws_stream_generation`
     (the token fan-out).  Every rejection here is an error frame on a
     connection that stays open — a 400-grade user mistake must not close the
     socket.
     """
     authored: _AuthoredTurn | None = None
-    native_commit_role: Literal["user", "assistant"] | None = None
-    try:
-        if isinstance(msg, WSSubmitMessage):
-            msg, authored, native_commit_role = _normalize_submit(msg)
-        _validate_generate(msg, native_commit_role)
-    except _WSRequestError as e:
-        await send_json(e.frame)
+    commit_only = False
+    if isinstance(msg, WSSubmitMessage):
+        try:
+            msg, authored, commit_only = _normalize_submit(msg)
+        except _WSRequestError as e:
+            await send_json(e.frame)
+            return
+
+    if commit_only:
+        assert authored is not None  # set together by ``_normalize_submit``
+        await _ws_handle_commit(session, msg, authored, send_json)
         return
 
     sampling = build_sampling_config(msg.sampling)
@@ -665,10 +591,6 @@ async def _ws_handle_generate(
         await send_json(_error_frame(
             message, code=type(e).__name__, status=status,
         ))
-        return
-
-    if msg.commit_role is not None:
-        await _ws_handle_commit(session, msg, native_commit_role, send_json)
         return
 
     await _ws_stream_generation(
@@ -1018,17 +940,15 @@ async def _ws_stream_generation(
             # the engine's canonical reason unchanged.
             if stop_signaled and result_json.get("finish_reason") == "stop":
                 result_json["finish_reason"] = "cancelled"
-            # The settled per-probe aggregate rides the ``done`` event in
-            # the same rich shape as each token frame.  Shared with the
-            # SSE / NDJSON finalization via ``probe_reading_aggregate``
-            # (result-parameterized so each n>1 sibling scores its own
-            # result).
-            mf_readings = probe_reading_aggregate(session, result)
-            if mf_readings:
-                result_json["probe_readings"] = mf_readings
-            # 5.x: the aggregate measurement envelope rides the done frame
-            # alongside the compat ``probe_readings`` block (geometry / lens /
-            # SAE instruments split by family).
+            # The settled per-probe aggregate rides the ``done`` event in the
+            # 5.x measurement envelope and nowhere else — the same clean break
+            # the ``token`` frame already made.  Geometry / lens / SAE readings
+            # are split by family inside ``instruments``; a client merges them
+            # exactly as it merges the token frame's.  The flat pre-5.x
+            # ``probe_readings`` block is gone from this frame (it survives on
+            # the OpenAI / Ollama ``x-saklas-probe-readings`` extension, which
+            # is a real external contract).  Result-parameterized so each n>1
+            # sibling reports its own result.
             mf_measurements = probe_measurements_aggregate(session, result)
             if mf_measurements:
                 result_json["measurements"] = mf_measurements

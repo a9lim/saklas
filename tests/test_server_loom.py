@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -83,6 +84,14 @@ class _StubSession:
         self._joint_logprob_cache: dict[Any, Any] = {}
         self.lens_probe_names: list[str] = []
         self.sae_probe_names: list[str] = []
+        # Public instrument surface — ``probe_measurements_aggregate`` reads
+        # the live source/layer binding off these, never the session's
+        # private ``_live_lens``/``_live_sae`` aliases.
+        self.lens = SimpleNamespace(live=None)
+        self.sae = SimpleNamespace(live=None)
+        # End-of-generation readings the stub stamps onto every result, so a
+        # test can pin the ``done`` frame's aggregate channel.
+        self.stub_probe_readings: dict[str, Any] = {}
         self.token_probe_payload: dict[str, Any] = {}
         self._tokenizer = MagicMock()
         self._tokenizer.encode.side_effect = lambda text, **_: [
@@ -102,10 +111,6 @@ class _StubSession:
         self.generation_state = gen_state
 
         self.lock = asyncio.Lock()
-
-        # Trait queue infrastructure (used by SSE traits/stream endpoint).
-        self._trait_queues = []
-        self._trait_lock = threading.Lock()
 
         self._next_token_stream: list[str] = ["hi"]
         self._fail_next: bool = False
@@ -127,17 +132,6 @@ class _StubSession:
 
     def probe_hashes(self) -> dict[str, str]:
         return {}
-
-    def register_trait_queue(self, loop: Any, q: Any) -> None:
-        with self._trait_lock:
-            self._trait_queues.append((loop, q))
-
-    def unregister_trait_queue(self, loop: Any, q: Any) -> None:
-        with self._trait_lock:
-            try:
-                self._trait_queues.remove((loop, q))
-            except ValueError:
-                pass
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -237,6 +231,7 @@ class _StubSession:
                     text=full_text, tokens=[1000 + sibling_idx],
                     token_count=1, tok_per_sec=10.0, elapsed=0.1,
                     finish_reason="stop",
+                    probe_readings=dict(self.stub_probe_readings) or None,
                 )
                 self.tree.finalize_assistant(
                     assistant_id,
@@ -995,6 +990,49 @@ class TestWebSocketLoom:
         done_node_ids = {ev["node_id"] for ev in done_events}
         assert done_node_ids == set(assistant_ids)
 
+    def test_done_carries_only_the_measurements_aggregate(
+        self, session_and_client: Any,
+    ):
+        """One aggregate-readings channel on ``done``: the 5.x envelope.
+
+        The flat pre-5.x ``result.probe_readings`` block is gone (the same
+        clean break the ``token`` frame already made); it survives only on
+        the OpenAI / Ollama ``x-saklas-probe-readings`` vendor extension."""
+        from saklas.core.results import ProbeReading
+
+        session, client = session_and_client
+        reading = ProbeReading(
+            coords=(0.5,), fraction=0.1, residual=0.0, nearest=(),
+        )
+        session.monitor.probe_names = ["calm"]
+        session.lens_probe_names = ["jlens/fake"]
+        session.lens.live = {"source": "local:default"}
+        session.stub_probe_readings = {"calm": reading, "jlens/fake": reading}
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "measure me"})
+            while (msg := ws.receive_json())["type"] != "done":
+                assert msg["type"] != "error", msg
+
+        result = msg["result"]
+        assert "probe_readings" not in result
+        instruments = result["measurements"]["instruments"]
+        assert result["measurements"]["scope"] == "aggregate"
+        assert set(instruments["geometry"]["readings"]) == {"calm"}
+        assert set(instruments["lens"]["readings"]) == {"jlens/fake"}
+        assert instruments["lens"]["binding"]["source"] == "local:default"
+
+    def test_done_omits_measurements_without_probes(
+        self, session_and_client: Any,
+    ):
+        _session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "unmeasured"})
+            while (msg := ws.receive_json())["type"] != "done":
+                assert msg["type"] != "error", msg
+        assert "measurements" not in msg["result"]
+        assert "probe_readings" not in msg["result"]
+
 
 # ---------------------------------------------------------------------------
 # WS: answer-prefill
@@ -1081,63 +1119,53 @@ class TestPrefill:
 
 
 # ---------------------------------------------------------------------------
-# WS: commit (Ctrl+Enter — no-generation send)
+# WS: commit (Ctrl+Enter — no-generation send).  ``submit`` is the ONE
+# authored-turn vocabulary; ``generate`` carries no ``commit_*`` fields.
 # ---------------------------------------------------------------------------
 
 
 class TestCommit:
+    def test_generate_rejects_the_retired_commit_vocabulary(
+        self, session_and_client: Any,
+    ):
+        """``commit_role``/``commit_text``/``commit_thinking`` are gone from
+        ``generate`` — ``WSGenerateMessage`` forbids extras, so the reader
+        rejects them instead of silently accepting a second commit door."""
+        _session, client = session_and_client
+        for field, value in (
+            ("commit_role", "user"),
+            ("commit_text", "manual"),
+            ("commit_thinking", "hmm"),
+        ):
+            with client.websocket_connect(
+                "/saklas/v1/sessions/default/stream",
+            ) as ws:
+                ws.send_json({"type": "generate", field: value})
+                msg = ws.receive_json()
+            assert msg["type"] == "error", (field, msg)
+            assert field in msg["message"], (field, msg)
+
     def test_missing_text_400(self, session_and_client: Any):
-        """commit_role without commit_text is rejected before dispatch."""
+        """``authored_role`` without text is rejected before dispatch."""
         _session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
-            ws.send_json({"type": "generate", "commit_role": "user"})
+            ws.send_json({"type": "submit", "authored_role": "user"})
             msg = ws.receive_json()
         assert msg["type"] == "error"
         assert msg["status"] == 400
-        assert "commit" in msg["message"].lower()
+        assert "text" in msg["message"].lower()
 
     def test_invalid_role_400(self, session_and_client: Any):
         _session, client = session_and_client
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "system",
-                "commit_text": "anything",
+                "type": "submit",
+                "authored_role": "system",
+                "text": "anything",
             })
             msg = ws.receive_json()
         # Pydantic rejects the Literal-mismatch at parse time before the
-        # handler runs, so the error frame source can be either layer —
-        # both surface 400.
-        assert msg["type"] == "error"
-
-    def test_assistant_commit_requires_parent_400(self, session_and_client: Any):
-        """``commit_role='assistant'`` without parent_node_id is rejected —
-        the authored turn has to hang off a known user node."""
-        _session, client = session_and_client
-        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
-            ws.send_json({
-                "type": "generate",
-                "commit_role": "assistant",
-                "commit_text": "the answer",
-            })
-            msg = ws.receive_json()
-        assert msg["type"] == "error"
-        assert msg["status"] == 400
-        assert "parent_node_id" in msg["message"]
-
-    def test_conflicts_with_prefill_400(self, session_and_client: Any):
-        """A message can't be both a commit and a prefill."""
-        session, client = session_and_client
-        uid = session.tree.add_user_turn("seed me")
-        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
-            ws.send_json({
-                "type": "generate",
-                "commit_role": "user",
-                "commit_text": "manual",
-                "prefill_node_id": uid,
-                "prefill_text": "It is",
-            })
-            msg = ws.receive_json()
+        # handler runs.
         assert msg["type"] == "error"
         assert msg["status"] == 400
 
@@ -1152,9 +1180,9 @@ class TestCommit:
         done = None
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "user",
-                "commit_text": "manual user input",
+                "type": "submit",
+                "authored_role": "user",
+                "text": "manual user input",
             })
             while True:
                 msg = ws.receive_json()
@@ -1168,7 +1196,8 @@ class TestCommit:
         assert started is not None
         assert started["node_id"] is None
         assert done is not None
-        assert done["result"]["kind"] == "commit"
+        # No ``kind`` discriminator: one door, so nothing to discriminate.
+        assert "kind" not in done["result"]
         assert done["result"]["role"] == "user"
         assert done["result"]["text"] == "manual user input"
         assert done["node_id"] == done["result"]["node_id"]
@@ -1214,7 +1243,6 @@ class TestSubmit:
                     break
                 assert msg["type"] != "error", msg
         assert msg["result"]["role"] == "assistant"
-        assert msg["result"]["kind"] == "append"
         path = session.tree.active_path()[1:]
         assert [node.role for node in path] == ["assistant"]
         assert path[0].recipe is None
@@ -1321,14 +1349,14 @@ class TestSubmit:
 
 class TestCommitContinued:
     def test_commit_user_appends_under_user_node(self, session_and_client: Any):
-        """The compatibility commit adapter shares same-role append semantics."""
+        """An append-only submit shares same-role append semantics."""
         session, client = session_and_client
         uid = session.tree.add_user_turn("first")  # active = uid
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "user",
-                "commit_text": "second",
+                "type": "submit",
+                "authored_role": "user",
+                "text": "second",
                 "parent_node_id": uid,
             })
             while True:
@@ -1348,9 +1376,9 @@ class TestCommitContinued:
         done = None
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "user",
-                "commit_text": "second",
+                "type": "submit",
+                "authored_role": "user",
+                "text": "second",
                 "parent_node_id": uid,
                 "raw": True,
             })
@@ -1375,9 +1403,9 @@ class TestCommitContinued:
         done = None
         with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
             ws.send_json({
-                "type": "generate",
-                "commit_role": "assistant",
-                "commit_text": "the canned answer",
+                "type": "submit",
+                "authored_role": "assistant",
+                "text": "the canned answer",
                 "parent_node_id": uid,
             })
             while True:
@@ -1430,15 +1458,35 @@ class TestWSErrorFrameShape:
         assert set(msg) == self._KEYS
         assert msg["code"] == "ValidationError"
 
-    def test_hand_validated_mode_rejection(self, session_and_client: Any) -> None:
+    def test_mode_consistency_rejection(self, session_and_client: Any) -> None:
+        """A ``generate`` mode-consistency failure is a schema rejection now
+        (``WSGenerateMessage`` model validator), so it lands on the SAME
+        ``ValidationError``/400 convention as a type or extra-field error —
+        it used to be a hand-rolled ``ValueError`` in the handler.  The
+        message stays verbatim (no ``"Value error, "`` prefix)."""
         _session, client = session_and_client
         msg = self._first_error(
             client, {"type": "generate", "fork_node_id": "n1"},
         )
         assert set(msg) == self._KEYS
         assert msg["status"] == 400
+        assert msg["code"] == "ValidationError"
+        assert msg["message"] == (
+            "fork requires fork_node_id, fork_raw_index, and "
+            "fork_alt_token_id together"
+        )
         assert msg["node_id"] is None
         assert msg["sibling_index"] == 0
+
+    def test_field_path_prefixes_a_field_level_rejection(
+        self, session_and_client: Any,
+    ) -> None:
+        """Field-level errors carry their path, the native REST convention."""
+        _session, client = session_and_client
+        msg = self._first_error(
+            client, {"type": "generate", "input": "hi", "legacy": True},
+        )
+        assert msg["message"] == "legacy: Extra inputs are not permitted"
 
     def test_submit_rejection(self, session_and_client: Any) -> None:
         _session, client = session_and_client

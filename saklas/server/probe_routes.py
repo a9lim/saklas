@@ -7,8 +7,8 @@ probe shape.  A Monitor probe is a :class:`~saklas.core.manifold.Manifold` — a
 ``sae/<id>`` selector lands on the session's readout-channel registries instead
 and is listed alongside.
 
-Live per-token scoring during generation rides the traits SSE stream and the
-WS / OpenAI / Ollama reading extensions, not a route here.
+Live per-token scoring during generation rides the WS ``measurements`` envelope
+and the OpenAI / Ollama reading extensions, not a route here.
 """
 
 from __future__ import annotations
