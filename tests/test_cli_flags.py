@@ -18,7 +18,7 @@ from saklas.cli import runners as cli_runners
         ["serve", "model", "--port", "70000"],
         ["manifold", "fit", "m", "--max-dim", "0"],
         ["manifold", "fit", "m", "--k-nn", "-2"],
-        ["sae", "load", "release", "-m", "model", "--layer", "-1"],
+        ["sae", "fetch", "model", "saelens:release", "--layer", "-1"],
     ],
 )
 def test_numeric_flags_reject_out_of_range_values(argv: list[str]) -> None:

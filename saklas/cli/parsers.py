@@ -1144,11 +1144,17 @@ def _build_sae_parser(parser: argparse.ArgumentParser) -> None:
             child.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
             child.add_argument("-j", "--json", dest="json_output", action="store_true")
         elif verb == "fetch":
+            # Pure IO, like ``lens fetch``: the provider's SAE weights land in
+            # the Hugging Face cache and Saklas writes a small binding.  The
+            # base model is never loaded, so there is no ``-d``/``-q``.
             child.add_argument("source", help="saelens:RELEASE")
             child.add_argument("--layer", type=_nonnegative_int, default=None,
                                help="Explicit covered hook layer (default: nearest 65%% depth)")
-            child.add_argument("-d", "--device", default="auto")
-            child.add_argument("-q", "--quantize", choices=["4bit", "8bit"], default=None)
+            child.add_argument(
+                "--revision", default=None, metavar="REV",
+                help="Provider revision to resolve and pin (default: the "
+                     "release's own resolved commit)",
+            )
             child.add_argument("-j", "--json", dest="json_output", action="store_true")
         elif verb == "show":
             child.add_argument("source", nargs="?", default=None,
