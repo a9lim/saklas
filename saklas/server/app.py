@@ -26,17 +26,17 @@ from saklas.core.session import ConcurrentGenerationError, GenerationStream, Sak
 from saklas.core.steering import Steering
 from saklas.server.request_helpers import (
     UnsupportedContentError,
-    build_sampling_config as _build_sampling_config,
-    flatten_content as _flatten_content,
-    merge_steering as _merge_steering,
-    parse_request_steering as _parse_req_steering,
-    probe_token_readings as _probe_token_readings,
-    strict_model_enabled as _strict_model_enabled,
+    build_sampling_config,
+    flatten_content,
+    merge_steering,
+    parse_request_steering,
+    probe_token_readings,
+    strict_model_enabled,
 )
 from saklas.server.streaming import (
-    _usage_dict,
-    probe_reading_aggregate as _probe_reading_aggregate,
+    probe_reading_aggregate,
     stream_finalizer,
+    usage_dict,
 )
 
 
@@ -74,10 +74,10 @@ class ChatMessage(BaseModel):
     name: str | None = None
 
     @model_validator(mode="after")
-    def _flatten_content(self):
+    def _normalize_content(self):
         # Accept OpenAI multimodal content-part arrays for text-only use:
         # concatenate text parts, reject anything else with a clear error.
-        self.content = _flatten_content(self.content)
+        self.content = flatten_content(self.content)
         return self
 
 
@@ -159,11 +159,11 @@ class _SamplingBase(BaseModel):
         inside ``session.steering()`` — the server does not resolve poles
         here.
         """
-        req_steering, explicit_clear = _parse_req_steering(self.steering)
+        req_steering, explicit_clear = parse_request_steering(self.steering)
         thinking: bool | None = self.thinking
         if req_steering is not None and req_steering.thinking is not None:
             thinking = req_steering.thinking
-        return _merge_steering(
+        return merge_steering(
             req_steering, default_steering, explicit_clear, thinking,
         )
 
@@ -263,35 +263,20 @@ def _sampling_kwargs(
     is the native request override; ``None`` triggers
     ``supports_thinking`` auto-detect inside ``_generate_core``.
     """
-    stop_tuple: tuple[str, ...] | None
-    if req.stop is None:
-        stop_tuple = None
-    elif isinstance(req.stop, str):
-        stop_tuple = (req.stop,)
-    else:
-        stop_tuple = tuple(req.stop)
-
-    # chat: logprobs is bool + top_logprobs gives count.
-    # completions: logprobs is int (number of top alternatives).
-    # Internally saklas takes an int count (0 = chosen only, None = disabled).
-    lp: int | None
-    if isinstance(req.logprobs, bool):
-        lp = (req.top_logprobs or 0) if req.logprobs else None
-    elif isinstance(req.logprobs, int):
-        lp = req.logprobs
-    else:
-        lp = None
-
-    sc = _build_sampling_config(
+    # ``stop`` (str or list) and the two OpenAI ``logprobs`` shapes (chat's
+    # bool + ``top_logprobs`` count, completions' bare int) are normalized
+    # inside the shared constructor.
+    sc = build_sampling_config(
         temperature=req.temperature,
         top_p=req.top_p,
         max_tokens=req.max_tokens,
         seed=req.seed,
-        stop=stop_tuple,
+        stop=req.stop,
         logit_bias=req.logit_bias,
-        presence_penalty=req.presence_penalty or 0.0,
-        frequency_penalty=req.frequency_penalty or 0.0,
-        logprobs=lp,
+        presence_penalty=req.presence_penalty,
+        frequency_penalty=req.frequency_penalty,
+        logprobs=req.logprobs,
+        top_logprobs=req.top_logprobs,
     )
 
     steering = req.to_steering(default_steering)
@@ -423,7 +408,7 @@ async def _stream_generation(
                 # that don't read the field stay unaffected.  Populated
                 # only when at least one manifold probe is attached
                 # and ``live_scores`` is True on the stream.
-                mf_token = _probe_token_readings(event)
+                mf_token = probe_token_readings(event)
                 if mf_token is not None:
                     choice["x-saklas-probe-readings"] = mf_token
                 chunk = {
@@ -577,7 +562,7 @@ def _openai_known_model_names(session: SaklasSession) -> set[str]:
 
 
 def _check_openai_model_strict(session: SaklasSession, name: str | None) -> None:
-    if not _strict_model_enabled():
+    if not strict_model_enabled():
         return
     if not name:
         return
@@ -681,7 +666,7 @@ def _register_routes(app: FastAPI) -> None:
             "logprobs": _render_logprobs_chat(result, session),
             "finish_reason": result.finish_reason,
         }
-        mf_chat = _probe_reading_aggregate(session, result)
+        mf_chat = probe_reading_aggregate(session, result)
         if mf_chat:
             chat_choice["x-saklas-probe-readings"] = mf_chat
         body = {
@@ -690,7 +675,7 @@ def _register_routes(app: FastAPI) -> None:
             "created": int(time.time()),
             "model": model_id,
             "choices": [chat_choice],
-            "usage": _usage_dict(result),
+            "usage": usage_dict(result),
         }
         return body
 
@@ -732,7 +717,7 @@ def _register_routes(app: FastAPI) -> None:
             "logprobs": _render_logprobs_completions(result, session),
             "finish_reason": result.finish_reason,
         }
-        mf_completion = _probe_reading_aggregate(session, result)
+        mf_completion = probe_reading_aggregate(session, result)
         if mf_completion:
             completion_choice["x-saklas-probe-readings"] = mf_completion
         body = {
@@ -741,6 +726,6 @@ def _register_routes(app: FastAPI) -> None:
             "created": int(time.time()),
             "model": model_id,
             "choices": [completion_choice],
-            "usage": _usage_dict(result),
+            "usage": usage_dict(result),
         }
         return body

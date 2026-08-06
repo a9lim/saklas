@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from saklas.core.errors import SaklasError
 from saklas.core.generation import GenerationConfig
 from saklas.core.results import GenerationResult, RunSet
-from saklas.server.ws_models import WSSamplingParams, build_sampling
+from saklas.server.ws_models import WSSamplingParams, build_sampling_config
 
 
 def _mock_session():
@@ -593,7 +593,7 @@ class TestExtract:
 
 
 def test_ws_sampling_can_disable_final_probe_readings() -> None:
-    sc = build_sampling(WSSamplingParams(return_probe_readings=False))
+    sc = build_sampling_config(WSSamplingParams(return_probe_readings=False))
     assert sc is not None
     assert sc.return_probe_readings is False
 
@@ -1453,9 +1453,9 @@ class TestTemplateRoutes:
 class TestRoleSampling:
     def test_build_sampling_carries_roles(self):
         """WS sampling roles map onto SamplingConfig (the per-send carrier)."""
-        from saklas.server.ws_models import WSSamplingParams, build_sampling
+        from saklas.server.ws_models import WSSamplingParams, build_sampling_config
 
-        sc = build_sampling(
+        sc = build_sampling_config(
             WSSamplingParams(user_role="captain", assistant_role="oracle")
         )
         assert sc is not None
@@ -1464,9 +1464,9 @@ class TestRoleSampling:
 
     def test_build_sampling_blank_roles_omitted(self):
         """Empty-string role boxes are treated as "no label" (None)."""
-        from saklas.server.ws_models import WSSamplingParams, build_sampling
+        from saklas.server.ws_models import WSSamplingParams, build_sampling_config
 
-        sc = build_sampling(WSSamplingParams(user_role="", assistant_role=""))
+        sc = build_sampling_config(WSSamplingParams(user_role="", assistant_role=""))
         assert sc is not None
         assert sc.user_role is None
         assert sc.assistant_role is None

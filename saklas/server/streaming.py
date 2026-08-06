@@ -107,7 +107,7 @@ def probe_measurements_aggregate(
     )
 
 
-def _usage_dict(result: "GenerationResult") -> dict[str, int]:
+def usage_dict(result: "GenerationResult") -> dict[str, int]:
     pt = result.prompt_tokens
     ct = result.token_count
     return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
@@ -128,7 +128,7 @@ def stream_finalizer(
     """
     if result is not None:
         finish_reason = result.finish_reason
-        usage: dict[str, int] | None = _usage_dict(result)
+        usage: dict[str, int] | None = usage_dict(result)
     else:
         finish_reason = session.generation_state.finish_reason
         usage = None

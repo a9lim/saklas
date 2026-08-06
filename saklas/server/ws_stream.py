@@ -41,7 +41,7 @@ from saklas.server.ws_models import (
     WSGenerateMessage,
     WSSubmitMessage,
     build_input,
-    build_sampling,
+    build_sampling_config,
     result_to_json,
 )
 
@@ -459,7 +459,7 @@ async def _ws_handle_generate(
     # invariant explicit for readers and static analysis across the long
     # handler below.
     assert isinstance(msg, WSGenerateMessage)
-    sampling = build_sampling(msg.sampling)
+    sampling = build_sampling_config(msg.sampling)
     try:
         req_steering, explicit_clear = parse_request_steering(msg.steering)
         thinking_override: bool | None = None
