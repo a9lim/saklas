@@ -29,6 +29,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 import torch
@@ -1093,6 +1094,347 @@ def _base_fit_metadata(
     return metadata
 
 
+@dataclass(frozen=True)
+class _WhitenedNodeGeometry:
+    """Per-layer whitened between-node geometry over the pooled centroids.
+
+    ``rows`` is ``Σ_L⁻¹ X̃_L`` and ``grams`` the symmetrized
+    ``G_L = X̃_L Σ_L⁻¹ X̃_Lᵀ`` of the node-mean-centered centroids, computed
+    once here because four later stages want them: discover coordinate
+    derivation and topology scoring (whose consensus Gram is the mean of
+    ``grams``), the Fisher basis in the per-layer fit, and the neutral-layout
+    anchoring.
+
+    ``node_spread`` is ``tr(G_L) = Σ_k ‖x̃_k‖²_M`` — the total whitened node
+    spread at layer L in background-σ² units, comparable across layers.  It is
+    a *diagnostic* layer profile (where does this concept live?), distinct from
+    the apply-time ``mahalanobis_share``, which restricts the same idea to the
+    steerable subspace: a layer with large ``tr(G_L)`` but a small share is one
+    whose fitted subspace is dropping concept signal.
+    """
+
+    rows: dict[int, torch.Tensor]
+    grams: dict[int, torch.Tensor]
+    centroid_means: dict[int, torch.Tensor]
+    node_spread: dict[int, float]
+
+
+def _whitened_node_geometry(
+    stacks: Mapping[int, torch.Tensor],
+    fit_layers: Sequence[int],
+    *,
+    whitener: Any,
+) -> _WhitenedNodeGeometry:
+    """Whiten each layer's ``(K, D)`` centroid stack; see the dataclass."""
+    rows: dict[int, torch.Tensor] = {}
+    grams: dict[int, torch.Tensor] = {}
+    centroid_means: dict[int, torch.Tensor] = {}
+
+    def _one(idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Keep the full K×D temporaries in a short-lived frame; otherwise the
+        # final loop iteration remains bound after the roster clears.
+        raw = stacks[idx].to(torch.float32)
+        centroid_mean = raw.mean(dim=0, keepdim=True)
+        xc = raw - centroid_mean
+        sinv_xc = whitener.apply_inv(idx, xc).to(torch.float32)
+        gram = xc @ sinv_xc.transpose(0, 1)
+        return sinv_xc, 0.5 * (gram + gram.transpose(0, 1)), centroid_mean
+
+    for idx in fit_layers:
+        rows[idx], grams[idx], centroid_means[idx] = _one(idx)
+    return _WhitenedNodeGeometry(
+        rows=rows,
+        grams=grams,
+        centroid_means=centroid_means,
+        node_spread={
+            idx: float(grams[idx].diagonal().sum()) for idx in fit_layers
+        },
+    )
+
+
+@dataclass(frozen=True)
+class _ResolvedGeometry:
+    """The geometry a fit runs on, resolved before any layer is fit.
+
+    ``fit_mode`` on disk is a *request*; this is the answer.  ``authored``
+    supplies its own domain and coords, ``pca``/``spectral`` derive coords from
+    the consensus Gram, and ``auto`` defers the whole
+    flat-vs-curved-vs-periodic choice to ``select_topology``.  All three
+    converge on the same things the per-layer fit needs: a domain, the shared
+    node layout, its embedding, the resolved mode to branch on, the sidecar
+    ``method``, and the discover provenance block — plus the curved-only knobs
+    and, for ``auto``, the winner's precomputed artifacts.
+    """
+
+    domain: Any
+    node_coords: torch.Tensor
+    node_params: torch.Tensor
+    #: What the per-layer fit branches on: ``mf.fit_mode`` verbatim for
+    #: authored/pca/spectral, and what ``select_topology`` picked for ``auto``.
+    effective_fit_mode: str
+    method: str
+    discover_metadata: dict[str, Any]
+    #: Penalized-RBF λ selection for the curved surface.  ``None`` ⇒ exact
+    #: interpolation — the authored contract (node = exact steering target) and
+    #: the flat ``pca`` path, which has no RBF at all.
+    curved_smoothing: float | str | None
+    #: Curved-only per-layer PCA width cap.  A flat fit's subspace *is* its
+    #: k-dim layout span, so the affine branch hard-sets ``n_components`` and
+    #: ignores any override.
+    max_subspace_dim_override: int | None
+    #: ``auto``-only: the winner's already-factorized RBF plan and Fisher
+    #: bases, carried out of topology scoring so the final layer fit doesn't
+    #: repeat the layout QR/eigh/LU.
+    rbf_plan: Any = None
+    fisher_bases: dict[int, torch.Tensor] = field(default_factory=dict)
+
+
+def _resolve_fit_geometry(
+    mf: Any,
+    *,
+    K: int,
+    fit_layers: Sequence[int],
+    stacks: Mapping[int, torch.Tensor],
+    layer_grams: Mapping[int, torch.Tensor],
+    whitened_rows: Mapping[int, torch.Tensor],
+    whitener: Any,
+    sae_backend: "SaeBackend | None",
+    progress: Callable[[str], None],
+) -> _ResolvedGeometry:
+    """Resolve the fit's geometry — the one step that differs by ``fit_mode``.
+
+    Pure computation over the pooled centroid stacks: no locks, no IO, no
+    publication.  Raises ``ValueError`` when the resolved intrinsic dim needs
+    more nodes than the corpus carries (``k + 1`` to span a flat affine
+    subspace, ``min_nodes(k) = 2k+1`` for a curved RBF surface).
+    """
+    from saklas.core.manifold import (
+        DEFAULT_N_COMPONENTS, CustomDomain, domain_from_spec,
+    )
+    from saklas.core.topology import discover_coords, select_topology
+    from saklas.io.manifolds import min_nodes, sanitize_hyperparams
+
+    discover_metadata: dict[str, Any] = {}
+    # ``max_subspace_dim`` caps the per-layer PCA subspace in the
+    # **curved** fit (``fit_layer_subspace``; default
+    # :data:`DEFAULT_N_COMPONENTS` = 64).  Smaller values constrain the
+    # dim count that ``subspace_inject`` displaces at steer time — finer-
+    # grained steering control at the cost of representing less per-layer
+    # activation variance.  It is a *curved-only* knob: a flat (``pca``)
+    # fit's per-layer subspace is exactly its k-dim layout span (the
+    # affine span *is* the layout), so ``max_subspace_dim`` is not a
+    # ``pca`` hyperparam — the affine branch hard-sets ``n_components`` to
+    # the derived intrinsic dim and ignores any override.  Authored
+    # manifolds don't currently route hyperparams so they inherit 64.
+    max_subspace_dim_override: int | None = None
+    # ``smoothing`` (curved discover only): penalized-RBF λ selection for
+    # the per-layer surface.  ``None`` ⇒ exact interpolation — the authored
+    # contract (node = exact steering target) and the flat ``pca`` path
+    # (no RBF).  A curved ``spectral`` discover fit defaults to GCV
+    # (``"auto"``), trading exactness for a surface that doesn't chase
+    # noise in the per-node centroids.
+    curved_smoothing: float | str | None = None
+
+    # ``effective_fit_mode`` is the *resolved* geometry the per-layer fit
+    # branches on: it equals ``mf.fit_mode`` for authored / pca / spectral,
+    # and the topology ``select_topology`` picks for ``fit_mode="auto"``.
+    effective_fit_mode = mf.fit_mode
+    auto_rbf_plan = None
+    auto_fisher_bases: dict[int, torch.Tensor] = {}
+    if mf.fit_mode == "authored":
+        domain = domain_from_spec(mf.domain)
+        node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
+        node_params = domain.embed(node_coords)
+        method = "manifold_sae" if sae_backend is not None else "manifold_pca"
+    elif mf.fit_mode == "auto":
+        # Auto: pick the discover geometry per-model — flat (pca) vs curved
+        # (spectral) by GCV, plus periodic (BoxDomain) axes via persistent
+        # homology.  ``select_topology`` returns the resolved fit_mode +
+        # coords + domain; the per-layer fit below runs unchanged on the
+        # resolved mode.  Sphere is authored-only (not an auto candidate).
+        st_hyper = sanitize_hyperparams("auto", dict(mf.hyperparams))
+        consensus_gram = torch.stack(
+            [layer_grams[idx] for idx in fit_layers]
+        ).mean(dim=0)
+        progress(
+            f"Selecting topology across {len(fit_layers)} layers "
+            f"({K} centroids)..."
+        )
+        choice = select_topology(
+            {idx: stacks[idx] for idx in fit_layers},
+            {idx: layer_grams[idx] for idx in fit_layers},
+            consensus_gram,
+            whitener=whitener,
+            whitened_rows=whitened_rows,
+            max_dim=int(st_hyper.get("max_dim", 8)),
+            smoothing=st_hyper.get("smoothing", "auto"),
+            persistence_frac=float(st_hyper.get("persistence_frac", 0.5)),
+            score_dim=int(
+                st_hyper.get("max_subspace_dim", DEFAULT_N_COMPONENTS)
+            ),
+        )
+        effective_fit_mode = choice.fit_mode
+        auto_rbf_plan = choice.rbf_plan
+        auto_fisher_bases = choice.fisher_bases
+        domain = choice.domain
+        node_coords = choice.coords
+        node_params = domain.embed(node_coords)
+        k = int(node_coords.shape[1])
+        floor = (k + 1) if effective_fit_mode == "pca" else min_nodes(k)
+        if floor > K:
+            raise ValueError(
+                f"auto manifold {mf.name!r}: resolved topology "
+                f"{choice.winner_name!r} (k={k}) needs >= {floor} nodes, "
+                f"got K={K}"
+            )
+        if effective_fit_mode == "spectral":
+            curved_smoothing = st_hyper.get("smoothing", "auto")
+        method = (
+            "manifold_discover_sae" if sae_backend is not None
+            else "manifold_discover_auto"
+        )
+        discover_metadata = {
+            "fit_mode": "auto",
+            "resolved_fit_mode": effective_fit_mode,
+            "hyperparams": dict(st_hyper),
+            "topology_winner": choice.winner_name,
+            "topology_candidates": [
+                {
+                    "name": c.name,
+                    "fit_mode": c.fit_mode,
+                    "intrinsic_dim": c.intrinsic_dim,
+                    "score": (c.score if math.isfinite(c.score) else None),
+                    "viable": c.viable,
+                    "reason": c.reason,
+                }
+                for c in choice.candidates
+            ],
+        }
+        # Emit the winner's coordinate diagnostics (pca per-component
+        # variance / spectral eigenvalues) so the inspector renders the
+        # same bars a pinned pca/spectral fit does — the auto resolution
+        # otherwise leaves the panel blank.
+        if choice.diagnostics is not None:
+            discover_metadata["diagnostics"] = _diagnostics_to_dict(
+                choice.diagnostics
+            )
+    else:
+        # Discover: derive coords from the per-node centroids, layer-
+        # agnostically — there is no reference layer.  The same coords feed
+        # the per-layer RBF as the manifold's intrinsic coordinates —
+        # wrapped in a ``CustomDomain(k)`` with identity embed so the
+        # existing fit machinery handles them unchanged.
+        # Sanitize against the per-mode whitelist (single source of truth
+        # in ``io.manifolds``) so a stale on-disk ``manifold.json`` carrying
+        # a since-removed key (e.g. the old ``anchor_origin``) can't reach
+        # ``discover_coords`` as an unexpected kwarg.  Author/CLI paths
+        # already sanitize; this guards legacy + hand-edited folders.
+        hyperparams = sanitize_hyperparams(mf.fit_mode, dict(mf.hyperparams))
+        # ``max_subspace_dim`` is consumed by the curved per-layer fit,
+        # not by ``discover_coords`` — pop it before the discover call so
+        # the dispatcher doesn't get an unexpected kwarg.  (Sanitized out
+        # of ``pca`` folders above; the affine branch ignores it regardless
+        # — see the affine fit below.)
+        if "max_subspace_dim" in hyperparams:
+            max_subspace_dim_override = int(hyperparams.pop("max_subspace_dim"))
+        # ``smoothing`` is consumed by the penalized curved fit
+        # (``fit_layer_subspace`` → ``fit_rbf_smoothed``), not by
+        # ``discover_coords`` — pop it before the dispatch so it isn't an
+        # unexpected kwarg.  Only the curved (``spectral``) path has an RBF
+        # surface to smooth; the flat (``pca``) path's affine span has no
+        # interpolant, so smoothing never applies there.
+        if mf.fit_mode == "spectral":
+            curved_smoothing = hyperparams.pop("smoothing", "auto")
+        else:
+            hyperparams.pop("smoothing", None)
+        # Consensus Gram: the mean over every fit layer of that layer's
+        # whitened, node-mean-centered (K, K) Gram ``X̃_L Σ_L⁻¹ X̃_Lᵀ``
+        # (the ``layer_grams`` already computed for the spread profile).
+        # Whitening puts each layer in common (background-σ) units, so the
+        # raw average is **signal-weighted** — a layer where the nodes
+        # aren't separated contributes a near-zero Gram and drops out, while
+        # a layer where the concept is strongly represented dominates.  PCA
+        # eigendecomposes this Gram; spectral reads its pairwise distances.
+        # The (K, K) Gram is the layer-invariant object, so this is exactly
+        # the single-reference-layer derivation generalized to the whole
+        # stack — ``%`` positions and node labels live in one coordinate
+        # system distilled from all layers, wherever the concept's signal
+        # happens to concentrate.
+        progress(
+            f"Deriving {mf.fit_mode} coords across {len(fit_layers)} "
+            f"layers ({K} centroids)..."
+        )
+        consensus_gram = torch.stack(
+            [layer_grams[idx] for idx in fit_layers]
+        ).mean(dim=0)
+        derived_coords, diagnostics = discover_coords(
+            consensus_gram, method=mf.fit_mode, **hyperparams,
+        )
+        k = derived_coords.shape[1]
+        # Node-count floor.  The curved (spectral) path fits an RBF
+        # surface and needs the poisedness floor ``min_nodes(k) = 2k+1``.
+        # The flat (``pca``) path fits an *affine* subspace with no RBF —
+        # it only needs ``k+1`` affinely-independent centroids to span a
+        # k-dim subspace, so a rank-1 (k=1) fit is valid at K=2: that is a
+        # difference-of-means steering vector (ARCHITECTURE §1/§5, "a
+        # vector = a 2-node fit_mode=pca folder").
+        if mf.fit_mode == "pca":
+            floor = k + 1
+            floor_reason = "to span the affine subspace"
+        else:
+            floor = min_nodes(k)
+            floor_reason = "for the RBF fit"
+        if floor > K:
+            raise ValueError(
+                f"discover manifold {mf.name!r}: picked k={k} needs "
+                f">= {floor} nodes {floor_reason}, got K={K}"
+            )
+        # The derived coords come out PCA-mean-centered (origin = the node
+        # centroid).  The per-layer fit below neutral-anchors each layer's
+        # *real* reduced frame (coord 0 = neutral), and the shared display
+        # layout is re-anchored on neutral in step 4a after the fit, so the
+        # display/`%`-authoring origin matches the steer origin.
+        domain = CustomDomain(k)
+        node_coords = derived_coords
+        node_params = derived_coords  # identity embedding
+        method = (
+            "manifold_discover_sae" if sae_backend is not None
+            else f"manifold_discover_{mf.fit_mode}"
+        )
+        # Record what we ran with — fit_mode + hyperparams (with
+        # any derived defaults filled in, e.g. spectral's resolved
+        # ``k_nn``/``bandwidth``) + the diagnostics for the sidecar
+        # and the inspector surfaces.
+        resolved_hyperparams = dict(hyperparams)
+        if max_subspace_dim_override is not None:
+            resolved_hyperparams["max_subspace_dim"] = max_subspace_dim_override
+        if curved_smoothing is not None:
+            resolved_hyperparams["smoothing"] = curved_smoothing
+        if isinstance(diagnostics, SpectralDiagnostics):
+            resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)
+            resolved_hyperparams["bandwidth"] = float(
+                diagnostics.bandwidth,
+            )
+        discover_metadata = {
+            "fit_mode": mf.fit_mode,
+            "hyperparams": resolved_hyperparams,
+            "diagnostics": _diagnostics_to_dict(diagnostics),
+        }
+
+    return _ResolvedGeometry(
+        domain=domain,
+        node_coords=node_coords,
+        node_params=node_params,
+        effective_fit_mode=effective_fit_mode,
+        method=method,
+        discover_metadata=discover_metadata,
+        curved_smoothing=curved_smoothing,
+        max_subspace_dim_override=max_subspace_dim_override,
+        rbf_plan=auto_rbf_plan,
+        fisher_bases=auto_fisher_bases,
+    )
+
+
 class ManifoldExtractionPipeline:
     """Fit an RBF-based steering manifold from an authored corpus.
 
@@ -1268,12 +1610,9 @@ class ManifoldExtractionPipeline:
         the corpus is unchanged.
         """
         from saklas.core.manifold import (
-            DEFAULT_N_COMPONENTS,
-            CustomDomain,
             Manifold,
             compute_manifold_node_stats,
             compute_store_reduced_covariances,
-            domain_from_spec,
             fit_affine_subspace,
             fit_layer_subspace,
             fit_sigma_field,
@@ -1281,11 +1620,9 @@ class ManifoldExtractionPipeline:
             prepare_rbf_fit_plan,
             subspace_share,
         )
-        from saklas.core.topology import discover_coords, neutral_layout_coord
+        from saklas.core.topology import neutral_layout_coord
         from saklas.core.capture import compute_dls_axes
-        from saklas.io.manifolds import (
-            ManifoldFolder, ManifoldSidecar, min_nodes,
-        )
+        from saklas.io.manifolds import ManifoldFolder, ManifoldSidecar
         from saklas.core.errors import SaeCoverageError
         from saklas.core.mahalanobis import WhitenerError
 
@@ -2090,255 +2427,40 @@ class ManifoldExtractionPipeline:
         # it cannot keep aliases alive after the final centroid consumer.
         stacks_cached.clear()
 
-        # 2c. Per-layer whitened between-node spread — the concept's signal
-        #     concentration across the stack.  ``G_L = X̃_L Σ_L⁻¹ X̃_Lᵀ`` is the
-        #     whitened (K, K) Gram of the node-mean-centered centroids;
-        #     ``tr(G_L) = Σ_k ‖x̃_k‖²_M`` is the total whitened node spread at
-        #     layer L, in background-σ² units (whitening makes it comparable
-        #     across layers).  This is a *diagnostic* layer profile — where does
-        #     this concept live? — distinct from the apply-time
-        #     ``mahalanobis_share``, which restricts the same idea to the
-        #     steerable subspace; a layer where ``tr(G_L)`` is large but the
-        #     share is small is one whose fitted subspace is dropping concept
-        #     signal (low explained variance).  The per-layer Grams are also the
-        #     summands of the discover consensus Gram, so the discover branch
-        #     reuses ``layer_grams`` instead of recomputing them.
-        whitened_rows: dict[int, torch.Tensor] = {}
-        layer_grams: dict[int, torch.Tensor] = {}
-        centroid_means: dict[int, torch.Tensor] = {}
-
-        def _whitened_geometry(
-            idx: int,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            # Keep the full K×D temporaries in a short-lived frame; otherwise
-            # the final loop iteration remains bound after the roster clears.
-            raw = stacks[idx].to(torch.float32)
-            centroid_mean = raw.mean(dim=0, keepdim=True)
-            xc = raw - centroid_mean
-            sinv_xc = maha_whitener.apply_inv(idx, xc).to(torch.float32)
-            gram = xc @ sinv_xc.transpose(0, 1)
-            return sinv_xc, 0.5 * (gram + gram.transpose(0, 1)), centroid_mean
-
-        for idx in fit_layers:
-            (
-                whitened_rows[idx], layer_grams[idx], centroid_means[idx],
-            ) = _whitened_geometry(idx)
-        del _whitened_geometry
-        node_spread_per_layer: dict[int, float] = {
-            idx: float(layer_grams[idx].diagonal().sum()) for idx in fit_layers
-        }
+        # 2c. Per-layer whitened between-node geometry, computed once and then
+        #     reused by discovery, topology scoring, the Fisher basis, and the
+        #     neutral-layout anchoring.
+        whitened = _whitened_node_geometry(
+            stacks, fit_layers, whitener=maha_whitener,
+        )
+        whitened_rows = whitened.rows
+        layer_grams = whitened.grams
+        centroid_means = whitened.centroid_means
+        node_spread_per_layer = whitened.node_spread
 
         # 3. Resolve domain + node_params — the only step that differs
         #    between authored and discover paths.
-        discover_metadata: dict[str, Any] = {}
-        # ``max_subspace_dim`` caps the per-layer PCA subspace in the
-        # **curved** fit (``fit_layer_subspace``; default
-        # :data:`DEFAULT_N_COMPONENTS` = 64).  Smaller values constrain the
-        # dim count that ``subspace_inject`` displaces at steer time — finer-
-        # grained steering control at the cost of representing less per-layer
-        # activation variance.  It is a *curved-only* knob: a flat (``pca``)
-        # fit's per-layer subspace is exactly its k-dim layout span (the
-        # affine span *is* the layout), so ``max_subspace_dim`` is not a
-        # ``pca`` hyperparam — the affine branch hard-sets ``n_components`` to
-        # the derived intrinsic dim and ignores any override.  Authored
-        # manifolds don't currently route hyperparams so they inherit 64.
-        max_subspace_dim_override: int | None = None
-        # ``smoothing`` (curved discover only): penalized-RBF λ selection for
-        # the per-layer surface.  ``None`` ⇒ exact interpolation — the authored
-        # contract (node = exact steering target) and the flat ``pca`` path
-        # (no RBF).  A curved ``spectral`` discover fit defaults to GCV
-        # (``"auto"``), trading exactness for a surface that doesn't chase
-        # noise in the per-node centroids.
-        curved_smoothing: float | str | None = None
-
-        # ``effective_fit_mode`` is the *resolved* geometry the per-layer fit
-        # branches on: it equals ``mf.fit_mode`` for authored / pca / spectral,
-        # and the topology ``select_topology`` picks for ``fit_mode="auto"``.
-        effective_fit_mode = mf.fit_mode
-        auto_rbf_plan = None
-        auto_fisher_bases: dict[int, torch.Tensor] = {}
-        if mf.fit_mode == "authored":
-            domain = domain_from_spec(mf.domain)
-            node_coords = torch.tensor(mf.node_coords, dtype=torch.float32)
-            node_params = domain.embed(node_coords)
-            method = "manifold_sae" if sae_backend is not None else "manifold_pca"
-        elif mf.fit_mode == "auto":
-            # Auto: pick the discover geometry per-model — flat (pca) vs curved
-            # (spectral) by GCV, plus periodic (BoxDomain) axes via persistent
-            # homology.  ``select_topology`` returns the resolved fit_mode +
-            # coords + domain; the per-layer fit below runs unchanged on the
-            # resolved mode.  Sphere is authored-only (not an auto candidate).
-            from saklas.io.manifolds import sanitize_hyperparams
-            from saklas.core.topology import select_topology
-            st_hyper = sanitize_hyperparams("auto", dict(mf.hyperparams))
-            consensus_gram = torch.stack(
-                [layer_grams[idx] for idx in fit_layers]
-            ).mean(dim=0)
-            _progress(
-                f"Selecting topology across {len(fit_layers)} layers "
-                f"({K} centroids)..."
-            )
-            choice = select_topology(
-                {idx: stacks[idx] for idx in fit_layers},
-                {idx: layer_grams[idx] for idx in fit_layers},
-                consensus_gram,
-                whitener=maha_whitener,
-                whitened_rows=whitened_rows,
-                max_dim=int(st_hyper.get("max_dim", 8)),
-                smoothing=st_hyper.get("smoothing", "auto"),
-                persistence_frac=float(st_hyper.get("persistence_frac", 0.5)),
-                score_dim=int(
-                    st_hyper.get("max_subspace_dim", DEFAULT_N_COMPONENTS)
-                ),
-            )
-            effective_fit_mode = choice.fit_mode
-            auto_rbf_plan = choice.rbf_plan
-            auto_fisher_bases = choice.fisher_bases
-            domain = choice.domain
-            node_coords = choice.coords
-            node_params = domain.embed(node_coords)
-            k = int(node_coords.shape[1])
-            floor = (k + 1) if effective_fit_mode == "pca" else min_nodes(k)
-            if floor > K:
-                raise ValueError(
-                    f"auto manifold {mf.name!r}: resolved topology "
-                    f"{choice.winner_name!r} (k={k}) needs >= {floor} nodes, "
-                    f"got K={K}"
-                )
-            if effective_fit_mode == "spectral":
-                curved_smoothing = st_hyper.get("smoothing", "auto")
-            method = (
-                "manifold_discover_sae" if sae_backend is not None
-                else "manifold_discover_auto"
-            )
-            discover_metadata = {
-                "fit_mode": "auto",
-                "resolved_fit_mode": effective_fit_mode,
-                "hyperparams": dict(st_hyper),
-                "topology_winner": choice.winner_name,
-                "topology_candidates": [
-                    {
-                        "name": c.name,
-                        "fit_mode": c.fit_mode,
-                        "intrinsic_dim": c.intrinsic_dim,
-                        "score": (c.score if math.isfinite(c.score) else None),
-                        "viable": c.viable,
-                        "reason": c.reason,
-                    }
-                    for c in choice.candidates
-                ],
-            }
-            # Emit the winner's coordinate diagnostics (pca per-component
-            # variance / spectral eigenvalues) so the inspector renders the
-            # same bars a pinned pca/spectral fit does — the auto resolution
-            # otherwise leaves the panel blank.
-            if choice.diagnostics is not None:
-                discover_metadata["diagnostics"] = _diagnostics_to_dict(
-                    choice.diagnostics
-                )
-        else:
-            # Discover: derive coords from the per-node centroids, layer-
-            # agnostically — there is no reference layer.  The same coords feed
-            # the per-layer RBF as the manifold's intrinsic coordinates —
-            # wrapped in a ``CustomDomain(k)`` with identity embed so the
-            # existing fit machinery handles them unchanged.
-            # Sanitize against the per-mode whitelist (single source of truth
-            # in ``io.manifolds``) so a stale on-disk ``manifold.json`` carrying
-            # a since-removed key (e.g. the old ``anchor_origin``) can't reach
-            # ``discover_coords`` as an unexpected kwarg.  Author/CLI paths
-            # already sanitize; this guards legacy + hand-edited folders.
-            from saklas.io.manifolds import sanitize_hyperparams
-            hyperparams = sanitize_hyperparams(mf.fit_mode, dict(mf.hyperparams))
-            # ``max_subspace_dim`` is consumed by the curved per-layer fit,
-            # not by ``discover_coords`` — pop it before the discover call so
-            # the dispatcher doesn't get an unexpected kwarg.  (Sanitized out
-            # of ``pca`` folders above; the affine branch ignores it regardless
-            # — see the affine fit below.)
-            if "max_subspace_dim" in hyperparams:
-                max_subspace_dim_override = int(hyperparams.pop("max_subspace_dim"))
-            # ``smoothing`` is consumed by the penalized curved fit
-            # (``fit_layer_subspace`` → ``fit_rbf_smoothed``), not by
-            # ``discover_coords`` — pop it before the dispatch so it isn't an
-            # unexpected kwarg.  Only the curved (``spectral``) path has an RBF
-            # surface to smooth; the flat (``pca``) path's affine span has no
-            # interpolant, so smoothing never applies there.
-            if mf.fit_mode == "spectral":
-                curved_smoothing = hyperparams.pop("smoothing", "auto")
-            else:
-                hyperparams.pop("smoothing", None)
-            # Consensus Gram: the mean over every fit layer of that layer's
-            # whitened, node-mean-centered (K, K) Gram ``X̃_L Σ_L⁻¹ X̃_Lᵀ``
-            # (the ``layer_grams`` already computed for the spread profile).
-            # Whitening puts each layer in common (background-σ) units, so the
-            # raw average is **signal-weighted** — a layer where the nodes
-            # aren't separated contributes a near-zero Gram and drops out, while
-            # a layer where the concept is strongly represented dominates.  PCA
-            # eigendecomposes this Gram; spectral reads its pairwise distances.
-            # The (K, K) Gram is the layer-invariant object, so this is exactly
-            # the single-reference-layer derivation generalized to the whole
-            # stack — ``%`` positions and node labels live in one coordinate
-            # system distilled from all layers, wherever the concept's signal
-            # happens to concentrate.
-            _progress(
-                f"Deriving {mf.fit_mode} coords across {len(fit_layers)} "
-                f"layers ({K} centroids)..."
-            )
-            consensus_gram = torch.stack(
-                [layer_grams[idx] for idx in fit_layers]
-            ).mean(dim=0)
-            derived_coords, diagnostics = discover_coords(
-                consensus_gram, method=mf.fit_mode, **hyperparams,
-            )
-            k = derived_coords.shape[1]
-            # Node-count floor.  The curved (spectral) path fits an RBF
-            # surface and needs the poisedness floor ``min_nodes(k) = 2k+1``.
-            # The flat (``pca``) path fits an *affine* subspace with no RBF —
-            # it only needs ``k+1`` affinely-independent centroids to span a
-            # k-dim subspace, so a rank-1 (k=1) fit is valid at K=2: that is a
-            # difference-of-means steering vector (ARCHITECTURE §1/§5, "a
-            # vector = a 2-node fit_mode=pca folder").
-            if mf.fit_mode == "pca":
-                floor = k + 1
-                floor_reason = "to span the affine subspace"
-            else:
-                floor = min_nodes(k)
-                floor_reason = "for the RBF fit"
-            if floor > K:
-                raise ValueError(
-                    f"discover manifold {mf.name!r}: picked k={k} needs "
-                    f">= {floor} nodes {floor_reason}, got K={K}"
-                )
-            # The derived coords come out PCA-mean-centered (origin = the node
-            # centroid).  The per-layer fit below neutral-anchors each layer's
-            # *real* reduced frame (coord 0 = neutral), and the shared display
-            # layout is re-anchored on neutral in step 4a after the fit, so the
-            # display/`%`-authoring origin matches the steer origin.
-            domain = CustomDomain(k)
-            node_coords = derived_coords
-            node_params = derived_coords  # identity embedding
-            method = (
-                "manifold_discover_sae" if sae_backend is not None
-                else f"manifold_discover_{mf.fit_mode}"
-            )
-            # Record what we ran with — fit_mode + hyperparams (with
-            # any derived defaults filled in, e.g. spectral's resolved
-            # ``k_nn``/``bandwidth``) + the diagnostics for the sidecar
-            # and the inspector surfaces.
-            resolved_hyperparams = dict(hyperparams)
-            if max_subspace_dim_override is not None:
-                resolved_hyperparams["max_subspace_dim"] = max_subspace_dim_override
-            if curved_smoothing is not None:
-                resolved_hyperparams["smoothing"] = curved_smoothing
-            if isinstance(diagnostics, SpectralDiagnostics):
-                resolved_hyperparams["k_nn"] = int(diagnostics.k_nn)
-                resolved_hyperparams["bandwidth"] = float(
-                    diagnostics.bandwidth,
-                )
-            discover_metadata = {
-                "fit_mode": mf.fit_mode,
-                "hyperparams": resolved_hyperparams,
-                "diagnostics": _diagnostics_to_dict(diagnostics),
-            }
+        geometry = _resolve_fit_geometry(
+            mf,
+            K=K,
+            fit_layers=fit_layers,
+            stacks=stacks,
+            layer_grams=layer_grams,
+            whitened_rows=whitened_rows,
+            whitener=maha_whitener,
+            sae_backend=sae_backend,
+            progress=_progress,
+        )
+        domain = geometry.domain
+        node_coords = geometry.node_coords
+        node_params = geometry.node_params
+        effective_fit_mode = geometry.effective_fit_mode
+        method = geometry.method
+        discover_metadata = geometry.discover_metadata
+        curved_smoothing = geometry.curved_smoothing
+        max_subspace_dim_override = geometry.max_subspace_dim_override
+        auto_rbf_plan = geometry.rbf_plan
+        auto_fisher_bases = geometry.fisher_bases
 
         # 4. Per-layer fit over the centroid stacks built in step 2b (SAE
         #    reconstruction, when set, already folded in there).  The whitener
