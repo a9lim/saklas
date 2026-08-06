@@ -1156,10 +1156,23 @@ def _resolve_load_plan(
     # model_type is itself in _LAYER_ACCESSORS (gemma3/gemma4): the full
     # multimodal model is still usable when handed to SaklasSession
     # directly, but the from_pretrained path prefers text-only.
-    extract_text_model = (
+    #
+    # Under bitsandbytes quantization the extraction path is skipped: its
+    # shard streamer copies raw weights into a ``from_config`` skeleton and
+    # cannot apply a quantizer, so it would silently produce an unquantized
+    # model stamped as quantized. The standard ``from_pretrained`` path
+    # quantizes the full multimodal model correctly (quantize survives only
+    # on CUDA, where the unified-memory discipline is moot).
+    text_extractable = (
         text_cfg is not None
         and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
     )
+    extract_text_model = text_extractable and quantize is None
+    if text_extractable and quantize is not None:
+        log.info(
+            "quantization requested; loading the full multimodal model "
+            "(the text-extraction path cannot quantize)",
+        )
 
     return LoadPlan(
         model_id=model_id,
@@ -1233,6 +1246,22 @@ def _materialize_model(plan: LoadPlan) -> Any:
     try:
         return _load_with_fallbacks(plan)
     except (RuntimeError, ValueError) as e:
+        if (
+            isinstance(e, ValueError)
+            and plan.quantize is not None
+            and text_cfg is not None
+            and getattr(text_cfg, "model_type", None) in _LAYER_ACCESSORS
+            and "Unrecognized configuration class" in str(e)
+        ):
+            # A composite AutoModelForCausalLM cannot load (Ministral-as-
+            # Mistral3) and the only working route — text extraction — cannot
+            # quantize.  Fail with the actionable cause, not HF's registry
+            # error.
+            raise RuntimeError(
+                f"{plan.model_id!r} is a multimodal checkpoint saklas can "
+                "only load through the text-extraction path, which does not "
+                "support bitsandbytes quantization; load without quantize=."
+            ) from e
         if plan.device in ("cuda", "cpu") or "CONVERSION" not in str(e):
             raise
         log.info("weight conversion failed on %s, retrying on CPU", plan.device)

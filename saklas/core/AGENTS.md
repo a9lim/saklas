@@ -22,7 +22,10 @@ cascades over attention implementation (SDPA → eager), dtype, and device.
 `_compile_with_probe` wraps `torch.compile` with a prefill+decode warmup so an
 inductor/Triton failure surfaces at load as a caught warning plus eager
 fallback. `_load_text_from_multimodal` extracts a text-only sub-model
-(Ministral-as-Mistral3), strips `language_model.` prefixes, and dequantizes FP8.
+(Ministral-as-Mistral3), strips `language_model.` prefixes, and dequantizes FP8;
+under bitsandbytes quantization the extraction path is skipped (the streamer
+copies raw weights and cannot quantize) in favor of the standard quantized
+full-model load.
 `patch_torch_for_mps()` installs two lazy MPS-only workarounds (`torch.histc`
 integer→float for MoE routing; `torch.ldexp` MXFP4 round-trip through CPU
 honoring `out=`).

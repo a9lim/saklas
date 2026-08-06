@@ -606,8 +606,11 @@ def test_source_fingerprint_recompute_matches_stamp_multimodal(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def _routing_calls(cfg: _FakeConfig, *, extractor_raises: bool = False):
-    """Run load_model on CPU with a mocked stack; return
+def _routing_calls(
+    cfg: _FakeConfig, *, extractor_raises: bool = False,
+    device: str = "cpu", quantize: str | None = None,
+):
+    """Run load_model with a mocked stack; return
     ``(text_extractor_called, from_pretrained_called)``."""
     fp_called = {"v": False}
 
@@ -630,7 +633,7 @@ def _routing_calls(cfg: _FakeConfig, *, extractor_raises: bool = False):
         mock_tok.from_pretrained.return_value = SimpleNamespace()
         mock_cfg.from_pretrained.return_value = cfg
         mock_model.from_pretrained.side_effect = _fake_from_pretrained
-        model_mod.load_model("fake/repo", device="cpu")
+        model_mod.load_model("fake/repo", device=device, quantize=quantize)
 
     return mock_extract.called, fp_called["v"]
 
@@ -680,6 +683,52 @@ def test_plain_text_model_uses_standard_load():
     extractor_called, from_pretrained_called = _routing_calls(cfg)
     assert not extractor_called
     assert from_pretrained_called
+
+
+def test_quantized_multimodal_routes_to_standard_full_load():
+    """Under bitsandbytes quantization the text-extraction path must be
+    skipped — its shard streamer copies raw weights and cannot quantize, so
+    routing through it would silently produce an unquantized model stamped
+    as quantized.  The standard from_pretrained quantizes the full model."""
+    cfg = _FakeConfig(model_type="gemma4", text_model_type="gemma4_text")
+    extractor_called, from_pretrained_called = _routing_calls(
+        cfg, device="cuda", quantize="4bit",
+    )
+    assert not extractor_called, (
+        "quantized loads must not take the text-extraction path"
+    )
+    assert from_pretrained_called
+
+
+def test_quantized_multimodal_without_standard_route_raises_actionable():
+    """Ministral-as-Mistral3 + quantize: the composite is not registered with
+    AutoModelForCausalLM, and the only working route — text extraction —
+    cannot quantize.  HF's registry error must be rewrapped with the
+    actionable cause."""
+    cfg = _FakeConfig(model_type="mistral3", text_model_type="mistral")
+
+    def _registry_error(model_id: str, **kwargs: Any):
+        raise ValueError(
+            "Unrecognized configuration class <class 'Mistral3Config'> for "
+            "this kind of AutoModel: AutoModelForCausalLM."
+        )
+
+    with (
+        patch.object(model_mod, "AutoTokenizer") as mock_tok,
+        patch.object(model_mod, "AutoConfig") as mock_cfg,
+        patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
+        patch.object(model_mod, "_load_text_from_multimodal") as mock_extract,
+    ):
+        mock_tok.from_pretrained.return_value = SimpleNamespace()
+        mock_cfg.from_pretrained.return_value = cfg
+        mock_model.from_pretrained.side_effect = _registry_error
+        with pytest.raises(
+            RuntimeError, match="does not support bitsandbytes",
+        ):
+            model_mod.load_model(
+                "fake/ministral", device="cuda", quantize="4bit",
+            )
+    assert not mock_extract.called
 
 
 def test_load_model_falls_back_to_full_load_on_no_text_weights():
@@ -758,6 +807,19 @@ def test_plan_drops_quantization_off_cuda():
     assert plan.quantize is None
     assert "quantization_config" not in plan.load_kwargs
     assert plan.load_kwargs["dtype"] is plan.dtype
+
+
+def test_plan_quantize_skips_text_extraction():
+    """Quantization flips a text-extractable composite onto the standard
+    quantized full-model path — the extraction streamer cannot quantize."""
+    cfg = _FakeConfig("gemma3", text_model_type="gemma3_text")
+    plan = _plan(cfg, device="cuda", quantize="4bit")
+    assert plan.extract_text_model is False
+    assert "quantization_config" in plan.load_kwargs
+
+    # Unquantized on the same config still prefers extraction.
+    plan = _plan(cfg, device="cuda")
+    assert plan.extract_text_model is True
 
 
 def test_plan_pins_the_resolved_revision():
