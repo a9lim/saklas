@@ -2040,10 +2040,10 @@ def test_fit_sae_no_coverage_raises_before_pooling(
 
     def _explode(*_a: Any, **_k: Any) -> None:
         raise AssertionError(
-            "compute_node_centroid called before SAE-coverage check"
+            "compute_manifold_node_stats called before SAE-coverage check"
         )
 
-    monkeypatch.setattr(M, "compute_node_centroid", _explode)
+    monkeypatch.setattr(M, "compute_manifold_node_stats", _explode)
 
     with pytest.raises(SaeCoverageError, match="covers no layers"):
         ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder, sae=sae)
@@ -2269,15 +2269,20 @@ def test_discover_cache_hit_skips_forward_passes(
 ) -> None:
     """A second fit with unchanged inputs short-circuits to the cached tensor."""
     folder = _discover_folder(tmp_path, fit_mode="pca")
-    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    # One handle for both fits: the cache identity folds in the loaded-model
+    # fingerprint, and a fresh ``_Handle`` re-initializes its stub module, so
+    # two handles are legitimately different models.
+    handle = _Handle()
+    ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
 
-    # Patch the centroid pooler to crash if called — cache hit must skip it.
+    # Patch the fit-wide capture pass to crash if called — a cache hit must
+    # never reach a model forward.
     def _explode(*_a: Any, **_k: Any) -> None:
-        raise AssertionError("compute_node_centroid called on cache hit")
+        raise AssertionError("compute_manifold_node_stats called on cache hit")
     from saklas.core import manifold as M
-    monkeypatch.setattr(M, "compute_node_centroid", _explode)
+    monkeypatch.setattr(M, "compute_manifold_node_stats", _explode)
 
-    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    manifold = ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
     assert manifold.name == "personas"
 
 

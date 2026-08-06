@@ -208,10 +208,10 @@ class ManifoldTerm:
     - ``onto`` — collapse the off-manifold, in-subspace residual onto the
       surface (vacuous when the surface fills its subspace).
 
-    The off-*subspace* residual is always kept verbatim; the old third op
-    (``toward``) is removed — its ``~`` / ``|`` semantics are recovered by
-    routing those operators into the merged affine subspace as push/ablation
-    axes instead.
+    The off-*subspace* residual is always kept verbatim, which is what lets a
+    manifold term compose with neighbors at zero cross-talk; ``~`` / ``|``
+    semantics live inside the subspace, as push/ablation axes of the merged
+    affine basis.
 
     The grammar's coefficient slot expands to a comma-run of ≤ 2: one coeff
     ⇒ ``along`` (``onto`` off); two ⇒ ``along, onto``.  ``manifold`` is the

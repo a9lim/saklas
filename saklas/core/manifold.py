@@ -1914,7 +1914,7 @@ class Manifold:
     # (``someone {label}`` vs ``{label}``) when authoring a node's
     # conversational corpus.  It does NOT feed the fit — extraction pools in
     # standard-assistant space (swap-back) regardless — so it is carried for
-    # provenance / regeneration, not consumed by ``compute_node_centroid``.
+    # provenance / regeneration, not consumed by the fit-time capture pass.
     node_kinds: list[str | None] = field(default_factory=_OmittedNodeRoster)
     # Per-layer Mahalanobis share weight recorded at fit time —
     # ``share_L = ‖Bᵀ coords_k‖_M`` summed over
@@ -2447,15 +2447,9 @@ def synthesize_subspace(
       uses a positive magnitude proxy because gain compensation makes the
       resulting collapse independent of cross-layer share normalization.
 
-    **Whitened normalization (``whitener`` given).**  The push magnitude used to
-    be the *raw-Euclidean* node displacement ``‖Δ_L‖₂``, which is not a
-    scale-stable steering unit: it is the un-whitened (rogue-dominated) distance
-    from neutral to the target node, and it spans ~100× across targets purely by
-    where each centroid happens to sit (a tight bipolar pole sits ~0.3 from
-    neutral, a far persona centroid ~17), so a single ``along`` gain over-pushed
-    far nodes into incoherence and left near ones doing nothing.  When the
-    ``whitener`` covers every synthesized layer the push is instead normalized in
-    the Mahalanobis metric ``M_R = B Σ⁻¹ Bᵀ`` (the engine-wide read/fit metric):
+    **Whitened normalization (Mahalanobis-only).**  ``whitener`` is required and
+    must cover every synthesized layer; the push is normalized in the Mahalanobis
+    metric ``M_R = B Σ⁻¹ Bᵀ`` (the engine-wide read/fit metric):
 
     - ``share = ‖Δ‖_M`` (whitened displacement) — the cross-layer profile weights
       by *whitened* signal, matching the baked ``mahalanobis_share`` rather than
@@ -2467,11 +2461,12 @@ def synthesize_subspace(
       calibration changes), it is just measured in std-units instead of the
       raw-Euclidean scale.  Every target then receives one uniform whitened
       budget (``Σ_L eff_along_L = gain·n_layers``), distributed across layers by
-      where its signal lives; ``along`` becomes a scale-stable strength knob.
+      where its signal lives; ``along`` is a scale-stable strength knob.
 
-    This is all-or-nothing (Mahalanobis-only): missing neutral means or partial
-    whitener coverage raise before synthesis, so a cross-layer profile can
-    never mix metrics. ``share`` carries the per-layer magnitude and ``target``
+    The metric gate is all-or-nothing: missing neutral means or partial whitener
+    coverage raise :class:`~saklas.core.mahalanobis.WhitenerError` before
+    synthesis, so a cross-layer profile can never mix metrics and there is no
+    Euclidean path.  ``share`` carries the per-layer magnitude and ``target``
     carries only the whitened-unit direction.
 
     The strengths live in ``target`` (per-axis), not in a single ``along`` — the
@@ -2496,7 +2491,7 @@ def synthesize_subspace(
             f"steering synthesis requires neutral means for every layer; "
             f"missing {missing_means}"
         )
-    if whitener is None or not whitener.covers_all(present_layers):
+    if not whitener.covers_all(present_layers):
         raise WhitenerError(
             "steering synthesis requires a Mahalanobis whitener covering "
             f"every layer {present_layers}"
@@ -2669,12 +2664,11 @@ def _soft_norm_cap(
     The scale is ``min(1, norm_cap·‖h‖ / ‖h_new‖)`` expressed as a single
     ``clamp(max=1.0)`` on the ratio — when ``‖h_new‖ ≤ cap`` the ratio is ``≥1``
     and clamps to a no-op ``1``; when it overshoots, the ratio is the shrink
-    factor ``cap/‖h_new‖``.  This is identical to the old
-    ``where(post > cap, cap/post, 1)`` form on every non-degenerate ``h`` but
-    skips both the full-width ``torch.ones_like`` temporary *and* the
-    ``torch.where`` select the guard used to allocate every fire (only the
-    all-zero-``h`` corner differs — scale 0 vs 1 — and there ``h_new ≈ 0`` so
-    the product is ``0`` either way)."""
+    factor ``cap/‖h_new‖``.  The clamp form is deliberate: a
+    ``where(post > cap, cap/post, 1)`` select would allocate a full-width
+    ``ones_like`` temporary every fire.  The two forms agree on every
+    non-degenerate ``h`` (they differ only at all-zero ``h`` — scale 0 vs 1 —
+    where ``h_new ≈ 0`` makes the product ``0`` either way)."""
     norm_pre = torch.linalg.vector_norm(h_f32, dim=-1, keepdim=True)
     norm_post = torch.linalg.vector_norm(h_new, dim=-1, keepdim=True)
     scale = (
@@ -2736,16 +2730,15 @@ def _frame_rotation_transport(
     The rotation maps ``span(j_old) → span(j_new)`` (and hence their normal
     complements) by rotating each pair of principal vectors ``aᵢ → bᵢ`` in its
     own plane, identity on the orthogonal complement of both frames.  Two
-    properties this guarantees, which the former project-onto-normal + renorm
-    violated:
+    load-bearing guarantees follow:
 
     - **Identity at rest.**  When the foot doesn't move (``p_new == p``, i.e.
       ``along == 0``) the frames coincide, every principal angle is 0, and the
       rotation is *exactly* the identity — so ``subspace_inject`` returns its
-      input untouched regardless of foot-solve accuracy.  (The old code
-      reprojected ``Hn`` onto the normal space every fire, corrupting any
-      off-neutral activation by the residual's tangential part — which never
-      vanishes at an approximate foot — independent of the slide.)
+      input untouched regardless of foot-solve accuracy.  Anything that
+      reprojects ``Hn`` onto the normal space instead corrupts an off-neutral
+      activation by the residual's tangential part, which never vanishes at an
+      approximate foot; the guarantee is why this is a rotation.
     - **No information loss.**  A rotation preserves ``‖Hn‖`` and discards no
       component; the residual's full content rides the frame as it turns.
 
@@ -2824,7 +2817,7 @@ def subspace_inject(
     origin: "torch.Tensor | None" = None,
     kappa: "float | torch.Tensor" = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The unified two-operation manifold injection (replaces angular/additive).
+    """The unified two-operation manifold injection — saklas's one steering kernel.
 
     Decomposes ``h = mean + H_m + H_n + H_o`` against the layer's affine
     subspace and its RBF surface ``M``, then applies two near-orthogonal
@@ -2841,11 +2834,9 @@ def subspace_inject(
       rotation between the two tangent subspaces
       (:func:`_frame_rotation_transport`) — *exactly* the identity when the foot
       didn't move, so the curved path is identity at ``along == 0`` regardless of
-      foot-solve accuracy; norm-preserving and lossless (the former
-      project-onto-normal + renorm discarded the residual's tangential part every
-      fire, corrupting any off-neutral activation independent of the slide).
-      Tangential / directional; leaves ``H_o`` untouched.  By moving *on the
-      surface* it never cuts through the off-manifold low-density region.
+      foot-solve accuracy; norm-preserving and lossless.  Tangential /
+      directional; leaves ``H_o`` untouched.  By moving *on the surface* it never
+      cuts through the off-manifold low-density region.
 
     ``origin`` is the neutral foot — the translate reference; it is coord 0 for
     an affine fit, so the affine path ignores it.  ``kappa`` is the per-axis
@@ -2863,12 +2854,11 @@ def subspace_inject(
       expanding a residual already inside the tube.  Vacuous when the surface
       fills its subspace (``H_n ≈ 0``, every affine term).
 
-    The off-*subspace* residual ``H_o`` is **always kept verbatim** — the old
-    third op (``toward``, which scaled ``H_o``) is removed.  It scaled the
-    orthogonal complement of *this* subspace, i.e. every composing neighbor's
-    span, so it broke orthogonal composition and never cohered as a knob; the
-    R-dim ``~``/``|`` semantics are recovered by routing those operators into the
-    merged affine subspace as push/ablation axes instead.
+    The off-*subspace* residual ``H_o`` is **always kept verbatim**.  That is the
+    composition invariant: ``H_o`` is the orthogonal complement of *this*
+    subspace, i.e. every composing neighbor's span, so touching it would couple
+    otherwise-orthogonal terms.  ``~``/``|`` semantics live inside the subspace
+    instead, as push/ablation axes of the merged affine basis.
 
     All subspace arithmetic runs in **reduced (R-dim) coordinates**; because
     ``basis`` is orthonormal, ``‖H_n_reduced‖ = ‖H_n‖`` exactly, so the
@@ -3001,17 +2991,17 @@ def subspace_inject(
         Hn_trans = _frame_rotation_transport(Hn_red, j_old, j_new)  # (.., R)
 
     # --- ONTO: collapse the transported off-manifold residual toward the tube ---
-    # Legacy (zero-thickness wire, σ-field absent): scale ``H_n`` by ``(1 − o)``
-    # — at ``o = 1`` the activation lands *on* the mean surface.  Fuzzy
-    # (σ-field present): shrink ``‖H_n‖`` toward the local within-node thickness
-    # ``σ(z)`` instead of toward 0, so ``o = 1`` lands one-σ off the wire (the
-    # surface's *typical set*, a sample-like point) rather than on the idealized
-    # centroid — the within-concept variety the hard collapse erases is exactly
-    # what drives the strong-push mode-collapse the open-frontier note flags.
-    # The residual *direction* is preserved (only its magnitude is rescaled),
-    # and a token already inside the tube (``‖H_n‖ ≤ σ``) is never *expanded*
-    # (the ``(·)_+`` clamp).  ``σ(z) = 0`` ⇒ ``shrink = (1)_+ = 1`` ⇒ the exact
-    # ``(1 − o)`` legacy collapse.
+    # Zero-thickness wire (σ-field absent — flat/SAE fits, which carry no tube):
+    # scale ``H_n`` by ``(1 − o)`` — at ``o = 1`` the activation lands *on* the
+    # mean surface.  Fuzzy (σ-field present): shrink ``‖H_n‖`` toward the local
+    # within-node thickness ``σ(z)`` instead of toward 0, so ``o = 1`` lands
+    # one-σ off the wire (the surface's *typical set*, a sample-like point)
+    # rather than on the idealized centroid — the within-concept variety a hard
+    # collapse erases is exactly what drives the strong-push mode-collapse the
+    # open-frontier note flags.  The residual *direction* is preserved (only its
+    # magnitude is rescaled), and a token already inside the tube
+    # (``‖H_n‖ ≤ σ``) is never *expanded* (the ``(·)_+`` clamp).  ``σ(z) = 0``
+    # ⇒ ``shrink = (1)_+ = 1`` ⇒ exactly the zero-thickness ``(1 − o)`` collapse.
     if onto_zero:
         Hn_final = Hn_trans
     else:
@@ -3242,6 +3232,43 @@ def _knn_adjacency(
     return mask, neighbor_dists
 
 
+class _DSU:
+    """Disjoint-set forest with path halving over the node ids ``0..n-1``.
+
+    The single union-find behind every graph reduction in the topology
+    block: connected-component counting on a k-NN adjacency mask, the H0
+    (edge) half of the Vietoris-Rips boundary reduction, and the Kruskal
+    MST that fixes the persistence connectivity scale ``ε_c``.  Node counts
+    are tens to hundreds, so path halving alone is ample — no rank/size
+    balancing, matching what each hand-rolled copy did.
+    """
+
+    __slots__ = ("_parent",)
+
+    def __init__(self, n: int) -> None:
+        self._parent = list(range(n))
+
+    def find(self, x: int) -> int:
+        parent = self._parent
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> bool:
+        """Merge the sets holding ``a`` and ``b``; True iff they differed.
+
+        The boolean is the H0 signal both persistence callers need: True
+        means the edge was a tree edge (it killed a component), False means
+        both endpoints were already joined (the edge births a 1-cycle).
+        """
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        self._parent[ra] = rb
+        return True
+
+
 def _connected_components(mask: torch.Tensor) -> int:
     """Number of connected components in an undirected adjacency mask.
 
@@ -3251,24 +3278,12 @@ def _connected_components(mask: torch.Tensor) -> int:
     tolerance choice.
     """
     K = mask.shape[0]
-    parent = list(range(K))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
+    dsu = _DSU(K)
     # Only need the upper triangle since the mask is symmetric.
     rows, cols = mask.triu(diagonal=1).nonzero(as_tuple=True)
     for r, c in zip(rows.tolist(), cols.tolist(), strict=True):
-        union(r, c)
-    return len({find(i) for i in range(K)})
+        dsu.union(r, c)
+    return len({dsu.find(i) for i in range(K)})
 
 
 def _laplacian_eigen(
@@ -3761,21 +3776,12 @@ def _rips_h1_persistence(
     # Reduction.  Vertices and edges first (H0); their positive (cycle-creating)
     # edges are found by union-find — equivalent to reducing the edge columns
     # over vertex rows, and cheaper.
-    parent = list(range(K))
-
-    def find(a: int) -> int:
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
+    dsu = _DSU(K)
     positive_edges: set[int] = set()  # edge filtration indices that create a 1-cycle
     for x in range(E):
-        ri, rj = find(ei[x]), find(ej[x])
-        if ri != rj:
-            parent[ri] = rj      # tree edge — kills an H0 component
-        else:
-            positive_edges.add(x)  # both endpoints already joined — births a loop
+        # A tree edge kills an H0 component; a redundant edge births a loop.
+        if not dsu.union(ei[x], ej[x]):
+            positive_edges.add(x)
 
     # H1 deaths: reduce triangle columns over edge rows (global edge indices, so
     # the pivot respects filtration order).  A reduced low on a positive edge
@@ -3847,21 +3853,12 @@ def _count_persistent_loops(
     iu = torch.triu_indices(K, K, offset=1)
     lens = distances[iu[0], iu[1]]
     order = torch.argsort(lens)
-    parent = list(range(K))
-
-    def find(a: int) -> int:
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
+    dsu = _DSU(K)
     eps_c = 0.0
     joined = 0
     src, dst = iu[0].tolist(), iu[1].tolist()
     for o in order.tolist():
-        ra, rb = find(src[o]), find(dst[o])
-        if ra != rb:
-            parent[ra] = rb
+        if dsu.union(src[o], dst[o]):
             eps_c = float(lens[o].item())
             joined += 1
             if joined == K - 1:
@@ -4349,156 +4346,6 @@ def select_topology(
 
 # ------------------------------------------------------ centroid capture ---
 
-def compute_node_centroid(
-    model: torch.nn.Module,
-    tokenizer: object,
-    layers: torch.nn.ModuleList,
-    device: torch.device,
-    responses: list[str],
-    prompts: "list[str] | list[list[dict[str, str]]]",
-    *,
-    role: str | None = None,
-    model_type: str | None = None,
-    layer_indices: Sequence[int] | None = None,
-) -> dict[int, torch.Tensor]:
-    """Mean per-layer pooled activation over a manifold node's responses.
-
-    Conversational (4.0 / A2) pooling: a node corpus is a list of in-character
-    *responses* to the shared baseline *prompts*, aligned positionally as
-    ``responses[i] -> prompts[i % len(prompts)]``.  Each is captured as a
-    ``[system: length directive, user: prompt, assistant: response]`` turn
-    (the shared brevity directive only -- *not* the generation-time persona --
-    standard label) via :func:`saklas.core.capture._encode_and_capture_all`,
-    matching the framing the corpus was generated under so it isn't
-    out-of-distribution and cancels as common-mode against the neutral baseline.
-    Same last-content-token, fp32 pooling discipline that backs
-    :func:`saklas.core.capture.compute_neutral_activations`, with the same MPS
-    ``empty_cache`` discipline between forward passes.
-
-    ``role`` (optional): substitute a custom assistant-role label into the
-    chat template via :func:`saklas.core.role_templates.apply_with_role`, so
-    the pooled centroid lives in persona-baseline activation space instead of
-    the standard assistant (swap-back) baseline.  Requires ``model_type``.
-    ``role=None`` is the swap-back default.
-
-    ``layer_indices`` narrows capture to a subset; ``None`` captures every layer.
-    Returns ``{layer_idx: centroid (D,)}`` in fp32 on CPU.
-    """
-    from saklas.core.capture import _CAPTURE_BATCH, _encode_and_capture_all_batch
-
-    if not responses:
-        raise ValueError("manifold node has no responses")
-    if not prompts:
-        raise ValueError("conversational capture needs at least one baseline prompt")
-    k = len(prompts)
-    if len(responses) % k != 0:
-        raise ValueError(
-            f"node corpus ({len(responses)} responses) must be a multiple of "
-            f"the baseline prompt set ({k}); responses align response[i] -> "
-            f"prompt[i % k]"
-        )
-
-    capture_layers = (
-        list(range(len(layers)))
-        if layer_indices is None
-        else [int(idx) for idx in layer_indices]
-    )
-    sums: dict[int, torch.Tensor] = {}
-    is_mps = getattr(device, "type", None) == "mps"
-    n = len(responses)
-    # Each response pairs with ``prompts[i % k]`` (the A2 round-robin alignment);
-    # capture is batched in chunks of ``_CAPTURE_BATCH`` (one forward per chunk,
-    # MPS flush amortized) and reduced to a running per-layer sum, so peak memory
-    # is one chunk's pooled ``(B, D)`` per layer rather than the whole corpus.
-    aligned_prompts = [prompts[i % k] for i in range(n)]
-
-    for start in range(0, n, _CAPTURE_BATCH):
-        end = min(start + _CAPTURE_BATCH, n)
-        per_layer = _encode_and_capture_all_batch(
-            model, tokenizer,
-            aligned_prompts[start:end], responses[start:end],
-            layers, device, role=role, model_type=model_type,
-            layer_indices=capture_layers,
-        )
-        for idx in capture_layers:
-            chunk_sum = per_layer[idx].detach().sum(dim=0).to("cpu", torch.float32)
-            if idx in sums:
-                sums[idx] += chunk_sum
-            else:
-                sums[idx] = chunk_sum
-        del per_layer
-        if is_mps:
-            torch.mps.empty_cache()
-
-    return {idx: sums[idx] / n for idx in capture_layers}
-
-
-def compute_node_activation_rows(
-    model: torch.nn.Module,
-    tokenizer: object,
-    layers: torch.nn.ModuleList,
-    device: torch.device,
-    responses: list[str],
-    prompts: "list[str] | list[list[dict[str, str]]]",
-    *,
-    role: str | None = None,
-    model_type: str | None = None,
-    layer_indices: Sequence[int] | None = None,
-) -> dict[int, torch.Tensor]:
-    """Per-response pooled activations for one node, fp32 on CPU.
-
-    This is the row-retaining sibling of :func:`compute_node_centroid`: same
-    conversational rendering, batching, last-content pooling, role handling, and
-    MPS cache discipline, but it returns ``{layer: (N, D)}`` instead of reducing
-    to a centroid.  Curved raw manifold fits use it to derive both centroids and
-    the fuzzy-manifold σ-field from one capture pass.
-    """
-    from saklas.core.capture import _CAPTURE_BATCH, _encode_and_capture_all_batch
-
-    if not responses:
-        raise ValueError("manifold node has no responses")
-    if not prompts:
-        raise ValueError("conversational capture needs at least one baseline prompt")
-    k = len(prompts)
-    if len(responses) % k != 0:
-        raise ValueError(
-            f"node corpus ({len(responses)} responses) must be a multiple of "
-            f"the baseline prompt set ({k}); responses align response[i] -> "
-            f"prompt[i % k]"
-        )
-
-    capture_layers = (
-        list(range(len(layers)))
-        if layer_indices is None
-        else [int(idx) for idx in layer_indices]
-    )
-    rows_by_layer: dict[int, torch.Tensor] = {}
-    is_mps = getattr(device, "type", None) == "mps"
-    n = len(responses)
-    aligned_prompts = [prompts[i % k] for i in range(n)]
-
-    for start in range(0, n, _CAPTURE_BATCH):
-        end = min(start + _CAPTURE_BATCH, n)
-        per_layer = _encode_and_capture_all_batch(
-            model, tokenizer,
-            aligned_prompts[start:end], responses[start:end],
-            layers, device, role=role, model_type=model_type,
-            layer_indices=capture_layers,
-        )
-        for idx in capture_layers:
-            chunk = per_layer[idx].detach().to("cpu", torch.float32)
-            if idx not in rows_by_layer:
-                rows_by_layer[idx] = torch.empty(
-                    n, chunk.shape[1], dtype=torch.float32,
-                )
-            rows_by_layer[idx][start:end].copy_(chunk)
-        del per_layer
-        if is_mps:
-            torch.mps.empty_cache()
-
-    return rows_by_layer
-
-
 def compute_manifold_node_stats(
     model: torch.nn.Module,
     tokenizer: object,
@@ -4675,9 +4522,14 @@ def compute_node_reduced_covariance_from_rows(
 ) -> dict[int, torch.Tensor]:
     """Within-node reduced covariance from retained pooled activations.
 
-    ``activation_rows`` must carry the same ``{layer: (N, D)}`` rows returned by
-    :func:`compute_node_activation_rows`.  The result is identical to
-    :func:`compute_node_reduced_covariance` without re-running the model.
+    ``activation_rows`` carries one node's ``{layer: (N, D)}`` pooled rows —
+    the per-response activations :func:`compute_manifold_node_stats` retains
+    when ``retain_rows=True``.  Projects them through each fitted layer's
+    affine frame (``Z = (h − mean) · basisᵀ``) and returns the sample
+    covariance ``{layer: (R, R)}`` (``N − 1`` denominator; zeros for a
+    single-sample node).  The standalone sibling of
+    :func:`compute_store_reduced_covariances`, which streams the same math
+    over a whole disk-backed roster.
     """
     covs: dict[int, torch.Tensor] = {}
     for idx, sub in layer_subs.items():
@@ -4755,97 +4607,6 @@ def compute_store_reduced_covariances(
                 cov = centered.transpose(0, 1) @ centered / float(size - 1)
             out[k][idx] = cov
     return out
-
-
-def compute_node_reduced_covariance(
-    model: torch.nn.Module,
-    tokenizer: object,
-    layers: torch.nn.ModuleList,
-    device: torch.device,
-    responses: list[str],
-    prompts: "list[str] | list[list[dict[str, str]]]",
-    layer_subs: "dict[int, LayerSubspace]",
-    *,
-    role: str | None = None,
-    model_type: str | None = None,
-) -> dict[int, torch.Tensor]:
-    """Within-node **reduced** covariance ``(R, R)`` per layer for one node.
-
-    The fuzzy-manifold fallback pass (curved fits only).  Re-captures the node's
-    corpus exactly as :func:`compute_node_centroid` does — same conversational
-    ``[directive, prompt, response]`` framing, same last-content-token fp32
-    pooling — but instead of pooling to the centroid it projects every sample
-    through each fitted layer's affine frame
-    (``Z = (h − mean) · basisᵀ``, ``(B, R)``) and accumulates the reduced
-    first/second moments, returning ``{layer: cov (R, R)}`` (sample covariance,
-    ``count − 1`` denominator; zeros for a single-sample node).
-
-    This needs the per-layer ``mean``/``basis`` (hence ``layer_subs``), which
-    only exist *after* the surface fit.  When the extraction pipeline already
-    retained first-pass activation rows it uses
-    :func:`compute_node_reduced_covariance_from_rows` instead; this function is
-    the low-memory fallback for paths that did not retain them (notably
-    auto-topology fits that resolved curved after centroid pooling).  The
-    off-surface reduction of these covariances into per-node ``σ`` lives in the
-    extraction pipeline.  fp32 on CPU, same MPS ``empty_cache`` discipline.
-    """
-    from saklas.core.capture import _CAPTURE_BATCH, _encode_and_capture_all_batch
-
-    if not responses:
-        raise ValueError("manifold node has no responses")
-    if not prompts:
-        raise ValueError("conversational capture needs at least one baseline prompt")
-    k = len(prompts)
-    if len(responses) % k != 0:
-        raise ValueError(
-            f"node corpus ({len(responses)} responses) must be a multiple of "
-            f"the baseline prompt set ({k})"
-        )
-    is_mps = getattr(device, "type", None) == "mps"
-    n = len(responses)
-    aligned_prompts = [prompts[i % k] for i in range(n)]
-
-    # Per-layer reduced accumulators: count, Σz (R,), Σ z zᵀ (R, R).
-    sum_z: dict[int, torch.Tensor] = {}
-    sum_zz: dict[int, torch.Tensor] = {}
-    means_basis = {
-        idx: (sub.mean.to(torch.float32), sub.basis.to(torch.float32))
-        for idx, sub in layer_subs.items()
-    }
-
-    for start in range(0, n, _CAPTURE_BATCH):
-        end = min(start + _CAPTURE_BATCH, n)
-        per_layer = _encode_and_capture_all_batch(
-            model, tokenizer,
-            aligned_prompts[start:end], responses[start:end],
-            layers, device, role=role, model_type=model_type,
-            layer_indices=sorted(layer_subs),
-        )
-        for idx, (mean, basis) in means_basis.items():
-            h = per_layer[idx].detach().to("cpu", torch.float32)  # (B, D)
-            z = (h - mean) @ basis.T                              # (B, R)
-            sz = z.sum(dim=0)                                     # (R,)
-            szz = z.T @ z                                         # (R, R)
-            if idx in sum_z:
-                sum_z[idx] += sz
-                sum_zz[idx] += szz
-            else:
-                sum_z[idx] = sz
-                sum_zz[idx] = szz
-        del per_layer
-        if is_mps:
-            torch.mps.empty_cache()
-
-    covs: dict[int, torch.Tensor] = {}
-    for idx in layer_subs:
-        cnt = float(n)
-        mu = sum_z[idx] / cnt                                     # (R,)
-        # Sample covariance Σzzᵀ/cnt − μμᵀ, unbiased (cnt−1) scaling.
-        cov = sum_zz[idx] / cnt - torch.outer(mu, mu)            # (R, R)
-        if n > 1:
-            cov = cov * (cnt / (cnt - 1.0))
-        covs[idx] = cov
-    return covs
 
 
 def _reduced_tangents(
@@ -4950,7 +4711,8 @@ def fit_sigma_field(
     """Attach a fuzzy-manifold ``log σ`` RBF to each curved layer (mutates them).
 
     Reduces the per-node within-node covariances (from
-    :func:`compute_node_reduced_covariance`) to one off-surface ``σ`` per node
+    :func:`compute_store_reduced_covariances` or
+    :func:`compute_node_reduced_covariance_from_rows`) to one off-surface ``σ`` per node
     per layer (:func:`_off_surface_var`), then fits a *separate* penalized
     ``r**3`` RBF over the **same normalized** ``node_params`` interpolating the
     per-node ``log σ`` and writes it onto ``sub.sigma_rbf_weights`` /
@@ -5443,8 +5205,6 @@ __all__ = [
     "discover_coords",
     "neutral_layout_coord",
     "select_topology",
-    "compute_node_centroid",
-    "compute_node_activation_rows",
     "compute_manifold_node_stats",
     "compute_node_reduced_covariance_from_rows",
     "compute_store_reduced_covariances",

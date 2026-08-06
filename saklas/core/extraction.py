@@ -1522,7 +1522,7 @@ class ManifoldExtractionPipeline:
         #    each node corpus is a list of in-character responses to the shared
         #    baseline prompts, pooled as ``[user: prompt, assistant: response]``
         #    pairs (response[i] -> prompt[i % k]).  Per-node role rides through
-        #    ``compute_node_centroid`` only when set (persona-baselined fit);
+        #    ``compute_manifold_node_stats`` only when set (persona-baselined fit);
         #    a ``None`` role pools under the standard assistant (swap-back)
         #    baseline.
         # Curved raw fits need within-node reduced covariance
