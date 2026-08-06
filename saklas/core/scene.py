@@ -294,10 +294,24 @@ def extract_turn_grammar(
     wrappers, content transforms); callers fall back to
     :func:`render_scene_raw`.
 
-    ``think_delimiters`` are the family's ``(open, close)`` reasoning-block
-    markers (from the generation layer's detector); when supplied, an extra
-    probe determines empirically whether the template strips thinking from
-    history, and the grammar's history policy follows it (a9 convention 3).
+    ``think_delimiters`` are **caller-supplied**: the family's ``(open,
+    close)`` reasoning-block marker strings, or ``None`` for "this family
+    cannot carry a committed thinking block".  The stitcher renders a turn's
+    thinking as ``open + thinking + close`` ahead of the turn text, so the
+    contract is deliberately narrow — a literal string *pair* that brackets
+    the reasoning content in the family's own render.  Section-style
+    reasoning channels (gpt-oss Harmony's ``<|channel|>analysis<|message|>``
+    …``<|end|>``) are not a bracketing pair and have no valid value here;
+    they stay ``None`` and the family carries no committed thinking.
+    ``TurnGrammar.think_open`` is ``None`` whenever the caller passes
+    ``None``, which is what makes
+    :class:`~saklas.core.scene.SceneThinkingUnsupportedError` fire on commit
+    and leaves a generated turn's ``thinking_text`` unstamped.
+
+    When a pair *is* supplied, an extra probe determines empirically whether
+    the template strips thinking from history, and the grammar's history
+    policy follows it (a9 convention 3); a template that chokes on the
+    embedded markers degrades to ``None`` rather than losing scene mode.
     """
     asst_header = ROLE_HEADERS.get(model_type)
     user_header = USER_ROLE_HEADERS.get(model_type)
