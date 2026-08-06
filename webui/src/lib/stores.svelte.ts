@@ -1628,9 +1628,10 @@ export function resetProbeStreams(): void {
   }
 }
 
-/** Append one per-token reading per attached probe (the unified
- *  ``probe_readings`` WS channel).  Drives the sparkline + per-layer strip +
- *  nearest readout + 2-D trajectory.  No-ops on undefined.
+/** Append one per-token reading per attached probe (the three families'
+ *  ``instruments.*.readings`` merged by ``_mergedReadings``).  Drives the
+ *  sparkline + per-layer strip + nearest readout + 2-D trajectory.  No-ops
+ *  on undefined.
  *
  *  Reassigns each entry (rather than mutating in place) so the SvelteMap
  *  fires reactivity — a bare ``entry.current = v`` would freeze probe strips
@@ -3170,10 +3171,12 @@ function handleWsMessage(msg: WSServerMessage): void {
       genStatus.active = false;
       genStatus.finishReason = msg.result?.finish_reason ?? "stop";
       // Probe rack — end-of-gen aggregate (the settled ``ProbeReading`` per
-      // probe: coords / fraction / nearest / residual + per-layer traces).
-      // Same omitted-when-absent rule.
+      // probe: coords / fraction / nearest / residual + per-layer traces),
+      // read out of the ``scope: "aggregate"`` measurement envelope and
+      // merged across the three families exactly as the ``token`` path
+      // merges them.  Same omitted-when-absent rule.
       if (!abState.processingAb) {
-        setProbeAggregates(msg.result?.probe_readings);
+        setProbeAggregates(_mergedReadings(msg.result?.measurements));
       }
       const turn = _currentWriteTurn();
       if (turn) {

@@ -1078,11 +1078,14 @@ export interface WSDoneResult {
    *  logprob capture wasn't live (replay / no on_token consumer). */
   mean_logprob?: number | null;
   mean_surprise?: number | null;
-  /** End-of-generation per-attached-probe aggregate — the same
-   *  ``ProbeReadingJSON`` shape as the per-token stream (the aggregate is the
-   *  reading pooled at the last-content token).  Keys are probe names.
-   *  Omitted entirely when no probe is attached — read defensively. */
-  probe_readings?: Record<string, ProbeReadingJSON>;
+  /** End-of-generation measurement envelope, ``scope: "aggregate"`` — the
+   *  same shape the ``token`` frame carries, pooled at the last-content
+   *  token.  The per-attached-probe readings live under
+   *  ``instruments.{geometry,lens,sae}.readings`` and merge by name exactly
+   *  as the token path merges them; there is no flat ``probe_readings``
+   *  alias on this frame.  Omitted when no probe is attached — read
+   *  defensively. */
+  measurements?: MeasurementsEnvelopeJSON;
 }
 
 export interface WSDoneEvent {

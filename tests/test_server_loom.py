@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -83,6 +84,14 @@ class _StubSession:
         self._joint_logprob_cache: dict[Any, Any] = {}
         self.lens_probe_names: list[str] = []
         self.sae_probe_names: list[str] = []
+        # Public instrument surface — ``probe_measurements_aggregate`` reads
+        # the live source/layer binding off these, never the session's
+        # private ``_live_lens``/``_live_sae`` aliases.
+        self.lens = SimpleNamespace(live=None)
+        self.sae = SimpleNamespace(live=None)
+        # End-of-generation readings the stub stamps onto every result, so a
+        # test can pin the ``done`` frame's aggregate channel.
+        self.stub_probe_readings: dict[str, Any] = {}
         self.token_probe_payload: dict[str, Any] = {}
         self._tokenizer = MagicMock()
         self._tokenizer.encode.side_effect = lambda text, **_: [
@@ -222,6 +231,7 @@ class _StubSession:
                     text=full_text, tokens=[1000 + sibling_idx],
                     token_count=1, tok_per_sec=10.0, elapsed=0.1,
                     finish_reason="stop",
+                    probe_readings=dict(self.stub_probe_readings) or None,
                 )
                 self.tree.finalize_assistant(
                     assistant_id,
@@ -979,6 +989,49 @@ class TestWebSocketLoom:
         # done frames carry distinct node_ids matching the two assistants.
         done_node_ids = {ev["node_id"] for ev in done_events}
         assert done_node_ids == set(assistant_ids)
+
+    def test_done_carries_only_the_measurements_aggregate(
+        self, session_and_client: Any,
+    ):
+        """One aggregate-readings channel on ``done``: the 5.x envelope.
+
+        The flat pre-5.x ``result.probe_readings`` block is gone (the same
+        clean break the ``token`` frame already made); it survives only on
+        the OpenAI / Ollama ``x-saklas-probe-readings`` vendor extension."""
+        from saklas.core.results import ProbeReading
+
+        session, client = session_and_client
+        reading = ProbeReading(
+            coords=(0.5,), fraction=0.1, residual=0.0, nearest=(),
+        )
+        session.monitor.probe_names = ["calm"]
+        session.lens_probe_names = ["jlens/fake"]
+        session.lens.live = {"source": "local:default"}
+        session.stub_probe_readings = {"calm": reading, "jlens/fake": reading}
+
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "measure me"})
+            while (msg := ws.receive_json())["type"] != "done":
+                assert msg["type"] != "error", msg
+
+        result = msg["result"]
+        assert "probe_readings" not in result
+        instruments = result["measurements"]["instruments"]
+        assert result["measurements"]["scope"] == "aggregate"
+        assert set(instruments["geometry"]["readings"]) == {"calm"}
+        assert set(instruments["lens"]["readings"]) == {"jlens/fake"}
+        assert instruments["lens"]["binding"]["source"] == "local:default"
+
+    def test_done_omits_measurements_without_probes(
+        self, session_and_client: Any,
+    ):
+        _session, client = session_and_client
+        with client.websocket_connect("/saklas/v1/sessions/default/stream") as ws:
+            ws.send_json({"type": "generate", "input": "unmeasured"})
+            while (msg := ws.receive_json())["type"] != "done":
+                assert msg["type"] != "error", msg
+        assert "measurements" not in msg["result"]
+        assert "probe_readings" not in msg["result"]
 
 
 # ---------------------------------------------------------------------------

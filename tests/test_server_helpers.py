@@ -134,8 +134,15 @@ class TestProbeMeasurementsAggregate:
         session.monitor.probe_names = monitor_names
         session.lens_probe_names = lens_names
         session.sae_probe_names = sae_names
-        session._live_lens = {"source": "local:default"}
-        session._live_sae = {"source": "saelens:rel", "layer": 17}
+        # The live source/layer binding is read through the PUBLIC instrument
+        # surface, not the session's delegating ``_live_lens``/``_live_sae``
+        # private aliases — a MagicMock would happily serve either, so the
+        # aliases are pinned to a sentinel that would fail the assertions if
+        # the helper ever reached for them again.
+        session.lens.live = {"source": "local:default"}
+        session.sae.live = {"source": "saelens:rel", "layer": 17}
+        session._live_lens = {"source": "WRONG-private-alias"}
+        session._live_sae = {"source": "WRONG-private-alias", "layer": -1}
         return session
 
     @staticmethod
@@ -201,6 +208,72 @@ class TestProbeMeasurementsAggregate:
         assert env is not None
         lens = env["instruments"].get("lens")
         assert lens is None or lens.get("readings") in (None, {})
+
+    def test_bindings_read_the_public_instrument_surface(self) -> None:
+        """``session.lens.live`` / ``session.sae.live``, not the private
+        session aliases the helper used to reach through."""
+        from unittest.mock import MagicMock
+
+        from saklas.server.streaming import probe_measurements_aggregate
+
+        reading = self._reading()
+        result = MagicMock()
+        result.probe_readings = {"jlens/fake": reading, "sae/12": reading}
+        result.applied_steering = None
+        session = self._session([], ["jlens/fake"], ["sae/12"])
+        # Any private-alias read would surface these sentinels instead.
+        del session._live_lens
+        del session._live_sae
+
+        env = probe_measurements_aggregate(session, result)
+        assert env is not None
+        instruments = env["instruments"]
+        assert instruments["lens"]["binding"]["source"] == "local:default"
+        assert instruments["sae"]["binding"]["source"] == "saelens:rel"
+        assert instruments["sae"]["binding"]["layer"] == 17
+
+    def test_readings_merge_by_name_across_families(self) -> None:
+        """The dashboard's ``done`` handler merges the three families into one
+        name-keyed rack update, exactly as the ``token`` path does — so the
+        envelope must key every attached probe uniquely."""
+        from unittest.mock import MagicMock
+
+        from saklas.server.streaming import probe_measurements_aggregate
+
+        reading = self._reading()
+        result = MagicMock()
+        result.probe_readings = {
+            "warm.clinical": reading, "jlens/fake": reading, "sae/12": reading,
+        }
+        result.applied_steering = None
+        session = self._session(["warm.clinical"], ["jlens/fake"], ["sae/12"])
+
+        instruments = (probe_measurements_aggregate(session, result) or {})[
+            "instruments"
+        ]
+        merged: dict[str, Any] = {}
+        for family in ("geometry", "lens", "sae"):
+            merged.update((instruments.get(family) or {}).get("readings") or {})
+        assert set(merged) == {"warm.clinical", "jlens/fake", "sae/12"}
+
+    def test_unattached_reading_is_dropped(self) -> None:
+        """A reading whose probe was detached mid-generation belongs to no
+        family and must not reach the rack."""
+        from unittest.mock import MagicMock
+
+        from saklas.server.streaming import probe_measurements_aggregate
+
+        result = MagicMock()
+        result.probe_readings = {
+            "warm.clinical": self._reading(), "detached": self._reading(),
+        }
+        result.applied_steering = None
+        session = self._session(["warm.clinical"], [], [])
+
+        instruments = (probe_measurements_aggregate(session, result) or {})[
+            "instruments"
+        ]
+        assert set(instruments["geometry"]["readings"]) == {"warm.clinical"}
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience

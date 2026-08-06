@@ -26,10 +26,12 @@ def probe_reading_aggregate(
     Returns ``{}`` when no result is recorded or no manifold probes are
     attached.  Surfaced under the ``x-saklas-probe-readings`` extension on the
     OpenAI and Ollama responses so vector-probe clients keep working unchanged
-    and manifold-aware clients pick up the geometric channel; the WS path reads
-    the same dict under its native ``probe_readings`` key.  Result-parameterized
-    (rather than reading ``session.last_result``) so the WS per-sibling done
-    frames score each sibling's own result.
+    and manifold-aware clients pick up the geometric channel — that vendor
+    extension is the only consumer of this flat shape (the native WS ``done``
+    frame carries the 5.x envelope alone, see
+    :func:`probe_measurements_aggregate`).  Result-parameterized (rather than
+    reading ``session.last_result``) so per-sibling done frames score each
+    sibling's own result.
     """
     if result is None:
         return {}
@@ -60,13 +62,16 @@ def probe_measurements_aggregate(
     lens (``session.lens_probe_names``), SAE (``session.sae_probe_names``) — and
     builds one ``scope="aggregate"`` envelope
     (:func:`saklas.core.measurements.build_measurements`).  ``None`` when no
-    probe is attached / no result recorded.  The compat ``probe_readings``
-    aggregate still rides the done frame separately (see
-    :func:`probe_reading_aggregate`); this is the additional 5.x envelope.
+    probe is attached / no result recorded.  This is the ONE aggregate-readings
+    channel on the native ``done`` frame; :func:`probe_reading_aggregate` is the
+    parallel flat shape the OpenAI / Ollama ``x-saklas-probe-readings`` vendor
+    extension is contractually pinned to.
 
     Source / layer binding fields come from the live lens / SAE configs when a
     family actually contributed readings; otherwise ``None`` (so a historical
-    row stays interpretable after a source switch).
+    row stays interpretable after a source switch).  Read through the public
+    instrument surface (``session.lens.live`` / ``session.sae.live``) rather
+    than the session's delegating private aliases.
     """
     from saklas.core.measurements import build_measurements
 
@@ -83,8 +88,8 @@ def probe_measurements_aggregate(
     lens = {n: r for n, r in readings.items() if n in lens_names} or None
     sae = {n: r for n, r in readings.items() if n in sae_names} or None
 
-    live_lens = getattr(session, "_live_lens", None)
-    live_sae = getattr(session, "_live_sae", None)
+    live_lens = session.lens.live
+    live_sae = session.sae.live
     lens_source = (
         live_lens.get("source") if lens and isinstance(live_lens, dict) else None
     )

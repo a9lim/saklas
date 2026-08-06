@@ -31,10 +31,7 @@ from saklas.core.steering import Steering
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 from saklas.server.native_common import SINGLE_SESSION_ID
 from saklas.server.request_helpers import merge_steering, parse_request_steering
-from saklas.server.streaming import (
-    probe_measurements_aggregate,
-    probe_reading_aggregate,
-)
+from saklas.server.streaming import probe_measurements_aggregate
 from saklas.server.tree_models import cast_json, node_json
 from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
@@ -952,17 +949,15 @@ async def _ws_stream_generation(
             # the engine's canonical reason unchanged.
             if stop_signaled and result_json.get("finish_reason") == "stop":
                 result_json["finish_reason"] = "cancelled"
-            # The settled per-probe aggregate rides the ``done`` event in
-            # the same rich shape as each token frame.  Shared with the
-            # SSE / NDJSON finalization via ``probe_reading_aggregate``
-            # (result-parameterized so each n>1 sibling scores its own
-            # result).
-            mf_readings = probe_reading_aggregate(session, result)
-            if mf_readings:
-                result_json["probe_readings"] = mf_readings
-            # 5.x: the aggregate measurement envelope rides the done frame
-            # alongside the compat ``probe_readings`` block (geometry / lens /
-            # SAE instruments split by family).
+            # The settled per-probe aggregate rides the ``done`` event in the
+            # 5.x measurement envelope and nowhere else — the same clean break
+            # the ``token`` frame already made.  Geometry / lens / SAE readings
+            # are split by family inside ``instruments``; a client merges them
+            # exactly as it merges the token frame's.  The flat pre-5.x
+            # ``probe_readings`` block is gone from this frame (it survives on
+            # the OpenAI / Ollama ``x-saklas-probe-readings`` extension, which
+            # is a real external contract).  Result-parameterized so each n>1
+            # sibling reports its own result.
             mf_measurements = probe_measurements_aggregate(session, result)
             if mf_measurements:
                 result_json["measurements"] = mf_measurements
