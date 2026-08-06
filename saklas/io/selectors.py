@@ -22,7 +22,7 @@ from typing import Optional
 
 from saklas.core.errors import SaklasError
 from saklas.core.naming import canonical_concept_name
-from saklas.io.packs import NAME_REGEX
+from saklas.io.integrity import NAME_REGEX
 from saklas.io.paths import VARIANT_SUFFIX_RE, manifolds_dir
 
 # Single source of truth lives in ``io.paths`` (owns the variant scheme).

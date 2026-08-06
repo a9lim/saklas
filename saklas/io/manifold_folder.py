@@ -51,7 +51,7 @@ from saklas.core.errors import SaklasError
 from saklas.core.manifold import BoxDomain, domain_from_spec
 from saklas.core.role_templates import _ROLE_SLUG_RE
 from saklas.io.atomic import write_json_atomic
-from saklas.io.packs import NAME_REGEX, hash_file, verify_integrity
+from saklas.io.integrity import NAME_REGEX, hash_file, verify_integrity
 
 # Manifold node *labels* are stricter than the artifact ``NAME_REGEX``
 # (``io.packs``): they drop ``.`` because the dot is reserved as the

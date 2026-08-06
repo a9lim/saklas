@@ -360,7 +360,7 @@ def _run_pack_export(args: argparse.Namespace) -> None:
     if fmt != "gguf":
         print(f"Unknown export format: {fmt}", file=sys.stderr)
         sys.exit(2)
-    from saklas.io.cache_ops import export_gguf_manifold
+    from saklas.io.gguf_io import export_gguf_manifold
 
     ns, name = _resolve_manifold_ns_name(args.name)
     try:

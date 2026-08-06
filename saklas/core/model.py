@@ -93,7 +93,7 @@ def _local_model_files(path: Path) -> list[tuple[str, int, str]]:
     """Exact local checkpoint/config identity with process-local hash reuse."""
     if not path.is_dir():
         return []
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     found: dict[str, Path] = {}
     ignored_parts = {".git", ".locks", "__pycache__"}

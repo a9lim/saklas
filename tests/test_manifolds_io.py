@@ -809,7 +809,7 @@ def test_update_manifold_folder_does_not_hash_fitted_payloads(
         "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
     )
     _fake_fit_tensor(folder, "test/model")
-    from saklas.io import packs
+    from saklas.io import integrity
 
     hashed: list[Path] = []
 
@@ -817,7 +817,7 @@ def test_update_manifold_folder_does_not_hash_fitted_payloads(
         hashed.append(Path(path))
         raise AssertionError("metadata-only authoring hashed a fitted payload")
 
-    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    monkeypatch.setattr(integrity, "hash_file", unexpected_hash)
     update_manifold_folder(folder, description="edited")
     assert hashed == []
 
@@ -1276,7 +1276,7 @@ def test_merge_discover_does_not_hash_source_fitted_payloads(
     ]
     for folder in folders:
         _fake_fit_tensor(folder, "test/model")
-    from saklas.io import packs
+    from saklas.io import integrity
 
     hashed: list[Path] = []
 
@@ -1284,7 +1284,7 @@ def test_merge_discover_does_not_hash_source_fitted_payloads(
         hashed.append(Path(path))
         raise AssertionError("metadata-only merge hashed a fitted payload")
 
-    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    monkeypatch.setattr(integrity, "hash_file", unexpected_hash)
     merge_discover_manifolds(
         "local", "combined", "", sources=[
             ("local", "src_a"), ("local", "src_b"),
@@ -1899,7 +1899,7 @@ def test_metadata_only_lifecycle_does_not_hash_fitted_payloads(
         "local", "mood", "", domain, _author_nodes(["a", "b", "c"]),
     )
     _fake_fit_tensor(folder, "test/model")
-    from saklas.io import packs
+    from saklas.io import integrity
 
     hashed: list[Path] = []
 
@@ -1907,7 +1907,7 @@ def test_metadata_only_lifecycle_does_not_hash_fitted_payloads(
         hashed.append(Path(path))
         raise AssertionError("metadata-only lifecycle hashed a fitted payload")
 
-    monkeypatch.setattr(packs, "hash_file", unexpected_hash)
+    monkeypatch.setattr(integrity, "hash_file", unexpected_hash)
     assert refresh_manifold("local", "mood") == "skipped"
     assert remove_manifold_folder("local", "mood")["removed"] is True
     assert hashed == []
@@ -2439,7 +2439,7 @@ def test_transfer_preflight_rejects_non_object_manifest_before_payload_hash(
     _fit_real_manifold(folder, "src/model", dim=4)
     (folder / "manifold.json").write_text(root)
     monkeypatch.setattr(
-        "saklas.io.packs.verify_integrity",
+        "saklas.io.integrity.verify_integrity",
         lambda *_args, **_kwargs: pytest.fail(
             "non-object manifest reached payload hashing"
         ),
@@ -2462,7 +2462,7 @@ def test_transfer_preflight_rejects_invalid_selected_digest_before_hashing(
     manifest["files"][source.name] = digest
     manifest_path.write_text(json.dumps(manifest))
     monkeypatch.setattr(
-        "saklas.io.packs.verify_integrity",
+        "saklas.io.integrity.verify_integrity",
         lambda *_args, **_kwargs: pytest.fail(
             "malformed selected digest reached payload hashing"
         ),
@@ -2485,7 +2485,7 @@ def test_transfer_preflight_rejects_future_manifest_before_payload_hash(
     manifest_path.write_text(json.dumps(manifest))
 
     monkeypatch.setattr(
-        "saklas.io.packs.verify_integrity",
+        "saklas.io.integrity.verify_integrity",
         lambda *_args, **_kwargs: pytest.fail(
             "future manifest reached payload hashing"
         ),
@@ -2514,7 +2514,7 @@ def test_strict_fitted_load_normalizes_trusted_corrupt_sidecar(
     tmp_path: Path, payload: str, message: str,
 ) -> None:
     from saklas.io.manifold_tensors import load_manifold
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     folder = _author_manifold(tmp_path)
     source = _fit_real_manifold(folder, "src/model", dim=4)
@@ -2541,7 +2541,7 @@ def test_strict_fitted_load_rejects_invalid_digest_before_hashing(
     manifest["files"][source.name] = "invalid"
     manifest_path.write_text(json.dumps(manifest))
     monkeypatch.setattr(
-        "saklas.io.packs.verify_integrity",
+        "saklas.io.integrity.verify_integrity",
         lambda *_args, **_kwargs: pytest.fail(
             "invalid digest reached fitted payload hashing"
         ),
@@ -3473,7 +3473,7 @@ def test_baked_publication_hashes_each_new_file_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
-    from saklas.io import manifold_folder as folder_module, packs
+    from saklas.io import manifold_folder as folder_module, integrity
 
     real_hash = folder_module.hash_file
     hashed: list[Path] = []
@@ -3483,7 +3483,7 @@ def test_baked_publication_hashes_each_new_file_once(
         return real_hash(Path(path))
 
     monkeypatch.setattr(folder_module, "hash_file", count_hash)
-    monkeypatch.setattr(packs, "hash_file", count_hash)
+    monkeypatch.setattr(integrity, "hash_file", count_hash)
     manifold, _ = _baked_manifold("merged")
 
     create_baked_manifold_folder(

@@ -57,7 +57,7 @@ def _seed_neutral_cache(model_id: str, *, n: int = 64, seed: int = 5) -> None:
     import json
 
     from safetensors.torch import save_file
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     md = model_dir(model_id)
     md.mkdir(parents=True, exist_ok=True)
@@ -389,7 +389,7 @@ class TestMergeFold:
 class TestGgufFold:
     def test_export_gguf_folds_manifold(self, tmp_path: Path) -> None:
         pytest.importorskip("gguf")  # writing the GGUF needs the optional extra
-        from saklas.io.cache_ops import export_gguf_manifold
+        from saklas.io.gguf_io import export_gguf_manifold
 
         _make_full_manifold("default", "happy.sad")
         out = tmp_path / "happy.gguf"
@@ -401,7 +401,7 @@ class TestGgufFold:
         assert out.is_file()
 
     def test_export_gguf_unfitted_errors(self, tmp_path: Path) -> None:
-        from saklas.io.cache_ops import export_gguf_manifold
+        from saklas.io.gguf_io import export_gguf_manifold
 
         # manifold.json but no fitted tensor for the model.
         from saklas.io.manifolds import create_discover_manifold_folder
@@ -420,8 +420,8 @@ class TestGgufFold:
     def test_export_preflight_skips_unrelated_variant_hashes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from saklas.io import gguf_io, packs
-        from saklas.io.cache_ops import export_gguf_manifold
+        from saklas.io import gguf_io, integrity
+        from saklas.io.gguf_io import export_gguf_manifold
         from saklas.io.manifolds import ManifoldFolder
 
         folder = _make_full_manifold("default", "happy.sad")
@@ -434,8 +434,8 @@ class TestGgufFold:
         ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
             unrelated, unrelated.with_suffix(".json"),
         )
-        packs._FINGERPRINT_CACHE.clear()
-        real_hash = packs.hash_file
+        integrity._FINGERPRINT_CACHE.clear()
+        real_hash = integrity.hash_file
         hashed: list[str] = []
 
         def track_hash(path: Path) -> str:
@@ -445,7 +445,7 @@ class TestGgufFold:
         def fake_write(_profile: object, path: Path, **_kwargs: object) -> None:
             Path(path).write_bytes(b"gguf")
 
-        monkeypatch.setattr(packs, "hash_file", track_hash)
+        monkeypatch.setattr(integrity, "hash_file", track_hash)
         monkeypatch.setattr(gguf_io, "write_gguf_profile", fake_write)
         export_gguf_manifold(
             "default", "happy.sad", model_scope=_MODEL,
@@ -462,7 +462,7 @@ def test_default_probe_preflight_skips_unrelated_variant_hashes(
 ) -> None:
     from saklas.io.manifold_tensors import load_manifold
     from saklas.core.session import SaklasSession
-    from saklas.io import packs
+    from saklas.io import integrity
     from saklas.io.manifolds import ManifoldFolder
     import saklas.io.manifolds as manifolds_module
     import saklas.io.probes_bootstrap as probes_module
@@ -475,8 +475,8 @@ def test_default_probe_preflight_skips_unrelated_variant_hashes(
     ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
         unrelated, unrelated.with_suffix(".json"),
     )
-    packs._FINGERPRINT_CACHE.clear()
-    real_hash = packs.hash_file
+    integrity._FINGERPRINT_CACHE.clear()
+    real_hash = integrity.hash_file
     hashed: list[str] = []
 
     def track_hash(path: Path) -> str:
@@ -490,7 +490,7 @@ def test_default_probe_preflight_skips_unrelated_variant_hashes(
         def ensure_manifold_loaded(self, key: str) -> None:
             self._manifolds[key] = load_manifold(raw)
 
-    monkeypatch.setattr(packs, "hash_file", track_hash)
+    monkeypatch.setattr(integrity, "hash_file", track_hash)
     monkeypatch.setattr(probes_module, "load_default_manifolds", lambda: {})
     monkeypatch.setattr(manifolds_module, "bundled_manifold_names", lambda: ["probe"])
     session = StubSession()

@@ -10,7 +10,7 @@ import torch
 
 from saklas.core.errors import SaklasError
 from saklas.core.profile import Profile, ProfileError
-from saklas.io.packs import PROFILE_FORMAT_VERSION
+from saklas.io.integrity import PROFILE_FORMAT_VERSION
 
 
 def _mk(layers: Any = (0, 5, 10), dim: int = 8, dtype: Any = torch.float32) -> dict[int, torch.Tensor]:

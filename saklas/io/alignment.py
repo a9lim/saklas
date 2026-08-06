@@ -49,7 +49,7 @@ from saklas.core.errors import SaklasError
 from saklas.core.profile import Profile
 from saklas.io.atomic import fsync_directory, write_bytes_atomic, write_json_atomic
 from saklas.io.paths import model_dir, safe_model_id
-from saklas.io.packs import hash_file
+from saklas.io.integrity import hash_file
 
 log = logging.getLogger(__name__)
 

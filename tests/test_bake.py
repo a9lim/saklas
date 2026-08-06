@@ -168,7 +168,7 @@ def _seed_neutral_cache(model_id: str, profile: dict[int, torch.Tensor]) -> None
     """Give offline bake the persisted metric its current contract requires."""
     import json
     from safetensors.torch import save_file
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     md = model_dir(model_id)
     md.mkdir(parents=True, exist_ok=True)

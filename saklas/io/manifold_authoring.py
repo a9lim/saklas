@@ -37,7 +37,7 @@ from saklas.io.manifold_folder import (
     min_nodes,
 )
 from saklas.core.manifold import domain_from_spec
-from saklas.io.packs import NAME_REGEX
+from saklas.io.integrity import NAME_REGEX
 from saklas.io.paths import manifold_dir, manifolds_dir
 
 
@@ -643,7 +643,7 @@ def _recoverable_baked_first_publication(
     """Whether ``folder`` is the interrupted first write of this baked target."""
 
     from saklas.io.manifold_folder import manifold_folder_tensor_paths
-    from saklas.io.packs import verify_integrity
+    from saklas.io.integrity import verify_integrity
     from saklas.io.paths import parse_tensor_filename, tensor_filename
 
     try:

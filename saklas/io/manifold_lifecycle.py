@@ -546,7 +546,7 @@ def _transfer_preflight_locked(
     folder: Path, *, from_model: str, to_model: str, force: bool,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, str], bool]:
     """Prove the source pair and classify the target with locks already held."""
-    from saklas.io.packs import verify_integrity
+    from saklas.io.integrity import verify_integrity
     from saklas.io.paths import tensor_filename
 
     folder = Path(folder)

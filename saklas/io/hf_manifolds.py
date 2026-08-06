@@ -33,7 +33,7 @@ from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
 )
-from saklas.io.packs import NAME_REGEX
+from saklas.io.integrity import NAME_REGEX
 from saklas.io.staging import stage_verify_swap
 
 # Mirror :data:`saklas.io.hf._HF_SEARCH_CAP`.  Kept independent so the
@@ -54,7 +54,7 @@ def _rewrite_staged_manifold_name(
     single manifest rewrite.
     """
     from saklas.io.atomic import write_json_atomic
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     files = dict(staged.files)
     for stem in staged.tensor_models():

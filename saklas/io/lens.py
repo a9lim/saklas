@@ -233,7 +233,7 @@ def lens_payloads_match(
     model_id: str, sidecar: Mapping[str, Any], *, checkpoint: bool = False,
 ) -> bool:
     """Validate exact payload digests without materializing fp32 matrices."""
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     try:
         paths = lens_tensor_paths(model_id, sidecar, checkpoint=checkpoint)
@@ -744,7 +744,7 @@ def _save_lens_components(
                 ts_path, current, current_layers,
             )
             current_digests = current["tensor_sha256"]
-            from saklas.io.packs import hash_file
+            from saklas.io.integrity import hash_file
             pointer_verified = _proof_matches(
                 verified_reuse_proof, ts_path, current,
             )

@@ -1,4 +1,12 @@
-"""GGUF read/write for baked steering-vector profiles.
+"""GGUF interchange: the control-vector codec plus the manifold export driver.
+
+Two layers live here.  The **codec** — ``write_gguf_profile`` /
+``read_gguf_profile`` — round-trips a per-layer direction dict through a
+llama.cpp control-vector file.  The **driver** — ``export_gguf_manifold`` —
+is the folder-level orchestrator over that codec: it folds a fitted 2-node
+``pca`` manifold to a single direction and writes one ``.gguf`` per model,
+with ``_resolve_model_hint`` deriving llama.cpp's architecture string.
+GGUF is the only interchange export saklas emits.
 
 Wire format matches the llama.cpp control-vector convention (same as
 repeng's export_gguf):
@@ -24,7 +32,7 @@ lazy-imports it and raises a clear error if it's missing.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import logging
 from pathlib import Path
@@ -32,6 +40,7 @@ from pathlib import Path
 import torch
 
 from saklas.core.errors import SaklasError
+from saklas.io.paths import safe_model_id, unsafe_model_id
 
 log = logging.getLogger(__name__)
 
@@ -153,3 +162,138 @@ def _gguf_source_version() -> str:
     """Return the saklas version string. Lazy import to avoid circularity."""
     from saklas import __version__
     return __version__
+
+
+def _resolve_model_hint(safe_id: str) -> str:
+    """Derive llama.cpp's ``controlvector.model_hint`` from a safe_model_id.
+
+    Strategy: load the base model's config via ``transformers.AutoConfig``
+    (cache-first, network fallback) and return ``config.model_type``.  That's
+    the same string llama.cpp's loader keys off when matching a control
+    vector to a loaded model (e.g. ``"llama"``, ``"gemma2"``, ``"qwen2"``).
+
+    Raises RuntimeError with actionable guidance if the config can't be
+    resolved — callers should surface the ``--model-hint`` flag as the
+    escape hatch.
+    """
+    hf_id = unsafe_model_id(safe_id)
+    try:
+        from transformers import AutoConfig
+    except ImportError as e:  # pragma: no cover — transformers is a hard dep
+        raise RuntimeError(
+            f"could not resolve model_hint for {hf_id!r}: transformers missing ({e})"
+        ) from e
+    try:
+        cfg = AutoConfig.from_pretrained(hf_id, trust_remote_code=False)
+    except Exception as e:
+        raise RuntimeError(
+            f"could not resolve model_hint for {hf_id!r}: {e}. "
+            f"Pass --model-hint <arch> explicitly (e.g. 'llama', 'gemma2', 'qwen2')."
+        ) from e
+    mt = getattr(cfg, "model_type", None)
+    if not mt:
+        raise RuntimeError(
+            f"{hf_id}: config has no model_type field; pass --model-hint explicitly"
+        )
+    return str(mt)
+
+
+def export_gguf_manifold(
+    ns: str,
+    name: str,
+    *,
+    model_scope: Optional[str],
+    output: Optional[str],
+    model_hint: Optional[str],
+) -> list[Path]:
+    """Export a fitted 2-node ``pca`` manifold to GGUF by folding it to a vector.
+
+    Sources each per-model profile by folding the manifold
+    (:func:`~saklas.core.capture.folded_directions`), then writes a
+    llama.cpp control-vector GGUF via :func:`write_gguf_profile`.
+    ``model_scope`` restricts to one base model;
+    without it, every fitted ``raw`` tensor is exported (one ``.gguf`` per
+    model).  ``output`` policy:
+      - single-model + ``.gguf`` path → write to exactly that path
+      - single-model + directory → ``<dir>/<safe_model_id>.gguf``
+      - multi-model → must be a directory (or None, meaning in-folder sibling)
+      - None → write alongside the safetensors (rejected for bundled manifolds,
+        whose folder is restored on refresh)
+    """
+    from saklas.io.manifolds import ManifoldFolder
+    from saklas.io.paths import (
+        manifold_dir, parse_tensor_filename, tensor_filename,
+    )
+    from saklas.io.manifold_tensors import load_manifold
+    from saklas.core.capture import folded_directions
+
+    mdir = manifold_dir(ns, name)
+    # Preflight needs folder identity/source and fitted filenames only.  Each
+    # selected raw tensor is integrity-checked by ``load_manifold`` below; do
+    # not eagerly hash unrelated models, SAE variants, or prior GGUF exports.
+    mf = ManifoldFolder.load(mdir, verify_manifest=False)
+
+    raw_models: set[str] = set()
+    for tensor in mdir.glob("*.safetensors"):
+        parsed = parse_tensor_filename(tensor.name)
+        if parsed is not None and parsed[1] is None:  # raw fitted → foldable
+            raw_models.add(parsed[0])
+
+    if model_scope is not None:
+        sid = safe_model_id(model_scope)
+        if sid not in raw_models:
+            raise RuntimeError(
+                f"{ns}/{name}: no fitted manifold tensor for {model_scope}"
+            )
+        targets = [sid]
+    else:
+        targets = sorted(raw_models)
+        if not targets:
+            raise RuntimeError(
+                f"{ns}/{name}: no fitted manifold tensors to export"
+            )
+
+    out_path = Path(output) if output else None
+    if out_path is not None and len(targets) > 1 and out_path.suffix == ".gguf":
+        raise RuntimeError(
+            "multi-model export needs a directory or no --output; "
+            f"got file path {out_path}"
+        )
+    if out_path is None and (mf.source or "").startswith("bundled"):
+        raise RuntimeError(
+            f"{ns}/{name}: bundled manifold — in-place GGUF export would be lost "
+            f"on next refresh. Pass --output <path> to write outside the folder."
+        )
+
+    written: list[Path] = []
+    for sid in targets:
+        manifold = load_manifold(
+            mdir / tensor_filename(
+                sid, release=None, model_id_is_safe=True,
+            )
+        )
+        try:
+            profile = folded_directions(manifold)
+        except Exception as e:
+            raise RuntimeError(
+                f"{ns}/{name}: manifold does not fold to a single steering "
+                f"direction (not a 2-node affine subspace): {e}"
+            ) from e
+        hint = model_hint or _resolve_model_hint(sid)
+        if out_path is None:
+            dest = mdir / f"{sid}.gguf"
+        elif out_path.suffix == ".gguf":
+            dest = out_path
+        else:
+            out_path.mkdir(parents=True, exist_ok=True)
+            dest = out_path / f"{sid}.gguf"
+        write_gguf_profile(profile, dest, model_hint=hint)
+        written.append(dest)
+
+    # The export only extends the folder's integrity manifest with the new
+    # ``.gguf`` entries; a manifold's namespace/name/tags/node labels are
+    # untouched, so the selector index stays valid.
+    if any(p.parent == mdir for p in written):
+        mf.update_file_hashes(*(p for p in written if p.parent == mdir))
+
+    return written

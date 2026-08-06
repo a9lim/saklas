@@ -6,11 +6,9 @@ SAEs trained by Saklas itself under ``models/<safe>/sae/local/<name>``.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
-import re
 from typing import Any, Mapping
 
 from safetensors import safe_open
@@ -18,11 +16,17 @@ from safetensors.torch import load_file, save_file
 import torch
 
 from saklas.io.atomic import artifact_lock, fsync_directory, write_json_atomic
+from saklas.io.integrity import NAME_REGEX, hash_file
 from saklas.io.paths import ensure_within, model_dir
-from saklas.io.sae import load_active_sae_source, sae_active_path, set_active_sae_source
+from saklas.io.sae import (
+    SAE_SOURCE_FORMAT_VERSION,
+    load_active_sae_source,
+    sae_active_path,
+    set_active_sae_source,
+)
 
 LOCAL_SAE_FORMAT_VERSION = 1
-_LOCAL_NAME_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
+_LOCAL_NAME_RE = NAME_REGEX
 _MANIFEST_FIELDS = {
     "format_version",
     "kind",
@@ -53,7 +57,7 @@ def normalize_local_sae_name(value: str) -> str:
     if value.startswith("local:"):
         value = value[6:]
     if _LOCAL_NAME_RE.fullmatch(value) is None:
-        raise ValueError("local SAE name must match [a-z][a-z0-9._-]{0,63}")
+        raise ValueError(f"local SAE name must match {_LOCAL_NAME_RE.pattern}")
     return value
 
 
@@ -71,14 +75,6 @@ def local_sae_dir(model_id: str, name: str) -> Path:
 
 def local_sae_manifest_path(model_id: str, name: str) -> Path:
     return local_sae_dir(model_id, name) / "manifest.json"
-
-
-def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _validate_manifest(
@@ -143,7 +139,7 @@ def load_local_sae_manifest(model_id: str, name: str) -> dict[str, Any] | None:
     try:
         payload = _validate_manifest(json.loads(path.read_text()), model_id, name)
         tensor_path = path.parent / payload["tensor_file"]
-        if not tensor_path.exists() or _hash_file(tensor_path) != payload["tensor_sha256"]:
+        if not tensor_path.exists() or hash_file(tensor_path) != payload["tensor_sha256"]:
             return None
         expected = {
             "W_enc": (payload["d_model"], payload["d_sae"]),
@@ -229,7 +225,7 @@ def save_local_sae(
         with open(tmp, "rb") as handle:
             os.fsync(handle.fileno())
         os.replace(tmp, tensor_path)
-        digest = _hash_file(tensor_path)
+        digest = hash_file(tensor_path)
         payload = {
             "format_version": LOCAL_SAE_FORMAT_VERSION,
             "kind": "local",

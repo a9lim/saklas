@@ -100,7 +100,7 @@ class TestMergeVector:
             "noble", dirs, means,
             whitener=isotropic_whitener(dirs, 4), label="merged",
         )
-        from saklas.io.packs import hash_file
+        from saklas.io.integrity import hash_file
 
         honest_source = tmp_path / "honest-source.safetensors"
         warm_source = tmp_path / "warm-source.safetensors"

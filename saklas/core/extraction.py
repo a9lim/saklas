@@ -400,7 +400,7 @@ def _capture_pending_path(
 def _capture_pointer_sha256(path: pathlib.Path) -> str | None:
     if not path.exists():
         return None
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     return hash_file(path)
 
@@ -508,7 +508,7 @@ def _capture_generation_is_complete(
             or key not in centroid_shapes
         ):
             return False
-    from saklas.io.packs import verify_integrity
+    from saklas.io.integrity import verify_integrity
 
     if files and not verify_integrity(capture_dir, files)[0]:
         return False
@@ -1313,7 +1313,7 @@ class ManifoldExtractionPipeline:
         if not force and not _verified_cache_miss:
             from saklas.io.manifold_tensors import _load_manifold_locked
             from saklas.io.manifold_folder import manifold_pair_lock
-            from saklas.io.packs import verify_integrity
+            from saklas.io.integrity import verify_integrity
 
             # Clear/rm/refresh take the folder lock and then this same stable
             # pair lock.  The fast path deliberately takes only the pair lock:
@@ -1573,7 +1573,7 @@ class ManifoldExtractionPipeline:
         if cache_meta is not None and cache_meta.exists():
             try:
                 from saklas.io.manifold_tensors import ActivationRowStore
-                from saklas.io.packs import verify_integrity
+                from saklas.io.integrity import verify_integrity
 
                 with open(cache_meta) as handle:
                     meta = json.load(handle)

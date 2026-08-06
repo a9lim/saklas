@@ -13,7 +13,6 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-import re
 from typing import Any
 
 import torch
@@ -21,12 +20,16 @@ import yaml
 
 from saklas.core.jlens import JacobianLens
 from saklas.io.atomic import artifact_lock, write_json_atomic
+# The three Hub indirections are imported (not redefined) so ``io.hf`` stays
+# the single monkeypatchable HF seam; tests patch them on this module.
+from saklas.io.hf import _hf_api, _hf_hub_download, _hf_snapshot_download
+from saklas.io.integrity import NAME_REGEX
 from saklas.io.paths import ensure_within, model_dir
 
 LENS_SOURCE_FORMAT_VERSION = 1
 NEURONPEDIA_REPO = "neuronpedia/jacobian-lens"
 NEURONPEDIA_BINDING = "neuronpedia"
-_LOCAL_NAME_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
+_LOCAL_NAME_RE = NAME_REGEX
 
 
 def lens_root(model_id: str) -> Path:
@@ -123,24 +126,6 @@ def _config_dimensions(config: Any) -> tuple[int | None, int | None]:
         int(hidden) if isinstance(hidden, int) and not isinstance(hidden, bool) else None,
         int(layers) if isinstance(layers, int) and not isinstance(layers, bool) else None,
     )
-
-
-def _snapshot_download(*args: Any, **kwargs: Any) -> str:
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(*args, **kwargs)
-
-
-def _hf_hub_download(*args: Any, **kwargs: Any) -> str:
-    from huggingface_hub import hf_hub_download
-
-    return hf_hub_download(*args, **kwargs)
-
-
-def _hf_api() -> Any:
-    from huggingface_hub import HfApi
-
-    return HfApi()
 
 
 @dataclass(frozen=True)
@@ -390,7 +375,7 @@ def fetch_neuronpedia_lens(
         raise ValueError(f"could not resolve model dimensions for {model_id}")
 
     root = Path(
-        _snapshot_download(
+        _hf_snapshot_download(
             repo_id,
             revision=repo_revision,
             allow_patterns=[f"*/jlens/{dataset}/config.yaml"],

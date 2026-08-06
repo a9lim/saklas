@@ -48,7 +48,7 @@ from typing import Any, Iterator
 
 from saklas.core.errors import SaklasError
 from saklas.io.atomic import write_bytes_atomic, write_json_atomic
-from saklas.io.packs import NAME_REGEX
+from saklas.io.integrity import NAME_REGEX
 from saklas.io.paths import ensure_within, templates_dir
 
 _LOG = logging.getLogger(__name__)

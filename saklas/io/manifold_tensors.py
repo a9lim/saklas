@@ -560,7 +560,7 @@ def _load_manifold_locked(
     verified_tensor_sha256: str | None = None
     folder_view: Any | None = None
     if verify_manifest and manifest_path.exists():
-        from saklas.io.packs import verify_integrity
+        from saklas.io.integrity import verify_integrity
         from saklas.io.manifold_folder import ManifoldFolder
 
         folder_view = ManifoldFolder.load(path.parent, verify_manifest=False)
