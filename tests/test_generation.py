@@ -569,6 +569,75 @@ def test_post_loop_utf8_flush_uses_the_last_forwards_step():
     assert emits[1][1] == 1
 
 
+def test_alt_token_decode_does_not_break_partial_utf8_buffering():
+    """Top-K alternative decoding shares the lazy decode cache with the emit
+    path; a partial-UTF-8 id decoded as an alternative must still buffer when
+    it is emitted (no replacement character reaches the stream)."""
+    model: Any = _Utf8SplitModel([0, 1, 2, 3])
+    tokenizer: Any = _Utf8SplitTokenizer()
+    state = GenerationState()
+    emits: list[tuple[str, int]] = []
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=4, temperature=0.0),
+        state,
+        on_token=lambda text, _th, _tid, _lp, _alts, _ppl, step: (
+            emits.append((text, step))
+        ),
+        logprobs=1,
+        cache_token_text=False,
+    )
+
+    assert generated_ids == [0, 1, 2, 3]
+    assert emits == [("A", 0), ("éB", 3)]
+    assert not any("�" in text for text, _step in emits)
+
+
+def test_perplexity_is_none_when_not_requested():
+    """``want_perplexity=False`` reports ``None`` (not computed), never NaN —
+    the value every ``float | None`` consumer is typed for."""
+    model: Any = _StopModel()
+    tokenizer: Any = _StopTokenizer()
+    state = GenerationState()
+    ppls: list[float | None] = []
+
+    generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=3, temperature=0.0),
+        state,
+        on_token=lambda _t, _th, _tid, _lp, _alts, ppl, _step: ppls.append(ppl),
+        want_perplexity=False,
+    )
+
+    assert ppls
+    assert all(p is None for p in ppls)
+
+
+def test_perplexity_is_a_float_when_requested():
+    model: Any = _StopModel()
+    tokenizer: Any = _StopTokenizer()
+    state = GenerationState()
+    ppls: list[float | None] = []
+
+    generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=3, temperature=0.0),
+        state,
+        on_token=lambda _t, _th, _tid, _lp, _alts, ppl, _step: ppls.append(ppl),
+        want_perplexity=True,
+    )
+
+    assert ppls
+    assert all(isinstance(p, float) and p == p for p in ppls)
+
+
 def test_stop_sequence_split_across_tokens_trims_final_text():
     model: Any = _SplitStopModel()
     tokenizer: Any = _SplitStopTokenizer()

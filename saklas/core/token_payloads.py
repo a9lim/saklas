@@ -64,11 +64,12 @@ class TokenProbePayload:
     ) -> dict[str, Any]:
         """Shape this token's payload as ``{"measurements": <envelope>}``.
 
-        The single 5.x wire record — the envelope replaces the former
-        ``captured`` record and the six top-level scalar aliases.  ``lens`` is
-        the native per-layer readout (``lens_readout`` in the envelope) and
-        ``sae`` the native feature discovery (``sae_features``); the attached
-        per-family readings come from the payload's own slots.
+        The measurement envelope is the whole wire record for a token — every
+        cross-family scalar view is derived inside it, so there are no
+        top-level aliases beside it.  ``lens`` is the native per-layer readout
+        (``lens_readout`` in the envelope) and ``sae`` the native feature
+        discovery (``sae_features``); the attached per-family readings come
+        from the payload's own slots.
         """
         measurements = build_measurements(
             scope="token",
