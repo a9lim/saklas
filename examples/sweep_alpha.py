@@ -25,8 +25,9 @@ def main() -> None:
     alphas = [float(x) for x in args.alphas.split(",")]
 
     with SaklasSession.from_pretrained(args.model, device="auto") as session:
-        name, profile = session.extract(args.concept)
-        session.steer(name, profile)
+        # The fitted manifold is the artifact; steering expressions resolve
+        # ``name`` straight off it, so no separate registration step is needed.
+        name, _profile = session.extract(args.concept)
 
         for alpha in alphas:
             result = session.generate(

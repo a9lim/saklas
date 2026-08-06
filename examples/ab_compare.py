@@ -27,8 +27,9 @@ def main() -> None:
     args = ap.parse_args()
 
     with SaklasSession.from_pretrained(args.model, device="auto") as session:
-        name, profile = session.extract(args.concept)
-        session.steer(name, profile)
+        # The fitted manifold is the artifact; steering expressions resolve
+        # ``name`` straight off it, so no separate registration step is needed.
+        name, _profile = session.extract(args.concept)
 
         unsteered = session.generate(
             args.prompt, stateless=True, sampling=SamplingConfig(seed=0),
