@@ -181,6 +181,27 @@ export class ApiError extends Error {
   }
 }
 
+/** THE error → user-facing message formatter.  Every surface that shows
+ *  a failed request — toast, inline form error, empty-state reason —
+ *  goes through this one, so the same backend failure reads identically
+ *  wherever it surfaces.
+ *
+ *  An :class:`ApiError` renders as ``"<status>: <detail>"``, preferring
+ *  the saklas error body's structured ``detail`` over the generic HTTP
+ *  message.  The status code carries real meaning across this API (400
+ *  malformed vs 404 missing vs 409 busy vs 503 unavailable), so it is
+ *  always shown.  Anything else falls back to its ``message``. */
+export function describeError(e: unknown): string {
+  if (e instanceof ApiError) {
+    const detail =
+      e.body && typeof e.body === "object" && "detail" in (e.body as object)
+        ? String((e.body as { detail: unknown }).detail)
+        : e.message;
+    return `${e.status}: ${detail}`;
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
 // --------------------------------------------------------- core fetch --
 
 async function parseBody(r: Response): Promise<{ text: string; json: unknown }> {

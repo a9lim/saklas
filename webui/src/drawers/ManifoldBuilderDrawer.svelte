@@ -18,6 +18,7 @@
     apiManifoldFitStream,
     apiManifoldGenerateStream,
     ApiError,
+    describeError,
   } from "../lib/api";
   import {
     closeDrawer,
@@ -330,7 +331,7 @@
         closeDrawer();
         openDrawer("manifolds");
       } catch (e) {
-        const msg = describeFitError(e);
+        const msg = describeError(e);
         pushToast(`build failed — ${msg}`, { kind: "error", ttlMs: null });
       } finally {
         submitting = false;
@@ -583,7 +584,7 @@
           );
         } catch (e) {
           dismissToast(fitToastId);
-          pushToast(`fit failed — ${describeFitError(e)}`, {
+          pushToast(`fit failed — ${describeError(e)}`, {
             kind: "error",
             ttlMs: null,
           });
@@ -599,7 +600,7 @@
       openDrawer("manifolds");
     } catch (e) {
       dismissToast(toastId);
-      const msg = describeFitError(e);
+      const msg = describeError(e);
       pushToast(`generate failed — ${msg}`, {
         kind: "error",
         ttlMs: null,
@@ -742,7 +743,7 @@
           );
         } catch (e) {
           dismissToast(fitToastId);
-          pushToast(`fit failed — ${describeFitError(e)}`, {
+          pushToast(`fit failed — ${describeError(e)}`, {
             kind: "error",
             ttlMs: null,
           });
@@ -758,22 +759,13 @@
       openDrawer("manifolds");
     } catch (e) {
       dismissToast(toastId);
-      pushToast(`author failed — ${describeFitError(e)}`, {
+      pushToast(`author failed — ${describeError(e)}`, {
         kind: "error",
         ttlMs: null,
       });
     } finally {
       submitting = false;
     }
-  }
-
-  function describeFitError(e: unknown): string {
-    if (e instanceof ApiError) {
-      return e.body && typeof e.body === "object" && "detail" in (e.body as object)
-        ? String((e.body as { detail: unknown }).detail)
-        : e.message;
-    }
-    return e instanceof Error ? e.message : String(e);
   }
 </script>
 

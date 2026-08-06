@@ -14,7 +14,7 @@
   // (`saklas manifold from-template`).
 
   import { onMount } from "svelte";
-  import { ApiError, apiTemplates } from "../lib/api";
+  import { apiTemplates, describeError } from "../lib/api";
   import { closeDrawer } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
   import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
@@ -28,17 +28,6 @@
 
   let _drawerProps: { params?: unknown } = $props();
   $effect(() => { void _drawerProps.params; });
-
-  function describeError(e: unknown): string {
-    if (e instanceof ApiError) {
-      const detail =
-        e.body && typeof e.body === "object" && "detail" in (e.body as object)
-          ? String((e.body as { detail: unknown }).detail)
-          : e.message;
-      return `${e.status}: ${detail}`;
-    }
-    return e instanceof Error ? e.message : String(e);
-  }
 
   type Tab = "score" | "build";
   let tab: Tab = $state("score");

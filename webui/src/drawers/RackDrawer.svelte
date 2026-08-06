@@ -27,7 +27,7 @@
 
   import { onMount } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
-  import { ApiError, apiManifolds, apiManifoldFitStream } from "../lib/api";
+  import { apiManifolds, apiManifoldFitStream, describeError } from "../lib/api";
   import {
     addManifoldToRack,
     addSubspaceToRack,
@@ -134,17 +134,6 @@
 
   function rowKey(m: ManifoldInfo): string {
     return `${m.namespace}/${m.name}`;
-  }
-
-  function describeError(e: unknown): string {
-    if (e instanceof ApiError) {
-      const detail =
-        e.body && typeof e.body === "object" && "detail" in (e.body as object)
-          ? String((e.body as { detail: unknown }).detail)
-          : e.message;
-      return `${e.status}: ${detail}`;
-    }
-    return e instanceof Error ? e.message : String(e);
   }
 
   const searching = $derived(query.trim().length > 0);

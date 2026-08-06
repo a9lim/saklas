@@ -34,7 +34,7 @@
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
   import JLensSteerCard from "./rack/JLensSteerCard.svelte";
   import JLensTokenCard from "./rack/JLensTokenCard.svelte";
-  import { ApiError, apiInstruments } from "../lib/api";
+  import { apiInstruments, describeError } from "../lib/api";
   import {
     addJLensToRack,
     activeProbeNames,
@@ -145,15 +145,6 @@
 
   let steerInput = $state("");
   let steerBusy = $state(false);
-
-  function describeError(e: unknown): string {
-    if (e instanceof ApiError) {
-      return e.body && typeof e.body === "object" && "detail" in e.body
-        ? String((e.body as { detail: unknown }).detail)
-        : e.message;
-    }
-    return e instanceof Error ? e.message : String(e);
-  }
 
   function bareWord(value: string): string {
     return value.trim().replace(/^jlens\//, "");
