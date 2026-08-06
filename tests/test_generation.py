@@ -1939,6 +1939,9 @@ def test_sae_gate_without_final_aggregate_attaches_sae_layer() -> None:
     assert attached is True
     assert capture.attached == [5]
     assert capture.aggregate_depth == 1
+    # The armed retention is a tail ring, so the recorded mode must say so
+    # rather than sitting at the FULL default.
+    assert session._capture_state.mode is CaptureMode.AGGREGATE_ONLY
 
 
 def test_monitor_probe_without_final_aggregate_and_no_per_token_skips_capture() -> None:

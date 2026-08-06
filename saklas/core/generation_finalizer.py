@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from saklas.core.capture import CaptureMode
 from saklas.core.events import ProbeScored
 from saklas.core.results import GenerationResult, ProbeReading
 
@@ -44,7 +45,6 @@ def finalize_generation(
         text = decoded if isinstance(decoded, str) else decoded[0]
 
     capture_mode = session._capture_state.mode
-    capture_mode_name = capture_mode.name
     captured_stack: dict[int, torch.Tensor] = {}
     if (
         generated_ids
@@ -53,7 +53,7 @@ def finalize_generation(
             or (
                 return_probe_readings
                 and session._monitor.probe_names
-                and capture_mode_name == "FULL"
+                and capture_mode is CaptureMode.FULL
             )
         )
     ):
@@ -105,11 +105,11 @@ def finalize_generation(
 
     agg_vals: dict[str, ProbeReading] = {}
     if return_probe_readings and session._monitor.probe_names and generated_ids:
-        if capture_mode_name == "INCREMENTAL":
+        if capture_mode is CaptureMode.INCREMENTAL:
             agg_vals, per_token = session._score_incremental(
                 generated_ids, accumulate=not stateless,
             )
-        elif capture_mode_name == "LEAN_INCREMENTAL":
+        elif capture_mode is CaptureMode.LEAN_INCREMENTAL:
             agg_vals, per_token = session._score_lean_incremental(
                 generated_ids,
                 accumulate=not stateless,

@@ -8,7 +8,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
-from enum import Enum, IntEnum
+from enum import IntEnum
 from types import TracebackType
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Protocol, cast, overload
@@ -21,6 +21,7 @@ from transformers import (
     StoppingCriteriaList,
 )
 
+from saklas.core.capture import CaptureMode, CaptureState
 from saklas.core.errors import SaklasError
 from saklas.core.events import (
     EventBus,
@@ -465,82 +466,6 @@ class GenState(IntEnum):
     PREAMBLE = 1
     RUNNING = 2
     FINALIZING = 3
-
-
-class CaptureMode(Enum):
-    """How the per-gen hidden-state capture scores its probes (legal-by-construction).
-
-    Replaces the five correlated capture booleans (``_capture_incremental`` /
-    ``_capture_aggregate_only`` / ``_capture_lean`` / ``_capture_gating_subset``)
-    that a hand-kept if/elif chain used to keep consistent — illegal combinations
-    (e.g. incremental *and* aggregate-only) were representable.  One mode is the
-    single source of truth; :meth:`SaklasSession._begin_capture` picks it and every
-    ``_score_*`` dispatch keys off it.  The modes trade only *when/how* scoring
-    runs (per token vs once) and what memory the capture keeps (length-1 buffer vs
-    tail ring vs full stack); every read is a full per-probe ``ProbeReading`` (see
-    ``hooks.py`` ``HiddenCapture``).
-
-    - ``INCREMENTAL`` — a full-reading live consumer wants per-token readings:
-      score each token live (full roster) into ``_incremental_readings``.
-    - ``LEAN_INCREMENTAL`` (FIX F2) — the only per-token consumers read axis-0
-      coords (trait stream / loom probe row): score each token ``coords_only`` and
-      re-score the full aggregate once at finalize from a bounded tail ring.
-    - ``AGGREGATE_ONLY`` — probes attached but nothing consumes a per-token
-      reading (e.g. stateless server gen): NO per-token scoring, pool the last
-      content token once at finalize from a bounded tail ring.
-    - ``GATING_SUBSET`` (FIX #4) — per-token scoring is needed *only* to feed probe
-      gates: score just the gated subset per token (into ``_incremental_gate_scores``)
-      while a tail ring lets finalize pool the FULL roster once.
-    - ``FULL`` — full-retention append (``return_hidden`` widen, or any
-      non-incremental read), or the degenerate no-probe / capture-disabled state:
-      distinct clones per step so ``stacked()`` builds the full ``[T, D]``.
-    """
-
-    INCREMENTAL = "incremental"
-    LEAN_INCREMENTAL = "lean_incremental"
-    AGGREGATE_ONLY = "aggregate_only"
-    GATING_SUBSET = "gating_subset"
-    FULL = "full"
-
-
-@dataclass
-class CaptureState:
-    """Per-generation capture configuration — the legal-by-construction state.
-
-    Carries the one :class:`CaptureMode` plus the orthogonal ``persistent`` flag
-    (capture rides the always-on compile-clean buffers rather than transient
-    per-gen hooks) and, for gated generations, the gated probe names / exact
-    scalar keys.  Set wholesale in :meth:`SaklasSession._begin_capture`; read by
-    the ``_score_*`` dispatch, the gating callback, and the streaming tap.  The
-    convenience predicates name the modes so the read sites stay legible.
-    """
-
-    mode: "CaptureMode" = CaptureMode.FULL
-    persistent: bool = False
-    gating_subset: "set[str] | None" = None
-    gating_keys: "set[str] | None" = None
-    final_probe_aggregate: bool = True
-
-    @property
-    def incremental(self) -> bool:
-        return self.mode is CaptureMode.INCREMENTAL
-
-    @property
-    def lean(self) -> bool:
-        return self.mode is CaptureMode.LEAN_INCREMENTAL
-
-    @property
-    def aggregate_only(self) -> bool:
-        # GATING_SUBSET also finalizes off the tail ring (its per-token rows feed
-        # only the gate), so it shares the aggregate-only full-roster pool when
-        # the caller still wants a final full probe aggregate.
-        return (
-            self.mode is CaptureMode.AGGREGATE_ONLY
-            or (
-                self.mode is CaptureMode.GATING_SUBSET
-                and self.final_probe_aggregate
-            )
-        )
 
 
 class ConcurrentGenerationError(RuntimeError, SaklasError):
@@ -6068,6 +5993,10 @@ class SaklasSession:
             self._capture.set_aggregate_tail(
                 _AGG_TAIL_DEPTH if final_probe_aggregate else 1
             )
+            # The armed retention IS an aggregate tail, so record it: leaving
+            # the FULL default here would make ``CaptureState`` describe a
+            # retention the capture never installed.
+            self._capture_state.mode = CaptureMode.AGGREGATE_ONLY
             self._monitor.enable_curved_warm(False)
         else:
             # FULL retention (the ``CaptureState`` default): return_hidden full
