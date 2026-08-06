@@ -626,3 +626,110 @@ def test_load_model_falls_back_to_full_load_on_no_text_weights():
     assert from_pretrained_called, (
         "a failed extraction must fall back to the standard full load"
     )
+
+
+# ---------------------------------------------------------------------------
+# The load-plan seam: decisions without weight I/O
+# ---------------------------------------------------------------------------
+
+
+def _plan(cfg: _FakeConfig, **kwargs: Any):
+    """Resolve a load plan against a mocked AutoConfig — reads no weights."""
+    with patch.object(model_mod, "AutoConfig") as mock_cfg:
+        mock_cfg.from_pretrained.return_value = cfg
+        return model_mod._resolve_load_plan(
+            "fake/repo",
+            quantize=kwargs.pop("quantize", None),
+            device=kwargs.pop("device", "cpu"),
+            dtype=kwargs.pop("dtype", None),
+        )
+
+
+def test_plan_resolves_decisions_without_loading_weights():
+    """Every ``load_model`` decision is inspectable before any weight read.
+
+    ``AutoModelForCausalLM`` is deliberately not patched here: reaching it
+    would fail the test, which is the point — the plan step must not load.
+    """
+    plan = _plan(_FakeConfig("qwen3"), device="cpu")
+    assert plan.model_id == "fake/repo"
+    assert plan.device == "cpu"
+    assert plan.dtype is torch.float32
+    assert plan.load_kwargs["attn_implementation"] == "sdpa"
+    assert plan.load_kwargs["device_map"] == {"": "cpu"}
+    assert plan.extract_text_model is False
+
+
+def test_plan_flags_text_extraction_for_supported_submodel():
+    plan = _plan(_FakeConfig("some_vlm", text_model_type="qwen3"), device="cpu")
+    assert plan.extract_text_model is True
+    assert plan.text_config is not None
+
+    # A text_config saklas has no accessor for stays a full-model load.
+    plan = _plan(_FakeConfig("some_vlm", text_model_type="not_a_family"))
+    assert plan.extract_text_model is False
+
+
+def test_plan_forces_eager_for_mla_on_mps():
+    """The MLA/MPS carve-out is a plan decision, testable on its own."""
+    for model_type in ("deepseek_v2", "deepseek_v3"):
+        plan = _plan(_FakeConfig(model_type), device="mps")
+        assert plan.load_kwargs["attn_implementation"] == "eager"
+    # Narrow: a vanilla architecture on MPS keeps sdpa, and MLA on CPU too.
+    assert _plan(
+        _FakeConfig("qwen3"), device="mps",
+    ).load_kwargs["attn_implementation"] == "sdpa"
+    assert _plan(
+        _FakeConfig("deepseek_v2"), device="cpu",
+    ).load_kwargs["attn_implementation"] == "sdpa"
+
+
+def test_plan_drops_quantization_off_cuda():
+    with pytest.warns(UserWarning, match="requires CUDA"):
+        plan = _plan(_FakeConfig("qwen3"), device="mps", quantize="4bit")
+    assert plan.quantize is None
+    assert "quantization_config" not in plan.load_kwargs
+    assert plan.load_kwargs["dtype"] is plan.dtype
+
+
+def test_plan_pins_the_resolved_revision():
+    cfg = _FakeConfig("qwen3")
+    cfg._commit_hash = "deadbeef"
+    plan = _plan(cfg)
+    assert plan.revision == "deadbeef"
+    assert plan.pin_kwargs == {"revision": "deadbeef"}
+    assert plan.load_kwargs["revision"] == "deadbeef"
+
+
+def test_plan_adds_the_mistral_tokenizer_fix_by_model_id():
+    with patch.object(model_mod, "AutoConfig") as mock_cfg:
+        mock_cfg.from_pretrained.return_value = _FakeConfig("mistral")
+        mistral = model_mod._resolve_load_plan(
+            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+            quantize=None, device="cpu", dtype=None,
+        )
+        other = model_mod._resolve_load_plan(
+            "Qwen/Qwen3-4B", quantize=None, device="cpu", dtype=None,
+        )
+    assert mistral.tokenizer_kwargs["fix_mistral_regex"] is True
+    assert "fix_mistral_regex" not in other.tokenizer_kwargs
+
+
+def test_load_with_fallbacks_narrows_attn_then_dtype_in_place():
+    """The retry ladder rewrites the plan's kwargs so retries compose."""
+    plan = _plan(_FakeConfig("qwen3"), device="cpu")
+    calls: list[dict[str, Any]] = []
+
+    def _first_attn_then_ok(model_id: str, **kwargs: Any):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise ValueError("model does not support an attention implementation")
+        return _FakeModel(kwargs["attn_implementation"])
+
+    with patch.object(model_mod, "AutoModelForCausalLM") as mock_model:
+        mock_model.from_pretrained.side_effect = _first_attn_then_ok
+        model_mod._load_with_fallbacks(plan)
+
+    assert calls[0]["attn_implementation"] == "sdpa"
+    assert calls[1]["attn_implementation"] == "eager"
+    assert plan.load_kwargs["attn_implementation"] == "eager"
