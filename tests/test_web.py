@@ -277,6 +277,29 @@ class TestRemovedDashboardSurfaces:
             assert client.get(path).status_code == 404
 
 
+class TestRepeatMount:
+    """``register_web_routes`` is not idempotent — a second call appends a
+    duplicate mount and duplicate routes that the first ones shadow.  The
+    docstring says so; pin the behaviour it describes."""
+
+    def test_second_call_appends_shadowed_routes_and_still_serves(
+        self, web_client: Any,
+    ) -> None:
+        from saklas.web import register_web_routes
+
+        _session, client = web_client
+        app = client.app
+        before = len(app.routes)
+
+        register_web_routes(app)
+
+        assert len(app.routes) > before
+        # The first registration keeps winning: FastAPI matches in
+        # registration order, so the dashboard still serves normally.
+        assert client.get("/").status_code == 200
+        assert client.get("/styleguide").status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # monitor.score_single_token_per_layer — un-aggregated heatmap source.
 # ---------------------------------------------------------------------------
