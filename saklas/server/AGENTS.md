@@ -14,6 +14,7 @@ generation across all three protocols serializes on one `asyncio.Lock`
 | `ollama.py` | The `/api/*` shim (`register_ollama_routes`) |
 | `native_routes.py` | `register_saklas_routes` — mounts the native sub-registrars in order |
 | `native_common.py` | Single-session id resolution, the strict `NativeRequest` base, `refuse_if_busy`, the shared extraction error policy |
+| `response_models.py` | The response `TypedDict`s every non-streaming native route annotates — the schema `scripts/generate_webui_types.py` renders `webui/src/lib/types.gen.ts` from |
 | `session_routes.py` / `session_models.py` | `/sessions` CRUD, clear/rewind, steering validation, `session_info` |
 | `manifold_routes.py` | `/manifolds/*` — authoring, merge, install, generate, fit, search |
 | `template_routes.py` | `/templates/*` — the templated-completion artifact + its scorer |
@@ -403,8 +404,8 @@ Dispatch is **table-driven**, not a chain of `if family == …` branches: the
 operation answers from the declaration (including its status and message).
 `require_family` validates `{family}` against the registry itself, so the table
 and the registry cannot disagree about which families exist. Response shapes
-are declared as `TypedDict`s that `tests/test_measurements_envelope.py` pins,
-so wire drift fails a test rather than a dashboard.
+live in `response_models.py` with the rest of the native tree's, and
+`tests/test_measurements_envelope.py` pins the envelope's key sets.
 
 | Family | `sources` | `preparations` | `token_readout` | `source_switch` |
 |---|---|---|---|---|
