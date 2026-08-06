@@ -87,8 +87,8 @@ from saklas.core.results import (
     TokenEvent,
 )
 from saklas.core.sampling import SamplingConfig
-from saklas.core.steering import Steering
-from saklas.core.steering_expr import AblationTerm, ManifoldTerm, ProjectedTerm
+from saklas.core.steering import SteeringStackEntry, Steering
+from saklas.core.steering_expr import ManifoldTerm
 from saklas.core.manifold import Manifold
 
 if TYPE_CHECKING:
@@ -588,14 +588,6 @@ class ConcurrentExtractionError(RuntimeError, SaklasError):
 
     def user_message(self) -> tuple[int, str]:
         return (409, str(self) or self.__class__.__name__)
-
-
-# Internal steering-stack entry shape: additive entries are
-# ``(alpha, Trigger)`` tuples; ablation entries are ``AblationTerm``
-# values carrying their own coeff + trigger + target.  The union flows
-# through the stack, ``flatten_stack``, ``push``/``pop``, and is
-# dispatched by type in ``SteeringComposer.compose_steering_entries``.
-SteeringStackEntry = tuple[float, Trigger] | AblationTerm | ManifoldTerm
 
 
 def _affine_manifold_push(
@@ -1444,23 +1436,17 @@ class SaklasSession:
         # payloads are expected to be present in their own cache already;
         # failure is non-fatal so an offline cache eviction cannot prevent the
         # model itself from starting.
-        from saklas.io.sae import load_active_sae_source, load_sae_metadata
+        from saklas.io.sae import load_active_sae
 
-        active_sae = load_active_sae_source(self.model_id)
+        # ``load_active_sae`` owns the source grammar: it renders the
+        # selection into the public ``local:<name>`` / bare-release form and
+        # reads the provider binding only when there is one.  Provider
+        # bindings remember the last explicitly selected hook layer, so the
+        # restore lands that exact measurement surface rather than silently
+        # returning to the release's automatic default.
+        active_sae = load_active_sae(self.model_id)
         if active_sae is not None:
-            release = (
-                f"local:{active_sae['name']}"
-                if active_sae["kind"] == "local"
-                else active_sae["name"]
-            )
-            # Provider bindings remember the last explicitly selected hook
-            # layer. Restore that exact measurement surface rather than
-            # silently returning to the release's automatic default.
-            metadata = (
-                load_sae_metadata(self.model_id, release)
-                if active_sae["kind"] == "saelens"
-                else None
-            )
+            release, metadata = active_sae
             layer = metadata.get("layer") if metadata is not None else None
             try:
                 self.load_sae(release, layer=layer)
@@ -3640,14 +3626,12 @@ class SaklasSession:
 
     def _active_jlens_source_label(self) -> str | None:
         """Return the active J-lens source in the public source syntax."""
-        from saklas.io.lens_sources import load_active_lens_source
+        from saklas.io.lens_sources import (
+            lens_source_label, load_active_lens_source,
+        )
 
         active = load_active_lens_source(self.model_id)
-        if active is None:
-            return None
-        if active["kind"] == "local":
-            return f"local:{active['name']}"
-        return str(active["name"])
+        return None if active is None else lens_source_label(active)
 
     def disable_live_lens(self) -> None:
         """Stop streaming the live lens readout and free the device J_l copies."""
@@ -3795,6 +3779,7 @@ class SaklasSession:
             save_sae_metadata,
             set_active_sae_source,
         )
+        from saklas.io.sae_artifacts import normalize_local_sae_name
 
         release = release.strip()
         if not release:
@@ -3837,7 +3822,7 @@ class SaklasSession:
             # provider backend.
             if isinstance(backend, LocalSaeBackend):
                 set_active_sae_source(
-                    self.model_id, "local", release.removeprefix("local:"),
+                    self.model_id, "local", normalize_local_sae_name(release),
                 )
             else:
                 save_sae_metadata(self.model_id, release, {
@@ -4662,8 +4647,9 @@ class SaklasSession:
         length directive is common-mode with the neutral corpus and with capture
         (it leads every system prompt), so it cancels at extraction.  Responses
         are emitted samples-outer / prompts-inner so ``response[i]`` aligns to
-        ``prompt[i % k]`` -- the alignment :func:`compute_node_centroid` and the
-        node corpus files assume.
+        ``prompt[i % k]`` -- the alignment
+        :func:`~saklas.core.manifold.compute_manifold_node_stats` and the node
+        corpus files assume.
 
         ``custom_system`` is the system template used for any concept whose
         ``kind`` is ``"custom"`` (``{c}`` = the humanized concept) -- the
@@ -5395,14 +5381,19 @@ class SaklasSession:
             )
         # Materialize any ProjectedTerm entries into derived profiles
         # registered in ``self._profiles`` under the synthetic key.
-        # Must run before ``normalized_entries`` because the normalized
-        # form flattens ``ProjectedTerm`` into ``(coeff, trigger)`` and
-        # loses the ``base`` / ``onto`` / ``operator`` fields.
+        # Must run before the classification below, which flattens
+        # ``ProjectedTerm`` into ``(coeff, trigger)`` and loses the
+        # ``base`` / ``onto`` / ``operator`` fields.
         composer = self._steering_composer
         snapshots = composer.materialize_projections(steering_obj)
-        raw_entries = steering_obj.normalized_entries()
+        # One walk of ``alphas`` yields all three consumer shapes.  Only the
+        # additive third takes pole-alias resolution; the ablation and
+        # manifold terms keep their whole term objects, and all three key
+        # spaces are disjoint (``<name>`` / ``!<target>`` /
+        # ``<manifold>%<position>``), so they merge without collision.
+        classified = steering_obj.classified()
         resolved: dict[str, SteeringStackEntry] = dict(
-            composer.resolve_pole_aliases(raw_entries)
+            composer.resolve_pole_aliases(classified.additive)
         )
 
         # Role-augmented extraction (role-extraction Phase 7):
@@ -5446,40 +5437,27 @@ class SaklasSession:
                 stacklevel=2,
             )
 
-        # Fold in ablation entries alongside additive/projection ones.
-        # ``normalized_entries`` strips ``AblationTerm`` values, so walk
-        # ``steering_obj.alphas`` directly.  Keys already carry the
-        # ``!<target>`` form from the parser and live in a disjoint
-        # namespace from plain/projection keys, so no collision is
-        # possible.  Attempt autoload for the target so a client can
-        # reference an installed pack without an explicit ``extract()``;
-        # genuine misses surface through ``_rebuild_steering_hooks``
-        # uniformly with the additive path.
-        for key, val in steering_obj.alphas.items():
-            if not isinstance(val, AblationTerm):
-                continue
-            target = val.target
+        # Fold in ablation entries alongside the additive/projection ones.
+        # Attempt autoload for each target so a client can reference an
+        # installed pack without an explicit ``extract()``; genuine misses
+        # surface through ``_rebuild_steering_hooks`` uniformly with the
+        # additive path.
+        for key, ablation in classified.ablations.items():
+            target = ablation.target
             if target not in self._profiles:
                 # Resolve via the unified fitted-manifold path. A miss or
                 # non-raw variant error surfaces at hook-install with the
                 # shared ProfileNotRegisteredError shape.
                 with suppress(Exception):
                     self.ensure_profile_registered(target, role="ablation")
-            resolved[key] = val
-        # Fold in manifold terms.  Like ablation, ``normalized_entries``
-        # strips ``ManifoldTerm`` values, so walk ``alphas`` directly.
-        # Keys carry the ``<manifold>%<pos>`` form — disjoint from
-        # plain/projection/ablation keys.  The manifold artifact is
-        # loaded into ``self._manifolds`` here so a miss surfaces
-        # eagerly (``ManifoldNotRegisteredError``) rather than at hook
-        # install.
-        manifold_terms: list[ManifoldTerm] = []
-        for key, val in steering_obj.alphas.items():
-            if not isinstance(val, ManifoldTerm):
-                continue
-            self.ensure_manifold_loaded(val.manifold)
-            resolved[key] = val
-            manifold_terms.append(val)
+            resolved[key] = ablation
+        # Fold in manifold terms.  The artifact is loaded into
+        # ``self._manifolds`` here so a miss surfaces eagerly
+        # (``ManifoldNotRegisteredError``) rather than at hook install.
+        manifold_terms: list[ManifoldTerm] = list(classified.manifolds.values())
+        for key, term in classified.manifolds.items():
+            self.ensure_manifold_loaded(term.manifold)
+            resolved[key] = term
 
         # Role-paired manifold steering (Phase A.4): each manifold term
         # implies a role via its nearest-node lookup.  Aggregate across
@@ -10142,18 +10120,7 @@ class SaklasSession:
         steering_obj: Steering | None,
     ) -> bool:
         """HF ``generate`` can batch only trigger-free/``Trigger.BOTH`` terms."""
-        if steering_obj is None:
-            return True
-        for entry in steering_obj.alphas.values():
-            if isinstance(entry, (ProjectedTerm, AblationTerm, ManifoldTerm)):
-                trigger = entry.trigger
-            elif isinstance(entry, tuple):
-                trigger = entry[1]
-            else:
-                trigger = steering_obj.trigger
-            if trigger is not Trigger.BOTH:
-                return False
-        return True
+        return steering_obj is None or steering_obj.triggers() <= {Trigger.BOTH}
 
     def _batch_generate_model(self) -> Any | None:
         """Model object exposing ``generate``; unwrap compiled modules if needed."""

@@ -1143,8 +1143,9 @@ export interface LoomTokenRowJSON {
    *  (``score_single_token``), persisted at append time.  Drives the
    *  highlight tint when the user rehydrates a tree across page refresh. */
   probes?: Record<string, number>;
-  /** Per-layer × per-probe heatmap (``score_single_token_per_layer``),
-   *  keyed by stringified layer index.  Drives the token-drilldown
+  /** Per-layer × per-probe heatmap — each reading's ``coords_per_layer``
+   *  axis 0, flattened server-side by ``token_payloads._per_layer_axis0``
+   *  and keyed by stringified layer index.  Drives the token-drilldown
    *  drawer's heatmap on rehydrated turns. */
   per_layer_scores?: Record<string, Record<string, number>>;
   /** The 5.x measurement envelope captured by the original generation. This

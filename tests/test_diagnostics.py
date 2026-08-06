@@ -1,10 +1,9 @@
 """Per-layer diagnostics carried as free-form Profile provenance.
 
-Nothing in saklas writes profile diagnostics — the unified pipeline's
-``PcaDiagnostics`` / ``SpectralDiagnostics`` ride the *manifold* sidecar
-instead.  What these cover is the surface a caller stashing its own
-metrics gets: the provenance blob round-trips them and
-``Profile.diagnostics`` / ``Profile.has_diagnostics`` read them back.
+The unified pipeline's ``PcaDiagnostics`` / ``SpectralDiagnostics`` ride the
+*manifold* sidecar, not the profile one.  What these cover is what a caller
+stashing its own metrics gets from the profile wire format: an arbitrary
+provenance blob that survives the save/load round trip.
 """
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ import pytest
 import torch
 
 from saklas.core import profile as V
-from saklas.core.profile import Profile
 
 
 class TestProvenanceRoundTrip:
@@ -69,35 +67,3 @@ class TestProvenanceRoundTrip:
 
         _, meta = V.load_profile(str(path))
         assert "diagnostics" not in meta
-
-
-class TestProfileSurface:
-    def test_profile_diagnostics_property(self) -> None:
-        diagnostics = {0: {"evr": 0.7, "intra_pair_variance_mean": 1.2}}
-        p = Profile(
-            {0: torch.ones(4)},
-            metadata={"method": "profile", "diagnostics": diagnostics},
-        )
-        assert p.has_diagnostics is True
-        out = p.diagnostics
-        assert out is not None
-        assert out[0]["evr"] == pytest.approx(0.7)
-
-    def test_profile_diagnostics_absent_returns_none(self) -> None:
-        p = Profile({0: torch.ones(4)}, metadata={"method": "profile"})
-        assert p.has_diagnostics is False
-        assert p.diagnostics is None
-
-    def test_profile_diagnostics_returns_defensive_copy(self) -> None:
-        diagnostics = {0: {"evr": 0.5}}
-        p = Profile(
-            {0: torch.ones(4)},
-            metadata={"method": "profile", "diagnostics": diagnostics},
-        )
-        out = p.diagnostics
-        assert out is not None
-        out[0]["evr"] = 999.0
-        # Cached metric dict is untouched by mutation through the surface.
-        again = p.diagnostics
-        assert again is not None
-        assert again[0]["evr"] == pytest.approx(0.5)

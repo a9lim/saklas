@@ -292,6 +292,7 @@ def _load_local_sae_backend(
     from saklas.io.sae_artifacts import (
         load_local_sae_manifest,
         load_local_sae_tensors,
+        local_sae_release,
         normalize_local_sae_name,
     )
 
@@ -323,7 +324,9 @@ def _load_local_sae_backend(
         layers=frozenset({layer}),
         model_fingerprint=manifest.get("model_fingerprint"),
         _loader=_load,
-        sae_ids_by_layer={str(layer): f"local:{name}:layer-{layer}"},
+        sae_ids_by_layer={
+            str(layer): f"{local_sae_release(name)}:layer-{layer}",
+        },
     )
 
 
@@ -534,7 +537,9 @@ def load_sae_backend(
         SaeReleaseNotFoundError: release not in the SAELens registry.
         SaeModelMismatchError: release's base model != requested ``model_id``.
     """
-    if release.strip().startswith("local:"):
+    from saklas.io.sae_artifacts import is_local_sae_release
+
+    if is_local_sae_release(release):
         return _load_local_sae_backend(
             release, model_id=model_id, device=device, dtype=dtype,
         )

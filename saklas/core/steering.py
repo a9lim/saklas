@@ -54,6 +54,41 @@ AlphaEntry = Union[
     "ManifoldTerm",
 ]
 
+#: One entry of a pushed steering scope, after ``Steering.classified()`` has
+#: flattened the additive kinds.  Three shapes survive: the ``(alpha,
+#: Trigger)`` pair every scalar term lowers to, and the two term objects whose
+#: extra fields don't fit that pair.  :func:`entry_trigger` / :func:`entry_coeff`
+#: are the readers — every consumer that only needs one of those two fields
+#: should go through them rather than re-deriving the three-way split.
+SteeringStackEntry = Union[
+    "tuple[float, Trigger]",
+    "AblationTerm",
+    "ManifoldTerm",
+]
+
+
+def entry_trigger(entry: SteeringStackEntry) -> Trigger:
+    """The trigger a stack entry fires under, whatever shape it is."""
+    from saklas.core.steering_expr import AblationTerm, ManifoldTerm
+
+    if isinstance(entry, (AblationTerm, ManifoldTerm)):
+        return entry.trigger
+    return entry[1]
+
+
+def entry_coeff(entry: SteeringStackEntry) -> float:
+    """The scalar strength a stack entry carries, whatever shape it is.
+
+    For a manifold term this is ``coeff`` — the ``along`` half of the
+    ``along[,onto]`` pair — which is what the flat ``{name: alpha}`` views
+    report.
+    """
+    from saklas.core.steering_expr import AblationTerm, ManifoldTerm
+
+    if isinstance(entry, (AblationTerm, ManifoldTerm)):
+        return float(entry.coeff)
+    return float(entry[0])
+
 
 @dataclass(frozen=True)
 class Steering:
@@ -146,6 +181,21 @@ class Steering:
                 additive[name] = (float(val), default)
         return SteeringEntries(
             additive=additive, ablations=ablations, manifolds=manifolds,
+        )
+
+    def triggers(self) -> set[Trigger]:
+        """Every trigger this steering's terms actually fire under.
+
+        Bare floats contribute :attr:`trigger`; every other entry kind
+        contributes its own.  Triggers are frozen and hashable, so the set
+        answers "does anything here run outside ``Trigger.BOTH``?" in one
+        comparison.
+        """
+        entries = self.classified()
+        return (
+            {trig for _alpha, trig in entries.additive.values()}
+            | {term.trigger for term in entries.ablations.values()}
+            | {term.trigger for term in entries.manifolds.values()}
         )
 
     def normalized_entries(self) -> "dict[str, tuple[float, Trigger]]":

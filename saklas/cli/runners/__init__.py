@@ -57,7 +57,6 @@ from saklas.cli.runners.manifold import (
     _VARIANT_SUFFIX_RE,
     _fold_all_fitted_manifolds,
     _fold_manifold_to_profile_with_identity,
-    _print_diagnostics,
     _print_why_histogram,
     _require_model,
     _run_manifold,

@@ -19,6 +19,7 @@ from saklas.io.atomic import artifact_lock, fsync_directory, write_json_atomic
 from saklas.io.integrity import NAME_REGEX, hash_file
 from saklas.io.paths import ensure_within, model_dir
 from saklas.io.sae import (
+    LOCAL_SOURCE_PREFIX,
     SAE_SOURCES,
     load_active_sae_source,
     sae_runtime_dir,
@@ -52,17 +53,21 @@ _MANIFEST_FIELDS = {
 }
 
 
+def is_local_sae_release(value: str) -> bool:
+    """True iff ``value`` names a Saklas-trained artifact rather than a provider
+    release — the one place the source grammar's ``local:`` prefix is tested."""
+    return value.strip().startswith(LOCAL_SOURCE_PREFIX)
+
+
 def normalize_local_sae_name(value: str) -> str:
-    value = value.strip()
-    if value.startswith("local:"):
-        value = value[6:]
+    value = value.strip().removeprefix(LOCAL_SOURCE_PREFIX)
     if _LOCAL_NAME_RE.fullmatch(value) is None:
         raise ValueError(f"local SAE name must match {_LOCAL_NAME_RE.pattern}")
     return value
 
 
 def local_sae_release(name: str) -> str:
-    return f"local:{normalize_local_sae_name(name)}"
+    return f"{LOCAL_SOURCE_PREFIX}{normalize_local_sae_name(name)}"
 
 
 def local_sae_root(model_id: str) -> Path:

@@ -87,9 +87,45 @@ def _run_sae_train(args: argparse.Namespace) -> None:
     print(f"Artifact: {result['artifact']}")
 
 
+def _model_shape_from_config(model_id: str) -> tuple[int, int]:
+    """``(n_layers, hidden_dim)`` for ``model_id`` without loading weights.
+
+    Reads the published config and unwraps a multimodal ``text_config``, so
+    the numbers match what a loaded session would report — which is what the
+    SAE's covered-layer and residual-width checks compare against.
+    """
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_id)
+    text_config = getattr(config, "text_config", config)
+    n_layers = getattr(
+        text_config, "num_hidden_layers", getattr(text_config, "n_layer", None),
+    )
+    hidden = getattr(
+        text_config, "hidden_size", getattr(text_config, "n_embd", None),
+    )
+    if not isinstance(n_layers, int) or isinstance(n_layers, bool):
+        raise ValueError(f"{model_id} config declares no layer count")
+    if not isinstance(hidden, int) or isinstance(hidden, bool):
+        raise ValueError(f"{model_id} config declares no hidden size")
+    return int(n_layers), int(hidden)
+
+
 def _run_sae_fetch(args: argparse.Namespace) -> None:
+    """Resolve a provider SAE release and pin its binding — no model load.
+
+    The ``lens fetch`` shape: provider weights land in the Hugging Face cache
+    and Saklas persists only the resolved release/layer binding.  Everything
+    ``load_sae`` validates for an external release is provable without the
+    base model — registry compatibility from the release entry, covered
+    layers against the config's layer count, and the decoder row against its
+    hidden size — so the transformer is never instantiated.
+    """
     import json
-    from saklas.core.session import SaklasSession
+    from saklas.core.sae import (
+        load_sae_backend, select_runtime_layer, validate_residual_width,
+    )
+    from saklas.io.sae import save_sae_metadata
 
     if not args.source.startswith("saelens:"):
         print("sae fetch: source must be saelens:RELEASE", file=sys.stderr)
@@ -98,25 +134,51 @@ def _run_sae_fetch(args: argparse.Namespace) -> None:
     if not release:
         print("sae fetch: release must not be empty", file=sys.stderr)
         sys.exit(2)
-    _pkg._print_startup(args)
-    with SaklasSession.from_pretrained(
-        args.model, device=args.device, quantize=args.quantize, probes=[],
-    ) as session:
-        _pkg._print_model_info(session)
-        if not args.json_output:
-            # Mirror ``lens fetch``: announce before the provider download,
-            # which is otherwise silent when hub progress bars are off.
-            print(
-                f"Fetching {args.source} into Hugging Face cache...",
-                flush=True,
-            )
-        info = session.load_sae(release, layer=args.layer)
+    try:
+        n_layers, hidden_dim = _model_shape_from_config(args.model)
+    except (OSError, ValueError) as exc:
+        print(
+            f"sae fetch: could not read the config for {args.model}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not args.json_output:
+        # Mirror ``lens fetch``: announce before the provider download,
+        # which is otherwise silent when hub progress bars are off.
+        print(f"Fetching {args.source} into Hugging Face cache...", flush=True)
+    backend = load_sae_backend(
+        release, revision=args.revision, model_id=args.model,
+        device="cpu", dtype=None, warn_on_multiple=False,
+    )
+    covered = frozenset(idx for idx in backend.layers if 0 <= idx < n_layers)
+    selected = select_runtime_layer(covered, n_layers, args.layer)
+    width = int(backend.feature_count(selected))  # materializes the weights
+    if width <= 0:
+        print(f"sae fetch: release {release!r} has no features", file=sys.stderr)
+        sys.exit(1)
+    validate_residual_width(backend, selected, hidden_dim)
+    save_sae_metadata(args.model, release, {
+        "layer": selected,
+        "width": width,
+        "revision": backend.revision,
+        "fingerprint": backend.fingerprint,
+        "sae_id": backend.sae_ids_by_layer.get(str(selected)),
+        "repo_id": backend.repo_id,
+        "neuronpedia_id": backend.neuronpedia_ids_by_layer.get(str(selected)),
+    })
     if args.json_output:
-        print(json.dumps({"model": args.model, "source": args.source, **info}, indent=2))
+        print(json.dumps({
+            "model": args.model,
+            "source": args.source,
+            "layer": selected,
+            "width": width,
+            "revision": backend.revision,
+            "repo_id": backend.repo_id,
+        }, indent=2))
     else:
         print(
             f"Fetched {args.source} for {args.model}: "
-            f"L{info['layer']}, {info['width']} features"
+            f"L{selected}, {width} features"
         )
         print("Provider weights remain in the Hugging Face cache; binding is active.")
 

@@ -32,7 +32,7 @@ from saklas.core.profile import Profile
 def _profile_from_layers(layers: dict[int, list[float]]) -> Profile:
     return Profile(
         {layer: torch.tensor(values, dtype=torch.float32) for layer, values in layers.items()},
-        metadata={"method": "contrastive_pca"},
+        metadata={"method": "manifold_pca"},
     )
 
 

@@ -97,7 +97,8 @@ class CaptureState:
 
 
 # Default chunk size for the batched capture path (:func:`_encode_and_capture_all_batch`
-# and its callers ``compute_node_centroid`` / ``compute_neutral_activations``).  One
+# and its callers :func:`compute_neutral_activations` and
+# ``core.manifold.compute_manifold_node_stats``).  One
 # forward over up to this many (prompt, response) pairs replaces that many sequential
 # batch-1 forwards — the dominant extraction-capture cost.  Sized conservatively so a
 # chunk's attention working set (``B · heads · T²``) stays comfortable on a single
