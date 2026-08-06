@@ -29,6 +29,7 @@ from saklas.cli.runners.shared import (
     _print_model_info,
     _print_startup,
     _print_verb_menu,
+    _progress_printer,
     _resolve_manifold_folder,
     _resolve_manifold_ns_name,
     _resolve_probes,

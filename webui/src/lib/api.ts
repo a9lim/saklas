@@ -490,6 +490,46 @@ export async function apiManifoldFitStream(
   return final;
 }
 
+/** Streaming manifold install — an HF pull carries a per-model safetensors
+ *  payload, so the route narrates the stages (resolve / download / validate /
+ *  stage / install) as ``progress`` frames and ends with the same
+ *  manifold-detail ``done`` payload the plain JSON POST returns. */
+export async function apiManifoldInstallStream(
+  body: InstallManifoldRequest,
+  onEvent: (ev: { event: string; data: unknown }) => void,
+): Promise<ManifoldInfo> {
+  const path = `${MANIFOLDS_BASE}/install`;
+  const r = await fetch(path, {
+    method: "POST",
+    headers: authHeaders({
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const { text, json } = await parseBody(r);
+    throw new ApiError(r.status, path, text, json);
+  }
+  if (!r.body) throw new Error("manifold install: server returned no SSE body");
+  let final: ManifoldInfo | null = null;
+  let lastError: string | null = null;
+  for await (const evt of consumeSse(r.body)) {
+    onEvent(evt);
+    if (evt.event === "done" && evt.data && typeof evt.data === "object") {
+      final = evt.data as ManifoldInfo;
+    } else if (evt.event === "error") {
+      lastError =
+        (evt.data as { message?: string } | null)?.message ?? "install failed";
+    }
+  }
+  if (lastError) throw new Error(lastError);
+  if (!final) {
+    throw new Error("manifold install: stream ended without done event");
+  }
+  return final;
+}
+
 /** Streaming manifold generate — LLM-author a discover-mode folder from
  *  a flat concept list.  Mirrors ``apiManifoldFitStream`` shape: SSE
  *  progress events as the K-tuple generator runs, then a ``done`` event

@@ -75,7 +75,28 @@ def _resolve_probes(raw: list[str] | None) -> list[str] | None:
     return raw
 
 
+def _progress_printer(
+    args: argparse.Namespace,
+) -> "Callable[[str], None] | None":
+    """The CLI's standard indented progress sink, or ``None`` under ``-j``.
+
+    Every model-loading verb narrates the same way (``  <message>``); a verb
+    emitting machine-readable JSON on stdout suppresses it so the payload
+    stays parseable.
+    """
+    if getattr(args, "json_output", False):
+        return None
+    return lambda m: print(f"  {m}", flush=True)
+
+
 def _make_session(args: argparse.Namespace, *, load_probes: bool = True):
+    """Build the session for a CLI verb, narrating construction as it goes.
+
+    Session construction is not cheap: HF load, then (with the default probe
+    roster) the neutral/whitener forward pass and a fit for every bundled
+    concept not yet fitted for this model.  The printing ``on_progress``
+    callback is what keeps that from looking like a hang.
+    """
     from saklas.core.session import SaklasSession
     probe_categories = _resolve_probes(args.probes) if load_probes else []
     # ``~`` / ``|`` projection is Mahalanobis-only (closed-form LEACE);
@@ -101,6 +122,7 @@ def _make_session(args: argparse.Namespace, *, load_probes: bool = True):
         compile=compile_enabled,
         cuda_graphs=cuda_graphs_enabled,
         return_top_k=return_top_k,
+        on_progress=_progress_printer(args),
     )
 
 

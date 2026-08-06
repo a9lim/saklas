@@ -876,6 +876,7 @@ def load_model(
     *,
     compile: bool = False,
     compile_mode: str = "default",
+    on_progress: Callable[[str], None] | None = None,
 ) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     """Load a HuggingFace causal LM and its tokenizer.
 
@@ -905,6 +906,11 @@ def load_model(
             would shape-recompile per decode step).
             ``"max-autotune"`` runs Triton autotune (long first-call
             latency, marginal gains for decode-shape workloads).
+        on_progress: Optional per-step status sink.  The loader's own
+            status goes to ``log.info``, which is invisible unless the
+            embedding application configured logging — a library must not
+            configure it globally — so a CLI/server caller passes a callback
+            to surface the device / weights / memory lines instead.
 
     Returns:
         (model, tokenizer) tuple.  Compiled models still expose the
@@ -916,14 +922,19 @@ def load_model(
     if device == "mps":
         patch_torch_for_mps()
     log.info("Device: %s", device)
+    if on_progress is not None:
+        on_progress(f"Device: {device}")
 
     plan = _resolve_load_plan(model_id, quantize=quantize, device=device, dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, **plan.tokenizer_kwargs, **plan.pin_kwargs,
     )
+    if on_progress is not None:
+        on_progress(f"Loading weights ({plan.dtype})...")
     model = _materialize_model(plan)
     model = _finalize_model(
         model, tokenizer, plan, compile=compile, compile_mode=compile_mode,
+        on_progress=on_progress,
     )
     return cast(PreTrainedModel, model), tokenizer
 
@@ -1184,6 +1195,7 @@ def _finalize_model(
     *,
     compile: bool,
     compile_mode: str,
+    on_progress: Callable[[str], None] | None = None,
 ) -> Any:
     """Stamp identity, freeze, reconcile stop tokens, optionally compile."""
     # ``from_pretrained`` preserves the resolved Hub revision on an ordinary
@@ -1246,6 +1258,8 @@ def _finalize_model(
     mem_gb = _get_memory_gb(plan.device)
     if mem_gb > 0:
         log.info("Memory used: %.2f GB", mem_gb)
+        if on_progress is not None:
+            on_progress(f"Memory used: {mem_gb:.2f} GB")
 
     # --- compile (CUDA-only auto-enable) ---
     # Wrapping last so the compile artifact closes over weights that
@@ -1263,6 +1277,8 @@ def _finalize_model(
     # no structural change and never retraces across α changes between
     # generations.
     if compile and plan.device == "cuda":
+        if on_progress is not None:
+            on_progress(f"Compiling model with torch.compile(mode={compile_mode!r})...")
         model = _compile_with_probe(
             model, tokenizer, plan.device, mode=compile_mode,
         )
@@ -1272,6 +1288,11 @@ def _finalize_model(
             "(supported only on CUDA)",
             plan.device,
         )
+        if on_progress is not None:
+            on_progress(
+                f"compile=True but device={plan.device} — skipping "
+                f"torch.compile (supported only on CUDA)"
+            )
     return model
 
 

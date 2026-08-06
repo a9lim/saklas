@@ -34,7 +34,7 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import torch
 from safetensors import safe_open
@@ -383,10 +383,16 @@ def load_or_compute_neutral_activations(
     *,
     model_id: str,
     force: bool = False,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict[int, torch.Tensor]:
-    """Single-flight neutral-cache load/capture, returning activations only."""
+    """Single-flight neutral-cache load/capture, returning activations only.
+
+    ``on_progress`` narrates the cache-miss capture loop (per forward chunk);
+    a cache hit reports nothing because it runs no model.
+    """
     activations, _sidecar = load_or_compute_neutral_activations_with_metadata(
         model, tokenizer, layers, model_id=model_id, force=force,
+        on_progress=on_progress,
     )
     return activations
 
@@ -398,6 +404,7 @@ def load_or_compute_neutral_activations_with_metadata(
     *,
     model_id: str,
     force: bool = False,
+    on_progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Return activations plus the sidecar proven in the same transaction.
 
@@ -410,6 +417,7 @@ def load_or_compute_neutral_activations_with_metadata(
     with neutral_fit_lock(model_id):
         return _load_or_compute_neutral_activations_with_metadata_locked(
             model, tokenizer, layers, model_id=model_id, force=force,
+            on_progress=on_progress,
         )
 
 
@@ -420,6 +428,7 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
     *,
     model_id: str,
     force: bool = False,
+    on_progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Disk-cached per-statement activations for one model.
 
@@ -492,8 +501,13 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
             log.warning("Corrupt neutral activations cache for %s, recomputing: %s", model_id, e)
 
     log.info("Computing neutral activations (one-time per model)...")
+    if on_progress is not None:
+        on_progress(
+            f"Computing neutral activations for {model_id} "
+            f"(one-time per model, {len(pairs)} prompts)..."
+        )
     activations = compute_neutral_activations(
-        model, tokenizer, layers, rendered=prepared,
+        model, tokenizer, layers, rendered=prepared, on_progress=on_progress,
     )
 
     # Persist fp32 — the whitener covariance is built and inverted from these,

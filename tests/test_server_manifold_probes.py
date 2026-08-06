@@ -493,6 +493,103 @@ class TestManifoldCrudRoutes:
             "fitted": [],
         }
 
+    def test_install_route_streams_progress_over_sse(
+        self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``Accept: text/event-stream`` gets the same per-stage narration
+        the fit / generate routes ship — an HF pull is a long operation, so a
+        client must be able to show more than a spinner.
+        """
+        import json as _json
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        _session, client = session_and_client
+        installed_dir = MagicMock(spec=Path)
+        installed_dir.parent.name = "local"
+        installed_dir.name = "personas"
+
+        def _install(*_args: Any, on_progress: Any = None, **_kwargs: Any) -> Any:
+            assert on_progress is not None
+            on_progress("Downloading a9lim/personas from Hugging Face...")
+            on_progress("Validating staged a9lim/personas...")
+            return installed_dir
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.install_manifold", _install,
+        )
+        fake_folder = MagicMock()
+        fake_folder.name = "personas"
+        fake_folder.folder = Path("/tmp/.saklas/manifolds/local/personas")
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes._find_manifold",
+            lambda ns, name: fake_folder,
+        )
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes._manifold_json",
+            lambda mf, sess, *, full=False: {
+                "namespace": mf.folder.parent.name, "name": mf.name,
+            },
+        )
+
+        with client.stream(
+            "POST", "/saklas/v1/manifolds/install",
+            json={"target": "a9lim/personas"},
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/event-stream")
+            body = "".join(resp.iter_text())
+
+        assert "event: progress" in body
+        assert "Downloading a9lim/personas" in body
+        assert "Validating staged a9lim/personas" in body
+        done = body.split("event: done\ndata: ")[1].split("\n\n")[0]
+        assert _json.loads(done)["name"] == "personas"
+
+    def test_install_route_sse_error_frame_is_typed(
+        self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A conflict surfaces its own safe message, not the generic scrub."""
+        from saklas.io.hf_manifolds import ManifoldInstallConflict
+
+        _session, client = session_and_client
+
+        def _install(*_args: Any, **_kwargs: Any) -> Any:
+            raise ManifoldInstallConflict("destination already exists")
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.install_manifold", _install,
+        )
+        with client.stream(
+            "POST", "/saklas/v1/manifolds/install",
+            json={"target": "a9lim/personas"},
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            body = "".join(resp.iter_text())
+        assert "event: error" in body
+        assert "destination already exists" in body
+        assert "ManifoldInstallConflict" in body
+
+    def test_install_route_json_branch_still_maps_conflict_to_409(
+        self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The non-streaming branch keeps its typed status table."""
+        from saklas.io.hf_manifolds import ManifoldInstallConflict
+
+        _session, client = session_and_client
+
+        def _install(*_args: Any, **_kwargs: Any) -> Any:
+            raise ManifoldInstallConflict("destination already exists")
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.install_manifold", _install,
+        )
+        resp = client.post(
+            "/saklas/v1/manifolds/install", json={"target": "a9lim/personas"},
+        )
+        assert resp.status_code == 409
+
 
 # ---------------------------------------------------------------------------
 # OpenAI extension: x-saklas-probe-readings

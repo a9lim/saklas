@@ -130,6 +130,27 @@ def test_manifold_extract_parses() -> None:
     assert args.concept == ["happy", "sad"]
 
 
+def test_manifold_extract_kind_defaults_to_abstract() -> None:
+    args = cli.parse_args(["manifold", "extract", "happy", "sad"])
+    assert args.kind == "abstract"
+    assert args.custom_system is None
+
+
+def test_manifold_extract_kind_and_system_parse() -> None:
+    """``--kind`` / ``--system`` reach the 2-node path like ``generate``."""
+    args = cli.parse_args([
+        "manifold", "extract", "january", "july",
+        "--kind", "custom", "--system", "You are the month of {c}.",
+    ])
+    assert args.kind == "custom"
+    assert args.custom_system == "You are the month of {c}."
+
+
+def test_manifold_extract_rejects_unknown_kind() -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["manifold", "extract", "happy", "sad", "--kind", "nope"])
+
+
 def test_manifold_bake_parses() -> None:
     args = cli.parse_args(["manifold", "bake", "bard", "0.3 a + 0.4 b"])
     assert args.command == "manifold"

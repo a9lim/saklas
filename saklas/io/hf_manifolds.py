@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from saklas.core.errors import SaklasError
 from saklas.io.atomic import write_bytes_atomic
@@ -39,6 +39,18 @@ from saklas.io.staging import stage_verify_swap
 #: Row ceiling for a Hub search.  The picker renders one card per row, so a
 #: wider result set costs a slower search for a list nobody scrolls.
 _HF_SEARCH_CAP = 20
+
+#: Optional per-stage narration sink for an install.  An HF pull is a
+#: multi-hundred-megabyte network operation with a stage-verify-swap tail, so
+#: every caller (CLI, SSE route) wants the same five stages: ``resolve`` →
+#: ``download`` → ``validate`` → ``stage`` → ``swap``.
+ProgressCallback = Callable[[str], None]
+
+
+def _report(on_progress: ProgressCallback | None, message: str) -> None:
+    """Emit one install stage line when the caller asked for narration."""
+    if on_progress is not None:
+        on_progress(message)
 
 
 def _rewrite_staged_manifold_name(
@@ -105,14 +117,19 @@ def pull_manifold(
     *,
     force: bool,
     revision: Optional[str] = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
-    """Download and atomically install while holding the target folder lock."""
+    """Download and atomically install while holding the target folder lock.
+
+    ``on_progress`` receives one line per stage (see :data:`ProgressCallback`).
+    """
     from saklas.io.manifold_folder import _locked_manifest
     from saklas.io.selectors import invalidate as invalidate_selector_index
 
     with _locked_manifest(Path(target_folder)):
         installed = _pull_manifold_locked(
             coord, target_folder, force=force, revision=revision,
+            on_progress=on_progress,
         )
     # The installed roster changed; drop the resolver's memoized walks so a
     # freshly pulled manifold's node labels resolve in this process.
@@ -126,6 +143,7 @@ def _pull_manifold_locked(
     *,
     force: bool,
     revision: Optional[str] = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Download ``coord`` from HF and install into ``target_folder``.
 
@@ -156,6 +174,8 @@ def _pull_manifold_locked(
     if target_folder.exists() and not force:
         raise HFError(f"{target_folder} exists; pass force=True to overwrite")
 
+    label = f"{coord}@{revision}" if revision else coord
+    _report(on_progress, f"Downloading {label} from Hugging Face...")
     tmp_dir = Path(_download(coord, revision=revision))
 
     if not (tmp_dir / "manifold.json").is_file():
@@ -168,11 +188,13 @@ def _pull_manifold_locked(
     source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
 
     def _build(staging: Path) -> None:
+        _report(on_progress, f"Staging {label}...")
         _install_manifold(tmp_dir, staging, coord)
         # Validate the staged folder against the same loader the
         # session will see — catches format-version mismatches and a
         # populated-but-broken ``files`` manifest before we touch the
         # target.
+        _report(on_progress, f"Validating staged {label}...")
         try:
             staged = ManifoldFolder.load(staging)
         except ManifoldFormatError as e:
@@ -203,6 +225,9 @@ def _pull_manifold_locked(
                 f"{coord}: staged manifold failed re-validation after "
                 f"source stamp ({e})"
             ) from e
+        # ``stage_verify_swap`` promotes the staging dir as soon as ``build``
+        # returns, so this is the last narration point before the swap.
+        _report(on_progress, f"Installing {label} into {target_folder.name}...")
 
     def _swap() -> Path:
         return stage_verify_swap(
@@ -696,6 +721,7 @@ def install_manifold(
     as_: Optional[str] = None,
     *,
     force: bool = False,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Install a manifold from an HF coord or a local folder.
 
@@ -706,15 +732,21 @@ def install_manifold(
 
     ``as_`` overrides the destination ``<dst_ns>/<dst_name>`` (must be
     fully qualified — manifold folders are always namespace-rooted).
-    ``force`` overwrites an existing destination.
+    ``force`` overwrites an existing destination.  ``on_progress`` narrates
+    the stages (resolve → download → validate → stage → swap) so a CLI or an
+    SSE client can show more than a spinner while a multi-hundred-megabyte
+    repo lands.
     """
     from saklas.io.paths import manifold_dir
 
     from saklas.io.selectors import invalidate as invalidate_selector_index
 
+    _report(on_progress, f"Resolving {target}...")
     p = Path(target)
     if p.exists() and p.is_dir():
-        installed = _install_local_manifold(p, as_=as_, force=force)
+        installed = _install_local_manifold(
+            p, as_=as_, force=force, on_progress=on_progress,
+        )
         # The installed roster changed; drop the resolver's memoized walks.
         # (The HF branch below invalidates inside ``pull_manifold``.)
         invalidate_selector_index()
@@ -745,16 +777,21 @@ def install_manifold(
         raise ManifoldInstallConflict(
             f"{dst} already exists; pass force=True or as_=<ns>/<name> to relocate"
         )
-    pull_manifold(coord, target_folder=dst, force=force, revision=revision)
+    pull_manifold(
+        coord, target_folder=dst, force=force, revision=revision,
+        on_progress=on_progress,
+    )
     return dst
 
 
 def _install_local_manifold(
     src: Path, *, as_: Optional[str] = None, force: bool = False,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Validate and copy a local manifold folder into the cache."""
     from saklas.io.paths import manifold_dir
 
+    _report(on_progress, f"Validating {src.name}...")
     try:
         ManifoldFolder.load(src)
     except ManifoldFormatError as e:
@@ -804,6 +841,7 @@ def _install_local_manifold(
                 )
 
             def _build(staging: Path) -> None:
+                _report(on_progress, f"Staging {src.name}...")
                 shutil.copytree(source_path, staging, dirs_exist_ok=True)
                 try:
                     staged = ManifoldFolder.load(staging)
@@ -826,6 +864,8 @@ def _install_local_manifold(
                         f"{src}: staged local manifold failed re-validation "
                         f"after destination rename ({exc})"
                     ) from exc
+                # The swap follows immediately once ``build`` returns.
+                _report(on_progress, f"Installing {src.name} into {dst.name}...")
 
             def _swap() -> Path:
                 return stage_verify_swap(

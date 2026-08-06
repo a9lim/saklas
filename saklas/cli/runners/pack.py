@@ -198,9 +198,13 @@ def _run_pack_install(args: argparse.Namespace) -> None:
     from saklas.io.hf_manifolds import install_manifold
 
     # Announce before the network call — hub progress bars are suppressed
-    # off-TTY, so without this the verb is silent while it downloads.
+    # off-TTY, so without the preamble plus the per-stage callback the verb is
+    # silent while it downloads, validates, stages, and swaps.
     print(f"Installing {args.target}...", flush=True)
-    dst = install_manifold(args.target, args.as_target, force=args.force)
+    dst = install_manifold(
+        args.target, args.as_target, force=args.force,
+        on_progress=lambda m: print(f"  {m}", flush=True),
+    )
     print(f"Installed {args.target} -> {dst}")
 
 

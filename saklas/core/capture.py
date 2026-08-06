@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from importlib import resources as _resources
@@ -760,6 +760,7 @@ def compute_neutral_activations(
     device: torch.device | None = None,
     *,
     rendered: Sequence[tuple[torch.Tensor, int]] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict[int, torch.Tensor]:
     """Per-layer ``[N, D]`` stack across the neutral corpus.
 
@@ -774,6 +775,11 @@ def compute_neutral_activations(
     Used by cross-model alignment (:func:`saklas.io.alignment.fit_alignment`)
     which needs paired observations to fit Procrustes; the means alone (N=1)
     are degenerate for that fit.
+
+    ``on_progress`` receives one line per captured chunk (the same narration
+    surface :meth:`~saklas.core.session.SaklasSession.fit` and
+    ``generate_responses`` expose), so a caller building the whitener can show
+    the neutral pass rather than blocking silently.
 
     Storage cost: ~90 · n_layers · hidden_dim · 4B in fp32 (≈ 56MB on
     a 4096-dim, 80-layer model).  Callers persist this through
@@ -807,6 +813,10 @@ def compute_neutral_activations(
         start = 0
         while start < n:
             end = min(start + active_batch, n)
+            if on_progress is not None:
+                on_progress(
+                    f"Capturing neutral activations {start + 1}-{end}/{n}..."
+                )
             try:
                 per_layer = _encode_and_capture_all_batch(
                     model, tokenizer,
