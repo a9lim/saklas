@@ -32,7 +32,6 @@ import json
 import math
 import logging
 import sys
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,8 +49,19 @@ from saklas.core.profile import Profile
 from saklas.io.atomic import fsync_directory, write_bytes_atomic, write_json_atomic
 from saklas.io.paths import model_dir, safe_model_id
 from saklas.io.integrity import hash_file
+from saklas.io.shards import (
+    cleanup_generations,
+    fit_lock,
+    generation_path,
+    json_pointer_matches as _json_pointer_matches,
+    shard_paths,
+)
 
 log = logging.getLogger(__name__)
+
+# Artifact labels for the shared shard primitive's error/log wording.
+_NEUTRAL_LABEL = "neutral activation cache"
+_ALIGNMENT_LABEL = "alignment cache"
 
 _NEUTRAL_ACTS_NAME = "neutral_activations"
 _NEUTRAL_CACHE_FORMAT_VERSION = 4
@@ -159,71 +169,23 @@ def _neutral_acts_paths(model_id: str) -> tuple[Path, Path]:
     )
 
 
-def _neutral_generation_path(anchor: Path, layer: int) -> Path:
-    return anchor.with_name(
-        f"{anchor.stem}.layer-{int(layer)}.gen-{uuid.uuid4().hex}{anchor.suffix}",
-    )
-
-
 def _neutral_shard_paths(
     anchor: Path, sidecar: Mapping[str, Any], layers: list[int],
 ) -> dict[int, Path]:
-    files = sidecar.get("tensor_files")
-    if not isinstance(files, Mapping):
-        raise ValueError("neutral activation cache has no tensor shard map")
-    if {str(layer) for layer in layers} != {str(key) for key in files}:
-        raise ValueError("neutral tensor shard keys do not match layers")
-    out: dict[int, Path] = {}
-    for layer in layers:
-        filename = files.get(str(layer))
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or Path(filename).name != filename
-        ):
-            raise ValueError(f"invalid neutral shard for layer {layer}")
-        out[layer] = anchor.parent / filename
-    return out
-
-
-def _json_pointer_matches(path: Path, payload: Mapping[str, Any]) -> bool:
-    """Whether an exception escaped after this exact pointer was replaced."""
-    try:
-        with open(path) as handle:
-            current = json.load(handle)
-        return current == payload
-    except (OSError, json.JSONDecodeError, TypeError):
-        return False
+    return shard_paths(anchor, sidecar, layers, label=_NEUTRAL_LABEL)
 
 
 def _cleanup_neutral_generations(
     anchor: Path, sidecar: Mapping[str, Any],
 ) -> None:
-    files = sidecar.get("tensor_files")
-    keep = (
-        {str(filename) for filename in files.values() if isinstance(filename, str)}
-        if isinstance(files, Mapping) else set()
-    )
-    for path in (
-        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors"),
-        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors.tmp"),
-        anchor,
-        anchor.with_suffix(anchor.suffix + ".tmp"),
-    ):
-        if path.name not in keep:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                log.warning("could not remove old neutral generation %s: %s", path, exc)
+    cleanup_generations(anchor, sidecar, label=_NEUTRAL_LABEL)
 
 
 @contextmanager
 def neutral_fit_lock(model_id: str) -> Iterator[None]:
     """Single-flight lock for one model's expensive neutral forward pass."""
-    from saklas.io.atomic import artifact_lock
-
     ts_path, _ = _neutral_acts_paths(model_id)
-    with artifact_lock(ts_path.with_name(f"{ts_path.stem}.fit")):
+    with fit_lock(ts_path):
         yield
 
 
@@ -554,7 +516,7 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
         created: list[Path] = []
         try:
             for idx, tensor in sorted(fp32.items()):
-                path = _neutral_generation_path(ts_path, idx)
+                path = generation_path(ts_path, idx)
                 payload = save_safetensors({f"layer_{idx}": tensor})
                 write_bytes_atomic(path, payload)
                 created.append(path)
@@ -893,59 +855,21 @@ def alignment_cache_path(src_model_id: str, tgt_model_id: str) -> tuple[Path, Pa
     return anchor, sidecar_path
 
 
-def _alignment_generation_path(anchor: Path, layer: int) -> Path:
-    return anchor.with_name(
-        f"{anchor.stem}.layer-{int(layer)}.gen-{uuid.uuid4().hex}{anchor.suffix}",
-    )
-
-
 def _alignment_shard_paths(
     anchor: Path, sidecar: Mapping[str, Any], layers: list[int],
 ) -> dict[int, Path]:
-    files = sidecar.get("tensor_files")
-    if not isinstance(files, Mapping):
-        raise ValueError("alignment cache has no tensor shard map")
-    if {str(layer) for layer in layers} != {str(key) for key in files}:
-        raise ValueError("alignment tensor shard keys do not match shared layers")
-    out: dict[int, Path] = {}
-    for layer in layers:
-        filename = files.get(str(layer))
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or Path(filename).name != filename
-        ):
-            raise ValueError(f"invalid alignment shard for layer {layer}")
-        out[layer] = anchor.parent / filename
-    return out
+    return shard_paths(anchor, sidecar, layers, label=_ALIGNMENT_LABEL)
 
 
 def _cleanup_alignment_generations(anchor: Path, sidecar: Mapping[str, Any]) -> None:
-    files = sidecar.get("tensor_files")
-    keep = (
-        {str(filename) for filename in files.values() if isinstance(filename, str)}
-        if isinstance(files, Mapping) else set()
-    )
-    for path in (
-        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors"),
-        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors.tmp"),
-        anchor,
-        anchor.with_suffix(anchor.suffix + ".tmp"),
-    ):
-        if path.name not in keep:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                log.warning("could not remove old alignment generation %s: %s", path, exc)
+    cleanup_generations(anchor, sidecar, label=_ALIGNMENT_LABEL)
 
 
 @contextmanager
 def alignment_fit_lock(src_model_id: str, tgt_model_id: str) -> Iterator[None]:
     """Single-flight a complete directional alignment fit, including loads."""
-    from saklas.io.atomic import artifact_lock
-
     ts_path, _ = _alignment_anchor_paths(src_model_id, tgt_model_id)
-    with artifact_lock(ts_path.with_name(f"{ts_path.stem}.fit")):
+    with fit_lock(ts_path):
         yield
 
 
@@ -1044,7 +968,7 @@ def save_alignment_map(
         created: list[Path] = []
         try:
             for idx, alignment in sorted(normalized.items()):
-                path = _alignment_generation_path(anchor, idx)
+                path = generation_path(anchor, idx)
                 payload = save_safetensors({
                     "left": alignment.left.contiguous().cpu(),
                     "right": alignment.right.contiguous().cpu(),
