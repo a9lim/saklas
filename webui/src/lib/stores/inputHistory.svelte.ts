@@ -1,6 +1,6 @@
 /** In-memory command/input recall ring. */
 
-import { pendingActions } from "../stores.svelte";
+import { pendingActions } from "./pending.svelte";
 
 export const INPUT_HISTORY_MAX = 200;
 
@@ -67,9 +67,9 @@ export function pushInputHistory(text: string): void {
  * the live slot.
  *
  * Pulling a pending item sets :attr:`InputHistoryState.pulledSlot` —
- * Chat.svelte forwards it to ``sendGenerate`` / ``sendCommit`` /
- * ``sendPrefill`` as ``replaceSlot`` so a re-submitted edit lands at
- * its original slot rather than appending to the queue tail.  An
+ * Chat.svelte forwards it to ``sendSubmit`` as ``replaceSlot`` so a
+ * re-submitted edit lands at its original slot rather than appending
+ * to the queue tail.  An
  * empty re-submit on a pulled slot is the cancel gesture; the GUI's
  * per-bubble ``×`` is the symmetric mouse path.
  */
@@ -182,8 +182,8 @@ export function cancelInputPull(): string | null {
 }
 
 /** Consume + clear the currently-pulled slot index.  Called by the
- *  submit path so the caller can pass it as ``replaceSlot`` to the
- *  send / commit / prefill helpers, then reset cleanly. */
+ *  submit path so the caller can pass it as ``replaceSlot`` to
+ *  ``sendSubmit``, then reset cleanly. */
 export function consumePulledSlot(): number | null {
   const slot = inputHistory.pulledSlot;
   inputHistory.pulledSlot = null;

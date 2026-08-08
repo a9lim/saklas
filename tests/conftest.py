@@ -15,8 +15,8 @@ that want a constant log-uniform distribution, a seeded-random one, or a
 scripted argmax pass their own ``logits_fn`` and inherit everything else.
 
 What this deliberately does *not* unify: the config-introspection stubs
-(``test_model_loading``'s ``load_model`` stand-in, ``test_cuda_graphs``'s
-StaticCache probe) carry no forward pass, and ``test_vectors_capture``'s
+(``test_model_loading``'s ``load_model`` stand-in, ``test_static_cache``'s
+StaticCache probe) carry no forward pass, and ``test_capture``'s
 ``_ToyModel`` returns ``last_hidden_state`` (a real layer stack), not logits.
 Those have materially different shapes and stay local.
 """

@@ -52,9 +52,8 @@ def _stub_generate_core(session: SaklasSession, *, capture: list[Any]) -> None:
 
     def _fake(input: Any, *, steering: Any = None, sampling: Any = None, stateless: bool = False, raw: bool = False, thinking: Any = None, on_token: Any = None, **kwargs: Any) -> GenerationResult:
         # ``kwargs`` swallows additions to ``_generate_core``'s signature
-        # (v2.3 added ``parent_node_id`` and ``recipe_override``) so this
-        # stub doesn't churn every time the core gains a new optional
-        # keyword.
+        # (``parent_node_id``, ``recipe_override``, ...) so this stub doesn't
+        # churn every time the core gains a new optional keyword.
         idx = counter["n"]
         counter["n"] += 1
         capture.append({"input": input, "steering": steering})
@@ -103,13 +102,13 @@ class _BatchModel:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.config = SimpleNamespace(vocab_size=200)
+        self.generation_config = SimpleNamespace(eos_token_id=99)
 
     def named_parameters(self):
         return iter(())
 
     def named_buffers(self):
         return iter(())
-        self.generation_config = SimpleNamespace(eos_token_id=99)
 
     def generate(self, **kwargs: Any):
         import torch
@@ -137,6 +136,9 @@ class _BatchProbeMonitor:
         return {0}
 
     def enable_curved_warm(self, flag: bool) -> None:
+        del flag
+
+    def set_subspace_coords(self, flag: bool) -> None:
         del flag
 
     def score_aggregate(
@@ -185,7 +187,7 @@ def _fast_batch_session():
     s_any._gen_lock = threading.Lock()
     s._gen_phase = GenState.IDLE
     s._gen_state = GenerationState()
-    s_any._monitor = SimpleNamespace(probe_names=[])
+    s_any._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
     s._profiles = {}
     s._manifolds = {}
     s._default_return_top_k = 0
@@ -204,11 +206,10 @@ def _fast_batch_session():
         has_compiled_offsets=lambda: False,
         zero_compiled_offsets=lambda: None,
     )
-    s._live_lens = None
-    s._lens_probes = {}
-    s._sae_probes = {}
+    s._lens_instrument.live = None
+    s._lens_instrument.probes = {}
+    s._sae_instrument.probes = {}
     s._sae_layer = None
-    s._trait_queues = []
     s._active_gen_reservation = None
     s._last_token_probe_payload = None
     s._capture_state = CaptureState()
@@ -273,12 +274,15 @@ def _probe_fast_batch_session():
 class TestGenerateBatch:
     def _session(self):
         # Construct a minimal SaklasSession by bypassing __init__; the
-        # batch methods only need ``_generate_core`` to exist.
+        # batch methods only need ``_generate_core`` to exist.  These tests
+        # pin the SERIAL fan-out contract (prompt order, per-row steering /
+        # sampling pass-through), so the one-shot fast path is declined
+        # outright rather than through some incidental engine attribute.
         from saklas.core.session import SaklasSession
 
         s = SaklasSession.__new__(SaklasSession)
         s._steering_composer = SteeringComposer(s)
-        cast(Any, s)._trait_queues = [object()]
+        cast(Any, s)._generate_batch_fast = lambda *_a, **_kw: None
         return s
 
     def test_returns_results_in_prompt_order(self) -> None:
@@ -358,6 +362,27 @@ class TestGenerateBatch:
         assert "batch_tok_per_sec" in runset.metrics
         assert s.last_result is runset[-1]
 
+    def test_fast_path_passes_full_eos_set_to_model_generate(self) -> None:
+        # ``model.generate`` must stop on every EOS id the ordinary decode
+        # loop recognizes (generation_config + tokenizer + added
+        # end-of-turn specials) — the tokenizer's single ``eos_token_id``
+        # alone misses e.g. Gemma's ``<end_of_turn>``, and the batch would
+        # generate past it to the token cap.
+        s, model = _fast_batch_session()
+        # A distinct tokenizer identity keyed away from the shared
+        # ``_get_eos_ids`` cache, carrying an added end-of-turn special
+        # beyond the plain eos.
+        tok = _BatchTokenizer()
+        tok.name_or_path = "batch-test-tokenizer-eos-set"
+        tok.added_tokens_encoder = {"<end_of_turn>": 42}
+        cast(Any, s)._tokenizer = tok
+        model.generation_config = SimpleNamespace(eos_token_id=[99, 98])
+
+        s.generate_batch(["alpha", "beta", "gamma"], thinking=False)
+
+        assert len(model.calls) == 1
+        assert model.calls[0]["eos_token_id"] == [42, 98, 99]
+
     def test_greedy_batch_allows_seeded_sampling_config(self) -> None:
         from saklas.core.sampling import SamplingConfig
 
@@ -394,10 +419,14 @@ class TestGenerateBatch:
         assert [r.text for r in runset] == ["out_0", "out_1"]
         assert [c["input"] for c in capture] == ["alpha", "beta"]
 
-    def test_probes_fall_back_to_serial_generation(self) -> None:
+    def test_sae_probes_without_layer_fall_back_to_serial_generation(self) -> None:
+        # Geometry probes ride the batched aggregate-only capture ring, but an
+        # SAE feature probe needs a resident SAE layer to encode against; with
+        # none the batch declines to the serial loop rather than reading
+        # nothing.
         s, model = _fast_batch_session()
-        cast(Any, s._monitor).probe_names = ["mood"]
-        cast(Any, s)._trait_queues = [object()]
+        cast(Any, s)._sae_instrument.probes = {"sae/17": {"feature_id": 17}}
+        cast(Any, s)._sae_layer = None
         capture: list[Any] = []
         _stub_generate_core(s, capture=capture)
 
@@ -451,12 +480,12 @@ class TestGenerateBatch:
         from saklas.core.sae import MockSaeBackend
 
         s, model = _probe_fast_batch_session()
-        cast(Any, s)._monitor = SimpleNamespace(probe_names=[])
+        cast(Any, s)._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
         s._sae_backend = MockSaeBackend(layers=frozenset({0}), d_model=1, d_feature=1)
         s._sae_layer = 0
         s._sae_width = 1
         s._sae_feature_meta = {}
-        s._sae_probes = {
+        s._sae_instrument.probes = {
             "sae/0": {
                 "feature_id": 0,
                 "layer": 0,
@@ -483,9 +512,9 @@ class TestGenerateBatch:
         from saklas.core.sampling import SamplingConfig
 
         s, model = _probe_fast_batch_session()
-        cast(Any, s)._monitor = SimpleNamespace(probe_names=[])
+        cast(Any, s)._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
         s._sae_layer = 0
-        s._sae_probes = {
+        s._sae_instrument.probes = {
             "sae/0": {
                 "feature_id": 0,
                 "layer": 0,
@@ -511,9 +540,9 @@ class TestGenerateBatch:
     def test_lens_readout_probe_batch_fast_path_scores_per_row_aggregate(self) -> None:
         s, model = _probe_fast_batch_session()
         s_any = cast(Any, s)
-        s_any._monitor = SimpleNamespace(probe_names=[])
-        s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
-        s_any._lens_probe_layers = lambda: {0}
+        s_any._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
+        s_any._lens_instrument.probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
+        s_any._lens_instrument.probe_layers = lambda: {0}
 
         def _score_lens_probes(
             hidden: dict[int, Any],
@@ -547,14 +576,14 @@ class TestGenerateBatch:
 
         s, model = _probe_fast_batch_session()
         s_any = cast(Any, s)
-        s_any._monitor = SimpleNamespace(probe_names=[])
-        s_any._lens_probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
-        s_any._lens_probe_layers = lambda: {0}
+        s_any._monitor = SimpleNamespace(probe_names=[], set_subspace_coords=lambda _flag: None)
+        s_any._lens_instrument.probes = {"jlens/g": {"token_id": 1, "layers": [0]}}
+        s_any._lens_instrument.probe_layers = lambda: {0}
 
         def _score_lens_probes(*_args: Any, **_kwargs: Any) -> dict[str, ProbeReading]:
             raise AssertionError("return_probe_readings=False should skip lens probes")
 
-        s_any._score_lens_probes = _score_lens_probes
+        s_any._lens_instrument.score_probes = _score_lens_probes
 
         def _fail_generate_core(*args: Any, **kwargs: Any) -> GenerationResult:
             raise AssertionError("serial generation path should not run")
@@ -866,7 +895,7 @@ class TestPrefixCacheEligibility:
             return static_cache
 
         monkeypatch.setattr(
-            "saklas.core.cuda_graphs.make_static_cache", _make_static_cache,
+            "saklas.core.static_cache.make_static_cache", _make_static_cache,
         )
 
         class _Model:
@@ -1048,3 +1077,62 @@ class TestGenerateSweep:
         s = self._session()
         with pytest.raises(ValueError, match="non-empty list"):
             s.generate_sweep("test", sweep={"a": []})
+
+
+# ---------------------------------------------------------------------------
+# Batch-fast eligibility: only always-on steering can ride HF ``generate``.
+# ---------------------------------------------------------------------------
+
+
+class TestBatchFastSteeringGate:
+    """``_batch_fast_steering_is_always_on`` over every entry shape.
+
+    HF ``generate`` runs the whole batch in one call, so there is no per-step
+    hook re-evaluation to make a phased or gated trigger mean anything — the
+    gate has to see every entry kind, not just the additive ones.
+    """
+
+    @staticmethod
+    def _gate(value: str | None) -> bool:
+        from saklas.core.session import SaklasSession
+        from saklas.core.steering import Steering
+
+        return SaklasSession._batch_fast_steering_is_always_on(
+            Steering.from_value(value),
+        )
+
+    def test_unsteered_is_eligible(self) -> None:
+        assert self._gate(None) is True
+
+    @pytest.mark.parametrize(
+        "expr",
+        ["0.5 formal.casual", "!gone", "0.5 personas%hacker"],
+    )
+    def test_default_trigger_entries_are_eligible(self, expr: str) -> None:
+        assert self._gate(expr) is True
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "0.5 formal.casual@response",
+            "!gone@thinking",
+            "0.5 personas%hacker@after",
+            "0.5 formal.casual@when:confident.uncertain>0.4",
+        ],
+    )
+    def test_phased_or_gated_entries_are_not_eligible(self, expr: str) -> None:
+        assert self._gate(expr) is False
+
+    def test_one_phased_term_disqualifies_the_whole_expression(self) -> None:
+        assert self._gate("0.5 formal.casual + 0.3 warm.clinical@response") is False
+
+    def test_a_nondefault_steering_level_trigger_disqualifies(self) -> None:
+        """Bare floats inherit ``Steering.trigger``, so it counts too."""
+        from saklas.core.session import SaklasSession
+        from saklas.core.steering import Steering
+        from saklas.core.triggers import Trigger
+
+        steering = Steering(
+            alphas={"formal.casual": 0.5}, trigger=Trigger.GENERATED_ONLY,
+        )
+        assert SaklasSession._batch_fast_steering_is_always_on(steering) is False

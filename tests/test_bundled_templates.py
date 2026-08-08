@@ -61,9 +61,7 @@ def _wire(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pkg_root: Path) -> No
     pkg_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(templates_mod, "_resources", _FakeResources(pkg_root))
-    monkeypatch.setattr(
-        templates_mod, "_templates_materialized_this_process", False,
-    )
+    monkeypatch.setattr(templates_mod, "_templates_materialized_home", None)
 
 
 # --------------------------------------------------------------------------- #
@@ -154,3 +152,58 @@ def test_bundle_update_recopies_and_backs_up(
     refreshed = TemplateFolder.load(target)
     assert list(refreshed.values) == ["alpha", "beta"]   # bundled content won
     assert (target / "template.json.bak").exists()        # old copy preserved
+
+
+# --------------------------------------------------------------------------- #
+# the ordering invariant lives in one place
+# --------------------------------------------------------------------------- #
+
+
+def test_bootstrap_entry_point_runs_templates_before_manifolds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The order is load-bearing, so exactly one function may own it.
+
+    A bundled manifold may ``template_ref`` a bundled ``default/<name>``
+    template; its fit resolves that ref and raises ``TemplateNotFoundError``
+    if the template hasn't materialized yet.  Five bootstrap sites used to
+    each re-derive this from a copied comment, so a sixth would silently
+    violate it.
+    """
+    from saklas.io import bootstrap, manifolds as manifolds_mod
+    from saklas.io import templates as templates_mod
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        templates_mod, "materialize_bundled_templates",
+        lambda: order.append("templates"),
+    )
+    monkeypatch.setattr(
+        manifolds_mod, "materialize_bundled_manifolds",
+        lambda: order.append("manifolds"),
+    )
+    bootstrap.materialize_bundled_artifacts()
+    assert order == ["templates", "manifolds"]
+
+
+def test_every_bootstrap_site_uses_the_entry_point() -> None:
+    """No site may call the two materializers directly and re-derive the order."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "saklas"
+    owners = {
+        root / "io" / "bootstrap.py",
+        root / "io" / "manifolds.py",
+        root / "io" / "templates.py",
+        # ``refresh_manifold``'s bundled tier re-materializes one artifact
+        # kind on purpose; it is not a bootstrap.
+        root / "io" / "manifold_lifecycle.py",
+    }
+    offenders = [
+        str(path.relative_to(root.parent))
+        for path in root.rglob("*.py")
+        if path not in owners
+        and "materialize_bundled_templates(" in path.read_text()
+    ]
+    assert offenders == []
+

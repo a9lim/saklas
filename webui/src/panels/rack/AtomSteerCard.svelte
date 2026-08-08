@@ -1,54 +1,65 @@
 <script lang="ts">
-  // J-lens steer card — one racked ``α jlens/<word>`` token atom, wearing
-  // the same RackCard chrome as the concept steer cards.  J-lens family:
-  // blue accent, ■/□ marker.
+  // Atom steer card — one racked single-direction term, wearing the same
+  // RackCard chrome as the concept steer cards.  Both atom families share
+  // this component; the family table below is the whole difference.
   //
-  //   statline : ■/□ enable toggle · word · trigger pill · ✕
+  //   statline : ■/□ (lens) or ▲/△ (sae) enable toggle · atom id ·
+  //              trigger pill · ✕
   //   body     : one α slider row (per-card, NOT the shared subspace
-  //              along — lens atoms run hotter than concept vectors, so
-  //              each token needs its own dial; ≈0.3 is the sweet spot)
+  //              along — atoms run hotter than concept vectors, so each
+  //              one needs its own dial; ≈0.3 is the sweet spot)
 
-  import type { JLensSteerEntry } from "../../lib/types";
+  import type { AtomMode, AtomSteerEntry } from "../../lib/types";
   import Slider from "../../lib/Slider.svelte";
-  import {
-    removeJLensFromRack,
-    setJLensAlpha,
-    setJLensEnabled,
-    setJLensTrigger,
-  } from "../../lib/stores.svelte";
+  import { ATOM_PREFIX, atomActions } from "../../lib/stores.svelte";
   import RackCard from "./RackCard.svelte";
   import RackMarker from "./RackMarker.svelte";
+  import type { RackMarkerShape } from "./RackMarker.svelte";
   import { TRIGGER_LABEL, TRIGGER_WORD, nextTrigger } from "./triggers";
 
+  /** Per-family presentation — the hue ontology's lens-blue ■ and
+   *  sae-gold ▲, plus what the hover title calls the atom. */
+  const FAMILY: Record<
+    AtomMode,
+    { accent: string; marker: RackMarkerShape; noun: string }
+  > = {
+    jlens: { accent: "--pillar-lens", marker: "square", noun: "j-lens token atom" },
+    sae: { accent: "--pillar-sae", marker: "triangle", noun: "SAE decoder-row atom" },
+  };
+
   interface Props {
+    mode: AtomMode;
     name: string;
-    entry: JLensSteerEntry;
+    entry: AtomSteerEntry;
   }
 
-  let { name, entry }: Props = $props();
+  let { mode, name, entry }: Props = $props();
 
-  const word = $derived(name.slice("jlens/".length));
+  const family = $derived(FAMILY[mode]);
+  const actions = $derived(atomActions(mode));
+  const atomId = $derived(name.slice(ATOM_PREFIX[mode].length));
+
   function cycleTrigger(): void {
-    setJLensTrigger(name, nextTrigger(entry.trigger));
+    actions.setTrigger(name, nextTrigger(entry.trigger));
   }
 </script>
 
-<RackCard accent="--pillar-lens" disabled={!entry.enabled}>
+<RackCard accent={family.accent} disabled={!entry.enabled}>
   {#snippet statline()}
     <button
       type="button"
       class="enable"
       class:off={!entry.enabled}
-      onclick={() => setJLensEnabled(name, !entry.enabled)}
+      onclick={() => actions.setEnabled(name, !entry.enabled)}
       title={entry.enabled ? "disable" : "enable"}
       aria-pressed={entry.enabled}
       aria-label="Toggle steering for {name}"
     >
-      <RackMarker shape="square" filled={entry.enabled} />
+      <RackMarker shape={family.marker} filled={entry.enabled} />
     </button>
 
-    <span class="name" class:struck={!entry.enabled} title="j-lens token atom {name}">
-      {word}
+    <span class="name" class:struck={!entry.enabled} title="{family.noun} {name}">
+      {atomId}
     </span>
 
     <span class="spacer"></span>
@@ -66,7 +77,7 @@
     <button
       type="button"
       class="icon remove"
-      onclick={() => removeJLensFromRack(name)}
+      onclick={() => actions.remove(name)}
       aria-label="remove {name}"
       title="remove {name}"
     >
@@ -84,7 +95,7 @@
         step={0.05}
         ariaLabel="alpha for {name}"
         title="coefficient"
-        oninput={(v) => Number.isFinite(v) && setJLensAlpha(name, v)}
+        oninput={(v) => Number.isFinite(v) && actions.setAlpha(name, v)}
       />
       <span class="alpha-val" title="coefficient">{entry.alpha.toFixed(2)}</span>
     </div>

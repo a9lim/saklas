@@ -6,6 +6,12 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+
+from saklas.core.instruments.types import (
+    GeometryLiveState,
+    LensLiveState,
+    SaeLiveState,
+)
 from fastapi.testclient import TestClient
 
 from saklas.core.results import GenerationResult, RunSet, TokenEvent
@@ -51,17 +57,28 @@ def _mock_session():
     session.tree.get.return_value.mean_surprise = None
     session.is_base_model = False
     session.has_compatible_jlens.return_value = False
-    session.live_lens_layers = None
     session.sae_info = None
-    session.live_sae = False
-    session.live_probe_scores = True
     session.scene_grammar = None
     session.joint_logprob_cache = {}
-    session.lens_probe_names = []
-    session.sae_probe_names = []
-    session.lens_probe_specs = {}
-    session.sae_probe_specs = {}
     session.token_probe_payload = {}
+    # Read plane: the three instrument faces the routes and session_info read.
+    session.geometry.names = []
+    session.geometry.specs.return_value = {}
+    session.geometry.active_source = None
+    session.geometry.live_state = GeometryLiveState(enabled=True)
+    session.lens.names = []
+    session.lens.specs.return_value = {}
+    session.lens.active_source = None
+    session.lens.live_state = LensLiveState(enabled=False)
+    session.sae.names = []
+    session.sae.specs.return_value = {}
+    session.sae.active_source = None
+    session.sae.live_state = SaeLiveState(enabled=False)
+    session.instruments = {
+        "geometry": session.geometry,
+        "lens": session.lens,
+        "sae": session.sae,
+    }
 
     # Gen state carries the real finish_reason after each generation.
     gen_state = MagicMock()
@@ -72,7 +89,6 @@ def _mock_session():
     session.tokenizer = MagicMock()
     session.tokenizer.decode.side_effect = lambda ids: f"<{ids[0]}>" if ids else ""
 
-    session.build_readings.return_value = {}
     # Real asyncio.Lock so `async with session.lock:` works under the
     # FastAPI test client's event loop.
     session.lock = asyncio.Lock()
@@ -233,6 +249,76 @@ class TestChatCompletions:
         assert err["code"] == 404
         assert err["type"] == "invalid_request_error"
         assert "No profile registered for 'missing'" in err["message"]
+        # The stream still terminates: openai-python's ``Stream`` (and
+        # LangChain's ``ChatOpenAI``) wait for the sentinel, exactly like
+        # ollama-python waits for the Ollama path's terminating done frame.
+        assert lines[-1] == "data: [DONE]"
+
+    def test_streaming_conflict_terminates_the_stream(
+        self, session_and_client: Any,
+    ) -> None:
+        session, client = session_and_client
+        session.generate_stream.return_value = TestGenerationStream(
+            [], None, error=ConcurrentGenerationError("busy"),
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        })
+        assert resp.status_code == 200
+        lines = [l for l in resp.text.strip().split("\n") if l.startswith("data: ")]
+        err = json.loads(lines[-2].removeprefix("data: "))["error"]
+        assert err["code"] == 409
+        assert err["type"] == "conflict"
+        assert lines[-1] == "data: [DONE]"
+
+    def test_streaming_lock_timeout_terminates_the_stream(
+        self, session_and_client: Any, monkeypatch: Any,
+    ) -> None:
+        """The 503 busy frame is terminated like every other error frame."""
+        import contextlib
+
+        import saklas.server.app as app_module
+
+        session, client = session_and_client
+
+        @contextlib.asynccontextmanager
+        async def _never_acquires(_session: Any):
+            yield False
+
+        monkeypatch.setattr(app_module, "acquire_session_lock", _never_acquires)
+        session.generate_stream.return_value = TestGenerationStream([], None)
+
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        })
+        assert resp.status_code == 200
+        lines = [l for l in resp.text.strip().split("\n") if l.startswith("data: ")]
+        err = json.loads(lines[0].removeprefix("data: "))["error"]
+        assert err["code"] == 503
+        assert err["type"] == "server_error"
+        assert lines[-1] == "data: [DONE]"
+
+    def test_non_streaming_error_type_matches_the_streaming_one(
+        self, session_and_client: Any,
+    ) -> None:
+        """404 reads ``invalid_request_error`` on both OpenAI surfaces.
+
+        The exception handler used to special-case only 400, so a 404 came
+        back as ``server_error`` there while the in-band SSE frame called the
+        same failure ``invalid_request_error``.
+        """
+        session, client = session_and_client
+        session.generate.side_effect = ProfileNotRegisteredError(
+            "No profile registered for 'missing'"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Hi"}],
+            "steering": "0.5 missing",
+        })
+        assert resp.status_code == 404
+        assert resp.json()["error"]["type"] == "invalid_request_error"
 
     def test_conflict_on_concurrent_generation(self, session_and_client: Any) -> None:
         session, client = session_and_client
@@ -349,9 +435,10 @@ class TestCLIParsing:
         args = parse_args(["serve", "m", "--no-web"])
         assert args.no_web is True
 
-    # Cache-op coverage lives in tests/test_cache_ops.py (delete_tensors
-    # across concept/tag/model selectors) and tests/test_cli_flags.py
-    # (the -r/-x/-i/-l/-m cache-ops flag grammar).
+    # Manifold lifecycle coverage (rm / clear / refresh, and the GGUF
+    # export driver) lives in tests/test_manifolds_io.py and
+    # tests/test_cli_manifold_fold.py; the CLI flag grammar around them is
+    # in tests/test_cli_flags.py.
 
 
 # ---------------------------------------------------------------------------
@@ -1000,33 +1087,57 @@ class TestSessionInfoInstrumentFields:
         got = client.get("/saklas/v1/sessions/default").json()
         assert got["jlens_fitted"] is True
 
-    def test_live_lens_layers(self, session_and_client: Any) -> None:
-        session, client = session_and_client
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.status_code == 200
-        assert resp.json()["live_lens_layers"] is None
-        session.live_lens_layers = [10, 14, 18]
-        got = client.get("/saklas/v1/sessions/default").json()
-        assert got["live_lens_layers"] == [10, 14, 18]
+    @staticmethod
+    def _families(client: Any) -> dict[str, Any]:
+        info = client.get("/saklas/v1/sessions/default").json()
+        return {row["family"]: row for row in info["instruments"]}
 
-    def test_live_probe_scores(self, session_and_client: Any) -> None:
+    def test_instruments_block_replaces_the_flat_keys(
+        self, session_and_client: Any,
+    ) -> None:
+        """One representation of read-plane state: the same per-family
+        blocks ``GET .../instruments`` lists.  The pre-5.x flat keys are a
+        clean break — their absence is the contract."""
+        _session, client = session_and_client
+        info = client.get("/saklas/v1/sessions/default").json()
+        assert {row["family"] for row in info["instruments"]} == {
+            "geometry", "lens", "sae",
+        }
+        for gone in (
+            "live_lens_layers", "live_sae", "live_probe_scores",
+            "sae_loaded", "sae_info",
+        ):
+            assert gone not in info
+
+    def test_lens_live_layers(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.status_code == 200
-        assert resp.json()["live_probe_scores"] is True
-        session.live_probe_scores = False
-        got = client.get("/saklas/v1/sessions/default").json()
-        assert got["live_probe_scores"] is False
+        assert self._families(client)["lens"]["live"] == {
+            "enabled": False, "layers": None,
+        }
+        session.lens.live_state = LensLiveState(
+            enabled=True, layers=(10, 14, 18),
+        )
+        assert self._families(client)["lens"]["live"] == {
+            "enabled": True, "layers": [10, 14, 18],
+        }
+
+    def test_geometry_live_probe_scores(self, session_and_client: Any) -> None:
+        session, client = session_and_client
+        assert self._families(client)["geometry"]["live"]["enabled"] is True
+        session.geometry.live_state = GeometryLiveState(enabled=False)
+        assert self._families(client)["geometry"]["live"]["enabled"] is False
 
     def test_sae_runtime(self, session_and_client: Any) -> None:
         session, client = session_and_client
-        session.sae_info = {"release": "scope", "layer": 14, "width": 16_384}
-        session.live_sae = True
-        resp = client.get("/saklas/v1/sessions/default")
-        assert resp.status_code == 200
-        assert resp.json()["sae_loaded"] is True
-        assert resp.json()["sae_info"]["layer"] == 14
-        assert resp.json()["live_sae"] is True
+        session.sae.active_source = "saelens:scope"
+        session.sae.live_state = SaeLiveState(
+            enabled=True, layer=14, source="saelens:scope",
+        )
+        sae = self._families(client)["sae"]
+        assert sae["source"] == "saelens:scope"
+        assert sae["live"] == {
+            "enabled": True, "layer": 14, "source": "saelens:scope",
+        }
 
 
 class TestWSTokenEventLens:
@@ -1174,24 +1285,27 @@ class TestLensProbeRoutes:
     def test_list_includes_lens_probes(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.monitor.attached_probes.return_value = {}
-        session.lens_probe_specs = {"jlens/fake": dict(self._SPEC)}
+        session.lens.specs.return_value = {"jlens/fake": dict(self._SPEC)}
         resp = client.get("/saklas/v1/sessions/default/probes")
         assert resp.status_code == 200
         (row,) = resp.json()["probes"]
-        assert row["name"] == "jlens/fake"
-        assert row["lens"] is True
-        assert row["word"] == "fake"
-        assert row["token_id"] == 42
-        assert row["layers"] == [12, 14, 18]
-        assert row["feature_space"] == "readout"
-        assert row["intrinsic_dim"] == 1  # the one strength axis
-        assert row["node_coords"] is None
+        # An explicit family discriminator, and only fields this family can
+        # actually produce — no invented manifold/domain/node geometry.
+        assert row == {
+            "family": "lens",
+            "name": "jlens/fake",
+            "layers": [12, 14, 18],
+            "intrinsic_dim": 1,  # the one strength axis
+            "feature_space": "readout",
+            "word": "fake",
+            "token_id": 42,
+        }
 
     def test_attach_returns_lens_info(self, session_and_client: Any) -> None:
         session, client = session_and_client
 
         def _attach(selector: str, **_kw: Any) -> str:
-            session.lens_probe_specs = {
+            session.lens.specs.return_value = {
                 selector: dict(TestLensProbeRoutes._SPEC),
             }
             return selector
@@ -1202,7 +1316,7 @@ class TestLensProbeRoutes:
             json={"selector": "jlens/fake"},
         )
         assert resp.status_code == 201
-        assert resp.json()["lens"] is True
+        assert resp.json()["family"] == "lens"
         assert resp.json()["name"] == "jlens/fake"
 
     def test_attach_lens_not_fitted_404(self, session_and_client: Any) -> None:
@@ -1235,7 +1349,7 @@ class TestLensProbeRoutes:
     def test_detach_lens_probe(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.monitor.probe_names = []
-        session.lens_probe_specs = {"jlens/fake": dict(self._SPEC)}
+        session.lens.specs.return_value = {"jlens/fake": dict(self._SPEC)}
         resp = client.delete("/saklas/v1/sessions/default/probes/jlens%2Ffake")
         assert resp.status_code == 204
         session.remove_probe.assert_called_once_with("jlens/fake")
@@ -1243,6 +1357,6 @@ class TestLensProbeRoutes:
     def test_detach_unknown_404(self, session_and_client: Any) -> None:
         session, client = session_and_client
         session.monitor.probe_names = []
-        session.lens_probe_specs = {}
+        session.lens.specs.return_value = {}
         resp = client.delete("/saklas/v1/sessions/default/probes/jlens%2Ffake")
         assert resp.status_code == 404

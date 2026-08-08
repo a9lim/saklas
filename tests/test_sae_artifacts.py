@@ -65,6 +65,37 @@ def test_local_sae_round_trip_and_backend() -> None:
     assert decoded.shape == (3,)
     assert torch.equal(backend.feature_direction(2, 0), _weights()["W_dec"][0])
     assert list_sae_sources("org/model")[0]["source"] == "local:mine"
+    # The synthesized per-layer id is built from the same ``local:`` renderer,
+    # not a second hand-spelled prefix.
+    assert backend.sae_ids_by_layer == {"2": "local:mine:layer-2"}
+
+
+def test_local_release_predicate_routes_padded_selectors() -> None:
+    """``is_local_sae_release`` owns the ``local:`` test, whitespace and all.
+
+    ``load_sae_backend`` dispatches on it, so a padded selector must not fall
+    through to the provider registry (which would report the whole padded
+    string as an unknown release).
+    """
+    from saklas.core.sae import load_sae_backend
+    from saklas.io.sae_artifacts import is_local_sae_release, save_local_sae
+
+    assert is_local_sae_release("local:mine") is True
+    assert is_local_sae_release("  local:mine  ") is True
+    assert is_local_sae_release("gemma-scope-2b-pt-res") is False
+
+    save_local_sae(
+        "org/model", "mine", _weights(),
+        model_fingerprint="model-fp", model_source_fingerprint="source-fp",
+        layer=2, corpus_spec="test", corpus_sha256="a" * 64,
+        tokens_trained=100, seq_len=16, batch_size=2, learning_rate=1e-3,
+        l1_coefficient=1e-3, dead_feature_threshold=1e-6,
+    )
+    backend = load_sae_backend(
+        "  local:mine  ", model_id="org/model", device="cpu",
+        dtype=torch.float32,
+    )
+    assert backend.release == "local:mine"
 
 
 class _Tokenizer:

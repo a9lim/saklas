@@ -107,7 +107,7 @@ def test_jlens_steering_atom_generates(session: Any, micro_lens: Any) -> None:
 def test_live_lens_does_not_break_static_steerable(session: Any, micro_lens: Any) -> None:
     session._jlens = micro_lens
     baseline = session._steering.static_steerable()
-    layers = session.enable_live_lens()
+    layers = session._lens_instrument.enable_live()
     try:
         assert session._steering.static_steerable() == baseline
         assert layers  # resolved the fitted layer set
@@ -118,4 +118,4 @@ def test_live_lens_does_not_break_static_steerable(session: Any, micro_lens: Any
         )
         assert result.first.text
     finally:
-        session.disable_live_lens()
+        session._lens_instrument.disable_live()

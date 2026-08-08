@@ -44,25 +44,187 @@ a source switch.
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, cast
 
+from typing_extensions import NotRequired, TypedDict
+
+from saklas.core.instruments.types import Reading, ScalarReading, reading_axis0
 from saklas.core.results import ProbeReading
 
 MEASUREMENTS_VERSION = 1
 
+MeasurementScope = Literal["token", "aggregate", "replay"]
+MeasurementProvenance = Literal["captured", "replayed"]
 
-def _axis0(readings: Mapping[str, ProbeReading]) -> dict[str, float]:
+
+# --------------------------------------------------------------------------
+# The envelope, declared
+# --------------------------------------------------------------------------
+# The wire contract used to live only in hand-mirrored TypeScript, which is
+# how `probe_measurements_aggregate`'s output went unread and how a unit no
+# producer held ended up on the wire.  These TypedDicts are the Python-side
+# declaration; ``tests/test_measurements_envelope.py`` pins the exact key
+# sets of a token frame, a done aggregate, and all three replay envelopes,
+# so wire drift is a test failure rather than a dashboard bug.
+
+class MeasurementBinding(TypedDict):
+    """What a family was measuring: source identity + recipe steering."""
+
+    source: str | None
+    steering: str | None
+    layer: NotRequired[int | None]
+
+
+class DepthSummaryDict(TypedDict):
+    """Wire form of ``instruments.types.DepthSummary``.
+
+    ``basis`` travels with the numbers because ``center`` means three
+    mathematically unrelated things across the families.
+    """
+
+    center: list[float]
+    spread: list[float]
+    basis: str
+
+
+class ScalarReadingDict(TypedDict):
+    """Wire form of ``ScalarReading.to_dict()`` — the lens/SAE reading.
+
+    One value with an explicit ``unit``, its per-layer trace, and a depth
+    summary.  No geometry fields: a readout channel has no subspace behind
+    it.  ``meta`` is emitted only when the producer attached one.
+    """
+
+    value: float
+    unit: str
+    per_layer: dict[str, float]
+    depth: DepthSummaryDict | None
+    meta: NotRequired[dict[str, Any]]
+
+
+class ProbeReadingDict(TypedDict):
+    """Wire form of ``ProbeReading.to_dict()`` — the geometry reading.
+
+    The complete key set that serializer emits, in its order.  Declaring it
+    here (rather than as an anonymous ``dict[str, Any]`` on the channel)
+    is what lets the generated dashboard types name the geometry reading
+    instead of falling back to an opaque record.
+    """
+
+    fraction: float
+    nearest: list[tuple[str, float]]
+    coords: list[float]
+    residual: float
+    fraction_per_layer: dict[str, float]
+    coords_per_layer: dict[str, list[float]]
+    residual_per_layer: dict[str, float]
+    # The live serializer always emits these five, but a *persisted* loom
+    # row written before they existed does not, and the same wire type
+    # covers both — so they are optional on read.
+    assignment: NotRequired[list[tuple[str, float]]]
+    membership: NotRequired[float]
+    depth_com: NotRequired[list[float]]
+    depth_spread: NotRequired[list[float]]
+    subspace_coords_per_layer: NotRequired[dict[str, list[float]]]
+
+
+class LensReadoutToken(TypedDict):
+    token: str
+    id: int
+    logprob: float
+
+
+class LensReadoutLayer(TypedDict):
+    layer: int
+    tokens: list[LensReadoutToken]
+
+
+class LensAggregateToken(TypedDict):
+    token: str
+    strength: float
+    com: float
+    spread: float
+
+
+class LensReadout(TypedDict):
+    layers: list[LensReadoutLayer]
+    aggregate: list[LensAggregateToken]
+
+
+class SaeFeature(TypedDict):
+    id: int
+    activation: float
+    label: str | None
+    max_act: float | None
+
+
+class SaeReadout(TypedDict):
+    features: list[SaeFeature]
+
+
+class GeometryChannel(TypedDict):
+    # Never null: ``build_measurements`` creates the channel only when there
+    # are geometry readings to put in it, so the historical ``| None`` was
+    # defensive over-typing that every consumer then had to defend against.
+    readings: dict[str, ProbeReadingDict]
+    binding: NotRequired[MeasurementBinding]
+
+
+class LensChannel(TypedDict):
+    binding: MeasurementBinding
+    readings: NotRequired[dict[str, ScalarReadingDict]]
+    readout: NotRequired[LensReadout]
+
+
+class SaeChannel(TypedDict):
+    binding: MeasurementBinding
+    readings: NotRequired[dict[str, ScalarReadingDict]]
+    readout: NotRequired[SaeReadout]
+
+
+class Instruments(TypedDict):
+    geometry: NotRequired[GeometryChannel]
+    lens: NotRequired[LensChannel]
+    sae: NotRequired[SaeChannel]
+
+
+class Measurements(TypedDict):
+    """The one versioned read-side wire record."""
+
+    version: int
+    scope: MeasurementScope
+    provenance: MeasurementProvenance
+    instruments: Instruments
+    scores: NotRequired[dict[str, float]]
+    per_layer_scores: NotRequired[dict[str, dict[str, float]]]
+
+
+class MeasurementsEnvelope(TypedDict):
+    """The replay endpoints' response body."""
+
+    measurements: Measurements | None
+
+
+def _axis0(readings: Mapping[str, Reading]) -> dict[str, float]:
     return {
-        str(name): round(
-            float(reading.coords[0] if reading.coords else 0.0), 6,
-        )
+        str(name): round(reading_axis0(reading), 6)
         for name, reading in readings.items()
     }
 
 
 def _readings_dict(
-    readings: Mapping[str, ProbeReading] | None,
+    readings: Mapping[str, Reading] | None,
 ) -> dict[str, Any] | None:
+    """Serialize a family's attached-probe readings in ITS OWN shape.
+
+    Geometry emits the full ``ProbeReading``; the single-axis families emit
+    the native ``ScalarReading`` (``{value, unit, per_layer, depth}``).  The
+    eight constant geometry fields a synthesized ``ProbeReading`` used to
+    carry for lens/SAE probes — ``fraction`` 0, ``residual`` 0, empty
+    ``nearest``/``assignment``, ``membership`` 1.0 and three empty per-layer
+    maps — are off the wire: they were constants masquerading as
+    measurements, and the client had to infer the unit they omitted.
+    """
     if not readings:
         return None
     return {str(name): reading.to_dict() for name, reading in readings.items()}
@@ -74,8 +236,8 @@ def build_measurements(
     provenance: str = "captured",
     geometry_readings: Mapping[str, ProbeReading] | None = None,
     geometry_binding: Mapping[str, Any] | None = None,
-    lens_readings: Mapping[str, ProbeReading] | None = None,
-    sae_readings: Mapping[str, ProbeReading] | None = None,
+    lens_readings: Mapping[str, ScalarReading] | None = None,
+    sae_readings: Mapping[str, ScalarReading] | None = None,
     per_layer_scores: Mapping[str, Mapping[str, float]] | None = None,
     lens_readout: Mapping[int, list[tuple[str, float]]] | None = None,
     lens_aggregate: list[tuple[str, float, float, float]] | None = None,
@@ -85,7 +247,7 @@ def build_measurements(
     sae_source: str | None = None,
     sae_layer: int | None = None,
     steering: str | None = None,
-) -> dict[str, Any] | None:
+) -> Measurements | None:
     """Build one measurement envelope; ``None`` when nothing measured.
 
     JSON-safe throughout (floats rounded/floored exactly as the historical
@@ -120,9 +282,10 @@ def build_measurements(
             tokens: list[dict[str, Any]] = []
             for index, (token, probability) in enumerate(row):
                 token_id = token_ids[index] if index < len(token_ids) else -1
-                # The live display already calibrated this row once.  Convert
-                # that probability into the endpoint's logprob unit without a
-                # second softmax; the floor keeps strict JSON finite.
+                # Every producer holds the per-layer probability ``p_l`` (the
+                # readout's one unit) and every consumer wants it back; this
+                # is the ONE conversion into the wire's logprob key, and the
+                # floor keeps strict JSON finite.
                 logprob = math.log(max(float(probability), 1e-45))
                 tokens.append({
                     "token": str(token),
@@ -180,11 +343,11 @@ def build_measurements(
     if not instruments:
         return None
 
-    envelope: dict[str, Any] = {
+    envelope: Measurements = {
         "version": MEASUREMENTS_VERSION,
-        "scope": scope,
-        "provenance": provenance,
-        "instruments": instruments,
+        "scope": cast(MeasurementScope, scope),
+        "provenance": cast(MeasurementProvenance, provenance),
+        "instruments": cast(Instruments, instruments),
     }
     if scores:
         envelope["scores"] = scores
@@ -195,4 +358,25 @@ def build_measurements(
     return envelope
 
 
-__all__ = ["MEASUREMENTS_VERSION", "build_measurements"]
+__all__ = [
+    "DepthSummaryDict",
+    "GeometryChannel",
+    "Instruments",
+    "LensAggregateToken",
+    "LensChannel",
+    "LensReadout",
+    "LensReadoutLayer",
+    "LensReadoutToken",
+    "MEASUREMENTS_VERSION",
+    "MeasurementBinding",
+    "MeasurementProvenance",
+    "MeasurementScope",
+    "Measurements",
+    "MeasurementsEnvelope",
+    "ProbeReadingDict",
+    "SaeChannel",
+    "SaeFeature",
+    "SaeReadout",
+    "ScalarReadingDict",
+    "build_measurements",
+]

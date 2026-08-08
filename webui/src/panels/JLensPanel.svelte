@@ -32,18 +32,16 @@
   import InstrumentSourceSection from "./rack/InstrumentSourceSection.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
   import JLensProbeCard from "./rack/JLensProbeCard.svelte";
-  import JLensSteerCard from "./rack/JLensSteerCard.svelte";
-  import JLensTokenCard from "./rack/JLensTokenCard.svelte";
-  import { ApiError, apiInstruments } from "../lib/api";
+  import { mergeInstrumentProbeRows } from "./rack/probeRows";
+  import type { InstrumentProbeRow } from "./rack/probeRows";
+  import AtomSteerCard from "./rack/AtomSteerCard.svelte";
+  import { apiInstruments, describeError } from "../lib/api";
   import {
     addJLensToRack,
     activeProbeNames,
     attachProbe,
-    checkLensFetch,
-    cancelLensFit,
-    checkLensFit,
-    lensFitState,
-    lensFetchState,
+    lensFetch,
+    lensFit,
     lensSourceState,
     lensState,
     lensAggregateForDisplay,
@@ -55,14 +53,16 @@
     sessionState,
     setLensWorkspaceSortMode,
     setLiveLens,
-    startLensFetch,
-    startLensFit,
     steerRack,
     tokenHoverState,
     useLensSource,
   } from "../lib/stores.svelte";
   import { pushToast } from "../lib/stores/toasts.svelte";
-  import type { JLensSteerEntry, ProbeRackEntry } from "../lib/types";
+  import type {
+    JLensSteerEntry,
+    ProbeRackEntry,
+    ScalarReadingJSON,
+  } from "../lib/types";
   import type { LensWorkspaceSortMode } from "../lib/stores.svelte";
 
   const fitted = $derived(sessionState.info?.jlens_fitted === true);
@@ -75,7 +75,7 @@
   });
   const sourceBusy = $derived(
     lensSourceState.loading || lensSourceState.busy ||
-      lensFetchState.running || lensFitState.running,
+      lensFetch.state.running || lensFit.state.running,
   );
   const LENS_PROVIDER_OPTIONS = [
     { value: "neuronpedia", label: "neuronpedia" },
@@ -89,7 +89,7 @@
       fitLayers.trim().length > 0,
   );
   const fitIsPreparing = $derived(
-    (lensFitState.message ?? "").startsWith("streaming "),
+    (lensFit.state.message ?? "").startsWith("streaming "),
   );
 
   function requestFit(): void {
@@ -98,7 +98,7 @@
       return;
     }
     fitConfirm = false;
-    void startLensFit({
+    void lensFit.start({
       prompts: fitPrompts,
       layers: fitLayers.trim(),
     });
@@ -107,27 +107,9 @@
   // Resume-visibility: a page reload mid-fit should pick the progress
   // polling back up (the fit runs server-side regardless of the client).
   onMount(() => {
-    void checkLensFit();
-    void checkLensFetch();
-    void refreshLensSources().then(() => {
-      const active = lensSourceState.sources.find((source) => source.active);
-      if (active) selectedSource = active.source;
-    });
-  });
-
-  $effect(() => {
-    const active = lensSourceState.sources.find((source) => source.active);
-    const known = lensSourceState.sources.some(
-      (source) => source.source === selectedSource,
-    ) || LENS_PROVIDER_OPTIONS.some((source) => source.value === selectedSource) ||
-      selectedSource === "local";
-    if (
-      !selectedSource ||
-      !known
-    ) {
-      selectedSource = active?.source ?? lensSourceState.sources[0]?.source ??
-        LENS_PROVIDER_OPTIONS[0]?.value ?? "";
-    }
+    void lensFit.check();
+    void lensFetch.check();
+    void refreshLensSources();
   });
 
   $effect(() => {
@@ -145,15 +127,6 @@
 
   let steerInput = $state("");
   let steerBusy = $state(false);
-
-  function describeError(e: unknown): string {
-    if (e instanceof ApiError) {
-      return e.body && typeof e.body === "object" && "detail" in e.body
-        ? String((e.body as { detail: unknown }).detail)
-        : e.message;
-    }
-    return e instanceof Error ? e.message : String(e);
-  }
 
   function bareWord(value: string): string {
     return value.trim().replace(/^jlens\//, "");
@@ -183,22 +156,17 @@
   // persistent (and gate-able); both card families share the one sort
   // control (strength / name / depth).
 
-  interface PinnedRow {
-    name: string;
-    entry: ProbeRackEntry;
-    /** Sort keys mirroring the aggregate rows' (axis 0 = strength). */
-    value: number;
-    com: number;
-  }
-
-  interface AggRow {
-    /** Raw vocabulary token text (untrimmed — the strip matches on it). */
+  /** One card's props plus the shared sort keys — pinned and discovery
+   *  rows produce the identical shape, so the roster is one list of one
+   *  card. */
+  interface WorkspaceCard extends InstrumentProbeRow {
     token: string;
     strength: number;
-    com: number;
-    spread: number;
-    /** Recent strength history (0 where the token fell below top-k). */
+    com: number | null;
+    spread: number | null;
     series: number[];
+    cells: { layer: number; p: number | null }[];
+    pinned: boolean;
   }
 
   const SORT_OPTIONS: {
@@ -210,39 +178,69 @@
     { value: "depth", label: "depth" },
   ];
 
-  const pinnedCards = $derived.by((): PinnedRow[] => {
-    const names = activeProbeNames().filter((n) => n.startsWith("jlens/"));
-    const rows: PinnedRow[] = [];
-    for (const name of names) {
+  /** Per-layer cells for a pinned probe — the store's axis-0 per-layer map. */
+  function pinnedCells(
+    entry: ProbeRackEntry,
+  ): { layer: number; p: number | null }[] {
+    const perLayer = entry.perLayer;
+    if (!perLayer) return [];
+    return Object.keys(perLayer)
+      .sort((a, b) => Number(a) - Number(b))
+      .map((layer) => ({ layer: Number(layer), p: perLayer[layer] ?? null }));
+  }
+
+  /** Per-layer cells for a discovery token — its softmax probability in
+   *  each streamed readout row; ``null`` = below that layer's top-k. */
+  function readoutCells(token: string): { layer: number; p: number | null }[] {
+    const trimmed = token.trim() || JSON.stringify(token);
+    return displayLayers.map((layer) => {
+      const pairs = displayReadout?.[String(layer)];
+      if (!pairs || pairs.length === 0) return { layer, p: null };
+      const hit =
+        pairs.find(([text]) => text === token) ??
+        pairs.find(([text]) => text.trim() === trimmed);
+      return { layer, p: hit ? hit[1] : null };
+    });
+  }
+
+  const pinnedCards = $derived.by((): WorkspaceCard[] => {
+    const rows: WorkspaceCard[] = [];
+    for (const name of activeProbeNames()) {
+      if (!name.startsWith("jlens/")) continue;
       const entry = probeEntryForDisplay(name);
       if (!entry) continue;
-      const latest = entry.aggregate ?? entry.reading;
+      // A pinned lens probe reads the family's NATIVE one-channel
+      // reading — value + depth summary, no coordinate vector to unwrap.
+      const latest = (entry.aggregate ?? entry.reading) as
+        | ScalarReadingJSON
+        | null;
+      const word = name.slice("jlens/".length);
       rows.push({
-        name,
-        entry,
-        value: latest?.coords?.[0] ?? entry.current ?? 0,
-        com: latest?.depth_com?.[0] ?? 0,
+        key: name,
+        sortName: word,
+        token: word,
+        strength: latest?.value ?? entry.current ?? 0,
+        com: latest?.depth?.center?.[0] ?? null,
+        spread: latest?.depth?.spread?.[0] ?? null,
+        series: entry.sparkline ?? [],
+        cells: pinnedCells(entry),
+        pinned: true,
       });
-    }
-    if (lensState.workspaceSortMode === "name") {
-      rows.sort((a, b) => a.name.localeCompare(b.name));
-    } else if (lensState.workspaceSortMode === "depth") {
-      rows.sort((a, b) => a.com - b.com || b.value - a.value);
-    } else {
-      rows.sort((a, b) => b.value - a.value || a.name.localeCompare(b.name));
     }
     return rows;
   });
 
-  const aggRows = $derived.by((): AggRow[] => {
+  const aggRows = $derived.by((): WorkspaceCard[] => {
     const rows = displayAggregate;
     if (!rows || rows.length === 0) return [];
     const hist = tokenHoverState.active ? [] : lensState.aggHistory;
-    // Pinned tokens already have a persistent card above — the aggregate
-    // group carries only the unpinned remainder of the top-k.
-    const out = rows
+    // Pinned tokens already have a persistent card — the aggregate group
+    // carries only the unpinned remainder of the top-k.
+    return rows
       .filter(([token]) => !probeRack.active.includes(`jlens/${token.trim()}`))
       .map(([token, strength, com, spread]) => ({
+        key: `aggregate:${token}`,
+        sortName: token.trim(),
         token,
         strength,
         com,
@@ -250,69 +248,20 @@
         series: tokenHoverState.active
           ? [strength]
           : hist.map((frame) => frame.find(([t]) => t === token)?.[1] ?? 0),
+        cells: readoutCells(token),
+        pinned: false,
       }));
-    if (lensState.workspaceSortMode === "name") {
-      out.sort((a, b) =>
-        a.token.trim().localeCompare(b.token.trim()) || b.strength - a.strength,
-      );
-    } else if (lensState.workspaceSortMode === "depth") {
-      out.sort((a, b) => a.com - b.com || b.strength - a.strength);
-    } else {
-      out.sort((a, b) => b.strength - a.strength);
-    }
-    return out;
   });
-
-  type WorkspaceCard =
-    | {
-        kind: "pinned";
-        key: string;
-        row: PinnedRow;
-        sortName: string;
-        strength: number;
-        com: number;
-      }
-    | {
-        kind: "aggregate";
-        key: string;
-        row: AggRow;
-        sortName: string;
-        strength: number;
-        com: number;
-      };
 
   /** Pinned and discovered tokens are one visual roster. Persistence is an
    *  action/state difference, not a hidden first sort key. */
-  const workspaceCards = $derived.by((): WorkspaceCard[] => {
-    const rows: WorkspaceCard[] = pinnedCards.map((row) => ({
-      kind: "pinned",
-      key: row.name,
-      row,
-      sortName: row.name.slice("jlens/".length),
-      strength: row.value,
-      com: row.com,
-    }));
-    if (liveOn || tokenHoverState.active) {
-      rows.push(...aggRows.map((row) => ({
-        kind: "aggregate" as const,
-        key: `aggregate:${row.token}`,
-        row,
-        sortName: row.token.trim(),
-        strength: row.strength,
-        com: row.com,
-      })));
-    }
-    if (lensState.workspaceSortMode === "name") {
-      rows.sort((a, b) => a.sortName.localeCompare(b.sortName) ||
-        b.strength - a.strength);
-    } else if (lensState.workspaceSortMode === "depth") {
-      rows.sort((a, b) => a.com - b.com || b.strength - a.strength);
-    } else {
-      rows.sort((a, b) => b.strength - a.strength ||
-        a.sortName.localeCompare(b.sortName));
-    }
-    return rows;
-  });
+  const workspaceCards = $derived(
+    mergeInstrumentProbeRows(
+      pinnedCards,
+      liveOn || tokenHoverState.active ? aggRows : [],
+      lensState.workspaceSortMode,
+    ),
+  );
 
   let probeInput = $state("");
   let probeBusy = $state(false);
@@ -397,11 +346,11 @@
     busy={sourceBusy}
     accent="var(--pillar-lens)"
     sourceError={lensSourceState.error}
-    working={lensFetchState.running || lensFitState.running}
+    working={lensFetch.state.running || lensFit.state.running}
     onuse={(source) => void useLensSource(source)}
     providerOptions={LENS_PROVIDER_OPTIONS}
     providerPlaceholder="lens provider"
-    onfetch={(source) => void startLensFetch(source)}
+    onfetch={(source) => void lensFetch.start({ source })}
     localActionLabel={fitConfirm ? "confirm fit" : "fit"}
     localActionDisabled={sourceBusy || !fitReady}
     onlocal={requestFit}
@@ -433,9 +382,9 @@
       </label>
     {/snippet}
     {#snippet progress()}
-      {#if lensFetchState.running}
+      {#if lensFetch.state.running}
         <p class="work-status" role="status" aria-live="polite">
-          {lensFetchState.message ?? "fetching official lens…"}
+          {lensFetch.state.message ?? "fetching official lens…"}
         </p>
       {:else}
         <div
@@ -445,10 +394,10 @@
           aria-label="Lens fit progress"
         >
           <div class="fit-line">
-            <span class="fit-msg">{lensFitState.message ?? "fitting…"}</span>
-            {#if lensFitState.promptsTotal > 0}
+            <span class="fit-msg">{lensFit.state.message ?? "fitting…"}</span>
+            {#if lensFit.state.total > 0}
               <span class="fit-count">
-                {lensFitState.promptsDone}/{lensFitState.promptsTotal}
+                {lensFit.state.current}/{lensFit.state.total}
               </span>
             {/if}
           </div>
@@ -457,19 +406,19 @@
             role="progressbar"
             aria-label="J-lens prompts fitted"
             aria-valuemin="0"
-            aria-valuemax={Math.max(lensFitState.promptsTotal, 1)}
-            aria-valuenow={lensFitState.promptsDone}
+            aria-valuemax={Math.max(lensFit.state.total, 1)}
+            aria-valuenow={lensFit.state.current}
           >
             <Bar
-              value={lensFitState.promptsDone}
-              max={Math.max(lensFitState.promptsTotal, 1)}
+              value={lensFit.state.current}
+              max={Math.max(lensFit.state.total, 1)}
               width={160}
               height={8}
               color="var(--pillar-lens)"
             />
           </div>
           <p class="hint">
-            {#if lensFitState.cancelling}
+            {#if lensFit.state.cancelling}
               stopping background work…
             {:else if fitIsPreparing}
               generation available during corpus setup
@@ -480,27 +429,27 @@
           <Button
             size="sm"
             variant="danger"
-            disabled={lensFitState.cancelling}
-            onclick={() => void cancelLensFit()}
+            disabled={lensFit.state.cancelling}
+            onclick={() => void lensFit.cancel()}
           >
-            {lensFitState.cancelling ? "cancelling…" : "cancel"}
+            {lensFit.state.cancelling ? "cancelling…" : "cancel"}
           </Button>
         </div>
       {/if}
     {/snippet}
     {#snippet warning()}
-      {#if fitConfirm && !lensFitState.running}
+      {#if fitConfirm && !lensFit.state.running}
         <p class="hint fit-warning" role="alert">
           Blocks generation; may take hours. Confirm again.
         </p>
       {/if}
     {/snippet}
     {#snippet messages()}
-      {#if lensFitState.error}
-        <p class="hint fit-error" role="alert">local fit: {lensFitState.error}</p>
+      {#if lensFit.state.error}
+        <p class="hint fit-error" role="alert">local fit: {lensFit.state.error}</p>
       {/if}
-      {#if lensFetchState.error}
-        <p class="hint fit-error" role="alert">official fetch: {lensFetchState.error}</p>
+      {#if lensFetch.state.error}
+        <p class="hint fit-error" role="alert">official fetch: {lensFetch.state.error}</p>
       {/if}
     {/snippet}
   </InstrumentSourceSection>
@@ -517,7 +466,7 @@
         <div class="cards steer-cards" role="list">
           {#each steerCards as [name, entry] (name)}
             <div role="listitem">
-              <JLensSteerCard {name} {entry} />
+              <AtomSteerCard mode="jlens" {name} {entry} />
             </div>
           {/each}
         </div>
@@ -566,25 +515,17 @@
           <div class="cards" role="list" aria-label="J-lens probe tokens">
             {#each workspaceCards as card (card.key)}
               <div role="listitem">
-                {#if card.kind === "pinned"}
-                  <JLensProbeCard
-                    name={card.row.name}
-                    entry={card.row.entry}
-                  />
-                {:else}
-                  <JLensTokenCard
-                    token={card.row.token}
-                    strength={card.row.strength}
-                    com={card.row.com}
-                    spread={card.row.spread}
-                    series={card.row.series}
-                    layers={displayLayers}
-                    readout={displayReadout}
-                    pinned={false}
-                    busy={probeBusy}
-                    onpin={pinWord}
-                  />
-                {/if}
+                <JLensProbeCard
+                  token={card.token}
+                  strength={card.strength}
+                  com={card.com}
+                  spread={card.spread}
+                  series={card.series}
+                  cells={card.cells}
+                  pinned={card.pinned}
+                  busy={probeBusy}
+                  onpin={pinWord}
+                />
               </div>
             {/each}
           </div>

@@ -13,8 +13,7 @@
     setInspectorTab,
     removeSubspaceFromRack,
     removeManifoldFromRack,
-    removeJLensFromRack,
-    removeSaeFromRack,
+    atomActions,
     currentSteeringExpression,
   } from "../lib/stores.svelte";
   import type { InspectorTab } from "../lib/stores.svelte";
@@ -68,7 +67,7 @@
           tab: "lens",
           order: 1,
           enabled: entry.enabled,
-          remove: () => removeJLensFromRack(name),
+          remove: () => atomActions("jlens").remove(name),
         };
       case "sae":
         return {
@@ -78,7 +77,7 @@
           tab: "sae",
           order: 1,
           enabled: entry.enabled,
-          remove: () => removeSaeFromRack(name),
+          remove: () => atomActions("sae").remove(name),
         };
     }
   }

@@ -18,14 +18,26 @@ from fastapi.responses import Response
 
 from saklas.core.profile import Profile
 from saklas.server.app import acquire_session_lock
-from saklas.server.native_common import resolve_session_id
+from saklas.server.native_common import (
+    extraction_error_frame,
+    extraction_json_errors,
+    refuse_if_busy,
+    resolve_session_id,
+)
+from saklas.server.response_models import (
+    CorrelationData,
+    ExtractResponse,
+    PairwiseCompareResponse,
+    ProfileListResponse,
+    VectorInfo,
+)
 from saklas.server.profile_models import (
     BakeProfileRequest,
     ExtractRequest,
     extract_registry_name,
     profile_to_json,
 )
-from saklas.server.sse import ProgressCallback, progress_sse_response
+from saklas.server.sse import ProgressCallback, sse_or_json
 
 
 def register_profile_routes(app: FastAPI) -> None:
@@ -33,7 +45,7 @@ def register_profile_routes(app: FastAPI) -> None:
     session = app.state.session
 
     @app.get("/saklas/v1/sessions/{session_id}/profiles")
-    def list_profiles(session_id: str):
+    def list_profiles(session_id: str) -> ProfileListResponse:
         resolve_session_id(session_id)
         return {
             "profiles": [
@@ -43,7 +55,9 @@ def register_profile_routes(app: FastAPI) -> None:
         }
 
     @app.get("/saklas/v1/sessions/{session_id}/profiles/pairwise")
-    def pairwise_compare(session_id: str, a: str, b: str):
+    def pairwise_compare(
+        session_id: str, a: str, b: str,
+    ) -> PairwiseCompareResponse:
         """Cross-layer whitened cosine matrix between two named profiles / probes.
 
         Query: ``?a=<name>&b=<name>``.  Each cell ``matrix[i][j]`` is the
@@ -190,7 +204,7 @@ def register_profile_routes(app: FastAPI) -> None:
         }
 
     @app.get("/saklas/v1/sessions/{session_id}/profiles/{name}")
-    def get_profile(session_id: str, name: str):
+    def get_profile(session_id: str, name: str) -> VectorInfo:
         resolve_session_id(session_id)
         profiles = session.profiles
         if name not in profiles:
@@ -198,7 +212,9 @@ def register_profile_routes(app: FastAPI) -> None:
         return profile_to_json(name, Profile(profiles[name]))
 
     @app.get("/saklas/v1/sessions/{session_id}/correlation")
-    def correlation_matrix(session_id: str, names: str | None = None):
+    def correlation_matrix(
+        session_id: str, names: str | None = None,
+    ) -> CorrelationData:
         """N×N magnitude-weighted cosine matrix across loaded vectors and probes.
 
         Query: ``?names=a,b,c`` restricts the matrix to a subset; default
@@ -338,65 +354,73 @@ def register_profile_routes(app: FastAPI) -> None:
             )
         return Response(status_code=204)
 
-    @app.post("/saklas/v1/sessions/{session_id}/extract")
+    @app.post(
+        "/saklas/v1/sessions/{session_id}/extract",
+        response_model=ExtractResponse,
+    )
     async def extract_profile(session_id: str, req: ExtractRequest, request: Request):
+        """Fit a concept and register its folded profile on the live session.
+
+        SSE progress on ``Accept: text/event-stream``, one JSON body
+        otherwise; the JSON branch additionally returns the collected
+        ``progress`` lines the SSE branch streams as frames.
+        """
         resolve_session_id(session_id)
+        # Same rejection ``POST /manifolds/generate`` applies, so the two
+        # authoring paths refuse an unframed custom kind identically.
+        if req.kind == "custom" and not req.custom_system:
+            raise HTTPException(
+                400, "kind='custom' requires custom_system (a system template "
+                "with a {c} placeholder)",
+            )
 
         def _run(on_progress: ProgressCallback) -> tuple[str, Any]:
             return session.extract(
                 req.concept, req.baseline,
+                kind=req.kind, custom_system=req.custom_system,
                 on_progress=on_progress,
                 sae=req.sae,
                 role=req.role, namespace=req.namespace, force=req.force,
             )
 
-        accept = request.headers.get("accept", "application/json")
-        if "text/event-stream" in accept:
-            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
-                canonical, profile = await asyncio.to_thread(_run, on_progress)
-                registry_name = extract_registry_name(canonical, req.namespace)
-                session.steer(registry_name, profile)
-                return {
-                    "done": True,
-                    "profile": profile_to_json(registry_name, profile),
-                    "canonical": registry_name,
-                }
-
-            return progress_sse_response(
-                session.lock,
-                _job,
-                error_message="extract failed",
-                log_message=f"extract failed for session={session_id}",
-            )
-
-        progress_msgs: list[str] = []
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            canonical, profile = await asyncio.to_thread(_run, progress_msgs.append)
+        async def _job(on_progress: ProgressCallback) -> ExtractResponse:
+            canonical, profile = await asyncio.to_thread(_run, on_progress)
             registry_name = extract_registry_name(canonical, req.namespace)
             session.steer(registry_name, profile)
-        return {
-            "canonical": registry_name,
-            "profile": profile_to_json(registry_name, profile),
-            "progress": progress_msgs,
-        }
+            return {
+                "done": True,
+                "profile": profile_to_json(registry_name, profile),
+                "canonical": registry_name,
+            }
+
+        # Extract and manifold ``fit`` drive the same extraction pipeline, so
+        # they share its typed error policy rather than diverging by accident.
+        return await sse_or_json(
+            request,
+            session,
+            _job,
+            error_message="extract failed",
+            log_message=f"extract failed for session={session_id}",
+            error_formatter=extraction_error_frame,
+            json_errors=extraction_json_errors(),
+            json_progress_key="progress",
+        )
 
     @app.post("/saklas/v1/sessions/{session_id}/profiles/bake")
-    async def bake_profile(session_id: str, req: BakeProfileRequest):
+    async def bake_profile(
+        session_id: str, req: BakeProfileRequest,
+    ) -> VectorInfo:
         """Merge an expression of installed directions into a baked manifold.
 
-        Wraps :func:`saklas.io.bake.merge_into_manifold` (model-scoped to
-        the session's loaded model) — the merge lands a corpus-less
-        ``fit_mode="baked"`` manifold — then folds the fitted tensor back to a
-        steering Profile and registers it so it's immediately steerable.
-        Returns the same profile-JSON shape ``GET /profiles/{name}`` produces.
+        The HTTP face of :meth:`SaklasSession.bake`, which owns the whole
+        sequence: the model-scoped merge (a corpus-less ``fit_mode="baked"``
+        manifold), the fold of its fitted tensor back to a steering Profile,
+        and the registration that makes it immediately steerable.  Because the
+        session method computes the loaded-weight fingerprint and hands it to
+        the merge, a bake whose components were fitted against different
+        weights is refused here exactly as it is in Python.  Returns the same
+        profile-JSON shape ``GET /profiles/{name}`` produces.
         """
-        from saklas.io.bake import merge_into_manifold, MergeError
-        from saklas.io.paths import tensor_filename
-        from saklas.io.manifold_tensors import load_manifold
-        from saklas.core.capture import folded_directions
-        from saklas.server.manifold_routes import _refuse_if_busy
         resolve_session_id(session_id)
 
         async with acquire_session_lock(session) as acquired:
@@ -405,30 +429,12 @@ def register_profile_routes(app: FastAPI) -> None:
             # Refuse (409) while an in-flight extract holds the engine
             # gen-lock — parity with the manifold mutating routes, so a
             # merge can't race a concurrent extraction.
-            _refuse_if_busy(session)
-            try:
-                dst_folder = await asyncio.to_thread(
-                    merge_into_manifold,
-                    req.name,
-                    req.expression,
-                    session.model_id,
-                    force=True,  # session-driven merges always overwrite
-                    strict=False,
-                )
-            except MergeError:
-                # Re-raised through the SaklasError handler (400).
-                raise
-            tensor_path = dst_folder / tensor_filename(session.model_id)
-            if not tensor_path.is_file():
-                raise HTTPException(
-                    500,
-                    f"merge produced no tensor for {session.model_id} at {tensor_path}",
-                )
-
-            def _load_folded() -> Profile:
-                manifold = load_manifold(str(tensor_path))
-                return Profile(folded_directions(manifold))
-
-            profile = await asyncio.to_thread(_load_folded)
-            session.steer(req.name, profile)
-        return profile_to_json(req.name, profile)
+            refuse_if_busy(session)
+            # MergeError (a bad expression, a missing component, a
+            # fingerprint mismatch, a merge that produced no tensor) is a
+            # SaklasError and reaches the client as a 400 through the global
+            # handler.
+            name, profile = await asyncio.to_thread(
+                session.bake, req.name, req.expression,
+            )
+        return profile_to_json(name, profile)

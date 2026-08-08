@@ -8,6 +8,7 @@ import pytest
 
 from saklas import cli
 from saklas.cli import runners as cli_runners
+from saklas.core.instruments.types import LensLiveState, SaeLiveState
 
 
 @pytest.mark.parametrize(
@@ -18,7 +19,7 @@ from saklas.cli import runners as cli_runners
         ["serve", "model", "--port", "70000"],
         ["manifold", "fit", "m", "--max-dim", "0"],
         ["manifold", "fit", "m", "--k-nn", "-2"],
-        ["sae", "load", "release", "-m", "model", "--layer", "-1"],
+        ["sae", "fetch", "model", "saelens:release", "--layer", "-1"],
     ],
 )
 def test_numeric_flags_reject_out_of_range_values(argv: list[str]) -> None:
@@ -213,6 +214,91 @@ def test_cli_compile_overrides_yaml_compile_false(monkeypatch: pytest.MonkeyPatc
     assert args.compile is True
 
 
+# ---------------------------------------------------------------------------
+# --max-tokens: CLI wins, YAML fills gaps, runner default floors it
+# ---------------------------------------------------------------------------
+
+#: (argv-prefix, runner default) for every verb carrying its own --max-tokens.
+_MAX_TOKEN_VERBS = [
+    (["experiment", "fan", "m/x", "prompt", "-g", "a=0,1"], 256),
+    (["experiment", "transcript", "run", "t.yaml", "m/x"], 256),
+    (
+        [
+            "experiment", "naturalness", "m/x", "prompt",
+            "--manifold", "f", "-S", "0.5 a",
+        ],
+        128,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "argv,runner_default", _MAX_TOKEN_VERBS,
+    ids=["fan", "transcript-run", "naturalness"],
+)
+def test_cli_max_tokens_survives_effective_config(
+    argv: list[str], runner_default: int,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """An explicit ``--max-tokens N`` must reach the runner unchanged.
+
+    The shared helper was written for ``serve`` (no such flag) and used to
+    stamp the YAML value or a hardcoded 1024 over whatever the flag parsed.
+    """
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    p = tmp_path / "setup.yaml"
+    p.write_text("max_tokens: 999\n")
+    args = cli.parse_args([*argv, "-c", str(p), "--max-tokens", "64"])
+    assert args.max_tokens == 64
+    cli_runners._load_effective_config(args, default_max_tokens=runner_default)
+    assert args.max_tokens == 64
+
+
+@pytest.mark.parametrize(
+    "argv,runner_default", _MAX_TOKEN_VERBS,
+    ids=["fan", "transcript-run", "naturalness"],
+)
+def test_yaml_max_tokens_fills_unset_flag(
+    argv: list[str], runner_default: int,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """With the flag unset, YAML fills the gap (the flag defaults to None)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    p = tmp_path / "setup.yaml"
+    p.write_text("max_tokens: 999\n")
+    args = cli.parse_args([*argv, "-c", str(p)])
+    assert args.max_tokens is None
+    cli_runners._load_effective_config(args, default_max_tokens=runner_default)
+    assert args.max_tokens == 999
+
+
+@pytest.mark.parametrize(
+    "argv,runner_default", _MAX_TOKEN_VERBS,
+    ids=["fan", "transcript-run", "naturalness"],
+)
+def test_runner_default_max_tokens_floors_unset_flag_and_yaml(
+    argv: list[str], runner_default: int,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """Neither CLI nor YAML supplied one — the runner's own default lands."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    args = cli.parse_args(argv)
+    cli_runners._load_effective_config(args, default_max_tokens=runner_default)
+    assert args.max_tokens == runner_default
+
+
+def test_serve_max_tokens_defaults_to_1024(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """``serve`` has no ``--max-tokens`` flag, so it always gets the helper's
+    own 1024 default (unchanged by the CLI-wins seeding)."""
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    args = cli.parse_args(["serve", "google/gemma-2-2b-it"])
+    assert getattr(args, "max_tokens", None) is None
+    cli_runners._load_effective_config(args)
+    assert args.max_tokens == 1024
+
+
 def test_yaml_compile_invalid_type_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Reject non-boolean ``compile:`` values rather than coercing —
     ``compile: "true"`` (a string) would otherwise pass through as
@@ -351,38 +437,109 @@ def test_fit_smoothing_override_is_delegated_to_fit_transaction(
     assert fit_kwargs["hyperparams"] == {"smoothing": 0.25}
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["manifold", "extract", "happy.sad", "-m", "fake/model"],
+        ["manifold", "fit", "happy.sad", "-m", "fake/model"],
+    ],
+    ids=["extract", "fit"],
+)
+@pytest.mark.parametrize("flag, expected_dls", [([], True), (["--no-dls"], False)])
+def test_no_dls_reaches_session_construction(
+    argv: list[str],
+    flag: list[str],
+    expected_dls: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--no-dls`` is accepted by both fit verbs and inverts into ``dls=``.
+
+    The two verbs where DLS actually applies did not expose the flag at all,
+    so this pins the subparser plus ``_make_session``'s
+    ``dls = not args.no_dls`` inversion.  The session-side hop
+    (``self._dls`` -> ``pipe.fit(dls=...)``) is pinned in
+    ``test_manifold_extraction``.
+    """
+    from saklas.core.session import SaklasSession
+    from saklas.io.manifold_authoring import create_discover_manifold_folder
+
+    monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+    create_discover_manifold_folder(
+        "local", "happy.sad", "", fit_mode="pca",
+        node_corpora={"happy": ["yes"], "sad": ["no"]},
+    )
+    captured: dict[str, Any] = {}
+
+    class _FakeSession:
+        model_info: dict[str, Any] = {}
+
+        def extract(self, *_args: Any, **_kwargs: Any) -> Any:
+            return "happy.sad", object()
+
+        def fit(self, *_args: Any, **_kwargs: Any) -> Any:
+            from saklas.core.manifold import CustomDomain
+            return SimpleNamespace(
+                name="happy.sad", layers={0: object()},
+                node_labels=["happy", "sad"], domain=CustomDomain(1),
+                feature_space="raw", metadata={"fit_mode": "pca"},
+            )
+
+    def _fake_from_pretrained(_model_id: str, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _FakeSession()
+
+    monkeypatch.setattr(
+        SaklasSession, "from_pretrained", staticmethod(_fake_from_pretrained),
+    )
+    monkeypatch.setattr(cli_runners, "_print_startup", lambda _args: None)
+    monkeypatch.setattr(cli_runners, "_print_model_info", lambda _session: None)
+
+    cli.main([*argv, *flag])
+    assert captured["dls"] is expected_dls
+
+
 def test_serve_stale_lens_gate_uses_weight_compatibility() -> None:
-    class _Session:
+    class _Lens:
         enabled = False
+
+        def set_live(self, enabled: bool, **_kwargs: Any) -> Any:
+            self.enabled = enabled
+            return LensLiveState(enabled=enabled, layers=())
+
+    class _Session:
+        lens = _Lens()
 
         def has_compatible_jlens(self) -> bool:
             return False
 
-        def enable_live_lens(self, **_kwargs: Any) -> None:
-            self.enabled = True
-
     session = _Session()
     assert not cli_runners._enable_serve_live_lens_if_compatible(session)
-    assert not session.enabled
+    assert not _Session.lens.enabled
 
 
 def test_serve_selects_cached_lens_when_active_pointer_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _Lens:
+        live_enabled = False
+
+        def set_live(self, enabled: bool, **_kwargs: Any) -> Any:
+            self.live_enabled = enabled
+            return LensLiveState(enabled=enabled, layers=(4, 5))
+
     class _Session:
         model_id = "org/model"
         selected: str | None = None
-        live_enabled = False
+
+        def __init__(self) -> None:
+            self.lens = _Lens()
 
         def has_compatible_jlens(self) -> bool:
             return self.selected == "local:default"
 
         def select_jlens_source(self, source: str) -> None:
             self.selected = source
-
-        def enable_live_lens(self) -> list[int]:
-            self.live_enabled = True
-            return [4, 5]
 
     monkeypatch.setattr(
         "saklas.io.lens_sources.list_lens_sources",
@@ -393,7 +550,7 @@ def test_serve_selects_cached_lens_when_active_pointer_is_missing(
     session = _Session()
     assert cli_runners._enable_serve_live_lens_if_compatible(session)
     assert session.selected == "local:default"
-    assert session.live_enabled
+    assert session.lens.live_enabled
 
 
 def test_best_serve_sae_release_prefers_official_canonical_provider() -> None:
@@ -419,19 +576,24 @@ def test_best_serve_sae_release_prefers_official_canonical_provider() -> None:
 def test_serve_attaches_best_sae_and_enables_live(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _Sae:
+        live_enabled = False
+
+        def set_live(self, enabled: bool, **_kwargs: Any) -> Any:
+            self.live_enabled = enabled
+            return SaeLiveState(enabled=enabled, layer=22)
+
     class _Session:
         model_id = "google/gemma-3-4b-it"
         sae_info = None
         loaded: str | None = None
-        live_enabled = False
+
+        def __init__(self) -> None:
+            self.sae = _Sae()
 
         def load_sae(self, release: str) -> dict[str, Any]:
             self.loaded = release
             return {"release": release, "layer": 22, "width": 16_384}
-
-        def enable_live_sae(self) -> dict[str, int]:
-            self.live_enabled = True
-            return {"layer": 22}
 
     monkeypatch.setattr(
         "saklas.io.sae.list_sae_sources",
@@ -449,23 +611,27 @@ def test_serve_attaches_best_sae_and_enables_live(
     session = _Session()
     assert cli_runners._enable_serve_live_sae_if_available(session)
     assert session.loaded == "gemma-scope-2-4b-it-res"
-    assert session.live_enabled
+    assert session.sae.live_enabled
 
 
 def test_serve_prefers_cached_sae_over_registry_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _Sae:
+        def set_live(self, enabled: bool, **_kwargs: Any) -> Any:
+            return SaeLiveState(enabled=enabled, layer=22)
+
     class _Session:
         model_id = "google/gemma-3-4b-it"
         sae_info = None
         loaded: str | None = None
 
+        def __init__(self) -> None:
+            self.sae = _Sae()
+
         def load_sae(self, release: str) -> dict[str, Any]:
             self.loaded = release
             return {"release": release, "layer": 22, "width": 16_384}
-
-        def enable_live_sae(self) -> dict[str, int]:
-            return {"layer": 22}
 
     monkeypatch.setattr(
         "saklas.io.sae.list_sae_sources",
@@ -785,13 +951,11 @@ def _setup_why_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return tmp_path / "manifolds"
 
 
-def _mock_why_profile(layer_mags: dict[int, float], diagnostics: dict[str, Any] | None = None) -> Any:
+def _mock_why_profile(layer_mags: dict[int, float]) -> Any:
     """Return a duck-typed mock profile for _run_why.
 
-    Carries the four surfaces ``_run_why`` reads: ``items()`` (per-layer
-    magnitudes), ``__len__`` (total layers), ``diagnostics``, and
-    ``has_diagnostics``.  Diagnostics default to ``None`` to mirror the
-    pre-1.6 sidecar shape.
+    Carries the two surfaces ``_run_why`` reads: ``items()`` (per-layer
+    magnitudes) and ``__len__`` (total layers).
     """
     import torch
 
@@ -801,14 +965,6 @@ def _mock_why_profile(layer_mags: dict[int, float], diagnostics: dict[str, Any] 
 
         def __len__(self):
             return len(layer_mags)
-
-        @property
-        def diagnostics(self):
-            return diagnostics
-
-        @property
-        def has_diagnostics(self):
-            return diagnostics is not None and bool(diagnostics)
 
     return MockProfile()
 
@@ -1053,3 +1209,86 @@ def test_vector_extract_sae_requires_value():
         cli.parse_args([
             "manifold","extract", "honest.deceptive", "-m", "m", "--sae",
         ])
+
+
+# ---------------------------------------------------------------------------
+# experiment fan — sweep progress
+# ---------------------------------------------------------------------------
+
+class _FanSession:
+    """Minimal ``generate_sweep`` stand-in that drives ``on_result``."""
+
+    def __init__(self) -> None:
+        self.model_info = {"model_type": "fake", "num_layers": 1,
+                           "hidden_dim": 8, "vram_used_gb": 0.0}
+        self.probes = {}
+        self.on_result_arg: Any = "unset"
+
+    def generate_sweep(
+        self, _prompt: Any, sweep: dict[str, list[float]], **kwargs: Any,
+    ) -> Any:
+        from saklas.core.results import GenerationResult, RunSet
+
+        self.on_result_arg = kwargs.get("on_result")
+        rows = [
+            {name: alpha for name, alpha in zip(sweep, combo, strict=True)}
+            for combo in _product(*sweep.values())
+        ]
+        results = [
+            GenerationResult(
+                text="", tokens=[], token_count=7 + i, tok_per_sec=0.0,
+                elapsed=0.0, finish_reason="stop",
+            )
+            for i in range(len(rows))
+        ]
+        if self.on_result_arg is not None:
+            for i, (result, row) in enumerate(zip(results, rows, strict=True)):
+                self.on_result_arg(i, result, row)
+        return RunSet(results, node_ids=[None] * len(rows), grid=rows, kind="fan")
+
+
+def _product(*lists: list[float]):
+    import itertools
+    return itertools.product(*lists)
+
+
+def _patch_fan_session(monkeypatch: pytest.MonkeyPatch) -> _FanSession:
+    session = _FanSession()
+    monkeypatch.setattr(
+        cli_runners, "_make_session", lambda _args, **_kw: session,
+    )
+    monkeypatch.setattr(cli_runners, "_print_model_info", lambda _s: None)
+    monkeypatch.setattr(cli_runners, "_print_startup", lambda _a: None)
+    monkeypatch.setattr(
+        cli_runners, "_load_effective_config", lambda _a, **_kw: None,
+    )
+    return session
+
+
+def test_experiment_fan_reports_progress_per_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+):
+    """A 6-row grid is 6 sequential generations; the runner must report each
+    completion rather than sit silent until the whole sweep finishes."""
+    session = _patch_fan_session(monkeypatch)
+    cli.main([
+        "experiment", "fan", "m/x", "prompt",
+        "-g", "a=0,0.5,1", "-g", "b=0,1",
+    ])
+    assert session.on_result_arg is not None
+    out = capsys.readouterr().out
+    assert "  1/6: a=+0.000, b=+0.000" in out
+    assert "  6/6: a=+1.000, b=+1.000" in out
+
+
+def test_experiment_fan_json_suppresses_progress(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+):
+    """``-j`` must leave stdout a single parseable document."""
+    import json as _json
+
+    session = _patch_fan_session(monkeypatch)
+    cli.main(["experiment", "fan", "m/x", "prompt", "-g", "a=0,1", "-j"])
+    assert session.on_result_arg is None
+    out = capsys.readouterr().out
+    assert _json.loads(out)["kind"] == "fan"

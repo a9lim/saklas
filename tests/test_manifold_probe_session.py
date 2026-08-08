@@ -34,7 +34,12 @@ from saklas.core.results import (
     ProbeReading,
     TokenEvent,
 )
-from saklas.core.session import CaptureMode, CaptureState, SaklasSession
+from saklas.core.session import (
+    CaptureMode,
+    CaptureState,
+    ReadDemand,
+    SaklasSession,
+)
 
 
 def fit_layer_subspace(*args: Any, **kwargs: Any) -> Any:
@@ -118,12 +123,12 @@ def _stub_session() -> SaklasSession:
     session._capture_state = CaptureState()
     session._jlens = None
     session._jlens_identity = None
-    session._generation_jlens = None
-    session._generation_jlens_active = False
-    session._live_lens = None
-    session._lens_probes = {}
-    session._live_sae = None
-    session._sae_probes = {}
+    session._lens_instrument.generation_lens = None
+    session._lens_instrument.generation_lens_active = False
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
     # All three families route through real instruments now: geometry for
     # the add_probe flow (exclusive section + whitener touch + resolve +
     # monitor.add_probe), lens/SAE because ``_begin_capture`` consumes
@@ -136,8 +141,14 @@ def _stub_session() -> SaklasSession:
     session._geometry_instrument = GeometryInstrument(session)
     session._lens_instrument = LensInstrument(session)
     session._sae_instrument = SaeInstrument(session)
-    session._lens_step_stash = None
-    session._live_lens_active_for_generation = True
+    # ``_begin_capture`` runs the close → prepare → plan → bind ritual
+    # through this helper; the MagicMock default would hand it an empty
+    # iterable instead of the three real plans.
+    session._bind_instrument_runs = types.MethodType(
+        SaklasSession._bind_instrument_runs, session,
+    )
+    session._lens_instrument.step_stash = None
+    session._lens_instrument.active_for_generation = True
     session._incremental_readings = []
     session._incremental_gate_scores = []
     session._compiled_clean_eligible = False
@@ -258,8 +269,7 @@ def test_begin_capture_widens_to_manifold_layers():
 
 
 def test_begin_capture_no_probes_returns_false():
-    """No probes attached → ``_begin_capture`` returns False (the v1
-    behavior)."""
+    """No probes attached → ``_begin_capture`` returns False."""
     session = _stub_session()
     session._layers = [None] * 4  # pyright: ignore[reportAttributeAccessIssue]  # test stub: list[None] satisfies len() contract
     session._capture.attach = lambda *args, **kw: None
@@ -321,7 +331,7 @@ def test_begin_capture_live_lens_ignored_without_consumer():
     session._incremental_readings = []
 
     ok = SaklasSession._begin_capture(
-        session, widen=False, live_lens_active=False,
+        session, ReadDemand(live_lens_active=False), widen=False,
     )
 
     assert ok is False
@@ -690,7 +700,9 @@ def test_full_incremental_sink_primes_geometry_observe_memo():
     session.add_probe("toy")
     holder = _wire_begin_capture(session)
 
-    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    ok = SaklasSession._begin_capture(
+        session, ReadDemand(need_per_token=True), widen=False,
+    )
     assert ok is True
     assert session._capture_state.mode is CaptureMode.INCREMENTAL
     run = session._geometry_instrument.current_run
@@ -724,7 +736,9 @@ def test_lean_and_gating_sinks_never_prime_observe_memo():
     holder = _wire_begin_capture(session)
 
     ok = SaklasSession._begin_capture(
-        session, widen=False, need_per_token=True, lean_per_token=True,
+        session,
+        ReadDemand(need_per_token=True, lean_per_token=True),
+        widen=False,
     )
     assert ok is True
     assert session._capture_state.mode is CaptureMode.LEAN_INCREMENTAL
@@ -744,11 +758,14 @@ def test_lean_and_gating_sinks_never_prime_observe_memo():
     session._incremental_gate_scores = []
     ok = SaklasSession._begin_capture(
         session,
+        ReadDemand(
+            need_per_token=True,
+            per_token_full_consumer=False,
+            gating_only_probes={"toy"},
+            gating_probe_keys={"toy"},
+            final_probe_aggregate=False,
+        ),
         widen=False,
-        need_per_token=True,
-        gating_only_probes={"toy"},
-        gating_probe_keys={"toy"},
-        final_probe_aggregate=False,
     )
     assert ok is True
     assert session._capture_state.mode is CaptureMode.GATING_SUBSET
@@ -802,7 +819,9 @@ def test_gate_callback_consumes_the_full_incremental_memo():
     )
     session.add_probe("toy")
     holder = _wire_begin_capture(session)
-    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    ok = SaklasSession._begin_capture(
+        session, ReadDemand(need_per_token=True), widen=False,
+    )
     assert ok is True
 
     latest = {
@@ -835,7 +854,9 @@ def test_token_payload_consumes_the_full_incremental_memo():
     )
     session.add_probe("toy")
     holder = _wire_begin_capture(session)
-    ok = SaklasSession._begin_capture(session, widen=False, need_per_token=True)
+    ok = SaklasSession._begin_capture(
+        session, ReadDemand(need_per_token=True), widen=False,
+    )
     assert ok is True
 
     latest = {
@@ -863,26 +884,6 @@ def test_token_payload_consumes_the_full_incremental_memo():
     )
     assert payload.geometry_readings is session._incremental_readings[-1]
     session._geometry_instrument.close_run()
-
-
-def test_geometry_gate_keys_none_vs_empty_contract():
-    """The protocol's sentinel semantics: ``gate_keys=None`` scores the
-    full roster, an explicit ``set()`` means "no gated probes" and scores
-    nothing.  The geometry member of the three-family contract pin."""
-    session = _stub_session()
-    m = _toy_manifold()
-    session.ensure_manifold_loaded = lambda key: session._manifolds.update(
-        {key: m},
-    )
-    session.add_probe("toy")
-    run = session._geometry_instrument.current_run
-    hidden = {
-        layer_idx: sub.mean + sub.basis[0]
-        for layer_idx, sub in m.layers.items()
-    }
-    full = run.gate_scalars(0, hidden, None)
-    assert "toy" in full and "toy:fraction" in full
-    assert run.gate_scalars(0, hidden, set()) == {}
 
 
 def test_batch_geometry_aggregate_routes_through_the_run():
@@ -944,6 +945,38 @@ def test_geometry_run_observe_aggregate_matches_live_read():
     assert via_run["toy"].fraction == live["toy"].fraction
     assert via_run["toy"].residual == live["toy"].residual
     assert via_run["toy"].nearest == live["toy"].nearest
+
+
+def test_pooled_aggregate_slice_is_one_position_for_every_family():
+    """All three families finalize through ``_pooled_aggregate_slice``, and it
+    lands on the aggregate *forward index* in FULL retention too.
+
+    FULL retention never advances the capture's forward counter (only the
+    bounded-ring modes do), so a ring lookup would clamp to the last forward —
+    the trailing special — instead of the last content token.
+    """
+    session = _stub_session()
+    rows = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
+    session._capture = cast(Any, types.SimpleNamespace(
+        stacked=lambda: {0: rows},
+        tail_slice_at=lambda _idx: {0: rows[-1]},
+    ))
+    session._aggregate_forward_index = types.MethodType(
+        lambda _self, _ids: 1, session,
+    )
+
+    session._capture_state = CaptureState(mode=CaptureMode.FULL)
+    full = SaklasSession._pooled_aggregate_slice(session, [1, 2, 3, 4])
+    assert torch.equal(full[0], rows[1])
+
+    session._capture_state = CaptureState(mode=CaptureMode.AGGREGATE_ONLY)
+    ring = SaklasSession._pooled_aggregate_slice(session, [1, 2, 3, 4])
+    assert torch.equal(ring[0], rows[-1])
+
+    session._aggregate_forward_index = types.MethodType(
+        lambda _self, _ids: None, session,
+    )
+    assert SaklasSession._pooled_aggregate_slice(session, [1, 2]) == {}
 
 
 # ===================================================== gating callback ===

@@ -16,12 +16,14 @@ keeps working unchanged everywhere:
   cross-model transfer, and the shared summary serializer.
 
 Bundled materialization (:func:`materialize_bundled_manifolds`,
-:func:`bundled_manifold_names`, and the ``_materialized_this_process``
-process-scope flag) lives **physically in this module**, not a submodule.
+:func:`bundled_manifold_names`, and the ``_materialized_home``
+process-scope guard) lives **physically in this module**, not a submodule.
 It is the one stateful, monkeypatched-by-path surface here — tests reset
-``saklas.io.manifolds._materialized_this_process`` directly — so keeping
-the real flag and the function that reads it (via this module's ``global``)
+``saklas.io.manifolds._materialized_home`` to ``None`` directly — so keeping
+the real guard and the function that reads it (via this module's ``global``)
 in one place preserves that contract with zero edits at any import site.
+:func:`saklas.io.bootstrap.materialize_bundled_artifacts` is the entry point
+callers should use; it owns the templates-before-manifolds ordering.
 
 A *manifold* is a set of labeled nodes — each node a small corpus of
 statements — placed at authoring coordinates on a :class:`ManifoldDomain`
@@ -33,7 +35,6 @@ manifold against a model produces a per-model RBF artifact (see
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import warnings
@@ -42,7 +43,9 @@ from pathlib import Path
 from typing import Any
 
 from saklas.io.atomic import write_bytes_atomic, write_json_atomic
+from saklas.io.bootstrap import canonical_payload_sha256
 from saklas.io.paths import manifolds_dir, saklas_home
+from saklas.io.selectors import invalidate as invalidate_selector_index
 
 # -- format core ---------------------------------------------------------
 from saklas.io.manifold_folder import (
@@ -52,7 +55,6 @@ from saklas.io.manifold_folder import (
     ManifoldFolder,
     ManifoldFormatError,
     ManifoldSidecar,
-    _canonical_json,
     _node_filename,
     sanitize_hyperparams,
     domain_label,
@@ -80,9 +82,12 @@ from saklas.io.manifold_authoring import (
 
 # -- lifecycle / transfer / summary -------------------------------------
 from saklas.io.manifold_lifecycle import (
+    ManifoldFitProof,
     TransferSourceProof,
     clear_manifold_tensors,
+    manifold_fit_summary,
     manifold_summary,
+    preflight_manifold_fit_noop,
     preflight_transfer_manifold,
     refresh_manifold,
     remove_manifold_folder,
@@ -91,17 +96,17 @@ from saklas.io.manifold_lifecycle import (
 
 _log = logging.getLogger("saklas.io.manifolds")
 
-# Process-scope flag: set True after the first ``materialize_bundled_manifolds``
-# call so subsequent calls within the same Python process are no-ops.  See
-# the docstring on that function for rationale (avoids clobbering CLI-set
-# hyperparams on session re-init within the same invocation).  This flag and
-# the function that reads it stay physically in this module so tests can reset
-# it via ``saklas.io.manifolds._materialized_this_process`` (see the module
+# Process-scope guard: the ``SAKLAS_HOME`` the first
+# ``materialize_bundled_manifolds`` call covered, so subsequent calls for that
+# same root are no-ops.  See the docstring on that function for rationale
+# (avoids clobbering CLI-set hyperparams on session re-init within the same
+# invocation).  The no-op is scoped to one artifact root rather than blindly to
+# the Python process: tests, embedded callers, and notebook workflows may
+# intentionally switch ``SAKLAS_HOME`` in-process, and that new root still
+# needs a fresh bootstrap.  ``None`` means "not yet materialized"; this guard
+# and the function that reads it stay physically in this module so tests can
+# reset it via ``saklas.io.manifolds._materialized_home`` (see the module
 # docstring).
-_materialized_this_process: bool = False
-# The no-op is scoped to one artifact root, not blindly to the Python process.
-# Tests, embedded callers, and notebook workflows may intentionally switch
-# ``SAKLAS_HOME`` in-process; that new root still needs a fresh bootstrap.
 _materialized_home: Path | None = None
 
 
@@ -166,30 +171,19 @@ def bundled_manifold_names() -> list[str]:
     )
 
 
-def _manifest_content_sha256(data: bytes) -> str:
-    """Bundle-drift sha of a manifest payload — canonical JSON (sorted
-    keys, no whitespace, so cosmetic differences compare equal) with local
-    fit-transaction state (``files`` / ``artifact_id`` / ``fit_epochs``)
-    stripped before hashing.
+# Local fit-transaction state a manifest carries but the shipped bundle does
+# not: ``files`` accumulates per-model fit proofs locally
+# (:meth:`ManifoldFolder.update_file_hashes` after every fit), and the other two
+# are per-install identity/epoch counters.  Hashing them would misread every fit
+# as a bundle update, and the refresh would clobber the manifest with the
+# shipped bytes (whose ``files`` is empty), orphaning the fitted tensors — the
+# strict per-tensor loader refuses a tensor with no proof.
+_LOCAL_MANIFEST_STATE_KEYS = ("files", "artifact_id", "fit_epochs")
 
-    ``files`` accumulates per-model fit proofs *locally*
-    (:meth:`ManifoldFolder.update_file_hashes` after every fit), so it is
-    local state, not bundle content.  Comparing the raw manifest against
-    the shipped one misreads every fit as a bundle update; the refresh
-    then clobbered the manifest with the shipped bytes (whose ``files`` is
-    empty), orphaning the fitted tensors — the strict per-tensor loader
-    refuses a tensor with no proof.  Falls back to a raw sha256 if the
-    bytes don't parse as JSON, so unparseable on-disk content is treated
-    as "user edited" rather than silently overwritten.
-    """
-    try:
-        parsed = json.loads(data)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return hashlib.sha256(data).hexdigest()
-    if isinstance(parsed, dict):
-        for key in ("files", "artifact_id", "fit_epochs"):
-            parsed.pop(key, None)
-    return hashlib.sha256(_canonical_json(parsed)).hexdigest()
+
+def _manifest_content_sha256(data: bytes) -> str:
+    """Bundle-drift sha of a manifest payload, local fit state stripped."""
+    return canonical_payload_sha256(data, strip_keys=_LOCAL_MANIFEST_STATE_KEYS)
 
 
 def _is_bundled_json_file(entry: Any) -> bool:
@@ -389,12 +383,14 @@ def materialize_bundled_manifolds() -> None:
     ambiguity.  A long-running server that wants to pick up a bundle
     update mid-process would need a restart; this is not a real use
     case (bundle updates ship via pip and require restart anyway).
+
+    Use :func:`saklas.io.bootstrap.materialize_bundled_artifacts` rather than
+    calling this directly — it owns the templates-before-manifolds ordering.
     """
-    global _materialized_this_process, _materialized_home
+    global _materialized_home
     home = saklas_home()
-    if _materialized_this_process and _materialized_home == home:
+    if _materialized_home == home:
         return
-    _materialized_this_process = True
     _materialized_home = home
 
     home.mkdir(parents=True, exist_ok=True)
@@ -403,6 +399,9 @@ def materialize_bundled_manifolds() -> None:
     default_dir.mkdir(parents=True, exist_ok=True)
     for name in bundled_manifold_names():
         _materialize_one_bundled_manifold(default_dir, name)
+    # This just changed the installed manifold roster, so the resolver's
+    # memoized walks are stale — callers carry no invalidation duty.
+    invalidate_selector_index()
 
 
 __all__ = [
@@ -431,8 +430,11 @@ __all__ = [
     "remove_manifold_folder",
     "refresh_manifold",
     "TransferSourceProof",
+    "ManifoldFitProof",
+    "preflight_manifold_fit_noop",
     "preflight_transfer_manifold",
     "transfer_manifold",
+    "manifold_fit_summary",
     "manifold_summary",
     "domain_label",
     "bundled_manifold_names",

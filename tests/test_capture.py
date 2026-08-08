@@ -7,7 +7,11 @@ from typing import Any
 
 import torch
 
-from saklas.core.capture import _ReusablePooledCapture, _capture_all_hidden_states
+from saklas.core.capture import (
+    _capture_all_hidden_states,
+    _load_json_with_override,
+    _ReusablePooledCapture,
+)
 
 
 class _AddLayer(torch.nn.Module):
@@ -91,3 +95,56 @@ def test_reusable_capture_registers_hooks_once_for_many_forwards(
         assert set(first) == {0, 1}
         assert torch.allclose(second[1], first[1] + 1)
     assert all(not layer._forward_hooks for layer in model.layers)
+
+
+def test_one_off_per_row_pool_matches_the_reusable_context() -> None:
+    """The one-off per-row capture and the fit-wide reusable context run the
+    same hook, so they must agree exactly (and both leave the model clean)."""
+    model = _ToyModel()
+    ids = torch.tensor([[10, 11, 12], [20, 21, 22]])
+    pool = torch.tensor([1, 2])
+
+    one_off = _capture_all_hidden_states(
+        model, model.layers, ids, pool_index=pool, layer_indices=[0, 1],
+    )
+    with _ReusablePooledCapture(model, model.layers, [0, 1]) as capture:
+        reused = _capture_all_hidden_states(
+            model, model.layers, ids, pool_index=pool,
+            layer_indices=[0, 1], capture_context=capture,
+        )
+
+    assert set(one_off) == {0, 1}
+    for layer in (0, 1):
+        assert one_off[layer].shape == (2, 3)
+        assert torch.allclose(one_off[layer], reused[layer])
+    assert all(not layer._forward_hooks for layer in model.layers)
+    assert model.head_calls == 0
+
+
+def test_one_off_per_row_pool_clamps_positions_past_the_sequence() -> None:
+    model = _ToyModel()
+    ids = torch.tensor([[10, 11, 12], [20, 21, 22]])
+
+    clamped = _capture_all_hidden_states(
+        model, model.layers, ids, pool_index=torch.tensor([1, 99]),
+        layer_indices=[1],
+    )
+    last = _capture_all_hidden_states(
+        model, model.layers, ids, pool_index=torch.tensor([1, 2]),
+        layer_indices=[1],
+    )
+
+    assert torch.allclose(clamped[1], last[1])
+
+
+def test_json_override_prefers_the_user_file_over_the_bundled_resource(
+    tmp_path: Any,
+) -> None:
+    override = tmp_path / "baseline_prompts.json"
+    bundled = _load_json_with_override(override, "baseline_prompts.json")
+    assert len(bundled) == 48
+
+    override.write_text('["only this"]')
+    assert _load_json_with_override(override, "baseline_prompts.json") == [
+        "only this",
+    ]

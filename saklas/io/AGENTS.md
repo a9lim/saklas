@@ -1,574 +1,693 @@
 # io/
 
-Persistence + distribution. Concepts and steering manifolds are the same artifact
-now — labeled nodes on a domain, fit per-model — so `manifolds.py` is the on-disk
-format and `hf_manifolds.py` the HF distribution path. The old pack
-format/distribution surface (`PackMetadata`/`ConceptFolder`/`pull_pack`/the
-`cache_ops` install layer/`datasource.py`) is gone; `packs.py` / `cache_ops.py` /
-`hf.py` are thin shared-primitive remnants. Everything lives under
-`~/.saklas/manifolds/`.
+Persistence and distribution: exact on-disk schemas, the selector grammar,
+integrity, atomic publication, Hugging Face transport, and artifact lifecycle.
+All Saklas-owned state lives under `~/.saklas/` and resolves through
+`paths.saklas_home()`.
 
-## paths.py
+`io` imports `core`'s pure dataclasses (`Manifold`, `LayerSubspace`,
+`ManifoldDomain`) — the correct layering arrow. `core/manifold.py` stays
+pure-tensor geometry with no filesystem coupling, so codecs and filesystem
+transactions live here.
 
-Every `~/.saklas/` path resolves through `saklas_home()` (honors `$SAKLAS_HOME`).
-Helpers: `manifolds_dir`, `manifold_dir(ns, name)`, `templates_dir`, `models_dir`, `model_dir(id)`,
-`neutral_statements_path`, `baseline_prompts_path` (user override for the shared A2
-baseline user prompts; falls back to bundled `saklas/data/baseline_prompts.json`),
-`safe_model_id` (every model id uses one reversible `_z` base64url encoding),
-`ensure_within(root, *parts)` (path-traversal
-barrier).
+Three artifact families: the **manifold** (per-concept, the steering artifact),
+the **template** (slot + values + contexts), and the **per-model sources**
+(neutral/alignment caches, Jacobian lens, SAEs).
 
-`sae.py` owns source selection plus small external bindings under
-`models/<safe>/sae/{active.json,bindings/}`: one release/layer identity sidecar
-plus the lazily fetched per-feature Neuronpedia metadata (`<release>-features.json` —
-`{id: {label, max_act}}`, where `max_act` is `maxActApprox`, the strength
-unit that normalizes the readout channel to 0..1). External weights remain in
-the Hugging Face cache. `sae_artifacts.py` owns Saklas-trained fp32 artifacts
-under `sae/local/<name>/` and never writes into provider caches.
+## Shared primitives
 
-Owns the tensor-filename variant scheme. A manifold folder can hold several
-fitted tensors per model, distinguished by filename suffix — exactly one *kind*
-per file:
+### paths.py
 
-- `<safe_model>.safetensors` — raw DiM (canonical)
-- `<safe_model>_sae-<encoded_release>.safetensors` — fit in SAE feature space
-- `<safe_model>_from-<encoded_src>.safetensors` — cross-model transfer
+`saklas_home()` honors `$SAKLAS_HOME`. Helpers: `manifolds_dir`, `manifold_dir`,
+`templates_dir`, `models_dir`, `model_dir`, `neutral_statements_path`,
+`baseline_prompts_path` (user override for the shared baseline user prompts,
+falling back to bundled `saklas/data/baseline_prompts.json`).
+`ensure_within(root, *parts)` is the path-traversal barrier — namespaces, names,
+model ids, and manifest-relative filenames arrive from HTTP bodies, CLI args, and
+downloaded manifests, so the string is re-checked where it becomes a path.
 
-`tensor_filename(model_id, *, release=None, transferred_from=None)` +
-`sidecar_filename(...)` construct (the two kind kwargs are mutually exclusive);
-`parse_tensor_filename(name) → (safe_model, variant)` inverts, variant ∈ `None` /
-`sae-<encoded_release>` / `from-<encoded_src>`. Both values use the canonical,
-reversible lowercase Base32 `encode_release_id` codec; the parser rejects a
-noncanonical target model or variant identity. Separators
-`_VARIANT_SEP_SAE`/`_FROM`. Role-augmented extraction still uses the expression
-suffix `:role-<name>`, but the role is baked into the corpus and the fit writes
-the canonical raw tensor; it is not a tensor-file variant. There is **no `pca` variant and no method
-suffix** — difference-of-means is the only vector extraction method.
+`safe_model_id` / `unsafe_model_id` round-trip a model id through one reversible
+`_z`-prefixed urlsafe-base64 component; `encode_release_id` / `decode_release_id`
+do the same in lowercase Base32 for SAE releases and source model ids. Both
+reject non-canonical input.
 
-## packs.py
+This module owns the tensor-filename variant scheme. A manifold folder holds
+several fitted tensors per model, at most one *kind* per file:
+`<safe_model>.safetensors` (canonical difference-of-means),
+`_sae-<encoded_release>`, `_from-<encoded_src>` (cross-model transfer).
+`tensor_filename` / `sidecar_filename` construct (the two kind kwargs are
+mutually exclusive) and `parse_tensor_filename → (safe_model, variant)` inverts;
+components escape the separators before concatenation so a model id containing
+one stays unambiguous, and a non-canonical identity parses as `None`.
+`VARIANT_SUFFIX_RE` is the single source of truth for the selector-level
+`:variant` suffix (`raw` | `sae[-…]` | `role[-…]` | `from[-…]`), imported by
+`io.selectors` and `cli.runners`. `role-` exists in the selector grammar only:
+`extract --role` bakes the role into the corpus and writes the canonical raw
+tensor.
 
-Shared artifact primitives only — the pack format/distribution surface is gone.
-What remains: `NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` (manifolds reuse it),
-`hash_file` / `verify_integrity` (the sha256 integrity
-helpers behind the neutral/layer-means/alignment caches and the manifold integrity
-manifest), and `PROFILE_FORMAT_VERSION = 5`, stamped onto the exact profile
-sidecars `profile.save_profile` writes. Standalone safetensor profiles use a
-stable pair lock and bind the exact tensor bytes through `tensor_sha256`; one
-shared validator gates writer and reader, with a closed method set and exact
-component, SAE-layer, and diagnostic-layer schemas covering the tensor roster.
+### integrity.py
 
-## manifolds.py
+`NAME_REGEX = ^[a-z][a-z0-9._-]{0,63}$` is the one artifact-name grammar
+(manifolds, selectors, templates, local lens/SAE names). `hash_file` /
+`verify_integrity` are the sha256 helpers behind every integrity manifest;
+`verify_integrity` routes each manifest-relative path through `ensure_within` and
+counts an escaping entry as a failure rather than reading off-tree. Its
+stat-identity fingerprint cache is purely an optimization — first load and any
+stat change still run the full sha256.
 
-The on-disk format for every concept + steering manifold —
-`~/.saklas/manifolds/<ns>/<name>/`. `MANIFOLD_FORMAT_VERSION = 9` (decoupled from
-the profile format); readers and writers require exactly v9.
-`min_nodes(n) = 2n+1`
-(the curved-fit poisedness floor). Five `fit_mode`s share the class, discriminated
-by `manifold.json::fit_mode`:
+`PROFILE_FORMAT_VERSION = 6` stamps the sidecars `core/profile.py::save_profile`
+writes. That schema is exactly `{format_version, saklas_version, method,
+tensor_sha256, provenance}` — four identity fields plus one free-form JSON-safe
+`provenance` object, so a producer records anything else there rather than
+growing the set. `method` is closed: `profile`, `manifold_pca` (the folded 2-node
+manifold view `session.extract` returns), `merge`. `tensor_sha256` binds the
+exact payload bytes, and writer-stamped fields are re-stamped on save so
+`Profile.load(p).save(q)` round-trips. No cache rides this version — the
+neutral-activation and alignment caches carry their own schemas and versions in
+`alignment.py` — so the only reader a bump reaches is a user-saved `Profile`,
+and the reader's version check leads so a stale file is told which version it
+is and what to re-run, not which field the exact-set schema missed first.
 
-- **`authored`** — user supplies `domain` + per-node `{label, coords}`. Curved RBF.
-- **`pca`** / **`spectral`** / **`auto`** (discover) — nodes carry `{label}` only;
-  coords are derived per-model at fit time and stored in the safetensors;
-`hyperparams` feeds the picker; keys outside the selected mode's exact whitelist
-raise at the authoring/override boundary rather than being discarded. `pca` is flat (also the 2-node vector case),
-  `spectral` curved, `auto` lets `core.manifold.select_topology` pick flat-vs-
-  curved (GCV) plus periodic `BoxDomain` axes (H1 persistent homology) per-model.
-  All three are `is_discover`; `_HYPERPARAMS_BY_MODE` whitelists each (auto's
-  union includes `smoothing` + `persistence_frac`), and `nodes_sha256` folds
-  `fit_mode` + hyperparams so re-fit is deterministic.
-- **`baked`** — corpus-less: a precomputed direction written by `manifold bake`.
-  No node corpus, no re-fit; `BakedManifoldError` guards corpus-requiring calls.
+### atomic.py / staging.py / shards.py
 
-`ManifoldFolder.load` validates the format version, `NAME_REGEX`, and per-node
-`_LABEL_REGEX = ^[a-z][a-z0-9_-]{0,63}$` (labels drop `.` — reserved as the
-bipolar separator and the `%label` lexer would mis-read it), branches on
-`fit_mode`, enforces `min_nodes` on authored folders (discover at fit time),
-verifies `files`, and demands a sidecar per fitted tensor. `source`
-(`local`/`bundled`/`hf://...`) and `tags` ride `manifold.json`. Each node entry
-also carries an optional `kind` ∈ {`abstract`, `concrete`, `custom`} (`_validate_node_kind`;
-`custom` = a caller-supplied generation system prompt, no role swap),
-parallel to the optional `role` — generation-only provenance (it selects the
-generation system template + elicitation role label) that the fit never consumes;
-it rides `ManifoldFolder.node_kinds` / `ManifoldSidecar.node_kinds` and is emitted
-only when set by `_node_payload_authored` / `_node_payload_discover`.
-`node_groups()` reads `nodes/NN_<label>.json` in order; `nodes_sha256()` is the
-staleness key — hashes `{corpus, domain, node_coords}` (authored) / `{corpus,
-fit_mode, hyperparams}` (discover) / a baked sentinel, folding in any non-`None`
-node role and any non-`None` node kind.
-`ManifoldSidecar` is the lean per-tensor JSON. Both folder discovery and direct
-tensor loading require its exact current `format_version` plus the current
-identity fields; missing fields are never synthesized. `method` is a closed
-discriminator coupled to `fit_mode`, not a free provenance string. It round-trips
-`manifold_pca`/`manifold_sae`/`manifold_monopolar{,_sae}` authored,
-`manifold_discover_{pca,spectral,sae}`
-plus `manifold_discover_auto` discover, `merge` / `folded_vector` baked, and
-`manifold_procrustes_transfer` transfer + the
-share/subspace metrics, fit_mode, hyperparams, diagnostics, and
-`node_spread_per_layer` — the whitened between-node spread `{str(L): tr(G_L)}`,
-a diagnostic concept-signal-by-layer profile measured before DLS, whose keys are
-the evaluated-layer roster and may strictly contain `fitted_layers` when DLS
-drops a layer); the tensor save/load itself lives in `manifold_tensors.py`; its
-tensor-derived layer roster must equal the sidecar's `fitted_layers`. Merge component provenance always
-carries a manifest-proven lowercase sha256. `hash_manifold_files` reuses
-`packs.hash_file` for the per-file sha256 integrity manifest. After the first
-manifest population, `ManifoldFolder.update_file_hashes` hashes only the tensor
-and sidecar just replaced; already-verified historical variants are preserved.
+`atomic.py` — `write_bytes_atomic` / `write_json_atomic` stage to a
+same-directory tempfile, `fsync`, then `os.replace` (same-dir staging is
+required: `os.replace` is atomic only within a filesystem). `fsync_directory`
+makes a directory entry durable. `artifact_lock` is the cross-process lock;
+`ReleasableArtifactLock` lets a short cache transaction run inside a longer fit,
+and `artifact_process_lease` / `artifact_has_live_lease` protect mapped immutable
+shards after that lock is released (stale PID markers are reaped).
 
-A node corpus is now a list of conversational *responses* (`list[str]`) aligned to
-the shared A2 baseline user prompts — `response[i]` answers `baseline_prompt[i % k]`
-(`baseline_prompts_path`), so a corpus length must be a multiple of `k`. The shared
-baseline prompts are global (bundled `saklas/data/baseline_prompts.json`), not
-per-manifold.
+`staging.py` — `stage_verify_swap`: recover a `.bak` when the destination is
+missing, wipe stale staging, build a fully validated `.staging/` tree, then
+promote (`target → .bak`, `.staging → target`) with best-effort restore.
 
-Authoring: `create_manifold_folder` (authored webui/HTTP path, returns `(folder,
-advisories)`), `create_discover_manifold_folder` (`sanitize_hyperparams` drops
-cross-method keys at the IO boundary, gated by `_HYPERPARAMS_BY_MODE`; takes
-`node_roles=` / `node_kinds=` maps),
-`create_baked_manifold_folder` + `save_baked_manifold_tensor` (the `subspace
-merge` target — one fitted tensor per model, all sharing one `manifold.json`);
-each baked pair records its manifest proof before the call returns, and an
-ordinary identical producer retry replaces an unproven first/later pair left by
-a crash between pair publication and the manifest update.
-Streaming companions for big rosters (a crash keeps finished nodes):
-`init_discover_manifold_folder` (also takes `node_kinds=`) +
-`append_discover_manifold_node`; `plan_discover_generation → DiscoverGenerationPlan`
-resumes intentionally incomplete node corpora but requires the partial manifest
-itself to have the exact current version, fields, name, and label-only node shape.
-(also takes `node_kinds=`) is
-the shared resume/add-nodes planner (deliberately bypasses `ManifoldFolder.load` so
-it can inspect a partial). `merge_discover_manifolds` unions ≥2 discover sources'
-node corpora into a fresh *unfitted* folder (authored sources / label collisions /
-mixed-mode-without-override raise). `update_manifold_folder` re-authors authored
-folders.
+`shards.py` — the immutable-generation primitive three per-model families share
+(the neutral and alignment caches in `alignment.py`, the local J-lens in
+`lens.py`). One `<stem>.layer-<L>.gen-<uuid>.safetensors` payload per layer plus
+a JSON sidecar naming the live generation per layer under `tensor_files`;
+publication is a single atomic pointer replace, so a reader only ever sees a
+complete generation set. `shard_paths` requires a bare filename (a
+manifest-supplied `..` or absolute path is rejected) and takes
+`require_exact_keys=False` for a scoped subset read. `cleanup_generations` runs
+only once the surviving pointer is durable, and logs rather than raises — an
+uncollected generation is inert, a collected-too-early one is data loss.
+`fit_lock` keys on a `<stem>.fit` sibling so the expensive transaction spans model
+construction without blocking short pointer reads. Sidecar *schemas* and format
+versions stay private per family; sharing only the path/GC/lock discipline keeps
+crash recovery from drifting between them.
 
-Lifecycle (addressed by `(namespace, name)`, not a concept `Selector`):
-`remove_manifold_folder` (returns `rematerializes_on_restart` for `default/`/
-bundled), `clear_manifold_tensors(... model_scope=None, variant="all")` (filter
-raw/sae/from/all; keeps `manifold.json` + corpus), `refresh_manifold` (unscoped:
-`local` → skip, `bundled` → re-materialize, `hf://` → re-pull; scoped → drop one
-model's fit), `transfer_manifold(folder, *, from_model, to_model, alignment,
-whitener, ...)` (folder read/write orchestration only — the subspace math itself
-moved to `core.manifold.transfer_manifold_subspaces`). It loads the source tensor,
-hands the loaded `Manifold` + caller-supplied compact affine `alignment` +
-target whitener to the core compute (which maps points/means through `M_L x+b_L`
-but directions through `M_L`, QR-orthonormalizes the mapped basis, transforms
-the affine/RBF reduced coefficients exactly into the new frame, re-bakes the
-Mahalanobis **share** in target space — target whitener **required**, `WhitenerError`
-otherwise; no Euclidean rebake — rejects a curved transfer whose tube would
-become anisotropic, and transforms `origin` into the target frame), then writes the
-`_from-<safe_src>` variant + patches the transfer-provenance sidecar. The core
-function raises a plain `ValueError` when the alignment covers no fitted layer; this
-function surfaces it as `ManifoldFormatError` (the `WhitenerError`, a `ValueError`
-subclass, propagates verbatim via a `SaklasError`-first `except`). The lazy imports
-are now just `load_manifold` / `save_manifold` (sibling `manifold_tensors.py`) +
-`core.manifold.transfer_manifold_subspaces` — no `LayerSubspace` / `eval_rbf` /
-`subspace_share` / `mahalanobis.WhitenerError`. `manifold_summary(folder)` is the session-independent
-serializer shared by `pack show -j` + the HTTP summary route.
-`clear` / `rm` garbage-collect shared format-v4 per-layer capture shards only
-after the last fitted-sidecar owner disappears, under the same capture-stem lock
-used by fitting and only when no live PID lease is consuming mapped rows; stale
-crash leases are reaped lazily. They enumerate all cache stems for affected
-models, so corrupt or missing fitted sidecars cannot strand an orphaned group;
-a readable owner in any other manifold still preserves it. Scoped clear increments only its model/variant
-fit epoch, invalidating a paused matching fit without discarding unrelated target
-work; rm/recreate changes the folder artifact id. Fitted pairs use stable
-digest-named locks outside the removable folder; clear/rm/refresh acquire the
-manifest lock followed by affected pair locks in deterministic order. Transfer
-provenance is part of the initial sidecar publication, and a pair left unproven
-by a failed manifest update is repaired on an ordinary retry; the CLI delegates
-target existence to that proof-aware backend rather than treating raw path
-presence as a conflict. A short manifest+pair preflight proves the source and
-rejects only a trusted existing target before any model/alignment work; the
-backend repeats the proof authoritatively under its full transfer transaction.
-Whole-folder force
-authoring resets and HF stage swaps use the same manifest → sorted stable-pair
-order before removing/renaming a destination, so they cannot unlink a tensor
-while a fitted reader owns its logical pair lock. This composes with fit-side
-size pruning, which locks victims one at a time after the publisher releases its
-own stem. Ordinary
-discovery/summary routing (`iter_manifold_folders`, `manifold_summary`, HTTP
-lookup), authoring edits/merges, and source-tier lifecycle reads load metadata
-with `verify_manifest=False`; install/push/fitted-tensor use stays strict, and
-pair publication hashes only the newly written files, validates that the live
-manifest version is readable, and atomically stamps the current writer version
-with those proofs. GGUF export likewise keeps its folder-shape preflight
-metadata-only, then strictly verifies the selected fitted pair when loading it.
-`bundled_manifold_names`,
-`materialize_bundled_manifolds`
-(copy-on-miss into `default/` for complete package-data folders only, plus a
-re-copy when the bundled manifest hash drifts or the on-disk `format_version`
-is not current). Its process guard is keyed by the resolved `SAKLAS_HOME`, so an
-in-process home switch still bootstraps the new artifact root. Bundle-drift comparison runs on the
-**`files`-stripped** canonical payload (`_manifest_content_sha256`) — the
-integrity map accumulates per-model fit proofs locally
-(`update_file_hashes`), so comparing it against the shipped manifest
-misread every fitted bundled manifold as a bundle update and the refresh
-clobbered the proofs, orphaning the tensors (the strict loader refuses a
-tensor with no proof). On a genuine bundle update the refresh **carries
-forward** `files` entries for still-present non-bundle-shipped artifacts
-(fitted tensors + sidecars) — proofs still verify on every load, and
-`nodes_sha256` staleness remains the thing that decides whether an old
-fit is current. Per-node `role`
-(slug `[a-z0-9._-]+`) rides the fit to `compute_node_centroid` for role-baselined
-centroids; family-unsupported raises `RoleSubstitutionUnsupportedError` at fit time.
+### source_registry.py
 
-**Templated manifolds** carry a `template_ref: str | None` (a
-`templates.py::TemplateFolder` selector) instead of node corpora authored by hand:
-`create_manifold_from_template(ns, name, *, template_ref, fit_mode, …)` resolves the
-template, expands its `values × contexts` into per-value node corpora (via
-`TemplateFolder.node_corpora()`), and writes a normal discover folder that stores
-both the derived corpus (`nodes/`) and the `template_ref`. The fit
-(`core/extraction.py`) resolves the ref to use the template's **multi-turn
-contexts** as the per-node elicitation prefixes; `nodes_sha256()` folds the resolved
-template's `sha256()` so a context/value edit re-fits. The template is the authoring
-source of truth; the corpus is its materialization. There is **no embedded
-`template` block** — the pre-migration `{slot, values, pairs}` block, `expand_template`,
-`_validate_template_block`, and `create_templated_manifold_folder` are gone.
+`ActiveSourceRegistry` is the `active.json` selection shared by the lens and SAE
+families: a `{format_version, model_id, kind, name}` payload written atomically
+under the artifact lock. `read` validates every field and returns `None` on any
+deviation — a stale or hand-edited selection must not stop a model from starting.
+`write` validates kind, name grammar, and on-disk existence, so a selection never
+dangles. `clear_if_active` unpublishes when the selection names exactly the
+source being removed. Per-family: the binding schemas the selection points at and
+the loaders that make it resident.
 
-## manifold_tensors.py
+### bootstrap.py
 
-The fitted per-model **tensor codec** plus the curved-fit activation-row spool —
-lifted out of `core/manifold.py` to restore that module's pure-tensor, no-IO
-contract (io importing core's `Manifold`/`LayerSubspace`/`ManifoldDomain`
-dataclasses is the correct layering arrow; the codec only lived in core because it
-needs those types). `save_manifold(manifold, path, metadata)` /
-`load_manifold(path, *, verify_manifest=True)` round-trip the safetensors payload
-(per-layer mean/basis[/affine_map] or the curved RBF/σ triple + shared
-`node_coords` + optional `origin`) and its lean JSON sidecar under the folder pair
-lock, staging both through same-directory tempfiles with fsync + `os.replace`
-(`_replace_manifold_file` is the atomic-replace seam the publication
+`materialize_bundled_artifacts()` is the single bootstrap call every entry point
+makes. It runs `materialize_bundled_templates()` **before**
+`materialize_bundled_manifolds()`: a bundled manifold may `template_ref` a
+bundled `default/<name>` template, and the fit resolves that ref (a hard
+`TemplateNotFoundError` otherwise, with `nodes_sha256` degrading to the bare ref
+string). Owning the order in one place keeps a new bootstrap site from getting it
+wrong.
+
+`canonical_payload_sha256(data, *, strip_keys=())` is the bundle-drift hash both
+materializers use — canonical JSON so cosmetic differences compare equal, with
+`strip_keys` dropping top-level keys carrying local transaction state.
+Unparseable bytes fall back to a raw sha256, so hand-edited content reads as
+drift rather than being silently overwritten.
+
+## The manifold artifact
+
+`~/.saklas/manifolds/<ns>/<name>/` holds `manifold.json`, `nodes/NN_<label>.json`
+corpora, and per-model fitted `.safetensors` + `.json` sidecar pairs. The format
+splits across four modules; `manifolds.py` re-exports them as the stable
+`from saklas.io.manifolds import X` surface.
+
+### manifold_folder.py — the format core
+
+The dependency root: dataclasses, validators, `manifold.json` load/save,
+integrity, and the locks. `MANIFOLD_FORMAT_VERSION = 10`; readers and writers
+require exactly 10. A `manifold.json` at any other version is a hard
+`ManifoldFormatError`; a *fitted sidecar* at another version is **stale, not
+corrupt** — `ManifoldFolder.load` leaves its stem unregistered and the manifold
+reads as "not fitted for that model", a clean cache miss the next fit
+overwrites. Raising there would take the whole artifact out of the selector
+index on a format bump, unfitting its labels, probes, and steering along with
+the one expired tensor. Corrupt (rather than merely old) sidecars still raise,
+and a corpus-less `baked` manifold keeps the strict read because it has nothing
+to re-fit from. `min_nodes(n) = 2n+1` is the curved-fit poisedness floor (a
+flat `pca` fit needs only `k+1`). Node labels validate against `_LABEL_REGEX =
+^[a-z][a-z0-9_-]{0,63}$` — stricter than `NAME_REGEX` because `.` is the bipolar
+separator and the steering lexer addresses a label as `%label`, so a dotted label
+could be neither typed nor resolved unambiguously. The manifold *name* keeps
+`NAME_REGEX`.
+
+Five `fit_mode`s share the class: **`authored`** (user supplies `domain` +
+per-node `{label, coords}`; curved RBF); the discover trio **`pca`** (flat, also
+the 2-node vector case) / **`spectral`** (curved) / **`auto`** (geometry chosen
+per-model by `core.topology.select_topology`), where nodes carry `{label}` only
+and coords are derived at fit time into the safetensors; and **`baked`** —
+corpus-less, a precomputed direction from `manifold bake` that never re-fits, with
+`BakedManifoldError` guarding corpus-requiring calls.
+
+`sanitize_hyperparams(fit_mode, hyperparams)` is the single per-mode whitelist
+(`auto` takes the union of its candidates' knobs plus `persistence_frac`). A key
+the selected dispatcher would ignore **raises** at the authoring/override
+boundary rather than being silently discarded, so the manifest never records a
+knob that did nothing.
+
+`ManifoldFolder.load(folder, *, verify_manifest=True)` validates the format
+version, name, labels, and node shape, branches on `fit_mode`, enforces
+`min_nodes` on authored folders, verifies the `files` manifest, and demands a
+sidecar per fitted tensor. `verify_manifest=False` serves metadata-only
+inventory, authoring, lifecycle routing, and summaries, so listing scales with
+metadata size rather than artifact bytes; runtime, install, and push callers keep
+the full walk. Structural checks and tensor/sidecar pairing run either way.
+
+A node corpus is a `list[str]` of responses aligned to the shared baseline
+prompts (`response[i]` answers `baseline_prompt[i % k]`, so its length is a
+multiple of `k`). Each node also carries an optional `role` (the assistant-role
+substitution its centroid is pooled under — a real fit input) and `kind` ∈
+{`abstract`, `concrete`, `custom`} (generation-time provenance the fit never
+consumes).
+
+`nodes_sha256(*, resolved_template_sha256=None)` is the staleness key: node
+labels, every corpus file's bytes, `{domain, node_coords}` (authored) or
+`{fit_mode, hyperparams}` (discover), `node_roles`, `node_kinds`, and — for a
+templated manifold — the resolved template's content hash, falling back to the
+ref string when it genuinely cannot be resolved. A baked folder hashes a
+provenance-only sentinel.
+
+`ManifoldSidecar` is the lean per-tensor JSON;
+`validate_manifold_sidecar_payload` enforces the exact schema by set equality, so
+no field is ever synthesized on read. `method` is a closed discriminator that
+`MANIFOLD_METHOD_FIT_MODES` couples to `fit_mode` (`manifold_pca` /
+`manifold_sae` / `manifold_monopolar{,_sae}` → authored;
+`manifold_discover_{pca,spectral,auto}` → their pinned mode;
+`manifold_discover_sae` → any discover mode; `merge` / `folded_vector` → baked;
+`manifold_procrustes_transfer` → any), and provenance blocks are validated
+all-or-nothing against it: `auto` carries the resolved mode plus ranked
+`topology_candidates`, `merge` carries `components` + `bake_policy`, a transfer
+carries source model id + fingerprint, and an `sae-*` feature space carries a
+release + per-layer feature ids — each absent on every other kind of fit.
+Four fields exist so a refit can be proven unnecessary *off-model*:
+`model_source_fingerprint` (the pre-load-verifiable checkpoint identity —
+distinct from `source_model_fingerprint`, which names the other model a
+cross-model transfer came from), `capture_version`, `capture_render_sha256`
+(the tokenizer-render half of `capture_sha256` — node partition plus each
+rendered row's token ids and pool index), and `baseline_prompts_sha256`. See
+"weight-free fit preflight" under `manifold_lifecycle.py`.
+`node_spread_per_layer` is measured *before* DLS, so its keys are the
+evaluated-layer roster and may strictly contain `fitted_layers`, which is what
+lets a cache prove a layer was evaluated rather than accidentally omitted.
+
+`_locked_manifest(folder)` serializes manifest read-modify-write per folder.
+`manifold_pair_lock(tensor)` locks one tensor/sidecar pair at a stable
+digest-named path in the *parent* namespace directory, not inside the removable
+folder, so `rm` and stage-swap refreshes cannot unlink a held lock inode and let
+a later process acquire a fresh one for the same logical pair.
+`update_file_hashes(*paths)` hashes only the files just replaced, preserving
+proofs for other variants. `manifold.json` also carries three local-only
+transaction keys — `files`, `artifact_id`, `fit_epochs` — stripped from
+bundle-drift comparisons and from pushes.
+
+### manifold_tensors.py — fitted-tensor codec + row spool
+
+`save_manifold` / `load_manifold(path, *, verify_manifest=True)` round-trip the
+safetensors payload (per-layer mean/basis/optional `affine_map`, or the curved
+RBF/σ triple, plus shared `node_coords` and optional `origin`) and its sidecar
+under the folder pair lock, staged through same-directory tempfiles with fsync +
+`os.replace`. `_replace_manifold_file` is the atomic-replace seam publication
 failure-injection tests monkeypatch; `_load_manifold_locked` is the pair-locked
-read half, reused by `core/extraction.py`'s cache-hit fast path). Re-exported
-through the `manifolds.py` barrel for a coherent public io surface. `ActivationRowStore`
-is the temporary layer-major mmap row spool a curved fit uses after the
-centroid-derived basis exists (one `torch.from_file` shared-memory tensor per
-layer, `persist`/`load`/`load_shards`/`combine_disjoint` for the v4 sharded
-capture cache); `core.manifold.compute_manifold_node_stats` produces it,
-`compute_store_reduced_covariances` consumes it, both lazy-importing it back from
-here.
+read half `core/extraction.py`'s cache-hit fast path reuses. The tensor-derived
+layer roster must equal the sidecar's `fitted_layers`.
 
-## templates.py
+`ActivationRowStore` is the temporary layer-major mmap row spool a curved fit
+uses once the centroid-derived basis exists — one shared-memory tensor per layer
+in the model output dtype (lossless relative to the source residual; fp32
+promotion happens only when covariance math consumes a node slice), keeping
+`nodes × responses × layers × d_model` off the accelerator. `persist` / `load` /
+`load_shards` / `combine_disjoint` back the sharded per-model capture cache.
 
-The standalone templated-completion artifact — `~/.saklas/templates/<ns>/<name>/
-template.json`, peer to a manifold. `TemplateFolder` = `{name, slot, values,
-contexts:[TemplateContext{turns:[{role,content}], assistant}]}`,
-`TEMPLATE_FORMAT_VERSION = 2`. Invariant (`_validate_body` / `_validate_context`):
-the slot appears **exactly once** in each context's final `assistant` string and in
-no history turn; the last history turn must be `user` (the slotted assistant turn
-follows it). Derived views: `node_labels()` (slugged values), `node_corpora()`
-(`{label: [slot-filled assistant per context]}` — the manifold corpus,
-`corpus[i] ↔ contexts[i]`), `score_inputs()` (per-context `{messages,
-assistant_prefix, suffix, choices, labels}` — the scorer feed, slot split via
-`partition`). `sha256()` hashes `slot × values × contexts` (excludes
-description/tags) — the staleness key folded into a referencing manifold's
-`nodes_sha256`. Lifecycle: `create_template_folder` (validates whole body before
-writing — no half-built folder), `resolve_template(selector)` (bare name searches
-all namespaces, `AmbiguousTemplateError` on collision, `TemplateNotFoundError` on
-miss), `iter_template_folders`, `remove_template_folder`. `_slug_value` mirrors the
-manifold node-label slug; `_LABEL_REGEX` is redefined locally so the
-`manifolds → templates` import direction stays acyclic.
+### manifold_authoring.py — discovery + the write path
 
-**Bundled templates.** `bundled_template_names` / `materialize_bundled_templates`
-mirror the manifold materializer for the template kind — copy-on-miss of
-`saklas/data/templates/<name>/template.json` into `~/.saklas/templates/default/`,
-re-copy on bundle drift (canonical hash or `format_version`), per-home
-process-scope no-op.
-**Ordering**: every bootstrap site runs this *before*
-`materialize_bundled_manifolds`, because a templated bundled manifold
-(`default/<name>`) resolves its `template_ref` at fit (a hard
-`TemplateNotFoundError` otherwise; `nodes_sha256` degrades to the ref string). A
-template-derived bundled manifold authors deterministically (model-free) — write
-the template, then `create_manifold_from_template` derives the corpus — so there
-is no model-generation step. No template-derived bundled manifold ships at present
-(colors was the first candidate, pulled).
+`iter_manifold_folders(namespace=None)` walks the tree metadata-only and skips
+malformed folders, so one bad artifact cannot break a listing.
+`RESERVED_NAMESPACES = {jlens, sae}` — both are lazily-resolved per-model
+steering tiers, and a folder under either name would shadow that resolution.
+
+- `create_manifold_folder(...) → (folder, advisories)` — the authored path;
+  advisories are soft poisedness/flat-axis warnings, surfaced before a fit is paid
+  for. `update_manifold_folder` re-authors one.
+- `create_discover_manifold_folder(..., node_roles=, node_kinds=)` — labeled
+  corpora only.
+- `create_manifold_from_template(ns, name, *, template_ref, fit_mode, …)` —
+  resolves the template, expands `values × contexts` through
+  `TemplateFolder.node_corpora()`, and writes an ordinary discover folder storing
+  both the derived corpus and the `template_ref`. The template is the authoring
+  source of truth; the corpus is its materialization.
+- `create_baked_manifold_folder` + `save_baked_manifold_tensor` — the `manifold
+  bake` target: one fitted tensor per model, all sharing one `manifold.json`. Each
+  pair records its manifest proof before the call returns, and an
+  identical-producer retry repairs a pair left unproven by a crash mid-publication.
+- `init_discover_manifold_folder` + `append_discover_manifold_node` — streaming
+  companions for big rosters, so a crash keeps the finished nodes.
+  `plan_discover_generation → DiscoverGenerationPlan` is the shared resume /
+  add-nodes planner; it bypasses `ManifoldFolder.load` so it can inspect a partial
+  folder, but still requires that partial manifest to carry the exact current
+  version, fields, name, and label-only node shape.
+- `merge_discover_manifolds` unions ≥2 discover sources' corpora into a fresh
+  *unfitted* folder (authored sources, label collisions, and mixed modes without an
+  explicit override raise).
+
+### manifold_lifecycle.py — rm / clear / refresh / transfer / summary
+
+Addressed by `(namespace, name)`, not a `Selector`. `manifold.json::source`
+(`local` / `bundled` / `hf://…`) is the tier that decides refresh behavior.
+`remove_manifold_folder` returns `rematerializes_on_restart` for bundled
+`default/` folders; `clear_manifold_tensors(..., model_scope=None,
+variant="all")` filters raw/sae/from/all and keeps `manifold.json` + corpus;
+`refresh_manifold` unscoped skips `local`, re-materializes `bundled`, and
+re-pulls `hf://`, while scoped it drops one model's fit. A scoped clear
+increments only its own model/variant fit epoch, invalidating a paused matching
+fit without discarding unrelated target work; rm/recreate changes the folder's
+`artifact_id`.
+
+Destructive paths take the manifest lock then the affected pair locks in
+deterministic sorted order — as do whole-folder force authoring and HF stage
+swaps — so they cannot unlink a tensor while a fitted reader owns its logical
+pair lock. Shared per-layer capture shards are collected only after the last
+fitted-sidecar owner disappears, under the capture-stem lock fitting uses, and
+only when no live PID lease is consuming mapped rows. Stem enumeration is
+deliberately independent of sidecar readability — clear and rm are repair
+surfaces, so a corrupt sidecar must not make a content-addressed capture
+undiscoverable — with ownership proven globally under the stem lock immediately
+before deletion.
+
+`transfer_manifold(folder, *, from_model, to_model, alignment, whitener, …)` is
+folder read/write orchestration only: it hands the loaded `Manifold`, the
+caller-supplied compact affine alignment, and the target whitener to
+`core.manifold.transfer_manifold_subspaces`, then writes the `_from-<safe_src>`
+variant and patches the transfer-provenance sidecar. The target whitener is
+required (`WhitenerError` otherwise, no Euclidean rebake), and the core function's
+plain `ValueError` for an alignment covering no fitted layer surfaces here as
+`ManifoldFormatError`. `preflight_transfer_manifold → TransferSourceProof` proves
+the source and rejects only a trusted existing target before any model or
+alignment work; the backend repeats the proof authoritatively inside its own
+transaction.
+
+`preflight_manifold_fit_noop(folder, *, model_id, layer_indices, sae, fit_mode,
+hyperparams, quantize, device) → ManifoldFitProof | None` is the **weight-free
+fit preflight** — the manifold counterpart of `lens fit`'s model-free no-op, and
+the reason `manifold extract` / `manifold fit` no longer pay a model load to
+discover they had nothing to do. It proves, in the order the fit keys on them:
+`nodes_sha256` (recomputed from the folder); `model_source_fingerprint`
+(recomputed from the published config / local checkpoint files and the load
+representation); `model_fingerprint`, which is *not* recomputable off-model and
+is therefore **bridged** — the neutral-activation cache was written by a real
+load and binds this checkpoint source to the loaded fingerprint it produced, the
+same bridge `alignment.py`'s `_proven_sidecar` walks; `capture_version` +
+`capture_render_sha256` + `baseline_prompts_sha256`, re-rendered here from
+tokenizer + prompts + corpus, which with the two fingerprints covering the
+model-identity half make `capture_sha256` equality follow; `fit_policy_version`;
+and the fitted-layer set, resolved against the *config's* layer count
+(`core.model.config_model_shape`). The identity digests come from
+`core.extraction.offline_fit_identity` so the preflight and the fit cannot drift
+on what a corpus hashes to.
+
+`None` means **unproven**, never "stale": an SAE fit (whose key needs a resolved
+backend fingerprint), a discover override (which rewrites `manifold.json` inside
+the fit's own lock, so the visible hash is not the one the fit compares), a
+checkpoint with no provable source, a missing neutral cache, a config with no
+layer count, an unresolvable template, a corpus a templated fit would re-derive,
+or a tokenizer that will not load all return it, and the caller must fall
+through to the ordinary model-loading fit. A partial proof is the one thing this
+must never emit — it would serve a stale fit after a baseline-prompt edit.
+Nothing here mutates: no manifest rewrite, no capture-cache recovery, no
+promotion.
+
+`manifold_summary(folder, *, include_fits=False)` is the session-independent
+serializer shared by `pack show -j` and the HTTP summary route: identity, source,
+tags, `template_ref`, fit mode, geometry, node layout, hyperparameters, and which
+models have a fitted tensor (`fitted_models` + per-model `tensor_variants`). A
+discover folder carries no on-disk geometry — coords are per-model, in the
+safetensors — so `domain` is `{}`, `intrinsic_dim` is `0`, `node_coords` is `[]`.
+`template_ref` is surfaced because it is what a user needs before hand-editing
+`nodes/`: a re-derive would overwrite the edit. `fitted` appears only under
+`include_fits` — one `manifold_fit_summary` block per fitted tensor *stem*,
+unreadable sidecars skipped rather than failing the summary — because it costs
+one sidecar read per stem: an inspection surface wants it, a listing rendering
+many folders does not.
+
+### manifolds.py — public barrel + bundled materialization
+
+Re-exports the four submodules under one import surface, and physically hosts
+bundled materialization: `_materialized_home` is monkeypatched by attribute path,
+so the guard and the function reading it stay together.
+
+`materialize_bundled_manifolds()` is copy-on-miss into `manifolds/default/`,
+JSON-only (per-model fits are user-side), and a per-home process-scoped no-op
+after the first call — which sidesteps the ambiguity between "bundle changed
+under the user" and "user changed the manifest via a CLI override" within one
+invocation. Three paths: fresh install, bundle update (canonical manifest hash
+differs, or the on-disk `format_version` is not current), or skip.
+`bundled_manifold_names()` advertises only folders whose `manifold.json` and
+every declared node file are present, so an interrupted regeneration cannot
+expose a partial folder as a default manifold.
+
+Drift comparison runs on the **local-state-stripped** canonical payload: `files`
+accumulates per-model fit proofs locally, so hashing it would misread every fit
+as a bundle update. A genuine bundle update carries `files` entries forward for
+still-present artifacts the bundle does not ship (fitted tensors + sidecars) —
+proofs are re-verified on every load, and `nodes_sha256` remains what decides
+whether a fit is current — but re-copies node corpora unconditionally, since a
+node-level edit is meaningful only against a specific bundle version and keeping
+it would mix two corpora. The materializer drops the selector index itself.
 
 ## selectors.py
 
-Selector grammar shared by `core.session` and the CLI (lives in `io` so neither
-imports up into `cli`). A concept *is* a manifold now: `all_concepts` walks
-`manifolds_dir()` via `iter_manifold_folders`, and `ResolvedConcept.folder` is the
-manifold folder. `Selector(kind, value, namespace)` with kinds `name` / `tag` /
-`namespace` / `model` / `all`; `parse(raw)` handles `ns/name`, the prefixes, and a
-trailing `:variant` via `_VARIANT_REGEX = ^(raw | sae[-…] | role[-…] | from[-…])$`
-— **no `pca`**. `resolve(selector)` filters the memoized walk; `model:X` matches
-any manifold with a fitted tensor for X.
+The selector grammar shared by `core.session` and the CLI. It lives in `io` so
+neither imports up into `cli`. A concept *is* a manifold, so every view projects
+from a walk of `manifolds_dir()`.
 
-Bare-pole resolution moved entirely to the manifold tier (a bipolar concept is a
-2-node `pca` manifold). **`resolve_bare_atom(concept, *, namespace=,
-typed_namespace=, variant=) → ResolvedBareAtom`** is the **single owner** of the
-whole bare-atom tier ladder (ordering + cross-tier arbitration) — `core/steering_expr`
-calls it once instead of hand-sequencing the tiers. It returns a tagged
-`ResolvedBareAtom(kind ∈ {label, name, pole})`: (1) **label** tier — a bare
-dot-free slug (`variant=="raw"`, no typed namespace) matching a node label, via
-`resolve_bare_name`; (2) **name** tier — a `variant=="raw"` 2-node `pca` manifold
-*name* (dotted `formal.casual` skips tier 1), via `resolve_manifold_name`,
-resolving to node 0 (the `orient_to=0` + pole); (3) **pole** tier — neither
-matched, so `canonicalize_atom` peels the `:variant` suffix + canonicalizes the
-slug. Every bipolar pole is itself a node label, so a bare pole resolves through
-tier 1 as an affine `%` push. The retired `resolve_pole` folded into
-**`canonicalize_atom(raw) → (canonical, variant)`** (the pure slug + variant peel —
-no `match`/`sign` slots, since the bipolar sign-flip is gone); the external
-canonicalizer consumers (`SteeringComposer.resolve_pole_aliases`, `cli/runners`)
-call it directly. The underlying tier steps stay public:
-`resolve_manifold_label(label, *, namespace=)` finds a node by label across
-installed manifolds; `resolve_manifold_name(name, *, namespace=)` resolves a 2-node
-`pca` manifold's *name* to node 0; `resolve_bare_name(raw, *, namespace=) →
-ResolvedManifoldLabel | None` is *just* the manifold-label tier (delegates to
-`resolve_manifold_label`, raising on cross-manifold collision). Three memoized walks
-(`_concepts_cache`/`_manifold_labels_cache`/`_manifold_names_cache`) keyed on
-`manifolds_dir()`; `invalidate()` clears all three — mutating code must call it.
-`parse_args(tokens)` splits a token list into one concept selector + one optional
-`model:` scope.
+`Selector(kind, value, namespace)` with kinds `name` / `tag` / `namespace` /
+`model` / `all`. `parse(raw)` handles `ns/name`, the prefixes, the `default` and
+`all` aliases, and a trailing `:variant` validated against `VARIANT_SUFFIX_RE`.
+`resolve(selector)` filters the index; `model:X` matches any manifold with a
+fitted tensor for X, regardless of variant. `parse_args(tokens)` splits a token
+list into one concept selector plus one optional `model:` scope.
 
-## cache_ops.py / hf.py
+**One memoized walk**, keyed by `manifolds_dir()`, produces a `_ManifoldIndex`
+with three views: `concepts` (every installed manifold), `labels` (the flattened
+`(namespace, manifold, node label)` index), and `names` (the 2-node `pca` subset
+addressable by manifold name). A single compound steering expression hits all
+three, so the tree is walked once and the views built in memory. `invalidate()`
+drops it, and **every io mutator calls it for itself** — authoring, lifecycle,
+install/pull, bundled materialization — so callers carry no invalidation duty.
 
-Both gutted to the surface that survives the collapse.
+`resolve_bare_atom(concept, *, namespace=, typed_namespace=, variant=) →
+ResolvedBareAtom` is the **single owner** of the bare-atom tier ladder, ordering
+and arbitration included; `core/steering_expr` calls it once instead of
+hand-sequencing tiers. The result is tagged `kind ∈ {label, name, pole}`:
 
-`cache_ops.py` is now just GGUF export: `export_gguf_manifold(ns, name, *,
-model_scope, output, model_hint)` folds a fitted 2-node `pca` manifold to a single
-direction (`folded_directions`) and writes a llama.cpp control-vector GGUF
-(one `.gguf` per model; refuses in-place export for bundled manifolds);
-`_resolve_model_hint` derives `controlvector.model_hint` from the base model's
-`AutoConfig.model_type`. The old pack data layer
-(install/refresh/clear/ls/search/push + `ConceptRow`/`PackListResult`) is gone.
+1. **label** — `resolve_manifold_label`, gated to a plain bare slug
+   (`variant == "raw"`, no typed namespace, no `.`); a hit routes to a label-form
+   `<manifold>%<label>` push. The lookup is a folder scan, not a fitted-tensor
+   check, so an authored-but-unfitted manifold's labels still resolve.
+2. **name** — `resolve_manifold_name`, for a `variant == "raw"` name that *is* a
+   2-node `pca` manifold (`formal.casual` — the `.` skips tier 1), resolving to
+   node 0, the positive pole.
+3. **pole** — `canonicalize_atom(raw) → (canonical, variant)`, the pure slug +
+   variant peel. Every bipolar pole is itself a node label and has already
+   resolved through tier 1, so this tier carries genuine fresh-vector, variant,
+   and dotted-name references.
 
-`hf.py` is the generic HF surface `hf_manifolds.py` builds on: `HFError`,
-`split_revision(owner/name@rev)`, the monkeypatchable `_hf_snapshot_download` /
-`_hf_hub_download` / `_hf_api` indirections, and `resolve_target_coord(name, as_)`
-(`--as owner/name` wins, else `whoami()/<name>`). All pack-shaped distribution
-(`pull_pack`/`push_pack`/`search_packs`/`fetch_info`) is gone.
+A collision in either manifold tier raises `AmbiguousSelectorError` and
+propagates; any other failure falls through to tier 3, where a genuine error
+re-surfaces with the canonical message. `resolve_manifold_label` and
+`resolve_manifold_name` stay public as the underlying steps.
 
-## hf_manifolds.py
+## templates.py
 
-HF distribution for manifolds (`saklas-manifold` tag, `repo_type="model"` —
-safetensors is hub-native, `base_model` frontmatter gives reverse-link
-discoverability). `pull_manifold` uses the shared `staging.stage_verify_swap` and
-**rejects** a repo with no `manifold.json` (the geometry cannot be inferred from a
-bare tensor dump). `push_manifold(..., variant="raw")`
-always uploads the corpus (a manifold can't re-fit without it) and filters tensors;
-the model card (`_render_manifold_card`) carries `library_name: saklas`,
-`saklas-manifold` tags, deduped `base_model:`, `base_model_relation: adapter`.
-`search_manifolds`/`fetch_manifold_info` fill the picker fields (`domain_label`,
-`node_count`, `fit_mode`, `tensor_models`); `install_manifold` orchestrates HF
-pulls + `_install_local_manifold` copies. Local copies use the same validated
-stage/swap recovery discipline as HF pulls, and a force install whose source is
-already the resolved destination is an exact no-op rather than self-deletion.
-Both HF and local staged installs rewrite `manifold.json::name` and every fitted
-sidecar's repeated `name` to the destination basename, re-hash those sidecars,
-then run final validation. A fitted pair is eligible for that rewrite only when
-both its tensor and original sidecar already have source-manifest proofs; rename
-never blesses a partial/unmanifested pair. Thus `--as ns/name` changes runtime
-identity as well as the directory; selector discovery retains the loader's actual
-`ManifoldFolder.folder` rather than reconstructing a path from manifest metadata.
-`push_manifold` snapshots its source under one manifest-then-sorted-pair lock
-transaction spanning validation and every corpus, tensor, and sidecar copy into
-staging. The tensor candidate list is frozen before those pair locks are
-acquired, so a lower-level unmanifested pair cannot enter through a later glob;
-the local locks are released before any Hub network request.
-If a caller explicitly supplies the reserved `.staging`/`.bak` sibling as its
-only source, it is snapshotted before recovery/cleanup can rename or delete it.
-`ManifoldInstallConflict` on an existing folder without `force`.
+The standalone templated-completion artifact —
+`~/.saklas/templates/<ns>/<name>/template.json`, a peer of a manifold.
+`TEMPLATE_FORMAT_VERSION = 2`. `TemplateFolder = {name, slot, values,
+contexts:[TemplateContext{turns:[{role, content}], assistant}]}`.
 
-## gguf_io.py
+**Invariant** (`_validate_body` / `_validate_context`): the slot appears exactly
+once in each context's final `assistant` string and in no history turn — history
+is shared common-mode across the values, so the slot lives only where the value
+is read — and the last history turn must be `user`.
 
-`write_gguf_profile(profile, path, *, model_hint)` + `read_gguf_profile(path)`,
-matching llama.cpp's control-vector convention (`general.architecture =
-"controlvector"`, `direction.<idx>` fp32). Lazy `gguf` import raises
-`GGUFNotInstalled`. Because shares are baked into the tensor magnitudes,
-llama.cpp's uniform `--control-vector-scaled` scalar reproduces saklas's per-layer
-weighting with no per-layer metadata.
+Derived views: `node_labels()` (slugged values), `node_corpora()` (`{label:
+[slot-filled assistant per context]}`, `corpus[i] ↔ contexts[i]` — the manifold
+corpus), `score_inputs()` (per-context `{messages, assistant_prefix, suffix,
+choices, labels}` — the scorer feed, split at the slot). `sha256()` hashes
+`slot × values × contexts`, excluding description/tags; it is the staleness key
+folded into a referencing manifold's `nodes_sha256`.
 
-## probes_bootstrap.py
+Lifecycle: `create_template_folder` (validates the whole body before writing, so
+there is no half-built folder), `resolve_template(selector)` (a bare name
+searches all namespaces; `AmbiguousTemplateError` on collision,
+`TemplateNotFoundError` on miss), `iter_template_folders`,
+`remove_template_folder`. `_LABEL_REGEX` is redefined locally so the
+`manifolds → templates` import direction stays acyclic.
 
-`load_default_manifolds()` walks `manifolds/default/` into `{tag: [manifold_name]}`
-(the category-grouped probe roster; triggers `materialize_bundled_manifolds`).
-`bootstrap_layer_means(...)` returns the per-layer probe-centering means as
-`X.mean(0)` of the per-model neutral-activation cache
-(`load_or_compute_neutral_activations`) — same corpus the whitener covariance is
-built from, so there is no separate `layer_means.safetensors` cache (a cold model
-pays one neutral-corpus forward loop, not two). The old `bootstrap_probes` is gone — the session
-sources bundled probe directions by folding fitted 2-node manifolds
-(`session._bootstrap_manifold_probes`).
+**Bundled templates are dormant by design.** `bundled_template_names` /
+`materialize_bundled_templates` mirror the manifold materializer, but no template
+ships bundled, so the lister returns `[]` and the materializer no-ops. The
+mechanism stays because a template-derived bundled manifold is the one artifact
+that authors deterministically and model-free — write the template, and
+`create_manifold_from_template` derives the corpus with no generation step. The
+templates-before-manifolds ordering that makes it shippable lives in
+`io.bootstrap`.
 
 ## bake.py
 
 Offline direction merging into a corpus-less `fit_mode="baked"` manifold.
-`merge_into_manifold(name, expression, model, *, force, strict)` resolves each
-component to a per-layer direction by folding a fitted 2-node `pca` manifold
-(`folded_directions`), linearly combines the directions (`linear_sum`,
-over the union of their layer coverage), folds the result to a one-pole ray
-(`fold_directions_to_subspace`), and writes a baked manifold to
-`manifolds/local/<name>/` — one fitted tensor per shared model
-(`create_baked_manifold_folder` / `save_baked_manifold_tensor`), all sharing one
-`manifold.json`. Only namespace-qualified additive/subtractive scalar terms are
-accepted. Triggers, `!`, `%`, multi-coefficients, and `~`/`|` are rejected;
-projection is Mahalanobis-only and cannot be reproduced without a live whitener.
-`shared_models(expression)` returns the models every term has a fitted tensor
-for. Merge discovery retains the exact verified/folded component resolutions and
-reuses them during preparation (one load/hash/fold per term/model, not two). A
-same-expression retry resumes only an incomplete baked destination whose proven
-prefix matches the component tensor hashes, coefficients, model fingerprints,
-and bake policy; a fully proven destination keeps ordinary exists semantics. The
-baked sidecar carries `method="merge"`, the unanimous component model
-fingerprint, and per-component `components` provenance. Legacy projected bakes
-are rejected at load and must be rebuilt.
+`merge_into_manifold(name, expression, model, *, force, strict,
+expected_model_fingerprint)` folds each component (a fitted 2-node `pca`
+manifold) to a direction via `core.capture.folded_directions`, combines them with
+`linear_sum` over the union of their layer coverage (an absent component
+contributes zero rather than deleting the layer, matching live composition), folds
+the result to a one-pole ray, and writes `manifolds/local/<name>/` — one fitted
+tensor per shared model, all sharing one `manifold.json`.
+`shared_models(expression)` reports the models every term has a fitted tensor for.
+
+Only namespace-qualified additive/subtractive scalar terms are accepted.
+Triggers, `!`, `%`, multi-coefficients, and `~`/`|` are rejected: projection is
+Mahalanobis-only and needs an identity-matched live whitener, so substituting an
+offline Euclidean projection would change semantics. Component variants are
+checked against the loaded manifold's provenance — a role-baselined component must
+be selected through its `:role-*` alias, a `:from-*` component must match the
+recorded source model.
+
+A same-expression retry resumes only an incomplete destination whose proven
+prefix matches the component tensor hashes, coefficients, model fingerprints, and
+bake policy; a fully proven destination keeps ordinary exists semantics. The baked
+sidecar carries `method="merge"`, the unanimous component model fingerprint,
+`bake_policy`, and per-component `components` provenance.
 
 ## alignment.py
 
-Cross-model probe alignment via per-layer Procrustes.
-`load_or_compute_neutral_activations(...)` is the disk-cached per-model neutrals
-(the neutral corpus × layers, **fp32** — the project-wide invariant; exact loaded
-model + rendered-token + layer-schema identity, payload-digest verified; non-current
-or corrupt caches miss and are replaced). These are what the Mahalanobis whitener builds its
-covariance from. Cache v4 is an atomic JSON pointer to one immutable fp32 shard
-per layer; every shard and its directory entry are durable before pointer
-publication, and old generations are collected only after the new pointer is
-durable. Readers require the current v4 sharded pointer format.
-`validate_neutral_cache_metadata` normally checks every digest plus the
-safetensors key/shape/dtype headers; exact-transfer preflight may request the
-header-only source proof, while `load_validated_neutral_cache(...,
-requested_layers=...)` digests/materializes only the selected shards and checks
-finiteness. A stable per-model neutral-fit lock spans cache recheck, **model
-construction**, capture, and publication, while
-the directional source→target alignment-fit lock spans both model loads and the
-second cache recheck; concurrent cold transfer commands never duplicate the
-shared model load, neutral forwards, or directional Procrustes fit. The alignment workflow uses the
-metadata-returning neutral loader, so each materialized cache also supplies its
-already-validated identity without a second payload hash. On a cold/stale
-alignment, the target whitener is built from those same resident target rows;
-the model-free preflight materializes only requested target layers once for either a cached-map
-whitener or an offline map fit. When requested factors are missing but both neutral
-identities still match their pre-load-verifiable model sources, it materializes
-the same source layers and runs `fit_alignment`/quality/save without loading either
-model. Existing factor pointers are carried forward and only missing requested
-layers are fitted/written; `-f` recomputes alignment/transfer output but does not
-recapture an exact neutral cache. A narrow transfer therefore does not digest,
-materialize, fit, or whiten unrelated layers. When a cold cache fill necessarily
-captures a full roster before requested coverage is known, the orchestration
-immediately narrows both seed mappings and releases unrequested tensor owners;
-the complete roster remains only in the reusable durable cache.
+The per-model neutral-activation cache and the cross-model Procrustes alignment
+cache, both built on `shards.py`.
 
-`load_or_fit_transfer_alignment(src_model, tgt_model, *, force, label,
-requested_layers=None) → (M, quality_per_layer, map_path, source_identity,
-target_identity, target_whitener, target_layer_means)` is the **public**
-single-flight orchestrator that wraps the primitives above (promoted from the
-former monolithic CLI runner so it lives beside them). `manifold transfer`'s
-runner is now a thin caller. The concurrency
-semantics are load-bearing: the `alignment_fit_lock` wraps the whole directional
-transaction and the per-model `neutral_fit_lock` is taken **before** model
-construction (so concurrent cold transfers sharing a model never duplicate the
-load); cache/source identity is proven by `validate_neutral_cache_metadata(...,
-verify_payload=False)` + `neutral_cache_identity` **without hashing any tensor
-payload**; a complete cached-map hit drops the source seed rows and never builds
-the source model; the roster is narrowed to `requested_layers ∩ available`; and a
-cache writer racing the metadata preflight is handled by restarting the
-directional transaction (`_load_or_fit_transfer_alignment_locked` recursion) under
-the already-held outer lock. It calls `sys.exit(1)` (with the caller's `label`
-prefix) on no-shared-layers / `AlignmentError`, exactly as the former CLI helper
-did.
+`load_or_compute_neutral_activations(...)` is the disk-cached neutral corpus,
+`[N, D]` per layer in **fp32** — the project-wide range invariant, since late
+residual channels overflow fp16 and would poison every covariance-derived read.
+It is the single per-model neutral artifact: the whitener's covariance and the
+probe-centering mean both come from it. Identity covers the exact loaded model,
+the rendered tokens, and the layer schema, with verified payload digests;
+non-current or corrupt caches miss and are replaced. Cache format 4 is an atomic
+JSON pointer to one immutable fp32 shard per layer, and
+`load_validated_neutral_cache(..., requested_layers=)` digests and materializes
+only the selected shards.
 
-`fit_alignment(src, tgt, *, min_shared_layers=10, requested_layers=...,
-available_shared_layers=...) → {layer: LayerAlignment}`
-(row-space orthogonal Procrustes for matched dim, rectangular minimum-norm
-least-squares otherwise; both retained as low-rank factors), plus the fitted
-translation `b_L = mean_tgt - M_L mean_src`; `alignment_quality` is per-layer
-R². `transfer_profile(profile, alignment_map, *, source_model_id, ..., whitener)`
-applies only the linear `M_L @ v_src` per
-layer (uncovered layers dropped, `method="procrustes_transfer"`), re-scaling each
-magnitude to its *target* Mahalanobis norm. The target whitener is **required** and
-must cover the transferred layers (`WhitenerError` otherwise; Mahalanobis-only — no
-Euclidean transfer). The fitted map binds both validated neutral-cache identities,
-both model fingerprints, and its own payload digest under the *target* model dir
-(`models/<safe_tgt>/alignments/<safe_src>.json`, cache v5): one immutable
-factor shard per layer, atomically pointer-switched. Identity + all headers are
-preflighted before payload materialization; a requested layer subset reads and
-digest-validates only those shards, with digest computed from the same bytes fed
-to safetensors decode. Transfer preflight binds that selective layer roster to
-the source tensor + sidecar manifest digests; the final pair-locked publication
-revalidates the proof and rejects a concurrent source refit before source load or
-target write. Non-current cache generations miss and are replaced normally.
-`transfer_manifold`
-(`manifolds.py`) is the manifold counterpart.
+Locking is load-bearing: the per-model `neutral_fit_lock` spans cache recheck,
+**model construction**, capture, and publication, and the directional
+`alignment_fit_lock` spans both model loads and the second cache recheck — so two
+concurrent cold transfers never duplicate the shared model load, the neutral
+forwards, or the Procrustes fit.
 
-## lens.py
+`load_or_fit_transfer_alignment(src, tgt, *, force, label, requested_layers=None)
+→ (M, quality_per_layer, map_path, source_identity, target_identity,
+target_whitener, target_layer_means)` is the public single-flight orchestrator
+over those primitives; `manifold transfer`'s runner is a thin caller. Identity is
+proven without hashing any tensor payload; a complete cached-map hit drops the
+source seed rows and never builds the source model; the roster narrows to
+`requested_layers ∩ available`, releasing unrequested tensor owners even when a
+cold fill had to capture a full roster first; a cache writer racing the metadata
+preflight restarts the directional transaction under the already-held outer lock.
+On no-shared-layers or `AlignmentError` it exits with the caller's `label` prefix.
 
-The Saklas-owned per-model Jacobian-lens artifact — an atomic
-`models/<safe_model_id>/jlens/local/default/manifest.json` pointer to immutable per-layer
-`jlens.layer-<L>.gen-<uuid>.safetensors` generations. Readers and writers require
-exactly `LENS_FORMAT_VERSION = 6`. Missing-layer top-ups carry forward unchanged shard pointers and write
-only the new matrices, after rehashing every reuse candidate; a corrupt reused
-shard is rewritten from the resident fp32 matrix while valid siblings stay put.
-a wrong version, missing/mismatched payload digest, non-finite tensors, or a corrupt sidecar all log a warning and
-read as "no lens" (`load_lens → None`) rather than crash — the caller decides
-whether to error (`LensNotFittedError` with the `lens fit` hint) or re-fit.
-Storage is **fp32**, matching manifolds, subspaces, profiles, and neutral
-activations and preserving the estimator accumulator losslessly across save and
-resume. The sidecar records `method`,
-`n_prompts`, `d_model`, `source_layers`, the corpus spec + token-id sha256 (the
-resume/staleness key), optional raw-corpus sha/count metadata for model-load-free
-no-op checks, `seq_len`, `dim_batch`, `skip_first_positions`, exact model
-source/live-weight identities, per-layer tensor filenames + sha256 values, and the model's
-layer count (needed to prove `all`/`workspace` coverage without loading it).
-Loading uses `safe_open` one shard at a time, so only the requested fp32 matrices
-are materialized rather than a complete shard mapping. The
-verified loader can materialize only requested v6 shards for a fresh same-corpus
-subset no-op; the durable pointer and its full layer union remain unchanged.
-Resumable
-checkpoints use the same generation-pointer scheme under `checkpoint.json`:
-the estimator writes a self-contained averaged checkpoint directly from raw sums,
-merging a prior prefix one layer at a time during fp32 streaming. This avoids a
-second full fp32 lens at checkpoint cadence and makes repeated interruptions
-independent of an older full artifact (`base_n_prompts=0`). Every checkpoint
-payload is fsynced and its directory entry made durable before the checkpoint
-pointer is published. Finalization promotes
-an already-complete terminal checkpoint by atomically pointing the durable sidecar
-at its immutable tensor generations, without moving or rewriting them; a pointer-write
-failure therefore preserves both the prior full artifact and the checkpoint.
-Promotion accepts only v6 checkpoints whose every shard matches its declared
-digest. Removal
-unpublishes both pointer sidecars, fsyncs that directory state, and only then
-performs best-effort shard garbage collection.
-Because final publication and checkpoint unlink are separate crash points, exact
-no-op recovery removes a leftover checkpoint only after the validated final
-artifact proves it has matching fit semantics, covers its layers, and reaches at
-least its effective base-plus-partial prompt progress; newer or different-corpus
-checkpoints remain resumable.
-Unreferenced generations and crash-left streamed `.safetensors.tmp` shards are
-collected at fit preflight/removal and only after pointer commit. The pointer's
-parent directory is fsynced after pointer publication before old shards are
-collected, and after pointer unlink before its shards are removed, preventing a
-power-loss rollback to a pointer whose payload was already collected. A dedicated
-per-model `jlens.fit` lock spans preflight, estimator/checkpoint work, final
-publication, and lifecycle removal across processes. Metadata-only
-final/checkpoint preflight rejects incompatible corpora/layers before matrix IO.
-The default FineWeb-Edu streamer accepts a fit cancellation event. On the
-server path, Hub resolution and iteration live in a spawn-only subprocess so a
-provider call blocked below Python can be terminated without leaving the
-dashboard or shutdown stuck at `cancelling…`. Spawn is deliberate: forking the
-already-loaded MPS process is unsafe, while a detached provider thread can leave
-its own non-daemon workers behind.
-`lens_paths` /
-`lens_checkpoint_paths` / `save_lens` / `save_lens_checkpoint_accumulator` /
-`load_lens` /
-`load_lens_checkpoint_sidecar` / `load_lens_checkpoint` /
-`promote_lens_checkpoint` / `remove_subsumed_lens_checkpoint` / `remove_lens`;
-the fit itself lives in `core/jlens.py`. `lens_sources.py` owns
-`jlens/active.json`, commit-pinned external bindings, Neuronpedia discovery, and
-the weights-only adapter that reads `.pt` payloads offline from the Hugging Face
-cache without copying or converting them into `SAKLAS_HOME`.
+`fit_alignment(src, tgt, *, min_shared_layers=10, …) → {layer: LayerAlignment}`
+runs row-space orthogonal Procrustes for a matched dim and rectangular
+minimum-norm least squares otherwise, both retained as low-rank factors, plus the
+fitted translation `b_L = mean_tgt − M_L mean_src`; `alignment_quality` is
+per-layer R². The map binds both validated neutral-cache identities, both model
+fingerprints, and its own payload digest under
+`models/<safe_tgt>/alignments/<safe_src>.json` (cache format 5): one immutable
+factor shard per layer, atomically pointer-switched. Existing factor pointers
+carry forward and only missing requested layers are fitted and written, so a
+narrow transfer never digests, materializes, fits, or whitens unrelated layers.
+`-f` recomputes the alignment and transfer output but does not recapture an exact
+neutral cache.
 
-All lens `*_sha256` identities are canonical lowercase 64-hex digests. A
-positive-progress checkpoint must carry the digest of its consumed token prefix;
-zero progress must not claim one.
+## lens.py / lens_sources.py
 
-## atomic.py / staging.py
+`lens.py` owns the Saklas-fitted per-model Jacobian lens:
+`models/<safe_model_id>/jlens/local/default/manifest.json`, an atomic pointer to
+immutable per-layer `jlens.layer-<L>.gen-<uuid>.safetensors` generations.
+`LENS_FORMAT_VERSION = 6`, required exactly. Storage is **fp32**, which keeps the
+estimator accumulator lossless across save and resume. The fit itself is
+`core/jlens_fit.py::fit_jacobian_lens`.
 
-`atomic.py` — `write_bytes_atomic` / `write_json_atomic`: stage to a same-directory
-temp file, `fsync`, then `os.replace`; `ReleasableArtifactLock` supports short
-cache transactions inside a longer fit, and `artifact_process_lease` /
-`artifact_has_live_lease` protect mapped immutable shards after that lock is
-released (PID-stale markers are reaped). `staging.py` — `stage_verify_swap` is the
-shared install choreography: build under `.staging/`, recover `.bak` on
-interrupted swaps, then promote atomically (`target → .bak`, `.staging → target`)
-with best-effort restore. (`datasource.py` is gone — extraction takes node corpora
-directly.)
+The sidecar records the estimator settings (`method`, `n_prompts`, `d_model`,
+`source_layers`, `seq_len`, `dim_batch`, `skip_first_positions`), the corpus spec
++ token-id sha256 that is the resume/staleness key, exact model source and
+live-weight identities, per-layer filenames + sha256, and the model's layer count
+— enough to prove `all` / `workspace` coverage without loading it. A wrong
+version, a missing or mismatched digest, non-finite tensors, or a corrupt sidecar
+log a warning and read as "no lens" (`load_lens → None`) rather than crashing;
+the caller decides whether to raise `LensNotFittedError` or re-fit. Loading uses
+`safe_open` one shard at a time, so only requested matrices materialize, and
+missing-layer top-ups carry unchanged shard pointers forward after rehashing
+every reuse candidate.
+
+Checkpoints use the same generation-pointer scheme under `checkpoint.json`. The
+estimator writes a self-contained averaged checkpoint from raw sums, merging any
+prior prefix one layer at a time during fp32 streaming, so repeated interruptions
+stay independent of any older artifact. Finalization promotes a complete terminal
+checkpoint by pointing the durable sidecar at its immutable generations without
+rewriting them, accepting only current-version checkpoints whose every shard
+matches its declared digest. Final publication and checkpoint unlink are separate
+crash points, so exact no-op recovery removes a leftover checkpoint only once the
+validated final artifact proves matching fit semantics, layer coverage, and at
+least its effective prompt progress; newer or different-corpus checkpoints stay
+resumable.
+
+Durability: payloads and directory entries are durable before any pointer is
+published, and the pointer's parent directory is fsynced both before old shards
+are collected and before an unlinked pointer's shards are removed, so power loss
+cannot roll back to a pointer whose payload is gone. A per-model `jlens.fit` lock
+spans preflight, estimator and checkpoint work, publication, and removal;
+metadata-only preflight rejects incompatible corpora or layers before any matrix
+IO. The default FineWeb-Edu streamer accepts a cancellation event, and on the
+server path Hub resolution and iteration run in a spawn-only subprocess so a
+blocked provider call can be terminated — spawn because forking an already-loaded
+MPS process is unsafe and a detached thread leaves non-daemon workers behind.
+Every lens `*_sha256` is a canonical lowercase 64-hex digest, and a
+positive-progress checkpoint must carry the digest of its consumed token prefix.
+
+Surface: `lens_paths` / `lens_checkpoint_paths` / `save_lens` /
+`save_lens_checkpoint_accumulator` / `load_lens` / `load_lens_checkpoint_sidecar`
+/ `load_lens_checkpoint` / `promote_lens_checkpoint` /
+`remove_subsumed_lens_checkpoint` / `remove_lens`.
+
+`lens_sources.py` owns `jlens/active.json` through `LENS_SOURCES`, an
+`ActiveSourceRegistry` over the kinds `local` and `huggingface` (both addressed by
+an artifact-name slug), plus commit-pinned external bindings under
+`jlens/bindings/<name>.json` at `LENS_SOURCE_FORMAT_VERSION = 1`. It also owns
+Neuronpedia discovery against `neuronpedia/jacobian-lens` and the weights-only
+adapter that reads `.pt` payloads offline from the Hugging Face cache without
+copying them into `SAKLAS_HOME`. Its Hub calls go through `io.hf`.
+
+## sae.py / sae_artifacts.py
+
+`sae.py` is the SAE family's source registry and local metadata cache.
+`SAE_SOURCES` is an `ActiveSourceRegistry` (`SAE_SOURCE_FORMAT_VERSION = 1`) over
+the kinds `local` and `saelens` — a local name obeys `NAME_REGEX`, a provider
+release id is provider-shaped and only has to be non-blank.
+`sae_source_release` is the one place the public `local:<name>` prefix convention
+is applied, `load_active_sae` the one place a selection resolves to
+`(release, provider_metadata)`. Under `models/<safe>/sae/bindings` it stores the
+release/layer runtime binding plus the lazily fetched per-feature Neuronpedia
+metadata (`<release>-features.json`, `{id: {label, max_act}}`, where `max_act` is
+`maxActApprox` — the unit that normalizes the SAE strength channel to 0..1), both
+at `SAE_RUNTIME_FORMAT_VERSION = 3`. Provider weights stay in the SAELens/Hugging
+Face cache. `sae_artifacts.py` owns Saklas-trained fp32 weights under
+`sae/local/<name>/` with their own manifest (`LOCAL_SAE_FORMAT_VERSION = 1`), and
+never writes into a provider cache.
+
+## hf.py / hf_manifolds.py
+
+`hf.py` is the single Hugging Face seam: `HFError`,
+`split_revision(owner/name@rev)` (names are `NAME_REGEX`-restricted, so `@` is
+unambiguous), the three monkeypatchable indirections `_hf_snapshot_download` /
+`_hf_hub_download` / `_hf_api`, and `resolve_target_coord(name, as_)`. Both
+`hf_manifolds.py` and `lens_sources.py` import those three under exactly these
+names, so patching either module's attribute blocks the network on that path. New
+Hub work belongs here.
+
+`hf_manifolds.py` is manifold distribution: the `saklas-manifold` tag on a
+`repo_type="model"` repo, because safetensors is hub-native and `base_model`
+frontmatter gives reverse-link discoverability. `pull_manifold` builds through
+`stage_verify_swap` and **rejects** a repo with no `manifold.json` — the geometry
+cannot be inferred from a bare tensor dump. `push_manifold(folder, coord, *,
+private, model_scope, variant="raw", dry_run) → (repo_url, commit_sha)` always
+uploads the corpus (a manifold cannot re-fit without it) and filters fitted pairs
+by model scope and variant; the card carries `library_name: saklas`, the
+`saklas-manifold` tags, deduped `base_model:`, and `base_model_relation: adapter`.
+`search_manifolds` / `fetch_manifold_info` fill the picker fields under a fixed
+row cap. `install_manifold(target, as_, *, force, on_progress)` orchestrates the
+HF pull and the local-folder copy, with `ProgressCallback` narrating five stages
+(resolve → download → validate → stage → swap) for the CLI and the SSE route.
+`ManifoldInstallConflict` (409) is raised on an existing destination without
+`force`.
+
+Both HF and local staged installs rewrite `manifold.json::name` and every fitted
+sidecar's repeated `name` to the destination basename, re-hash those sidecars,
+then re-validate — so `--as ns/name` changes runtime identity, not just the
+directory. A pair is eligible for that rewrite only when both its tensor and
+original sidecar already carry source-manifest proofs; the rename never blesses a
+partial pair. `push_manifold` snapshots its source under one
+manifest-then-sorted-pair transaction, freezing the tensor candidate list before
+those pair locks are acquired and releasing every local lock before any Hub
+request. A force install whose source is already the resolved destination is an
+exact no-op rather than self-deletion.
+
+## gguf_io.py
+
+The GGUF codec plus the manifold export driver — the only interchange export
+saklas emits. `write_gguf_profile(profile, path, *, model_hint)` /
+`read_gguf_profile(path)` round-trip a per-layer direction dict through
+llama.cpp's control-vector convention (`general.architecture = "controlvector"`,
+`controlvector.model_hint`, `controlvector.layer_count`, `direction.<idx>` fp32).
+The `gguf` package is optional; the lazy import raises `GGUFNotInstalled`. Because
+per-layer shares are baked into the stored magnitudes, llama.cpp's uniform
+`--control-vector-scaled` scalar reproduces saklas's layer weighting with no extra
+metadata slot; a unit-normed repeng vector reads back as uniform-per-layer, the
+semantic it was exported with.
+
+`export_gguf_manifold(ns, name, *, model_scope, output, model_hint)` folds each
+fitted raw 2-node `pca` tensor to a single direction and writes one `.gguf` per
+model. The preflight is metadata-only and each *selected* tensor is
+integrity-checked when loaded, so unrelated models, SAE variants, and prior
+exports are never eagerly hashed. In-folder export is refused for a bundled
+manifold, whose folder is restored on refresh, and otherwise extends the folder's
+integrity manifest with the new `.gguf` entries only, leaving the selector index
+valid. `_resolve_model_hint` derives llama.cpp's architecture string from the
+base model's `AutoConfig.model_type`, with `--model-hint` as the escape hatch.
+
+## probes_bootstrap.py
+
+`load_default_manifolds()` walks `manifolds/default/` into `{tag:
+[manifold_name]}` — the category-grouped probe roster — triggering bundled
+materialization first. `bootstrap_layer_means(...)` returns the per-layer
+probe-centering means as `X.mean(0)` of the neutral-activation cache: the same
+corpus, pooling, and dtype the whitener's covariance is built from, so there is no
+separate `layer_means` artifact and a cold model pays one neutral-corpus forward
+loop instead of two. The bundled probe *directions* are sourced by the session
+folding fitted 2-node manifolds, not by this module.
+
+## Deliberately absent
+
+Rejected designs, listed once so they do not get re-proposed:
+
+- **No pack format or datasource layer.** Concepts *are* manifolds and extraction
+  takes node corpora directly; there is no `PackMetadata` / `ConceptFolder` /
+  `pull_pack` surface.
+- **No `pca` tensor variant and no method suffix.** Difference-of-means is the
+  only vector extraction method, so the canonical raw tensor carries no method
+  tag. `role-` is a selector suffix only, never a tensor-file kind.
+- **No Euclidean fallback** in the fit, the share bake, or the transfer rebake. A
+  missing or non-covering whitener raises `WhitenerError`; on real LMs the
+  Euclidean metric is rogue-dominated, so a fallback would be a wrong answer
+  rather than a degraded one.
+- **No separate `layer_means` cache** — the neutral-activation cache is the one
+  per-model neutral artifact.
+- **No embedded `template` block** in `manifold.json`; a templated manifold
+  carries `template_ref` plus its derived corpus.
+- **No profile-level cross-model transfer.** Transfer runs through
+  `transfer_manifold` → `core.manifold.transfer_manifold_subspaces`.
+- **No caller-side selector invalidation.** Every io mutator calls
+  `selectors.invalidate()` itself.

@@ -17,7 +17,10 @@
     togglePalette,
   } from "./lib/stores/palette.svelte";
 
-  import * as Drawers from "./drawers";
+  // One typed registry row per drawer — component, params, sizing.  The
+  // host below renders whichever row ``drawerState.open`` names, so there
+  // is no per-drawer branch here to fall out of sync with the union.
+  import { DRAWERS, drawerParams } from "./drawers";
 
   import {
     bootstrap,
@@ -31,19 +34,6 @@
     loomRegenerateActive,
     requestLoomModal,
   } from "./lib/stores.svelte";
-
-  import type { DrawerName } from "./lib/types";
-
-  // Content-driven drawer sizing — forms and pickers get a narrow panel,
-  // while analysis views keep the wide one.
-  const NARROW_DRAWERS: ReadonlySet<DrawerName> = new Set<DrawerName>([
-    "subspace",
-    "manifolds",
-    "manifold_builder",
-    "system_prompt",
-    "save_conversation",
-    "load_conversation",
-  ]);
 
   type BootStatus = "loading" | "ready" | "failed";
   type CompactView = "threads" | "chat" | "rack";
@@ -100,7 +90,7 @@
       try {
         await ensureWebSocket();
       } catch {
-        /* ignore — sendGenerate will retry */
+        /* ignore — the send paths reopen the socket on demand */
       }
       bootStatus = "ready";
     } catch (e) {
@@ -284,6 +274,7 @@
       </section>
 
       {#if drawerState.open !== null}
+        {@const entry = DRAWERS[drawerState.open]}
         <div
           class="drawer-backdrop"
           role="button"
@@ -297,79 +288,16 @@
         <div
           bind:this={drawerEl}
           class="drawer"
-          class:narrow={NARROW_DRAWERS.has(drawerState.open)}
+          class:narrow={entry.narrow}
           role="dialog"
           aria-modal="true"
           aria-label="{drawerState.open} drawer"
           tabindex="-1"
           onkeydown={onDrawerKeydown}
         >
-          {#if drawerState.open === "subspace"}
-            <Drawers.RackDrawer
-              params={{
-                ...(drawerState.params as Record<string, unknown>),
-                family: "subspace",
-              }}
-            />
-          {:else if drawerState.open === "manifolds"}
-            <Drawers.RackDrawer
-              params={{
-                ...(drawerState.params as Record<string, unknown>),
-                family: "manifold",
-              }}
-            />
-          {:else if drawerState.open === "manifold_builder"}
-            <Drawers.ManifoldBuilder params={drawerState.params} />
-          {:else if drawerState.open === "manifold_merge"}
-            <Drawers.ManifoldMerge params={drawerState.params} />
-          {:else if drawerState.open === "manifold_pack"}
-            <Drawers.ManifoldPack params={drawerState.params} />
-          {:else if drawerState.open === "save_conversation"}
-            <Drawers.SaveConversation params={drawerState.params} />
-          {:else if drawerState.open === "load_conversation"}
-            <Drawers.LoadConversation params={drawerState.params} />
-          {:else if drawerState.open === "compare"}
-            <Drawers.Compare params={drawerState.params} />
-          {:else if drawerState.open === "system_prompt"}
-            <Drawers.SystemPrompt params={drawerState.params} />
-          {:else if drawerState.open === "help"}
-            <Drawers.Help params={drawerState.params} />
-          {:else if drawerState.open === "export"}
-            <Drawers.Export params={drawerState.params} />
-          {:else if drawerState.open === "token_drilldown"}
-            <Drawers.TokenDrilldown params={drawerState.params} />
-          {:else if drawerState.open === "correlation"}
-            <Drawers.Correlation params={drawerState.params} />
-          {:else if drawerState.open === "probe_inspector"}
-            <Drawers.ProbeInspector params={drawerState.params} />
-          {:else if drawerState.open === "advanced_sampling"}
-            <Drawers.AdvancedSampling params={drawerState.params} />
-          {:else if drawerState.open === "health"}
-            <Drawers.Health params={drawerState.params} />
-          {:else if drawerState.open === "session_admin"}
-            <Drawers.SessionAdmin params={drawerState.params} />
-          {:else if drawerState.open === "node_compare"}
-            <Drawers.NodeCompare params={drawerState.params} />
-          {:else if drawerState.open === "transcript"}
-            <Drawers.Transcript params={drawerState.params} />
-          {:else if drawerState.open === "template_lab"}
-            <Drawers.TemplateLab params={drawerState.params} />
-          {:else if drawerState.open === "cast"}
-            <Drawers.Cast params={drawerState.params} />
-          {:else}
-            <header class="drawer-header">
-              <span class="drawer-title">{drawerState.open}</span>
-              <button
-                type="button"
-                class="drawer-close"
-                aria-label="Close"
-                onclick={closeDrawer}
-              >✕</button>
-            </header>
-            <div class="drawer-body">
-              <p class="stub">unknown drawer: {drawerState.open}</p>
-            </div>
-          {/if}
+          <entry.component
+            params={drawerParams(drawerState.open, drawerState.params)}
+          />
         </div>
       {/if}
     </main>
@@ -585,39 +513,6 @@
       transform: translateX(0);
       opacity: 1;
     }
-  }
-  .drawer-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--space-3) var(--space-6);
-  }
-  .drawer-title {
-    color: var(--accent);
-    font-size: var(--text);
-    text-transform: lowercase;
-    letter-spacing: 0;
-  }
-  .drawer-close {
-    background: transparent;
-    border: 0;
-    color: var(--fg-dim);
-    font-size: var(--text);
-    line-height: 1;
-    padding: var(--space-2) var(--space-3);
-  }
-  .drawer-close:hover {
-    color: var(--accent-red);
-  }
-  .drawer-body {
-    flex: 1;
-    overflow-y: auto;
-    padding: var(--space-5);
-  }
-  .stub {
-    color: var(--fg-strong);
-    font-size: var(--text);
-    margin: 0 0 var(--space-3) 0;
   }
 
   /* Boot-failed gate — sits over the whole viewport since the rest of

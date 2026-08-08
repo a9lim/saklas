@@ -32,6 +32,15 @@ jobs:
       # while it analyzes the package, tests, examples, and maintained scripts.
       - run: pip install -e ".[dev]"
       - run: pyright
+      # The dashboard's REST types are generated from the FastAPI app's
+      # OpenAPI schema, so an unmirrored response-shape change has to fail
+      # the build rather than a panel.  It lives in this job rather than in
+      # ``webui`` because the generator imports the package: this is the job
+      # that already has it installed, and duplicating the install would
+      # double CI's heaviest step for one diff.  ``webui`` keeps the
+      # sibling parity check for the committed bundle.
+      - name: Verify the generated dashboard types are current
+        run: python scripts/generate_webui_types.py --check
 
   test-matrix:
     runs-on: ubuntu-latest

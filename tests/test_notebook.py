@@ -65,7 +65,7 @@ def _make_profile(layers: dict[int, list[float]]) -> Profile:
     """Build a Profile from a per-layer values dict (cheap: no torch.norm)."""
     return Profile(
         {layer: torch.tensor(values, dtype=torch.float32) for layer, values in layers.items()},
-        metadata={"method": "contrastive_pca"},
+        metadata={"method": "manifold_pca"},
     )
 
 

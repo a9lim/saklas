@@ -10,13 +10,32 @@ from typing import Any
 
 import torch
 
-
-class _SaeCaptureComplete(RuntimeError):
-    """Internal short-circuit after the selected residual layer is captured."""
+from saklas.core.errors import SaklasError
 
 
-class SaeTrainingCancelled(RuntimeError):
-    """Raised when a cooperative local-SAE training cancellation lands."""
+class _SaeCaptureComplete(BaseException):
+    """Private non-error control flow: the selected residual layer is captured.
+
+    ``BaseException``, like ``capture._CaptureComplete`` and the J-lens fit's
+    terminal sentinel: a broad ``except Exception`` anywhere in third-party
+    modeling code would otherwise swallow the signal, and the rest of the
+    forward (final norm + the full vocabulary head) would run silently on
+    every training batch.  The exact-once guard below would not catch that —
+    the capture has already appended by the time the raise is absorbed.
+    """
+
+
+class SaeTrainingCancelled(RuntimeError, SaklasError):
+    """Raised when a cooperative local-SAE training cancellation lands.
+
+    Mirrors :class:`~saklas.core.jlens.JacobianLensCancelled` — the same event
+    on the other background-preparation family, so it reports the same 409 and
+    is caught by the same ``except SaklasError``.  ``RuntimeError`` stays in
+    the MRO, so existing catch sites are unaffected.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (409, str(self) or "SAE training cancelled")
 
 
 def _token_rows(tokenizer: Any, documents: Sequence[str], seq_len: int) -> list[list[int]]:

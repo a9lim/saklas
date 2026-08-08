@@ -385,7 +385,7 @@ def _build_whitened_factors(
         node_white = v_reduced.to(torch.float32) @ chol_dev   # (K, R)
         # Append the neutral anchor as the ``K``-th candidate once, here, so the
         # per-token read does one ``vector_norm`` against a standing
-        # ``(Kc, R)`` tensor instead of a per-token ``cat`` (FIX F4).
+        # ``(Kc, R)`` tensor, so the hot path never pays a per-token ``cat``.
         node_white_aug = (
             torch.cat([node_white, neutral_white.reshape(1, -1)], dim=0)
             if probe.inject_neutral else node_white
@@ -490,7 +490,7 @@ def _attach_manifold_probe(
         whitener, probe, factor_cache=factor_cache,
     )
     bw, lvb = _compute_assign_bandwidth(probe, embedded)
-    # Park the soft-assignment factors on the scoring device once (FIX F4), so
+    # Park the soft-assignment factors on the scoring device once, so
     # the per-token ``probe.assign_bandwidth.to(dist_acc_t.device, fp32)`` in the
     # curved/gate read is a no-op (``.to`` returns self on a device+dtype match)
     # rather than a per-token host→device copy of the ``(Kc,)`` tensors.

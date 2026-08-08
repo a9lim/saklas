@@ -38,12 +38,25 @@ from saklas.core.session import (
     _PROFILE_ABSENT,
     _affine_manifold_push,
 )
+from saklas.core.steering import entry_coeff, entry_trigger
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 
 if TYPE_CHECKING:
-    from saklas.core.instruments.types import GateRef
+    from saklas.core.instruments.types import GateRef, InstrumentFamily
     from saklas.core.session import SaklasSession
     from saklas.core.steering import Steering
+
+
+def _fires_in_prefill(trigger: Trigger) -> bool:
+    """True iff ``trigger`` touches the prompt residual stream.
+
+    A term steers the prefill exactly when its phase includes the prompt and
+    it carries no probe gate — gates report inactive during prefill, because
+    there is no post-forward score yet (see
+    :meth:`~saklas.core.triggers.Trigger.active`).  Both the live-stack check
+    and the pre-flight check over an incoming value reduce to this predicate.
+    """
+    return trigger.prompt and trigger.gate is None
 
 
 class SteeringComposer:
@@ -191,10 +204,20 @@ class SteeringComposer:
             transferred_from_is_encoded=transferred_from is not None,
         )
 
+        # A fit from an older artifact format is a *miss*, not a corrupt
+        # artifact: the corpus is intact, so the answer is "refit", which is
+        # exactly what the no-tensor branch below already says. Screening it
+        # here keeps a format bump from raising a raw codec error out of every
+        # steering resolution and probe bootstrap on the way to that refit.
+        from saklas.io.manifold_folder import fitted_sidecar_is_current
+
         matches = [
-            (ns, manifold_dir(ns, name) / fname)
-            for ns in search_ns
-            if (manifold_dir(ns, name) / fname).exists()
+            (ns, path)
+            for ns, path in (
+                (ns, manifold_dir(ns, name) / fname) for ns in search_ns
+            )
+            if path.exists()
+            and fitted_sidecar_is_current(path.with_suffix(".json"))
         ]
         if not matches:
             raise ManifoldNotRegisteredError(
@@ -592,12 +615,9 @@ class SteeringComposer:
         alphas_only: dict[str, float] = {}
         entries_out: dict[str, tuple[float, Trigger]] = {}
         for name, entry in flat.items():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                alphas_only[name] = entry.coeff
-                entries_out[name] = (entry.coeff, entry.trigger)
-                continue
-            alphas_only[name] = entry[0]
-            entries_out[name] = entry
+            coeff = entry_coeff(entry)
+            alphas_only[name] = coeff
+            entries_out[name] = (coeff, entry_trigger(entry))
         self._session.events.emit(
             SteeringApplied(alphas=alphas_only, entries=entries_out)
         )
@@ -613,22 +633,16 @@ class SteeringComposer:
         """Return True iff any active steering trigger carries a
         :class:`~saklas.core.triggers.ProbeGate`.
 
-        Walks the flattened steering stack head — entry tuples'
-        triggers and ablation entries' triggers both inspected.
-        Cheap pre-flight check that lets ``_generate_core`` decide
-        whether to wire the per-step score callback at all.
+        Walks the flattened steering stack head through
+        :func:`~saklas.core.steering.entry_trigger`, so every entry shape is
+        inspected the same way.  Cheap pre-flight check that lets
+        ``_generate_core`` decide whether to wire the per-step score callback
+        at all.
         """
-        flat = self.flatten_stack()
-        for entry in flat.values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                if entry.trigger.gate is not None:
-                    return True
-                continue
-            # entry is (alpha, Trigger) — the additive / projection shape
-            _alpha, trig = entry
-            if trig.gate is not None:
-                return True
-        return False
+        return any(
+            entry_trigger(entry).gate is not None
+            for entry in self.flatten_stack().values()
+        )
 
     def _gated_refs(self) -> "list[tuple[str, GateRef]]":
         """Every active probe-gate reference, parsed once into its
@@ -643,11 +657,7 @@ class SteeringComposer:
 
         refs = []
         for entry in self.flatten_stack().values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            gate = trig.gate
+            gate = entry_trigger(entry).gate
             if gate is None:
                 continue
             refs.append((gate.probe, parse_gate_ref(gate.probe)))
@@ -676,46 +686,41 @@ class SteeringComposer:
             if ref.probe in attached
         }
 
-    def gated_lens_probe_keys(self) -> set[str]:
-        """Exact gate scalar keys referencing attached J-lens token probes.
+    def gated_family_probe_keys(self, family: "InstrumentFamily") -> set[str]:
+        """Exact gate scalar keys referencing one read family's probes.
 
-        The lens sibling of :meth:`gated_probe_keys`: lens probes live in
-        the session lens instrument (readout channel), not the Monitor.
-        A key whose base name is an attached lens probe is also
-        **channel-validated** here — the lens family produces only the
-        strength axis, so ``@when:jlens/word:membership`` raises
-        ``UnsupportedProbeChannelError`` at generation preflight instead of
-        sitting silently inactive.
+        Driven by ``session.instruments`` — the registry IS the family
+        enumeration, so this is one loop rather than a per-family copy.
+        Lens and SAE probes live in their instruments' own registries (the
+        readout channels), not the Monitor, so :meth:`gated_probe_keys`'
+        attachment test doesn't see them.
+
+        A key whose base name is attached to the family is also
+        **channel-validated** here (``Instrument.validate_gate``): the
+        single-axis families produce only the strength channel, so
+        ``@when:jlens/word:membership`` raises
+        ``UnsupportedProbeChannelError`` at generation preflight rather than
+        sitting silently inactive.  Geometry accepts every channel, so the
+        same call is a no-op there.
         """
-        attached = set(self._session._lens_probes)
+        instrument = self._session.instruments[family]
+        attached = set(instrument.names)
         if not attached:
             return set()
-        # Historical name for the attachment check (duck-typed stubs supply
-        # a plain dict); the instrument, when present, channel-validates.
-        instrument = getattr(self._session, "_lens_instrument", None)
         out: set[str] = set()
         for key, ref in self._gated_refs():
             if ref.probe in attached:
-                if instrument is not None:
-                    instrument.validate_gate(ref)
+                instrument.validate_gate(ref)
                 out.add(key)
         return out
+
+    def gated_lens_probe_keys(self) -> set[str]:
+        """Exact gate scalar keys referencing attached J-lens token probes."""
+        return self.gated_family_probe_keys("lens")
 
     def gated_sae_probe_keys(self) -> set[str]:
-        """Exact gate scalar keys referencing attached SAE feature probes,
-        channel-validated like the lens sibling (the SAE family produces
-        only the strength axis)."""
-        attached = set(self._session._sae_probes)
-        if not attached:
-            return set()
-        instrument = getattr(self._session, "_sae_instrument", None)
-        out: set[str] = set()
-        for key, ref in self._gated_refs():
-            if ref.probe in attached:
-                if instrument is not None:
-                    instrument.validate_gate(ref)
-                out.add(key)
-        return out
+        """Exact gate scalar keys referencing attached SAE feature probes."""
+        return self.gated_family_probe_keys("sae")
 
     def steering_active_in_prefill(self) -> bool:
         """Return True iff any active steering term fires during prompt prefill.
@@ -730,15 +735,10 @@ class SteeringComposer:
         keys on, and the condition under which steering push/pop preserves the
         cache.  Mirrors :meth:`steering_needs_probe_gating`'s stack walk.
         """
-        flat = self.flatten_stack()
-        for entry in flat.values():
-            if isinstance(entry, (AblationTerm, ManifoldTerm)):
-                trig = entry.trigger
-            else:  # (alpha, Trigger)
-                _alpha, trig = entry
-            if trig.prompt and trig.gate is None:
-                return True
-        return False
+        return any(
+            _fires_in_prefill(entry_trigger(entry))
+            for entry in self.flatten_stack().values()
+        )
 
     def steering_value_prefill_inactive(
         self, value: "str | Steering | None",
@@ -755,7 +755,6 @@ class SteeringComposer:
         caching and lets the normal path surface the error.
         """
         from saklas.core.steering import Steering
-        from saklas.core.steering_expr import ProjectedTerm
 
         try:
             s = Steering.from_value(
@@ -765,17 +764,7 @@ class SteeringComposer:
             return False
         if s is None:
             return True
-        default = s.trigger
-        for val in s.alphas.values():
-            if isinstance(val, (AblationTerm, ManifoldTerm, ProjectedTerm)):
-                trig = val.trigger
-            elif isinstance(val, tuple):
-                trig = val[1]
-            else:  # bare float — inherits the Steering default trigger
-                trig = default
-            if trig.prompt and trig.gate is None:
-                return False
-        return True
+        return not any(_fires_in_prefill(trig) for trig in s.triggers())
 
     def build_gating_score_callback(self):
         """Return a closure that scores latest captures into a

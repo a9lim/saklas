@@ -10,6 +10,11 @@ from fastapi.responses import Response
 
 from saklas.server.app import acquire_session_lock
 from saklas.server.native_common import resolve_session_id
+from saklas.server.response_models import (
+    SessionInfo,
+    SessionListResponse,
+    SteeringValidationResponse,
+)
 from saklas.server.session_models import (
     CreateSessionRequest,
     PatchSessionRequest,
@@ -23,13 +28,13 @@ def register_session_routes(app: FastAPI) -> None:
     session = app.state.session
 
     @app.get("/saklas/v1/sessions")
-    def list_sessions():
+    def list_sessions() -> SessionListResponse:
         return {"sessions": [session_info(
             session, app.state.default_steering, app.state.created_ts,
         )]}
 
     @app.post("/saklas/v1/sessions")
-    def create_session(req: CreateSessionRequest):
+    def create_session(req: CreateSessionRequest) -> SessionInfo:
         if req.model and req.model != session.model_id:
             logging.getLogger("saklas.api").warning(
                 "POST /saklas/v1/sessions requested model=%r but session is %r; "
@@ -42,7 +47,7 @@ def register_session_routes(app: FastAPI) -> None:
         )
 
     @app.get("/saklas/v1/sessions/{session_id}")
-    def get_session(session_id: str):
+    def get_session(session_id: str) -> SessionInfo:
         resolve_session_id(session_id)
         return session_info(
             session, app.state.default_steering, app.state.created_ts,
@@ -58,7 +63,7 @@ def register_session_routes(app: FastAPI) -> None:
         return Response(status_code=204)
 
     @app.patch("/saklas/v1/sessions/{session_id}")
-    def patch_session(session_id: str, req: PatchSessionRequest):
+    def patch_session(session_id: str, req: PatchSessionRequest) -> SessionInfo:
         resolve_session_id(session_id)
         config = session.config
         session.config = replace(
@@ -86,7 +91,9 @@ def register_session_routes(app: FastAPI) -> None:
         )
 
     @app.post("/saklas/v1/sessions/{session_id}/steering/validate")
-    async def validate_steering(session_id: str, req: ValidateSteeringRequest):
+    async def validate_steering(
+        session_id: str, req: ValidateSteeringRequest,
+    ) -> SteeringValidationResponse:
         """Parse, resolve, and dry-install a dashboard-authored expression."""
         resolve_session_id(session_id)
         expression = req.expression.strip()

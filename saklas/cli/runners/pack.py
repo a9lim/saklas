@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Any
 
 from saklas.cli.parsers import _PACK_VERBS
 from saklas.cli.runners.shared import (
-    _iter_manifold_folders, _resolve_manifold_ns_name, _saklas_error_exit,
-    _split_manifold_ns_name,
+    _iter_manifold_folders, _print_verb_menu, _resolve_manifold_ns_name,
+    _saklas_error_exit, _split_manifold_ns_name,
 )
 
 
@@ -69,23 +68,12 @@ def _run_pack_show(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
     ns, mf = matches[0]
-    fitted = []
-    for stem in mf.tensor_models():
-        sc = mf.sidecar(stem)
-        entry: dict[str, Any] = {
-            "stem": stem,
-            "method": sc.method,
-            "feature_space": sc.feature_space,
-            "node_count": sc.node_count,
-            "fit_mode": sc.fit_mode,
-        }
-        if sc.hyperparams:
-            entry["hyperparams"] = sc.hyperparams
-        if sc.diagnostics:
-            entry["diagnostics"] = sc.diagnostics
-        if sc.node_spread_per_layer:
-            entry["node_spread"] = sc.node_spread_per_layer
-        fitted.append(entry)
+    from saklas.io.manifolds import manifold_fit_summary
+
+    fitted = [
+        manifold_fit_summary(mf.sidecar(stem), stem)
+        for stem in mf.tensor_models()
+    ]
 
     # In discover mode the folder itself has no per-node coords (they are
     # derived per-model at fit time) — try to surface the derived coords
@@ -120,7 +108,9 @@ def _run_pack_show(args: argparse.Namespace) -> None:
         # in the fitted safetensors; the text path below still surfaces
         # the derived coords for interactive use.
         from saklas.io.manifolds import manifold_summary
-        print(_json.dumps(manifold_summary(mf.folder), indent=2))
+        print(_json.dumps(
+            manifold_summary(mf.folder, include_fits=True), indent=2,
+        ))
         return
 
     print(f"{ns}/{mf.name}")
@@ -207,7 +197,14 @@ def _run_pack_show(args: argparse.Namespace) -> None:
 def _run_pack_install(args: argparse.Namespace) -> None:
     from saklas.io.hf_manifolds import install_manifold
 
-    dst = install_manifold(args.target, args.as_target, force=args.force)
+    # Announce before the network call — hub progress bars are suppressed
+    # off-TTY, so without the preamble plus the per-stage callback the verb is
+    # silent while it downloads, validates, stages, and swaps.
+    print(f"Installing {args.target}...", flush=True)
+    dst = install_manifold(
+        args.target, args.as_target, force=args.force,
+        on_progress=lambda m: print(f"  {m}", flush=True),
+    )
     print(f"Installed {args.target} -> {dst}")
 
 
@@ -215,6 +212,9 @@ def _run_pack_search(args: argparse.Namespace) -> None:
     import json as _json
     from saklas.io.hf_manifolds import search_manifolds
 
+    if not getattr(args, "json_output", False):
+        target = f" matching {args.query!r}" if args.query else ""
+        print(f"Searching Hugging Face for manifolds{target}...", flush=True)
     try:
         rows = search_manifolds(args.query or None)
     except ImportError as e:
@@ -257,16 +257,17 @@ def _run_pack_push(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # The coord follows pack push's resolution: ``--as owner/name`` wins,
-    # else ``<whoami>/<name>``.  ``push_manifold`` takes the resolved
-    # coord directly (no internal selector machinery), so the runner owns
-    # the resolution the way ``cache_ops.push`` does for packs.
+    # Coord resolution: ``--as owner/name`` wins, else ``<whoami>/<name>``.
+    # ``push_manifold`` takes the resolved coord directly (no internal
+    # selector machinery), so the runner owns the resolution.
     try:
         coord = resolve_target_coord(name, args.as_target)
     except Exception as e:
         print(f"manifold push: {e}", file=sys.stderr)
         sys.exit(2)
 
+    action = "Dry-run: resolving push of" if args.dry_run else "Pushing"
+    print(f"{action} {ns}/{name} to {coord}...", flush=True)
     try:
         repo_url, sha = push_manifold(
             folder, coord,
@@ -291,14 +292,19 @@ def _run_pack_rm(args: argparse.Namespace) -> None:
     from saklas.io.manifolds import remove_manifold_folder
 
     ns, name = _resolve_manifold_ns_name(args.selector)
-    # Bundled (``default/``) manifolds re-materialize on next session
-    # init — mirror ``pack rm``'s confirmation guard for the broad/
-    # destructive case (here: a bundled folder the user likely didn't
-    # mean to nuke).  ``-y`` skips it.
-    if ns == "default" and not args.yes:
+    # Removal is irrecoverable for every namespace *except* bundled
+    # (``default/``), which re-materializes on the next session start — so
+    # the guard covers all of them, hardest-to-reproduce included (a
+    # ``local/`` manifold cost real extraction/fit time).  ``-y`` confirms.
+    # Same ``-y``-or-exit-2 idiom as ``template rm``.
+    if not args.yes:
+        tail = (
+            " (re-materializes on restart)" if ns == "default"
+            else " (this cannot be undone)"
+        )
         print(
-            f"refusing to remove bundled manifold {ns}/{name} "
-            f"(re-materializes on restart); pass --yes to confirm",
+            f"refusing to remove manifold {ns}/{name}{tail}; "
+            f"pass -y/--yes to confirm",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -332,8 +338,7 @@ def _run_pack_refresh(args: argparse.Namespace) -> None:
 
     ns, name = _resolve_manifold_ns_name(args.selector)
     # ``args.model`` is the raw model id; ``refresh_manifold`` converts to
-    # a safe id at the io boundary (via ``clear_manifold_tensors``), the
-    # same convention ``cache_ops.refresh``'s scoped path uses.
+    # a safe id at the io boundary (via ``clear_manifold_tensors``).
     try:
         tier = refresh_manifold(ns, name, model_scope=args.model)
     except FileNotFoundError as e:
@@ -360,7 +365,7 @@ def _run_pack_export(args: argparse.Namespace) -> None:
     if fmt != "gguf":
         print(f"Unknown export format: {fmt}", file=sys.stderr)
         sys.exit(2)
-    from saklas.io.cache_ops import export_gguf_manifold
+    from saklas.io.gguf_io import export_gguf_manifold
 
     ns, name = _resolve_manifold_ns_name(args.name)
     try:
@@ -397,16 +402,7 @@ def _run_pack(args: argparse.Namespace) -> None:
     """Dispatch ``saklas pack <verb>`` (the manifold lifecycle verbs)."""
     cmd = getattr(args, "pack_cmd", None)
     if cmd is None:
-        print("usage: saklas pack <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _PACK_VERBS)
-        for v, desc in _PACK_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas pack <verb> -h` for verb-specific options.")
+        _print_verb_menu("pack", _PACK_VERBS)
         sys.exit(0)
-    runner = _PACK_RUNNERS.get(cmd)
-    if runner is None:
-        print(f"unknown pack verb {cmd!r}", file=sys.stderr)
-        sys.exit(2)
-    runner(args)
+    # Registered-subparser invariant: argparse rejects an unknown verb.
+    _PACK_RUNNERS[cmd](args)

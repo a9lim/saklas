@@ -685,6 +685,43 @@ def test_registry_covers_tested_archs():
     )
 
 
+def test_seat_views_derive_from_one_registry():
+    """``ROLE_HEADERS`` / ``USER_ROLE_HEADERS`` are views over ``SEAT_HEADERS``.
+
+    The two per-seat tables used to be independent literals — a family edit
+    in two places with nothing enforcing agreement.  They are derived now, so
+    key sets and per-family support cannot drift.
+    """
+    from saklas.core.role_templates import SEAT_HEADERS
+
+    assert set(ROLE_HEADERS) == set(SEAT_HEADERS) == set(USER_ROLE_HEADERS)
+    for model_type, seats in SEAT_HEADERS.items():
+        assert ROLE_HEADERS[model_type] is seats.assistant
+        assert USER_ROLE_HEADERS[model_type] is seats.user
+        # Support is per-family, not per-seat: a label-free template has no
+        # label on either side.
+        assert (seats.assistant is None) == (seats.user is None)
+
+
+def test_seat_headers_share_delimiters_except_gpt_oss():
+    """``_seat_headers`` builds both seats from one delimiter pair.
+
+    gpt-oss is the sole documented divergence (Harmony renders user turns
+    with ``<|message|>``); every other family's seats differ only in label.
+    """
+    from saklas.core.role_templates import SEAT_HEADERS
+
+    for model_type, seats in SEAT_HEADERS.items():
+        if seats.assistant is None or seats.user is None:
+            continue
+        assert seats.assistant.before == seats.user.before
+        assert seats.user.label == "user"
+        if model_type == "gpt_oss":
+            assert seats.assistant.after != seats.user.after
+        else:
+            assert seats.assistant.after == seats.user.after
+
+
 def test_role_header_is_frozen():
     """RoleHeader is a frozen dataclass — registry entries can't be mutated post-import."""
     header = RoleHeader(before="x", after="y", label="z")
@@ -1005,3 +1042,77 @@ def test_apply_with_per_turn_ordering():
         tok, msgs, gen_role=None, model_type="qwen3", tokenize=False)
     # alice precedes bob in the rendered string.
     assert out.index("<|im_start|>alice\n") < out.index("<|im_start|>bob\n")
+
+
+# ---------------------------------------------------------------------------
+# Cross-seat label collision (the splice path's occurrence-matching hazard)
+# ---------------------------------------------------------------------------
+
+
+def test_per_turn_user_label_equal_to_assistant_label():
+    """A user turn labelled ``assistant`` must not steal the assistant slot.
+
+    Nothing forbids the label — ``validate_role`` accepts it and
+    ``LoomTree.add_user_turn(role_label=...)`` doesn't screen it — and on
+    GLM-shaped families both seats share ``<|`` / ``|>`` delimiters, so
+    splicing the sides in sequence wrote the assistant header into the buffer
+    at the *user* position and the assistant pass then claimed it as its own
+    occurrence 0.  Both sides splice in one scan now.
+    """
+    tok = _glm_tok()
+    msgs = [
+        {"role": "user", "content": "hi", "label": "assistant"},
+        {"role": "assistant", "content": "yo", "label": "pirate"},
+    ]
+    out = apply_with_per_turn_roles(
+        tok, msgs, gen_role=None, model_type="glm", tokenize=False,
+        add_generation_prompt=False)
+    assert out == "<|assistant|>\nhi<|pirate|>\nyo"
+
+
+def test_per_turn_assistant_label_equal_to_user_label():
+    """The mirror case — an assistant turn labelled ``user``."""
+    tok = _glm_tok()
+    msgs = [
+        {"role": "user", "content": "hi", "label": "captain"},
+        {"role": "assistant", "content": "yo", "label": "user"},
+        {"role": "user", "content": "more", "label": "bosun"},
+    ]
+    out = apply_with_per_turn_roles(
+        tok, msgs, gen_role=None, model_type="glm", tokenize=False,
+        add_generation_prompt=False)
+    # The second user turn keeps its own label — it is not shifted by the
+    # ``<|user|>`` header the assistant turn's label wrote.
+    assert out == "<|captain|>\nhi<|user|>\nyo<|bosun|>\nmore"
+
+
+def test_per_turn_gemma_user_label_equal_to_model_label():
+    """Gemma's assistant label is ``model``; a user turn may carry it."""
+    tok = FakeTokenizer(GEMMA_TEMPLATE)
+    msgs = [
+        {"role": "user", "content": "hi", "label": "model"},
+        {"role": "assistant", "content": "yo", "label": "oracle"},
+    ]
+    out = apply_with_per_turn_roles(
+        tok, msgs, gen_role=None, model_type="gemma3", tokenize=False)
+    assert "<start_of_turn>model\nhi" in out
+    assert "<start_of_turn>oracle\nyo" in out
+
+
+def test_per_turn_collision_does_not_shift_later_labels():
+    """Occurrence indices stay per-side across a collision."""
+    tok = _glm_tok()
+    msgs = [
+        {"role": "user", "content": "a", "label": "assistant"},
+        {"role": "assistant", "content": "b", "label": "one"},
+        {"role": "user", "content": "c", "label": "bob"},
+        {"role": "assistant", "content": "d", "label": "two"},
+    ]
+    out = apply_with_per_turn_roles(
+        tok, msgs, gen_role="skipper", model_type="glm", tokenize=False)
+    # The trailing generation prompt is the assistant side's *third*
+    # occurrence, so it takes ``gen_role`` even though a user turn wrote a
+    # look-alike ``<|assistant|>`` header ahead of it.
+    assert out == (
+        "<|assistant|>\na<|one|>\nb<|bob|>\nc<|two|>\nd<|skipper|>\n"
+    )

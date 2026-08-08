@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import pytest
 import torch
@@ -14,10 +14,20 @@ from saklas.core.generation import (
     _PenaltyState,
     generate_steered,
 )
+from saklas.core.instruments.types import ScalarReading
 from saklas.core.results import GenerationResult, ProbeReading
 from saklas.core.sampling import SamplingConfig
-from saklas.core.session import CaptureMode, CaptureState, GenState, SaklasSession
+from saklas.core.session import (
+    CaptureMode,
+    CaptureState,
+    GenState,
+    PreparedCall,
+    ReadDemand,
+    SaklasSession,
+)
 from saklas.core.steering import Steering
+from saklas.core.token_payloads import TokenProbePayload
+from tests.conftest import FakeLogitsModel
 
 
 class _StopTokenizer:
@@ -46,12 +56,33 @@ class _StopTokenizer:
         return "".join(pieces)
 
 
+def _stub_instruments(
+    *,
+    geometry: Any = None,
+    lens_names: "tuple[str, ...]" = (),
+    sae_names: "tuple[str, ...]" = (),
+) -> dict[str, Any]:
+    """A minimal ``session.instruments`` registry for composer stubs.
+
+    The composer's gate preflight walks the registry (``names`` +
+    ``validate_gate``), so a narrow stub supplies those two members per
+    family rather than the historical private probe dicts.
+    """
+    def _fam(names: "tuple[str, ...]", extra: Any = None) -> Any:
+        base = {"names": list(names), "validate_gate": lambda _ref: None}
+        if extra is not None:
+            base.update(vars(extra))
+        return SimpleNamespace(**base)
+
+    return {
+        "geometry": _fam((), geometry),
+        "lens": _fam(lens_names),
+        "sae": _fam(sae_names),
+    }
+
+
 def _complete_finalizer_session(session: Any) -> None:
     """Install the current finalizer collaborator roster on a narrow stub."""
-    if not hasattr(session, "_lens_probes"):
-        session._lens_probes = {}
-    if not hasattr(session, "_sae_probes"):
-        session._sae_probes = {}
     session._scene_grammar = None
     session._scene_grammar_resolved = True
 
@@ -61,14 +92,14 @@ class _CurrentSessionStub(SaklasSession):
 
     def __new__(cls) -> "_CurrentSessionStub":
         instance = super().__new__(cls)
-        instance._lens_probes = {}
-        instance._sae_probes = {}
-        instance._live_lens = None
-        instance._live_sae = None
-        instance._live_lens_active_for_generation = True
-        instance._live_sae_active_for_generation = True
-        instance._generation_jlens = None
-        instance._generation_jlens_active = False
+        instance._lens_instrument.probes = {}
+        instance._sae_instrument.probes = {}
+        instance._lens_instrument.live = None
+        instance._sae_instrument.live = None
+        instance._lens_instrument.active_for_generation = True
+        instance._sae_instrument.active_for_generation = True
+        instance._lens_instrument.generation_lens = None
+        instance._lens_instrument.generation_lens_active = False
         instance._default_return_top_k = 0
         return instance
 
@@ -87,22 +118,16 @@ def _complete_capture_session(session: Any) -> None:
     anyway (attach records the full fitted set; adoption rewrites every
     probe), so an ``object()`` lens only modeled an impossible state.
     """
-    if not hasattr(session, "_lens_probes"):
-        session._lens_probes = {}
-    if not hasattr(session, "_sae_probes"):
-        session._sae_probes = {}
-    if not hasattr(session, "_live_sae"):
-        session._live_sae = None
     live_layers = (
-        (session._live_lens or {}).get("layers") or []
-        if session._live_lens is not None else []
+        (session._lens_instrument.live or {}).get("layers") or []
+        if session._lens_instrument.live is not None else []
     )
     probe_layers = {
         int(layer)
-        for spec in session._lens_probes.values()
+        for spec in session._lens_instrument.probes.values()
         for layer in spec.get("layers", [])
     }
-    if session._live_lens is not None or session._lens_probes:
+    if session._lens_instrument.live is not None or session._lens_instrument.probes:
         session._jlens = SimpleNamespace(
             source_layers=sorted(
                 {int(layer) for layer in live_layers} | probe_layers
@@ -224,8 +249,8 @@ def test_persist_authored_prompt_capture_writes_all_measurement_channels() -> No
     session._monitor = SimpleNamespace(
         score_single_token=lambda _hidden: {"formal": _reading(0.25)},
     )
-    session._live_lens = {"source": "local:default"}
-    session._live_sae = {"source": "saelens:test", "layer": 0}
+    session._lens_instrument.live = {"source": "local:default"}
+    session._sae_instrument.live = {"source": "saelens:test", "layer": 0}
     seen_top_k: dict[str, int] = {}
 
     def _lens_capture(_hidden: Any, *, top_k: int) -> Any:
@@ -288,20 +313,17 @@ def test_prepare_generation_uses_session_thinking_default(monkeypatch: pytest.Mo
     session.config = GenerationConfig(thinking=False)
     monkeypatch.setattr("saklas.core.session.supports_thinking", lambda _tok: True)
 
-    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+    assert SaklasSession._prepare_generation_call(
         session, None, None, None,
-    )
-    assert use_thinking is False
+    ).use_thinking_req is False
 
-    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+    assert SaklasSession._prepare_generation_call(
         session, Steering(alphas={}, thinking=True), None, None,
-    )
-    assert use_thinking is True
+    ).use_thinking_req is True
 
-    _steering, use_thinking, *_rest = SaklasSession._prepare_generation_call(
+    assert SaklasSession._prepare_generation_call(
         session, None, None, True,
-    )
-    assert use_thinking is True
+    ).use_thinking_req is True
 
 
 def test_readout_top_k_shares_logit_alternative_width() -> None:
@@ -359,31 +381,55 @@ def test_prepare_input_raw_feeds_flat_active_path():
     assert _decode_echo(ids) == "once upon a time"
 
 
-class _StopModel:
-    config = SimpleNamespace(vocab_size=4)
-    generation_config = SimpleNamespace(eos_token_id=3)
+def _scripted_logits(
+    tokens: list[int], vocab_size: int,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """A scripted-argmax ``logits_fn``: forward *i* forces ``tokens[i]``
+    (clamped at the last entry), ignoring ``input_ids`` entirely."""
+    step = 0
 
-    def __init__(self):
-        self._tokens = [0, 1, 2]
-        self._idx = 0
+    def _logits(_input_ids: torch.Tensor) -> torch.Tensor:
+        nonlocal step
+        tid = tokens[min(step, len(tokens) - 1)]
+        step += 1
+        out = torch.full((1, 1, vocab_size), -100.0)
+        out[0, 0, tid] = 100.0
+        return out
 
-    def __call__(self, **_kwargs: Any) -> Any:
-        tid = self._tokens[min(self._idx, len(self._tokens) - 1)]
-        self._idx += 1
-        logits = torch.full((1, 1, self.config.vocab_size), -100.0)
-        logits[0, 0, tid] = 100.0
-        return SimpleNamespace(logits=logits, past_key_values=object())
+    return _logits
 
 
-class _NoCacheModel(_StopModel):
-    def __init__(self):
-        super().__init__()
-        self._tokens = [0, 1, 3]
+class _NoCacheModel(FakeLogitsModel):
+    """The scripted model with its KV cache withheld — the modeling files
+    that ignore ``past_key_values`` and drive the O(N²) fallback."""
 
-    def __call__(self, **_kwargs: Any) -> Any:
-        out = super().__call__(**_kwargs)
+    def __call__(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        use_cache: bool | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        out = super().__call__(input_ids, use_cache=use_cache, **kwargs)
         out.past_key_values = None
         return out
+
+
+def _scripted_model(
+    tokens: list[int],
+    *,
+    vocab_size: int = 4,
+    eos_token_id: int = 3,
+    model_cls: type[FakeLogitsModel] = FakeLogitsModel,
+) -> Any:
+    """A decode stub forcing a fixed token sequence, with a fresh KV-cache
+    sentinel per forward.  ``model_cls=_NoCacheModel`` withholds the cache."""
+    return model_cls(
+        _scripted_logits(tokens, vocab_size),
+        with_past_key_values=True,
+        config=SimpleNamespace(vocab_size=vocab_size),
+        generation_config=SimpleNamespace(eos_token_id=eos_token_id),
+    )
 
 
 class _SplitStopTokenizer(_StopTokenizer):
@@ -397,16 +443,9 @@ class _SplitStopTokenizer(_StopTokenizer):
     }
 
 
-class _SplitStopModel(_StopModel):
-    config = SimpleNamespace(vocab_size=5)
-
-    def __init__(self):
-        self._tokens = [0, 1, 3]
-        self._idx = 0
-
 
 def test_stop_sequence_trimmed_text_is_final_result_text():
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     emitted: list[str] = []
@@ -435,7 +474,6 @@ def test_stop_sequence_trimmed_text_is_final_result_text():
     session._capture_state = CaptureState(mode=CaptureMode.FULL)
     session._last_per_token_scores = None
     session._last_result = None
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -457,7 +495,7 @@ def test_decode_loop_hands_one_step_id_to_sink_gate_and_tap():
     forward's gate and display reads."""
     from saklas.core.triggers import TriggerContext
 
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     sink_steps: list[int] = []
@@ -506,20 +544,13 @@ class _Utf8SplitTokenizer(_StopTokenizer):
         return super().decode(ids, skip_special_tokens)
 
 
-class _Utf8SplitModel(_StopModel):
-    config = SimpleNamespace(vocab_size=5)
-    generation_config = SimpleNamespace(eos_token_id=4)
-
-    def __init__(self, tokens: list[int]):
-        self._tokens = tokens
-        self._idx = 0
-
-
 def test_buffered_utf8_group_emits_carry_the_flush_forwards_step():
     """Partial-UTF-8 tokens buffer in ``pending_ids`` and flush as a group
     — every emit in the group carries the FLUSHING forward's step (the
     group's readings semantics: they all read that forward's captures)."""
-    model: Any = _Utf8SplitModel([0, 1, 2, 3])
+    model: Any = _scripted_model(
+        [0, 1, 2, 3], vocab_size=5, eos_token_id=4,
+    )
     tokenizer: Any = _Utf8SplitTokenizer()
     state = GenerationState()
     emits: list[tuple[str, int]] = []
@@ -545,7 +576,7 @@ def test_buffered_utf8_group_emits_carry_the_flush_forwards_step():
 def test_post_loop_utf8_flush_uses_the_last_forwards_step():
     """A generation ending with a still-buffered partial flushes post-loop
     with ``last_forward_step`` (no fresh forward ran since)."""
-    model: Any = _Utf8SplitModel([0, 1])
+    model: Any = _scripted_model([0, 1], vocab_size=5, eos_token_id=4)
     tokenizer: Any = _Utf8SplitTokenizer()
     state = GenerationState()
     emits: list[tuple[str, int]] = []
@@ -569,8 +600,79 @@ def test_post_loop_utf8_flush_uses_the_last_forwards_step():
     assert emits[1][1] == 1
 
 
+def test_alt_token_decode_does_not_break_partial_utf8_buffering():
+    """Top-K alternative decoding shares the lazy decode cache with the emit
+    path; a partial-UTF-8 id decoded as an alternative must still buffer when
+    it is emitted (no replacement character reaches the stream)."""
+    model: Any = _scripted_model(
+        [0, 1, 2, 3], vocab_size=5, eos_token_id=4,
+    )
+    tokenizer: Any = _Utf8SplitTokenizer()
+    state = GenerationState()
+    emits: list[tuple[str, int]] = []
+
+    generated_ids = generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=4, temperature=0.0),
+        state,
+        on_token=lambda text, _th, _tid, _lp, _alts, _ppl, step: (
+            emits.append((text, step))
+        ),
+        logprobs=1,
+        cache_token_text=False,
+    )
+
+    assert generated_ids == [0, 1, 2, 3]
+    assert emits == [("A", 0), ("éB", 3)]
+    assert not any("�" in text for text, _step in emits)
+
+
+def test_perplexity_is_none_when_not_requested():
+    """``want_perplexity=False`` reports ``None`` (not computed), never NaN —
+    the value every ``float | None`` consumer is typed for."""
+    model: Any = _scripted_model([0, 1, 2])
+    tokenizer: Any = _StopTokenizer()
+    state = GenerationState()
+    ppls: list[float | None] = []
+
+    generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=3, temperature=0.0),
+        state,
+        on_token=lambda _t, _th, _tid, _lp, _alts, ppl, _step: ppls.append(ppl),
+        want_perplexity=False,
+    )
+
+    assert ppls
+    assert all(p is None for p in ppls)
+
+
+def test_perplexity_is_a_float_when_requested():
+    model: Any = _scripted_model([0, 1, 2])
+    tokenizer: Any = _StopTokenizer()
+    state = GenerationState()
+    ppls: list[float | None] = []
+
+    generate_steered(
+        model,
+        cast(Any, tokenizer),
+        torch.tensor([[0]]),
+        GenerationConfig(max_new_tokens=3, temperature=0.0),
+        state,
+        on_token=lambda _t, _th, _tid, _lp, _alts, ppl, _step: ppls.append(ppl),
+        want_perplexity=True,
+    )
+
+    assert ppls
+    assert all(isinstance(p, float) and p == p for p in ppls)
+
+
 def test_stop_sequence_split_across_tokens_trims_final_text():
-    model: Any = _SplitStopModel()
+    model: Any = _scripted_model([0, 1, 3], vocab_size=5)
     tokenizer: Any = _SplitStopTokenizer()
     state = GenerationState()
     emitted: list[str] = []
@@ -593,7 +695,7 @@ def test_stop_sequence_split_across_tokens_trims_final_text():
 
 
 def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
     generated_ids = generate_steered(
@@ -628,7 +730,6 @@ def test_stop_sequence_probe_aggregate_uses_visible_endpoint():
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -654,7 +755,7 @@ def test_stop_sequence_only_tap_can_skip_full_token_table():
             self.batch_decode_calls += 1
             return super().batch_decode(ids)
 
-    model: Any = _StopModel()
+    model: Any = _scripted_model([0, 1, 2])
     tokenizer = CountingStopTokenizer()
     state = GenerationState()
     emitted: list[str] = []
@@ -731,7 +832,6 @@ def test_finalize_reuses_scored_probe_aggregate() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -772,7 +872,9 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     result = GenerationResult(
         text="ok", tokens=[7], token_count=1, tok_per_sec=1.0, elapsed=1.0,
     )
-    reading = ProbeReading(0.0, [], coords=(0.7,))
+    # A pinned SAE probe reads the family's native one-channel shape; the
+    # compat ``ProbeReading`` projection happens at the stream consumer.
+    reading = ScalarReading(value=0.7, unit="raw_activation")
     flags: dict[str, bool] = {}
     # The readout-suppression mechanism now lives at the tap: ``live_readouts``
     # gates the consumer's ``lens_readout`` / ``sae_readout`` compute flags, so
@@ -788,7 +890,9 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
         on_token = kwargs["on_token"]
         flags["lens"] = on_token.options.lens_readout
         flags["sae"] = on_token.options.sae_readout
-        session._last_token_probe_readings = {"sae/0": reading}
+        session._last_token_payload = TokenProbePayload(
+            sae_readings={"sae/0": reading},
+        )
         session._last_token_probe_payload = {"measurements": envelope}
         on_token("ok", False, 7, None, None, None)
         return result
@@ -798,10 +902,10 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
         probe_names=[],
         update_live=lambda _readings: None,
     )
-    session._lens_probes = {}
-    session._sae_probes = {"sae/0": {"feature_id": 0}}
+    session._lens_instrument.probes = {}
+    session._sae_instrument.probes = {"sae/0": {"feature_id": 0}}
     session._last_token_probe_payload = {}
-    session._last_token_probe_readings = None
+    session._last_token_payload = None
     session._generate_core = _fake_generate_core
 
     events = list(session.generate_stream(
@@ -809,7 +913,9 @@ def test_generate_stream_live_readouts_false_suppresses_readout_flags() -> None:
     ))
 
     assert flags == {"lens": False, "sae": False}
-    assert events[0].probe_readings == {"sae/0": reading}
+    assert events[0].probe_readings == {
+        "sae/0": reading.to_probe_reading(),
+    }
     assert events[0].measurements is envelope
 
 
@@ -832,17 +938,19 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
             thinking,
         )
     )
-    session._prepare_generation_call = lambda *_args: (
-        None,
-        False,
-        GenerationConfig(max_new_tokens=1, temperature=0.0, top_p=1.0, top_k=None),
-        None,
-        None,
-        None,
-        None,
-        0.0,
-        0.0,
-        None,
+    session._prepare_generation_call = lambda *_args: PreparedCall(
+        steering_obj=None,
+        use_thinking_req=False,
+        gen_config=GenerationConfig(
+            max_new_tokens=1, temperature=0.0, top_p=1.0, top_k=None,
+        ),
+        lp_count=None,
+        seed=None,
+        stop_list=None,
+        logit_bias=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logprobs_list=None,
     )
     session._whitener = None
     session._seat_stop_augmentation = lambda stop_list, **_kwargs: stop_list
@@ -852,9 +960,7 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
         begin_live=lambda: None,
         end_live=lambda: None,
     )
-    session._live_probe_scores = True
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
+    session._geometry_instrument._live = True
     composer = SimpleNamespace(
         _stack=[],
         steering_needs_probe_gating=lambda: False,
@@ -872,7 +978,7 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
         1,
     )
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session._begin_capture = lambda **_kwargs: False
+    session._begin_capture = lambda *_args, **_kwargs: False
     session._steering = SimpleNamespace(
         ctx=TriggerContext(),
         reset_manifold_feet=lambda: None,
@@ -886,16 +992,16 @@ def test_token_tap_skips_unconsumed_live_readout_helpers_and_empty_payload(
     session._capture = SimpleNamespace(per_layer_buckets=lambda: {})
     session._incremental_readings = []
     session._incremental_gate_scores = []
-    session._live_lens = {"layers": [0]}
-    session._live_sae = {"layer": 0}
+    session._lens_instrument.live = {"layers": [0]}
+    session._sae_instrument.live = {"layer": 0}
     session._live_lens_readout_step = lambda **_kwargs: (
         (_ for _ in ()).throw(AssertionError("lens readout not consumed"))
     )
     session._live_sae_readout_step = lambda **_kwargs: (
         (_ for _ in ()).throw(AssertionError("sae readout not consumed"))
     )
-    session._last_lens_step_readings = None
-    session._last_sae_step_readings = None
+    session._lens_instrument.last_step_readings = None
+    session._sae_instrument.last_step_readings = None
     session._last_token_probe_payload = {"stale": True}
     observed_payloads: list[Any] = []
     seen_tokens: list[str] = []
@@ -995,7 +1101,6 @@ def test_finalize_incremental_probe_path_does_not_stack_capture() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1091,7 +1196,6 @@ def test_finalize_lean_incremental_probe_path() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1175,7 +1279,6 @@ def test_finalize_gating_subset_probe_path() -> None:
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {}
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1254,8 +1357,8 @@ def test_finalize_reuses_one_aggregate_pool_for_monitor_lens_and_sae() -> None:
     session._monitor = Monitor()
     session._capture = capture
     session._capture_state = CaptureState(mode=CaptureMode.AGGREGATE_ONLY)
-    session._lens_probes = {"jlens/g": {}}
-    session._sae_probes = {"sae/0": {}}
+    session._lens_instrument.probes = {"jlens/g": {}}
+    session._sae_instrument.probes = {"sae/0": {}}
     session._aggregate_forward_index = lambda _ids: 1
     session._score_aggregate_only = score_aggregate_only
     session._score_lens_probes_aggregate = score_lens
@@ -1341,14 +1444,13 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
         ),
         _incremental_readings=[{"toy": object()}],
         _incremental_gate_scores=[],
-        _lens_probes={},
-        _sae_probes={},
         _profiles={},
         # A memo-less run: the incremental branch's ``observe`` read falls
         # back to the sink's appended row, which is what this test pins.
         _geometry_instrument=SimpleNamespace(
             current_run=SimpleNamespace(observe=lambda _step, _hidden: {}),
         ),
+        instruments=_stub_instruments(),
     )
 
     callback = SteeringComposer(session).build_gating_score_callback()
@@ -1365,17 +1467,17 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
 
 
 @pytest.mark.parametrize(
-    ("expr", "registry_attr", "score_attr", "expected"),
+    ("expr", "family", "score_attr", "expected"),
     [
         (
             "0.3 jlens/g@when:jlens/g>0.4",
-            "_lens_probes",
+            "lens",
             "_score_lens_gate_scalars",
             {"jlens/g": 0.7},
         ),
         (
             "0.3 sae/2@when:sae/2>0.4",
-            "_sae_probes",
+            "sae",
             "_score_sae_gate_scalars",
             {"sae/2": 0.8},
         ),
@@ -1383,7 +1485,7 @@ def test_gating_callback_backfills_exact_keys_hidden_by_top_n() -> None:
 )
 def test_readout_only_gates_skip_monitor_probe_scoring(
     expr: str,
-    registry_attr: str,
+    family: str,
     score_attr: str,
     expected: dict[str, float],
 ) -> None:
@@ -1412,17 +1514,17 @@ def test_readout_only_gates_skip_monitor_probe_scoring(
         _capture_state=CaptureState(),
         _incremental_readings=[],
         _incremental_gate_scores=[],
-        _lens_probes={},
-        _sae_probes={},
         _geometry_instrument=SimpleNamespace(
             current_run=SimpleNamespace(observe=lambda _step, _hidden: {}),
+        ),
+        instruments=_stub_instruments(
+            **{f"{family}_names": (next(iter(expected)),)},
         ),
     )
     setattr(
         session, score_attr,
         lambda _keys, *, step_id=-1: dict(expected),
     )
-    setattr(session, registry_attr, {next(iter(expected)): {}})
     other_score_attr = (
         "_score_sae_gate_scalars"
         if score_attr == "_score_lens_gate_scalars"
@@ -1477,8 +1579,7 @@ def test_mixed_monitor_and_lens_gates_score_only_monitor_gate_keys() -> None:
         _capture_state=CaptureState(),
         _incremental_readings=[],
         _incremental_gate_scores=[],
-        _lens_probes={"jlens/g": {}},
-        _sae_probes={},
+        instruments=_stub_instruments(lens_names=("jlens/g",)),
         _score_lens_gate_scalars=(
             lambda _keys, *, step_id=-1: {"jlens/g": 0.7}
         ),
@@ -1521,9 +1622,6 @@ def test_stateless_zero_token_probe_result_does_not_use_history() -> None:
     session._last_per_token_scores = {"toy": [99.0]}
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {
-        "toy": SimpleNamespace(mean=(42.0,), to_dict=lambda: {})
-    }
 
     _complete_finalizer_session(session)
     result = SaklasSession._finalize_generation(
@@ -1553,16 +1651,13 @@ def test_return_probe_readings_false_skips_probe_finalization() -> None:
     session._gen_state = state
     session._tokenizer = _StopTokenizer()
     session._monitor = Monitor()
-    session._lens_probes = {"jlens/x": {}}
-    session._sae_probes = {"sae/0": {}}
+    session._lens_instrument.probes = {"jlens/x": {}}
+    session._sae_instrument.probes = {"sae/0": {}}
     session._capture = Capture()
     session._capture_state = CaptureState(mode=CaptureMode.FULL)
     session._last_per_token_scores = None
     session._last_result = None
     session.events = SimpleNamespace(emit=lambda _event: None)
-    session.build_readings = lambda: {
-        "toy": SimpleNamespace(mean=(42.0,), to_dict=lambda: {})
-    }
     session._score_lens_probes_aggregate = lambda _ids: (
         (_ for _ in ()).throw(AssertionError("lens finalization disabled"))
     )
@@ -1615,17 +1710,20 @@ def test_lens_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
     session._capture_buffers = {}
     session._compiled_clean_eligible = False
     session._steering_uses_compiled_offsets = False
-    session._live_lens = {"layers": [2, 4]}
-    session._lens_probes = {}
-    session._live_sae = None
-    session._sae_probes = {}
+    session._lens_instrument.live = {"layers": [2, 4]}
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
     _complete_capture_session(session)
     SaklasSession._begin_capture(
         session,
-        need_per_token=False,
-        final_probe_aggregate=False,
+        ReadDemand(
+            need_per_token=False,
+            per_token_full_consumer=False,
+            final_probe_aggregate=False,
+        ),
     )
 
     assert capture.attached == [2, 4]
@@ -1654,16 +1752,19 @@ def test_dormant_lens_probe_without_final_aggregate_does_not_attach_capture() ->
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
-    session._live_lens = None
-    session._lens_probes = {"jlens/g": {"layers": [3]}}
-    session._live_sae = None
-    session._sae_probes = {}
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {"jlens/g": {"layers": [3]}}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
 
     _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
-        need_per_token=False,
-        final_probe_aggregate=False,
+        ReadDemand(
+            need_per_token=False,
+            per_token_full_consumer=False,
+            final_probe_aggregate=False,
+        ),
     )
 
     assert attached is False
@@ -1703,21 +1804,24 @@ def test_lens_gate_without_final_aggregate_attaches_gated_probe_layers() -> None
     session._capture_buffers = {}
     session._compiled_clean_eligible = False
     session._steering_uses_compiled_offsets = False
-    session._live_lens = None
-    session._lens_probes = {
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {
         "jlens/g": {"layers": [3]},
         "jlens/h": {"layers": [6]},
     }
-    session._live_sae = None
-    session._sae_probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
     _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
-        need_per_token=False,
-        final_probe_aggregate=False,
-        lens_gating_probe_keys={"jlens/g"},
+        ReadDemand(
+            need_per_token=False,
+            per_token_full_consumer=False,
+            final_probe_aggregate=False,
+            lens_gating_probe_keys={"jlens/g"},
+        ),
     )
 
     assert attached is True
@@ -1763,17 +1867,20 @@ def test_sae_only_without_final_probe_aggregate_keeps_latest_tail() -> None:
     session._capture_buffers = {}
     session._compiled_clean_eligible = False
     session._steering_uses_compiled_offsets = False
-    session._live_lens = None
-    session._lens_probes = {}
-    session._live_sae = {"layer": 5}
-    session._sae_probes = {}
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = {"layer": 5}
+    session._sae_instrument.probes = {}
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
     _complete_capture_session(session)
     SaklasSession._begin_capture(
         session,
-        need_per_token=False,
-        final_probe_aggregate=False,
+        ReadDemand(
+            need_per_token=False,
+            per_token_full_consumer=False,
+            final_probe_aggregate=False,
+        ),
     )
 
     assert capture.attached == [5]
@@ -1802,17 +1909,20 @@ def test_dormant_sae_probe_without_final_aggregate_does_not_attach_capture() -> 
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
-    session._live_lens = None
-    session._lens_probes = {}
-    session._live_sae = None
-    session._sae_probes = {"sae/0": {"feature_id": 0}}
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {"sae/0": {"feature_id": 0}}
     session._sae_layer = 5
 
     _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
-        need_per_token=False,
-        final_probe_aggregate=False,
+        ReadDemand(
+            need_per_token=False,
+            per_token_full_consumer=False,
+            final_probe_aggregate=False,
+        ),
     )
 
     assert attached is False
@@ -1852,24 +1962,30 @@ def test_sae_gate_without_final_aggregate_attaches_sae_layer() -> None:
     session._capture_buffers = {}
     session._compiled_clean_eligible = False
     session._steering_uses_compiled_offsets = False
-    session._live_lens = None
-    session._lens_probes = {}
-    session._live_sae = None
-    session._sae_probes = {"sae/0": {"feature_id": 0}}
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {"sae/0": {"feature_id": 0}}
     session._sae_layer = 5
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
     _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
-        need_per_token=False,
-        final_probe_aggregate=False,
-        sae_gating_probe_keys={"sae/0"},
+        ReadDemand(
+            need_per_token=False,
+            per_token_full_consumer=False,
+            final_probe_aggregate=False,
+            sae_gating_probe_keys={"sae/0"},
+        ),
     )
 
     assert attached is True
     assert capture.attached == [5]
     assert capture.aggregate_depth == 1
+    # The armed retention is a tail ring, so the recorded mode must say so
+    # rather than sitting at the FULL default.
+    assert session._capture_state.mode is CaptureMode.AGGREGATE_ONLY
 
 
 def test_monitor_probe_without_final_aggregate_and_no_per_token_skips_capture() -> None:
@@ -1891,22 +2007,148 @@ def test_monitor_probe_without_final_aggregate_and_no_per_token_skips_capture() 
     session._layers = [object()] * 8
     session._monitor = Monitor()
     session._capture = capture
-    session._live_lens = None
-    session._lens_probes = {}
-    session._live_sae = None
-    session._sae_probes = {}
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
     session._sae_layer = None
 
     _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
-        need_per_token=False,
-        final_probe_aggregate=False,
+        ReadDemand(
+            need_per_token=False,
+            per_token_full_consumer=False,
+            final_probe_aggregate=False,
+        ),
     )
 
     assert attached is False
     assert capture.attached is None
     assert session._capture_state.final_probe_aggregate is False
+
+
+class _RecordingInstrument:
+    """Records the ``ReadRequest`` each family is prepared with."""
+
+    def __init__(self, family: str) -> None:
+        self.family = family
+        self.requests: list[Any] = []
+
+    def prepare(self, request: Any) -> Any:
+        from saklas.core.instruments.types import InstrumentPrep
+
+        self.requests.append(request)
+        return InstrumentPrep(family=self.family, request=request)
+
+    def plan(self, prep: Any) -> Any:
+        from saklas.core.instruments.types import InstrumentPlan
+
+        return InstrumentPlan(family=self.family, prep_token=prep.token)
+
+    def bind(self, _plan: Any, _prep: Any) -> None:
+        return None
+
+
+def test_begin_capture_takes_per_token_full_consumer_from_the_demand() -> None:
+    """``_begin_capture`` must not re-derive the demand's predicates.
+
+    A gate-only generation has ``need_per_token`` true with no full-roster
+    per-token consumer; re-deriving it here from ``gating_only_probes is
+    None`` gets the opposite answer whenever the resolver's richer rule and
+    that shorthand disagree.
+    """
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
+    session._layers = [object()] * 4
+    session._monitor = SimpleNamespace(probe_names=[])
+    session._capture = SimpleNamespace(clear=lambda: None)
+    session._close_instrument_runs = lambda: None
+    geometry = _RecordingInstrument("geometry")
+    lens = _RecordingInstrument("lens")
+    sae = _RecordingInstrument("sae")
+    # The three instrument properties read a lazily-created __dict__ slot.
+    session.__dict__["_geometry_instrument"] = geometry
+    session.__dict__["_lens_instrument"] = lens
+    session.__dict__["_sae_instrument"] = sae
+
+    attached = SaklasSession._begin_capture(
+        session,
+        ReadDemand(need_per_token=True, per_token_full_consumer=False),
+    )
+
+    assert attached is False
+    for instrument in (geometry, lens, sae):
+        assert [r.per_token_consumers for r in instrument.requests] == [False]
+
+
+def _resolve_demand(*, gated: bool = False, **kwargs: Any) -> ReadDemand:
+    session: Any = _CurrentSessionStub.__new__(_CurrentSessionStub)
+    session._steering_composer = SimpleNamespace(
+        steering_needs_probe_gating=lambda: gated,
+        gated_probe_keys=lambda: {"gate@x"},
+        gated_lens_probe_keys=lambda: set(),
+        gated_sae_probe_keys=lambda: set(),
+        gated_probe_names=lambda: {"gate"},
+    )
+    defaults: dict[str, Any] = dict(
+        want_hidden=False,
+        live_scores_on=True,
+        has_monitor_probes=True,
+        loom_attached=False,
+        wants_live_token_scores=False,
+        persists_layer_scores=False,
+        persists_probe_row=False,
+        persists_subspace_coords=False,
+        live_lens_active=False,
+        live_sae_active=False,
+        final_probe_aggregate=True,
+        capture_prompt=False,
+    )
+    defaults.update(kwargs)
+    return SaklasSession._resolve_read_demand(session, **defaults)
+
+
+def test_resolve_read_demand_routes_a_gate_only_generation_to_the_subset() -> None:
+    demand = _resolve_demand(gated=True)
+
+    assert demand.need_per_token is True
+    assert demand.per_token_full_consumer is False
+    assert demand.gating_only_probes == {"gate"}
+    assert demand.gating_probe_keys == {"gate@x"}
+    # Gating forces per-token scoring but the lean path is for coord-only
+    # consumers, so a gated generation never goes lean.
+    assert demand.lean_per_token is False
+
+
+def test_resolve_read_demand_marks_a_loom_attached_generation_full_and_lean() -> None:
+    demand = _resolve_demand(loom_attached=True)
+
+    assert demand.need_per_token is True
+    assert demand.per_token_full_consumer is True
+    assert demand.gating_only_probes is None
+    assert demand.lean_per_token is True
+
+
+def test_resolve_read_demand_drops_per_token_when_nothing_consumes_it() -> None:
+    demand = _resolve_demand()
+
+    assert demand.need_per_token is False
+    assert demand.per_token_full_consumer is False
+    assert demand.lean_per_token is False
+
+
+def test_resolve_read_demand_leaves_lean_off_for_a_full_reading_consumer() -> None:
+    demand = _resolve_demand(loom_attached=True, wants_live_token_scores=True)
+
+    assert demand.per_token_full_consumer is True
+    assert demand.lean_per_token is False
+
+
+def test_resolve_read_demand_leaves_lean_off_when_hidden_states_are_wanted() -> None:
+    demand = _resolve_demand(loom_attached=True, want_hidden=True)
+
+    assert demand.need_per_token is True
+    assert demand.lean_per_token is False
 
 
 def test_monitor_probe_final_aggregate_still_attaches_capture() -> None:
@@ -1947,18 +2189,21 @@ def test_monitor_probe_final_aggregate_still_attaches_capture() -> None:
     session._capture_buffers = {}
     session._compiled_clean_eligible = False
     session._steering_uses_compiled_offsets = False
-    session._live_lens = None
-    session._lens_probes = {}
-    session._live_sae = None
-    session._sae_probes = {}
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
     session._sae_layer = None
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
     _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
-        need_per_token=False,
-        final_probe_aggregate=True,
+        ReadDemand(
+            need_per_token=False,
+            per_token_full_consumer=False,
+            final_probe_aggregate=True,
+        ),
     )
 
     assert attached is True
@@ -2030,15 +2275,18 @@ def test_gate_only_without_final_probe_aggregate_narrows_capture_layers() -> Non
     session._capture_buffers = {}
     session._compiled_clean_eligible = False
     session._steering_uses_compiled_offsets = False
-    session._live_lens = None
+    session._lens_instrument.live = None
 
     _complete_capture_session(session)
     SaklasSession._begin_capture(
         session,
-        need_per_token=True,
-        gating_only_probes={"gate"},
-        gating_probe_keys={"gate@x"},
-        final_probe_aggregate=False,
+        ReadDemand(
+            need_per_token=True,
+            per_token_full_consumer=False,
+            gating_only_probes={"gate"},
+            gating_probe_keys={"gate@x"},
+            final_probe_aggregate=False,
+        ),
     )
 
     assert monitor.layer_query == {"gate"}
@@ -2114,20 +2362,23 @@ def test_gate_only_capture_reuses_preplanned_gate_scalars() -> None:
     session._capture_buffers = {}
     session._compiled_clean_eligible = False
     session._steering_uses_compiled_offsets = False
-    session._live_lens = None
-    session._lens_probes = {}
-    session._live_sae = None
-    session._sae_probes = {}
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
     session._sae_layer = None
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
     _complete_capture_session(session)
     SaklasSession._begin_capture(
         session,
-        need_per_token=True,
-        gating_only_probes={"gate"},
-        gating_probe_keys={"gate"},
-        final_probe_aggregate=False,
+        ReadDemand(
+            need_per_token=True,
+            per_token_full_consumer=False,
+            gating_only_probes={"gate"},
+            gating_probe_keys={"gate"},
+            final_probe_aggregate=False,
+        ),
     )
 
     assert monitor.plan_calls == [({"gate"}, {"gate"})]
@@ -2181,19 +2432,18 @@ def test_full_incremental_capture_deep_tail_only_for_readout_aggregate_layers() 
     session._capture_buffers = {}
     session._compiled_clean_eligible = False
     session._steering_uses_compiled_offsets = False
-    session._live_lens = None
-    session._lens_probes = {"jlens/g": {"layers": {3}}}
-    session._lens_probe_layers = lambda _names=None: {3}
-    session._live_sae = None
-    session._sae_probes = {"sae/5": {"feature_id": 5}}
+    session._lens_instrument.live = None
+    session._lens_instrument.probes = {"jlens/g": {"layers": {3}}}
+    session._lens_instrument.probe_layers = lambda _names=None: {3}
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {"sae/5": {"feature_id": 5}}
     session._sae_layer = 5
     session._steering = SimpleNamespace(all_fast_path=lambda: True)
 
     _complete_capture_session(session)
     attached = SaklasSession._begin_capture(
         session,
-        need_per_token=True,
-        final_probe_aggregate=True,
+        ReadDemand(need_per_token=True, final_probe_aggregate=True),
     )
 
     assert attached is True
@@ -2218,7 +2468,7 @@ def test_penalty_state_applies_sparse_counts_on_device():
 
 
 def test_no_cache_fallback_does_not_cat_each_step(monkeypatch: pytest.MonkeyPatch) -> None:
-    model: Any = _NoCacheModel()
+    model: Any = _scripted_model([0, 1, 3], model_cls=_NoCacheModel)
     tokenizer: Any = _StopTokenizer()
     state = GenerationState()
 
@@ -2237,3 +2487,141 @@ def test_no_cache_fallback_does_not_cat_each_step(monkeypatch: pytest.MonkeyPatc
 
     assert generated_ids == [0, 1]
     assert state.finish_reason == "stop"
+
+# ---------------------------------------------------------------------------
+# The generation-concurrency guard: ``_gen_lock`` / ``_gen_phase`` /
+# ``_generation_transaction``.  Extraction runs forward passes, so it takes
+# the same exclusive section generation does; the transaction is the shared
+# teardown backstop both sides rely on.
+# ---------------------------------------------------------------------------
+
+
+def _stub_session_with_lock() -> Any:
+    """A ``__new__``-bypass stub carrying the minimum state the extract gate
+    touches."""
+    import threading
+
+    s: Any = SaklasSession.__new__(SaklasSession)
+    s._gen_phase = GenState.IDLE
+    s._gen_lock = threading.Lock()
+    return s
+
+
+def test_extract_acquires_gen_lock_against_concurrent_generation():
+    """If ``_gen_lock`` is already held (generation in flight), extract
+    must raise ``ConcurrentExtractionError`` rather than reading
+    ``_gen_phase`` and racing the generation that's about to flip it."""
+    from saklas.core.session import ConcurrentExtractionError
+
+    s = _stub_session_with_lock()
+    # Simulate "generation just acquired the lock" — phase still IDLE
+    # because the flip happens after acquire on the generation side.
+    assert s._gen_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(ConcurrentExtractionError):
+            s.extract("honest.deceptive")
+    finally:
+        s._gen_lock.release()
+
+
+def test_extract_releases_lock_on_path_through_phase_gate():
+    """When extract bails on the phase gate (RUNNING from a stub), the
+    lock it acquired must be released so subsequent extract attempts
+    can proceed once the phase clears."""
+    import threading
+
+    from saklas.core.session import ConcurrentExtractionError
+
+    s: Any = SaklasSession.__new__(SaklasSession)
+    s._gen_phase = GenState.RUNNING
+    s._gen_lock = threading.Lock()
+    s._extraction = SimpleNamespace(extract=lambda *a, **kw: ("x", None))
+
+    with pytest.raises(ConcurrentExtractionError):
+        s.extract("honest.deceptive")
+
+    # Lock is back to free — caller can try again.
+    assert s._gen_lock.acquire(blocking=False)
+    s._gen_lock.release()
+
+
+def _transaction_stub_session() -> Any:
+    """A stub carrying only what ``_generation_transaction`` touches."""
+    import threading
+
+    s: Any = SaklasSession.__new__(SaklasSession)
+    s._gen_phase = GenState.IDLE
+    s._gen_lock = threading.Lock()
+    s._end_capture_calls = 0
+
+    def _end_capture() -> None:
+        s._end_capture_calls += 1
+
+    s._end_capture = _end_capture
+    s._monitor = SimpleNamespace(set_subspace_coords=lambda _flag: None)
+    s._close_instrument_runs = lambda: None
+    s._capture_state = CaptureState()
+    s._steering = SimpleNamespace(has_compiled_offsets=lambda: False)
+    return s
+
+
+def test_generation_transaction_detaches_capture_when_the_body_never_does():
+    """A BaseException before the body's own teardown (a preamble failure,
+    a KeyboardInterrupt) must still leave no capture hooks attached — the
+    transaction's teardown is the backstop, and it also frees the phase and
+    the lock."""
+    s = _transaction_stub_session()
+
+    with pytest.raises(KeyboardInterrupt):
+        with s._generation_transaction():
+            raise KeyboardInterrupt
+
+    assert s._end_capture_calls == 1
+    assert s._gen_phase is GenState.IDLE
+    assert s._gen_lock.acquire(blocking=False)
+    s._gen_lock.release()
+
+
+def test_generation_transaction_pops_a_scope_the_body_left_open():
+    """The body assigns ``txn.steering_cm`` before entering the scope; if it
+    throws before popping it, the transaction pops it — swallowing a teardown
+    failure so it can't mask the error already propagating."""
+    exits: list[bool] = []
+    s = _transaction_stub_session()
+    s._exit_internal_steering = (
+        lambda _cm, *, swallow: exits.append(swallow)
+    )
+
+    with pytest.raises(RuntimeError):
+        with s._generation_transaction() as txn:
+            txn.steering_cm = object()
+            raise RuntimeError("preamble blew up")
+
+    assert exits == [True]
+
+
+def test_generation_transaction_leaves_a_popped_scope_alone():
+    """The ordinary path pops its own scope before finalizing and clears the
+    slot; the transaction must not pop it a second time."""
+    exits: list[bool] = []
+    s = _transaction_stub_session()
+    s._exit_internal_steering = (
+        lambda _cm, *, swallow: exits.append(swallow)
+    )
+
+    with s._generation_transaction() as txn:
+        txn.steering_cm = object()
+        txn.steering_cm = None
+
+    assert exits == []
+    assert s._gen_phase is GenState.IDLE
+
+
+def test_generation_transaction_rejects_a_reentrant_generation():
+    from saklas.core.session import ConcurrentGenerationError
+
+    s = _transaction_stub_session()
+    with s._generation_transaction():
+        with pytest.raises(ConcurrentGenerationError):
+            with s._generation_transaction():
+                pass  # pragma: no cover - the guard raises on entry

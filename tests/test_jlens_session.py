@@ -31,7 +31,7 @@ from saklas.core.loom import (
     Recipe,
     UnknownNodeError,
 )
-from saklas.core.session import SaklasSession
+from saklas.core.session import ReadDemand, SaklasSession
 from saklas.core.steering_composer import SteeringComposer
 from saklas.io.lens import (
     lens_checkpoint_paths,
@@ -86,31 +86,18 @@ class _StubSession:
     _jlens_depth_tensor = SaklasSession._jlens_depth_tensor
     _readout_long_tensor = SaklasSession._readout_long_tensor
     register_jlens_direction = SaklasSession.register_jlens_direction
-    enable_live_lens = SaklasSession.enable_live_lens
-    disable_live_lens = SaklasSession.disable_live_lens
     _live_lens_readout_step = SaklasSession._live_lens_readout_step
     _jlens_workspace_band = SaklasSession._jlens_workspace_band
     _add_lens_probe = SaklasSession._add_lens_probe
-    _lens_probe_layers = SaklasSession._lens_probe_layers
-    _score_lens_probes = SaklasSession._score_lens_probes
     _score_lens_gate_scalars = SaklasSession._score_lens_gate_scalars
     _effective_return_top_k = SaklasSession._effective_return_top_k
-    _active_jlens_source_label = SaklasSession._active_jlens_source_label
     _select_tensor_rows = staticmethod(SaklasSession._select_tensor_rows)
-    # Lens state lives on the LensInstrument (constructed in __init__);
-    # borrow the session's delegating property objects so the plain
-    # attribute assignments below route into the instrument exactly as the
-    # real session's do.
-    _lens_probes = SaklasSession._lens_probes
-    _live_lens = SaklasSession._live_lens
-    _lens_step_stash = SaklasSession._lens_step_stash
-    _last_lens_step_readings = SaklasSession._last_lens_step_readings
-    _live_lens_active_for_generation = (
-        SaklasSession._live_lens_active_for_generation
-    )
-    _generation_jlens = SaklasSession._generation_jlens
-    _generation_jlens_active = SaklasSession._generation_jlens_active
     _close_instrument_runs = SaklasSession._close_instrument_runs
+    _bind_instrument_runs = SaklasSession._bind_instrument_runs
+    instruments = SaklasSession.instruments
+    lens = SaklasSession.lens
+    sae = SaklasSession.sae
+    geometry = SaklasSession.geometry
 
     def __init__(self, *, n_layers: int = 3) -> None:
         from saklas.core.instruments.geometry import GeometryInstrument
@@ -130,21 +117,12 @@ class _StubSession:
         self._profiles: dict[str, Any] = {}
         self._jlens: Any = None
         self._jlens_identity: Any = None
-        self._generation_jlens = None
-        self._generation_jlens_active = False
-        self._live_lens = None
         self._capture: Any = None
         self._capture_buffers: dict[int, torch.Tensor] = {}
         self._compiled_clean_eligible = False
         self._steering_uses_compiled_offsets = False
         self._steering: Any = None
-        self._lens_probes = {}
-        self._live_lens_active_for_generation = True
-        self._live_sae: Any = None
-        self._sae_probes: dict[str, Any] = {}
         self._probe_hash_cache: dict[str, str] = {}
-        self._lens_step_stash = None
-        self._last_lens_step_readings = None
         self._jlens_readout_module_cache: Any = None
         self._jlens_device_cache: dict[Any, Any] = {}
         self._jlens_depths_cache: dict[Any, list[float]] = {}
@@ -208,7 +186,7 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import saklas.io.lens as lens_io
-    from saklas.io import packs
+    from saklas.io import integrity
 
     real_save = lens_io._save_fp32_square_safetensors_atomic
     writes = 0
@@ -222,14 +200,14 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
     monkeypatch.setattr(
         lens_io, "_save_fp32_square_safetensors_atomic", _counting_save,
     )
-    real_hash = packs.hash_file
+    real_hash = integrity.hash_file
 
     def _counting_hash(path: Path) -> str:
         nonlocal hashes
         hashes += 1
         return real_hash(path)
 
-    monkeypatch.setattr(packs, "hash_file", _counting_hash)
+    monkeypatch.setattr(integrity, "hash_file", _counting_hash)
     fitted = _StubSession().fit_jlens(
         _PROMPTS[:2], force=True, checkpoint_every=2,
     )
@@ -246,24 +224,24 @@ def test_terminal_checkpoint_is_promoted_without_second_tensor_write(
 def test_refit_rebuilds_live_lens_probes_and_evicts_directions() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS, source_layers=[0])
-    s.enable_live_lens(layers=[0])
-    live = s._live_lens
+    s._lens_instrument.enable_live(layers=[0])
+    live = s._lens_instrument.live
     assert live is not None
     old_stack = live["J_stack"]
     s._profiles["jlens/a"] = {0: torch.ones(4)}
-    s._lens_probes["jlens/a"] = {
+    s._lens_instrument.probes["jlens/a"] = {
         "word": "a", "token_id": 1, "layers": [0],
     }
 
     fitted = s.fit_jlens(_PROMPTS, source_layers=[1], force=True)
 
     assert fitted.source_layers == [1]
-    live = s._live_lens
+    live = s._lens_instrument.live
     assert live is not None
     assert live["layers"] == [1]
     assert live["uses_all_layers"] is True
     assert live["J_stack"] is not old_stack
-    assert s._lens_probes["jlens/a"]["layers"] == [1]
+    assert s._lens_instrument.probes["jlens/a"]["layers"] == [1]
     assert "jlens/a" not in s._profiles
 
 
@@ -499,7 +477,7 @@ def test_jlens_property_refreshes_and_evicts_after_external_lifecycle() -> None:
     session_a = _StubSession()
     resident_a = session_a.fit_jlens(_PROMPTS, force=True)
     session_a._profiles["jlens/example"] = {0: torch.ones(6)}
-    session_a._lens_probes["jlens/example"] = {
+    session_a._lens_instrument.probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0, 1],
     }
     disk_b = _StubSession().fit_jlens(corpus_b, force=True)
@@ -521,15 +499,15 @@ def test_jlens_property_refreshes_and_evicts_after_external_lifecycle() -> None:
     assert not session_a.has_compatible_jlens()
     assert session_a.jlens is None
     assert "jlens/example" not in session_a._profiles
-    assert session_a._lens_probes["jlens/example"]["layers"] == []
-    assert session_a._live_lens is None
+    assert session_a._lens_instrument.probes["jlens/example"]["layers"] == []
+    assert session_a._lens_instrument.live is None
 
 
 def test_generation_boundary_refreshes_external_lens_once() -> None:
     """A generation snapshots the current pointer before fixing capture layers."""
     session_a = _StubSession()
     resident_a = session_a.fit_jlens(_PROMPTS, force=True)
-    session_a._lens_probes["jlens/example"] = {
+    session_a._lens_instrument.probes["jlens/example"] = {
         "word": "example", "token_id": 1,
         "layers": list(resident_a.source_layers),
     }
@@ -558,16 +536,16 @@ def test_generation_boundary_refreshes_external_lens_once() -> None:
         probe_names=[],
         enable_curved_warm=lambda _enabled: None,
     )
-    session_a._live_sae = None
-    session_a._sae_probes = {}
+    session_a._sae_instrument.live = None
+    session_a._sae_instrument.probes = {}
 
     SaklasSession._begin_capture(
-        cast(Any, session_a), final_probe_aggregate=True,
+        cast(Any, session_a), ReadDemand(final_probe_aggregate=True),
     )
 
-    snap = session_a._generation_jlens
+    snap = session_a._lens_instrument.generation_lens
     assert snap is not None and snap is session_a._jlens
-    assert session_a._generation_jlens_active is True
+    assert session_a._lens_instrument.generation_lens_active is True
     assert any(
         not torch.equal(resident_a.jacobians[layer], snap.jacobians[layer])
         for layer in snap.source_layers
@@ -581,12 +559,12 @@ def test_generation_boundary_refreshes_external_lens_once() -> None:
     # and the validated missing state is pinned (no per-token retry loop).
     assert remove_lens(_MODEL_ID)
     SaklasSession._begin_capture(
-        cast(Any, session_a), final_probe_aggregate=True,
+        cast(Any, session_a), ReadDemand(final_probe_aggregate=True),
     )
-    assert session_a._generation_jlens_active is True
-    assert session_a._generation_jlens is None
+    assert session_a._lens_instrument.generation_lens_active is True
+    assert session_a._lens_instrument.generation_lens is None
     assert session_a._jlens is None
-    assert session_a._lens_probes["jlens/example"]["layers"] == []
+    assert session_a._lens_instrument.probes["jlens/example"]["layers"] == []
 
 
 def test_external_lens_replacement_plans_and_freezes_refreshed_layers() -> None:
@@ -596,7 +574,7 @@ def test_external_lens_replacement_plans_and_freezes_refreshed_layers() -> None:
     with stale layers KeyErrors in the transport stack."""
     session_a = _StubSession()
     session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
-    session_a._lens_probes["jlens/example"] = {
+    session_a._lens_instrument.probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0],
     }
 
@@ -628,18 +606,18 @@ def test_external_lens_replacement_plans_and_freezes_refreshed_layers() -> None:
         probe_names=[],
         enable_curved_warm=lambda _enabled: None,
     )
-    session_a._live_sae = None
-    session_a._sae_probes = {}
+    session_a._sae_instrument.live = None
+    session_a._sae_instrument.probes = {}
 
     ok = SaklasSession._begin_capture(
-        cast(Any, session_a), final_probe_aggregate=True,
+        cast(Any, session_a), ReadDemand(final_probe_aggregate=True),
     )
 
     assert ok is True
     # The adoption rewrote the live registry BEFORE planning/freezing:
     # the capture plan, the frozen binding, and the pinned lens all agree
     # on the replacement's layer set.
-    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+    assert session_a._lens_instrument.probes["jlens/example"]["layers"] == [1]
     assert attached_layers == [1]
     run = session_a._lens_instrument.current_run
     assert run.pinned is True
@@ -663,7 +641,7 @@ def test_prepare_is_the_refresh_site_and_supplies_the_pin() -> None:
 
     session_a = _StubSession()
     session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
-    session_a._lens_probes["jlens/example"] = {
+    session_a._lens_instrument.probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0],
     }
     assert session_a.jlens is not None  # resident before the swap
@@ -680,7 +658,7 @@ def test_prepare_is_the_refresh_site_and_supplies_the_pin() -> None:
     assert prep.lens is not None and list(prep.lens.source_layers) == [1]
     # The adoption rewrote the live registry inside prepare, and the prep's
     # spec snapshot carries the layers derived from the prepared identity.
-    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+    assert session_a._lens_instrument.probes["jlens/example"]["layers"] == [1]
     assert list(prep.specs["jlens/example"]["layers"]) == [1]
     run = inst.bind(inst.plan(prep), prep)
     assert run.pinned is True and run.lens is prep.lens
@@ -700,7 +678,7 @@ def test_interleaved_adoption_cannot_desync_plan_from_pin() -> None:
 
     session_a = _StubSession()
     session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
-    session_a._lens_probes["jlens/example"] = {
+    session_a._lens_instrument.probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0],
     }
     inst = session_a._lens_instrument
@@ -714,7 +692,7 @@ def test_interleaved_adoption_cannot_desync_plan_from_pin() -> None:
     ]
     _StubSession().fit_jlens(corpus_b, source_layers=[1], force=True)
     assert session_a.has_compatible_jlens() is True  # adopts B
-    assert session_a._lens_probes["jlens/example"]["layers"] == [1]
+    assert session_a._lens_instrument.probes["jlens/example"]["layers"] == [1]
 
     plan = inst.plan(prep)
     run = inst.bind(plan, prep)
@@ -785,7 +763,7 @@ def test_lens_state_lock_serializes_detach_and_reads() -> None:
     ``prepare`` snapshot or tear a concurrent registry iteration."""
     session = _StubSession()
     session._probe_hash_cache = {}
-    session._lens_probes["jlens/example"] = {
+    session._lens_instrument.probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0],
     }
     inst = session._lens_instrument
@@ -832,7 +810,7 @@ def test_idle_measurement_state_is_coherent() -> None:
 
     session_a = _StubSession()
     session_a.fit_jlens(_PROMPTS, source_layers=[0], force=True)
-    session_a._lens_probes["jlens/example"] = {
+    session_a._lens_instrument.probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0],
     }
     corpus_b = [
@@ -893,10 +871,10 @@ def test_prepare_pin_demand_formula() -> None:
     assert prep.pinned is False and prep.lens is None
 
     # Probes + final aggregate (also the batch shape) -> pinned.
-    session._lens_probes["jlens/example"] = {
+    session._lens_instrument.probes["jlens/example"] = {
         "word": "example", "token_id": 1, "layers": [0],
     }
-    prep = inst.prepare(ReadRequest(final_aggregate=True, batch=True))
+    prep = inst.prepare(ReadRequest(final_aggregate=True))
     assert prep.pinned is True and prep.lens is not None
 
     # Final readings disabled: dormant probes do not pin — a lens gate does.
@@ -909,7 +887,7 @@ def test_prepare_pin_demand_formula() -> None:
     assert prep.pinned is True
 
     # A live-readout consumer pins with an empty probe registry.
-    del session._lens_probes["jlens/example"]
+    del session._lens_instrument.probes["jlens/example"]
     inst.live = {"layers": [0]}
     prep = inst.prepare(ReadRequest(final_aggregate=False, live=True))
     assert prep.pinned is True and prep.request.live is True
@@ -1071,7 +1049,7 @@ def test_generation_lens_snapshot_avoids_per_token_disk_validation(
     session = _StubSession()
     lens = session.fit_jlens(_PROMPTS, force=True)
     layers = list(lens.source_layers)
-    session._lens_probes["jlens/a"] = {
+    session._lens_instrument.probes["jlens/a"] = {
         "word": "a", "token_id": 1, "layers": layers,
     }
     session._lens_instrument.generation_lens = lens
@@ -1091,8 +1069,8 @@ def test_generation_lens_snapshot_avoids_per_token_disk_validation(
     vocab = int(session._model.lm_head.weight.shape[0])
     probabilities = torch.softmax(torch.randn(len(layers), vocab), dim=-1)
     for _ in range(3):
-        readings = session._score_lens_probes(
-            {}, probabilities=probabilities, layers=layers,
+        readings = session._lens_instrument.score_probes_from_rows(
+            layers=layers, probabilities=probabilities,
         )
         assert "jlens/a" in readings
 
@@ -1787,7 +1765,7 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
 ) -> None:
     import saklas.core.jlens as jlens_mod
     import saklas.io.lens as lens_io
-    from saklas.io import packs
+    from saklas.io import integrity
 
     full = _StubSession().fit_jlens(
         _PROMPTS, force=True, source_layers=[0, 1],
@@ -1817,14 +1795,14 @@ def test_fit_jlens_missing_layer_topup_resumes_checkpoint(
     real_save = lens_io.save_lens
     reused: list[set[int]] = []
     hashes = 0
-    real_hash = packs.hash_file
+    real_hash = integrity.hash_file
 
     def _count_hash(path: Path) -> str:
         nonlocal hashes
         hashes += 1
         return real_hash(path)
 
-    monkeypatch.setattr(packs, "hash_file", _count_hash)
+    monkeypatch.setattr(integrity, "hash_file", _count_hash)
 
     def _capture_reuse(*args: Any, **kwargs: Any) -> Any:
         reused.append(set(kwargs.get("reuse_layers") or ()))
@@ -1875,8 +1853,10 @@ def test_jlens_readout_shape_and_default_position() -> None:
     for rows in out.values():
         assert len(rows) == 1  # default: final position only
         assert len(rows[0]) == 3
-        token, logprob = rows[0][0]
-        assert isinstance(token, str) and logprob <= 0.0
+        # One unit end to end: the per-layer readout PROBABILITY p_l, the
+        # same quantity the aggregate's ``strength`` averages.
+        token, p_l = rows[0][0]
+        assert isinstance(token, str) and 0.0 <= p_l <= 1.0
 
 
 def test_jlens_readout_aggregate_rides_same_logits() -> None:
@@ -1988,26 +1968,26 @@ class _FakeCapture:
 def test_enable_live_lens_defaults_and_disable() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    layers = s.enable_live_lens()
+    layers = s._lens_instrument.enable_live()
     assert layers == [0, 1]
-    assert s._live_lens is not None
-    assert s._live_lens["layers"] == layers
-    assert "J" not in s._live_lens
-    s.disable_live_lens()
-    assert s._live_lens is None
+    assert s._lens_instrument.live is not None
+    assert s._lens_instrument.live["layers"] == layers
+    assert "J" not in s._lens_instrument.live
+    s._lens_instrument.disable_live()
+    assert s._lens_instrument.live is None
 
 
 def test_enable_live_lens_rejects_unfitted_layer() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
     with pytest.raises(ValueError, match="not in the fitted lens"):
-        s.enable_live_lens(layers=[7])
+        s._lens_instrument.enable_live(layers=[7])
 
 
 def test_enable_live_lens_requires_lens() -> None:
     s = _StubSession()
     with pytest.raises(LensNotFittedError):
-        s.enable_live_lens()
+        s._lens_instrument.enable_live()
 
 
 def test_enable_live_lens_registers_no_forward_hooks() -> None:
@@ -2019,7 +1999,7 @@ def test_enable_live_lens_registers_no_forward_hooks() -> None:
         (len(block._forward_hooks), len(block._forward_pre_hooks))
         for block in s._layers
     ]
-    s.enable_live_lens()
+    s._lens_instrument.enable_live()
     after = [
         (len(block._forward_hooks), len(block._forward_pre_hooks))
         for block in s._layers
@@ -2030,7 +2010,7 @@ def test_enable_live_lens_registers_no_forward_hooks() -> None:
 def test_live_lens_readout_step_reads_latest_slices() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[0, 1])
+    s._lens_instrument.enable_live(layers=[0, 1])
     # The per-step reader should use the pre-stacked transport cache, not the
     # per-layer dict.  Replacing the dict entries would have blown up the old
     # per-token ``state["J"][layer].to(...)`` path.
@@ -2038,8 +2018,8 @@ def test_live_lens_readout_step_reads_latest_slices() -> None:
         def to(self, *_args: Any, **_kwargs: Any) -> Any:
             raise AssertionError("live lens readout should use J_stack")
 
-    assert s._live_lens is not None
-    s._live_lens["J"] = {0: Bomb(), 1: Bomb()}
+    assert s._lens_instrument.live is not None
+    s._lens_instrument.live["J"] = {0: Bomb(), 1: Bomb()}
     gen = torch.Generator().manual_seed(11)
     s._capture = _FakeCapture({
         0: torch.randn(6, generator=gen),
@@ -2092,7 +2072,7 @@ def test_live_lens_readout_step_avoids_float64_for_mps_compatibility(
     monkeypatch.setattr(torch.Tensor, "to", reject_float64)
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[0, 1])
+    s._lens_instrument.enable_live(layers=[0, 1])
     s._capture = _FakeCapture({0: torch.randn(6), 1: torch.randn(6)})
 
     step = s._live_lens_readout_step(top_k=3)
@@ -2122,11 +2102,15 @@ def test_jlens_row_selector_avoids_copy_for_identity_and_contiguous_rows() -> No
 def test_live_lens_step_normalizes_once_across_all_consumers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.jlens as jlens_module
+    # The instrument binds the readout primitives at module scope (the per-step
+    # surfaces must not re-import), so the counters patch its namespace.
+    import saklas.core.instruments.lens as lens_instrument_module
+
+    jlens_module = lens_instrument_module
 
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[1])
+    s._lens_instrument.enable_live(layers=[1])
     s._add_lens_probe("jlens/g", as_name=None)
     s._capture = _FakeCapture({1: torch.randn(6)})
     calls = 0
@@ -2161,16 +2145,16 @@ def test_live_lens_step_normalizes_once_across_all_consumers(
     assert s._live_lens_readout_step(top_k=3, step_id=4) is not None
     assert calls == 1
     assert stat_calls == 1
-    assert s._last_lens_step_readings is not None
-    assert s._last_lens_step_readings["jlens/g"].coords[0] == pytest.approx(
-        scalars["jlens/g"],
+    assert s._lens_instrument.last_step_readings is not None
+    assert s._lens_instrument.last_step_readings["jlens/g"].value == (
+        pytest.approx(scalars["jlens/g"])
     )
 
 
 def test_live_lens_readout_reuses_depth_and_token_selector_tensors() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[0, 1])
+    s._lens_instrument.enable_live(layers=[0, 1])
     s._add_lens_probe("jlens/g", as_name=None)
     s._capture = _FakeCapture({
         0: torch.randn(6, generator=torch.Generator().manual_seed(20)),
@@ -2204,9 +2188,9 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
 
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[1])
+    s._lens_instrument.enable_live(layers=[1])
     s._capture = _FakeCapture({1: cast(Any, BombHidden())})
-    assert s._live_lens is not None
+    assert s._lens_instrument.live is not None
     vocab = int(s._model.lm_head.weight.shape[0])
     logits = torch.randn(1, vocab, generator=torch.Generator().manual_seed(7))
     import saklas.core.jlens as jlens_module
@@ -2226,7 +2210,7 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
     # rides the stash (the old ``fresh`` flag was consume-once); a
     # different step never matches, so staleness is structural.
     assert s._live_lens_readout_step(top_k=3, step_id=5) is not None
-    stash = s._lens_step_stash
+    stash = s._lens_instrument.step_stash
     assert stash is not None
     assert stash["step"] == 5
 
@@ -2234,23 +2218,23 @@ def test_live_lens_exact_stash_reuse_skips_hidden_cast() -> None:
 def test_live_lens_reuses_gated_subset_rows_for_wider_display() -> None:
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[0, 1])
+    s._lens_instrument.enable_live(layers=[0, 1])
     s._add_lens_probe("jlens/g", as_name=None)
-    s._lens_probes["jlens/g"]["layers"] = [1]
+    s._lens_instrument.probes["jlens/g"]["layers"] = [1]
     s._capture = _FakeCapture({
         0: torch.randn(6, generator=torch.Generator().manual_seed(0)),
         1: torch.randn(6, generator=torch.Generator().manual_seed(1)),
     })
 
     assert s._score_lens_gate_scalars({"jlens/g"}, step_id=3)
-    assert s._lens_step_stash is not None
-    assert s._lens_step_stash["layers"] == (1,)
+    assert s._lens_instrument.step_stash is not None
+    assert s._lens_instrument.step_stash["layers"] == (1,)
     # Poison the live transport row for the gated layer after the gate callback.
     # The display still covers both live layers, but layer 1 should ride the
     # cached gate logits/probabilities instead of recomputing from this row.
-    assert s._live_lens is not None
-    row = s._live_lens["layer_rows"][1]
-    s._live_lens["J_stack"][row].fill_(float("nan"))
+    assert s._lens_instrument.live is not None
+    row = s._lens_instrument.live["layer_rows"][1]
+    s._lens_instrument.live["J_stack"][row].fill_(float("nan"))
 
     step = s._live_lens_readout_step(top_k=3, step_id=3)
 
@@ -2271,7 +2255,7 @@ def test_lens_full_roster_gate_read_primes_bound_observe_memo() -> None:
 
     s = _StubSession()
     s.fit_jlens(_PROMPTS)
-    s.enable_live_lens(layers=[0, 1])
+    s._lens_instrument.enable_live(layers=[0, 1])
     s._add_lens_probe("jlens/g", as_name=None)
     s._capture = _FakeCapture({
         0: torch.randn(6, generator=torch.Generator().manual_seed(30)),
@@ -2438,8 +2422,11 @@ def test_jlens_token_readout_shape_and_position() -> None:
     assert set(out["readout"]) == {0, 1}  # fitted sources of the 3-layer toy
     for rows in out["readout"].values():
         assert len(rows) == 4
-        tok, lp, tid = rows[0]
-        assert isinstance(tok, str) and lp <= 0.0 and isinstance(tid, int)
+        # Per-layer rows and the aggregate share one unit: the readout
+        # probability, so ``strength`` is literally the mean of these.
+        tok, p_l, tid = rows[0]
+        assert isinstance(tok, str) and 0.0 <= p_l <= 1.0
+        assert isinstance(tid, int)
     # The aggregate block rides the same logits across both fitted layers.
     assert len(out["aggregate"]) == 4
     for tok, strength, com, spread in out["aggregate"]:
@@ -2541,3 +2528,47 @@ def test_jlens_token_readout_errors() -> None:
     s.tree.finalize_assistant(bare, text="no raw record", finish_reason="stop")
     with pytest.raises(InvalidNodeOperationError, match="no raw token record"):
         s.jlens_token_readout(bare, 0)
+
+
+def test_score_probes_entries_are_disjoint_and_guarded() -> None:
+    """Two entries, no placeholder argument: ``score_probes`` takes capture
+    slices, ``score_probes_from_rows`` takes a precomputed matrix.  The
+    logits-xor-probabilities rule is a real guard, so ``python -O`` behaves
+    identically to a normal run."""
+    s = _StubSession()
+    s.fit_jlens(_PROMPTS)
+    s._add_lens_probe("jlens/g", as_name=None)
+    inst = s._lens_instrument
+    layers = [int(layer) for layer in s.jlens.source_layers]
+    d_model = next(iter(s.jlens.jacobians.values())).shape[0]
+    hidden = {
+        layer: torch.randn(
+            d_model, generator=torch.Generator().manual_seed(layer),
+        )
+        for layer in layers
+    }
+
+    from saklas.core.jlens import readout_probabilities
+
+    logits = s._jlens_logits_rows(
+        s.jlens, [(layer, hidden[layer]) for layer in layers],
+    )
+    from_slices = inst.score_probes(hidden)
+    from_logits = inst.score_probes_from_rows(layers=layers, logits=logits)
+    from_probs = inst.score_probes_from_rows(
+        layers=layers, probabilities=readout_probabilities(logits),
+    )
+    assert from_slices["jlens/g"].value == pytest.approx(
+        from_logits["jlens/g"].value,
+    )
+    assert from_logits["jlens/g"].value == pytest.approx(
+        from_probs["jlens/g"].value,
+    )
+
+    with pytest.raises(ValueError, match="logits OR probabilities"):
+        inst.score_probes_from_rows(layers=layers)
+    with pytest.raises(ValueError, match="logits OR probabilities"):
+        inst.score_probes_from_rows(
+            layers=layers, logits=logits,
+            probabilities=readout_probabilities(logits),
+        )

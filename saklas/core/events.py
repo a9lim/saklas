@@ -1,9 +1,12 @@
 """Synchronous pub/sub event bus for SaklasSession.
 
 Event types are frozen dataclasses emitted at specific lifecycle points
-(extraction, steering enter/exit, probe scoring, generation start/finish).
-Subscribers are called on the emit thread — server routes that need to hop
-to an event loop should do so inside their callback via
+(extraction, steering enter/exit, probe scoring, generation start/finish,
+loom-tree mutation).  This module owns every payload type the bus carries,
+so a subscriber written against the documented ``Callable[[Event], None]``
+signature sees the complete set — :data:`Event` is the closed union, not a
+partial one.  Subscribers are called on the emit thread — server routes that
+need to hop to an event loop should do so inside their callback via
 ``loop.call_soon_threadsafe``.
 
 Synchronous by design: keeps the hot-path emit cost to a for-loop over
@@ -62,6 +65,47 @@ class GenerationFinished:
     result: Any  # GenerationResult
 
 
+@dataclass(frozen=True)
+class LoomMutated:
+    """Tree-mutation event, emitted by :class:`saklas.core.loom.LoomTree`.
+
+    ``op`` is one of ``"edit"``, ``"branch"``, ``"navigate"``, ``"delete"``,
+    ``"star"``, ``"note"``, ``"reset"``, ``"add_user"``, ``"begin_assistant"``,
+    ``"finalize_assistant"``, ``"capture_authored"``,
+    ``"restore"`` (whole-tree replacement),
+    ``"cast"`` (roster change — no node ids;
+    clients refetch the roster).
+
+    Delta payload fields carry ids only at the engine level — the
+    server WS layer (:mod:`saklas.server.ws_stream`'s
+    ``WS /saklas/v1/sessions/{id}/stream``) enriches each id into full
+    ``LoomNodeJSON`` payloads via :func:`saklas.server.tree_models.node_json`
+    before forwarding to clients. The wire-level ``tree_mutated`` event
+    therefore carries full nodes while in-process subscribers that already
+    hold the tree look the ids up themselves; the network hop is the only
+    place that needs the inlined node data.
+
+    Field semantics:
+
+    - ``added``: newly-created node ids
+    - ``removed``: dropped node ids (delete_subtree)
+    - ``updated``: ids of nodes whose fields changed in place (edit/star/note)
+    - ``active_node_id``: present when the active node moves
+    - ``rev``: monotonic tree revision after the mutation
+
+    Lives here rather than beside ``LoomTree`` because it rides the same
+    :class:`EventBus` as its siblings: one module owns the bus's payload
+    types.  ``saklas.core.loom`` re-exports it for the historical import path.
+    """
+
+    op: str
+    rev: int
+    added: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    updated: tuple[str, ...] = ()
+    active_node_id: str | None = None
+
+
 Event = Union[
     ManifoldExtracted,
     SteeringApplied,
@@ -69,6 +113,7 @@ Event = Union[
     ProbeScored,
     GenerationStarted,
     GenerationFinished,
+    LoomMutated,
 ]
 
 

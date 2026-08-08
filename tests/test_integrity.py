@@ -1,46 +1,42 @@
-"""Surviving pack-format primitives (4.0 collapse).
+"""``io.integrity`` — the shared artifact-name grammar + sha256 helpers.
 
-The pack *format/distribution* surface (``PackMetadata`` / ``Sidecar`` /
-``ConceptFolder`` / ``enumerate_variants`` / ``materialize_bundled`` /
-``is_stale`` / ``version_mismatch`` / ``bundled_concept_names``) was retired
-when concepts collapsed into manifolds.  What remains in ``io.packs`` is the
-cross-cutting integrity infra — ``hash_file`` / ``verify_integrity`` — plus the
-``save_profile`` / ``load_profile`` tensor-dict cache helpers (owned by
-``core.profile`` and still aliased from ``core.capture``).  This module covers
-exactly those.
+Covers ``hash_file`` / ``verify_integrity``: the digest primitives behind the
+manifold integrity manifest, the neutral/alignment caches, and the lens shard
+sidecars, including the stat-identity fingerprint cache and the
+path-traversal barrier on manifest-supplied relative paths.
 """
 from pathlib import Path
 
-from saklas.io import packs
+from saklas.io import integrity
 
 
 def test_hash_file_sha256(tmp_path: Path):
     p = tmp_path / "x.txt"
     p.write_bytes(b"hello")
     # echo -n hello | sha256sum
-    assert packs.hash_file(p) == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    assert integrity.hash_file(p) == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
 
 
 def test_verify_integrity_clean(tmp_path: Path):
     (tmp_path / "statements.json").write_bytes(b"data")
-    files = {"statements.json": packs.hash_file(tmp_path / "statements.json")}
-    ok, bad = packs.verify_integrity(tmp_path, files)
+    files = {"statements.json": integrity.hash_file(tmp_path / "statements.json")}
+    ok, bad = integrity.verify_integrity(tmp_path, files)
     assert ok is True
     assert bad == []
 
 
 def test_verify_integrity_tampered(tmp_path: Path):
     (tmp_path / "statements.json").write_bytes(b"original")
-    files = {"statements.json": packs.hash_file(tmp_path / "statements.json")}
+    files = {"statements.json": integrity.hash_file(tmp_path / "statements.json")}
     (tmp_path / "statements.json").write_bytes(b"tampered")
-    ok, bad = packs.verify_integrity(tmp_path, files)
+    ok, bad = integrity.verify_integrity(tmp_path, files)
     assert ok is False
     assert bad == ["statements.json"]
 
 
 def test_verify_integrity_missing_file(tmp_path: Path):
     files = {"statements.json": "deadbeef"}
-    ok, bad = packs.verify_integrity(tmp_path, files)
+    ok, bad = integrity.verify_integrity(tmp_path, files)
     assert ok is False
     assert bad == ["statements.json"]
 
@@ -52,12 +48,12 @@ def test_verify_integrity_detects_same_size_rewrite_with_restored_mtime(
 
     target = tmp_path / "x.bin"
     target.write_bytes(b"AAAA")
-    expected = packs.hash_file(target)
-    assert packs.verify_integrity(tmp_path, {"x.bin": expected}) == (True, [])
+    expected = integrity.hash_file(target)
+    assert integrity.verify_integrity(tmp_path, {"x.bin": expected}) == (True, [])
     original = target.stat()
     target.write_bytes(b"BBBB")
     os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
-    ok, bad = packs.verify_integrity(tmp_path, {"x.bin": expected})
+    ok, bad = integrity.verify_integrity(tmp_path, {"x.bin": expected})
     assert not ok
     assert bad == ["x.bin"]
 
@@ -65,7 +61,7 @@ def test_verify_integrity_detects_same_size_rewrite_with_restored_mtime(
 def test_verify_integrity_rejects_path_traversal(tmp_path: Path):
     # A manifest entry resolving outside the folder fails rather than reading
     # off-tree (ensure_within is the path-traversal barrier).
-    ok, bad = packs.verify_integrity(tmp_path, {"../escape": "deadbeef"})
+    ok, bad = integrity.verify_integrity(tmp_path, {"../escape": "deadbeef"})
     assert ok is False
     assert bad == ["../escape"]
 
@@ -79,12 +75,12 @@ def test_save_load_profile_roundtrip_slim_sidecar(tmp_path: Path):
     }
     path = tmp_path / "google__gemma-2-2b-it.safetensors"
     save_profile(profile, str(path), {
-        "method": "contrastive_pca",
+        "method": "profile",
         "statements_sha256": "a" * 64,
     })
     loaded, meta = load_profile(str(path))
     assert sorted(loaded.keys()) == [0, 14]
-    assert meta["method"] == "contrastive_pca"
+    assert meta["method"] == "profile"
     assert meta["statements_sha256"] == "a" * 64
     assert "saklas_version" in meta
     # Scores no longer live on disk — shares are baked into tensor magnitudes.

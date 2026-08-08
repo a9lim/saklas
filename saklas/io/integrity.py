@@ -1,15 +1,13 @@
 """Shared artifact primitives: name validation, integrity, and profile versioning.
 
-The 4.0 collapse retired the pack *format/distribution* surface
-(``PackMetadata`` / ``ConceptFolder`` / ``Sidecar`` / ``enumerate_variants`` /
-``materialize_bundled`` / HF pack distribution) — concepts are manifolds now
-(:mod:`saklas.io.manifolds`).  What remains here is the cross-cutting
-infrastructure several layers still share:
+The cross-cutting infrastructure every artifact family in :mod:`saklas.io`
+shares:
 
-- ``NAME_REGEX`` — the artifact-name grammar (manifolds reuse it);
+- ``NAME_REGEX`` — the artifact-name grammar.  Manifolds, selectors, templates,
+  and the local lens/SAE source names all validate against this one pattern;
 - ``hash_file`` / ``verify_integrity`` — the sha256
-  integrity helpers (the neutral/layer-means/alignment caches + the manifold
-  format's own integrity manifest build on these);
+  integrity helpers (the neutral/alignment caches, the lens shard sidecars, and
+  the manifold format's own integrity manifest build on these);
 - ``PROFILE_FORMAT_VERSION`` — the current profile sidecar version written by
   :func:`saklas.core.profile.save_profile`.
 """
@@ -24,8 +22,15 @@ from saklas.io.paths import ensure_within
 
 NAME_REGEX = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 
-# Current profile-cache sidecar format version.
-PROFILE_FORMAT_VERSION = 5
+# Current profile sidecar format version.  v6 is the honest stamp for the
+# five-key schema (``format_version`` / ``saklas_version`` / ``method`` /
+# ``tensor_sha256`` / ``provenance``): the field set was cut from fourteen keys
+# without a bump, so a v5 file already fails the exact-set validator and the
+# invalidation was paid in practice before it was declared.  No cache rides this
+# version — the neutral-activation and alignment caches carry their own sidecar
+# schemas and format versions in :mod:`saklas.io.alignment` — so the only reader
+# affected is a user-saved ``Profile``, which gets a clear regenerate error.
+PROFILE_FORMAT_VERSION = 6
 
 
 def hash_file(path: Path) -> str:

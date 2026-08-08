@@ -8,7 +8,7 @@
   import type {
     LensAggregateTokenJSON,
     LensTokenReadoutJSON,
-    ProbeReadingJSON,
+    ScalarReadingJSON,
   } from "../../lib/types";
   import Bar from "../../lib/charts/Bar.svelte";
   import LayerStrip from "../../panels/rack/LayerStrip.svelte";
@@ -34,7 +34,7 @@
     jlensFitted: boolean;
     hasReplayContext: boolean;
     /** Live-captured pinned-probe readings from the token's envelope. */
-    pinned: Record<string, ProbeReadingJSON> | null;
+    pinned: Record<string, ScalarReadingJSON> | null;
     /** For the unfitted-state CLI hint. */
     modelId: string | null;
   } = $props();

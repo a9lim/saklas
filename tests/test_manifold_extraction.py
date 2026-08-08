@@ -1120,10 +1120,10 @@ def test_concurrent_deferred_row_topups_merge_latest_pointer(
 def test_row_cache_uses_layer_digests_without_container_rehash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from saklas.io import packs
+    from saklas.io import integrity
     from saklas.io.paths import model_dir
 
-    real_hash_file = packs.hash_file
+    real_hash_file = integrity.hash_file
     hashed: list[Path] = []
 
     def _tracked_hash(path: Path) -> str:
@@ -1133,7 +1133,7 @@ def test_row_cache_uses_layer_digests_without_container_rehash(
             raise AssertionError("row shard was redundantly whole-file hashed")
         return real_hash_file(resolved)
 
-    monkeypatch.setattr(packs, "hash_file", _tracked_hash)
+    monkeypatch.setattr(integrity, "hash_file", _tracked_hash)
     folder = _author_manifold(tmp_path)
     pipe = ManifoldExtractionPipeline(_Handle(), EventBus())
     pipe.fit(folder)
@@ -2040,10 +2040,10 @@ def test_fit_sae_no_coverage_raises_before_pooling(
 
     def _explode(*_a: Any, **_k: Any) -> None:
         raise AssertionError(
-            "compute_node_centroid called before SAE-coverage check"
+            "compute_manifold_node_stats called before SAE-coverage check"
         )
 
-    monkeypatch.setattr(M, "compute_node_centroid", _explode)
+    monkeypatch.setattr(M, "compute_manifold_node_stats", _explode)
 
     with pytest.raises(SaeCoverageError, match="covers no layers"):
         ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder, sae=sae)
@@ -2269,15 +2269,20 @@ def test_discover_cache_hit_skips_forward_passes(
 ) -> None:
     """A second fit with unchanged inputs short-circuits to the cached tensor."""
     folder = _discover_folder(tmp_path, fit_mode="pca")
-    ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    # One handle for both fits: the cache identity folds in the loaded-model
+    # fingerprint, and a fresh ``_Handle`` re-initializes its stub module, so
+    # two handles are legitimately different models.
+    handle = _Handle()
+    ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
 
-    # Patch the centroid pooler to crash if called — cache hit must skip it.
+    # Patch the fit-wide capture pass to crash if called — a cache hit must
+    # never reach a model forward.
     def _explode(*_a: Any, **_k: Any) -> None:
-        raise AssertionError("compute_node_centroid called on cache hit")
+        raise AssertionError("compute_manifold_node_stats called on cache hit")
     from saklas.core import manifold as M
-    monkeypatch.setattr(M, "compute_node_centroid", _explode)
+    monkeypatch.setattr(M, "compute_manifold_node_stats", _explode)
 
-    manifold = ManifoldExtractionPipeline(_Handle(), EventBus()).fit(folder)
+    manifold = ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
     assert manifold.name == "personas"
 
 
@@ -2510,10 +2515,10 @@ def test_affine_push_coord_form_interpolates_between_nodes(tmp_path: Path) -> No
 
 def test_affine_push_coord_form_arity_mismatch_raises(tmp_path: Path) -> None:
     """A coord-form position with the wrong number of coordinates raises
-    ``ManifoldArityError`` (a ``SteeringExprError``), matching the curved path.
+    ``ManifoldArityError`` (a ``SteeringCompositionError``), matching the
+    curved path.
     """
-    from saklas.core.errors import ManifoldArityError
-    from saklas.core.steering_expr import SteeringExprError
+    from saklas.core.errors import ManifoldArityError, SteeringCompositionError
     from saklas.core.session import _affine_manifold_push
 
     folder = _discover_folder(
@@ -2524,7 +2529,8 @@ def test_affine_push_coord_form_arity_mismatch_raises(tmp_path: Path) -> None:
     n = manifold.domain.intrinsic_dim
     with pytest.raises(ManifoldArityError) as exc:
         _affine_manifold_push(manifold, tuple([0.0] * (n + 1)))
-    assert isinstance(exc.value, SteeringExprError)
+    assert isinstance(exc.value, SteeringCompositionError)
+    assert exc.value.user_message()[0] == 422
 
 
 def test_discover_pca_flat_fit_skips_rbf_floor(tmp_path: Path) -> None:
@@ -2712,6 +2718,7 @@ def test_adopt_fitted_manifold_rebinds_loaded_probe_profile_and_prefix(
     }
     session._analytics_cpu_cache = {"local/mood": object()}
     session._prefix_cache = object()
+    session._dls = True
 
     session._adopt_fitted_manifold(tmp_path / "local" / "mood", new)
 
@@ -2765,6 +2772,7 @@ def test_failed_fit_override_evicts_stale_manifold_consumers(
     }
     session._analytics_cpu_cache = {"local/mood": object()}
     session._prefix_cache = object()
+    session._dls = True
 
     @contextmanager
     def _exclusive(*_args: Any, **_kwargs: Any):
@@ -2819,6 +2827,7 @@ def test_override_validation_failure_preserves_unchanged_consumers(
     session._probe_hash_cache = {}
     session._analytics_cpu_cache = {}
     session._prefix_cache = object()
+    session._dls = True
     folder = tmp_path / "local" / "mood"
     folder.mkdir(parents=True)
     (folder / "manifold.json").write_text('{"fit_mode":"authored"}')
@@ -2844,3 +2853,117 @@ def test_override_validation_failure_preserves_unchanged_consumers(
 
     assert session._manifolds == {"local/mood": old}
     assert set(session._profiles) == {"local/mood"}
+
+
+def test_dls_false_keeps_every_axis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``dls=False`` skips straddle-pruning; every fitted axis survives.
+
+    The flag was threaded from ``--no-dls`` all the way to ``self._dls`` and
+    then read by nobody: ``compute_dls_axes`` ran unconditionally with the real
+    per-model baseline, so DLS could not actually be disabled. The pipeline now
+    gates it by passing ``None`` for the baseline — ``compute_dls_axes``'s own
+    documented "disabled" contract.
+    """
+    from saklas.core import capture as C
+
+    seen: list[object] = []
+    real = C.compute_dls_axes
+
+    def _spy(
+        node_centroids: Any, bases: Any, layer_means: Any,
+    ) -> Any:
+        seen.append(layer_means)
+        return real(node_centroids, bases, layer_means)
+
+    monkeypatch.setattr(C, "compute_dls_axes", _spy)
+
+    handle = _Handle()
+    folder = _discover_folder(
+        tmp_path / "off", fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    manifold = ManifoldExtractionPipeline(handle, EventBus()).fit(
+        folder, dls=False,
+    )
+
+    # The gate reached the DLS core as the disabled baseline...
+    assert seen == [None]
+    # ...and nothing was pruned: every requested layer is fitted, each at the
+    # full derived layout rank.
+    layout_dim = int(manifold.node_coords.shape[1])
+    assert sorted(manifold.layers) == list(range(_N_LAYERS))
+    for sub in manifold.layers.values():
+        assert sub.rank == layout_dim
+
+
+def test_dls_true_passes_the_real_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default still runs straddle-pruning against the per-model means."""
+    from saklas.core import capture as C
+
+    seen: list[object] = []
+    real = C.compute_dls_axes
+
+    def _spy(
+        node_centroids: Any, bases: Any, layer_means: Any,
+    ) -> Any:
+        seen.append(layer_means)
+        return real(node_centroids, bases, layer_means)
+
+    monkeypatch.setattr(C, "compute_dls_axes", _spy)
+
+    handle = _Handle()
+    folder = _discover_folder(
+        tmp_path / "on", fit_mode="pca",
+        hyperparams={"max_dim": 4, "var_threshold": 0.70},
+    )
+    ManifoldExtractionPipeline(handle, EventBus()).fit(folder)
+    assert len(seen) == 1
+    assert seen[0] is handle.layer_means
+
+
+@pytest.mark.parametrize("dls", [True, False])
+def test_session_fit_forwards_its_dls_setting(
+    dls: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``SaklasSession.fit`` hands ``self._dls`` to the pipeline.
+
+    The session-side half of the ``--no-dls`` chain: the CLI sets ``dls=`` at
+    construction, and this is the hop that has to carry it into the fit that
+    consumes it.
+    """
+    import saklas.core.extraction as extraction_mod
+    from saklas.core.session import SaklasSession
+
+    fit_kwargs: dict[str, Any] = {}
+    fitted = object()
+
+    class _FakePipeline:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def fit(self, *_args: Any, **kwargs: Any) -> Any:
+            fit_kwargs.update(kwargs)
+            return fitted
+
+    monkeypatch.setattr(
+        extraction_mod, "ManifoldExtractionPipeline", _FakePipeline,
+    )
+
+    @contextmanager
+    def _exclusive(*_args: Any, **_kwargs: Any) -> Any:
+        yield
+
+    session: Any = object.__new__(SaklasSession)
+    session._dls = dls
+    session.events = EventBus()
+    session._model_exclusive = _exclusive
+    session._steering_composer = cast(Any, type("_C", (), {"_stack": []})())
+    session._adopt_fitted_manifold = lambda *_a, **_kw: None
+    session._invalidate_analytics_cache = lambda: None
+
+    assert session.fit("folder") is fitted
+    assert fit_kwargs["dls"] is dls

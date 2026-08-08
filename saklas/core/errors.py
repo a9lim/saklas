@@ -1,4 +1,4 @@
-"""Shared base class for all saklas-raised exceptions.
+"""Error taxonomy for the engine layer.
 
 Every custom exception defined in saklas re-parents to :class:`SaklasError`
 so callers (and the HTTP server) can catch the whole family with a single
@@ -12,6 +12,19 @@ exceptions consistently. The
 default ``(500, str(self))`` matches today's behaviour for any subclass
 that doesn't override; subclasses lift the status (and optionally rewrite
 the message) by overriding the method.
+
+**Ownership rule.**  This module is the single home for the *core engine's*
+error classes — the ones raised across module boundaries by
+``manifold``/``mahalanobis``/``profile``/``steering_expr``/``hooks``/``sae``.
+Defining them here rather than beside each raiser is what keeps the taxonomy
+visible in one place and keeps a low-level module (``mahalanobis``,
+``profile``) from becoming an import dependency of everything that catches
+its errors.  Modules that historically owned a class re-export it under its
+old name so ``from saklas.core.mahalanobis import WhitenerError`` and friends
+keep working; those aliases are import-compatibility only, not a second home.
+The io layer keeps its own errors beside the format code they describe
+(``ManifoldFormatError``, ``SelectorError``, ``TemplateNotFoundError``, ...) —
+they never cross into core.
 """
 
 
@@ -37,6 +50,44 @@ def is_out_of_memory_error(exc: BaseException) -> bool:
         needle in message
         for needle in ("out of memory", "can't allocate memory", "cannot allocate memory")
     )
+
+
+class WhitenerError(ValueError, SaklasError):
+    """Raised when whitener construction or lookup fails.
+
+    Also the all-or-nothing metric gate: every activation-space surface
+    (fit, projection, monitor read, cross-model rebake, ``manifold compare``)
+    requires a :class:`~saklas.core.mahalanobis.LayerWhitener` covering every
+    scored layer and raises this otherwise — there is no Euclidean fallback.
+    Re-exported from ``core.mahalanobis``.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
+
+class ProfileError(ValueError, SaklasError):
+    """Raised on invalid Profile operations (missing layer, empty, etc.).
+
+    Re-exported from ``core.profile``.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (400, str(self) or self.__class__.__name__)
+
+
+class UnknownManifoldLabelError(KeyError, SaklasError):
+    """Raised when a manifold position payload names an unknown node label.
+
+    Produced by :meth:`~saklas.core.manifold.Manifold.resolve_position` (and
+    the nearest-node helpers, which short-circuit on labels) when the label is
+    not in ``Manifold.node_labels``.  Surfaces a 404-shaped error at the HTTP
+    layer through the shared :class:`SaklasError` MRO; CLI handlers print the
+    message and recover.  Re-exported from ``core.manifold``.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (404, str(self))
 
 
 class SaeBackendImportError(ImportError, SaklasError):
@@ -134,29 +185,44 @@ class SteeringExprError(ValueError, SaklasError):
         return (400, str(self) or self.__class__.__name__)
 
 
-class ManifoldArityError(SteeringExprError):
+class SteeringCompositionError(ValueError, SaklasError):
+    """Base for failures that happen *after* an expression parses cleanly.
+
+    The expression was syntactically valid and every atom resolved; what
+    failed is composing the resolved terms against the loaded artifacts —
+    a coordinate count that doesn't match the manifold's domain, or two
+    curved manifolds whose spans collide at a shared layer.  Raised by
+    ``SteeringManager.add_manifold`` / ``apply_to_model`` and the session's
+    affine push, never by the parser.
+
+    Status is ``422``: syntactically valid, semantically unsatisfiable.
+    That is the distinction from :class:`SteeringExprError`'s ``400`` — a
+    parse failure is malformed input, a composition failure is a
+    well-formed request the loaded geometry cannot honor.
+    """
+
+    def user_message(self) -> tuple[int, str]:
+        return (422, str(self) or self.__class__.__name__)
+
+
+class ManifoldArityError(SteeringCompositionError):
     """Raised when a ``%`` manifold position has the wrong number of
     coordinates for the manifold's domain.
 
     The grammar collects the position payload but cannot validate arity —
     it does not know the domain.  ``SteeringManager.add_manifold`` checks
     the coordinate count against the loaded domain's intrinsic dimension
-    and raises this when they disagree.  The manifold-surface analogue of
-    the vector surface's dedicated selector errors
-    (``AmbiguousSelectorError`` / ``AmbiguousVariantError``); subclasses
-    ``SteeringExprError`` so existing ``except SteeringExprError`` sites
-    still catch it.
+    and raises this when they disagree.
     """
 
 
-class OverlappingManifoldError(SteeringExprError):
+class OverlappingManifoldError(SteeringCompositionError):
     """Raised when curved manifold terms overlap at a shared layer.
 
     Multiple curved terms may share a layer when their fitted spans are
     near-orthogonal; the affine merged subspace is orthogonalized against
     those spans.  This error identifies the unsupported case where two curved
-    spans exceed the overlap tolerance.  It subclasses ``SteeringExprError``
-    so existing expression-error handlers still catch it.
+    spans exceed the overlap tolerance.
     """
 
 

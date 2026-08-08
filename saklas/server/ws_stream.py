@@ -31,17 +31,13 @@ from saklas.core.steering import Steering
 from saklas.server.app import acquire_session_lock, ws_auth_ok
 from saklas.server.native_common import SINGLE_SESSION_ID
 from saklas.server.request_helpers import merge_steering, parse_request_steering
-from saklas.server.streaming import (
-    probe_measurements_aggregate,
-    probe_reading_aggregate,
-)
 from saklas.server.tree_models import cast_json, node_json
 from saklas.server.ws_events import build_token_event
 from saklas.server.ws_models import (
     WSGenerateMessage,
     WSSubmitMessage,
     build_input,
-    build_sampling,
+    build_sampling_config,
     result_to_json,
 )
 
@@ -91,6 +87,83 @@ class _TokenDone:
 _TokenQueueItem = _TokenFrame | _TokenDone
 
 
+def _error_frame(
+    message: str,
+    *,
+    code: str = "ValueError",
+    status: int = 400,
+    node_id: str | None = None,
+    sibling_index: int = 0,
+) -> JSONObject:
+    """Build the one ``{type: "error", …}`` frame shape this stream emits.
+
+    Every error frame carries the same five keys, so a client never has to
+    branch on which of them happens to be present.  ``node_id`` is filled only
+    once a generation has produced its assistant node.
+    """
+    return {
+        "type": "error",
+        "message": message,
+        "code": code,
+        "status": status,
+        "node_id": node_id,
+        "sibling_index": sibling_index,
+    }
+
+
+def _validation_message(exc: ValidationError) -> str:
+    """Render a pydantic rejection as one line, the native tree's convention.
+
+    Each error reads ``"<field path>: <message>"``, the shape
+    ``app._on_validation_error`` gives native REST bodies; a model-level rule
+    has no path, so its message stands alone (``"a generate message cannot be
+    both a fork and a prefill"``) — ``PydanticCustomError`` in ``ws_models``
+    is what keeps that verbatim rather than ``"Value error, …"``.
+
+    Every error is reported, not just the first: ``input`` is a union, so its
+    real failure (a bad key inside a message object) is the *second* branch
+    error and a first-only render would name the wrong problem.
+    """
+    parts: list[str] = []
+    for error in exc.errors():
+        message = str(error.get("msg", "invalid request"))
+        loc = ".".join(str(part) for part in error.get("loc", ()))
+        parts.append(f"{loc}: {message}" if loc else message)
+    return "; ".join(parts) or str(exc)
+
+
+class _WSRequestError(Exception):
+    """A request-shape problem to report as an error frame, not a close.
+
+    Raised by the pre-dispatch validators so the field-consistency rules read
+    as straight-line checks instead of a ``send_json``/``return`` pair each.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "ValueError",
+        status: int = 400,
+        node_id: str | None = None,
+        sibling_index: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.frame = _error_frame(
+            message, code=code, status=status,
+            node_id=node_id, sibling_index=sibling_index,
+        )
+
+
+@dataclass(frozen=True)
+class _AuthoredTurn:
+    """The turn a ``submit`` commits before its generation runs."""
+
+    text: str
+    role: Literal["user", "assistant"]
+    thinking: str | None
+
+
 def register_ws_stream(app: FastAPI) -> None:
     """Mount the bidirectional WebSocket token+probe co-stream."""
     session = app.state.session
@@ -133,7 +206,9 @@ def register_ws_stream(app: FastAPI) -> None:
                             )
                             await incoming.put(message)
                         except ValidationError as exc:
-                            await incoming.put(_InvalidInbound(str(exc)))
+                            await incoming.put(
+                                _InvalidInbound(_validation_message(exc))
+                            )
                     elif raw.get("type") == "stop":
                         await incoming.put(_Stop())
                     else:
@@ -190,7 +265,7 @@ def register_ws_stream(app: FastAPI) -> None:
             # well as explicit configuration.  Inline the small effective
             # roster on every mutation so adds, deletes, and restores reconcile
             # identity without a refetch or provenance inference client-side.
-            mutated_payload["cast"] = cast_json(session)
+            mutated_payload["cast"] = cast(JSONValue, cast_json(session))
             _queue_tree_event(mutated_payload)
         loom_unsub = session.events.subscribe(_on_loom_event)
 
@@ -288,22 +363,18 @@ def register_ws_stream(app: FastAPI) -> None:
                     # Idle-state stop: nothing in flight.
                     continue
                 else:
-                    await _send_json({
-                        "type": "error",
-                        "message": msg.message,
-                        "code": "ValidationError",
-                    })
+                    await _send_json(_error_frame(
+                        msg.message, code="ValidationError", status=400,
+                    ))
         except WebSocketDisconnect:
             # Ensure any stray generation is signaled.
             _stop_session_safely()
             return
         except Exception as e:
             try:
-                await _send_json({
-                    "type": "error",
-                    "message": str(e),
-                    "code": type(e).__name__,
-                })
+                await _send_json(_error_frame(
+                    str(e), code=type(e).__name__, status=500,
+                ))
             finally:
                 with suppress(Exception):
                     await websocket.close(code=1011)
@@ -320,10 +391,219 @@ def register_ws_stream(app: FastAPI) -> None:
             await _cancel_and_wait(reader_task)
 
 
+def _normalize_submit(
+    submit: WSSubmitMessage,
+) -> tuple[WSGenerateMessage, _AuthoredTurn | None, bool]:
+    """Lower a ``submit`` frame onto the specialist ``generate`` schema.
+
+    ``submit`` is the ONE authored-turn contract on this wire: an explicit
+    authored role plus an optional generated role.  Append-only submissions
+    take the no-decode commit path; append+generate keeps the authored turn
+    for one atomic commit inside the generation worker and generates from
+    ``input=None`` once that turn has landed.
+
+    Returns ``(generate_message, authored_turn, commit_only)``.  When
+    ``commit_only`` the authored turn is the whole request and the returned
+    generate message carries only the commit's context (parent, sampling
+    labels, raw); otherwise the authored turn — if any — is committed inside
+    the generation worker.  Raises :class:`_WSRequestError` on any
+    field-consistency violation.
+    """
+    if submit.text is None:
+        if submit.authored_role is not None:
+            raise _WSRequestError("authored_role requires non-empty text")
+        if submit.authored_thinking is not None:
+            raise _WSRequestError("authored_thinking requires non-empty text")
+        authored: _AuthoredTurn | None = None
+    else:
+        if submit.text == "":
+            raise _WSRequestError("submit text must be non-empty when present")
+        if submit.authored_role is None:
+            raise _WSRequestError("text requires authored_role")
+        authored = _AuthoredTurn(
+            text=submit.text,
+            role=submit.authored_role,
+            thinking=submit.authored_thinking,
+        )
+    if submit.generated_role is None and authored is None:
+        raise _WSRequestError("submit requires text or generated_role")
+
+    if submit.generated_role is None:
+        assert authored is not None  # guarded by the check above
+        return (
+            WSGenerateMessage(
+                type="generate",
+                parent_node_id=submit.parent_node_id,
+                sampling=submit.sampling,
+                raw=submit.raw,
+            ),
+            authored,
+            True,
+        )
+    return (
+        WSGenerateMessage(
+            type="generate",
+            input=None,
+            steering=submit.steering,
+            sampling=submit.sampling,
+            thinking=submit.thinking,
+            stateless=False,
+            raw=submit.raw,
+            parent_node_id=submit.parent_node_id,
+            n=submit.n,
+            recipe_override=submit.recipe_override,
+            generate_seat=submit.generated_role,
+        ),
+        authored,
+        False,
+    )
+
+
+async def _ws_handle_commit(
+    session: SaklasSession,
+    msg: WSGenerateMessage,
+    authored: _AuthoredTurn,
+    send_json: Callable[[JSONObject], Awaitable[None]],
+) -> None:
+    """Land one authored turn with no decode.
+
+    Short-circuits the n-way fan-out and the streaming worker entirely: one
+    tree mutation, one ``started`` (``node_id`` null — the node id is only
+    known after the append), one ``done`` carrying the new node.  No token
+    frames.  Seating is free: ``session.append_turn`` is the role-neutral
+    primitive, so an assistant-authored opening turn needs no parent.
+    """
+    parent_node_id = msg.parent_node_id
+    generation_id = uuid.uuid4().hex[:12]
+    await send_json({
+        "type": "started",
+        "generation_id": generation_id,
+        "node_id": None,
+        "sibling_index": 0,
+        "sibling_count": 1,
+    })
+    # Per-message role labels ride the commit's sampling block too
+    # (roleplay scaffold).  Raw / flat commits carry no chat-template
+    # role, so labels are suppressed there.
+    commit_label = None
+    if msg.sampling is not None:
+        commit_label = (
+            msg.sampling.user_role
+            if authored.role == "user"
+            else msg.sampling.assistant_role
+        ) or None
+    async with acquire_session_lock(session) as acquired:
+        if not acquired:
+            await send_json(_error_frame(
+                "session locked — try again when the current generation finishes",
+                code="SessionLocked", status=503,
+            ))
+            return
+        try:
+            new_id = await asyncio.to_thread(
+                session.append_turn,
+                parent_node_id,
+                authored.text,
+                role=authored.role,
+                raw=msg.raw,
+                role_label=None if msg.raw else commit_label,
+                thinking=None if msg.raw else (authored.thinking or None),
+            )
+        except SaklasError as e:
+            status, message = e.user_message()
+            await send_json(_error_frame(
+                message, code=type(e).__name__, status=status,
+            ))
+            return
+    await send_json({
+        "type": "done",
+        "result": {
+            "role": authored.role,
+            "text": authored.text,
+            "node_id": new_id,
+            "finish_reason": "stop",
+            "mean_logprob": None,
+            "mean_surprise": None,
+        },
+        "node_id": new_id,
+        "sibling_index": 0,
+        "sibling_count": 1,
+    })
+
+
 async def _ws_handle_generate(
     session: SaklasSession,
     msg: WSGenerateMessage | WSSubmitMessage,
     default_steering: "Steering | None",
+    incoming: asyncio.Queue[_Inbound],
+    deferred_incoming: "deque[_Inbound]",
+    send_json: Callable[[JSONObject], Awaitable[None]],
+    wait_for_tree_finalization: Callable[[str], Awaitable[None]],
+) -> None:
+    """Validate one inbound turn and dispatch it to its mode handler.
+
+    ``generate``'s own field-consistency rules already ran in the schema
+    (``WSGenerateMessage`` model validators, rejected by the reader), so the
+    only checks left here are ``submit``'s cross-field rules, which have no
+    schema home: they decide *which* generate frame to lower onto
+    (:func:`_normalize_submit`).  Then the steering expression is composed
+    over the server default and the turn goes to exactly one of two handlers:
+    :func:`_ws_handle_commit` (no decode) or :func:`_ws_stream_generation`
+    (the token fan-out).  Every rejection here is an error frame on a
+    connection that stays open — a 400-grade user mistake must not close the
+    socket.
+    """
+    authored: _AuthoredTurn | None = None
+    commit_only = False
+    if isinstance(msg, WSSubmitMessage):
+        try:
+            msg, authored, commit_only = _normalize_submit(msg)
+        except _WSRequestError as e:
+            await send_json(e.frame)
+            return
+
+    if commit_only:
+        assert authored is not None  # set together by ``_normalize_submit``
+        await _ws_handle_commit(session, msg, authored, send_json)
+        return
+
+    sampling = build_sampling_config(msg.sampling)
+    try:
+        req_steering, explicit_clear = parse_request_steering(msg.steering)
+        thinking_override: bool | None = None
+        if req_steering is not None and req_steering.thinking is not None:
+            thinking_override = req_steering.thinking
+        steering = merge_steering(
+            req_steering, default_steering, explicit_clear, thinking_override,
+        )
+    except SaklasError as e:
+        # ``parse_request_steering`` -> ``parse_expr`` -> ``resolve_bare_atom`` can
+        # raise ``SteeringExprError`` / ``AmbiguousSelectorError`` /
+        # ``AmbiguousVariantError`` on malformed or colliding input.
+        # FastAPI's ``@app.exception_handler(SaklasError)`` doesn't apply
+        # to WebSocket routes, so without this guard the exception falls
+        # through to the outer reader loop's ``except Exception`` which
+        # closes the socket with code 1011. A 400-grade user mistake
+        # shouldn't kill the connection — send the error frame and let
+        # the client try again on the same WS.
+        status, message = e.user_message()
+        await send_json(_error_frame(
+            message, code=type(e).__name__, status=status,
+        ))
+        return
+
+    await _ws_stream_generation(
+        session, msg, steering, sampling, authored,
+        incoming, deferred_incoming, send_json, wait_for_tree_finalization,
+    )
+
+
+async def _ws_stream_generation(
+    session: SaklasSession,
+    msg: WSGenerateMessage,
+    steering: "Steering | None",
+    sampling: SamplingConfig | None,
+    authored: _AuthoredTurn | None,
     incoming: asyncio.Queue[_Inbound],
     deferred_incoming: "deque[_Inbound]",
     send_json: Callable[[JSONObject], Awaitable[None]],
@@ -352,343 +632,20 @@ async def _ws_handle_generate(
     between turns so we never have two ``receive_json()`` calls in
     flight.
 
-    **Loom (v2.3)**: ``parent_node_id`` attaches the assistant node
-    under a specific tree node; ``n>1`` fans out N siblings serially
-    (per decision 7 in the plan — N-way gen is serial in v1).  Each
-    sibling produces its own ``started`` / token-stream / ``done``
+    **Loom**: ``parent_node_id`` attaches the assistant node
+    under a specific tree node; ``n>1`` fans out N siblings serially.
+    Each sibling produces its own ``started`` / token-stream / ``done``
     triplet, all tagged with the assistant node id.  ``tree_mutated``
     events ride the connection-level subscription
     in ``session_stream``; this handler only emits the per-sibling
-    ``started`` / ``token`` / ``done`` frames.
+    ``started`` / ``token`` / ``done`` frames.  ``authored`` (from a
+    ``submit`` that also generates) is committed once inside the worker,
+    under the same session lock as the whole fan.
     """
     loop = asyncio.get_running_loop()
-
-    # ``submit`` is the native composer contract: an explicit authored role
-    # plus an optional generated role.  Normalize its generation half to the
-    # legacy adapter shape while retaining the authored turn for one atomic
-    # commit inside the generation worker (the async session lock below covers
-    # the whole commit + N-way fan).  ``generate`` remains accepted for protocol
-    # compatibility and the specialist fork/prefill tools.
-    submit = msg if isinstance(msg, WSSubmitMessage) else None
-    submit_text: str | None = None
-    submit_authored_role: Literal["user", "assistant"] | None = None
-    submit_authored_thinking: str | None = None
-    native_commit_role: Literal["user", "assistant"] | None = None
-    if submit is not None:
-        if submit.text is None:
-            if submit.authored_role is not None:
-                await send_json({
-                    "type": "error",
-                    "message": "authored_role requires non-empty text",
-                    "code": "ValueError",
-                    "status": 400,
-                })
-                return
-            if submit.authored_thinking is not None:
-                await send_json({
-                    "type": "error",
-                    "message": "authored_thinking requires non-empty text",
-                    "code": "ValueError",
-                    "status": 400,
-                })
-                return
-        else:
-            if submit.text == "":
-                await send_json({
-                    "type": "error",
-                    "message": "submit text must be non-empty when present",
-                    "code": "ValueError",
-                    "status": 400,
-                })
-                return
-            if submit.authored_role is None:
-                await send_json({
-                    "type": "error",
-                    "message": "text requires authored_role",
-                    "code": "ValueError",
-                    "status": 400,
-                })
-                return
-            submit_text = submit.text
-            submit_authored_role = submit.authored_role
-            submit_authored_thinking = submit.authored_thinking
-        if submit.generated_role is None and submit_text is None:
-            await send_json({
-                "type": "error",
-                "message": "submit requires text or generated_role",
-                "code": "ValueError",
-                "status": 400,
-            })
-            return
-
-        # Append-only submissions can use the established no-decode path.
-        # Append+generate keeps the authored fields above and generates from
-        # ``input=None`` after the worker lands the turn.
-        if submit.generated_role is None:
-            assert submit_authored_role is not None
-            native_commit_role = submit_authored_role
-            msg = WSGenerateMessage(
-                type="generate",
-                commit_role=submit_authored_role,
-                commit_text=submit_text,
-                commit_thinking=submit_authored_thinking,
-                parent_node_id=submit.parent_node_id,
-                sampling=submit.sampling,
-                raw=submit.raw,
-            )
-            submit_text = None
-            submit_authored_role = None
-            submit_authored_thinking = None
-        else:
-            msg = WSGenerateMessage(
-                type="generate",
-                input=None,
-                steering=submit.steering,
-                sampling=submit.sampling,
-                thinking=submit.thinking,
-                stateless=False,
-                raw=submit.raw,
-                parent_node_id=submit.parent_node_id,
-                n=submit.n,
-                recipe_override=submit.recipe_override,
-                generate_seat=submit.generated_role,
-            )
-
-    # Both submit branches above normalize to the specialist generation
-    # schema; direct generate frames already have that type.  Keep the
-    # invariant explicit for readers and static analysis across the long
-    # handler below.
-    assert isinstance(msg, WSGenerateMessage)
-    sampling = build_sampling(msg.sampling)
-    try:
-        req_steering, explicit_clear = parse_request_steering(msg.steering)
-        thinking_override: bool | None = None
-        if req_steering is not None and req_steering.thinking is not None:
-            thinking_override = req_steering.thinking
-        steering = merge_steering(
-            req_steering, default_steering, explicit_clear, thinking_override,
-        )
-    except SaklasError as e:
-        # ``parse_request_steering`` -> ``parse_expr`` -> ``resolve_bare_atom`` can
-        # raise ``SteeringExprError`` / ``AmbiguousSelectorError`` /
-        # ``AmbiguousVariantError`` on malformed or colliding input.
-        # FastAPI's ``@app.exception_handler(SaklasError)`` doesn't apply
-        # to WebSocket routes, so without this guard the exception falls
-        # through to the outer reader loop's ``except Exception`` which
-        # closes the socket with code 1011. A 400-grade user mistake
-        # shouldn't kill the connection — send the error frame and let
-        # the client try again on the same WS.
-        status, message = e.user_message()
-        await send_json({
-            "type": "error",
-            "message": message,
-            "code": type(e).__name__,
-            "status": status,
-        })
-        return
-
     n = msg.n
-    if n < 1:
-        await send_json({
-            "type": "error",
-            "message": f"n must be >= 1, got {n}",
-            "code": "ValueError",
-            "status": 400,
-        })
-        return
-
     parent_node_id = msg.parent_node_id
     submitted_parent_holder: list[str] = []
-
-    # Logit fork: when ``fork_node_id`` is set the worker calls
-    # ``session.fork_from_token`` instead of ``session.generate``.  All
-    # three fork fields must be present together.
-    is_fork = msg.fork_node_id is not None
-    if is_fork and (msg.fork_raw_index is None or msg.fork_alt_token_id is None):
-        await send_json({
-            "type": "error",
-            "message": (
-                "fork requires fork_node_id, fork_raw_index, and "
-                "fork_alt_token_id together"
-            ),
-            "code": "ValueError",
-            "status": 400,
-        })
-        return
-
-    # Answer-prefill: when ``prefill_node_id`` is set the worker calls
-    # ``session.prefill_assistant`` instead of ``session.generate``.  It
-    # needs ``prefill_text`` alongside it, and can't co-exist with a fork.
-    is_prefill = msg.prefill_node_id is not None
-    if is_prefill and (msg.prefill_text is None or msg.prefill_text == ""):
-        await send_json({
-            "type": "error",
-            "message": "prefill requires prefill_node_id and prefill_text together",
-            "code": "ValueError",
-            "status": 400,
-        })
-        return
-    if is_prefill and is_fork:
-        await send_json({
-            "type": "error",
-            "message": "a generate message cannot be both a fork and a prefill",
-            "code": "ValueError",
-            "status": 400,
-        })
-        return
-
-    # Commit (Ctrl+Enter on either surface): land a turn under
-    # ``parent_node_id`` without running a decode.  Short-circuits the
-    # n-way fan-out / streaming worker entirely — one mutation, one
-    # ``done`` event, no token frames.  Mutually exclusive with prefill
-    # and fork (rejected above by symmetry).
-    is_commit = msg.commit_role is not None
-    if is_commit:
-        if msg.commit_text is None or msg.commit_text == "":
-            await send_json({
-                "type": "error",
-                "message": "commit requires commit_role and commit_text together",
-                "code": "ValueError",
-                "status": 400,
-            })
-            return
-        if msg.commit_role not in ("user", "assistant"):
-            await send_json({
-                "type": "error",
-                "message": (
-                    f"commit_role must be 'user' or 'assistant', "
-                    f"got {msg.commit_role!r}"
-                ),
-                "code": "ValueError",
-                "status": 400,
-            })
-            return
-        if is_fork or is_prefill:
-            await send_json({
-                "type": "error",
-                "message": (
-                    "a generate message cannot mix commit with fork or prefill"
-                ),
-                "code": "ValueError",
-                "status": 400,
-            })
-            return
-        if (
-            native_commit_role is None
-            and msg.commit_role == "assistant"
-            and parent_node_id is None
-        ):
-            await send_json({
-                "type": "error",
-                "message": (
-                    "commit_role='assistant' requires parent_node_id "
-                    "(the user node the authored turn hangs off)"
-                ),
-                "code": "ValueError",
-                "status": 400,
-            })
-            return
-
-        generation_id = uuid.uuid4().hex[:12]
-        commit_text = str(msg.commit_text)
-        await send_json({
-            "type": "started",
-            "generation_id": generation_id,
-            "node_id": None,
-            "sibling_index": 0,
-            "sibling_count": 1,
-        })
-        # Per-message role labels ride the commit's sampling block too
-        # (roleplay scaffold).  Raw / flat commits carry no chat-template
-        # role, so labels are suppressed there.
-        commit_user_role = (
-            msg.sampling.user_role if msg.sampling is not None else None
-        ) or None
-        commit_asst_role = (
-            msg.sampling.assistant_role if msg.sampling is not None else None
-        ) or None
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                await send_json({
-                    "type": "error",
-                    "message": "session locked — try again when the current generation finishes",
-                    "code": "SessionLocked",
-                    "status": 503,
-                    "node_id": None,
-                    "sibling_index": 0,
-                })
-                return
-            try:
-                commit_thinking = (
-                    None if msg.raw else (msg.commit_thinking or None)
-                )
-                if native_commit_role is not None:
-                    commit_label = (
-                        commit_user_role
-                        if native_commit_role == "user"
-                        else commit_asst_role
-                    )
-                    new_id = await asyncio.to_thread(
-                        session.append_turn,
-                        parent_node_id,
-                        commit_text,
-                        role=native_commit_role,
-                        raw=msg.raw,
-                        role_label=None if msg.raw else commit_label,
-                        thinking=commit_thinking,
-                    )
-                elif msg.commit_role == "user":
-                    # ``raw`` flags a flat (base-model) commit — the
-                    # authored span may hang under a node of any role,
-                    # so the user-under-user guard is lifted.
-                    new_id = await asyncio.to_thread(
-                        session.append_user_turn,
-                        parent_node_id,
-                        commit_text,
-                        allow_any_parent=msg.raw,
-                        role_label=None if msg.raw else commit_user_role,
-                        thinking=commit_thinking,
-                    )
-                else:
-                    # ``parent_node_id`` is non-None here (validated above
-                    # for the assistant role); narrow for the type-checker.
-                    assert parent_node_id is not None
-                    new_id = await asyncio.to_thread(
-                        session.append_assistant_turn,
-                        parent_node_id,
-                        commit_text,
-                        role_label=None if msg.raw else commit_asst_role,
-                        thinking=commit_thinking,
-                    )
-            except SaklasError as e:
-                status, message = e.user_message()
-                await send_json({
-                    "type": "error",
-                    "message": message,
-                    "code": type(e).__name__,
-                    "status": status,
-                    "node_id": None,
-                    "sibling_index": 0,
-                })
-                return
-        await send_json({
-            "type": "done",
-            "result": {
-                "kind": (
-                    "append" if native_commit_role is not None else "commit"
-                ),
-                "role": msg.commit_role,
-                "text": commit_text,
-                "node_id": new_id,
-                "finish_reason": "stop",
-                "mean_logprob": None,
-                "mean_surprise": None,
-            },
-            "node_id": new_id,
-            "sibling_index": 0,
-            "sibling_count": 1,
-        })
-        return
 
     # Per-sibling seed schedule: when n>1, derive deterministic per-
     # sibling seeds from the request seed (or fresh entropy).  Single
@@ -711,14 +668,10 @@ async def _ws_handle_generate(
     # a timeout surfaces as a WS error frame (no HTTP in the WS context).
     async with acquire_session_lock(session) as acquired:
         if not acquired:
-            await send_json({
-                "type": "error",
-                "message": "session locked — try again when the current generation finishes",
-                "code": "SessionLocked",
-                "status": 503,
-                "node_id": None,
-                "sibling_index": 0,
-            })
+            await send_json(_error_frame(
+                "session locked — try again when the current generation finishes",
+                code="SessionLocked", status=503,
+            ))
             return
         for sibling_idx, seed_i in enumerate(seeds):
             generation_id = uuid.uuid4().hex[:12]
@@ -800,23 +753,22 @@ async def _ws_handle_generate(
             ) -> None:
                 try:
                     effective_parent = parent_node_id
-                    if submit_text is not None:
+                    if authored is not None:
                         if not submitted_parent_holder:
-                            assert submit_authored_role is not None
                             commit_label = None
                             if not msg.raw and msg.sampling is not None:
                                 commit_label = (
                                     msg.sampling.user_role
-                                    if submit_authored_role == "user"
+                                    if authored.role == "user"
                                     else msg.sampling.assistant_role
                                 ) or None
                             committed_id = session.append_turn(
                                 parent_node_id,
-                                submit_text,
-                                role=submit_authored_role,
+                                authored.text,
+                                role=authored.role,
                                 raw=msg.raw,
                                 role_label=commit_label,
-                                thinking=submit_authored_thinking,
+                                thinking=authored.thinking,
                             )
                             submitted_parent_holder.append(committed_id)
                         effective_parent = submitted_parent_holder[0]
@@ -963,14 +915,13 @@ async def _ws_handle_generate(
                 else:
                     status = 500
                     message = "Generation failed. Check the server log for details."
-                await send_json({
-                    "type": "error",
-                    "message": message,
-                    "code": type(exc).__name__,
-                    "status": status,
-                    "node_id": current_node_holder[0],
-                    "sibling_index": sibling_idx,
-                })
+                await send_json(_error_frame(
+                    message,
+                    code=type(exc).__name__,
+                    status=status,
+                    node_id=current_node_holder[0],
+                    sibling_index=sibling_idx,
+                ))
                 # On error inside a sibling, abort the remaining fan-out
                 # rather than continuing with stale state.
                 return
@@ -988,20 +939,21 @@ async def _ws_handle_generate(
             # the engine's canonical reason unchanged.
             if stop_signaled and result_json.get("finish_reason") == "stop":
                 result_json["finish_reason"] = "cancelled"
-            # The settled per-probe aggregate rides the ``done`` event in
-            # the same rich shape as each token frame.  Shared with the
-            # SSE / NDJSON finalization via ``probe_reading_aggregate``
-            # (result-parameterized so each n>1 sibling scores its own
-            # result).
-            mf_readings = probe_reading_aggregate(session, result)
-            if mf_readings:
-                result_json["probe_readings"] = mf_readings
-            # 5.x: the aggregate measurement envelope rides the done frame
-            # alongside the compat ``probe_readings`` block (geometry / lens /
-            # SAE instruments split by family).
-            mf_measurements = probe_measurements_aggregate(session, result)
-            if mf_measurements:
-                result_json["measurements"] = mf_measurements
+            # The settled per-probe aggregate rides the ``done`` event in the
+            # 5.x measurement envelope and nowhere else — the same clean break
+            # the ``token`` frame already made.  Geometry / lens / SAE readings
+            # are split by family inside ``instruments``; a client merges them
+            # exactly as it merges the token frame's.  The flat pre-5.x
+            # ``probe_readings`` block is gone from this frame (it survives on
+            # the OpenAI / Ollama ``x-saklas-probe-readings`` extension, which
+            # is a real external contract).  Result-parameterized so each n>1
+            # sibling reports its own result.
+            # Built once by the engine at finalize (``GenerationResult.
+            # measurements``), so the server does not re-split readings by
+            # family — and the lens/SAE channels keep their native
+            # ``ScalarReading`` shape instead of a reprojection.
+            if result is not None and result.measurements:
+                result_json["measurements"] = result.measurements
             # Phase 1 logit pass: stamp the per-turn logprob rollup on the
             # ``done`` event so subscribers (loom sidebar's sort-by-surprise,
             # webui chat-header summary) don't need to re-fetch the node.

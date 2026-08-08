@@ -28,6 +28,8 @@ from saklas.cli.runners.shared import (
     _make_session,
     _print_model_info,
     _print_startup,
+    _print_verb_menu,
+    _progress_printer,
     _resolve_manifold_folder,
     _resolve_manifold_ns_name,
     _resolve_probes,
@@ -56,7 +58,6 @@ from saklas.cli.runners.manifold import (
     _VARIANT_SUFFIX_RE,
     _fold_all_fitted_manifolds,
     _fold_manifold_to_profile_with_identity,
-    _print_diagnostics,
     _print_why_histogram,
     _require_model,
     _run_manifold,
@@ -130,6 +131,9 @@ from saklas.cli.runners.sae import (
     _run_sae_use,
 )
 from saklas.cli.runners.experiment import (
+    _EXPERIMENT_RUNNERS,
+    _TRANSCRIPT_RUNNERS,
+    _TRANSCRIPT_VERBS,
     _parse_grid_terms,
     _run_experiment,
     _run_experiment_fan,

@@ -29,12 +29,18 @@ Examples::
 Aggregate semantics:
 
 - ``agg:`` reads from :attr:`LoomNode.aggregate_readings` directly.
-- ``any:`` and ``last:`` need the per-token score table; callers must
-  pass ``per_token_scores={node_id: {probe: [score_per_token,...]}}``
-  to :meth:`FilterClause.evaluate`.  When the table is missing for a
-  node (or the probe is missing for that node), the clause evaluates
-  to ``False`` per the documented "missing-probe = False, AND
-  semantics" rule.
+- ``any:`` and ``last:`` read the node's own per-token rows —
+  :attr:`LoomNode.thinking_tokens` then :attr:`LoomNode.tokens`, in decode
+  order — pulling each row's flat probe scores out of its ``measurements``
+  envelope (falling back to the row's ``probes`` alias).  Rows that carry no
+  reading for the clause's probe are skipped, so ``last:`` is the last row
+  that measured it.  When no row measured it at all the clause evaluates to
+  ``False`` per the documented "missing-probe = False, AND semantics" rule.
+
+Every clause is therefore a pure function of the node — there is no
+caller-supplied side table to plumb, which is what makes ``any:`` / ``last:``
+work through every surface that exposes the grammar (notably
+``GET /saklas/v1/sessions/{id}/tree/filter``).
 
 The grammar is intentionally minimal — no parentheses, no ``OR``, no
 negation.  Multi-clause AND covers the practical filter cases for
@@ -45,7 +51,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping
 
 from saklas.core.errors import SaklasError
 
@@ -81,6 +87,54 @@ class _Clause:
     threshold: float
 
 
+def _row_scores(row: Any) -> Mapping[str, Any] | None:
+    """Flat ``{probe: axis0}`` view of one persisted token row.
+
+    The 5.x ``measurements`` envelope is canonical; the row-level ``probes``
+    key is the flat alias the same writers emit beside it, kept as a fallback
+    so pre-envelope rows still filter.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    measurements = row.get("measurements")
+    if isinstance(measurements, Mapping):
+        scores = measurements.get("scores")
+        if isinstance(scores, Mapping):
+            return scores
+    probes = row.get("probes")
+    return probes if isinstance(probes, Mapping) else None
+
+
+def node_token_series(node: Any, probes: frozenset[str]) -> dict[str, list[float]]:
+    """Per-probe per-token score series for one node, in decode order.
+
+    Reads the node's own token rows — ``thinking_tokens`` first, then
+    ``tokens``, which is the order the decode loop wrote them — and collects
+    each requested probe's per-row reading.  A row that carries no reading
+    for a probe contributes nothing to that probe's series, so a probe
+    attached mid-generation yields the readings it actually has rather than
+    a padded lie.  ``node`` is typed loosely so this module stays
+    import-cycle-free against :mod:`saklas.core.loom`.
+    """
+    series: dict[str, list[float]] = {}
+    if not probes:
+        return series
+    for attr in ("thinking_tokens", "tokens"):
+        for row in getattr(node, attr, None) or ():
+            scores = _row_scores(row)
+            if not scores:
+                continue
+            for probe in probes:
+                value = scores.get(probe)
+                if value is None:
+                    continue
+                try:
+                    series.setdefault(probe, []).append(float(value))
+                except (TypeError, ValueError):
+                    continue
+    return series
+
+
 @dataclass(frozen=True)
 class FilterClause:
     """A parsed filter expression — one or more AND'd :class:`_Clause`s.
@@ -93,19 +147,23 @@ class FilterClause:
 
     clauses: tuple[_Clause, ...]
 
-    def evaluate(
-        self,
-        node: Any,
-        *,
-        per_token_scores: Mapping[str, Sequence[float]] | None = None,
-    ) -> bool:
+    @property
+    def token_probes(self) -> frozenset[str]:
+        """Probes whose per-token series this expression needs.
+
+        Only ``any:`` / ``last:`` clauses read token rows, so an
+        ``agg:``-only expression skips the per-node row walk entirely.
+        """
+        return frozenset(c.probe for c in self.clauses if c.agg != "agg")
+
+    def evaluate(self, node: Any) -> bool:
         """Return ``True`` iff every clause matches against ``node``.
 
         ``node`` is a :class:`LoomNode` (typed loosely so this module
-        stays import-cycle-free against ``saklas.core.loom``).  We read
-        :attr:`LoomNode.aggregate_readings` for ``agg:`` clauses and
-        ``per_token_scores`` (a flat ``{probe: [scores]}`` mapping for
-        this single node) for ``any:`` / ``last:`` clauses.
+        stays import-cycle-free against ``saklas.core.loom``).  ``agg:``
+        clauses read :attr:`LoomNode.aggregate_readings`; ``any:`` /
+        ``last:`` clauses read the node's own token rows via
+        :func:`node_token_series`.
 
         Missing-probe semantics (documented contract): when the probe
         key is absent from the relevant table, the clause evaluates to
@@ -116,7 +174,7 @@ class FilterClause:
         aggregates: Mapping[str, float] = getattr(
             node, "aggregate_readings", {},
         ) or {}
-        ptokens = per_token_scores or {}
+        ptokens = node_token_series(node, self.token_probes)
 
         for c in self.clauses:
             if c.agg == "agg":
@@ -126,8 +184,8 @@ class FilterClause:
                     return False
                 continue
 
-            # ``any`` / ``last`` need the per-token table.
-            seq = ptokens.get(c.probe) if ptokens else None
+            # ``any`` / ``last`` read the node's own per-token series.
+            seq = ptokens.get(c.probe)
             if not seq:
                 return False
             if c.agg == "any":
@@ -271,37 +329,25 @@ def parse_filter(text: str) -> FilterClause:
 
 # --- LoomTree integration --------------------------------------------------
 
-def filter_tree(
-    tree: Any,
-    text: str,
-    *,
-    per_token_scores: Mapping[str, Mapping[str, Sequence[float]]] | None = None,
-) -> set[str]:
+def filter_tree(tree: Any, text: str) -> set[str]:
     """Apply a filter expression to every node in ``tree``.
 
     ``tree`` is a :class:`saklas.core.loom.LoomTree`.  Returns the set
     of node ids whose nodes satisfy the parsed filter.  This is the
     free-function form; :meth:`LoomTree.filter_by_expr` calls it.
 
-    ``per_token_scores`` is an optional ``{node_id: {probe: [scores]}}``
-    mapping — needed for ``any:`` / ``last:`` clauses.  Callers can
-    pull this from a side-cache keyed by node id; absent entries simply
-    fail the clause per documented semantics.
+    Every clause reads the node itself — aggregates from
+    ``aggregate_readings``, per-token series from the node's own token rows
+    — so all three ops work through every surface that exposes the grammar.
     """
     clause = parse_filter(text)
-    ptokens = per_token_scores or {}
-
-    def _pred(node: Any) -> bool:
-        nid = getattr(node, "id", None)
-        per_node = ptokens.get(nid) if nid is not None else None
-        return clause.evaluate(node, per_token_scores=per_node)
-
-    return tree.filter(_pred)
+    return tree.filter(clause.evaluate)
 
 
 __all__ = [
     "FilterClause",
     "FilterParseError",
     "filter_tree",
+    "node_token_series",
     "parse_filter",
 ]

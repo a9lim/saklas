@@ -209,24 +209,50 @@ def test_session_facades_are_the_instruments() -> None:
     assert session.sae is inst["sae"]
 
 
-def test_instruments_and_runs_satisfy_the_protocol() -> None:
-    """Every concrete family satisfies the runtime-checkable ``Instrument``
-    protocol, and each carries a current run satisfying ``InstrumentRun``
-    (idle passthrough before ``bind``, generation-bound after)."""
-    from saklas.core.instruments import Instrument, InstrumentRun
+#: The instrument/run surface the session, composer, and server exercise
+#: uniformly across families — the contract ``protocol.py`` describes in prose.
+#: Pinned here rather than as a ``Protocol`` because an unchecked Protocol
+#: drifts from its implementations and grows conformance-only methods.
+_INSTRUMENT_SURFACE = (
+    "specs", "probe_hash", "prepare", "plan", "bind", "close_run",
+)
+_RUN_SURFACE = ("observe", "prime_observation", "observe_aggregate", "close")
+
+
+def test_every_family_carries_the_uniform_instrument_surface() -> None:
+    """Each family exposes the same instrument/run methods and starts on an
+    idle passthrough run; ``close_run`` restores one."""
     from saklas.core.session import SaklasSession
 
     session = SaklasSession.__new__(SaklasSession)
     for family, instrument in session.instruments.items():
-        assert isinstance(instrument, Instrument), family
+        assert instrument.family == family
+        for name in _INSTRUMENT_SURFACE:
+            assert callable(getattr(instrument, name)), f"{family}.{name}"
         run = instrument.current_run
-        assert isinstance(run, InstrumentRun), family
+        for name in _RUN_SURFACE:
+            assert callable(getattr(run, name)), f"{family} run.{name}"
         assert run.bound is False
         assert run.binding.family == family
-        # close_run is protocol surface (the bind/close asymmetry is what
-        # let a standalone capture path leak a bound run), and it must
-        # restore an idle passthrough run.
+        # The bind/close asymmetry is what let a standalone capture path leak
+        # a bound run, so close_run must restore an idle passthrough run.
         instrument.close_run()
         assert instrument.current_run.bound is False
     assert session.lens.family == "lens"
     assert session.sae.family == "sae"
+
+
+def test_gate_validation_is_only_where_a_channel_can_be_refused() -> None:
+    """Every family answers ``validate_gate`` — that is what lets the
+    composer walk ``session.instruments`` uniformly.  Lens and SAE read one
+    strength axis, so a geometry-channel gate is a composition-preflight
+    error there; geometry produces every channel, so its implementation
+    accepts unconditionally."""
+    from saklas.core.session import SaklasSession
+
+    session = SaklasSession.__new__(SaklasSession)
+    ref = parse_gate_ref("probe:membership")
+    for family in ("lens", "sae"):
+        with pytest.raises(UnsupportedProbeChannelError):
+            session.instruments[family].validate_gate(ref)
+    assert session.instruments["geometry"].validate_gate(ref) is None

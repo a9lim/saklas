@@ -21,11 +21,9 @@ and the end-of-gen aggregate are the same shape — ``fraction`` /
 
 from __future__ import annotations
 
-import asyncio
 import json
-import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -37,7 +35,47 @@ from saklas.core.results import (
     RunSet,
     TokenEvent,
 )
+from tests._fakes import make_mock_session
 from tests._generation_stream import TestGenerationStream
+
+
+def manifold_json_stub(namespace: str, name: str, **extra: Any) -> dict[str, Any]:
+    """A complete ``ManifoldInfo`` body for routes that stub ``_manifold_json``.
+
+    The manifold routes declare a response schema, so a stub that carried
+    only the two or three keys a test asserts on is now a
+    ``ResponseValidationError`` — which is the point: a double that cannot
+    produce the contract is testing a shape the server cannot emit.  This
+    is the minimum complete body; tests layer their assertions on top via
+    ``extra``.
+    """
+    body: dict[str, Any] = {
+        "namespace": namespace,
+        "name": name,
+        "description": "",
+        "source": "local",
+        "tags": [],
+        "template_ref": None,
+        "fit_mode": "pca",
+        "is_discover": True,
+        "domain": {},
+        "domain_label": "discover-pca",
+        "intrinsic_dim": 0,
+        "min_nodes": None,
+        "node_count": 0,
+        "node_labels": [],
+        "node_coords": [],
+        "node_roles": [],
+        "node_kinds": [],
+        "hyperparams": {},
+        "fitted_models": [],
+        "tensor_variants": {},
+        "fitted_for_session": False,
+        "stale": False,
+        "resolved_fit_mode": None,
+    }
+    body.update(extra)
+    return body
 
 
 def _single_run(**kwargs: Any) -> RunSet:
@@ -97,36 +135,16 @@ def _mock_probe(name: str, manifold: MagicMock, top_n: int = 3) -> MagicMock:
 
 
 def _mock_session():
-    session = MagicMock()
-    session.model_id = "test/model"
-    session.model_info = {
-        "model_type": "gemma2",
-        "num_layers": 26,
-        "hidden_dim": 2304,
-        "device": "cpu",
-        "dtype": "torch.bfloat16",
-    }
-    session._device = "cpu"
-    session._dtype = "torch.bfloat16"
-    session._created_ts = 1_700_000_000
-
-    session.config = MagicMock()
-    session.config.temperature = 1.0
-    session.config.top_p = 0.9
-    session.config.top_k = None
-    session.config.max_new_tokens = 1024
-    session.config.system_prompt = None
-
-    session.profiles = {}
-    session.probes = {}
+    # Shared native-API wiring lives in tests/_fakes.py.
+    session = make_mock_session()
     session.manifolds = {}
     session.tree = MagicMock()
     session.tree.messages_for.return_value = []
     session.tree.active_node_id = "test-assistant"
     session.tree.get.return_value.mean_logprob = None
     session.tree.get.return_value.mean_surprise = None
-    session.lens_probe_specs = {}
-    session.sae_probe_specs = {}
+    session.lens.specs.return_value = {}
+    session.sae.specs.return_value = {}
 
     # The unified monitor: one object, both ``probe_names`` (the wire/gate
     # surface) and ``attached_probes()`` (the serializer source).
@@ -141,8 +159,6 @@ def _mock_session():
     session._layers = []
     session.last_per_token_scores = None
     session.last_result = None
-    session.last_per_token_scores = None
-    session.last_result = None
     # The WS token-frame builder consults this first; a real None lets the
     # inline ``_monitor`` / ``_capture`` scoring branch run (a bare
     # MagicMock would shadow it with a truthy child mock).
@@ -152,12 +168,6 @@ def _mock_session():
     gen_state.finish_reason = "stop"
     gen_state.emit_map = []
     session.generation_state = gen_state
-
-    session.build_readings.return_value = {}
-    session.lock = asyncio.Lock()
-
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
     return session
 
 
@@ -382,15 +392,16 @@ class TestManifoldCrudRoutes:
         )
         fake_folder = MagicMock()
         fake_folder.name = "combined"
+        fake_folder.folder = Path("/tmp/.saklas/manifolds/local/combined")
         monkeypatch.setattr(
             "saklas.server.manifold_routes._find_manifold",
-            lambda ns, name: (ns, fake_folder),
+            lambda ns, name: fake_folder,
         )
         monkeypatch.setattr(
             "saklas.server.manifold_routes._manifold_json",
-            lambda ns, mf, sess, *, full=False: {
-                "namespace": ns, "name": mf.name, "fit_mode": "pca",
-            },
+            lambda mf, sess, *, full=False: manifold_json_stub(
+                mf.folder.parent.name, mf.name, fit_mode="pca",
+            ),
         )
 
         resp = client.post(
@@ -406,11 +417,9 @@ class TestManifoldCrudRoutes:
             },
         )
         assert resp.status_code == 201
-        assert resp.json() == {
-            "namespace": "local",
-            "name": "combined",
-            "fit_mode": "pca",
-        }
+        assert resp.json() == manifold_json_stub(
+            "local", "combined", fit_mode="pca",
+        )
         # Inner call shape: target identity, source tuples, fit_mode
         # ride through unchanged.
         assert captured["args"] == ("local", "combined", "fold heap")
@@ -454,6 +463,7 @@ class TestManifoldCrudRoutes:
         # an on-disk fixture.
         fake_folder = MagicMock()
         fake_folder.name = "personas"
+        fake_folder.folder = Path("/tmp/.saklas/manifolds/local/personas")
         fake_folder.description = "100 personas"
         fake_folder.domain = {"type": "custom", "embed_dim": 8}
         fake_folder.node_labels = ["hacker", "caveman"]
@@ -471,13 +481,13 @@ class TestManifoldCrudRoutes:
         # _find_manifold helper itself.
         monkeypatch.setattr(
             "saklas.server.manifold_routes._find_manifold",
-            lambda ns, name: (ns, fake_folder),
+            lambda ns, name: fake_folder,
         )
         monkeypatch.setattr(
             "saklas.server.manifold_routes._manifold_json",
-            lambda ns, mf, sess, *, full=False: {
-                "namespace": ns, "name": mf.name, "fitted": [],
-            },
+            lambda mf, sess, *, full=False: manifold_json_stub(
+                mf.folder.parent.name, mf.name, fitted=[],
+            ),
         )
 
         resp = client.post(
@@ -485,11 +495,104 @@ class TestManifoldCrudRoutes:
             json={"target": "a9lim/personas"},
         )
         assert resp.status_code == 201
-        assert resp.json() == {
-            "namespace": "local",
-            "name": "personas",
-            "fitted": [],
-        }
+        assert resp.json() == manifold_json_stub("local", "personas", fitted=[])
+
+    def test_install_route_streams_progress_over_sse(
+        self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``Accept: text/event-stream`` gets the same per-stage narration
+        the fit / generate routes ship — an HF pull is a long operation, so a
+        client must be able to show more than a spinner.
+        """
+        import json as _json
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        _session, client = session_and_client
+        installed_dir = MagicMock(spec=Path)
+        installed_dir.parent.name = "local"
+        installed_dir.name = "personas"
+
+        def _install(*_args: Any, on_progress: Any = None, **_kwargs: Any) -> Any:
+            assert on_progress is not None
+            on_progress("Downloading a9lim/personas from Hugging Face...")
+            on_progress("Validating staged a9lim/personas...")
+            return installed_dir
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.install_manifold", _install,
+        )
+        fake_folder = MagicMock()
+        fake_folder.name = "personas"
+        fake_folder.folder = Path("/tmp/.saklas/manifolds/local/personas")
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes._find_manifold",
+            lambda ns, name: fake_folder,
+        )
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes._manifold_json",
+            lambda mf, sess, *, full=False: {
+                "namespace": mf.folder.parent.name, "name": mf.name,
+            },
+        )
+
+        with client.stream(
+            "POST", "/saklas/v1/manifolds/install",
+            json={"target": "a9lim/personas"},
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/event-stream")
+            body = "".join(resp.iter_text())
+
+        assert "event: progress" in body
+        assert "Downloading a9lim/personas" in body
+        assert "Validating staged a9lim/personas" in body
+        done = body.split("event: done\ndata: ")[1].split("\n\n")[0]
+        assert _json.loads(done)["name"] == "personas"
+
+    def test_install_route_sse_error_frame_is_typed(
+        self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A conflict surfaces its own safe message, not the generic scrub."""
+        from saklas.io.hf_manifolds import ManifoldInstallConflict
+
+        _session, client = session_and_client
+
+        def _install(*_args: Any, **_kwargs: Any) -> Any:
+            raise ManifoldInstallConflict("destination already exists")
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.install_manifold", _install,
+        )
+        with client.stream(
+            "POST", "/saklas/v1/manifolds/install",
+            json={"target": "a9lim/personas"},
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            body = "".join(resp.iter_text())
+        assert "event: error" in body
+        assert "destination already exists" in body
+        assert "ManifoldInstallConflict" in body
+
+    def test_install_route_json_branch_still_maps_conflict_to_409(
+        self, session_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The non-streaming branch keeps its typed status table."""
+        from saklas.io.hf_manifolds import ManifoldInstallConflict
+
+        _session, client = session_and_client
+
+        def _install(*_args: Any, **_kwargs: Any) -> Any:
+            raise ManifoldInstallConflict("destination already exists")
+
+        monkeypatch.setattr(
+            "saklas.server.manifold_routes.install_manifold", _install,
+        )
+        resp = client.post(
+            "/saklas/v1/manifolds/install", json={"target": "a9lim/personas"},
+        )
+        assert resp.status_code == 409
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +881,12 @@ class TestWebSocketProbeReadings:
                 probe_readings=(
                     {"circumplex": aggregate} if aggregate else {}
                 ),
+                measurements=cast(dict[str, Any] | None, build_measurements(
+                    scope="aggregate",
+                    geometry_readings=(
+                        {"circumplex": aggregate} if aggregate else None
+                    ),
+                )),
             )
             session.last_result = result
             session.last_result = result
@@ -854,15 +963,11 @@ class TestWebSocketProbeReadings:
                     done = msg
                     break
 
-        agg_blob = done["result"].get("probe_readings")
-        assert agg_blob is not None
+        # The aggregate rides the 5.x envelope alone, split by family
+        # (geometry here).  The flat pre-5.x ``probe_readings`` block is gone
+        # from this frame — the same clean break the ``token`` frame made.
+        assert "probe_readings" not in done["result"]
         assert "per_token_probes" not in done["result"]
-        assert agg_blob["circumplex"]["fraction"] == pytest.approx(0.42)
-        assert agg_blob["circumplex"]["coords"] == [
-            pytest.approx(0.61), pytest.approx(0.42),
-        ]
-        # 5.x: the done frame additionally carries the aggregate-scope
-        # measurement envelope, split by family (geometry here).
         agg_env = done["result"].get("measurements")
         assert agg_env is not None
         assert agg_env["scope"] == "aggregate"
@@ -1078,3 +1183,132 @@ class TestManifoldSharedSerializer:
         _home, _session, client = home_and_client
         resp = client.delete("/saklas/v1/manifolds/local/ghost")
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Cheap fitted-geometry read (list route)
+# ---------------------------------------------------------------------------
+#
+# ``GET /manifolds`` reports each discover folder's derived per-model
+# ``node_coords`` and its resolved flat/curved family.  Both live in the
+# safetensors header plus one small entry, so the route must not deserialize
+# the whole per-layer mean/basis/RBF payload once per installed manifold.
+
+
+def _fitted_discover_manifold(model_id: str, name: str = "heap") -> Any:
+    """Author a discover folder under ``$SAKLAS_HOME`` and land a flat fit."""
+    import torch
+
+    from saklas.core.capture import fold_directions_to_subspace
+    from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
+    from saklas.io.manifold_tensors import save_manifold
+    from saklas.io.manifolds import (
+        ManifoldFolder,
+        create_discover_manifold_folder,
+    )
+    from saklas.io.paths import tensor_filename
+    from tests._whitener import isotropic_whitener
+
+    folder = create_discover_manifold_folder(
+        "local", name, "a heap",
+        fit_mode="pca",
+        node_corpora={
+            "alpha": ["alpha one", "alpha two"],
+            "beta": ["beta one", "beta two"],
+        },
+    )
+    means = {0: torch.zeros(4)}
+    manifold = fold_directions_to_subspace(
+        name, {0: torch.tensor([1.0, 0.0, 0.0, 0.0])}, means, label="alpha",
+        feature_space="raw",
+        whitener=isotropic_whitener(means, 4),
+    )
+    mf = ManifoldFolder.load(folder, verify_manifest=False)
+    path = folder / tensor_filename(model_id)
+    save_manifold(manifold, path, {
+        "method": "manifold_pca",
+        "nodes_sha256": mf.nodes_sha256(),
+        "model_fingerprint": f"fp:{model_id}",
+        "fit_policy_version": MANIFOLD_FIT_POLICY_VERSION,
+    })
+    mf.update_file_hashes(path, path.with_suffix(".json"))
+    return folder, path
+
+
+class TestFittedGeometryRead:
+    @pytest.fixture
+    def home_and_client(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
+        from saklas.server import create_app
+
+        session = _mock_session()
+        app = create_app(session, default_steering=None)
+        return tmp_path, session, TestClient(app)
+
+    def test_matches_full_load(self, home_and_client: Any) -> None:
+        """The header read answers exactly what a full load would."""
+        from saklas.core.manifold import manifold_is_affine
+        from saklas.io.manifold_tensors import load_manifold
+        from saklas.server.manifold_routes import _fitted_geometry
+
+        _home, session, _client = home_and_client
+        _folder, path = _fitted_discover_manifold(session.model_id)
+
+        coords, is_affine = _fitted_geometry(path)
+        loaded = load_manifold(path)
+        assert coords == [
+            [float(x) for x in row] for row in loaded.node_coords.tolist()
+        ]
+        assert is_affine is manifold_is_affine(loaded)
+
+    def test_curved_fit_reads_as_non_affine(self, tmp_path: Any) -> None:
+        """A ``layer_<L>.node_params`` entry is the curved marker."""
+        import torch
+        from safetensors.torch import save_file
+
+        from saklas.server.manifold_routes import _fitted_geometry
+
+        path = tmp_path / "curved.safetensors"
+        save_file({
+            "node_coords": torch.tensor([[0.0], [1.0]]),
+            "layer_0.mean": torch.zeros(4),
+            "layer_0.basis": torch.zeros(1, 4),
+            "layer_0.node_params": torch.tensor([[0.0], [1.0]]),
+        }, str(path))
+        coords, is_affine = _fitted_geometry(path)
+        assert coords == [[0.0], [1.0]]
+        assert is_affine is False
+
+    def test_missing_artifact_is_unresolved(self, tmp_path: Any) -> None:
+        from saklas.server.manifold_routes import _fitted_geometry
+
+        assert _fitted_geometry(tmp_path / "nope.safetensors") == ([], None)
+
+    def test_list_route_does_not_deserialize_the_payload(
+        self, home_and_client: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The list route derives both answers without ``load_manifold``."""
+        import saklas.io.manifold_tensors as manifold_tensors
+
+        from saklas.server.manifold_routes import _fitted_geometry
+
+        _home, session, client = home_and_client
+        _folder, path = _fitted_discover_manifold(session.model_id)
+        expected_coords, _affine = _fitted_geometry(path)
+
+        def _boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError(
+                "the list route fully deserialized a fitted manifold tensor"
+            )
+
+        monkeypatch.setattr(manifold_tensors, "load_manifold", _boom)
+
+        resp = client.get("/saklas/v1/manifolds")
+        assert resp.status_code == 200
+        rows = resp.json()["manifolds"]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["fitted_for_session"] is True
+        assert row["resolved_fit_mode"] == "pca"
+        assert row["node_coords"] == expected_coords
+        assert row["node_coords"]

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from enum import Enum
 from importlib import resources as _resources
-from typing import TYPE_CHECKING, Any, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -14,8 +17,88 @@ if TYPE_CHECKING:
     from saklas.core.manifold import Manifold
 
 
+class CaptureMode(Enum):
+    """How the per-gen hidden-state capture scores its probes.
+
+    One mode is the single source of truth for what the capture retains and
+    when it scores; :meth:`SaklasSession._begin_capture` picks it and every
+    ``_score_*`` dispatch keys off it.  Holding it as one enum rather than a
+    set of correlated booleans makes illegal combinations (incremental *and*
+    aggregate-only) unrepresentable.  The modes trade only *when/how* scoring
+    runs (per token vs once) and what memory the capture keeps (length-1
+    buffer vs tail ring vs full stack); every read is a full per-probe
+    ``ProbeReading`` (see ``hooks.py`` ``HiddenCapture``).
+
+    - ``INCREMENTAL`` — a full-reading live consumer wants per-token readings:
+      score each token live (full roster) into ``_incremental_readings``.
+    - ``LEAN_INCREMENTAL`` — the only per-token consumers read axis-0 coords
+      (the loom probe row): score each token ``coords_only`` and
+      re-score the full aggregate once at finalize from a bounded tail ring.
+    - ``AGGREGATE_ONLY`` — nothing consumes a per-token reading (a stateless
+      server gen, or a lens/SAE-only capture with no monitor probes): NO
+      per-token scoring, pool the last content token once at finalize from a
+      bounded tail ring.
+    - ``GATING_SUBSET`` — per-token scoring is needed *only* to feed probe
+      gates: score just the gated subset per token (into
+      ``_incremental_gate_scores``) while a tail ring lets finalize pool the
+      FULL roster once.
+    - ``FULL`` — full-retention append (``return_hidden`` widen, or any
+      non-incremental read), or the degenerate no-probe / capture-disabled
+      state: distinct clones per step so ``stacked()`` builds the full
+      ``[T, D]``.
+    """
+
+    INCREMENTAL = "incremental"
+    LEAN_INCREMENTAL = "lean_incremental"
+    AGGREGATE_ONLY = "aggregate_only"
+    GATING_SUBSET = "gating_subset"
+    FULL = "full"
+
+
+@dataclass
+class CaptureState:
+    """Per-generation capture configuration — the legal-by-construction state.
+
+    Carries the one :class:`CaptureMode` plus the orthogonal ``persistent``
+    flag (capture rides the always-on compile-clean buffers rather than
+    transient per-gen hooks) and, for gated generations, the gated probe names
+    / exact scalar keys.  Set wholesale in
+    :meth:`SaklasSession._begin_capture`; read by the ``_score_*`` dispatch,
+    the gating callback, and the streaming tap.  The convenience predicates
+    name the modes so the read sites stay legible.
+    """
+
+    mode: CaptureMode = CaptureMode.FULL
+    persistent: bool = False
+    gating_subset: "set[str] | None" = None
+    gating_keys: "set[str] | None" = None
+    final_probe_aggregate: bool = True
+
+    @property
+    def incremental(self) -> bool:
+        return self.mode is CaptureMode.INCREMENTAL
+
+    @property
+    def lean(self) -> bool:
+        return self.mode is CaptureMode.LEAN_INCREMENTAL
+
+    @property
+    def aggregate_only(self) -> bool:
+        # GATING_SUBSET also finalizes off the tail ring (its per-token rows feed
+        # only the gate), so it shares the aggregate-only full-roster pool when
+        # the caller still wants a final full probe aggregate.
+        return (
+            self.mode is CaptureMode.AGGREGATE_ONLY
+            or (
+                self.mode is CaptureMode.GATING_SUBSET
+                and self.final_probe_aggregate
+            )
+        )
+
+
 # Default chunk size for the batched capture path (:func:`_encode_and_capture_all_batch`
-# and its callers ``compute_node_centroid`` / ``compute_neutral_activations``).  One
+# and its callers :func:`compute_neutral_activations` and
+# ``core.manifold.compute_manifold_node_stats``).  One
 # forward over up to this many (prompt, response) pairs replaces that many sequential
 # batch-1 forwards — the dominant extraction-capture cost.  Sized conservatively so a
 # chunk's attention working set (``B · heads · T²``) stays comfortable on a single
@@ -40,7 +123,15 @@ class _CaptureComplete(BaseException):
 
 
 class _ReusablePooledCapture:
-    """Fit-scoped layer hooks reused across many pooled batch forwards."""
+    """Layer hooks for the per-row pooled forward.
+
+    Owns the whole per-row path: clamp each row's pool position into range,
+    gather ``(B, D)`` inside the hook so the ``(B, T, D)`` stack is never
+    retained, optionally promote to fp32, and abort the wrapper at the last
+    requested block.  Fit-wide capture holds one instance across many forwards
+    so the hooks are registered once; :func:`_capture_all_hidden_states` runs a
+    single-use instance for a one-off per-row capture.
+    """
 
     def __init__(
         self, model: torch.nn.Module, layers: torch.nn.ModuleList,
@@ -152,15 +243,21 @@ def _capture_all_hidden_states(
 
     ``layer_indices`` narrows hook registration to a subset; ``None`` captures
     every layer. Returns a dict mapping layer index to the retained tensor.
+
+    The per-row shape is served by a single-use :class:`_ReusablePooledCapture`
+    — the same hook the fit-wide reusable path runs — so there is exactly one
+    implementation of the in-hook gather. This function's own hook covers the
+    ``None`` and scalar-``int`` shapes only.
     """
+    capture_layers = (
+        list(range(len(layers)))
+        if layer_indices is None
+        else [int(idx) for idx in layer_indices]
+    )
     if capture_context is not None:
         if not isinstance(pool_index, torch.Tensor):
             raise ValueError("reusable capture requires a per-row pool_index tensor")
-        requested = (
-            list(range(len(layers)))
-            if layer_indices is None else [int(idx) for idx in layer_indices]
-        )
-        if requested != capture_context.layer_indices:
+        if capture_layers != capture_context.layer_indices:
             raise ValueError(
                 "reusable capture layer selection does not match this forward"
             )
@@ -169,47 +266,21 @@ def _capture_all_hidden_states(
             promote_pooled=promote_pooled,
         )
 
-    captured_hidden: dict[int, torch.Tensor] = {}
-    capture_layers = (
-        list(range(len(layers)))
-        if layer_indices is None
-        else [int(idx) for idx in layer_indices]
-    )
     if not capture_layers:
         raise ValueError("layer_indices must select at least one layer")
+    if isinstance(pool_index, torch.Tensor):
+        with _ReusablePooledCapture(model, layers, capture_layers) as ctx:
+            return ctx.capture(
+                input_ids, attention_mask=attention_mask,
+                pool_index=pool_index, promote_pooled=promote_pooled,
+            )
+
+    captured_hidden: dict[int, torch.Tensor] = {}
     terminal_layer = max(capture_layers)
-    per_row = isinstance(pool_index, torch.Tensor)
-    # Precompute the gather index tensors once (not per layer/hook fire); both
-    # are set iff ``per_row`` (the assert in the hook narrows them back).
-    _rows = (
-        torch.arange(input_ids.shape[0], device=input_ids.device)
-        if per_row else None
-    )
-    _pos = (
-        cast(torch.Tensor, pool_index).to(input_ids.device)
-        if isinstance(pool_index, torch.Tensor)
-        else None
-    )
 
     def _make_hook(idx: int):
         def _hook(module: torch.nn.Module, input: Any, output: Any):
             h = output if isinstance(output, torch.Tensor) else output[0]
-            if per_row:
-                assert _pos is not None and _rows is not None  # set iff per_row
-                pos = _pos.clamp(max=h.shape[1] - 1)
-                # Advanced indexing returns a fresh tensor (a copy), so the
-                # gathered (B, D) doesn't alias h — h is free to be released as
-                # the forward proceeds, keeping peak memory at one layer's
-                # (B, T, D) rather than every layer's.
-                pooled = h[_rows, pos, :].detach()
-                captured_hidden[idx] = (
-                    pooled.to(torch.float32)
-                    if promote_pooled and pooled.dtype != torch.float32
-                    else pooled
-                )
-                if idx == terminal_layer:
-                    raise _CaptureComplete()
-                return
             if pool_index is not None:
                 pos = min(max(int(pool_index), 0), h.shape[1] - 1)
                 pooled = h[0, pos, :].detach()
@@ -403,19 +474,12 @@ def _encode_and_capture_all_batch(
     the single-pair path.
 
     Returns ``{layer_idx: (B, D)}`` in fp32 (on the model device).
+
+    Argument agreement (``responses`` / ``role`` / ``roles`` against
+    ``prompts``) is checked by :func:`_prepare_capture_batch`, which is the
+    only consumer of those arguments; the pre-rendered branch instead checks
+    the one alignment it does consume.
     """
-    if len(prompts) != len(responses):
-        raise ValueError(
-            "batched capture needs len(prompts) == len(responses) "
-            f"({len(prompts)} != {len(responses)})"
-        )
-    if roles is not None and len(roles) != len(prompts):
-        raise ValueError(
-            "batched capture needs len(roles) == len(prompts) "
-            f"({len(roles)} != {len(prompts)})"
-        )
-    if roles is not None and role is not None:
-        raise ValueError("batched capture accepts role= or roles=, not both")
     if rendered is None:
         rendered_rows = _prepare_capture_batch(
             tokenizer, prompts, responses,
@@ -631,15 +695,25 @@ def _render_and_tokenize_for_capture(
     return ids, content_end
 
 
-def _load_neutral_prompts() -> list[str]:
-    """Load neutral prompts, preferring a user override at ~/.saklas/neutral_statements.json."""
-    from saklas.io.paths import neutral_statements_path
-    user_path = neutral_statements_path()
+def _load_json_with_override(user_path: Path, resource_name: str) -> list[str]:
+    """Read a bundled ``saklas.data`` JSON list, or the user's override of it.
+
+    A file at ``user_path`` wins outright — the bundled resource is the
+    fallback, never a merge base.
+    """
     if user_path.exists():
         with open(user_path) as f:
             return json.load(f)
-    with _resources.files("saklas.data").joinpath("neutral_statements.json").open() as f:
+    with _resources.files("saklas.data").joinpath(resource_name).open() as f:
         return json.load(f)
+
+
+def _load_neutral_prompts() -> list[str]:
+    """Load neutral prompts, preferring a user override at ~/.saklas/neutral_statements.json."""
+    from saklas.io.paths import neutral_statements_path
+    return _load_json_with_override(
+        neutral_statements_path(), "neutral_statements.json",
+    )
 
 
 def _load_baseline_prompts() -> list[str]:
@@ -651,12 +725,9 @@ def _load_baseline_prompts() -> list[str]:
     ``response[i] -> prompt[i % len(prompts)]``.
     """
     from saklas.io.paths import baseline_prompts_path
-    user_path = baseline_prompts_path()
-    if user_path.exists():
-        with open(user_path) as f:
-            return json.load(f)
-    with _resources.files("saklas.data").joinpath("baseline_prompts.json").open() as f:
-        return json.load(f)
+    return _load_json_with_override(
+        baseline_prompts_path(), "baseline_prompts.json",
+    )
 
 
 def _neutral_pairs() -> list[tuple[str, str]]:
@@ -689,6 +760,7 @@ def compute_neutral_activations(
     device: torch.device | None = None,
     *,
     rendered: Sequence[tuple[torch.Tensor, int]] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict[int, torch.Tensor]:
     """Per-layer ``[N, D]`` stack across the neutral corpus.
 
@@ -703,6 +775,11 @@ def compute_neutral_activations(
     Used by cross-model alignment (:func:`saklas.io.alignment.fit_alignment`)
     which needs paired observations to fit Procrustes; the means alone (N=1)
     are degenerate for that fit.
+
+    ``on_progress`` receives one line per captured chunk (the same narration
+    surface :meth:`~saklas.core.session.SaklasSession.fit` and
+    ``generate_responses`` expose), so a caller building the whitener can show
+    the neutral pass rather than blocking silently.
 
     Storage cost: ~90 · n_layers · hidden_dim · 4B in fp32 (≈ 56MB on
     a 4096-dim, 80-layer model).  Callers persist this through
@@ -736,6 +813,10 @@ def compute_neutral_activations(
         start = 0
         while start < n:
             end = min(start + active_batch, n)
+            if on_progress is not None:
+                on_progress(
+                    f"Capturing neutral activations {start + 1}-{end}/{n}..."
+                )
             try:
                 per_layer = _encode_and_capture_all_batch(
                     model, tokenizer,

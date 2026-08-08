@@ -259,7 +259,7 @@ class TestSaveLoad:
                 )
 
 
-class TestTraitMonitor:
+class TestMonitor:
     def test_monitor_records_history(self, model_and_tokenizer: Any, layers: Any, happy_profile: Any, layer_means: Any) -> None:
         from saklas.core.hooks import SteeringManager
         from saklas.core.monitor import Monitor
@@ -288,7 +288,7 @@ class TestTraitMonitor:
                 "sad", dict(sad_profile), dict(layer_means), whitener=whit,
             ),
         }
-        monitor = Monitor(probe_profiles, layer_means, whitener=whit)
+        monitor = Monitor(probe_profiles, whitener=whit)
 
         # Steer toward happy
         mgr = SteeringManager()

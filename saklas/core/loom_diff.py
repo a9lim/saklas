@@ -293,7 +293,12 @@ class NodeDiff:
 
 
 def _parse_or_empty(expr: str | None):
-    """Parse a steering expression or return an empty Steering proxy."""
+    """Parse a steering expression, or ``None`` for "no terms".
+
+    Empty input and an unparseable expression collapse to the same answer:
+    the caller reads both as an empty alpha map, so an unrenderable side
+    contributes nothing to the delta rather than poisoning the label.
+    """
     if not expr:
         return None
     from saklas.core.steering_expr import parse_expr, SteeringExprError
@@ -342,11 +347,12 @@ def steering_delta(parent_expr: str | None, child_expr: str | None) -> str:
 
     Walks both expressions through the shared grammar (matching the
     keys used by ``Steering.alphas``), subtracts coefficients
-    name-by-name, and returns a compact multi-term label.  Returns an
-    empty string when the two expressions are identical (no label to
-    render) and ``"(unsteered)"`` / ``"(unparsed)"`` for the
-    edge cases where one side fails to parse — UIs render whichever
-    sentinel they receive.
+    name-by-name, and returns a compact multi-term label.  The empty
+    string is the only non-term output: it means "no label to render",
+    covering identical expressions, two empty sides, and any side the
+    grammar can't parse (unparseable reads as no terms — see
+    :func:`_parse_or_empty`).  There are no sentinel strings for callers
+    to branch on.
 
     Output format examples (``X``/``Y`` stand for the canonical
     ``Steering.alphas`` keys the grammar produces; the leading term carries

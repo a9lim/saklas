@@ -8,7 +8,7 @@ from pathlib import Path
 
 import saklas.cli.runners as _pkg
 from saklas.cli.parsers import _LENS_VERBS
-from saklas.cli.runners.shared import _saklas_error_exit
+from saklas.cli.runners.shared import _print_verb_menu, _saklas_error_exit
 
 
 #: Documents are sliced to this many characters before tokenization — the fit
@@ -425,9 +425,11 @@ def _run_lens_top(args: argparse.Namespace) -> None:
                 ]
                 for rows in agg
             ],
+            # Per-layer rows carry the same unit the aggregate averages: the
+            # per-layer readout probability p_l, not a logprob.
             "layers": {
                 str(layer): [
-                    [{"token": t, "logprob": round(lp, 4)} for t, lp in row]
+                    [{"token": t, "strength": round(p_l, 6)} for t, p_l in row]
                     for row in rows
                 ]
                 for layer, rows in out.items()
@@ -560,16 +562,7 @@ def _run_lens(args: argparse.Namespace) -> None:
     """Dispatch ``saklas lens <verb>`` (the per-model Jacobian lens)."""
     cmd = getattr(args, "lens_cmd", None)
     if cmd is None:
-        print("usage: saklas lens <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _LENS_VERBS)
-        for v, desc in _LENS_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas lens <verb> -h` for verb-specific options.")
+        _print_verb_menu("lens", _LENS_VERBS)
         sys.exit(0)
-    runner = _LENS_RUNNERS.get(cmd)
-    if runner is None:
-        print(f"unknown lens verb {cmd!r}", file=sys.stderr)
-        sys.exit(2)
-    runner(args)
+    # Registered-subparser invariant: argparse rejects an unknown verb.
+    _LENS_RUNNERS[cmd](args)

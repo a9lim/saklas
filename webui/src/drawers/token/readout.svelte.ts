@@ -5,11 +5,9 @@
 // way: prefer the token's loom-owned ``measurements`` envelope (original
 // capture), otherwise hit the family's ``token-readout`` replay endpoint
 // — request-sequenced so a stale response can never clobber a newer
-// view.  Pre-refactor each tab hand-rolled this ~50-line dance and they
-// drifted (the sae tab lost the steered toggle); this class is the one
-// implementation.
+// view.  This class is the one implementation the three tabs share.
 
-import { ApiError, apiInstruments } from "../../lib/api";
+import { apiInstruments, describeError } from "../../lib/api";
 import type { InstrumentFamily } from "../../lib/api";
 import type {
   MeasurementsEnvelopeJSON,
@@ -24,18 +22,6 @@ export type ReadoutOrigin = "captured" | "replayed" | null;
 export interface GeometryTokenReadout {
   steering: string | null;
   readings: Record<string, ProbeReadingJSON>;
-}
-
-/** Prefer the structured ``detail`` a saklas error body carries over the
- *  generic HTTP message. */
-export function errorDetail(e: unknown): string {
-  if (
-    e instanceof ApiError &&
-    typeof (e.body as { detail?: unknown } | null)?.detail === "string"
-  ) {
-    return (e.body as { detail: string }).detail;
-  }
-  return e instanceof Error ? e.message : String(e);
 }
 
 export class ReplayReadout<T> {
@@ -97,7 +83,7 @@ export class ReplayReadout<T> {
       })
       .catch((e) => {
         if (seq !== this.#seq) return;
-        this.error = errorDetail(e);
+        this.error = describeError(e);
       })
       .finally(() => {
         if (seq === this.#seq) this.loading = false;

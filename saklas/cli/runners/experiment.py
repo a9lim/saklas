@@ -9,7 +9,12 @@ from typing import Any
 
 import saklas.cli.runners as _pkg
 from saklas.cli.parsers import _EXPERIMENT_VERBS
-from saklas.cli.runners.shared import _saklas_error_exit
+from saklas.cli.runners.shared import _print_verb_menu, _saklas_error_exit
+
+#: The one nested verb under ``experiment transcript`` — its own menu table.
+_TRANSCRIPT_VERBS = [
+    ("run", "Replay a transcript on the current session"),
+]
 
 
 @_saklas_error_exit
@@ -17,23 +22,10 @@ def _run_experiment(args: argparse.Namespace) -> None:
     """Dispatch ``saklas experiment <verb>``."""
     cmd = getattr(args, "experiment_cmd", None)
     if cmd is None:
-        print("usage: saklas experiment <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _EXPERIMENT_VERBS)
-        for v, desc in _EXPERIMENT_VERBS:
-            print(f"  {v:<{width}}  {desc}")
+        _print_verb_menu("experiment", _EXPERIMENT_VERBS)
         sys.exit(0)
-    if cmd == "fan":
-        _run_experiment_fan(args)
-        return
-    if cmd == "transcript":
-        _run_experiment_transcript(args)
-        return
-    if cmd == "naturalness":
-        _run_experiment_naturalness(args)
-        return
-    print(f"unknown experiment verb {cmd!r}", file=sys.stderr)
-    sys.exit(2)
+    # Registered-subparser invariant: argparse rejects an unknown verb.
+    _EXPERIMENT_RUNNERS[cmd](args)
 
 
 def _run_experiment_naturalness(args: argparse.Namespace) -> None:
@@ -54,7 +46,7 @@ def _run_experiment_naturalness(args: argparse.Namespace) -> None:
     from saklas.core.steering_expr import ManifoldTerm, parse_expr
     from saklas.io.manifolds import ManifoldFolder
 
-    _pkg._load_effective_config(args)
+    _pkg._load_effective_config(args, default_max_tokens=128)
     mfolder = Path(args.manifold)
     if not (mfolder / "manifold.json").exists():
         print(
@@ -175,15 +167,10 @@ def _run_experiment_transcript(args: argparse.Namespace) -> None:
     """Dispatch ``saklas experiment transcript <verb>``."""
     cmd = getattr(args, "transcript_cmd", None)
     if cmd is None:
-        print("usage: saklas experiment transcript <verb> [...]")
-        print()
-        print("  run  Replay a transcript on the current session")
+        _print_verb_menu("experiment transcript", _TRANSCRIPT_VERBS)
         sys.exit(0)
-    if cmd == "run":
-        _run_transcript_run(args)
-        return
-    print(f"unknown experiment transcript verb {cmd!r}", file=sys.stderr)
-    sys.exit(2)
+    # Registered-subparser invariant: argparse rejects an unknown verb.
+    _TRANSCRIPT_RUNNERS[cmd](args)
 
 
 def _parse_grid_terms(raw_terms: list[str]) -> dict[str, list[float]]:
@@ -217,17 +204,33 @@ def _parse_grid_terms(raw_terms: list[str]) -> dict[str, list[float]]:
 def _run_experiment_fan(args: argparse.Namespace) -> None:
     import json as _json
 
-    _pkg._load_effective_config(args)
+    _pkg._load_effective_config(args, default_max_tokens=256)
     _pkg._print_startup(args)
     session = _pkg._make_session(args)
     _pkg._print_model_info(session)
 
     grid = _parse_grid_terms(args.grid)
+
+    # A grid is sequential generations; without a per-completion line the
+    # user sees nothing between "Loaded N probes" and the final table.  JSON
+    # mode stays silent so stdout remains a single parseable document.
+    total = 1
+    for alphas in grid.values():
+        total *= len(alphas)
+
+    def _report(idx: int, result: Any, alphas: dict[str, float]) -> None:
+        row = ", ".join(f"{k}={v:+.3f}" for k, v in alphas.items())
+        print(
+            f"  {idx + 1}/{total}: {row} ({result.token_count} tokens)",
+            flush=True,
+        )
+
     runset = session.generate_sweep(
         args.prompt,
         grid,
         base_steering=args.base_steering,
         stateless=False,
+        on_result=None if args.json_output else _report,
     )
     if args.json_output:
         print(_json.dumps(runset.to_dict(), indent=2))
@@ -259,7 +262,7 @@ def _run_transcript_run(args: argparse.Namespace) -> None:
         print(f"transcript run: {e}", file=sys.stderr)
         sys.exit(2)
 
-    _pkg._load_effective_config(args)
+    _pkg._load_effective_config(args, default_max_tokens=256)
     if not args.model:
         if transcript.model_id:
             args.model = transcript.model_id
@@ -326,3 +329,16 @@ def _run_transcript_run(args: argparse.Namespace) -> None:
             for name, d, ev, av in deltas[:5]:
                 print(f"    {name:<32}  Δ {d:+.4f}  (expected {ev:+.4f} → got {av:+.4f})")
         print()
+
+
+# The three research verbs, plus the one nested ``transcript`` leaf.  Declared
+# after their runners so the tables carry bound functions.
+_EXPERIMENT_RUNNERS = {
+    "fan":         _run_experiment_fan,
+    "transcript":  _run_experiment_transcript,
+    "naturalness": _run_experiment_naturalness,
+}
+
+_TRANSCRIPT_RUNNERS = {
+    "run": _run_transcript_run,
+}

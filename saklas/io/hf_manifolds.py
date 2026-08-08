@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from saklas.core.errors import SaklasError
 from saklas.io.atomic import write_bytes_atomic
@@ -33,13 +33,24 @@ from saklas.io.manifolds import (
     ManifoldFolder,
     ManifoldFormatError,
 )
-from saklas.io.packs import NAME_REGEX
+from saklas.io.integrity import NAME_REGEX
 from saklas.io.staging import stage_verify_swap
 
-# Mirror :data:`saklas.io.hf._HF_SEARCH_CAP`.  Kept independent so the
-# manifold side can diverge later (e.g. larger cap once a few canonical
-# manifolds are published) without touching the pack ceiling.
+#: Row ceiling for a Hub search.  The picker renders one card per row, so a
+#: wider result set costs a slower search for a list nobody scrolls.
 _HF_SEARCH_CAP = 20
+
+#: Optional per-stage narration sink for an install.  An HF pull is a
+#: multi-hundred-megabyte network operation with a stage-verify-swap tail, so
+#: every caller (CLI, SSE route) wants the same five stages: ``resolve`` →
+#: ``download`` → ``validate`` → ``stage`` → ``swap``.
+ProgressCallback = Callable[[str], None]
+
+
+def _report(on_progress: ProgressCallback | None, message: str) -> None:
+    """Emit one install stage line when the caller asked for narration."""
+    if on_progress is not None:
+        on_progress(message)
 
 
 def _rewrite_staged_manifold_name(
@@ -54,7 +65,7 @@ def _rewrite_staged_manifold_name(
     single manifest rewrite.
     """
     from saklas.io.atomic import write_json_atomic
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     files = dict(staged.files)
     for stem in staged.tensor_models():
@@ -84,11 +95,11 @@ def _download(
 ) -> str:
     """Snapshot-download ``<owner>/<repo>`` from the HF model hub.
 
-    Thin wrapper over :func:`saklas.io.hf._hf_snapshot_download` for
-    error-shape parity with the pack pull path.  No allow-patterns
-    filter: a manifold folder is small (a manifest + a ``nodes/`` corpus
-    of short JSON files + at most a few safetensors), so the full
-    snapshot is the simplest correct read.
+    Wraps the shared :func:`saklas.io.hf._hf_snapshot_download` seam so
+    every failure surfaces as :class:`~saklas.io.hf.HFError` with the
+    ``coord@revision`` label.  No allow-patterns filter: a manifold folder is
+    small (a manifest + a ``nodes/`` corpus of short JSON files + at most a
+    few safetensors), so the full snapshot is the simplest correct read.
     """
     kwargs: dict[str, Any] = {"repo_id": coord}
     if revision is not None:
@@ -106,14 +117,24 @@ def pull_manifold(
     *,
     force: bool,
     revision: Optional[str] = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
-    """Download and atomically install while holding the target folder lock."""
+    """Download and atomically install while holding the target folder lock.
+
+    ``on_progress`` receives one line per stage (see :data:`ProgressCallback`).
+    """
     from saklas.io.manifold_folder import _locked_manifest
+    from saklas.io.selectors import invalidate as invalidate_selector_index
 
     with _locked_manifest(Path(target_folder)):
-        return _pull_manifold_locked(
+        installed = _pull_manifold_locked(
             coord, target_folder, force=force, revision=revision,
+            on_progress=on_progress,
         )
+    # The installed roster changed; drop the resolver's memoized walks so a
+    # freshly pulled manifold's node labels resolve in this process.
+    invalidate_selector_index()
+    return installed
 
 
 def _pull_manifold_locked(
@@ -122,10 +143,11 @@ def _pull_manifold_locked(
     *,
     force: bool,
     revision: Optional[str] = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Download ``coord`` from HF and install into ``target_folder``.
 
-    Stage-verify-swap discipline (same shape ``pull_pack`` uses):
+    Stage-verify-swap discipline (:mod:`saklas.io.staging`):
     the manifold folder is built under ``<target_folder>.staging/``,
     then validated by ``ManifoldFolder.load`` (which already checks
     format version + ``NAME_REGEX`` + the ``files`` integrity manifest
@@ -152,6 +174,8 @@ def _pull_manifold_locked(
     if target_folder.exists() and not force:
         raise HFError(f"{target_folder} exists; pass force=True to overwrite")
 
+    label = f"{coord}@{revision}" if revision else coord
+    _report(on_progress, f"Downloading {label} from Hugging Face...")
     tmp_dir = Path(_download(coord, revision=revision))
 
     if not (tmp_dir / "manifold.json").is_file():
@@ -164,11 +188,13 @@ def _pull_manifold_locked(
     source = f"hf://{coord}@{revision}" if revision else f"hf://{coord}"
 
     def _build(staging: Path) -> None:
+        _report(on_progress, f"Staging {label}...")
         _install_manifold(tmp_dir, staging, coord)
         # Validate the staged folder against the same loader the
         # session will see — catches format-version mismatches and a
         # populated-but-broken ``files`` manifest before we touch the
         # target.
+        _report(on_progress, f"Validating staged {label}...")
         try:
             staged = ManifoldFolder.load(staging)
         except ManifoldFormatError as e:
@@ -199,6 +225,9 @@ def _pull_manifold_locked(
                 f"{coord}: staged manifold failed re-validation after "
                 f"source stamp ({e})"
             ) from e
+        # ``stage_verify_swap`` promotes the staging dir as soon as ``build``
+        # returns, so this is the last narration point before the swap.
+        _report(on_progress, f"Installing {label} into {target_folder.name}...")
 
     def _swap() -> Path:
         return stage_verify_swap(
@@ -256,11 +285,10 @@ def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
 
 # ---------------------------------------------------------------------- push --
 #
-# HF upload, mirroring :func:`saklas.io.hf.push_pack` in shape: stage a
-# filtered copy of the folder (so we can add README + .gitattributes
-# without mutating the source), then one ``upload_folder``.  The
-# divergences from the pack push are the ``saklas-manifold`` repo tag, the
-# manifold-shaped model card, and that the corpus (``manifold.json`` +
+# HF upload: stage a filtered copy of the folder (so README +
+# .gitattributes can be added without mutating the source), then one
+# ``upload_folder``.  The repo carries the ``saklas-manifold`` tag and a
+# manifold-shaped model card, and the corpus (``manifold.json`` +
 # ``nodes/*``) is *always* included — a manifold without its node corpus
 # can't be re-fit, so a tensors-only manifold push would be useless.
 
@@ -268,10 +296,11 @@ def _install_manifold(tmp_dir: Path, target_folder: Path, _coord: str) -> None:
 def _manifold_sidecar_stem_to_hf_coord(stem: str) -> Optional[str]:
     """Convert a fitted-tensor stem back to its base-model HF coord.
 
-    Mirrors :func:`saklas.io.hf._sidecar_stem_to_hf_coord`: strips any
-    variant suffix (``_sae-<release>`` / ``_from-<safe_src>``) so the
-    ``base_model:`` frontmatter lists the clean base model, then flips
-    ``__`` → ``/``.  Returns ``None`` for stems that don't parse.
+    Strips any variant suffix (``_sae-<release>`` / ``_from-<safe_src>``) so
+    the ``base_model:`` frontmatter lists the clean base model, then decodes
+    the safe stem back to its Hub id through
+    :func:`~saklas.io.paths.unsafe_model_id` (the reversible base64url ``_z``
+    codec).  Returns ``None`` for stems that don't parse.
     """
     from saklas.io.paths import parse_tensor_filename, unsafe_model_id
 
@@ -287,10 +316,9 @@ def _render_manifold_card(
 ) -> str:
     """Build a HF model card (YAML frontmatter + markdown body) for a manifold.
 
-    Parallel to :func:`saklas.io.hf._render_model_card`, but manifold-
-    shaped: the table lists the manifold's domain / node count / fit_mode
-    rather than a recommended alpha.  ``base_model:`` is deduped over the
-    fitted tensor stems.
+    The frontmatter carries ``library_name: saklas``, the discovery tags, and
+    a ``base_model:`` list deduped over the fitted tensor stems; the body
+    table lists the manifold's domain / node count / fit_mode.
     """
     base_models = sorted({
         c for stem in tensor_stems
@@ -349,7 +377,7 @@ def _render_manifold_card(
 
 
 def _manifold_variant_matches(key: str, variant: str) -> bool:
-    """Variant filter for a manifold tensor, mirroring ``push_pack``'s.
+    """Variant filter for a manifold tensor.
 
     ``key`` is the parsed variant slug (``"raw"`` / ``"sae-<release>"`` /
     ``"from-<safe_src>"``); ``variant`` is one of ``"raw"`` / ``"sae"`` /
@@ -377,24 +405,22 @@ def push_manifold(
 ) -> tuple[str, Optional[str]]:
     """Push a manifold folder to HF as a model repo.
 
-    Mirrors :func:`saklas.io.hf.push_pack` exactly in shape — stage a
-    filtered copy (adding README.md + .gitattributes without mutating the
-    source), then one atomic ``upload_folder``.  Returns
+    Stages a filtered copy (adding README.md + .gitattributes without
+    mutating the source), then makes one atomic ``upload_folder``.  Returns
     ``(repo_url, commit_sha)``; ``sha`` is ``None`` on dry-run.
 
     The corpus is *always* uploaded — ``manifold.json`` plus every
     ``nodes/*.json`` — because a manifold can't be re-fit without it.
     Per-model fitted ``<safe>.safetensors`` + ``.json`` sidecars are
-    filtered the way ``push_pack`` filters tensors:
+    filtered two ways:
 
     - ``model_scope`` restricts to one base model (``safe_model_id``).
     - ``variant`` filters tensor flavor: ``"raw"`` (default) only
       unsuffixed, ``"sae"`` only ``_sae-*``, ``"from"`` only ``_from-*``,
       ``"all"`` every variant.  Sidecars follow their partner tensor.
 
-    A staged manifest with no tensors is still a valid push — the
-    corpus alone re-fits on the consumer side, unlike a pack where a
-    tensors-and-statements-empty push is rejected.
+    A staged manifest with no tensors is still a valid push: the corpus
+    alone re-fits on the consumer side.
     """
     from contextlib import ExitStack
     import tempfile
@@ -535,9 +561,8 @@ def push_manifold(
 def search_manifolds(query: Optional[str]) -> list[dict[str, Any]]:
     """Search HF for ``saklas-manifold``-tagged model repos.
 
-    Returns row dicts ready for display — same shape ``search_packs``
-    emits so the webui can reuse its row-rendering machinery.  At most
-    ``_HF_SEARCH_CAP`` rows.  ``query`` is a free-text substring; an
+    Returns row dicts ready for display by the CLI and the webui picker.
+    At most ``_HF_SEARCH_CAP`` rows.  ``query`` is a free-text substring; an
     empty / ``None`` query lists tagged repos by recency.
     """
     api = _hf_api()
@@ -603,7 +628,7 @@ def fetch_manifold_info(
     """Fetch minimal info about an HF saklas-manifold repo without a full pull.
 
     Pulls only ``manifold.json`` plus the repo's file listing — same
-    cheap probe ``hf.fetch_info`` uses for packs.  Returns a dict the
+    cheap single-file probe.  Returns a dict the
     search row renderer can consume; raises :class:`HFError` on
     transport / format failure.
     """
@@ -696,24 +721,36 @@ def install_manifold(
     as_: Optional[str] = None,
     *,
     force: bool = False,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Install a manifold from an HF coord or a local folder.
 
-    Mirrors :func:`saklas.io.cache_ops.install` for packs — top-level
-    orchestration over the HF + folder-copy primitives.  ``target`` is
-    one of:
+    Top-level orchestration over the HF pull and folder-copy primitives.
+    ``target`` is one of:
       * ``<ns>/<name>[@revision]`` — HF pull via :func:`pull_manifold`
       * a local path to a folder — copy install
 
     ``as_`` overrides the destination ``<dst_ns>/<dst_name>`` (must be
     fully qualified — manifold folders are always namespace-rooted).
-    ``force`` overwrites an existing destination.
+    ``force`` overwrites an existing destination.  ``on_progress`` narrates
+    the stages (resolve → download → validate → stage → swap) so a CLI or an
+    SSE client can show more than a spinner while a multi-hundred-megabyte
+    repo lands.
     """
     from saklas.io.paths import manifold_dir
 
+    from saklas.io.selectors import invalidate as invalidate_selector_index
+
+    _report(on_progress, f"Resolving {target}...")
     p = Path(target)
     if p.exists() and p.is_dir():
-        return _install_local_manifold(p, as_=as_, force=force)
+        installed = _install_local_manifold(
+            p, as_=as_, force=force, on_progress=on_progress,
+        )
+        # The installed roster changed; drop the resolver's memoized walks.
+        # (The HF branch below invalidates inside ``pull_manifold``.)
+        invalidate_selector_index()
+        return installed
 
     coord, revision = split_revision(target)
     if "/" not in coord:
@@ -740,16 +777,21 @@ def install_manifold(
         raise ManifoldInstallConflict(
             f"{dst} already exists; pass force=True or as_=<ns>/<name> to relocate"
         )
-    pull_manifold(coord, target_folder=dst, force=force, revision=revision)
+    pull_manifold(
+        coord, target_folder=dst, force=force, revision=revision,
+        on_progress=on_progress,
+    )
     return dst
 
 
 def _install_local_manifold(
     src: Path, *, as_: Optional[str] = None, force: bool = False,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Validate and copy a local manifold folder into the cache."""
     from saklas.io.paths import manifold_dir
 
+    _report(on_progress, f"Validating {src.name}...")
     try:
         ManifoldFolder.load(src)
     except ManifoldFormatError as e:
@@ -799,6 +841,7 @@ def _install_local_manifold(
                 )
 
             def _build(staging: Path) -> None:
+                _report(on_progress, f"Staging {src.name}...")
                 shutil.copytree(source_path, staging, dirs_exist_ok=True)
                 try:
                     staged = ManifoldFolder.load(staging)
@@ -821,6 +864,8 @@ def _install_local_manifold(
                         f"{src}: staged local manifold failed re-validation "
                         f"after destination rename ({exc})"
                     ) from exc
+                # The swap follows immediately once ``build`` returns.
+                _report(on_progress, f"Installing {src.name} into {dst.name}...")
 
             def _swap() -> Path:
                 return stage_verify_swap(

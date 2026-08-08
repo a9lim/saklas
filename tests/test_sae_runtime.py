@@ -47,16 +47,16 @@ def _session() -> SaklasSession:
     session._sae_feature_meta = {
         "2": {"label": "feature two", "max_act": 10.0, "checked": True},
     }
-    session._live_sae = None
-    session._sae_probes = {}
-    session._sae_step_stash = None
-    session._last_sae_step_readings = None
+    session._sae_instrument.live = None
+    session._sae_instrument.probes = {}
+    session._sae_instrument.step_stash = None
+    session._sae_instrument.last_step_readings = None
     session._profiles = {}
     session._probe_hash_cache = {}
     session._analytics_cpu_cache = {}
     session._readout_long_tensor_cache = {}
     session._capture = _Capture(torch.tensor([0.2, 3.0, 5.0, 1.0]))
-    session._live_sae_active_for_generation = True
+    session._sae_instrument.active_for_generation = True
     session._invalidate_prefix_cache = lambda: None  # type: ignore[method-assign]
     session._invalidate_analytics_cache = lambda: None  # type: ignore[method-assign]
     return cast(SaklasSession, session)
@@ -141,10 +141,10 @@ def test_sae_feature_validation_and_decoder_row_registration() -> None:
 
 def test_live_sae_readout_and_probe_share_one_encoder_result() -> None:
     session = _session()
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
-    assert session.enable_live_sae() == {"layer": 1}
+    assert session._sae_instrument.enable_live() == {"layer": 1}
     readout = session._live_sae_readout_step(top_k=3)
     assert readout == [
         (2, 5.0, "feature two", 10.0),
@@ -153,17 +153,18 @@ def test_live_sae_readout_and_probe_share_one_encoder_result() -> None:
     ]
     # The probe channel is normalized strength — activation / maxActApprox —
     # while the readout row keeps the raw activation beside the unit.
-    reading = session._last_sae_step_readings["sae/2"]  # type: ignore[index]
-    assert reading.coords == (0.5,)
-    assert reading.coords_per_layer == {1: (0.5,)}
+    reading = session._sae_instrument.last_step_readings["sae/2"]  # type: ignore[index]
+    assert reading.value == 0.5
+    assert reading.unit == "activation_over_max"
+    assert reading.per_layer == {1: 0.5}
 
 
 def test_live_sae_readout_seeds_topk_raw_values_for_pinned_probes() -> None:
     session = _session()
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
-    session.enable_live_sae()
+    session._sae_instrument.enable_live()
     seen_raw: dict[int, float] = {}
     original = session._sae_instrument.probe_values
 
@@ -187,18 +188,19 @@ def test_live_sae_readout_seeds_topk_raw_values_for_pinned_probes() -> None:
 
 def test_sae_probe_without_metadata_reads_raw_activation() -> None:
     session = _session()
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
-    session.enable_live_sae()
+    session._sae_instrument.enable_live()
     session._live_sae_readout_step(top_k=1)
-    reading = session._last_sae_step_readings["sae/1"]  # type: ignore[index]
-    assert reading.coords == (3.0,)
+    reading = session._sae_instrument.last_step_readings["sae/1"]  # type: ignore[index]
+    assert reading.value == 3.0
+    assert reading.unit == "raw_activation"
 
 
 def test_sae_gate_scalar_stashes_activations_for_live_step() -> None:
     session = _session()
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
     scalars = session._score_sae_gate_scalars(step_id=6)
@@ -209,16 +211,16 @@ def test_sae_gate_scalar_stashes_activations_for_live_step() -> None:
     # never a silently-constant comparison.
     assert "sae/1:fraction" not in scalars
     assert "sae/1:membership" not in scalars
-    assert session._sae_step_stash is not None
-    assert session._sae_step_stash["step"] == 6
+    assert session._sae_instrument.step_stash is not None
+    assert session._sae_instrument.step_stash["step"] == 6
 
 
 def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
     session = _session()
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
-    session.enable_live_sae()
+    session._sae_instrument.enable_live()
     calls = 0
     original = session._encode_sae_hidden
 
@@ -235,16 +237,18 @@ def test_sae_gate_scalar_and_live_step_share_one_encoder_result() -> None:
     assert calls == 1
     assert scalars["sae/2"] == pytest.approx(0.5)
     assert readout is not None
-    assert session._last_sae_step_readings is not None
-    assert session._last_sae_step_readings["sae/2"].coords == pytest.approx((0.5,))
+    assert session._sae_instrument.last_step_readings is not None
+    assert session._sae_instrument.last_step_readings["sae/2"].value == (
+        pytest.approx(0.5)
+    )
 
 
 def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
     session = _session()
-    session._sae_probes["sae/0"] = {
+    session._sae_instrument.probes["sae/0"] = {
         "feature_id": 0, "layer": 1, "label": None, "max_act": None,
     }
-    session.enable_live_sae()  # Feature 2 wins the one-wide generation readout.
+    session._sae_instrument.enable_live()  # Feature 2 wins the one-wide generation readout.
     seen_raw: dict[int, float] = {}
     original = session._sae_instrument.probe_values
 
@@ -266,30 +270,32 @@ def test_sae_gate_raw_values_seed_live_probe_reads_outside_topk() -> None:
     assert scalars["sae/0"] == pytest.approx(0.2)
     assert readout is not None
     assert seen_raw[0] == pytest.approx(0.2)
-    assert session._last_sae_step_readings is not None
-    assert session._last_sae_step_readings["sae/0"].coords == pytest.approx((0.2,))
+    assert session._sae_instrument.last_step_readings is not None
+    assert session._sae_instrument.last_step_readings["sae/0"].value == (
+        pytest.approx(0.2)
+    )
 
 
 def test_sae_probe_values_reuse_feature_selector_tensor() -> None:
     session = _session()
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
     latest = session._capture.latest_per_layer()
     acts = session._encode_sae_hidden(latest[1])
 
-    first = session._score_sae_probes(activations=acts)
+    first = session._sae_instrument.score_probes_from_activations(acts)
     first_ids = {
         key: id(value)
         for key, value in session._readout_long_tensor_cache.items()
     }
-    second = session._score_sae_probes(activations=acts)
+    second = session._sae_instrument.score_probes_from_activations(acts)
 
-    assert first["sae/1"].coords == second["sae/1"].coords
-    assert first["sae/2"].coords == second["sae/2"].coords
+    assert first["sae/1"].value == second["sae/1"].value
+    assert first["sae/2"].value == second["sae/2"].value
     assert first_ids
     assert {
         key: id(value)
@@ -299,7 +305,7 @@ def test_sae_probe_values_reuse_feature_selector_tensor() -> None:
 
 def test_sae_gate_scalar_is_normalized_when_metadata_known() -> None:
     session = _session()
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
     scalars = session._score_sae_gate_scalars()
@@ -308,10 +314,10 @@ def test_sae_gate_scalar_is_normalized_when_metadata_known() -> None:
 
 def test_sae_gate_scalar_scores_only_referenced_probe() -> None:
     session = _session()
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
 
@@ -324,8 +330,13 @@ def test_sae_gate_scalar_scores_only_referenced_probe() -> None:
 
 def test_composer_detects_attached_sae_gate() -> None:
     stub = SimpleNamespace(
-        _sae_probes={"sae/2": {"feature_id": 2}},
-        _lens_probes={},
+        instruments={
+            "geometry": SimpleNamespace(names=[], validate_gate=lambda _r: None),
+            "lens": SimpleNamespace(names=[], validate_gate=lambda _r: None),
+            "sae": SimpleNamespace(
+                names=["sae/2"], validate_gate=lambda _r: None,
+            ),
+        },
         _monitor=SimpleNamespace(probe_names=()),
     )
     composer = SteeringComposer(stub)  # type: ignore[arg-type]
@@ -340,16 +351,16 @@ def test_unsupported_sae_gate_channel_raises_at_preflight() -> None:
     from saklas.core.errors import UnsupportedProbeChannelError
     from saklas.core.instruments.sae import SaeInstrument
 
-    stub = SimpleNamespace(
-        _lens_probes={},
-        _monitor=SimpleNamespace(probe_names=()),
-    )
+    stub = SimpleNamespace(_monitor=SimpleNamespace(probe_names=()))
     instrument = SaeInstrument(stub)  # type: ignore[arg-type]
     instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": None, "max_act": None,
     }
-    stub._sae_instrument = instrument
-    stub._sae_probes = instrument.probes
+    stub.instruments = {
+        "geometry": SimpleNamespace(names=[], validate_gate=lambda _r: None),
+        "lens": SimpleNamespace(names=[], validate_gate=lambda _r: None),
+        "sae": instrument,
+    }
     composer = SteeringComposer(stub)  # type: ignore[arg-type]
     steering = parse_expr("0.3 sae/2@when:sae/2:membership>0.5")
     composer._stack.append(dict(steering.alphas))  # type: ignore[arg-type]
@@ -477,8 +488,8 @@ def test_stream_aggregate_keeps_lens_and_sae_probe_readings() -> None:
     }
     session = SimpleNamespace(
         monitor=SimpleNamespace(probe_names=("confident.uncertain",)),
-        lens_probe_names=["jlens/fake"],
-        sae_probe_names=["sae/548"],
+        lens=SimpleNamespace(names=["jlens/fake"]),
+        sae=SimpleNamespace(names=["sae/548"]),
     )
     result = SimpleNamespace(probe_readings=readings)
     out = probe_reading_aggregate(session, result)  # type: ignore[arg-type]
@@ -492,7 +503,7 @@ def test_fetch_sae_feature_meta_batch_caches_and_updates_probes(
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
     session = _session()
     session._model_info = {"model_id": "org/model"}
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
     session._probe_hash_cache["sae/1"] = "stale"
@@ -513,7 +524,7 @@ def test_fetch_sae_feature_meta_batch_caches_and_updates_probes(
     assert out["2"] == {"label": "feature two", "max_act": 10.0}
     assert "3" not in out and "99" not in out
     # The attached probe's spec + hash cache reflect the new unit.
-    assert session._sae_probes["sae/1"]["max_act"] == 4.0
+    assert session._sae_instrument.probes["sae/1"]["max_act"] == 4.0
     assert "sae/1" not in session._probe_hash_cache
     # Persisted — a fresh load sees the merged cache.
     from saklas.io.sae import load_sae_feature_meta
@@ -533,7 +544,7 @@ def test_sae_registry_lock_snapshots_idle_reads() -> None:
 
     session = _session()
     inst = session._sae_instrument
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
     session._probe_hash_cache = {}
@@ -546,7 +557,7 @@ def test_sae_registry_lock_snapshots_idle_reads() -> None:
     assert inst.try_detach("sae/1") is False
 
     # And the removal path serializes on the registry lock.
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
     entered = threading.Event()
@@ -578,7 +589,7 @@ def test_bound_run_freezes_sae_unit_against_metadata_backfill() -> None:
     session = _session()
     inst = session._sae_instrument
     # Attached before any metadata exists: the unit is raw at bind time.
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
     acts = session._encode_sae_hidden(
@@ -613,7 +624,7 @@ def test_sae_bind_resolves_unit_from_meta_cache() -> None:
     inst = session._sae_instrument
     # Feature 2's unit (10.0) is already in the fixture's meta cache; the
     # spec itself carries no max_act (validate-time fetch never ran).
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": None, "max_act": None,
     }
     acts = session._encode_sae_hidden(
@@ -635,7 +646,7 @@ def test_sae_gate_keys_none_vs_empty_contract() -> None:
     """``gate_keys=None`` scores the full roster; an explicit ``set()``
     scores nothing.  The SAE member of the three-family contract pin."""
     session = _session()
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": "feature two", "max_act": 10.0,
     }
     inst = session._sae_instrument
@@ -652,7 +663,7 @@ def test_sae_negative_step_observe_never_caches() -> None:
 
     session = _session()
     inst = session._sae_instrument
-    session._sae_probes["sae/2"] = {
+    session._sae_instrument.probes["sae/2"] = {
         "feature_id": 2, "layer": 1, "label": None, "max_act": 10.0,
     }
     prep = inst.prepare(ReadRequest(final_aggregate=True))
@@ -681,7 +692,7 @@ def test_detach_during_bound_generation_keeps_aggregate_roster() -> None:
 
     session = _session()
     inst = session._sae_instrument
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
     prep = inst.prepare(ReadRequest(final_aggregate=True))
@@ -698,21 +709,70 @@ def test_detach_during_bound_generation_keeps_aggregate_roster() -> None:
     assert readings == {}  # the removal applies at the next boundary
 
 
+def test_score_probes_entries_are_disjoint() -> None:
+    """Two entries, no placeholder argument: ``score_probes`` takes capture
+    slices and encodes them, ``score_probes_from_activations`` takes this
+    forward's encode.  Both land the same reading."""
+    session = _session()
+    inst = session._sae_instrument
+    session._sae_instrument.probes["sae/2"] = {
+        "feature_id": 2, "layer": 1, "label": None, "max_act": 10.0,
+    }
+    hidden = session._capture.latest_per_layer()
+    acts = session._encode_sae_hidden(hidden[1])
+
+    from_slices = inst.score_probes(hidden)
+    from_acts = inst.score_probes_from_activations(acts)
+    assert from_slices["sae/2"].value == pytest.approx(
+        from_acts["sae/2"].value,
+    )
+    # A layer the resident hook does not cover reads nothing.
+    assert inst.score_probes({7: hidden[1]}) == {}
+
+
+def test_bound_run_reads_its_bind_time_live_snapshot() -> None:
+    """The lens's live-state discipline, mirrored: a bound run reads the
+    live-discovery config its generation started with, so a toggle from
+    another thread cannot flip a running generation mid-stream.  Idle runs
+    pass the current config through."""
+    from saklas.core.instruments.types import ReadRequest
+
+    session = _session()
+    inst = session._sae_instrument
+    inst.enable_live()
+    live_at_bind = dict(inst.live or {})
+    assert live_at_bind
+
+    prep = inst.prepare(ReadRequest(final_aggregate=True, live=True))
+    inst.bind(inst.plan(prep), prep)
+    assert inst._measurement_live() == live_at_bind
+
+    # A concurrent library caller flips the toggle mid-generation.
+    inst.disable_live()
+    assert inst.live is None
+    assert inst._measurement_live() == live_at_bind
+    assert inst.live_readout_step(top_k=2, step_id=0) is not None
+
+    inst.close_run()  # generation boundary: the idle run passes through
+    assert inst._measurement_live() is None
+    assert inst.live_readout_step(top_k=2, step_id=0) is None
+
+
 def test_idle_observe_never_memoizes_stale_readings() -> None:
     """The idle passthrough run persists indefinitely, so ``observe`` must
     not key a memo on ``step_id`` alone — a repeated step with different
     hidden states returns fresh readings."""
     session = _session()
     inst = session._sae_instrument
-    session._sae_probes["sae/1"] = {
+    session._sae_instrument.probes["sae/1"] = {
         "feature_id": 1, "layer": 1, "label": None, "max_act": None,
     }
     run = inst.current_run
     assert run.bound is False
     first = run.observe(0, {1: torch.tensor([0.2, 3.0, 5.0, 1.0])})
     second = run.observe(0, {1: torch.tensor([0.2, 8.0, 5.0, 1.0])})
-    assert first["sae/1"].coords == (3.0,)
-    assert second["sae/1"].coords == (8.0,)
+    assert first["sae/1"].value == 3.0
+    assert second["sae/1"].value == 8.0
 
 
 @pytest.mark.parametrize("max_act", [float("nan"), float("inf")])

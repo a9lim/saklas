@@ -233,6 +233,18 @@ def test_requires_contexts():
         create_template_folder("local", "bad", slot=SLOT, values=VALUES, contexts=[])
 
 
+def test_rejects_values_colliding_on_one_label():
+    # Distinct strings, one node label — the webui's client-side validator
+    # (webui/src/lib/templates.ts) mirrors this rule, so keep the engine
+    # side pinned.
+    with pytest.raises(TemplateFormatError, match="collides"):
+        create_template_folder(
+            "local", "cities", slot="[CITY]", values=["New York", "new-york"],
+            contexts=[{"turns": [{"role": "user", "content": "where?"}],
+                       "assistant": "in [CITY]"}],
+        )
+
+
 def test_rejects_value_slugging_to_invalid_label():
     with pytest.raises(TemplateFormatError, match="not a valid node label"):
         create_template_folder(

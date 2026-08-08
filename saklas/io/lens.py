@@ -26,7 +26,6 @@ import logging
 import os
 import struct
 import threading
-import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +37,19 @@ from safetensors import safe_open
 
 from saklas.core.jlens import JacobianLens
 from saklas.io.atomic import artifact_lock, fsync_directory, write_json_atomic
+from saklas.io.shards import (
+    fit_lock,
+    generation_path as _new_layer_generation,
+    json_pointer_matches as _json_pointer_matches,
+    representative_shard_path,
+    shard_paths,
+)
 
 log = logging.getLogger(__name__)
 
 LENS_FORMAT_VERSION = 6
+# Artifact label for the shared shard primitive's error/log wording.
+_LENS_LABEL = "J-lens"
 _LENS_NAME = "jlens"
 _LENS_CHECKPOINT_NAME = "jlens.partial"
 _LENS_METHOD = "jlens_cotangent_sum"
@@ -91,16 +99,6 @@ def _proof_matches(
     return proof == _lens_payload_proof(anchor, sidecar) if proof is not None else False
 
 
-def _json_pointer_matches(path: Path, payload: Mapping[str, Any]) -> bool:
-    """Whether an exception escaped after this exact pointer was replaced."""
-    try:
-        with open(path) as handle:
-            current = json.load(handle)
-        return current == payload
-    except (OSError, json.JSONDecodeError, TypeError):
-        return False
-
-
 def _lens_anchor_paths(model_id: str) -> tuple[Path, Path]:
     """Stable lock anchor and atomic durable pointer."""
     from saklas.io.lens_sources import local_lens_dir
@@ -121,48 +119,26 @@ def _checkpoint_anchor_paths(model_id: str) -> tuple[Path, Path]:
 
 def _sidecar_tensor_path(anchor: Path, sidecar: Mapping[str, Any]) -> Path:
     """Resolve a representative generation for path-reporting compatibility."""
-    shard_files = sidecar.get("tensor_files")
-    if isinstance(shard_files, Mapping) and shard_files:
-        try:
-            first_key = min(shard_files, key=lambda key: int(str(key)))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("invalid lens tensor shard keys") from exc
-        filename = shard_files[first_key]
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or Path(filename).name != filename
-        ):
-            raise ValueError("invalid lens tensor shard filename")
-        return anchor.parent / filename
-    raise ValueError("lens sidecar has no tensor shard map")
+    return representative_shard_path(anchor, sidecar, label=_LENS_LABEL)
 
 
 def _sidecar_tensor_paths(
     anchor: Path, sidecar: Mapping[str, Any], source_layers: list[int], *,
     require_exact_keys: bool = True,
 ) -> dict[int, Path]:
-    """Resolve every declared layer to its immutable tensor generation."""
-    shard_files = sidecar.get("tensor_files")
-    if not isinstance(shard_files, Mapping):
-        raise ValueError("invalid lens tensor_files mapping")
-    out: dict[int, Path] = {}
-    for layer in source_layers:
-        filename = shard_files.get(str(layer))
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or Path(filename).name != filename
-        ):
-            raise ValueError(f"missing or invalid tensor shard for layer {layer}")
-        out[layer] = anchor.parent / filename
-    if (
-        require_exact_keys
-        and {str(layer) for layer in source_layers}
-        != {str(key) for key in shard_files}
-    ):
-        raise ValueError("tensor shard keys do not match source_layers")
-    return out
+    """Resolve every declared layer to its immutable tensor generation.
+
+    ``require_exact_keys=False`` materializes a subset of a wider pointer —
+    the same-corpus layer-subset no-op read leaves the durable pointer and its
+    full layer union untouched.
+    """
+    return shard_paths(
+        anchor,
+        sidecar,
+        source_layers,
+        label=_LENS_LABEL,
+        require_exact_keys=require_exact_keys,
+    )
 
 
 def _public_pointer_paths(
@@ -233,7 +209,7 @@ def lens_payloads_match(
     model_id: str, sidecar: Mapping[str, Any], *, checkpoint: bool = False,
 ) -> bool:
     """Validate exact payload digests without materializing fp32 matrices."""
-    from saklas.io.packs import hash_file
+    from saklas.io.integrity import hash_file
 
     try:
         paths = lens_tensor_paths(model_id, sidecar, checkpoint=checkpoint)
@@ -253,14 +229,8 @@ def lens_payloads_match(
 def lens_fit_lock(model_id: str):
     """Serialize the complete per-model fit/lifecycle transaction cross-process."""
     anchor, _ = _lens_anchor_paths(model_id)
-    with artifact_lock(anchor.parent / "jlens.fit"):
+    with fit_lock(anchor):
         yield
-
-
-def _new_layer_generation(anchor: Path, layer: int) -> Path:
-    return anchor.with_name(
-        f"{anchor.stem}.layer-{int(layer)}.gen-{uuid.uuid4().hex}{anchor.suffix}",
-    )
 
 
 def _referenced_tensor_names(model_folder: Path) -> set[str] | None:
@@ -744,7 +714,7 @@ def _save_lens_components(
                 ts_path, current, current_layers,
             )
             current_digests = current["tensor_sha256"]
-            from saklas.io.packs import hash_file
+            from saklas.io.integrity import hash_file
             pointer_verified = _proof_matches(
                 verified_reuse_proof, ts_path, current,
             )
@@ -1300,11 +1270,18 @@ def remove_lens(model_id: str) -> bool:
             except OSError as exc:
                 log.warning("could not remove J-lens tensor %s: %s", path, exc)
         fsync_directory(final_anchor.parent)
-        from saklas.io.lens_sources import lens_active_path, load_active_lens_source
+        # Unpublish the selection when it named the lens just deleted, so it
+        # can never outlive what it points at.  The registry owns the payload
+        # shape.
+        from saklas.io.lens_sources import (
+            LENS_SOURCES, lens_root, load_active_lens_source,
+        )
 
         active = load_active_lens_source(model_id)
         if active is not None and active["kind"] == "local":
-            lens_active_path(model_id).unlink(missing_ok=True)
+            LENS_SOURCES.clear_if_active(
+                lens_root(model_id), model_id, "local", active["name"],
+            )
         return removed
 
 

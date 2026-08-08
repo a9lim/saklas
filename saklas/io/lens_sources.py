@@ -13,7 +13,6 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-import re
 from typing import Any
 
 import torch
@@ -21,12 +20,20 @@ import yaml
 
 from saklas.core.jlens import JacobianLens
 from saklas.io.atomic import artifact_lock, write_json_atomic
+# The three Hub indirections are imported (not redefined) so ``io.hf`` stays
+# the single monkeypatchable HF seam; tests patch them on this module.
+from saklas.io.hf import _hf_api, _hf_hub_download, _hf_snapshot_download
+from saklas.io.integrity import NAME_REGEX
 from saklas.io.paths import ensure_within, model_dir
+from saklas.io.source_registry import ActiveSourceRegistry
 
 LENS_SOURCE_FORMAT_VERSION = 1
 NEURONPEDIA_REPO = "neuronpedia/jacobian-lens"
 NEURONPEDIA_BINDING = "neuronpedia"
-_LOCAL_NAME_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
+_LOCAL_NAME_RE = NAME_REGEX
+# The local-source grammar prefix, spelled once (the external tier addresses
+# its single binding by bare name).
+LOCAL_SOURCE_PREFIX = "local:"
 
 
 def lens_root(model_id: str) -> Path:
@@ -53,29 +60,37 @@ def lens_active_path(model_id: str) -> Path:
     return lens_root(model_id) / "active.json"
 
 
+def _validate_source_name(kind: str, name: str) -> None:
+    """Both J-lens kinds are addressed by a Saklas artifact-name slug."""
+    del kind
+    if _LOCAL_NAME_RE.fullmatch(name) is None:
+        raise ValueError(f"invalid J-lens source name {name!r}")
+
+
+def _source_exists(root: Path, kind: str, name: str) -> bool:
+    """Whether the named source is on disk, so a selection can never dangle."""
+    if kind == "local":
+        return (root / "local" / name / "manifest.json").exists()
+    return (root / "bindings" / f"{name}.json").exists()
+
+
+#: The active-source selection, shared implementation with the SAE family.
+LENS_SOURCES = ActiveSourceRegistry(
+    label="J-lens",
+    format_version=LENS_SOURCE_FORMAT_VERSION,
+    kinds=("local", "huggingface"),
+    validate_name=_validate_source_name,
+    exists=_source_exists,
+)
+
+
 def _active_payload(model_id: str, kind: str, name: str) -> dict[str, Any]:
-    return {
-        "format_version": LENS_SOURCE_FORMAT_VERSION,
-        "model_id": model_id,
-        "kind": kind,
-        "name": name,
-    }
+    return LENS_SOURCES.payload(model_id, kind, name)
 
 
 def set_active_lens_source(model_id: str, kind: str, name: str) -> Path:
-    if kind not in {"local", "huggingface"}:
-        raise ValueError(f"unknown J-lens source kind {kind!r}")
-    if _LOCAL_NAME_RE.fullmatch(name) is None:
-        raise ValueError(f"invalid J-lens source name {name!r}")
-    if kind == "local":
-        if not (local_lens_dir(model_id, name) / "manifest.json").exists():
-            raise FileNotFoundError(f"local J-lens {name!r} is not fitted")
-    elif not lens_binding_path(model_id, name).exists():
-        raise FileNotFoundError(f"external J-lens binding {name!r} is not fetched")
-    path = lens_active_path(model_id)
-    with artifact_lock(path):
-        write_json_atomic(path, _active_payload(model_id, kind, name))
-    return path
+    """Select the runtime J-lens source (locked, validated, existing)."""
+    return LENS_SOURCES.write(lens_root(model_id), model_id, kind, name)
 
 
 def set_active_local_lens(model_id: str, name: str = "default") -> Path:
@@ -84,24 +99,8 @@ def set_active_local_lens(model_id: str, name: str = "default") -> Path:
 
 
 def load_active_lens_source(model_id: str) -> dict[str, Any] | None:
-    path = lens_active_path(model_id)
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    if (
-        not isinstance(payload, dict)
-        or set(payload) != {"format_version", "model_id", "kind", "name"}
-        or payload.get("format_version") != LENS_SOURCE_FORMAT_VERSION
-        or payload.get("model_id") != model_id
-        or payload.get("kind") not in {"local", "huggingface"}
-        or not isinstance(payload.get("name"), str)
-        or _LOCAL_NAME_RE.fullmatch(payload["name"]) is None
-    ):
-        return None
-    return payload
+    """The validated ``{format_version, model_id, kind, name}`` selection."""
+    return LENS_SOURCES.read(lens_root(model_id), model_id)
 
 
 def _model_commit(config: Any) -> str | None:
@@ -123,24 +122,6 @@ def _config_dimensions(config: Any) -> tuple[int | None, int | None]:
         int(hidden) if isinstance(hidden, int) and not isinstance(hidden, bool) else None,
         int(layers) if isinstance(layers, int) and not isinstance(layers, bool) else None,
     )
-
-
-def _snapshot_download(*args: Any, **kwargs: Any) -> str:
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(*args, **kwargs)
-
-
-def _hf_hub_download(*args: Any, **kwargs: Any) -> str:
-    from huggingface_hub import hf_hub_download
-
-    return hf_hub_download(*args, **kwargs)
-
-
-def _hf_api() -> Any:
-    from huggingface_hub import HfApi
-
-    return HfApi()
 
 
 @dataclass(frozen=True)
@@ -390,7 +371,7 @@ def fetch_neuronpedia_lens(
         raise ValueError(f"could not resolve model dimensions for {model_id}")
 
     root = Path(
-        _snapshot_download(
+        _hf_snapshot_download(
             repo_id,
             revision=repo_revision,
             allow_patterns=[f"*/jlens/{dataset}/config.yaml"],
@@ -558,11 +539,27 @@ def list_lens_sources(model_id: str) -> list[dict[str, Any]]:
     return rows
 
 
+def lens_source_label(active: dict[str, Any]) -> str:
+    """Render a selection back into the public source grammar.
+
+    ``local:<name>`` for a Saklas-fitted lens, the bare provider name for an
+    external binding — the inverse of :func:`use_lens_source`, and the SAE
+    family's :func:`saklas.io.sae.sae_source_release` twin.  This is the ONE
+    place the lens prefix convention is applied.
+    """
+    if active["kind"] == "local":
+        return f"{LOCAL_SOURCE_PREFIX}{active['name']}"
+    return str(active["name"])
+
+
 def use_lens_source(model_id: str, source: str) -> Path:
+    """Select a source from the public ``local:NAME`` / ``neuronpedia`` grammar."""
     source = source.strip()
-    if source.startswith("local:"):
-        return set_active_lens_source(model_id, "local", source[6:])
-    if source == "neuronpedia":
+    if source.startswith(LOCAL_SOURCE_PREFIX):
+        return set_active_lens_source(
+            model_id, "local", source[len(LOCAL_SOURCE_PREFIX):],
+        )
+    if source == NEURONPEDIA_BINDING:
         return set_active_lens_source(
             model_id,
             "huggingface",
@@ -577,11 +574,12 @@ def remove_external_lens_binding(
 ) -> bool:
     """Forget an external binding without touching its provider cache."""
     path = lens_binding_path(model_id, name)
-    active_path = lens_active_path(model_id)
-    with artifact_lock(path), artifact_lock(active_path):
-        active = load_active_lens_source(model_id)
+    with artifact_lock(path):
         removed = path.exists()
         path.unlink(missing_ok=True)
-        if active is not None and active["kind"] == "huggingface" and active["name"] == name:
-            active_path.unlink(missing_ok=True)
-        return removed
+    # Unpublish after the binding is gone, so the selection can never outlive
+    # what it points at.  The registry owns the payload shape.
+    LENS_SOURCES.clear_if_active(
+        lens_root(model_id), model_id, "huggingface", name,
+    )
+    return removed

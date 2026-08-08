@@ -15,16 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ConfigDict, Field
 
-from saklas.core.manifold import domain_from_spec, manifold_is_affine
-from saklas.core.session import (
-    ConcurrentExtractionError,
-    SaklasSession,
-)
+from saklas.core.manifold import domain_from_spec
+from saklas.core.session import SaklasSession
 from saklas.io.hf_manifolds import (
     HFError as ManifoldHFError,
     ManifoldInstallConflict,
@@ -50,8 +48,21 @@ from saklas.io.manifolds import (
 from saklas.io.paths import manifold_dir
 from saklas.io.templates import AmbiguousTemplateError, TemplateNotFoundError
 from saklas.server.app import acquire_session_lock
-from saklas.server.native_common import NativeRequest
-from saklas.server.sse import ProgressCallback, progress_sse_response
+from saklas.server.native_common import (
+    NativeRequest,
+    extraction_error_frame,
+    extraction_json_errors,
+    refuse_if_busy,
+)
+from saklas.server.response_models import (
+    ManifoldDeleteResponse,
+    ManifoldFitInfo,
+    ManifoldInfo,
+    ManifoldListResponse,
+    ManifoldSearchResponse,
+    RemoteManifoldInfo,
+)
+from saklas.server.sse import ProgressCallback, sse_or_json
 
 log = logging.getLogger("saklas.api")
 
@@ -267,13 +278,40 @@ def _resolve_intrinsic_dim(mf: ManifoldFolder, session_stem: str) -> tuple[int, 
     return 0, mf.domain
 
 
+def _fitted_geometry(path: Path) -> tuple[list[list[float]], bool | None]:
+    """Read a fitted tensor's shared layout + flat/curved family cheaply.
+
+    Returns ``(node_coords, is_affine)``.  Both answers live in the
+    safetensors *header* plus one small ``(K, n)`` entry, so this opens the
+    file lazily instead of deserializing the whole per-layer
+    ``mean``/``basis``/RBF payload the way ``load_manifold`` does — the list
+    route calls this once per installed manifold.
+
+    The flat/curved discriminator is the same one ``load_manifold`` keys on:
+    the *absence* of any ``layer_<L>.node_params`` entry marks an affine fit.
+    ``([], None)`` when the artifact is missing or unreadable — the caller
+    reports an unresolved geometry rather than failing the whole listing.
+    """
+    from safetensors import SafetensorError, safe_open
+
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            keys = set(tensors.keys())
+            if "node_coords" not in keys:
+                return [], None
+            is_affine = not any(k.endswith(".node_params") for k in keys)
+            coords = tensors.get_tensor("node_coords")
+    except (OSError, SafetensorError, ValueError, KeyError):
+        return [], None
+    return [[float(x) for x in row] for row in coords.tolist()], is_affine
+
+
 def _manifold_json(
-    namespace: str,
     mf: ManifoldFolder,
     session: SaklasSession,
     *,
     full: bool,
-) -> dict[str, Any]:
+) -> ManifoldInfo:
     """Serialize a :class:`ManifoldFolder` for the wire.
 
     The session-independent fields come straight from
@@ -293,8 +331,7 @@ def _manifold_json(
     ``full`` adds per-node statements and per-tensor fit detail — the
     list route omits both to stay light.
     """
-    folder = manifold_dir(namespace, mf.name)
-    out: dict[str, Any] = manifold_summary(folder)
+    out = cast(ManifoldInfo, manifold_summary(mf.folder))
 
     from saklas.io.paths import tensor_filename
 
@@ -323,25 +360,19 @@ def _manifold_json(
     node_roles_padded = out["node_roles"]
 
     # For fitted discover folders the derived per-model coords live in
-    # the safetensors, not on the folder.  Load them once and share
+    # the safetensors, not on the folder.  Read them once and share
     # between the list-level ``node_coords`` field and the detail-level
     # ``nodes`` block — the list shape needs them so the manifold rack
     # strip's snap-to-node action can sync the position sliders to the
     # picked node's actual coords (otherwise label-form selections show
-    # zeros on every axis).  Cheap (one safetensors header read).
+    # zeros on every axis).  Header + one small entry, not a full
+    # per-layer deserialization (see :func:`_fitted_geometry`).
     derived_coords: list[list[float]] = []
     resolved_affine: bool | None = None
     if fitted_for_session and mf.is_discover:
-        from saklas.io.manifold_tensors import load_manifold
-        try:
-            m = load_manifold(mf.tensor_path(session_stem))
-            derived_coords = [
-                [float(x) for x in row]
-                for row in m.node_coords.tolist()
-            ]
-            resolved_affine = manifold_is_affine(m)
-        except (FileNotFoundError, KeyError, ValueError):
-            derived_coords = []
+        derived_coords, resolved_affine = _fitted_geometry(
+            mf.tensor_path(session_stem),
+        )
 
     # Session-aware geometry override.  ``manifold_summary`` reports the
     # empty/discover form for a discover folder (no session, no per-model
@@ -413,13 +444,13 @@ def _manifold_json(
                 }
                 for i, label in enumerate(mf.node_labels)
             ]
-        fitted: list[dict[str, Any]] = []
+        fitted: list[ManifoldFitInfo] = []
         for stem in fitted_models:
             try:
                 sc = mf.sidecar(stem)
             except KeyError:
                 continue
-            entry: dict[str, Any] = {
+            entry: ManifoldFitInfo = {
                 "stem": stem,
                 "method": sc.method,
                 "feature_space": sc.feature_space,
@@ -437,35 +468,22 @@ def _manifold_json(
     return out
 
 
-def _find_manifold(
-    namespace: str, name: str,
-) -> tuple[str, ManifoldFolder]:
-    """Locate one manifold by namespace + name, or 404."""
+def _find_manifold(namespace: str, name: str) -> ManifoldFolder:
+    """Locate one manifold by namespace + name, or 404.
+
+    The folder carries its own path (and therefore its namespace), so the
+    caller reads identity off the returned object rather than threading the
+    request's namespace string alongside it.
+    """
     folder = manifold_dir(namespace, name)
     if not (folder / "manifold.json").exists():
         raise HTTPException(404, f"manifold {namespace}/{name} not found")
     try:
-        return namespace, ManifoldFolder.load(folder, verify_manifest=False)
+        return ManifoldFolder.load(folder, verify_manifest=False)
     except ManifoldFormatError as e:
         raise HTTPException(
             400, f"manifold {namespace}/{name} is malformed: {e}",
         ) from e
-
-
-def _refuse_if_busy(session: SaklasSession) -> None:
-    """Raise 409 when the engine gen-lock is held.
-
-    ``session.lock`` (the asyncio HTTP serializer) orders manifold
-    mutations against each other and the JSON fit path, but an SSE fit
-    whose request was cancelled leaves its worker thread — and the
-    ``gen_lock`` it holds — alive past the cancel.  A non-blocking probe
-    of ``gen_lock`` refuses a folder mutation while that thread runs.
-    """
-    if not session.gen_lock.acquire(blocking=False):
-        raise HTTPException(
-            409, "a model operation is in flight; retry shortly",
-        )
-    session.gen_lock.release()
 
 
 def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
@@ -482,6 +500,34 @@ def _evict_manifold(session: SaklasSession, namespace: str, name: str) -> None:
             session.manifolds.pop(key, None)
 
 
+def _install_error_frame(exc: Exception) -> dict[str, Any] | None:
+    """SSE ``error``-frame body for a typed install failure.
+
+    The two ``SaklasError`` install failures carry their own safe messages
+    through ``user_message()``, and a ``ValueError`` here is always an
+    argument-shape rejection (the ``as_`` grammar / ``NAME_REGEX``), so both
+    surface verbatim — the same statuses and texts the JSON branch returns.
+    Everything else, ``FileNotFoundError`` above all (its message is a
+    filesystem path), routes to the shared catch-all scrubber.
+    """
+    if isinstance(exc, HTTPException):
+        # The only ``HTTPException`` the install job raises is
+        # ``refuse_if_busy``'s engine-busy 409, whose detail is a fixed
+        # retry-shortly string.
+        return {"message": str(exc.detail), "code": "Conflict"}
+    if isinstance(exc, (ManifoldInstallConflict, ManifoldHFError)):
+        _status, message = exc.user_message()
+        return {"message": message, "code": type(exc).__name__}
+    if isinstance(exc, ImportError):
+        return {
+            "message": "huggingface_hub is not installed",
+            "code": "ImportError",
+        }
+    if isinstance(exc, ValueError):
+        return {"message": str(exc), "code": type(exc).__name__}
+    return None
+
+
 # ------------------------------------------------------------------- routes ---
 
 def register_manifold_routes(app: FastAPI) -> None:
@@ -490,23 +536,23 @@ def register_manifold_routes(app: FastAPI) -> None:
     session: SaklasSession = app.state.session
 
     @app.get("/saklas/v1/manifolds")
-    def list_manifolds():
+    def list_manifolds() -> ManifoldListResponse:
         """List every installed manifold with per-session fit status."""
         return {
             "manifolds": [
-                _manifold_json(ns, mf, session, full=False)
-                for ns, mf in iter_manifold_folders()
+                _manifold_json(mf, session, full=False)
+                for _ns, mf in iter_manifold_folders()
             ],
         }
 
     @app.get("/saklas/v1/manifolds/{namespace}/{name}")
-    def get_manifold(namespace: str, name: str):
+    def get_manifold(namespace: str, name: str) -> ManifoldInfo:
         """One manifold: domain, nodes with statements, per-tensor fit detail."""
-        ns, mf = _find_manifold(namespace, name)
-        return _manifold_json(ns, mf, session, full=True)
+        mf = _find_manifold(namespace, name)
+        return _manifold_json(mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds", status_code=201)
-    def create_manifold(req: CreateManifoldRequest):
+    def create_manifold(req: CreateManifoldRequest) -> ManifoldInfo:
         """Author a fresh authored manifold artifact on disk.
 
         Writes ``manifold.json`` + the ``nodes/`` corpus.  Returns the
@@ -526,12 +572,14 @@ def register_manifold_routes(app: FastAPI) -> None:
         except ManifoldFormatError as e:
             raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
-        body = _manifold_json(req.namespace, mf, session, full=True)
+        body = _manifold_json(mf, session, full=True)
         body["advisories"] = advisories
         return body
 
     @app.post("/saklas/v1/manifolds/discover", status_code=201)
-    def create_discover_manifold(req: CreateDiscoverManifoldRequest):
+    def create_discover_manifold(
+        req: CreateDiscoverManifoldRequest,
+    ) -> ManifoldInfo:
         """Author a fresh discover-mode manifold from supplied per-concept corpora.
 
         Nodes carry ``{label, statements}`` only — coords are derived
@@ -557,12 +605,12 @@ def register_manifold_routes(app: FastAPI) -> None:
         except ManifoldFormatError as e:
             raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
-        return _manifold_json(req.namespace, mf, session, full=True)
+        return _manifold_json(mf, session, full=True)
 
     @app.post("/saklas/v1/manifolds/from-template", status_code=201)
     def create_manifold_from_template_route(
         req: CreateManifoldFromTemplateRequest,
-    ):
+    ) -> ManifoldInfo:
         """Author a discover manifold from an existing template artifact."""
         try:
             folder = create_manifold_from_template(
@@ -581,10 +629,12 @@ def register_manifold_routes(app: FastAPI) -> None:
         except ManifoldFormatError as e:
             raise HTTPException(400, str(e)) from e
         mf = ManifoldFolder.load(folder)
-        return _manifold_json(req.namespace, mf, session, full=True)
+        return _manifold_json(mf, session, full=True)
 
     @app.get("/saklas/v1/manifolds/search")
-    def search_remote_manifolds(q: str = "", limit: int = 20):
+    def search_remote_manifolds(
+        q: str = "", limit: int = 20,
+    ) -> ManifoldSearchResponse:
         """Search HF for ``saklas-manifold``-tagged repos matching ``q``.
 
         Delegates to :func:`saklas.io.hf_manifolds.search_manifolds` and returns
@@ -603,11 +653,11 @@ def register_manifold_routes(app: FastAPI) -> None:
         # the cap when ``limit`` is omitted or oversized.
         if limit and limit > 0:
             rows = rows[: int(limit)]
-        # Echo ``query`` for parity with ``GET /saklas/v1/packs/search``.
-        return {"query": q, "results": rows}
+        # The response echoes the query alongside the rows.
+        return {"query": q, "results": cast(list[RemoteManifoldInfo], rows)}
 
     @app.post("/saklas/v1/manifolds/merge", status_code=201)
-    async def merge_manifold(req: MergeManifoldRequest):
+    async def merge_manifold(req: MergeManifoldRequest) -> ManifoldInfo:
         """Union N discover-mode manifolds' nodes into a fresh discover folder.
 
         Pools source node corpora into one unfitted discover folder. The next
@@ -619,7 +669,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         refused with a clear error (rename in source folders first).
 
         Held under the session lock so a parallel fit on one of the
-        sources can't race the corpus read; ``_refuse_if_busy`` guards
+        sources can't race the corpus read; ``refuse_if_busy`` guards
         against an in-flight engine operation holding the gen-lock.
         """
         if len(req.sources) < 2:
@@ -631,7 +681,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
-            _refuse_if_busy(session)
+            refuse_if_busy(session)
             try:
                 folder = await asyncio.to_thread(
                     merge_discover_manifolds,
@@ -655,53 +705,72 @@ def register_manifold_routes(app: FastAPI) -> None:
             # target — paranoia in case the user is merging-over an
             # existing folder with the same name (force=True path).
             _evict_manifold(session, req.namespace, req.name)
-        ns, mf = _find_manifold(folder.parent.name, folder.name)
-        return _manifold_json(ns, mf, session, full=True)
+        mf = _find_manifold(folder.parent.name, folder.name)
+        return _manifold_json(mf, session, full=True)
 
-    @app.post("/saklas/v1/manifolds/install", status_code=201)
-    async def install_remote_manifold(req: InstallManifoldRequest):
+    @app.post(
+        "/saklas/v1/manifolds/install",
+        status_code=201,
+        response_model=ManifoldInfo,
+    )
+    async def install_remote_manifold(req: InstallManifoldRequest, request: Request):
         """Install a manifold from an HF coord or local folder.
 
-        Mirrors ``POST /saklas/v1/packs`` for parity with the vector
-        pack side.  ``target`` is an HF coord (``owner/name[@revision]``)
-        or a local folder path; ``as_`` overrides the destination
-        namespace+name (must be fully qualified); ``force`` overwrites
-        an existing folder.  Held under the session lock so a parallel
-        delete / fit can't race the swap-into-place.  Returns the same
-        manifold-detail JSON shape ``GET /saklas/v1/manifolds/{ns}/{name}``
-        ships.
+        ``target`` is an HF coord (``owner/name[@revision]``) or a local
+        folder path; ``as_`` overrides the destination namespace+name
+        (must be fully qualified); ``force`` overwrites an existing
+        folder.  Held under the session lock so a parallel delete / fit
+        can't race the swap-into-place.  SSE progress when ``Accept:
+        text/event-stream``, JSON otherwise — a manifold repo carries a
+        per-model safetensors payload, so the download plus stage/verify/swap
+        tail is a long operation like ``generate`` / ``fit``.  Both branches
+        return the manifold-detail JSON shape ``GET
+        /saklas/v1/manifolds/{ns}/{name}`` ships.
         """
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            _refuse_if_busy(session)
-            try:
-                folder = await asyncio.to_thread(
-                    install_manifold,
-                    req.target,
-                    req.as_,
-                    force=req.force,
-                )
-            except ManifoldInstallConflict as e:
-                raise HTTPException(409, str(e)) from e
-            except FileNotFoundError as e:
-                raise HTTPException(404, str(e)) from e
-            except ValueError as e:
-                raise HTTPException(400, str(e)) from e
-            except ImportError as e:
-                raise HTTPException(503, f"huggingface_hub not installed: {e}") from e
-            except ManifoldHFError as e:
-                raise HTTPException(502, str(e)) from e
+        def _install(on_progress: Callable[[str], None]) -> ManifoldInfo:
+            folder = install_manifold(
+                req.target,
+                req.as_,
+                force=req.force,
+                on_progress=on_progress,
+            )
+            # The just-installed folder lives at ``manifolds/<ns>/<name>/`` —
+            # derive namespace/name from the resolved path so the response
+            # carries the destination identity even when ``as_`` re-routed it.
+            mf = _find_manifold(folder.parent.name, folder.name)
+            # No ``done`` marker: the SSE client keys off the frame's event
+            # name, and the plain JSON body stays exactly what non-streaming
+            # callers already parse.
+            return _manifold_json(mf, session, full=True)
 
-        # The just-installed folder lives at ``manifolds/<ns>/<name>/`` —
-        # derive namespace/name from the resolved path so the response
-        # carries the destination identity even when ``as_`` re-routed it.
-        dst_namespace = folder.parent.name
-        dst_name = folder.name
-        ns, mf = _find_manifold(dst_namespace, dst_name)
-        return _manifold_json(ns, mf, session, full=True)
+        async def _job(on_progress: ProgressCallback) -> ManifoldInfo:
+            # Under the session lock in both branches; the gen-lock probe has
+            # to run before the worker thread starts writing the folder.
+            refuse_if_busy(session)
+            return await asyncio.to_thread(_install, on_progress)
 
-    @app.post("/saklas/v1/manifolds/generate", status_code=201)
+        return await sse_or_json(
+            request,
+            session,
+            _job,
+            error_message="install failed",
+            log_message="manifold install crashed",
+            error_formatter=_install_error_frame,
+            json_errors=(
+                (ManifoldInstallConflict, 409),
+                (FileNotFoundError, 404),
+                (ValueError, 400),
+                (ImportError, 503),
+                (ManifoldHFError, 502),
+            ),
+            logger=log,
+        )
+
+    @app.post(
+        "/saklas/v1/manifolds/generate",
+        status_code=201,
+        response_model=ManifoldInfo,
+    )
     async def generate_manifold(req: GenerateManifoldRequest, request: Request):
         """LLM-author a discover-mode manifold from a flat concept list (A2).
 
@@ -735,7 +804,7 @@ def register_manifold_routes(app: FastAPI) -> None:
             node_roles_map = {c: c for c in req.concepts}
         node_kinds_map: dict[str, str | None] = {c: req.kind for c in req.concepts}
 
-        def _gen(on_progress: Callable[[str], None]) -> dict[str, Any]:
+        def _gen(on_progress: Callable[[str], None]) -> ManifoldInfo:
             # ``force`` is a clean slate; the default *resumes* — fill missing
             # nodes + append any concepts new to the roster.
             try:
@@ -763,54 +832,46 @@ def register_manifold_routes(app: FastAPI) -> None:
                     folder, plan.index_of[concept], concept, corpora[concept],
                 )
             _evict_manifold(session, req.namespace, req.name)
-            ns, mf = _find_manifold(req.namespace, req.name)
-            body = _manifold_json(ns, mf, session, full=True)
+            mf = _find_manifold(req.namespace, req.name)
+            body = _manifold_json(mf, session, full=True)
             body["done"] = True
             return body
 
-        accept = request.headers.get("accept", "application/json")
-        if "text/event-stream" in accept:
-            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
-                return await asyncio.to_thread(_gen, on_progress)
+        async def _job(on_progress: ProgressCallback) -> ManifoldInfo:
+            return await asyncio.to_thread(_gen, on_progress)
 
-            def _format_error(e: Exception) -> dict[str, Any] | None:
-                if isinstance(e, HTTPException):
-                    http_error = cast(HTTPException, e)
-                    # The generate job only raises HTTPException to wrap a
-                    # ManifoldFormatError, whose detail embeds the on-disk
-                    # manifold path.  Log the detail server-side and surface a
-                    # path-free frame (SSE info-disclosure discipline — see
-                    # server/AGENTS.md).
-                    log.warning("manifold generate: format error: %s", http_error.detail)
-                    return {
-                        "message": "manifold has an unsupported on-disk format",
-                        "code": "ManifoldFormatError",
-                    }
-                if isinstance(e, ValueError):
-                    return {"message": str(e), "code": "ValueError"}
-                return None
+        def _format_error(e: Exception) -> dict[str, Any] | None:
+            if isinstance(e, HTTPException):
+                http_error = cast(HTTPException, e)
+                # The generate job only raises HTTPException to wrap a
+                # ManifoldFormatError, whose detail embeds the on-disk
+                # manifold path.  Log the detail server-side and surface a
+                # path-free frame (SSE info-disclosure discipline — see
+                # server/AGENTS.md).
+                log.warning("manifold generate: format error: %s", http_error.detail)
+                return {
+                    "message": "manifold has an unsupported on-disk format",
+                    "code": "ManifoldFormatError",
+                }
+            if isinstance(e, ValueError):
+                return {"message": str(e), "code": "ValueError"}
+            return None
 
-            return progress_sse_response(
-                session.lock,
-                _job,
-                error_message="generate failed",
-                log_message="manifold generate crashed",
-                error_formatter=_format_error,
-                logger=log,
-            )
-
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            try:
-                return await asyncio.to_thread(_gen, lambda _msg: None)
-            except ValueError as e:
-                raise HTTPException(400, str(e)) from e
+        return await sse_or_json(
+            request,
+            session,
+            _job,
+            error_message="generate failed",
+            log_message="manifold generate crashed",
+            error_formatter=_format_error,
+            json_errors=((ValueError, 400),),
+            logger=log,
+        )
 
     @app.patch("/saklas/v1/manifolds/{namespace}/{name}")
     async def update_manifold(
         namespace: str, name: str, req: UpdateManifoldRequest,
-    ):
+    ) -> ManifoldInfo:
         """Re-author a manifold's description and/or node corpus.
 
         Held under the session lock so a node-corpus rewrite cannot race
@@ -833,7 +894,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
-            _refuse_if_busy(session)
+            refuse_if_busy(session)
             try:
                 await asyncio.to_thread(
                     update_manifold_folder,
@@ -844,11 +905,13 @@ def register_manifold_routes(app: FastAPI) -> None:
             except ManifoldFormatError as e:
                 raise HTTPException(400, str(e)) from e
             _evict_manifold(session, namespace, name)
-        ns, mf = _find_manifold(namespace, name)
-        return _manifold_json(ns, mf, session, full=True)
+        mf = _find_manifold(namespace, name)
+        return _manifold_json(mf, session, full=True)
 
     @app.delete("/saklas/v1/manifolds/{namespace}/{name}")
-    async def delete_manifold(namespace: str, name: str):
+    async def delete_manifold(
+        namespace: str, name: str,
+    ) -> ManifoldDeleteResponse:
         """Remove a manifold folder.
 
         Delegates the actual removal to
@@ -873,18 +936,24 @@ def register_manifold_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
-            _refuse_if_busy(session)
+            refuse_if_busy(session)
             _evict_manifold(session, namespace, name)
             try:
-                return await asyncio.to_thread(
-                    remove_manifold_folder, namespace, name,
+                return cast(
+                    ManifoldDeleteResponse,
+                    await asyncio.to_thread(
+                        remove_manifold_folder, namespace, name,
+                    ),
                 )
             except FileNotFoundError as e:
                 # Lost a race with another delete between the pre-lock
                 # existence check and acquiring the lock.
                 raise HTTPException(404, str(e)) from e
 
-    @app.post("/saklas/v1/manifolds/{namespace}/{name}/fit")
+    @app.post(
+        "/saklas/v1/manifolds/{namespace}/{name}/fit",
+        response_model=ManifoldInfo,
+    )
     async def fit_manifold(
         namespace: str, name: str, req: FitManifoldRequest, request: Request,
     ):
@@ -900,7 +969,7 @@ def register_manifold_routes(app: FastAPI) -> None:
         if not (folder / "manifold.json").exists():
             raise HTTPException(404, f"manifold {namespace}/{name} not found")
 
-        def _fit(on_progress: Callable[[str], None]) -> dict[str, Any]:
+        def _fit(on_progress: Callable[[str], None]) -> ManifoldInfo:
             manifold = session.fit(
                 folder, sae=req.sae,
                 layers=req.layers,
@@ -910,47 +979,23 @@ def register_manifold_routes(app: FastAPI) -> None:
                 on_progress=on_progress,
             )
             _evict_manifold(session, namespace, name)
-            ns, mf = _find_manifold(namespace, name)
-            body = _manifold_json(ns, mf, session, full=True)
+            mf = _find_manifold(namespace, name)
+            body = _manifold_json(mf, session, full=True)
             body["done"] = True
             body["layers_fitted"] = len(manifold.layers)
             body["feature_space"] = manifold.feature_space
             return body
 
-        accept = request.headers.get("accept", "application/json")
-        if "text/event-stream" in accept:
-            async def _job(on_progress: ProgressCallback) -> dict[str, Any]:
-                return await asyncio.to_thread(_fit, on_progress)
+        async def _job(on_progress: ProgressCallback) -> ManifoldInfo:
+            return await asyncio.to_thread(_fit, on_progress)
 
-            def _format_error(e: Exception) -> dict[str, Any] | None:
-                if isinstance(e, ConcurrentExtractionError):
-                    return {"message": str(e), "code": "Conflict"}
-                if isinstance(e, (ValueError, ManifoldFormatError)):
-                    return {
-                        "message": str(e),
-                        "code": (
-                            "PoisednessError"
-                            if "poisedness" in str(e).lower()
-                            else type(e).__name__
-                        ),
-                    }
-                return None
-
-            return progress_sse_response(
-                session.lock,
-                _job,
-                error_message="fit failed",
-                log_message="manifold fit crashed",
-                error_formatter=_format_error,
-                logger=log,
-            )
-
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            try:
-                return await asyncio.to_thread(_fit, lambda _msg: None)
-            except ConcurrentExtractionError as e:
-                raise HTTPException(409, str(e)) from e
-            except (ValueError, ManifoldFormatError) as e:
-                raise HTTPException(400, str(e)) from e
+        return await sse_or_json(
+            request,
+            session,
+            _job,
+            error_message="fit failed",
+            log_message="manifold fit crashed",
+            error_formatter=extraction_error_frame,
+            json_errors=extraction_json_errors(),
+            logger=log,
+        )

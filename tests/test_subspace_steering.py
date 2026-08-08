@@ -19,7 +19,12 @@ import pytest
 import torch
 from torch import nn
 
-from saklas.core.hooks import _SUBSPACE_GAIN, SteeringManager
+from saklas.core.hooks import (
+    _SUBSPACE_GAIN,
+    SteeringManager,
+    _affine_push_offset,
+    _lower_affine_subspaces,
+)
 from saklas.core.mahalanobis import LayerWhitener
 from saklas.core.manifold import (
     CustomDomain,
@@ -166,6 +171,24 @@ def test_static_steerable_false_when_unsteered():
     assert mgr.all_fast_path() is True
 
 
+def test_all_fast_path_true_once_steering_lowers_to_compiled_offsets():
+    # ``all_fast_path`` reports "no *transient* hook", not "unsteered": the
+    # compiled path detaches the transient hooks and steers through the
+    # persistent offset buffers, and graph capture stays eligible either way.
+    synth = _single_layer_synth(0)
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__", synth)
+    mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
+    assert mgr.all_fast_path() is False
+
+    offsets = mgr.compute_static_offsets()
+    assert offsets is not None and offsets
+    mgr.detach_transient_hooks()
+    assert mgr.all_fast_path() is True       # no transient hook...
+    assert mgr.static_steerable() is False   # ...so nothing to classify
+    assert mgr.subspaces                     # ...but the steering is still live
+
+
 def test_static_steerable_false_for_gated_subspace():
     # A phase-gated (non-BOTH) trigger keeps the hook on the ctx-consulting
     # general path, so it is NOT statically capturable.
@@ -276,6 +299,132 @@ def test_hot_path_translates_in_subspace_component_by_target():
     coord = (hidden - sub.mean) @ sub.basis.T
     expected = q_coord + eff * target.expand_as(q_coord)
     assert torch.allclose(coord, expected, atol=1e-4)
+
+
+# -------------------------------------------- compiled / eager push parity ---
+#
+# ``compute_static_offsets`` (the persistent compiled offset buffers) and
+# ``SteeringHook._pure_push_constant`` (the transient constant-add hook) are two
+# consumers of ONE lowering, ``_lower_affine_subspaces``.  These pin that the
+# compiled and eager pushes are the same world vector, so ``compile=True`` and
+# ``compile=False`` generations steer identically.
+
+def _ablation_synth(layer: int = 0, *, coeff: float = 0.4):
+    """A push term plus an orthogonal ablation term at one layer (κ ≠ 0)."""
+    push_dir = torch.zeros(_DIM)
+    push_dir[0] = 1.0
+    abl_dir = torch.zeros(_DIM)
+    abl_dir[1] = 1.0
+    neutral = 20.0 + torch.randn(_DIM)
+    return synthesize_subspace(
+        push=[({layer: push_dir.reshape(1, -1)},
+               {layer: torch.tensor([1.0])}, 0.5)],
+        ablate=[({layer: abl_dir.reshape(1, -1)}, coeff)],
+        neutral_means={layer: neutral},
+    )
+
+
+def test_static_offsets_match_transient_constant_add():
+    # The compiled offset for each layer is byte-identical to the constant the
+    # transient hook precomputed for the same layer.
+    synth = _unequal_share_synth((3.0, 1.0))
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__", synth)
+    mgr.apply_to_model(_model_layers(2), torch.device("cpu"), torch.float32)
+
+    offsets = mgr.compute_static_offsets()
+    assert offsets is not None
+    assert set(offsets) == set(mgr.hooks)
+    for L, hook in mgr.hooks.items():
+        # Every layer armed the transient constant-add fast path...
+        assert hook._const_single is not None
+        # ...and the compiled buffer carries the same displacement.
+        assert torch.equal(offsets[L], hook._const_single)
+
+
+def test_static_offsets_sum_multiple_subspaces_like_the_hook_groups():
+    # Two always-active affine subspaces sharing a layer: the compiled path
+    # sums their offsets into one buffer, the eager path adds one per group.
+    synth_a = _single_layer_synth(0, coeff=0.5)
+    synth_b = _single_layer_synth(0, coeff=0.3)
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__0", synth_a)
+    mgr.add_subspace("__affine__1", synth_b)
+    mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
+
+    offsets = mgr.compute_static_offsets()
+    assert offsets is not None
+    hook = mgr.hooks[0]
+    # Two groups ⇒ the single-affine fast path is not armed; the general path
+    # adds each group's per-group constant.
+    assert hook._const_single is None
+    per_group = [c for c in hook._const_groups if c is not None]
+    assert len(per_group) == 2
+    assert torch.allclose(
+        offsets[0], per_group[0] + per_group[1], atol=1e-6,
+    )
+
+
+def test_static_offsets_use_the_shared_lowering():
+    # The offsets are the shared contraction of the shared lowering — not a
+    # second transcription of the share/gain math.
+    synth = _unequal_share_synth((3.0, 1.0))
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__", synth)
+    offsets = mgr.compute_static_offsets()
+    assert offsets is not None
+
+    lowered = _lower_affine_subspaces(synth)
+    assert set(lowered) == set(offsets)
+    for L, low in lowered.items():
+        assert low.eff_along == pytest.approx(
+            _SUBSPACE_GAIN * (1.5 if L == 0 else 0.5), abs=1e-5,
+        )
+        assert low.is_pure_push
+        expected = _affine_push_offset(low.subspace, low.target, low.eff_along)
+        assert torch.equal(offsets[L], expected)
+
+
+def test_lowering_matches_the_groups_apply_to_model_installs():
+    # ``apply_to_model`` builds its hook entries from the same lowering, so the
+    # installed group tuple carries the lowered subspace / target / eff_along /
+    # kappa verbatim.
+    synth = _ablation_synth(0)
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__", synth)
+    mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
+
+    lowered = _lower_affine_subspaces(synth)
+    _trig, sub, _domain, target, _origin, along, _onto, kappa = _group(mgr, 0)
+    low = lowered[0]
+    assert torch.allclose(sub.basis, low.subspace.basis, atol=1e-6)
+    assert torch.allclose(target, low.target, atol=1e-6)
+    assert along == pytest.approx(low.eff_along, abs=1e-6)
+    assert isinstance(kappa, torch.Tensor)
+    assert torch.allclose(kappa, low.kappa, atol=1e-6)
+
+
+def test_ablation_disqualifies_the_compiled_offsets_and_the_constant_add():
+    # An ``!`` ablation makes the injection depend on ``h``, so BOTH constant
+    # paths must decline — the compiled offsets return ``None`` and the
+    # transient hook falls back to the low-rank / kernel path.
+    synth = _ablation_synth(0)
+    mgr = SteeringManager()
+    mgr.add_subspace("__affine__", synth)
+    mgr.apply_to_model(_model_layers(1), torch.device("cpu"), torch.float32)
+
+    assert mgr.compute_static_offsets() is None
+    assert mgr.hooks[0]._const_single is None
+    assert not _lower_affine_subspaces(synth)[0].is_pure_push
+
+
+def test_gain_compensated_kappa_recovers_the_user_coefficient():
+    # The lowering divides the requested κ by ``eff_along`` so the kernel's
+    # ``along · κ`` product is exactly the user's ablation fraction.
+    synth = _ablation_synth(0, coeff=0.4)
+    low = _lower_affine_subspaces(synth)[0]
+    product = low.eff_along * low.kappa
+    assert float(product.abs().max()) == pytest.approx(0.4, abs=1e-5)
 
 
 def test_clear_all_drops_subspaces():

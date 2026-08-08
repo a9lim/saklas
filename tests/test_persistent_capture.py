@@ -1,4 +1,4 @@
-"""Persistent compile-clean capture parity (slice 2).
+"""Persistent compile-clean capture parity.
 
 The compiled MPS path can't register transient per-token capture hooks (they
 graph-break / recompile), so probed generation rides always-on pre-compile
@@ -21,8 +21,11 @@ import torch
 
 from saklas.core.hooks import (
     HiddenCapture,
+    SteeringManager,
     install_persistent_capture_hooks,
+    install_persistent_offset_hooks,
 )
+from saklas.core.session import SaklasSession
 
 _D = 8
 _LAYERS = [0, 1, 2]
@@ -179,7 +182,7 @@ def test_persistent_ingest_matches_transient_incremental_and_sink():
     cap_t.set_incremental(lambda _step, latest: rows_t.append(
         {k: v.clone() for k, v in latest.items()}
     ))
-    # In-hook incremental accumulates during the forward; the FIX-F1 sink fires
+    # In-hook incremental accumulates during the forward; the step sink fires
     # post-forward via fire_step_sink.
     _drive(stack_t, clock_t, n, after=cap_t.fire_step_sink)
 
@@ -251,3 +254,40 @@ def test_attach_persistent_registers_no_hooks_and_detach_clears_buffers():
     # ingest is a no-op once the buffer source is gone.
     cap.ingest_persistent(0)
     assert cap._forward_count == 0
+
+
+def test_session_close_removes_both_persistent_hook_families():
+    """``from_pretrained`` installs permanent offset + capture hooks on the
+    caller's model; ``close()`` is the only symmetric teardown, and
+    ``SaklasSession.__init__`` takes a pre-loaded model that outlives the
+    session, so leaving them attached leaks ``2 x n_layers`` forward hooks and
+    their device buffers.
+    """
+    stack, _clock = _toy_stack()
+    device, dtype = torch.device("cpu"), torch.float32
+    offset_buffers, offset_handles = install_persistent_offset_hooks(
+        stack, _D, device, dtype,
+    )
+    capture_buffers, capture_handles = install_persistent_capture_hooks(
+        stack, _D, device, dtype,
+    )
+    assert all(len(layer._forward_hooks) == 2 for layer in stack)
+
+    steering = SteeringManager()
+    steering.adopt_compiled_offsets(offset_buffers, offset_handles)
+    session = SaklasSession.__new__(SaklasSession)
+    session._steering = steering
+    session._capture_buffers = capture_buffers
+    session._capture_handles = capture_handles
+    session._profiles = {}
+    session._manifolds = {}
+
+    session.close()
+
+    assert all(not layer._forward_hooks for layer in stack)
+    assert steering.has_compiled_offsets() is False
+    assert session._capture_handles == []
+    assert session._capture_buffers == {}
+
+    # Idempotent: a second close (or an explicit re-detach) must not raise.
+    session.close()

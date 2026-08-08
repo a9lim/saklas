@@ -5,22 +5,21 @@ model isn't directly usable on a different model — different tokenizers,
 different hidden dims, different basis rotation in the residual stream.
 This module fits a per-layer linear map between two models' neutral
 activations (``Procrustes`` for matched dim, low-rank PCA-and-lift for
-mismatched dim) and uses it to transfer a probe's per-layer baked
-direction from source-space to target-space.
+mismatched dim); ``core.manifold.transfer_manifold_subspaces``, driven by
+``io.manifold_lifecycle.transfer_manifold``, is what applies it.
 
 Public surface:
 
 * :func:`load_or_compute_neutral_activations` — disk-cached per-model
-  neutral-statement activations; ``[N=90, D]`` per layer, stored fp32.
+  neutral-statement activations; ``[N, D]`` per layer, stored fp32.
   Its metadata-returning sibling lets dependent artifact builders reuse the
   sidecar validated in that same cache transaction instead of hashing the
   payload again merely to recover its identity.
 * :func:`fit_alignment` — per-layer alignment map ``M_L : ℝ^D_src → ℝ^D_tgt``.
-* :func:`transfer_profile` — apply the alignment map to a profile.
 * :func:`alignment_cache_path` — disk cache for the fitted map keyed by
   the source model id.
 
-The transferred profile lands at the target model's tensor path with a
+The transferred manifold lands at the target model's tensor path with a
 ``_from-<safe_src>`` suffix — uses the same variant-suffix machinery as
 SAE variants, so the rest of saklas (selectors, packs, monitor) sees a
 transferred probe as just another tensor on disk.
@@ -32,11 +31,10 @@ import json
 import math
 import logging
 import sys
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import torch
 from safetensors import safe_open
@@ -46,12 +44,22 @@ from safetensors.torch import (
 )
 
 from saklas.core.errors import SaklasError
-from saklas.core.profile import Profile
 from saklas.io.atomic import fsync_directory, write_bytes_atomic, write_json_atomic
 from saklas.io.paths import model_dir, safe_model_id
-from saklas.io.packs import hash_file
+from saklas.io.integrity import hash_file
+from saklas.io.shards import (
+    cleanup_generations,
+    fit_lock,
+    generation_path,
+    json_pointer_matches as _json_pointer_matches,
+    shard_paths,
+)
 
 log = logging.getLogger(__name__)
+
+# Artifact labels for the shared shard primitive's error/log wording.
+_NEUTRAL_LABEL = "neutral activation cache"
+_ALIGNMENT_LABEL = "alignment cache"
 
 _NEUTRAL_ACTS_NAME = "neutral_activations"
 _NEUTRAL_CACHE_FORMAT_VERSION = 4
@@ -159,71 +167,23 @@ def _neutral_acts_paths(model_id: str) -> tuple[Path, Path]:
     )
 
 
-def _neutral_generation_path(anchor: Path, layer: int) -> Path:
-    return anchor.with_name(
-        f"{anchor.stem}.layer-{int(layer)}.gen-{uuid.uuid4().hex}{anchor.suffix}",
-    )
-
-
 def _neutral_shard_paths(
     anchor: Path, sidecar: Mapping[str, Any], layers: list[int],
 ) -> dict[int, Path]:
-    files = sidecar.get("tensor_files")
-    if not isinstance(files, Mapping):
-        raise ValueError("neutral activation cache has no tensor shard map")
-    if {str(layer) for layer in layers} != {str(key) for key in files}:
-        raise ValueError("neutral tensor shard keys do not match layers")
-    out: dict[int, Path] = {}
-    for layer in layers:
-        filename = files.get(str(layer))
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or Path(filename).name != filename
-        ):
-            raise ValueError(f"invalid neutral shard for layer {layer}")
-        out[layer] = anchor.parent / filename
-    return out
-
-
-def _json_pointer_matches(path: Path, payload: Mapping[str, Any]) -> bool:
-    """Whether an exception escaped after this exact pointer was replaced."""
-    try:
-        with open(path) as handle:
-            current = json.load(handle)
-        return current == payload
-    except (OSError, json.JSONDecodeError, TypeError):
-        return False
+    return shard_paths(anchor, sidecar, layers, label=_NEUTRAL_LABEL)
 
 
 def _cleanup_neutral_generations(
     anchor: Path, sidecar: Mapping[str, Any],
 ) -> None:
-    files = sidecar.get("tensor_files")
-    keep = (
-        {str(filename) for filename in files.values() if isinstance(filename, str)}
-        if isinstance(files, Mapping) else set()
-    )
-    for path in (
-        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors"),
-        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors.tmp"),
-        anchor,
-        anchor.with_suffix(anchor.suffix + ".tmp"),
-    ):
-        if path.name not in keep:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                log.warning("could not remove old neutral generation %s: %s", path, exc)
+    cleanup_generations(anchor, sidecar, label=_NEUTRAL_LABEL)
 
 
 @contextmanager
 def neutral_fit_lock(model_id: str) -> Iterator[None]:
     """Single-flight lock for one model's expensive neutral forward pass."""
-    from saklas.io.atomic import artifact_lock
-
     ts_path, _ = _neutral_acts_paths(model_id)
-    with artifact_lock(ts_path.with_name(f"{ts_path.stem}.fit")):
+    with fit_lock(ts_path):
         yield
 
 
@@ -423,10 +383,16 @@ def load_or_compute_neutral_activations(
     *,
     model_id: str,
     force: bool = False,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict[int, torch.Tensor]:
-    """Single-flight neutral-cache load/capture, returning activations only."""
+    """Single-flight neutral-cache load/capture, returning activations only.
+
+    ``on_progress`` narrates the cache-miss capture loop (per forward chunk);
+    a cache hit reports nothing because it runs no model.
+    """
     activations, _sidecar = load_or_compute_neutral_activations_with_metadata(
         model, tokenizer, layers, model_id=model_id, force=force,
+        on_progress=on_progress,
     )
     return activations
 
@@ -438,6 +404,7 @@ def load_or_compute_neutral_activations_with_metadata(
     *,
     model_id: str,
     force: bool = False,
+    on_progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Return activations plus the sidecar proven in the same transaction.
 
@@ -450,6 +417,7 @@ def load_or_compute_neutral_activations_with_metadata(
     with neutral_fit_lock(model_id):
         return _load_or_compute_neutral_activations_with_metadata_locked(
             model, tokenizer, layers, model_id=model_id, force=force,
+            on_progress=on_progress,
         )
 
 
@@ -460,6 +428,7 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
     *,
     model_id: str,
     force: bool = False,
+    on_progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
     """Disk-cached per-statement activations for one model.
 
@@ -532,8 +501,13 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
             log.warning("Corrupt neutral activations cache for %s, recomputing: %s", model_id, e)
 
     log.info("Computing neutral activations (one-time per model)...")
+    if on_progress is not None:
+        on_progress(
+            f"Computing neutral activations for {model_id} "
+            f"(one-time per model, {len(pairs)} prompts)..."
+        )
     activations = compute_neutral_activations(
-        model, tokenizer, layers, rendered=prepared,
+        model, tokenizer, layers, rendered=prepared, on_progress=on_progress,
     )
 
     # Persist fp32 — the whitener covariance is built and inverted from these,
@@ -554,7 +528,7 @@ def _load_or_compute_neutral_activations_with_metadata_locked(
         created: list[Path] = []
         try:
             for idx, tensor in sorted(fp32.items()):
-                path = _neutral_generation_path(ts_path, idx)
+                path = generation_path(ts_path, idx)
                 payload = save_safetensors({f"layer_{idx}": tensor})
                 write_bytes_atomic(path, payload)
                 created.append(path)
@@ -749,119 +723,6 @@ def alignment_quality(
 
 
 # ---------------------------------------------------------------------------
-# Profile transfer.
-# ---------------------------------------------------------------------------
-
-
-def transfer_profile(
-    profile: Profile,
-    alignment_map: AlignmentMap,
-    *,
-    source_model_id: str,
-    transfer_quality_estimate: float | None = None,
-    whitener: "Any | None" = None,
-) -> Profile:
-    """Apply the alignment map to a source-space profile.
-
-    For each layer in the profile that the alignment covers, computes
-    ``v_tgt = M_L @ v_src``.  Layers not covered by the alignment are
-    dropped — partial transfer is the only sensible behavior, since a
-    direction with no map can't be lifted into target space.
-
-    **Target-metric re-bake (mandatory).**  The source tensor is
-    share-baked in the *source* model's metric — its per-layer Euclidean
-    magnitude is the source Mahalanobis norm of the raw mean-diff (the
-    unified subspace hook reads ``‖baked_L‖₂ / Σ‖baked‖₂`` back out as
-    the layer share).  The orthogonal Procrustes map preserves Euclidean norm, so a
-    bare transfer would carry the *source* cross-layer share into target
-    space — where it no longer matches the target's anisotropy.  The
-    ``whitener`` for the **target** model is **required** and must cover
-    every transferred layer (all-or-nothing, mirroring the DiM-bake /
-    monitor / manifold-fit gate); each layer is rescaled so its magnitude
-    becomes its *target* Mahalanobis norm::
-
-        v_tgt'_L = v_tgt_L · (‖v_tgt_L‖_M(target) / ‖v_tgt_L‖₂)
-
-    The direction is untouched; only the per-layer magnitude — and hence
-    the hook-recovered share — changes.  ``‖v_tgt_L‖₂`` carries
-    the transported source-signal strength (the best target-signal proxy
-    available without target contrastive pairs) and ``‖v̂_tgt_L‖_M(target)``
-    applies the target anisotropy correction, so the composite is the
-    target-metric analogue of a native DiM bake.  ``bake: "mahalanobis"``
-    is stamped on the result.  A missing or non-covering whitener raises
-    :class:`WhitenerError` — there is no Euclidean transfer.
-
-    Carries provenance through ``Profile.metadata``:
-
-    * ``method = "procrustes_transfer"``
-    * ``source_model_id`` — HF coord of the source model.
-    * ``transfer_quality_estimate`` — median R² across shared layers, if
-      known.
-    * ``bake`` — always ``"mahalanobis"``.
-
-    Existing diagnostics fields on the source profile pass through
-    unchanged; users can still reason about source-side separation when
-    judging whether to trust a transferred probe.
-    """
-    if not alignment_map:
-        from saklas.core.profile import ProfileError
-
-        raise ProfileError("transfer_profile: alignment_map is empty")
-
-    # Stage the transferred directions in fp32 (keyed by layer) plus the
-    # original per-layer dtype, so the target re-bake operates at full
-    # precision before the dtype restore.
-    staged: dict[int, torch.Tensor] = {}
-    orig_dtype: dict[int, torch.dtype] = {}
-    for layer, src_vec in profile.items():
-        M_L = alignment_map.get(layer)
-        if M_L is None:
-            continue
-        staged[layer] = M_L.apply_vector(src_vec).cpu()
-        orig_dtype[layer] = src_vec.dtype
-
-    if not staged:
-        from saklas.core.profile import ProfileError
-
-        raise ProfileError(
-            "transfer_profile: alignment covered no layers in the source profile"
-        )
-
-    # Mahalanobis-only target re-bake: the per-layer ‖·‖_M and ‖·‖₂ scales
-    # differ by a 1/√λ_L factor that doesn't cancel from the cross-layer
-    # share, so the target whitener must cover every transferred layer.
-    # No Euclidean transfer — a missing / partial whitener is an error.
-    from saklas.core.mahalanobis import WhitenerError
-
-    if whitener is None or not whitener.covers_all(staged.keys()):
-        raise WhitenerError(
-            "transfer_profile requires a Mahalanobis whitener covering every "
-            f"transferred layer {sorted(staged.keys())}; generate neutral "
-            "activations for the TARGET model first (the Euclidean path is gone)"
-        )
-    for layer, v_tgt in staged.items():
-        eucl = float(v_tgt.norm().item())
-        if eucl < 1e-8:
-            # Degenerate direction — leave it; rescaling a zero vector
-            # is undefined and it carries no share anyway.
-            continue
-        m_norm = whitener.mahalanobis_norm(layer, v_tgt)
-        staged[layer] = v_tgt * (m_norm / eucl)
-
-    out_tensors = {
-        layer: v.to(dtype=orig_dtype[layer]) for layer, v in staged.items()
-    }
-
-    metadata = dict(profile.metadata)
-    metadata["method"] = "procrustes_transfer"
-    metadata["source_model_id"] = source_model_id
-    metadata["bake"] = "mahalanobis"
-    if transfer_quality_estimate is not None:
-        metadata["transfer_quality_estimate"] = float(transfer_quality_estimate)
-    return Profile(out_tensors, metadata=metadata)
-
-
-# ---------------------------------------------------------------------------
 # Alignment-map disk cache.
 # ---------------------------------------------------------------------------
 
@@ -893,59 +754,21 @@ def alignment_cache_path(src_model_id: str, tgt_model_id: str) -> tuple[Path, Pa
     return anchor, sidecar_path
 
 
-def _alignment_generation_path(anchor: Path, layer: int) -> Path:
-    return anchor.with_name(
-        f"{anchor.stem}.layer-{int(layer)}.gen-{uuid.uuid4().hex}{anchor.suffix}",
-    )
-
-
 def _alignment_shard_paths(
     anchor: Path, sidecar: Mapping[str, Any], layers: list[int],
 ) -> dict[int, Path]:
-    files = sidecar.get("tensor_files")
-    if not isinstance(files, Mapping):
-        raise ValueError("alignment cache has no tensor shard map")
-    if {str(layer) for layer in layers} != {str(key) for key in files}:
-        raise ValueError("alignment tensor shard keys do not match shared layers")
-    out: dict[int, Path] = {}
-    for layer in layers:
-        filename = files.get(str(layer))
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or Path(filename).name != filename
-        ):
-            raise ValueError(f"invalid alignment shard for layer {layer}")
-        out[layer] = anchor.parent / filename
-    return out
+    return shard_paths(anchor, sidecar, layers, label=_ALIGNMENT_LABEL)
 
 
 def _cleanup_alignment_generations(anchor: Path, sidecar: Mapping[str, Any]) -> None:
-    files = sidecar.get("tensor_files")
-    keep = (
-        {str(filename) for filename in files.values() if isinstance(filename, str)}
-        if isinstance(files, Mapping) else set()
-    )
-    for path in (
-        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors"),
-        *anchor.parent.glob(f"{anchor.stem}.layer-*.gen-*.safetensors.tmp"),
-        anchor,
-        anchor.with_suffix(anchor.suffix + ".tmp"),
-    ):
-        if path.name not in keep:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                log.warning("could not remove old alignment generation %s: %s", path, exc)
+    cleanup_generations(anchor, sidecar, label=_ALIGNMENT_LABEL)
 
 
 @contextmanager
 def alignment_fit_lock(src_model_id: str, tgt_model_id: str) -> Iterator[None]:
     """Single-flight a complete directional alignment fit, including loads."""
-    from saklas.io.atomic import artifact_lock
-
     ts_path, _ = _alignment_anchor_paths(src_model_id, tgt_model_id)
-    with artifact_lock(ts_path.with_name(f"{ts_path.stem}.fit")):
+    with fit_lock(ts_path):
         yield
 
 
@@ -1044,7 +867,7 @@ def save_alignment_map(
         created: list[Path] = []
         try:
             for idx, alignment in sorted(normalized.items()):
-                path = _alignment_generation_path(anchor, idx)
+                path = generation_path(anchor, idx)
                 payload = save_safetensors({
                     "left": alignment.left.contiguous().cpu(),
                     "right": alignment.right.contiguous().cpu(),

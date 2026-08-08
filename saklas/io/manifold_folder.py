@@ -51,7 +51,7 @@ from saklas.core.errors import SaklasError
 from saklas.core.manifold import BoxDomain, domain_from_spec
 from saklas.core.role_templates import _ROLE_SLUG_RE
 from saklas.io.atomic import write_json_atomic
-from saklas.io.packs import NAME_REGEX, hash_file, verify_integrity
+from saklas.io.integrity import NAME_REGEX, hash_file, verify_integrity
 
 # Manifold node *labels* are stricter than the artifact ``NAME_REGEX``
 # (``io.packs``): they drop ``.`` because the dot is reserved as the
@@ -260,14 +260,22 @@ def sanitize_hyperparams(
     return dict(hyperparams)
 
 
-# Current manifold artifact format. v7 makes manifest defaults and per-node
-# provenance explicit, yielding one canonical payload shape. v6 added an optional per-layer
-# ``affine_map`` tensor for flat fitted
-# subspaces.  Ordinary fits omit it (identity); rectangular/non-isometric
-# cross-model transfers persist the exact authoring-to-orthonormal-reduced
-# reparameterization.  Old readers would otherwise ignore that tensor and
-# silently move manifold world points, so this is a real format boundary.
-MANIFOLD_FORMAT_VERSION = 9
+# Current manifold artifact format. v10 splits the fit's capture identity into
+# separately provable halves — ``capture_version`` + ``capture_render_sha256``
+# (the tokenizer render, reproducible from tokenizer + prompts + corpus alone)
+# alongside ``model_source_fingerprint`` (the pre-load-verifiable checkpoint
+# identity) and ``baseline_prompts_sha256`` — so a fit no-op can be *proven*
+# without loading weights (:func:`saklas.io.manifold_lifecycle.
+# preflight_manifold_fit_noop`).  A v9 sidecar carries none of them, so it
+# cannot be proven and reads as an ordinary cache miss.
+# v7 made manifest defaults and per-node provenance explicit, yielding one
+# canonical payload shape. v6 added an optional per-layer ``affine_map`` tensor
+# for flat fitted subspaces.  Ordinary fits omit it (identity);
+# rectangular/non-isometric cross-model transfers persist the exact
+# authoring-to-orthonormal-reduced reparameterization.  Old readers would
+# otherwise ignore that tensor and silently move manifold world points, so this
+# is a real format boundary.
+MANIFOLD_FORMAT_VERSION = 10
 
 MANIFOLD_SIDECAR_FIELDS = {
     "format_version", "name", "method", "saklas_version", "domain",
@@ -275,7 +283,9 @@ MANIFOLD_SIDECAR_FIELDS = {
     "diagnostics", "node_spread_per_layer", "mahalanobis_share_per_layer",
     "origin_per_layer", "nodes_sha256", "sae_release", "sae_revision",
     "sae_fingerprint", "sae_ids_by_layer", "sae_full_coverage",
-    "model_fingerprint", "capture_sha256", "fitted_layers",
+    "model_fingerprint", "model_source_fingerprint", "capture_sha256",
+    "capture_version", "capture_render_sha256", "baseline_prompts_sha256",
+    "fitted_layers",
     "fit_policy_version", "share_metric", "subspace_metric",
     "rbf_smoothing_per_layer", "sigma_field_per_layer", "resolved_fit_mode",
     "topology_winner", "topology_candidates", "node_roles", "node_kinds",
@@ -296,6 +306,15 @@ MANIFOLD_METHOD_FIT_MODES: dict[str, frozenset[str]] = {
     "merge": frozenset({"baked"}),
     "folded_vector": frozenset({"baked"}),
 }
+
+
+def _is_sha256_digest(value: Any) -> bool:
+    """True for a canonical lowercase 64-hex sha256 digest."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
 
 
 def _finite_number(value: Any) -> bool:
@@ -460,7 +479,8 @@ def validate_manifold_sidecar_payload(
         raise ManifoldFormatError(f"{location} sae_full_coverage must be bool")
     nullable_strings = (
         "nodes_sha256", "sae_release", "sae_revision", "sae_fingerprint",
-        "model_fingerprint", "capture_sha256", "share_metric",
+        "model_fingerprint", "model_source_fingerprint", "capture_sha256",
+        "share_metric",
         "subspace_metric", "resolved_fit_mode", "topology_winner",
         "bake_policy", "source_model_id", "source_model_fingerprint",
     )
@@ -469,6 +489,21 @@ def validate_manifold_sidecar_payload(
         for key in nullable_strings
     ):
         raise ManifoldFormatError(f"{location} has invalid nullable string metadata")
+    # The two preflight-provable digests are always writer-produced sha256, so
+    # they are held to the exact digest grammar rather than "non-empty string":
+    # a preflight that compares a recomputed digest against a malformed stored
+    # one must fail loudly at load, not quietly mismatch forever.
+    if any(
+        data[key] is not None and not _is_sha256_digest(data[key])
+        for key in ("capture_render_sha256", "baseline_prompts_sha256")
+    ):
+        raise ManifoldFormatError(f"{location} has invalid capture digest metadata")
+    if data["capture_version"] is not None and (
+        isinstance(data["capture_version"], bool)
+        or not isinstance(data["capture_version"], int)
+        or data["capture_version"] < 0
+    ):
+        raise ManifoldFormatError(f"{location} has invalid capture_version")
     if data["fit_policy_version"] is not None and (
         isinstance(data["fit_policy_version"], bool)
         or not isinstance(data["fit_policy_version"], int)
@@ -614,7 +649,10 @@ def canonical_manifold_sidecar_payload(
         "nodes_sha256": None, "sae_release": None, "sae_revision": None,
         "sae_fingerprint": None, "sae_ids_by_layer": {},
         "sae_full_coverage": False, "model_fingerprint": None,
-        "capture_sha256": None, "fitted_layers": list(fitted_layers or []),
+        "model_source_fingerprint": None,
+        "capture_sha256": None, "capture_version": None,
+        "capture_render_sha256": None, "baseline_prompts_sha256": None,
+        "fitted_layers": list(fitted_layers or []),
         "fit_policy_version": None, "share_metric": None,
         "subspace_metric": None, "rbf_smoothing_per_layer": {},
         "sigma_field_per_layer": {}, "resolved_fit_mode": None,
@@ -777,7 +815,30 @@ class ManifoldSidecar:
     sae_ids_by_layer: dict[str, str] = field(default_factory=dict)
     sae_full_coverage: bool = False
     model_fingerprint: Optional[str] = None
+    # The *pre-load-verifiable* checkpoint identity
+    # (:func:`saklas.core.model.model_source_fingerprint`): resolved Hub commit
+    # or exact local file hashes, plus the load representation.  Distinct from
+    # ``source_model_fingerprint``, which names the *other* model a cross-model
+    # Procrustes transfer came from.  This one exists so a fit no-op can be
+    # proven without instantiating the transformer.
+    model_source_fingerprint: Optional[str] = None
     capture_sha256: Optional[str] = None
+    # The two provable halves of ``capture_sha256``.  ``capture_version`` is the
+    # capture-identity schema revision (:data:`saklas.core.extraction.
+    # MANIFOLD_CAPTURE_VERSION`); ``capture_render_sha256`` digests the
+    # tokenizer-render half alone — node partition plus every rendered row's
+    # token ids and pool index — which is exactly the part reproducible from
+    # tokenizer + baseline prompts + corpus with no weights loaded.  The
+    # remaining half (model class, config, commit, load representation) is
+    # covered by ``model_fingerprint`` + ``model_source_fingerprint``.
+    capture_version: Optional[int] = None
+    capture_render_sha256: Optional[str] = None
+    # Digest of the exact shared baseline prompts (or a templated manifold's
+    # resolved contexts) the corpus rows were paired against.  Redundant with
+    # ``capture_render_sha256`` by construction, and deliberately so: a
+    # baseline-prompt edit is the failure mode a weight-free preflight most
+    # needs to name, so it gets its own directly comparable channel.
+    baseline_prompts_sha256: Optional[str] = None
     fitted_layers: list[int] = field(default_factory=list)
     fit_policy_version: Optional[int] = None
     # Discover-mode-only fields.  ``None`` on authored fits.
@@ -811,6 +872,32 @@ class ManifoldSidecar:
     # Per-node conceptual kind ("abstract"/"concrete"), ``node_labels`` order.
     # Mirrors ``node_roles``' independent-copy rationale; generation provenance.
     node_kinds: list[str | None] = field(default_factory=list)
+    # Metric labels: how the per-layer share was weighted and how the subspace
+    # basis was selected.  Both read ``"mahalanobis"`` on an ordinary fit; a
+    # monopolar fold labels its raw-δ̂ basis ``"euclidean"`` (a basis-selection
+    # label, not a metric fallback — ``concept − ν`` cancels common-mode by
+    # differencing, like DiM).
+    share_metric: Optional[str] = None
+    subspace_metric: Optional[str] = None
+    # Topology-selection evidence, stamped for ``fit_mode="auto"`` only (all
+    # three are ``None``/empty otherwise — the payload validator enforces that
+    # consistency).  ``resolved_fit_mode`` is the geometry ``select_topology``
+    # picked for *this* model (``pca`` flat / ``spectral`` curved),
+    # ``topology_winner`` names the winning candidate, and
+    # ``topology_candidates`` is the full ranked field — each
+    # ``{name, fit_mode, intrinsic_dim, score, viable, reason}`` — i.e. the GCV
+    # + persistent-homology evidence behind the flat-vs-curved-vs-periodic call.
+    resolved_fit_mode: Optional[str] = None
+    topology_winner: Optional[str] = None
+    topology_candidates: list[dict[str, Any]] = field(default_factory=list)
+    # Curved-fit per-layer summaries.  ``rbf_smoothing_per_layer``
+    # ``{L: {lambda, edf, gcv}}`` records the GCV-selected penalized-RBF
+    # smoothing; ``sigma_field_per_layer``
+    # ``{L: {sigma_mean, sigma_min, sigma_max, lambda}}`` summarizes the
+    # fuzzy-manifold tube thickness.  The σ-RBF tensors themselves ride the
+    # safetensors — these are the inspector summaries.  Empty on flat fits.
+    rbf_smoothing_per_layer: dict[str, Any] = field(default_factory=dict)
+    sigma_field_per_layer: dict[str, Any] = field(default_factory=dict)
 
     @property
     def evaluated_layers(self) -> list[int]:
@@ -842,7 +929,11 @@ class ManifoldSidecar:
             sae_ids_by_layer=dict(data["sae_ids_by_layer"]),
             sae_full_coverage=data["sae_full_coverage"],
             model_fingerprint=data["model_fingerprint"],
+            model_source_fingerprint=data["model_source_fingerprint"],
             capture_sha256=data["capture_sha256"],
+            capture_version=data["capture_version"],
+            capture_render_sha256=data["capture_render_sha256"],
+            baseline_prompts_sha256=data["baseline_prompts_sha256"],
             fitted_layers=list(data["fitted_layers"]),
             fit_policy_version=data["fit_policy_version"],
             fit_mode=data["fit_mode"],
@@ -853,87 +944,54 @@ class ManifoldSidecar:
             node_kinds=list(data["node_kinds"]),
             components=data["components"],
             bake_policy=data["bake_policy"],
+            share_metric=data["share_metric"],
+            subspace_metric=data["subspace_metric"],
+            resolved_fit_mode=data["resolved_fit_mode"],
+            topology_winner=data["topology_winner"],
+            topology_candidates=list(data["topology_candidates"]),
+            rbf_smoothing_per_layer=dict(data["rbf_smoothing_per_layer"]),
+            sigma_field_per_layer=dict(data["sigma_field_per_layer"]),
         )
 
 
+def fitted_sidecar_is_current(path: Path) -> bool:
+    """Whether a fitted sidecar carries exactly the current format version.
+
+    A cheap version peek, deliberately narrower than the full validator: only a
+    well-formed *older or newer* stamp counts as stale.  Unreadable bytes, a
+    non-object payload, and a missing or non-integer ``format_version`` all
+    return ``True`` so the strict loader still runs and reports what is actually
+    wrong — a format bump must invalidate fits, never launder corruption.
+    """
+    try:
+        with open(path) as handle:
+            value = json.load(handle).get("format_version")
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return True
+    if isinstance(value, bool) or not isinstance(value, int):
+        return True
+    return value == MANIFOLD_FORMAT_VERSION
+
+
 def load_manifold_sidecar_data(path: Path) -> dict[str, Any]:
-    """Read and validate the exact current fitted-manifold sidecar shape."""
+    """Read and validate the exact current fitted-manifold sidecar shape.
+
+    The reader half of :func:`validate_manifold_sidecar_payload` — one
+    validator gates writer and reader, so a sidecar that loads is exactly a
+    sidecar the writer could have produced.  Only the version check is hoisted
+    ahead of it: an artifact from an older format should say so rather than
+    report whichever field the current schema happens to miss first.
+    """
+    location = f"manifold sidecar {path}"
     try:
         with open(path) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} is unreadable: {exc}"
-        ) from exc
+        raise ManifoldFormatError(f"{location} is unreadable: {exc}") from exc
     if not isinstance(data, dict):
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} must be a JSON object"
-        )
-    validate_manifold_format_version(
-        data.get("format_version"), location=f"manifold sidecar {path}",
-    )
-    if set(data) != MANIFOLD_SIDECAR_FIELDS:
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} does not match the current exact schema"
-        )
-    validate_manifold_sidecar_payload(data, location=f"manifold sidecar {path}")
-    required_types: dict[str, type] = {
-        "name": str,
-        "method": str,
-        "saklas_version": str,
-        "domain": dict,
-        "node_count": int,
-        "node_labels": list,
-        "feature_space": str,
-        "fit_mode": str,
-        "hyperparams": dict,
-        "diagnostics": dict,
-        "node_spread_per_layer": dict,
-    }
-    for key, expected in required_types.items():
-        value = data.get(key)
-        if not isinstance(value, expected) or (
-            expected is int and isinstance(value, bool)
-        ):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} field {key!r} must be "
-                f"{expected.__name__}"
-            )
-    if data["fit_mode"] not in {
-        "authored", "pca", "spectral", "auto", "baked",
-    }:
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} has invalid "
-            f"fit_mode={data['fit_mode']!r}"
-        )
-    labels = data["node_labels"]
-    if any(not isinstance(label, str) for label in labels):
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} node_labels must contain only strings"
-        )
-    if data["node_count"] != len(labels):
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} node_count does not match node_labels"
-        )
-    for key in (
-        "sae_ids_by_layer", "hyperparams", "diagnostics",
-        "node_spread_per_layer", "mahalanobis_share_per_layer",
-        "origin_per_layer", "rbf_smoothing_per_layer", "sigma_field_per_layer",
-    ):
-        if not isinstance(data[key], dict):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} field {key!r} must be an object"
-            )
-    for key in ("fitted_layers", "node_roles", "node_kinds", "topology_candidates"):
-        if not isinstance(data[key], list):
-            raise ManifoldFormatError(
-                f"manifold sidecar {path} field {key!r} must be an array"
-            )
-    if len(data["node_roles"]) != len(labels) or len(data["node_kinds"]) != len(labels):
-        raise ManifoldFormatError(
-            f"manifold sidecar {path} node provenance does not match node_labels"
-        )
-    return data
+        raise ManifoldFormatError(f"{location} must be a JSON object")
+    validate_manifold_format_version(data.get("format_version"), location=location)
+    return validate_manifold_sidecar_payload(data, location=location)
 
 
 @dataclass
@@ -1367,6 +1425,17 @@ class ManifoldFolder:
                     f"manifold {name!r} tensor {t.name} has no sidecar "
                     f"{sc_path.name}"
                 )
+            # A fit from an older format is **stale, not corrupt**: the folder's
+            # corpus and geometry are untouched, so the only thing that expired
+            # is one per-model tensor.  Leave its stem unregistered and the
+            # manifold reads as "not fitted for that model" — a clean cache miss
+            # the next fit overwrites.  Raising here instead would take the
+            # whole artifact out of the selector index on a format bump,
+            # unfitting its labels, probes, and steering along with it.  A
+            # corpus-less baked manifold has nothing to re-fit from, so it keeps
+            # the strict read (and the tensor-less check below then fires).
+            if fit_mode != "baked" and not fitted_sidecar_is_current(sc_path):
+                continue
             inst._sidecars[t.stem] = ManifoldSidecar.load(sc_path)
 
         # A baked manifold's tensor is its entire reason to exist (no corpus

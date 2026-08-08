@@ -534,12 +534,83 @@ def test_load_text_from_multimodal_raises_when_no_text_weights(tmp_path: Path, m
 
 
 # ---------------------------------------------------------------------------
+# Source-fingerprint parity: pre-load recompute == post-load stamp.
+#
+# ``_finalize_model`` stamps ``model_source_fingerprint`` from ``plan.config``
+# *after* the weights loaded.  On the text-extraction path the load mutates
+# that object in place (``_materialize_model`` fills
+# ``text_config._name_or_path``; ``from_config`` writes the load dtype onto
+# ``text_config``), so a naive pre-load recompute hashed a different config
+# and every metadata-only fast path (manifold-fit preflight, lens-fit no-op,
+# alignment ``_proven_sidecar``) failed closed on gemma-3/gemma-4/mistral-3.
+# The fingerprint canonicalizes its config payload to the post-load view;
+# these tests pin recompute == stamp end-to-end for both checkpoint shapes.
+# ---------------------------------------------------------------------------
+
+
+def _stub_tokenizer(name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        name_or_path=name, vocab_size=128, eos_token_id=2,
+        added_tokens_encoder={},
+    )
+
+
+def _load_stamped(ckpt: Path, tok_name: str):
+    """Real ``load_model`` on a local checkpoint; only the tokenizer is stubbed."""
+    with patch.object(model_mod, "AutoTokenizer") as mock_tok:
+        mock_tok.from_pretrained.return_value = _stub_tokenizer(tok_name)
+        model, _ = model_mod.load_model(str(ckpt), device="cpu")
+    return model
+
+
+def test_source_fingerprint_recompute_matches_stamp_text_only(tmp_path: Path):
+    from transformers import AutoModelForCausalLM as _AM
+
+    text_cfg = _tiny_text_config(tie=True)
+    torch.manual_seed(0)
+    ckpt = tmp_path / "text-only"
+    _AM.from_config(text_cfg).save_pretrained(ckpt)
+
+    pre = model_mod.model_source_fingerprint(str(ckpt), device="cpu")
+    assert pre is not None
+    model = _load_stamped(ckpt, "text-only-stub")
+    assert getattr(model, "_saklas_source_fingerprint", None) == pre
+
+
+def test_source_fingerprint_recompute_matches_stamp_multimodal(tmp_path: Path):
+    from safetensors.torch import save_file
+    from transformers import AutoModelForCausalLM as _AM
+    from transformers import LlavaConfig
+
+    text_cfg = _tiny_text_config(tie=False)
+    torch.manual_seed(0)
+    ref = _AM.from_config(text_cfg)
+    ckpt = tmp_path / "vlm"
+    LlavaConfig(text_config=text_cfg.to_dict()).save_pretrained(ckpt)
+    save_file(
+        _remap_to_layout(ref.state_dict(), "mistral"),
+        str(ckpt / "model.safetensors"),
+    )
+
+    pre = model_mod.model_source_fingerprint(str(ckpt), device="cpu")
+    assert pre is not None
+    model = _load_stamped(ckpt, "vlm-stub")
+    # The extraction path must actually have fired (and with it the in-place
+    # plan-config mutations), else this asserts nothing.
+    assert type(model).__name__ == "LlamaForCausalLM"
+    assert getattr(model, "_saklas_source_fingerprint", None) == pre
+
+
+# ---------------------------------------------------------------------------
 # Routing: when does load_model prefer the text-only extraction path?
 # ---------------------------------------------------------------------------
 
 
-def _routing_calls(cfg: _FakeConfig, *, extractor_raises: bool = False):
-    """Run load_model on CPU with a mocked stack; return
+def _routing_calls(
+    cfg: _FakeConfig, *, extractor_raises: bool = False,
+    device: str = "cpu", quantize: str | None = None,
+):
+    """Run load_model with a mocked stack; return
     ``(text_extractor_called, from_pretrained_called)``."""
     fp_called = {"v": False}
 
@@ -562,7 +633,7 @@ def _routing_calls(cfg: _FakeConfig, *, extractor_raises: bool = False):
         mock_tok.from_pretrained.return_value = SimpleNamespace()
         mock_cfg.from_pretrained.return_value = cfg
         mock_model.from_pretrained.side_effect = _fake_from_pretrained
-        model_mod.load_model("fake/repo", device="cpu")
+        model_mod.load_model("fake/repo", device=device, quantize=quantize)
 
     return mock_extract.called, fp_called["v"]
 
@@ -614,6 +685,52 @@ def test_plain_text_model_uses_standard_load():
     assert from_pretrained_called
 
 
+def test_quantized_multimodal_routes_to_standard_full_load():
+    """Under bitsandbytes quantization the text-extraction path must be
+    skipped — its shard streamer copies raw weights and cannot quantize, so
+    routing through it would silently produce an unquantized model stamped
+    as quantized.  The standard from_pretrained quantizes the full model."""
+    cfg = _FakeConfig(model_type="gemma4", text_model_type="gemma4_text")
+    extractor_called, from_pretrained_called = _routing_calls(
+        cfg, device="cuda", quantize="4bit",
+    )
+    assert not extractor_called, (
+        "quantized loads must not take the text-extraction path"
+    )
+    assert from_pretrained_called
+
+
+def test_quantized_multimodal_without_standard_route_raises_actionable():
+    """Ministral-as-Mistral3 + quantize: the composite is not registered with
+    AutoModelForCausalLM, and the only working route — text extraction —
+    cannot quantize.  HF's registry error must be rewrapped with the
+    actionable cause."""
+    cfg = _FakeConfig(model_type="mistral3", text_model_type="mistral")
+
+    def _registry_error(model_id: str, **kwargs: Any):
+        raise ValueError(
+            "Unrecognized configuration class <class 'Mistral3Config'> for "
+            "this kind of AutoModel: AutoModelForCausalLM."
+        )
+
+    with (
+        patch.object(model_mod, "AutoTokenizer") as mock_tok,
+        patch.object(model_mod, "AutoConfig") as mock_cfg,
+        patch.object(model_mod, "AutoModelForCausalLM") as mock_model,
+        patch.object(model_mod, "_load_text_from_multimodal") as mock_extract,
+    ):
+        mock_tok.from_pretrained.return_value = SimpleNamespace()
+        mock_cfg.from_pretrained.return_value = cfg
+        mock_model.from_pretrained.side_effect = _registry_error
+        with pytest.raises(
+            RuntimeError, match="does not support bitsandbytes",
+        ):
+            model_mod.load_model(
+                "fake/ministral", device="cuda", quantize="4bit",
+            )
+    assert not mock_extract.called
+
+
 def test_load_model_falls_back_to_full_load_on_no_text_weights():
     """If text extraction raises ``_NoTextWeightsExtracted`` (unexpected
     weight layout), load_model must fall back to the standard full load
@@ -626,3 +743,123 @@ def test_load_model_falls_back_to_full_load_on_no_text_weights():
     assert from_pretrained_called, (
         "a failed extraction must fall back to the standard full load"
     )
+
+
+# ---------------------------------------------------------------------------
+# The load-plan seam: decisions without weight I/O
+# ---------------------------------------------------------------------------
+
+
+def _plan(cfg: _FakeConfig, **kwargs: Any):
+    """Resolve a load plan against a mocked AutoConfig — reads no weights."""
+    with patch.object(model_mod, "AutoConfig") as mock_cfg:
+        mock_cfg.from_pretrained.return_value = cfg
+        return model_mod._resolve_load_plan(
+            "fake/repo",
+            quantize=kwargs.pop("quantize", None),
+            device=kwargs.pop("device", "cpu"),
+            dtype=kwargs.pop("dtype", None),
+        )
+
+
+def test_plan_resolves_decisions_without_loading_weights():
+    """Every ``load_model`` decision is inspectable before any weight read.
+
+    ``AutoModelForCausalLM`` is deliberately not patched here: reaching it
+    would fail the test, which is the point — the plan step must not load.
+    """
+    plan = _plan(_FakeConfig("qwen3"), device="cpu")
+    assert plan.model_id == "fake/repo"
+    assert plan.device == "cpu"
+    assert plan.dtype is torch.float32
+    assert plan.load_kwargs["attn_implementation"] == "sdpa"
+    assert plan.load_kwargs["device_map"] == {"": "cpu"}
+    assert plan.extract_text_model is False
+
+
+def test_plan_flags_text_extraction_for_supported_submodel():
+    plan = _plan(_FakeConfig("some_vlm", text_model_type="qwen3"), device="cpu")
+    assert plan.extract_text_model is True
+    assert plan.text_config is not None
+
+    # A text_config saklas has no accessor for stays a full-model load.
+    plan = _plan(_FakeConfig("some_vlm", text_model_type="not_a_family"))
+    assert plan.extract_text_model is False
+
+
+def test_plan_forces_eager_for_mla_on_mps():
+    """The MLA/MPS carve-out is a plan decision, testable on its own."""
+    for model_type in ("deepseek_v2", "deepseek_v3"):
+        plan = _plan(_FakeConfig(model_type), device="mps")
+        assert plan.load_kwargs["attn_implementation"] == "eager"
+    # Narrow: a vanilla architecture on MPS keeps sdpa, and MLA on CPU too.
+    assert _plan(
+        _FakeConfig("qwen3"), device="mps",
+    ).load_kwargs["attn_implementation"] == "sdpa"
+    assert _plan(
+        _FakeConfig("deepseek_v2"), device="cpu",
+    ).load_kwargs["attn_implementation"] == "sdpa"
+
+
+def test_plan_drops_quantization_off_cuda():
+    with pytest.warns(UserWarning, match="requires CUDA"):
+        plan = _plan(_FakeConfig("qwen3"), device="mps", quantize="4bit")
+    assert plan.quantize is None
+    assert "quantization_config" not in plan.load_kwargs
+    assert plan.load_kwargs["dtype"] is plan.dtype
+
+
+def test_plan_quantize_skips_text_extraction():
+    """Quantization flips a text-extractable composite onto the standard
+    quantized full-model path — the extraction streamer cannot quantize."""
+    cfg = _FakeConfig("gemma3", text_model_type="gemma3_text")
+    plan = _plan(cfg, device="cuda", quantize="4bit")
+    assert plan.extract_text_model is False
+    assert "quantization_config" in plan.load_kwargs
+
+    # Unquantized on the same config still prefers extraction.
+    plan = _plan(cfg, device="cuda")
+    assert plan.extract_text_model is True
+
+
+def test_plan_pins_the_resolved_revision():
+    cfg = _FakeConfig("qwen3")
+    cfg._commit_hash = "deadbeef"
+    plan = _plan(cfg)
+    assert plan.revision == "deadbeef"
+    assert plan.pin_kwargs == {"revision": "deadbeef"}
+    assert plan.load_kwargs["revision"] == "deadbeef"
+
+
+def test_plan_adds_the_mistral_tokenizer_fix_by_model_id():
+    with patch.object(model_mod, "AutoConfig") as mock_cfg:
+        mock_cfg.from_pretrained.return_value = _FakeConfig("mistral")
+        mistral = model_mod._resolve_load_plan(
+            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+            quantize=None, device="cpu", dtype=None,
+        )
+        other = model_mod._resolve_load_plan(
+            "Qwen/Qwen3-4B", quantize=None, device="cpu", dtype=None,
+        )
+    assert mistral.tokenizer_kwargs["fix_mistral_regex"] is True
+    assert "fix_mistral_regex" not in other.tokenizer_kwargs
+
+
+def test_load_with_fallbacks_narrows_attn_then_dtype_in_place():
+    """The retry ladder rewrites the plan's kwargs so retries compose."""
+    plan = _plan(_FakeConfig("qwen3"), device="cpu")
+    calls: list[dict[str, Any]] = []
+
+    def _first_attn_then_ok(model_id: str, **kwargs: Any):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise ValueError("model does not support an attention implementation")
+        return _FakeModel(kwargs["attn_implementation"])
+
+    with patch.object(model_mod, "AutoModelForCausalLM") as mock_model:
+        mock_model.from_pretrained.side_effect = _first_attn_then_ok
+        model_mod._load_with_fallbacks(plan)
+
+    assert calls[0]["attn_implementation"] == "sdpa"
+    assert calls[1]["attn_implementation"] == "eager"
+    assert plan.load_kwargs["attn_implementation"] == "eager"

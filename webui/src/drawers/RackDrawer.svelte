@@ -21,13 +21,13 @@
   //   * Unfitted  — node corpus on disk but no tensor for this model.
   //                 Per row: [fit] [delete].
   //
-  // The top "+ …" launcher is the one legitimately family-specific flow:
-  // subspace opens the concept-extract drawer, manifold opens the
-  // curved-manifold builder.
+  // Nothing here is family-specific beyond the catalog filter and the
+  // chrome: the top "+ …" launcher opens the manifold builder for both
+  // families (see ``launcherLabel`` below).
 
   import { onMount } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
-  import { ApiError, apiManifolds, apiManifoldFitStream } from "../lib/api";
+  import { apiManifolds, apiManifoldFitStream, describeError } from "../lib/api";
   import {
     addManifoldToRack,
     addSubspaceToRack,
@@ -81,8 +81,8 @@
     family === "manifold" ? "var(--pillar-manifold)" : "var(--accent)",
   );
   const title = $derived(family === "manifold" ? "manifold" : "subspace");
-  // Authoring always routes to the manifold builder now — a flat (2-node /
-  // personas) fit is just a pca manifold, so there's no separate vector
+  // Authoring always routes to the manifold builder — a flat (2-node /
+  // personas) fit is just a pca manifold, so there is no separate vector
   // extraction form.  Both families' launcher opens the same builder.
   const launcherLabel = "build manifold";
   const launcherHint = "author a domain and node corpus";
@@ -134,17 +134,6 @@
 
   function rowKey(m: ManifoldInfo): string {
     return `${m.namespace}/${m.name}`;
-  }
-
-  function describeError(e: unknown): string {
-    if (e instanceof ApiError) {
-      const detail =
-        e.body && typeof e.body === "object" && "detail" in (e.body as object)
-          ? String((e.body as { detail: unknown }).detail)
-          : e.message;
-      return `${e.status}: ${detail}`;
-    }
-    return e instanceof Error ? e.message : String(e);
   }
 
   const searching = $derived(query.trim().length > 0);

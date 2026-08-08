@@ -4,17 +4,18 @@
 
 from __future__ import annotations
 
-import asyncio
-import threading
 from pathlib import Path
-from typing import cast
+from types import MethodType
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from fastapi.testclient import TestClient
 
+from saklas.core.model import loaded_model_fingerprint
 from saklas.core.session import SaklasSession
+from tests._fakes import make_mock_session
 
 
 # ---------------------------------------------------------------------------
@@ -23,29 +24,8 @@ from saklas.core.session import SaklasSession
 
 
 def _mock_session():
-    session = MagicMock()
-    session.model_id = "test/model"
-    session.model_info = {
-        "model_type": "gemma2",
-        "num_layers": 26,
-        "hidden_dim": 2304,
-        "device": "cpu",
-        "dtype": "torch.bfloat16",
-    }
-    session._device = "cpu"
-    session._dtype = "torch.bfloat16"
-    session._created_ts = 1_700_000_000
-
-    session.config = MagicMock()
-    session.config.temperature = 1.0
-    session.config.top_p = 0.9
-    session.config.top_k = None
-    session.config.max_new_tokens = 1024
-    session.config.system_prompt = None
-
-    session.profiles = {}
-    session.probes = {}
-    session.history = []
+    # Shared native-API wiring lives in tests/_fakes.py.
+    session = make_mock_session()
 
     monitor = MagicMock()
     monitor.probe_names = []
@@ -53,14 +33,13 @@ def _mock_session():
     session._monitor = monitor
     session._tokenizer = MagicMock()
     session._layers = []
-    session.lock = asyncio.Lock()
-
-    session._trait_queues = []
-    session._trait_lock = threading.Lock()
-    session.register_trait_queue = lambda *_a, **_kw: None
-    session.unregister_trait_queue = lambda *_a, **_kw: None
     session.events = MagicMock()
     session.events.subscribe = lambda cb: (lambda: None)
+    # ``POST /profiles/bake`` is a thin wrapper over ``SaklasSession.bake`` —
+    # bind the real method so the route's contract (including the
+    # loaded-weight fingerprint it forwards into the merge) is under test
+    # rather than a mock's return value.
+    session.bake = MethodType(SaklasSession.bake, session)
     return session
 
 
@@ -89,7 +68,6 @@ class TestMergeVector:
             fold_directions_to_subspace, folded_directions,
         )
         from saklas.io.manifold_tensors import load_manifold
-        from saklas.core.model import loaded_model_fingerprint
         from saklas.io.manifolds import create_baked_manifold_folder
         from saklas.io.paths import tensor_filename
 
@@ -100,7 +78,7 @@ class TestMergeVector:
             "noble", dirs, means,
             whitener=isotropic_whitener(dirs, 4), label="merged",
         )
-        from saklas.io.packs import hash_file
+        from saklas.io.integrity import hash_file
 
         honest_source = tmp_path / "honest-source.safetensors"
         warm_source = tmp_path / "warm-source.safetensors"
@@ -142,13 +120,17 @@ class TestMergeVector:
         data = resp.json()
         assert data["name"] == "noble"
         assert data["layers"] == [0, 5]
-        # Confirm we forwarded model + expression + force=True.
+        # Confirm we forwarded model + expression + force=True, and that the
+        # loaded-weight fingerprint guard rides along.
         kwargs = m.call_args.kwargs
         args = m.call_args.args
         assert args[0] == "noble"
         assert args[1] == "0.3 default/honest + 0.4 default/warm"
         assert args[2] == "test/model"
         assert kwargs["force"] is True
+        assert kwargs["expected_model_fingerprint"] == loaded_model_fingerprint(
+            session._model, session.model_id,
+        )
         # Auto-register on the session with the folded merged direction.
         steer_mock = cast(MagicMock, session.steer)
         steer_mock.assert_called_once()
@@ -196,11 +178,44 @@ class TestMergeVector:
         )
         assert resp.status_code == 404
 
-    def test_no_tensor_for_model_500(self, session_and_client: tuple[SaklasSession, TestClient], tmp_path: Path):
+    def test_fingerprint_mismatch_400(self, session_and_client: tuple[SaklasSession, TestClient]):
+        """Components fitted against other weights are refused.
+
+        The route forwards the session's live fingerprint into the merge, so
+        the guard that ``SaklasSession.bake`` exists to enforce fires over
+        HTTP too rather than baking a tensor the loaded model never produced.
+        """
+        from saklas.io.bake import MergeError
+        session, client = session_and_client
+        live = loaded_model_fingerprint(session._model, session.model_id)
+        seen: dict[str, Any] = {}
+
+        def _merge(*_args: Any, **kwargs: Any) -> Path:
+            seen.update(kwargs)
+            expected = kwargs.get("expected_model_fingerprint")
+            if expected is not None and expected != "stale-fingerprint":
+                raise MergeError(
+                    "cannot bake 'x' for test/model: components were fitted "
+                    "for different loaded weights; refit them for this "
+                    "session first"
+                )
+            raise AssertionError("guard did not fire")
+
+        with patch("saklas.io.bake.merge_into_manifold", side_effect=_merge):
+            resp = client.post(
+                "/saklas/v1/sessions/default/profiles/bake",
+                json={"name": "x", "expression": "0.3 default/a"},
+            )
+        assert seen["expected_model_fingerprint"] == live
+        assert resp.status_code == 400
+        assert "different loaded weights" in resp.json()["detail"]
+
+    def test_no_tensor_for_model_400(self, session_and_client: tuple[SaklasSession, TestClient], tmp_path: Path):
         """If merge_into_manifold returns a folder with no tensor for our model.
 
-        Defensive 500 — merge_into_manifold should always produce one when given
-        a model arg, but if it doesn't (e.g. silent skip), we surface it.
+        Defensive — merge_into_manifold should always produce one when given a
+        model arg, but if it doesn't (e.g. silent skip), the session raises
+        ``MergeError`` and the global SaklasError handler reports 400.
         """
         session, client = session_and_client
         empty_folder = tmp_path / "local" / "x"
@@ -214,4 +229,5 @@ class TestMergeVector:
                 "/saklas/v1/sessions/default/profiles/bake",
                 json={"name": "x", "expression": "0.3 default/a"},
             )
-        assert resp.status_code == 500
+        assert resp.status_code == 400
+        assert "produced no tensor" in resp.json()["detail"]

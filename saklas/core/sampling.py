@@ -1,11 +1,10 @@
 """Per-call sampling configuration for SaklasSession.generate.
 
-Frozen dataclass holding the OpenAI-shaped sampling knobs that used to be
-positional kwargs on ``session.generate``.  None on any field means "use the
-session default" — the session's ``GenerationConfig`` still holds session-level
-defaults (``max_new_tokens``, ``temperature``, ``top_p``, ``top_k``,
-``system_prompt``) and ``_generate_core`` composes the two at entry without
-mutating ``session.config``.
+Frozen dataclass holding the OpenAI-shaped per-call sampling knobs.  None on
+any field means "use the session default" — the session's ``GenerationConfig``
+holds the session-level defaults (``max_new_tokens``, ``temperature``,
+``top_p``, ``top_k``, ``system_prompt``) and ``_generate_core`` composes the two
+at entry without mutating ``session.config``.
 
 Keeping these values separate from session configuration lets one session serve
 many concurrent requests without request-local overrides leaking across calls.

@@ -4,6 +4,7 @@ fit/bake/merge/transfer/compare/why) and their dispatch table."""
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 from operator import itemgetter
 import sys
 from pathlib import Path
@@ -12,11 +13,9 @@ from typing import TYPE_CHECKING, Any
 import saklas.cli.runners as _pkg
 from saklas.cli.parsers import _MANIFOLD_VERBS
 from saklas.cli.runners.shared import (
-    _resolve_manifold_folder, _resolve_manifold_ns_name, _saklas_error_exit,
-    _split_manifold_ns_name,
+    _print_verb_menu, _resolve_manifold_folder, _resolve_manifold_ns_name,
+    _saklas_error_exit, _split_manifold_ns_name,
 )
-from saklas.core.histogram import summarize_diagnostics
-from saklas.core.stats import median_or_zero
 from saklas.io.paths import VARIANT_SUFFIX_RE
 
 if TYPE_CHECKING:
@@ -30,6 +29,53 @@ def _run_manifold_bake(args: argparse.Namespace) -> None:
         force=args.force, strict=args.strict,
     )
     print(f"Merged manifold written to {dst}")
+
+
+def _try_manifold_fit_noop_preflight(
+    args: argparse.Namespace,
+    folder: "Path",
+    *,
+    sae: str | None = None,
+    fit_mode: str | None = None,
+    hyperparams: "dict[str, object] | None" = None,
+    expected_role: str | None = None,
+    enforce_role: bool = False,
+) -> "Any | None":
+    """Prove this fit target is already exact before any model load.
+
+    The ``lens fit`` no-op shape for manifolds.  Everything decisive lives in
+    ``io.preflight_manifold_fit_noop``; this wrapper only supplies the CLI's
+    request shape and applies the one check that is an *authoring* concern
+    rather than a fit-identity one — ``extract --role`` refuses to reuse a
+    folder whose corpus carries a different role baseline, and that refusal is
+    an error the loaded path must be allowed to raise.  ``manifold fit`` takes
+    the folder's roles as given (a persona manifold is authored with them), so
+    it leaves ``enforce_role`` off.
+    """
+    from saklas.io.manifold_folder import ManifoldFolder, ManifoldFormatError
+    from saklas.io.manifolds import preflight_manifold_fit_noop
+
+    if not (folder / "manifold.json").exists():
+        return None
+    if enforce_role:
+        try:
+            roles = ManifoldFolder.load(
+                folder, verify_manifest=False,
+            )._roles_padded()
+        except (ManifoldFormatError, OSError, ValueError):
+            return None
+        if not roles or not all(role == expected_role for role in roles):
+            return None
+    return preflight_manifold_fit_noop(
+        folder,
+        model_id=args.model,
+        layer_indices=getattr(args, "layers", None),
+        sae=sae,
+        fit_mode=fit_mode,
+        hyperparams=hyperparams,
+        quantize=getattr(args, "quantize", None),
+        device=getattr(args, "device", None) or "auto",
+    )
 
 
 def _require_model(args: argparse.Namespace) -> None:
@@ -73,18 +119,61 @@ def _run_manifold_extract(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
 
+    # Same rejection the multi-node authoring path applies: ``custom`` has no
+    # built-in system template, so the caller must supply one.
+    kind = getattr(args, "kind", None) or "abstract"
+    custom_system = getattr(args, "custom_system", None)
+    if kind == "custom" and not custom_system:
+        print(
+            "manifold extract: --kind custom requires --system "
+            '(a template with a {c} placeholder, e.g. "You are the month of '
+            '{c}; speak as that month.")',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # A steering vector is a 2-node ``pca`` manifold (4.0); a role-augmented
     # fit bakes into its node corpora and writes the canonical tensor name (no
-    # ``_role-`` suffix). Cache validation belongs to the loaded session/pipeline
-    # because bare file existence cannot prove sidecar integrity, corpus/role/SAE
-    # identity, or the loaded model fingerprint.
+    # ``_role-`` suffix).  Bare file existence proves nothing, so the cache
+    # check runs through the weight-free preflight (sidecar integrity, corpus /
+    # role / template identity, the token-exact render, and the checkpoint→
+    # loaded fingerprint bridge) and falls through to the loaded session
+    # whenever any component is unproven.
+    from saklas.core.naming import canonical_concept_name
+
     ns = getattr(args, "namespace", None) or "local"
     tensor_name = tensor_filename(args.model, release=requested_release)
+    if not args.force:
+        canonical = canonical_concept_name(raw, baseline)
+        proof = _try_manifold_fit_noop_preflight(
+            args,
+            pathlib.Path(manifold_dir(ns, canonical)),
+            sae=requested_release,
+            expected_role=requested_role,
+            enforce_role=True,
+        )
+        if proof is not None:
+            variant_tail = f":role-{requested_role}" if requested_role else ""
+            print(
+                f"extracted {canonical}{variant_tail} -> {proof.tensor_path}"
+            )
+            print(
+                "Already fitted for this corpus and exact model source "
+                "— nothing to do."
+            )
+            return
     _pkg._print_startup(args)
     session = _pkg._make_session(args, load_probes=False)
     _pkg._print_model_info(session)
 
-    extract_kwargs: dict[str, Any] = {}
+    # ``extract`` generates up to 96 in-character responses and then runs a
+    # full fit, so it narrates per batch like its ``fit`` / ``generate``
+    # siblings rather than going quiet until the final line.
+    extract_kwargs: dict[str, Any] = {
+        "kind": kind,
+        "custom_system": custom_system,
+        "on_progress": lambda m: print(f"  {m}"),
+    }
     if requested_release:
         extract_kwargs["sae"] = args.sae
     if requested_role:
@@ -464,7 +553,6 @@ def _run_manifold_why(args: argparse.Namespace) -> None:
         key=itemgetter(0),
     )
     total_layers = len(profile)
-    diagnostics = profile.diagnostics  # None when extracted before saklas 1.6
 
     if args.json_output:
         result: dict[str, Any] = {
@@ -473,31 +561,9 @@ def _run_manifold_why(args: argparse.Namespace) -> None:
             "total_layers": total_layers,
             "layers": [{"layer": l, "magnitude": round(m, 6)} for l, m in layer_mags],
         }
-        if diagnostics is not None:
-            result["diagnostics_by_layer"] = {
-                str(layer): {k: round(float(v), 6) for k, v in metrics.items()}
-                for layer, metrics in sorted(diagnostics.items())
-            }
-            result["diagnostics_summary"] = summarize_diagnostics(diagnostics)
         print(_json.dumps(result, indent=2))
     else:
         _print_why_histogram(concept_name, args.model, total_layers, layer_mags)
-        if diagnostics is not None:
-            _print_diagnostics(diagnostics)
-
-
-def _print_diagnostics(diagnostics: dict[int, dict[str, float]]) -> None:
-    """Render the diagnostics summary + per-layer table beneath the histogram."""
-    summary = summarize_diagnostics(diagnostics)
-    quality = summary["quality"]
-    print()
-    print(f"  DIAGNOSTICS (probe quality: {quality}):")
-    print(
-        f"    median EVR:                 {summary['median_evr']:.3f}\n"
-        f"    median intra-pair variance: {summary['median_intra_pair_variance']:.4f}\n"
-        f"    median inter-pair alignment:{summary['median_inter_pair_alignment']:>7.3f}\n"
-        f"    median diff→PC projection:  {summary['median_diff_principal_projection']:.3f}"
-    )
 
 
 def _print_why_histogram(
@@ -635,6 +701,31 @@ def _run_manifold_fit(args: argparse.Namespace) -> None:
             requested_hyperparams["persistence_frac"] = float(
                 args.persistence_frac,
             )
+
+    # Weight-free no-op: if every component of the fit's cache key can be
+    # proven off-model, the model load (minutes on a cold cache) buys nothing.
+    # An override patch is deliberately not proven — it rewrites
+    # ``manifold.json`` inside the fit's own lock, so the on-disk hash the
+    # preflight can see is not the one the fit would compare against.
+    if not bool(getattr(args, "force", False)):
+        proof = _try_manifold_fit_noop_preflight(
+            args, folder,
+            sae=getattr(args, "sae", None),
+            fit_mode=requested_fit_mode,
+            hyperparams=requested_hyperparams,
+        )
+        if proof is not None:
+            print(
+                f"fitted manifold '{proof.manifold_name}' "
+                f"({len(proof.fitted_layers)} layers, "
+                f"{len(proof.node_labels)} nodes, {proof.fit_mode})"
+            )
+            print(
+                "Already fitted for this corpus and exact model source "
+                "— nothing to do."
+            )
+            print(f"Artifact: {proof.tensor_path}")
+            return
 
     _pkg._print_startup(args)
     session = _pkg._make_session(args, load_probes=False)
@@ -857,6 +948,22 @@ def _run_manifold_merge(args: argparse.Namespace) -> None:
     )
 
 
+def _median(values: "Iterable[float]") -> float:
+    """Median of ``values``; ``0.0`` for an empty iterable.
+
+    Summarizes the per-layer Procrustes alignment qualities into the single
+    ``transfer_quality_estimate`` the transferred sidecar records.
+    """
+    ordered = sorted(float(v) for v in values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2 == 1:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
 def _run_manifold_transfer(args: argparse.Namespace) -> None:
     """Cross-model manifold transfer via Procrustes.
 
@@ -915,7 +1022,7 @@ def _run_manifold_transfer(args: argparse.Namespace) -> None:
         print(f"manifold transfer failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    median_quality = median_or_zero(list(quality_per_layer.values())) if quality_per_layer else None
+    median_quality = _median(quality_per_layer.values()) if quality_per_layer else None
 
     try:
         out_path = transfer_manifold(
@@ -983,16 +1090,8 @@ def _run_manifold(args: argparse.Namespace) -> None:
     """Dispatch ``saklas manifold <verb>`` (the compute verbs)."""
     cmd = getattr(args, "manifold_cmd", None)
     if cmd is None:
-        print("usage: saklas manifold <verb> [...]")
-        print()
-        width = max(len(v) for v, _ in _MANIFOLD_VERBS)
-        for v, desc in _MANIFOLD_VERBS:
-            print(f"  {v:<{width}}  {desc}")
-        print()
-        print("Run `saklas manifold <verb> -h` for verb-specific options.")
+        _print_verb_menu("manifold", _MANIFOLD_VERBS)
         sys.exit(0)
-    runner = _MANIFOLD_RUNNERS.get(cmd)
-    if runner is None:
-        print(f"unknown manifold verb {cmd!r}", file=sys.stderr)
-        sys.exit(2)
-    runner(args)
+    # Every verb is a registered subparser, so argparse rejects an unknown
+    # one with its own "invalid choice" error before dispatch gets here.
+    _MANIFOLD_RUNNERS[cmd](args)

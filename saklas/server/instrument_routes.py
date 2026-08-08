@@ -37,7 +37,8 @@ import asyncio
 import logging
 import math
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException
 from pydantic import Field, ValidationError
@@ -45,7 +46,7 @@ from pydantic import Field, ValidationError
 from saklas.core.errors import SaklasError
 from saklas.core.jlens import LensNotFittedError, resolve_word_token
 from saklas.core.loom import InvalidNodeOperationError, UnknownNodeError
-from saklas.core.measurements import build_measurements
+from saklas.core.measurements import MeasurementsEnvelope
 from saklas.server.app import acquire_session_lock
 from saklas.server.background_job import (
     BackgroundJob,
@@ -53,10 +54,144 @@ from saklas.server.background_job import (
     scrub_job_error,
 )
 from saklas.server.native_common import NativeRequest, resolve_session_id
+from saklas.server.response_models import (
+    InstrumentCapabilities,
+    InstrumentFamilyBlock,
+    InstrumentLiveState,
+    InstrumentSourceJSON,
+    InstrumentsResponse,
+    LensTokenValidationJSON,
+    PreparationProgress,
+    PreparationStatusJSON,
+    SaeFeatureMetaResponse,
+    SaeFeatureValidationJSON,
+    SaeReleaseJSON,
+    SourceSwitchResponse,
+    SourcesResponse,
+)
 
 log = logging.getLogger(__name__)
 
-_FAMILIES = ("geometry", "lens", "sae")
+
+# ---------------------------------------------------------------------------
+# Response shapes
+# ---------------------------------------------------------------------------
+# The wire contract used to be maintained by hand in TypeScript.  It now
+# lives in ``server/response_models.py`` as the Python-side declaration every
+# non-streaming native route annotates: FastAPI emits a real OpenAPI response
+# schema from it, ``scripts/generate_webui_types.py`` renders
+# ``webui/src/lib/types.gen.ts`` from that schema, and
+# ``tests/test_measurements_envelope.py`` pins the exact key sets — so a shape
+# change that isn't mirrored fails a test or the parity check rather than a
+# dashboard.
+
+@dataclass(frozen=True)
+class FamilyCapabilities:
+    """What a read family supports over HTTP — ONE declaration.
+
+    The route dispatch, the ``GET /instruments`` listing's ``capabilities``
+    block, and ``session_info``'s per-family block all read this, so an
+    unsupported operation answers from the declaration rather than from a
+    hand-written ``if family == …`` branch.  ``*_error`` carries the status
+    and message an unsupported operation returns, so a family that *can't*
+    do something says why in one place.
+    """
+
+    sources: bool
+    preparations: tuple[str, ...]
+    token_readout: bool
+    source_switch: bool
+    sources_error: "tuple[int, str] | None" = None
+    source_switch_error: "tuple[int, str] | None" = None
+    preparations_error: "tuple[int, str] | None" = None
+
+    def to_dict(self) -> InstrumentCapabilities:
+        return {
+            "sources": self.sources,
+            "preparations": list(self.preparations),
+            "token_readout": self.token_readout,
+            "source_switch": self.source_switch,
+        }
+
+
+_NO_SOURCE_LIFECYCLE = (
+    404,
+    "geometry has no source lifecycle (Monitor probes attach directly; "
+    "there is nothing to fetch or switch)",
+)
+
+#: Per-family capability declaration, keyed by the same family names
+#: ``session.instruments`` uses (the route layer validates ``{family}``
+#: against the registry, so this table and the registry cannot disagree
+#: about which families exist).
+CAPABILITIES: dict[str, FamilyCapabilities] = {
+    "geometry": FamilyCapabilities(
+        sources=False,
+        preparations=(),
+        token_readout=True,
+        source_switch=False,
+        sources_error=_NO_SOURCE_LIFECYCLE,
+        source_switch_error=(404, "geometry has no source to switch"),
+        preparations_error=(404, "geometry has no background preparations"),
+    ),
+    "lens": FamilyCapabilities(
+        sources=True,
+        preparations=("fetch", "fit"),
+        token_readout=True,
+        source_switch=True,
+    ),
+    "sae": FamilyCapabilities(
+        sources=True,
+        preparations=("fetch", "train"),
+        token_readout=True,
+        source_switch=False,
+        source_switch_error=(
+            409,
+            "switching the SAE source loads weights — run it as a "
+            "background preparation (POST .../instruments/sae/preparations "
+            "with operation='fetch')",
+        ),
+    ),
+}
+
+
+def family_block(session: Any, family: str) -> InstrumentFamilyBlock:
+    """The per-family wire block: ``{family, live, source, probes,
+    capabilities}``.
+
+    THE one builder — ``GET /instruments`` lists it for every family and
+    ``session_info`` embeds the same list, so the dashboard hydrates one
+    representation of instrument state instead of two that drift.
+    """
+    instrument = session.instruments[family]
+    return {
+        "family": family,
+        "live": instrument.live_state.to_dict(),
+        # The active-source accessor is the same resolver that stamps the
+        # source onto every measurement binding — a listing that answered
+        # from the prepared-sources scan instead would report ``null`` for
+        # an active pointer whose artifact is gone while persisted rows
+        # still carry its label.
+        "source": instrument.active_source,
+        "probes": list(instrument.names),
+        "capabilities": CAPABILITIES[family].to_dict(),
+    }
+
+
+def instrument_families(session: Any) -> list[InstrumentFamilyBlock]:
+    """Every read family's block, in registry order."""
+    return [family_block(session, family) for family in session.instruments]
+
+
+def require_family(session: Any, family: str) -> str:
+    """404 unless ``family`` names a registered read instrument."""
+    if family not in session.instruments:
+        raise HTTPException(
+            404,
+            f"unknown instrument family {family!r} "
+            f"(want one of {', '.join(session.instruments)})",
+        )
+    return family
 
 #: ``fit_jacobian_lens`` per-prompt progress line — "prompt 12/100 (…)".
 _FIT_PROGRESS_RE = re.compile(r"prompt (\d+)/(\d+)")
@@ -123,7 +258,7 @@ class LensFitRequest(NativeRequest):
     force: bool = False
 
 
-class SaeLoadRequest(NativeRequest):
+class SaeFetchRequest(NativeRequest):
     release: str = Field(min_length=1)
     layer: int | None = Field(default=None, ge=0)
 
@@ -160,36 +295,20 @@ def _parse_layers(layers: str | None) -> list[int] | str | None:
         ) from e
 
 
-def _require_family(family: str) -> str:
-    if family not in _FAMILIES:
-        raise HTTPException(
-            404,
-            f"unknown instrument family {family!r} "
-            f"(want one of {', '.join(_FAMILIES)})",
-        )
-    return family
+def _validation_message(exc: ValidationError) -> str:
+    """Flatten a pydantic ``ValidationError`` into one ``detail`` string.
 
-
-def _active_lens_source(session: Any) -> str | None:
-    """The active J-lens source label, from the public source listing."""
-    from saklas.io.lens_sources import list_lens_sources
-
-    for row in list_lens_sources(session.model_id):
-        if row.get("active"):
-            return row.get("source")
-    return None
-
-
-def _sae_source_label(session: Any) -> str | None:
-    """The resident SAE's source string (``local:``/``saelens:``), or None."""
-    info = session.sae_info
-    if not info:
-        return None
-    release = info.get("release")
-    if not release:
-        return None
-    text = str(release)
-    return text if text.startswith(("local:", "saelens:")) else f"saelens:{text}"
+    The preparation bodies are re-parsed into per-operation models after the
+    ``{operation, …}`` envelope is split, so their failures arrive as a raw
+    ``exc.errors()`` list.  The native envelope's ``detail`` is always a
+    string, so render the field paths here rather than shipping the list.
+    """
+    parts: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()))
+        msg = str(err.get("msg", "invalid value"))
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts) or "invalid preparation fields"
 
 
 def register_instrument_routes(app: FastAPI) -> None:
@@ -286,7 +405,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         done_field: str | None,
         total_field: str | None,
         extras: tuple[str, ...],
-    ) -> dict[str, Any]:
+    ) -> PreparationStatusJSON:
         st = job.status()
         running = bool(st.get("running"))
         error = st.get("error")
@@ -299,14 +418,14 @@ def register_instrument_routes(app: FastAPI) -> None:
             state = "done"
         else:
             state = "idle"
-        progress = None
+        progress: PreparationProgress | None = None
         if unit is not None and done_field is not None and total_field is not None:
             progress = {
                 "current": st.get(done_field),
                 "total": st.get(total_field),
                 "unit": unit,
             }
-        common: dict[str, Any] = {
+        common: PreparationStatusJSON = {
             "state": state,
             "operation": operation,
             "progress": progress,
@@ -327,13 +446,13 @@ def register_instrument_routes(app: FastAPI) -> None:
              ("live_layers",)),
         ),
         "sae": (
-            (sae_load_job, "load", None, None, None, ("release", "info")),
+            (sae_load_job, "fetch", None, None, None, ("release", "info")),
             (sae_train_job, "train", "tokens", "tokens_done", "tokens_total",
              ("name", "info")),
         ),
     }
 
-    def _idle_status() -> dict[str, Any]:
+    def _idle_status() -> PreparationStatusJSON:
         return {
             "state": "idle",
             "operation": None,
@@ -345,7 +464,7 @@ def register_instrument_routes(app: FastAPI) -> None:
             "cancellable": False,
         }
 
-    def _prep_status(family: str) -> dict[str, Any]:
+    def _prep_status(family: str) -> PreparationStatusJSON:
         specs = _JOB_SPECS.get(family)
         if not specs:
             return _idle_status()
@@ -374,77 +493,20 @@ def register_instrument_routes(app: FastAPI) -> None:
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise RuntimeError("session locked")
-            session.disable_live_lens()
+            session.lens.set_live(False)
             await asyncio.to_thread(session.select_jlens_source, source)
-            return await asyncio.to_thread(session.enable_live_lens)
+            state = await asyncio.to_thread(session.lens.set_live, True)
+            return list(state.layers or ())
 
     # =====================================================================
     # GET /instruments — enumerate the three families
     # =====================================================================
 
-    def _geometry_family() -> dict[str, Any]:
-        return {
-            "family": "geometry",
-            "live": {"enabled": bool(session.live_probe_scores)},
-            "source": None,
-            "probes": list(session.monitor.probe_names),
-            "capabilities": {
-                "sources": False,
-                "preparations": [],
-                "token_readout": True,
-                "source_switch": False,
-            },
-        }
-
-    def _lens_family() -> dict[str, Any]:
-        layers = session.live_lens_layers
-        return {
-            "family": "lens",
-            "live": {"enabled": layers is not None, "layers": layers},
-            "source": _active_lens_source(session),
-            "probes": list(session.lens_probe_names),
-            "capabilities": {
-                "sources": True,
-                "preparations": ["fetch", "fit"],
-                "token_readout": True,
-                "source_switch": True,
-            },
-        }
-
-    def _sae_family() -> dict[str, Any]:
-        live_on = bool(session.live_sae)
-        live_cfg = getattr(session, "_live_sae", None) if live_on else None
-        if isinstance(live_cfg, dict):
-            live = {
-                "enabled": True,
-                "layer": live_cfg.get("layer"),
-            }
-        else:
-            live = {"enabled": live_on, "layer": None}
-        return {
-            "family": "sae",
-            "live": live,
-            "source": _sae_source_label(session),
-            "probes": list(session.sae_probe_names),
-            "capabilities": {
-                "sources": True,
-                "preparations": ["load", "train"],
-                "token_readout": True,
-                "source_switch": False,
-            },
-        }
-
     @app.get("/saklas/v1/sessions/{session_id}/instruments")
-    def list_instruments(session_id: str):
-        """Enumerate the geometry / lens / sae read families."""
+    def list_instruments(session_id: str) -> InstrumentsResponse:
+        """Enumerate the read families over ``session.instruments``."""
         resolve_session_id(session_id)
-        return {
-            "instruments": [
-                _geometry_family(),
-                _lens_family(),
-                _sae_family(),
-            ],
-        }
+        return {"instruments": instrument_families(session)}
 
     # =====================================================================
     # POST /instruments/{family}/live — uniform live toggle
@@ -453,98 +515,73 @@ def register_instrument_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/sessions/{session_id}/instruments/{family}/live")
     async def instrument_live(
         session_id: str, family: str, body: InstrumentLiveRequest,
-    ):
+    ) -> InstrumentLiveState:
+        """Uniform live toggle: ``instrument.set_live(enabled, **extras)``.
+
+        Family extras travel as keyword arguments and the *instrument*
+        rejects the ones it can't honor (``TypeError`` -> 400), so there is
+        one rejection rule instead of three separately-worded branches.
+        ``top_k`` is refused for every family up front — readout width is
+        generation state shared with ``return_top_k``/alts, never an
+        instrument-local dial.
+        """
         resolve_session_id(session_id)
-        _require_family(family)
-
-        if family == "geometry":
-            if body.layers is not None or body.top_k is not None:
-                raise HTTPException(
-                    400,
-                    "geometry live takes no layers/top_k (per-token monitor "
-                    "scoring is all-or-nothing)",
-                )
-            async with acquire_session_lock(session) as acquired:
-                if not acquired:
-                    raise HTTPException(503, "session locked")
-                enabled = bool(session.set_live_probe_scores(body.enabled))
-            return {"enabled": enabled}
-
-        if family == "lens":
-            if body.top_k is not None:
-                raise HTTPException(400, "lens live takes no top_k")
-            async with acquire_session_lock(session) as acquired:
-                if not acquired:
-                    raise HTTPException(503, "session locked")
-                if not body.enabled:
-                    session.disable_live_lens()
-                    return {"enabled": False, "layers": None}
-                try:
-                    resolved = await asyncio.to_thread(
-                        session.enable_live_lens, layers=body.layers,
-                    )
-                except LensNotFittedError as e:
-                    raise HTTPException(404, str(e)) from e
-                except ValueError as e:
-                    raise HTTPException(400, str(e)) from e
-                except SaklasError as e:
-                    status, text = e.user_message()
-                    raise HTTPException(status, text) from e
-            return {"enabled": True, "layers": resolved}
-
-        # sae
-        if body.layers is not None or body.top_k is not None:
+        require_family(session, family)
+        if body.top_k is not None:
             raise HTTPException(
                 400,
-                "sae live takes no layers/top_k; readout width follows alts",
+                "live takes no top_k; readout width follows the "
+                "generation's alternatives (return_top_k)",
             )
+        extras: dict[str, Any] = {}
+        if body.layers is not None:
+            extras["layers"] = body.layers
+        instrument = session.instruments[family]
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
             try:
-                if body.enabled:
-                    state = session.enable_live_sae()
-                    return {
-                        "enabled": True,
-                        "layer": state.get("layer"),
-                    }
-                session.disable_live_sae()
-                return {"enabled": False, "layer": None}
-            except ValueError as e:
+                state = await asyncio.to_thread(
+                    instrument.set_live, body.enabled, **extras,
+                )
+            except LensNotFittedError as e:
+                raise HTTPException(404, str(e)) from e
+            except (TypeError, ValueError) as e:
                 raise HTTPException(400, str(e)) from e
             except SaklasError as e:
                 status, text = e.user_message()
                 raise HTTPException(status, text) from e
+        return state.to_dict()
 
     # =====================================================================
     # GET /instruments/{family}/sources
     # =====================================================================
 
-    @app.get("/saklas/v1/sessions/{session_id}/instruments/{family}/sources")
-    async def instrument_sources(session_id: str, family: str):
-        resolve_session_id(session_id)
-        _require_family(family)
-        if family == "geometry":
-            raise HTTPException(
-                404,
-                "geometry has no source lifecycle (Monitor probes attach "
-                "directly; there is nothing to fetch or switch)",
-            )
-        if family == "lens":
-            from saklas.io.lens_sources import list_lens_sources
+    async def _lens_sources() -> SourcesResponse:
+        from saklas.io.lens_sources import list_lens_sources
 
-            return {
-                "sources": [
-                    {k: v for k, v in row.items() if k != "path"}
-                    for row in list_lens_sources(session.model_id)
-                ],
-            }
-        # sae: prepared sources AND provider release candidates
+        return {
+            "sources": [
+                cast(InstrumentSourceJSON, {
+                    k: v for k, v in row.items() if k != "path"
+                })
+                for row in list_lens_sources(session.model_id)
+            ],
+        }
+
+    async def _sae_sources() -> SourcesResponse:
+        """Prepared sources AND provider release candidates, so the
+        dashboard sees both prepared and still-needs-fetching rows."""
         from saklas.core.sae import list_sae_releases
         from saklas.io.sae import list_sae_sources
 
         rows = await asyncio.to_thread(list_sae_sources, session.model_id)
-        sources = [{k: v for k, v in row.items() if k != "path"} for row in rows]
+        sources = [
+            cast(InstrumentSourceJSON, {
+                k: v for k, v in row.items() if k != "path"
+            })
+            for row in rows
+        ]
         try:
             releases = await asyncio.to_thread(
                 list_sae_releases, session.model_id,
@@ -552,26 +589,43 @@ def register_instrument_routes(app: FastAPI) -> None:
         except SaklasError as exc:
             status, message = exc.user_message()
             raise HTTPException(status, message) from exc
-        return {"sources": sources, "releases": releases}
+        return {
+            "sources": sources,
+            "releases": cast(list[SaeReleaseJSON], releases),
+        }
+
+    _SOURCE_LISTERS = {"lens": _lens_sources, "sae": _sae_sources}
+
+    def _refuse(spec: "tuple[int, str] | None", fallback: str) -> None:
+        status, message = spec if spec is not None else (404, fallback)
+        raise HTTPException(status, message)
+
+    @app.get("/saklas/v1/sessions/{session_id}/instruments/{family}/sources")
+    async def instrument_sources(
+        session_id: str, family: str,
+    ) -> SourcesResponse:
+        resolve_session_id(session_id)
+        require_family(session, family)
+        caps = CAPABILITIES[family]
+        if not caps.sources:
+            _refuse(caps.sources_error, f"{family} has no source lifecycle")
+        return await _SOURCE_LISTERS[family]()
 
     # =====================================================================
     # PUT /instruments/{family}/source — synchronous source switch (lens)
     # =====================================================================
 
     @app.put("/saklas/v1/sessions/{session_id}/instruments/{family}/source")
-    async def instrument_source(session_id: str, family: str, body: SourceRequest):
+    async def instrument_source(
+        session_id: str, family: str, body: SourceRequest,
+    ) -> SourceSwitchResponse:
         resolve_session_id(session_id)
-        _require_family(family)
-        if family == "geometry":
-            raise HTTPException(
-                404, "geometry has no source to switch",
-            )
-        if family == "sae":
-            raise HTTPException(
-                409,
-                "switching the SAE source loads weights — run it as a "
-                "background preparation (POST .../instruments/sae/preparations "
-                "with operation='load')",
+        require_family(session, family)
+        caps = CAPABILITIES[family]
+        if not caps.source_switch:
+            _refuse(
+                caps.source_switch_error,
+                f"{family} has no synchronous source switch",
             )
         # lens: the old POST /lens/use semantics
         lens_fit_job.refuse_if_busy()
@@ -588,7 +642,10 @@ def register_instrument_routes(app: FastAPI) -> None:
             raise HTTPException(status, text) from exc
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from exc
-        return {"source": body.source, "live_layers": layers}
+        response: SourceSwitchResponse = {
+            "source": body.source, "live_layers": layers,
+        }
+        return response
 
     # =====================================================================
     # POST/GET/DELETE /instruments/{family}/preparations — background jobs
@@ -657,13 +714,15 @@ def register_instrument_routes(app: FastAPI) -> None:
         )
         async with acquire_session_lock(session) as acquired:
             if acquired:
-                st["live_layers"] = await asyncio.to_thread(
-                    session.enable_live_lens,
+                st["live_layers"] = list(
+                    (
+                        await asyncio.to_thread(session.lens.set_live, True)
+                    ).layers or ()
                 )
         st["message"] = "done"
         st["error"] = None
 
-    async def _sae_load_body(body: SaeLoadRequest, source: str, release: str) -> None:
+    async def _sae_fetch_body(body: SaeFetchRequest, source: str, release: str) -> None:
         st = sae_load_job.state
         async with acquire_session_lock(session) as acquired:
             if not acquired:
@@ -671,14 +730,14 @@ def register_instrument_routes(app: FastAPI) -> None:
             info = await asyncio.to_thread(
                 session.load_sae, release, layer=body.layer,
             )
-            await asyncio.to_thread(session.enable_live_sae)
+            await asyncio.to_thread(session.sae.set_live, True)
         st["info"] = info
         st["message"] = (
             f"loaded {source} · live at L{info.get('layer')} "
             f"({info.get('width')} features)"
         )
 
-    def _sae_load_on_error(exc: BaseException) -> None:
+    def _sae_fetch_on_error(exc: BaseException) -> None:
         st = sae_load_job.state
         if isinstance(exc, SaklasError):
             _code, message = exc.user_message()
@@ -724,11 +783,11 @@ def register_instrument_routes(app: FastAPI) -> None:
         try:
             async with acquire_session_lock(session) as acquired:
                 if acquired:
-                    await asyncio.to_thread(session.enable_live_sae)
+                    await asyncio.to_thread(session.sae.set_live, True)
         except Exception:
             log.exception("could not auto-enable live SAE after training")
 
-    def _start_lens_fetch(fields: dict[str, Any]) -> dict[str, Any]:
+    def _start_lens_fetch(fields: dict[str, Any]) -> PreparationStatusJSON:
         body = LensFetchRequest(**fields)
         lens_fetch_job.refuse_if_busy()
         lens_fetch_job.start(
@@ -739,7 +798,7 @@ def register_instrument_routes(app: FastAPI) -> None:
         )
         return _prep_status("lens")
 
-    def _start_lens_fit(fields: dict[str, Any]) -> dict[str, Any]:
+    def _start_lens_fit(fields: dict[str, Any]) -> PreparationStatusJSON:
         from saklas.core.jlens import JacobianLensCancelled
 
         body = LensFitRequest(**fields)
@@ -768,8 +827,8 @@ def register_instrument_routes(app: FastAPI) -> None:
         )
         return _prep_status("lens")
 
-    def _start_sae_load(fields: dict[str, Any]) -> dict[str, Any]:
-        body = SaeLoadRequest(**fields)
+    def _start_sae_fetch(fields: dict[str, Any]) -> PreparationStatusJSON:
+        body = SaeFetchRequest(**fields)
         sae_load_job.refuse_if_busy()
         source = body.release.strip()
         release = (
@@ -779,11 +838,11 @@ def register_instrument_routes(app: FastAPI) -> None:
             raise HTTPException(400, "SAE source must not be empty")
         sae_load_job.start(message=f"loading {source}", release=source, info=None)
         sae_load_job.launch(
-            lambda: _sae_load_body(body, source, release), _sae_load_on_error,
+            lambda: _sae_fetch_body(body, source, release), _sae_fetch_on_error,
         )
         return _prep_status("sae")
 
-    def _start_sae_train(fields: dict[str, Any]) -> dict[str, Any]:
+    def _start_sae_train(fields: dict[str, Any]) -> PreparationStatusJSON:
         from saklas.core.sae_training import SaeTrainingCancelled
 
         body = SaeTrainRequest(**fields)
@@ -817,10 +876,14 @@ def register_instrument_routes(app: FastAPI) -> None:
         sae_train_job.launch(lambda: _sae_train_body(body, layer), _on_error)
         return _prep_status("sae")
 
+    #: Preparation starters keyed by ``(family, operation)``.  The operation
+    #: names match the CLI verbs exactly — ``sae fetch`` is ``fetch`` on both
+    #: surfaces, like ``lens fetch`` (the historical HTTP ``load`` spelling
+    #: for the same operation is gone; clean break, no alias).
     _PREP_STARTERS = {
         ("lens", "fetch"): _start_lens_fetch,
         ("lens", "fit"): _start_lens_fit,
-        ("sae", "load"): _start_sae_load,
+        ("sae", "fetch"): _start_sae_fetch,
         ("sae", "train"): _start_sae_train,
     }
 
@@ -828,12 +891,16 @@ def register_instrument_routes(app: FastAPI) -> None:
         "/saklas/v1/sessions/{session_id}/instruments/{family}/preparations",
         status_code=202,
     )
-    async def preparations_start(session_id: str, family: str, body: dict[str, Any]):
+    async def preparations_start(
+        session_id: str, family: str, body: dict[str, Any],
+    ) -> PreparationStatusJSON:
         resolve_session_id(session_id)
-        _require_family(family)
-        if family == "geometry":
-            raise HTTPException(
-                404, "geometry has no background preparations",
+        require_family(session, family)
+        caps = CAPABILITIES[family]
+        if not caps.preparations:
+            _refuse(
+                caps.preparations_error,
+                f"{family} has no background preparations",
             )
         operation = body.get("operation")
         if not isinstance(operation, str):
@@ -849,29 +916,37 @@ def register_instrument_routes(app: FastAPI) -> None:
         try:
             return starter(fields)
         except ValidationError as exc:
-            raise HTTPException(400, exc.errors()) from exc
+            raise HTTPException(400, _validation_message(exc)) from exc
 
     @app.get(
         "/saklas/v1/sessions/{session_id}/instruments/{family}/preparations",
     )
-    def preparations_status(session_id: str, family: str):
+    def preparations_status(
+        session_id: str, family: str,
+    ) -> PreparationStatusJSON:
         resolve_session_id(session_id)
-        _require_family(family)
-        if family == "geometry":
-            raise HTTPException(
-                404, "geometry has no background preparations",
+        require_family(session, family)
+        caps = CAPABILITIES[family]
+        if not caps.preparations:
+            _refuse(
+                caps.preparations_error,
+                f"{family} has no background preparations",
             )
         return _prep_status(family)
 
     @app.delete(
         "/saklas/v1/sessions/{session_id}/instruments/{family}/preparations",
     )
-    async def preparations_cancel(session_id: str, family: str):
+    async def preparations_cancel(
+        session_id: str, family: str,
+    ) -> PreparationStatusJSON:
         resolve_session_id(session_id)
-        _require_family(family)
-        if family == "geometry":
-            raise HTTPException(
-                404, "geometry has no background preparations",
+        require_family(session, family)
+        caps = CAPABILITIES[family]
+        if not caps.preparations:
+            _refuse(
+                caps.preparations_error,
+                f"{family} has no background preparations",
             )
         if family == "lens":
             # Only the fit is cancellable (the fetch is not).
@@ -899,41 +974,41 @@ def register_instrument_routes(app: FastAPI) -> None:
         family: str,
         node_id: str,
         raw_index: int,
-        top_k: int = 8,
+        top_k: int | None = None,
         steered: bool = True,
         raw: bool = False,
         layers: str | None = None,
-    ):
+    ) -> MeasurementsEnvelope:
+        """Resolve -> validate -> dispatch.
+
+        The family owns the whole replay including its ``measurements``
+        envelope (``Instrument.token_readout``), so this route no longer
+        reshapes three different native dicts.  A knob a family cannot
+        honor comes back as a ``ValueError`` -> 400 rather than being
+        dropped: ``top_k``/``layers`` on geometry, ``layers`` on sae.
+        """
         resolve_session_id(session_id)
-        _require_family(family)
-        if family == "geometry":
-            # ``top_k``/``layers`` don't apply: the roster's own fitted
-            # layers drive the capture (same silent-ignore the SAE
-            # branch gives ``layers``).
-            return await _geometry_token_readout(
-                node_id, raw_index, steered, raw,
+        require_family(session, family)
+        caps = CAPABILITIES[family]
+        if not caps.token_readout:
+            raise HTTPException(
+                404, f"{family} has no token readout",
             )
-        if family == "lens":
-            return await _lens_token_readout(
-                node_id, raw_index, top_k, steered, raw, layers,
-            )
-        return await _sae_token_readout(node_id, raw_index, top_k, steered, raw)
-
-    async def _geometry_token_readout(
-        node_id: str, raw_index: int, steered: bool, raw: bool,
-    ) -> dict[str, Any]:
+        instrument = session.instruments[family]
         async with acquire_session_lock(session) as acquired:
             if not acquired:
                 raise HTTPException(503, "session locked")
             try:
-                out = await asyncio.to_thread(
-                    session.geometry_token_readout,
+                return await asyncio.to_thread(
+                    instrument.token_readout,
                     node_id,
                     raw_index,
+                    top_k=top_k,
+                    layers=_parse_layers(layers),
                     apply_steering=steered,
                     raw=raw,
                 )
-            except UnknownNodeError as exc:
+            except (LensNotFittedError, UnknownNodeError) as exc:
                 raise HTTPException(404, str(exc)) from exc
             except InvalidNodeOperationError as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -942,114 +1017,6 @@ def register_instrument_routes(app: FastAPI) -> None:
             except SaklasError as exc:
                 status, message = exc.user_message()
                 raise HTTPException(status, message) from exc
-        measurements = build_measurements(
-            scope="replay",
-            provenance="replayed",
-            geometry_readings=out.get("readings"),
-            # The shared MeasurementBinding wire shape carries both keys;
-            # geometry has no source lifecycle, so source is always null.
-            geometry_binding={
-                "source": None,
-                "steering": (out.get("steering") if steered else None),
-            },
-        )
-        return {"measurements": measurements}
-
-    async def _lens_token_readout(
-        node_id: str, raw_index: int, top_k: int, steered: bool,
-        raw: bool, layers: str | None,
-    ) -> dict[str, Any]:
-        req_layers = _parse_layers(layers) or "all"
-        if not 1 <= top_k <= 256:
-            raise HTTPException(400, "top_k must be in [1, 256]")
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            try:
-                out = await asyncio.to_thread(
-                    session.jlens_token_readout,
-                    node_id,
-                    raw_index,
-                    layers=req_layers,
-                    top_k=top_k,
-                    apply_steering=steered,
-                    raw=raw,
-                )
-            except (LensNotFittedError, UnknownNodeError) as e:
-                raise HTTPException(404, str(e)) from e
-            except InvalidNodeOperationError as e:
-                raise HTTPException(400, str(e)) from e
-            except ValueError as e:
-                raise HTTPException(400, str(e)) from e
-            except SaklasError as e:
-                status, text = e.user_message()
-                raise HTTPException(status, text) from e
-        readout = out.get("readout", {})
-        lens_readout = {
-            int(layer): [(str(tok), math.exp(float(lp))) for tok, lp, _tid in rows]
-            for layer, rows in readout.items()
-        }
-        lens_token_ids = {
-            int(layer): [int(tid) for _tok, _lp, tid in rows]
-            for layer, rows in readout.items()
-        }
-        lens_aggregate = [
-            (str(tok), float(strength), float(com), float(spread))
-            for tok, strength, com, spread in out.get("aggregate", [])
-        ]
-        measurements = build_measurements(
-            scope="replay",
-            provenance="replayed",
-            lens_readout=lens_readout,
-            lens_aggregate=lens_aggregate,
-            lens_token_ids=lens_token_ids,
-            lens_source=_active_lens_source(session),
-            steering=(out.get("steering") if steered else None),
-        )
-        return {"measurements": measurements}
-
-    async def _sae_token_readout(
-        node_id: str, raw_index: int, top_k: int, steered: bool, raw: bool,
-    ) -> dict[str, Any]:
-        async with acquire_session_lock(session) as acquired:
-            if not acquired:
-                raise HTTPException(503, "session locked")
-            try:
-                out = await asyncio.to_thread(
-                    session.sae_token_readout,
-                    node_id,
-                    raw_index,
-                    top_k=top_k,
-                    apply_steering=steered,
-                    raw=raw,
-                )
-            except UnknownNodeError as exc:
-                raise HTTPException(404, str(exc)) from exc
-            except InvalidNodeOperationError as exc:
-                raise HTTPException(400, str(exc)) from exc
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-            except SaklasError as exc:
-                status, message = exc.user_message()
-                raise HTTPException(status, message) from exc
-        sae_features = [
-            (
-                int(f["id"]),
-                float(f["activation"]),
-                f.get("label"),
-                f.get("max_act"),
-            )
-            for f in out.get("features", [])
-        ]
-        measurements = build_measurements(
-            scope="replay",
-            provenance="replayed",
-            sae_features=sae_features,
-            sae_source=_sae_source_label(session),
-            sae_layer=out.get("layer"),
-            steering=(out.get("steering") if steered else None),
-        )
-        return {"measurements": measurements}
 
     # =====================================================================
     # Family extras
@@ -1058,7 +1025,9 @@ def register_instrument_routes(app: FastAPI) -> None:
     @app.post(
         "/saklas/v1/sessions/{session_id}/instruments/lens/token/validate",
     )
-    def validate_lens_token(session_id: str, body: LensTokenValidationRequest):
+    def validate_lens_token(
+        session_id: str, body: LensTokenValidationRequest,
+    ) -> LensTokenValidationJSON:
         """Read-only single-token check for the J-lens steer/probe add forms."""
         resolve_session_id(session_id)
         word = body.word.strip()
@@ -1073,7 +1042,9 @@ def register_instrument_routes(app: FastAPI) -> None:
     @app.post(
         "/saklas/v1/sessions/{session_id}/instruments/sae/features/validate",
     )
-    def sae_feature_validate(session_id: str, body: SaeFeatureRequest):
+    def sae_feature_validate(
+        session_id: str, body: SaeFeatureRequest,
+    ) -> SaeFeatureValidationJSON:
         resolve_session_id(session_id)
         try:
             return session.validate_sae_feature(body.id)
@@ -1084,7 +1055,9 @@ def register_instrument_routes(app: FastAPI) -> None:
     @app.post(
         "/saklas/v1/sessions/{session_id}/instruments/sae/features/metadata",
     )
-    async def sae_features_metadata(session_id: str, body: SaeFeatureMetaRequest):
+    async def sae_features_metadata(
+        session_id: str, body: SaeFeatureMetaRequest,
+    ) -> SaeFeatureMetaResponse:
         """Fetch-and-cache Neuronpedia metadata (label + maxActApprox).
 
         Network + disk-cache only (no model use), so it deliberately does not

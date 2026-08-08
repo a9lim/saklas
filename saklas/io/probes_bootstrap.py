@@ -20,16 +20,12 @@ def load_default_manifolds() -> dict[str, list[str]]:
 
     A steering vector lives as a 2-node ``pca`` manifold, tagged
     (``manifold.json::tags``) for category-grouped probe bootstrap.  Triggers
-    first-run materialization of bundled manifolds.
+    first-run materialization of the bundled artifacts.
     """
-    from saklas.io.manifolds import (
-        iter_manifold_folders, materialize_bundled_manifolds,
-    )
-    from saklas.io.templates import materialize_bundled_templates
+    from saklas.io.bootstrap import materialize_bundled_artifacts
+    from saklas.io.manifolds import iter_manifold_folders
 
-    # Templates first — a bundled manifold may ``template_ref`` a bundled one.
-    materialize_bundled_templates()
-    materialize_bundled_manifolds()
+    materialize_bundled_artifacts()
     by_tag: dict[str, list[str]] = {}
     for _ns, mf in iter_manifold_folders(namespace="default"):
         for tag in mf.tags or []:

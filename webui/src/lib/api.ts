@@ -1,5 +1,12 @@
 // Typed REST + WS + SSE client for the native /saklas/v1/* API.
 //
+// Scope policy: this is a client for the routes the dashboard actually
+// calls, NOT an exhaustive mirror of the native API.  A route with no
+// dashboard consumer has no method here — an absent method means "no
+// surface needs it yet", never "the server lacks it".  Add the method in
+// the same change that adds its caller, and drop it when the last caller
+// goes; the server's own route tree (server/AGENTS.md) is the catalogue.
+//
 // Single source of truth for HTTP shapes; types live in types.ts so panels
 // and drawers can `import type` without dragging the fetch helpers along.
 //
@@ -14,13 +21,15 @@ import type {
   CreateTemplateRequest,
   CreateManifoldFromTemplateRequest,
   ExtractRequest,
-  ExtractResponse,
   FilterMatchesJSON,
   FitManifoldRequest,
   GenerateManifoldRequest,
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  InstrumentFamily,
+  InstrumentFamilyBlock,
+  InstrumentLiveState,
   InstrumentSourceJSON,
   LensTokenValidationJSON,
   LoomNodeJSON,
@@ -33,7 +42,6 @@ import type {
   PairwiseCompareResponse,
   PreparationOp,
   PreparationStatusJSON,
-  ProbeDefaultsResponse,
   ProbeGeometryResponse,
   ProbeInfo,
   ProbeListResponse,
@@ -43,11 +51,10 @@ import type {
   ScoreTemplateResponse,
   SaeFeatureMetaResponse,
   SessionInfo,
+  SourcesResponse,
   TemplateDetail,
   TemplateSummary,
-  TraitsEvent,
   TranscriptLoadResponseJSON,
-  UpdateManifoldRequest,
   VectorInfo,
   WSClientMessage,
   WSServerMessage,
@@ -65,11 +72,13 @@ export type {
   FitManifoldRequest,
   GenerateManifoldRequest,
   ExtractRequest,
-  ExtractResponse,
   FilterMatchesJSON,
   InstallManifoldRequest,
   JointLogprobRowJSON,
   JointLogprobsJSON,
+  InstrumentFamily,
+  InstrumentFamilyBlock,
+  InstrumentLiveState,
   InstrumentSourceJSON,
   LensTokenValidationJSON,
   LoomNodeJSON,
@@ -82,7 +91,6 @@ export type {
   PairwiseCompareResponse,
   PreparationOp,
   PreparationStatusJSON,
-  ProbeDefaultsResponse,
   ProbeGeometryResponse,
   ProbeInfo,
   ProbeListResponse,
@@ -94,9 +102,7 @@ export type {
   SessionInfo,
   TemplateDetail,
   TemplateSummary,
-  TraitsEvent,
   TranscriptLoadResponseJSON,
-  UpdateManifoldRequest,
   VectorInfo,
   WSClientMessage,
   WSServerMessage,
@@ -180,6 +186,27 @@ export class ApiError extends Error {
   }
 }
 
+/** THE error → user-facing message formatter.  Every surface that shows
+ *  a failed request — toast, inline form error, empty-state reason —
+ *  goes through this one, so the same backend failure reads identically
+ *  wherever it surfaces.
+ *
+ *  An :class:`ApiError` renders as ``"<status>: <detail>"``, preferring
+ *  the saklas error body's structured ``detail`` over the generic HTTP
+ *  message.  The status code carries real meaning across this API (400
+ *  malformed vs 404 missing vs 409 busy vs 503 unavailable), so it is
+ *  always shown.  Anything else falls back to its ``message``. */
+export function describeError(e: unknown): string {
+  if (e instanceof ApiError) {
+    const detail =
+      e.body && typeof e.body === "object" && "detail" in (e.body as object)
+        ? String((e.body as { detail: unknown }).detail)
+        : e.message;
+    return `${e.status}: ${detail}`;
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
 // --------------------------------------------------------- core fetch --
 
 async function parseBody(r: Response): Promise<{ text: string; json: unknown }> {
@@ -232,13 +259,6 @@ export const apiSessions = {
   list(): Promise<{ sessions: SessionInfo[] }> {
     return request("/saklas/v1/sessions");
   },
-  /** POST /sessions — single-session impl; calling with a different
-   * model logs a server warning but returns the existing session. */
-  create(body: { model?: string; device?: string; dtype?: string } = {}): Promise<
-    SessionInfo
-  > {
-    return request("/saklas/v1/sessions", jsonBody(body));
-  },
   get(id: string = SESSION): Promise<SessionInfo> {
     return request(SESSION_BASE(id));
   },
@@ -254,15 +274,6 @@ export const apiSessions = {
     id: string = SESSION,
   ): Promise<SessionInfo> {
     return request(SESSION_BASE(id), { ...jsonBody(body), method: "PATCH" });
-  },
-  delete(id: string = SESSION): Promise<void> {
-    return request<void>(SESSION_BASE(id), { method: "DELETE" });
-  },
-  clear(id: string = SESSION): Promise<void> {
-    return request<void>(`${SESSION_BASE(id)}/clear`, { method: "POST" });
-  },
-  rewind(id: string = SESSION): Promise<void> {
-    return request<void>(`${SESSION_BASE(id)}/rewind`, { method: "POST" });
   },
   validateSteering(
     expression: string,
@@ -283,17 +294,6 @@ export const apiProfiles = {
   },
   get(name: string, id: string = SESSION): Promise<VectorInfo> {
     return request(`${SESSION_BASE(id)}/profiles/${encodeURIComponent(name)}`);
-  },
-  delete(name: string, id: string = SESSION): Promise<void> {
-    return request<void>(
-      `${SESSION_BASE(id)}/profiles/${encodeURIComponent(name)}`,
-      { method: "DELETE" },
-    );
-  },
-  /** Synchronous extract.  For SSE progress pass ``onProgress`` to
-   * ``apiExtractStream`` instead. */
-  extract(req: ExtractRequest, id: string = SESSION): Promise<ExtractResponse> {
-    return request(`${SESSION_BASE(id)}/extract`, jsonBody(req));
   },
   correlation(
     names?: string[] | null,
@@ -320,9 +320,6 @@ export const apiProfiles = {
 export const apiProbes = {
   list(id: string = SESSION): Promise<ProbeListResponse> {
     return request(`${SESSION_BASE(id)}/probes`);
-  },
-  defaults(id: string = SESSION): Promise<ProbeDefaultsResponse> {
-    return request(`${SESSION_BASE(id)}/probes/defaults`);
   },
   /** Attach any probe shape by selector — the same ``[ns/]name[:variant]``
    *  the ``%`` steering term consumes (a 2-node concept axis is the rank-1
@@ -379,16 +376,6 @@ export const apiManifolds = {
     req: CreateManifoldFromTemplateRequest,
   ): Promise<ManifoldInfo> {
     return request(`${MANIFOLDS_BASE}/from-template`, jsonBody(req));
-  },
-  update(
-    namespace: string,
-    name: string,
-    req: UpdateManifoldRequest,
-  ): Promise<ManifoldInfo> {
-    return request(
-      `${MANIFOLDS_BASE}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
-      { ...jsonBody(req), method: "PATCH" },
-    );
   },
   delete(
     namespace: string,
@@ -507,6 +494,46 @@ export async function apiManifoldFitStream(
   }
   if (lastError) throw new Error(lastError);
   if (!final) throw new Error("manifold fit: stream ended without done event");
+  return final;
+}
+
+/** Streaming manifold install — an HF pull carries a per-model safetensors
+ *  payload, so the route narrates the stages (resolve / download / validate /
+ *  stage / install) as ``progress`` frames and ends with the same
+ *  manifold-detail ``done`` payload the plain JSON POST returns. */
+export async function apiManifoldInstallStream(
+  body: InstallManifoldRequest,
+  onEvent: (ev: { event: string; data: unknown }) => void,
+): Promise<ManifoldInfo> {
+  const path = `${MANIFOLDS_BASE}/install`;
+  const r = await fetch(path, {
+    method: "POST",
+    headers: authHeaders({
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const { text, json } = await parseBody(r);
+    throw new ApiError(r.status, path, text, json);
+  }
+  if (!r.body) throw new Error("manifold install: server returned no SSE body");
+  let final: ManifoldInfo | null = null;
+  let lastError: string | null = null;
+  for await (const evt of consumeSse(r.body)) {
+    onEvent(evt);
+    if (evt.event === "done" && evt.data && typeof evt.data === "object") {
+      final = evt.data as ManifoldInfo;
+    } else if (evt.event === "error") {
+      lastError =
+        (evt.data as { message?: string } | null)?.message ?? "install failed";
+    }
+  }
+  if (lastError) throw new Error(lastError);
+  if (!final) {
+    throw new Error("manifold install: stream ended without done event");
+  }
   return final;
 }
 
@@ -733,7 +760,7 @@ export const apiTree = {
     id: string = SESSION,
   ): Promise<{ label: string }> {
     const q = new URLSearchParams({ parent_id, child_id });
-    return request(`${SESSION_BASE(id)}/tree/edge_label?${q.toString()}`);
+    return request(`${SESSION_BASE(id)}/tree/edge-label?${q.toString()}`);
   },
   /** Apply a filter-grammar expression server-side and get the
    *  matching node id list back.  Empty ``expr`` returns []. */
@@ -797,7 +824,7 @@ export const apiTree = {
     id: string = SESSION,
   ): Promise<JointLogprobsJSON> {
     return request(
-      `${SESSION_BASE(id)}/tree/joint_logprobs`,
+      `${SESSION_BASE(id)}/tree/joint-logprobs`,
       jsonBody({ a_id, b_id }),
     );
   },
@@ -805,52 +832,26 @@ export const apiTree = {
 
 // ========================================================= instruments ==
 
-/** The three read-side instrument families the ``/instruments`` route tree
- *  unifies (the 5.x replacement for the per-family ``/lens/*`` / ``/sae/*``
- *  groups and ``POST /probes/live``). */
-export type InstrumentFamily = "geometry" | "lens" | "sae";
-
-/** Per-family listing row from ``GET /instruments``. */
-export interface InstrumentFamilyJSON {
-  family: InstrumentFamily;
-  live:
-    | { enabled: boolean }
-    | { enabled: boolean; layers: number[] | null }
-    | { enabled: boolean; layer: number | null };
-  source: string | null;
-  probes: string[];
-  capabilities: {
-    sources: boolean;
-    preparations: PreparationOp[];
-    token_readout: boolean;
-    source_switch: boolean;
-  };
-}
+// The read-side families and their per-family block live in ``types.ts``
+// with the rest of the wire shapes: the SAME block is listed by
+// ``GET /instruments`` and embedded in ``session_info.instruments``, so
+// there is exactly one declaration of it on the client.
+export type InstrumentFamilyJSON = InstrumentFamilyBlock;
 
 /** The unified read-side instrument client — one surface over geometry /
  *  lens / sae.  The former per-family live toggles, source lifecycle, the
  *  polled preparations resource, and token-readout replay all live here; the
  *  store slices adapt these to the panel-facing state. */
 export const apiInstruments = {
-  /** Enumerate the three families (live state, active source, probes,
-   *  capabilities). */
-  list(id: string = SESSION): Promise<{ instruments: InstrumentFamilyJSON[] }> {
-    return request(`${SESSION_BASE(id)}/instruments`);
-  },
-
   /** Uniform live toggle.  geometry = the CAA per-token monitor scoring
-   *  switch (``POST /probes/live`` before 5.x); lens = the workspace
-   *  readout (``layers`` optional); sae = the feature-discovery readout.
+   *  switch; lens = the workspace readout (``layers`` optional); sae =
+   *  the feature-discovery readout.
    *  Readout width follows the generation's alts field. */
   setLive(
     family: InstrumentFamily,
     body: { enabled: boolean; layers?: number[] | null },
     id: string = SESSION,
-  ): Promise<{
-    enabled: boolean;
-    layers?: number[] | null;
-    layer?: number | null;
-  }> {
+  ): Promise<InstrumentLiveState> {
     return request(`${SESSION_BASE(id)}/instruments/${family}/live`, jsonBody(body));
   },
 
@@ -860,18 +861,11 @@ export const apiInstruments = {
   sources(
     family: InstrumentFamily,
     id: string = SESSION,
-  ): Promise<{
-    sources: InstrumentSourceJSON[];
-    releases?: {
-      release: string; model?: string | null; layers: number[];
-      repo_id?: string | null; neuronpedia?: boolean;
-      source?: "local" | "saelens";
-    }[];
-  }> {
+  ): Promise<SourcesResponse> {
     return request(`${SESSION_BASE(id)}/instruments/${family}/sources`);
   },
 
-  /** Synchronous lens source switch (the old ``POST /lens/use`` — lock +
+  /** Synchronous lens source switch (lock +
    *  derived-state eviction + auto-enable live).  lens only. */
   setLensSource(
     source: string,
@@ -980,26 +974,11 @@ export const apiInstruments = {
   },
 };
 
-// =========================================================== traits ====
-
-/** Open the live traits SSE stream.  Returns the underlying ``Response``
- * so the caller owns lifecycle (cancel via ``response.body.cancel()``). */
-export async function apiTraitsStream(id: string = SESSION): Promise<Response> {
-  const r = await fetch(`${SESSION_BASE(id)}/traits/stream`, {
-    headers: authHeaders({ Accept: "text/event-stream" }),
-  });
-  if (!r.ok) {
-    const { text, json } = await parseBody(r);
-    throw new ApiError(r.status, `${SESSION_BASE(id)}/traits/stream`, text, json);
-  }
-  return r;
-}
-
 // ============================================================ SSE util =
 
 export interface SseEvent {
   /** SSE ``event:`` field — defaults to ``"message"`` per the spec when
-   * absent (which is also the wire format traits streaming uses). */
+   * absent. */
   event: string;
   /** Parsed JSON if the data line was JSON, otherwise the raw string. */
   data: unknown;

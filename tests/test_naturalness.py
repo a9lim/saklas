@@ -183,7 +183,7 @@ def test_naturalness_preflight_does_not_hash_fitted_payloads(
     from argparse import Namespace
 
     import saklas.cli.runners as runners
-    from saklas.io import packs
+    from saklas.io import integrity
     from saklas.io.manifolds import (
         ManifoldFolder,
         create_manifold_folder,
@@ -211,8 +211,8 @@ def test_naturalness_preflight_does_not_hash_fitted_payloads(
     ManifoldFolder.load(folder, verify_manifest=False).update_file_hashes(
         tensor, sidecar,
     )
-    packs._FINGERPRINT_CACHE.clear()
-    real_hash = packs.hash_file
+    integrity._FINGERPRINT_CACHE.clear()
+    real_hash = integrity.hash_file
     hashed: list[Path] = []
 
     def track_hash(path: Path) -> str:
@@ -225,8 +225,10 @@ def test_naturalness_preflight_does_not_hash_fitted_payloads(
     def stop(_args: Namespace) -> None:
         raise StopAfterPreflight
 
-    monkeypatch.setattr(packs, "hash_file", track_hash)
-    monkeypatch.setattr(runners, "_load_effective_config", lambda _args: None)
+    monkeypatch.setattr(integrity, "hash_file", track_hash)
+    monkeypatch.setattr(
+        runners, "_load_effective_config", lambda _args, **_kw: None,
+    )
     monkeypatch.setattr(runners, "_print_startup", stop)
     with pytest.raises(StopAfterPreflight):
         runners._run_experiment_naturalness(Namespace(manifold=str(folder)))

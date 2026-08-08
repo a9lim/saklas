@@ -25,7 +25,7 @@ from saklas.core.jlens import (
     lens_logits,
     readout_probabilities,
     resolve_word_token,
-    topk_logprobs,
+    topk_probabilities,
     token_readout_stats,
     token_readout_stats_from_probabilities,
 )
@@ -247,7 +247,7 @@ def test_ragged_prompt_microbatch_matches_single_prompt_graphs() -> None:
 def test_oom_after_committed_rows_resumes_without_double_counting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()
@@ -281,7 +281,7 @@ def test_oom_after_committed_rows_resumes_without_double_counting(
 def test_committed_row_oom_at_dim_one_restarts_with_smaller_prompt_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()
@@ -318,7 +318,7 @@ def test_late_committed_row_oom_splits_only_current_group_without_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A late width backoff must not erase already completed microbatches."""
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()
@@ -372,7 +372,7 @@ def test_late_committed_row_oom_splits_only_current_group_without_replay(
 
 
 def test_cuda_oom_downgrades_transfer_buffers_to_one_slot() -> None:
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     first_device = {0: object()}
     first_host = {0: object()}
@@ -392,7 +392,7 @@ def test_cuda_oom_downgrades_transfer_buffers_to_one_slot() -> None:
 
 
 def test_row_stripe_capacity_is_byte_bounded_and_never_splits_a_vjp() -> None:
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     budget = 128 * 1024**2
     capacity = jlens_module._row_stripe_capacity(
@@ -409,7 +409,7 @@ def test_row_stripe_capacity_is_byte_bounded_and_never_splits_a_vjp() -> None:
 
 
 def test_row_stripe_allocation_backoff_terminates_at_vjp_width() -> None:
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     capacity = 51
     seen: list[int] = []
@@ -424,7 +424,7 @@ def test_row_stripe_allocation_backoff_terminates_at_vjp_width() -> None:
 
 
 def test_one_slot_oom_releases_staging_and_caps_retry_capacity() -> None:
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     state: dict[str, Any] = {
         "stripe_rows": [{0: object()}],
@@ -448,7 +448,7 @@ def test_one_slot_oom_releases_staging_and_caps_retry_capacity() -> None:
 def test_repeated_oom_after_committed_rows_never_double_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()
@@ -485,7 +485,7 @@ def test_repeated_oom_after_committed_rows_never_double_counts(
 def test_auto_scalar_fallback_stays_single_prompt_and_never_double_counts(
     monkeypatch: pytest.MonkeyPatch, fail_call: int,
 ) -> None:
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
 
     model = _frozen_model(n_layers=2)
     tokenizer = _CharTokenizer()
@@ -670,7 +670,7 @@ def test_fit_cancellation_interrupts_an_active_prompt_group(
     """A width-2 fit must not make cancel wait for both full prompt sweeps."""
     import threading
 
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
     from saklas.core.jlens import JacobianLensCancelled
 
     model = _frozen_model(n_layers=2)
@@ -710,7 +710,7 @@ def test_fit_cancellation_after_terminal_group_prevents_publication(
     """Cancel in the final return window must not be silently ignored."""
     import threading
 
-    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as jlens_module
     from saklas.core.jlens import JacobianLensCancelled
 
     model = _frozen_model(n_layers=2)
@@ -810,10 +810,12 @@ def test_token_direction_can_restrict_layers() -> None:
     assert torch.allclose(dirs[1], unembed[5] @ J[1])
 
 
-def test_topk_logprobs_matches_full_log_softmax() -> None:
+def test_topk_probabilities_matches_full_softmax() -> None:
+    """The selected-column shortcut agrees with a full softmax, and reports
+    the same unit ``readout_probabilities`` does — the one lens unit."""
     logits = torch.randn(4, _VOCAB)
-    vals, idxs = topk_logprobs(logits, 7)
-    expected = torch.log_softmax(logits, dim=-1)
+    vals, idxs = topk_probabilities(logits, 7)
+    expected = readout_probabilities(logits)
     exp_vals, exp_idxs = expected.topk(7, dim=-1)
     assert torch.equal(idxs, exp_idxs)
     assert torch.allclose(vals, exp_vals)
@@ -1029,3 +1031,34 @@ def test_merge_rejects_mismatched_lenses() -> None:
     b = JacobianLens({1: torch.eye(_D)}, n_prompts=1, d_model=_D)
     with pytest.raises(ValueError, match="disagree"):
         JacobianLens.merge([a, b])
+
+
+# --------------------------------------------------------------------------
+# module split: readout stays import-light, the estimator loads on demand
+# --------------------------------------------------------------------------
+
+def test_readout_module_does_not_import_the_estimator() -> None:
+    """``saklas.core.jlens`` is imported per decode step by the lens
+    instrument, so it must not drag in the backward-pass estimator."""
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import saklas.core.jlens, sys;"
+            "print('saklas.core.jlens_fit' in sys.modules)",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    assert out.stdout.strip() == "False"
+
+
+def test_fit_jacobian_lens_stays_reachable_from_the_readout_module() -> None:
+    """The compatibility alias resolves to the estimator's own function."""
+    import saklas.core.jlens as jlens_module
+    import saklas.core.jlens_fit as fit_module
+
+    assert jlens_module.fit_jacobian_lens is fit_module.fit_jacobian_lens
+    with pytest.raises(AttributeError):
+        jlens_module.definitely_not_a_lens_symbol  # noqa: B018

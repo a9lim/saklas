@@ -315,7 +315,7 @@ def _resumable_baked_merge(
         MERGE_BAKE_POLICY,
         manifold_folder_tensor_paths,
     )
-    from saklas.io.packs import verify_integrity
+    from saklas.io.integrity import verify_integrity
     from saklas.io.paths import tensor_filename
 
     try:

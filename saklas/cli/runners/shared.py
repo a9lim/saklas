@@ -40,6 +40,25 @@ def _saklas_error_exit(fn: Callable[..., _R]) -> Callable[..., _R]:
     return _wrapper
 
 
+def _print_verb_menu(group: str, verbs: "list[tuple[str, str]]") -> None:
+    """Print the bare-verb-group menu every ``saklas <group>`` shows.
+
+    ``group`` is the invocation path under ``saklas`` (``"pack"``,
+    ``"experiment transcript"``); ``verbs`` is that group's
+    ``(verb, description)`` table.  One implementation so every group's menu
+    stays identical: usage line, the width-aligned verb table, and the
+    ``-h`` next-step pointer.  Callers ``sys.exit(0)`` afterwards — a bare
+    verb group is help, not an error.
+    """
+    print(f"usage: saklas {group} <verb> [...]")
+    print()
+    width = max(len(verb) for verb, _ in verbs)
+    for verb, desc in verbs:
+        print(f"  {verb:<{width}}  {desc}")
+    print()
+    print(f"Run `saklas {group} <verb> -h` for verb-specific options.")
+
+
 def _resolve_probes(raw: list[str] | None) -> list[str] | None:
     """Resolve the ``--probes`` flag to a value for ``from_pretrained``.
 
@@ -56,7 +75,28 @@ def _resolve_probes(raw: list[str] | None) -> list[str] | None:
     return raw
 
 
+def _progress_printer(
+    args: argparse.Namespace,
+) -> "Callable[[str], None] | None":
+    """The CLI's standard indented progress sink, or ``None`` under ``-j``.
+
+    Every model-loading verb narrates the same way (``  <message>``); a verb
+    emitting machine-readable JSON on stdout suppresses it so the payload
+    stays parseable.
+    """
+    if getattr(args, "json_output", False):
+        return None
+    return lambda m: print(f"  {m}", flush=True)
+
+
 def _make_session(args: argparse.Namespace, *, load_probes: bool = True):
+    """Build the session for a CLI verb, narrating construction as it goes.
+
+    Session construction is not cheap: HF load, then (with the default probe
+    roster) the neutral/whitener forward pass and a fit for every bundled
+    concept not yet fitted for this model.  The printing ``on_progress``
+    callback is what keeps that from looking like a hang.
+    """
     from saklas.core.session import SaklasSession
     probe_categories = _resolve_probes(args.probes) if load_probes else []
     # ``~`` / ``|`` projection is Mahalanobis-only (closed-form LEACE);
@@ -82,6 +122,7 @@ def _make_session(args: argparse.Namespace, *, load_probes: bool = True):
         compile=compile_enabled,
         cuda_graphs=cuda_graphs_enabled,
         return_top_k=return_top_k,
+        on_progress=_progress_printer(args),
     )
 
 
@@ -93,12 +134,22 @@ def _print_model_info(session: SaklasSession) -> None:
     print(f"Loaded {len(session.probes)} probes")
 
 
-def _load_effective_config(args: argparse.Namespace):
+def _load_effective_config(
+    args: argparse.Namespace, *, default_max_tokens: int = 1024,
+):
     """Compose ~/.saklas/config.yaml + any -c files and stamp args in place.
 
     Returns the composed ConfigFile (poles pre-resolved). Sets:
       args.config_vectors, args.temperature, args.top_p, args.thinking,
       args.system_prompt, args.max_tokens, and args.model (if YAML supplied it).
+
+    ``max_tokens`` follows the same CLI-wins / YAML-fills-gaps precedence as
+    every other overridable field: an explicit ``--max-tokens N`` (the verbs
+    that carry the flag argparse-default it to ``None``) seeds the override
+    and survives untouched, YAML fills an unset one, and
+    ``default_max_tokens`` is the caller's own floor when neither supplied a
+    value — 1024 for ``serve`` (which has no such flag), 256/128 for the
+    ``experiment`` verbs.
     """
     from saklas.cli.config_file import (
         ConfigFile, apply_flag_overrides, ensure_vectors_installed,
@@ -110,7 +161,7 @@ def _load_effective_config(args: argparse.Namespace):
         model=getattr(args, "model", None),
         temperature=None,
         top_p=None,
-        max_tokens=None,
+        max_tokens=getattr(args, "max_tokens", None),
         system_prompt=None,
     )
     if getattr(args, "model", None) is None:
@@ -119,7 +170,10 @@ def _load_effective_config(args: argparse.Namespace):
     args.top_p = composed.top_p
     args.thinking = composed.thinking
     args.system_prompt = composed.system_prompt
-    args.max_tokens = composed.max_tokens if composed.max_tokens is not None else 1024
+    args.max_tokens = (
+        composed.max_tokens if composed.max_tokens is not None
+        else default_max_tokens
+    )
     args.config_vectors = composed.vectors
     # YAML ``compile: true`` folds onto ``args.compile`` (the CLI
     # opt-in).  YAML ``compile: false`` is the default, so it's a
@@ -247,14 +301,10 @@ def _iter_manifold_folders(namespace: str | None):
     server has its own session-driven materialization at startup, so
     going through ``iter_manifold_folders`` directly stays correct.
     """
-    from saklas.io.manifolds import (
-        iter_manifold_folders, materialize_bundled_manifolds,
-    )
-    from saklas.io.templates import materialize_bundled_templates
+    from saklas.io.bootstrap import materialize_bundled_artifacts
+    from saklas.io.manifolds import iter_manifold_folders
 
-    # Templates first — a bundled manifold may ``template_ref`` a bundled one.
-    materialize_bundled_templates()
-    materialize_bundled_manifolds()
+    materialize_bundled_artifacts()
     yield from iter_manifold_folders(namespace)
 
 
@@ -284,12 +334,9 @@ def _resolve_manifold_ns_name(name: str) -> tuple[str, str]:
     # an existing ``~/.saklas`` that predates it — the ``ns/name`` branch below
     # returns verbatim and never walks the installed folders, so it would
     # otherwise miss the materialize that the bare-name walk triggers.  Process-
-    # scoped no-op, so this is free when already done.  Templates before
-    # manifolds (a templated manifold's fit resolves its ``template_ref``).
-    from saklas.io.manifolds import materialize_bundled_manifolds
-    from saklas.io.templates import materialize_bundled_templates
-    materialize_bundled_templates()
-    materialize_bundled_manifolds()
+    # scoped no-op, so this is free when already done.
+    from saklas.io.bootstrap import materialize_bundled_artifacts
+    materialize_bundled_artifacts()
 
     if "/" in name:
         ns, leaf = name.split("/", 1)

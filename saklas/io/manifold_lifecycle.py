@@ -7,7 +7,7 @@ cross-model Procrustes transfer, and the session-independent
 :mod:`saklas.io.manifold_folder`.
 
 Bundled materialization (``materialize_bundled_manifolds`` and the
-``_materialized_this_process`` flag) deliberately does **not** live here —
+``_materialized_home`` process guard) deliberately does **not** live here —
 it stays physically in :mod:`saklas.io.manifolds` so the process-scope
 flag is monkeypatchable by its public attribute path with zero test edits.
 ``refresh_manifold`` reaches it through a lazy import of that module.
@@ -30,38 +30,37 @@ from saklas.io.manifold_folder import (
     BakedManifoldError,
     ManifoldFolder,
     ManifoldFormatError,
+    ManifoldSidecar,
     domain_label,
     manifold_pair_lock,
     min_nodes,
     validate_manifold_format_version,
 )
 from saklas.io.paths import manifold_dir
+# Every lifecycle entry point that can change the installed manifold roster
+# drops the resolver's memoized walks itself — callers carry no duty.
+from saklas.io.selectors import invalidate as invalidate_selector_index
 
 
 # ============================================================ lifecycle (rm/clear/refresh) ===
 #
-# The manifold analogue of pack lifecycle in ``saklas.io.cache_ops``
-# (``uninstall`` / ``delete_tensors`` / ``refresh``).  Manifolds don't
-# go through the concept ``Selector``/``resolve`` machinery — they're
-# addressed by ``(namespace, name)`` and discovered through
-# ``iter_manifold_folders`` — so these are folder-level functions rather
-# than selector-driven sweeps.  Source-tier semantics mirror packs: the
+# ``rm`` / ``clear`` / ``refresh``.  Manifolds don't go through the
+# ``Selector``/``resolve`` machinery — they're addressed by
+# ``(namespace, name)`` and discovered through ``iter_manifold_folders`` — so
+# these are folder-level functions rather than selector-driven sweeps.  The
 # ``manifold.json::source`` field (``"local"`` / ``"bundled"`` /
-# ``"hf://..."``) decides refresh behavior.
+# ``"hf://..."``) is the source tier that decides refresh behavior.
 
 
 def _manifold_tensor_variant_matches(key: str, filter_: str) -> bool:
-    """Mirror ``cache_ops._variant_matches_key`` for manifold tensors.
+    """Whether a parsed tensor variant slug passes a clear/push filter.
 
     ``key`` is the variant slug a manifold tensor filename parses to:
     ``"raw"`` (unsuffixed, canonical), ``"sae-<release>"``, or
     ``"from-<safe_src>"`` (transferred).  ``filter_`` is one of ``"raw"``
     / ``"sae"`` / ``"from"`` / ``"all"`` — ``"from"`` selects transferred
     tensors, so a ``clear --variant from`` drops only the cross-model
-    transfer variants while keeping the native fit.  Twin of
-    ``cache_ops._variant_matches_key`` — kept in sync so the pack and
-    manifold clear-filters recognize the same variant slugs (both match
-    the ``_from-<safe_src>`` variant transfers produce).
+    transfer variants while keeping the native fit.
     """
     if filter_ == "all":
         return True
@@ -88,9 +87,8 @@ def _manifold_tensor_files(
     ``model_scope`` (a raw model id, e.g. ``"google/gemma-3-4b-it"``)
     narrows the result to a single model's tensors — the filename's
     parsed safe-model-id must equal ``safe_model_id(model_scope)``.
-    ``None`` (default) keeps every model's tensors.  Mirrors the
-    ``model_scope`` filter in :func:`saklas.io.cache_ops._tensor_files_for`,
-    which does the same safe-id conversion at the io boundary.
+    ``None`` (default) keeps every model's tensors; the raw-id → safe-id
+    conversion happens here, at the io boundary.
     """
     from saklas.io.paths import parse_tensor_filename, safe_model_id
 
@@ -225,9 +223,11 @@ def clear_manifold_tensors(
 
     folder = manifold_dir(namespace, name)
     with _locked_manifest(folder):
-        return _clear_manifold_tensors_locked(
+        cleared = _clear_manifold_tensors_locked(
             namespace, name, model_scope, variant=variant,
         )
+    invalidate_selector_index()
+    return cleared
 
 
 def _clear_manifold_tensors_locked(
@@ -235,15 +235,15 @@ def _clear_manifold_tensors_locked(
 ) -> int:
     """Delete a manifold's per-model fitted tensors, keeping the corpus.
 
-    Mirrors ``saklas.io.cache_ops.delete_tensors`` for packs: removes the
+    Removes the
     fitted ``<safe>*.safetensors`` + ``.json`` sidecars (so they re-fit
     on next use) while leaving ``manifold.json`` and the ``nodes/`` corpus
     in place.  ``variant`` filters by tensor flavor — ``"raw"`` only the
     unsuffixed canonical tensors, ``"sae"`` only ``_sae-*`` variants,
     ``"from"`` only ``_from-*`` transfer variants, ``"all"`` (default)
     every flavor.  ``model_scope`` (a raw model id) narrows
-    deletion to that one model's tensors (safe-id-matched, the same
-    convention ``delete_tensors`` uses); ``None`` (default) clears every
+    deletion to that one model's tensors (safe-id-matched); ``None``
+    (default) clears every
     model.  Returns the number of files deleted.
 
     Re-hashes ``manifold.json::files`` afterward (via ``write_metadata``)
@@ -361,17 +361,18 @@ def remove_manifold_folder(namespace: str, name: str) -> dict[str, Any]:
 
     folder = manifold_dir(namespace, name)
     with _locked_manifest(folder):
-        return _remove_manifold_folder_locked(namespace, name)
+        removed = _remove_manifold_folder_locked(namespace, name)
+    invalidate_selector_index()
+    return removed
 
 
 def _remove_manifold_folder_locked(namespace: str, name: str) -> dict[str, Any]:
     """Remove a whole manifold folder (rm), bundled-respawn semantics.
 
-    The manifold analogue of ``saklas.io.cache_ops.uninstall`` for a
-    single concept: ``rmtree`` the folder so the manifold ceases to
+    ``rmtree`` the folder so the manifold ceases to
     exist.  Bundled manifolds (``default/`` namespace) re-materialize on
-    next session init via :func:`materialize_bundled_manifolds`, exactly
-    as bundled concepts do — the returned ``rematerializes_on_restart``
+    next session init via :func:`materialize_bundled_manifolds` — the
+    returned ``rematerializes_on_restart``
     flag lets a caller pick a friendlier message for that case.
 
     Returns ``{namespace, name, source, removed, rematerializes_on_restart}``.
@@ -455,9 +456,11 @@ def refresh_manifold(
 
     folder = manifold_dir(namespace, name)
     with _locked_manifest(folder):
-        return _refresh_manifold_locked(
+        tier = _refresh_manifold_locked(
             namespace, name, model_scope=model_scope, force=force,
         )
+    invalidate_selector_index()
+    return tier
 
 
 def _refresh_manifold_locked(
@@ -465,7 +468,7 @@ def _refresh_manifold_locked(
 ) -> str:
     """Re-pull / re-materialize a manifold from its source.
 
-    Mirrors ``saklas.io.cache_ops.refresh`` per source tier:
+    Dispatches on the ``manifold.json::source`` tier:
 
     - ``local`` (or any source other than the two below) — nothing
       upstream to re-pull from; silently skipped, returns ``"skipped"``.
@@ -477,8 +480,7 @@ def _refresh_manifold_locked(
       :func:`saklas.io.hf_manifolds.pull_manifold`; returns ``"hf"``.
 
     When ``model_scope`` (a raw model id) is given the source tier is
-    *bypassed* — exactly as ``cache_ops.refresh``'s scoped path does for
-    packs: delete just that model's fitted tensor pair (via
+    *bypassed*: delete just that model's fitted tensor pair (via
     :func:`clear_manifold_tensors`) so it re-fits on next use, and do NOT
     re-pull from the upstream source.  Returns ``"scoped"``.
 
@@ -492,9 +494,9 @@ def _refresh_manifold_locked(
 
     if model_scope is not None:
         # Scoped refresh: drop just that model's fitted tensor pair so it
-        # re-fits from the node corpus on next use.  Mirrors the pack-side
-        # tensors-only scoped refresh — a whole-repo re-pull for one model
-        # makes no sense (HF pulls are whole-folder).
+        # re-fits from the node corpus on next use.  Tensors only — a
+        # whole-repo re-pull for one model makes no sense (HF pulls are
+        # whole-folder).
         clear_manifold_tensors(namespace, name, model_scope, variant="all")
         return "scoped"
 
@@ -532,6 +534,247 @@ def _refresh_manifold_locked(
 # the transferred tensor.  Do not rebuild the Procrustes solver here.
 
 
+# =========================================================== weight-free fit preflight ===
+
+
+@dataclass(frozen=True)
+class ManifoldFitProof:
+    """Proof that one ``manifold fit`` target is already exact, made off-model.
+
+    Returned only when *every* component of the fit's cache key was
+    independently established without instantiating the transformer.  Carries
+    what a caller needs to report the hit honestly — all of it read from the
+    digest-proven sidecar, none of it inferred.
+    """
+
+    folder: Path
+    model_id: str
+    tensor_path: Path
+    manifold_name: str
+    fit_mode: str
+    fitted_layers: tuple[int, ...]
+    node_labels: tuple[str, ...]
+
+
+def _proven_neutral_loaded_fingerprint(
+    model_id: str, source_fingerprint: str,
+) -> str | None:
+    """Bridge a proven checkpoint source to the loaded fingerprint it produces.
+
+    The neutral-activation cache is the one artifact that records both halves
+    for the same weights: it was written by a real load, binding
+    ``model_source_fingerprint`` (recomputable off-model) to the
+    ``model_fingerprint`` that load produced.  Matching the source half
+    therefore establishes the loaded half without a second load — the same
+    bridge ``io.alignment``'s ``_proven_sidecar`` walks before it declines to
+    build a source model.
+    """
+    from saklas.io.alignment import validate_neutral_cache_metadata
+
+    try:
+        sidecar = validate_neutral_cache_metadata(model_id, verify_payload=False)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+        return None
+    if sidecar.get("model_source_fingerprint") != source_fingerprint:
+        return None
+    loaded = sidecar.get("model_fingerprint")
+    return loaded if isinstance(loaded, str) and loaded else None
+
+
+def _proven_fitted_pair_sidecar(
+    folder: Path, tensor_path: Path,
+) -> ManifoldSidecar | None:
+    """Read one fitted pair's sidecar only once the manifest proves both files.
+
+    The same transaction shape ``ManifoldExtractionPipeline``'s fitted-tensor
+    fast path uses: take the stable pair lock, prove the *current* manifest's
+    digests for exactly this tensor/sidecar pair, then read.  An unproven,
+    half-published, or foreign pair reads as no sidecar at all.
+    """
+    from saklas.io.integrity import verify_integrity
+
+    sidecar_path = tensor_path.with_suffix(".json")
+    with manifold_pair_lock(tensor_path):
+        try:
+            with open(folder / "manifold.json") as handle:
+                files = json.load(handle).get("files", {})
+            if not isinstance(files, dict):
+                return None
+            expected = {
+                name: files[name]
+                for name in (tensor_path.name, sidecar_path.name)
+                if name in files
+            }
+            if (
+                len(expected) != 2
+                or not tensor_path.exists()
+                or not sidecar_path.exists()
+                or not verify_integrity(folder, expected)[0]
+            ):
+                return None
+            return ManifoldSidecar.load(sidecar_path)
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            return None
+
+
+def _fitted_tensor_layers(tensor_path: Path) -> tuple[int, ...] | None:
+    """Layer roster off the safetensors header alone — no payload paged in."""
+    from safetensors import SafetensorError, safe_open
+
+    try:
+        with safe_open(str(tensor_path), framework="pt", device="cpu") as tensors:
+            return tuple(sorted({
+                int(key.split(".", 1)[0].split("_", 1)[1])
+                for key in tensors.keys()
+                if key.startswith("layer_") and key.endswith(".mean")
+            }))
+    except (OSError, ValueError, SafetensorError):
+        return None
+
+
+def preflight_manifold_fit_noop(
+    folder: Path | str,
+    *,
+    model_id: str,
+    layer_indices: "Any" = None,
+    sae: str | None = None,
+    fit_mode: str | None = None,
+    hyperparams: Mapping[str, Any] | None = None,
+    quantize: str | None = None,
+    device: str = "auto",
+) -> ManifoldFitProof | None:
+    """Prove an existing fit is exact for ``model_id`` without loading weights.
+
+    The manifold counterpart of ``lens fit``'s model-free no-op preflight.  A
+    non-``None`` return means re-running the fit would publish the identical
+    tensor, so the caller may report the cache hit and skip the model load.
+    ``None`` means **unproven**, which is not the same as "stale": every path
+    that cannot establish a component — an SAE fit, a discover override that
+    would rewrite ``manifold.json`` before the key is derived, a checkpoint with
+    no provable source, a missing neutral cache, a config that declares no layer
+    count, a tokenizer that will not load — returns it, and the caller must fall
+    through to the ordinary model-loading fit.
+
+    Components proven, in the order the fit itself keys on them:
+
+    ``nodes_sha256``
+        Recomputed from the folder (labels, corpus bytes, geometry or
+        hyperparameters, roles, kinds, resolved template).
+    ``model_source_fingerprint``
+        Recomputed from the published config / local checkpoint files and the
+        load representation, and matched against the sidecar.
+    ``model_fingerprint``
+        Not recomputable off-model, so it is *bridged*: the neutral cache binds
+        this checkpoint source to the loaded fingerprint it produced.
+    ``capture_version`` + ``capture_render_sha256`` + ``baseline_prompts_sha256``
+        The tokenizer-render half of ``capture_sha256``, re-rendered here from
+        tokenizer + prompts + corpus.  With the two fingerprints above covering
+        the model-identity half (class, config, commit, name_or_path,
+        model_type, load representation), ``capture_sha256`` equality follows.
+    ``fit_policy_version``
+        Matched against the current policy.
+    fitted-layer set
+        The request resolved against the *config's* layer count and matched
+        against the sidecar's evaluated roster.
+
+    Nothing here mutates: no manifest rewrite, no capture-cache recovery, no
+    artifact promotion.
+    """
+    from saklas.core.extraction import (
+        MANIFOLD_CAPTURE_VERSION,
+        offline_fit_identity,
+        resolve_fit_layer_indices,
+    )
+    from saklas.core.manifold import MANIFOLD_FIT_POLICY_VERSION
+    from saklas.core.model import config_model_shape, model_source_fingerprint
+    from saklas.io.paths import tensor_filename
+
+    # An SAE fit's key includes the backend's own fingerprint, which only a
+    # resolved backend can supply; a discover override rewrites the manifest
+    # (and therefore ``nodes_sha256``) inside the fit's own lock, so the
+    # on-disk hash here is not the one the fit would compare.
+    if sae is not None or fit_mode is not None or hyperparams:
+        return None
+
+    folder = Path(folder)
+    try:
+        mf = ManifoldFolder.load(folder, verify_manifest=False)
+    except (ManifoldFormatError, BakedManifoldError, OSError, ValueError):
+        return None
+    # A baked manifold has no corpus and never re-fits; let the ordinary path
+    # raise its own ``BakedManifoldError`` rather than reporting a hit.
+    if mf.fit_mode == "baked":
+        return None
+
+    source_fingerprint = model_source_fingerprint(
+        model_id, quantize=quantize, device=device,
+    )
+    if source_fingerprint is None:
+        return None
+    loaded_fingerprint = _proven_neutral_loaded_fingerprint(
+        model_id, source_fingerprint,
+    )
+    if loaded_fingerprint is None:
+        return None
+
+    try:
+        n_layers, _hidden = config_model_shape(model_id)
+        requested_layers = resolve_fit_layer_indices(layer_indices, n_layers)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return None
+
+    try:
+        from transformers import AutoConfig, AutoTokenizer
+
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        model_type = getattr(config, "model_type", None)
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+    except Exception:
+        # Tokenizer/config resolution can raise anything the Hub or a custom
+        # implementation chooses; every failure means "cannot prove".
+        return None
+
+    identity = offline_fit_identity(
+        mf, tokenizer=tokenizer, model_type=model_type,
+    )
+    if identity is None:
+        return None
+
+    tensor_path = folder / tensor_filename(model_id)
+    sidecar = _proven_fitted_pair_sidecar(folder, tensor_path)
+    if sidecar is None:
+        return None
+    if (
+        sidecar.nodes_sha256 != identity.nodes_sha256
+        or tuple(sidecar.node_labels) != identity.node_labels
+        or sidecar.feature_space != "raw"
+        or sidecar.sae_release is not None
+        or sidecar.model_fingerprint != loaded_fingerprint
+        or sidecar.model_source_fingerprint != source_fingerprint
+        or sidecar.capture_version != MANIFOLD_CAPTURE_VERSION
+        # A fit whose handle had no callable tokenizer stamps both capture
+        # digests ``None``; that is a real fit but not a provable one.
+        or sidecar.capture_sha256 is None
+        or sidecar.capture_render_sha256 != identity.capture_render_sha256
+        or sidecar.baseline_prompts_sha256 != identity.baseline_prompts_sha256
+        or sidecar.fit_policy_version != MANIFOLD_FIT_POLICY_VERSION
+        or sidecar.evaluated_layers != requested_layers
+    ):
+        return None
+    layers = _fitted_tensor_layers(tensor_path)
+    if layers is None or list(layers) != sorted(sidecar.fitted_layers):
+        return None
+    return ManifoldFitProof(
+        folder=folder,
+        model_id=model_id,
+        tensor_path=tensor_path,
+        manifold_name=mf.name,
+        fit_mode=sidecar.fit_mode,
+        fitted_layers=layers,
+        node_labels=tuple(sidecar.node_labels),
+    )
+
+
 @dataclass(frozen=True)
 class TransferSourceProof:
     """Immutable source-pair generation selected before alignment work."""
@@ -546,7 +789,7 @@ def _transfer_preflight_locked(
     folder: Path, *, from_model: str, to_model: str, force: bool,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, str], bool]:
     """Prove the source pair and classify the target with locks already held."""
-    from saklas.io.packs import verify_integrity
+    from saklas.io.integrity import verify_integrity
     from saklas.io.paths import tensor_filename
 
     folder = Path(folder)
@@ -712,8 +955,8 @@ def _transfer_manifold_locked(
     is orthonormalized and the affine/RBF reduced coefficients are transformed
     exactly into that new frame; a rank collapse is rejected.  ``node_coords``
     (the intrinsic authoring layout) remains model-independent.  Layers the
-    alignment doesn't cover are dropped,
-    mirroring :func:`saklas.io.alignment.transfer_profile`.
+    alignment doesn't cover are dropped — partial transfer is the only sensible
+    behavior, since a subspace with no map can't be lifted into target space.
 
     ``alignment`` is supplied by the caller (building it needs both
     models loaded — a session/CLI concern), keeping this function
@@ -856,7 +1099,50 @@ def _transfer_manifold_locked(
 # ============================================================ shared summary serializer ===
 
 
-def manifold_summary(folder: Path) -> dict[str, Any]:
+def manifold_fit_summary(sidecar: ManifoldSidecar, stem: str) -> dict[str, Any]:
+    """Serialize one fitted tensor's sidecar for inspection surfaces.
+
+    The single per-tensor detail block behind ``pack show`` and the manifold
+    inspector.  Everything here is provenance the fit stamped and nothing
+    branches on at runtime, which is exactly why it needs a *reader*: an
+    ``auto`` fit's ``resolved_fit_mode`` / ``topology_winner`` /
+    ``topology_candidates`` are the ranked GCV + persistent-homology evidence
+    behind its flat-vs-curved-vs-periodic decision, and ``share_metric`` /
+    ``subspace_metric`` say how the share was weighted and the basis selected.
+    Empty/absent fields are omitted so an authored or pinned-discover fit
+    stays terse.
+
+    Metadata-only: one small sidecar JSON, no payload hashing.
+    """
+    entry: dict[str, Any] = {
+        "stem": stem,
+        "method": sidecar.method,
+        "feature_space": sidecar.feature_space,
+        "node_count": sidecar.node_count,
+        "nodes_sha256": sidecar.nodes_sha256,
+        "fit_mode": sidecar.fit_mode,
+        "fitted_layers": list(sidecar.fitted_layers),
+    }
+    for key, value in (
+        ("hyperparams", sidecar.hyperparams),
+        ("diagnostics", sidecar.diagnostics),
+        ("node_spread", sidecar.node_spread_per_layer),
+        ("share_metric", sidecar.share_metric),
+        ("subspace_metric", sidecar.subspace_metric),
+        ("resolved_fit_mode", sidecar.resolved_fit_mode),
+        ("topology_winner", sidecar.topology_winner),
+        ("topology_candidates", sidecar.topology_candidates),
+        ("rbf_smoothing", sidecar.rbf_smoothing_per_layer),
+        ("sigma_field", sidecar.sigma_field_per_layer),
+    ):
+        if value:
+            entry[key] = value
+    return entry
+
+
+def manifold_summary(
+    folder: Path, *, include_fits: bool = False,
+) -> dict[str, Any]:
     """Session-independent summary of a manifold folder.
 
     The shared serializer behind ``manifold show -j`` (CLI) and
@@ -876,10 +1162,23 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
     summary).
 
     Returns a dict with keys: ``namespace`` / ``name`` / ``description`` /
-    ``source`` / ``tags`` / ``fit_mode`` / ``is_discover`` / ``domain`` /
-    ``domain_label`` / ``intrinsic_dim`` / ``min_nodes`` / ``node_count`` /
-    ``node_labels`` / ``node_coords`` / ``node_roles`` / ``hyperparams`` /
-    ``fitted_models`` / ``tensor_variants``.
+    ``source`` / ``tags`` / ``template_ref`` / ``fit_mode`` / ``is_discover`` /
+    ``domain`` / ``domain_label`` / ``intrinsic_dim`` / ``min_nodes`` /
+    ``node_count`` / ``node_labels`` / ``node_coords`` / ``node_roles`` /
+    ``node_kinds`` / ``hyperparams`` / ``fitted_models`` / ``tensor_variants`` /
+    ``fitted``.
+
+    ``template_ref`` is the standalone template a templated manifold derives
+    its corpus from (``None`` for a hand-authored folder) — the fact a user
+    needs before editing ``nodes/`` by hand, since the template is the
+    authoring source of truth and a re-derive would overwrite the edit.
+
+    ``fitted`` is present only under ``include_fits`` — one
+    :func:`manifold_fit_summary` block per fitted tensor *stem* (so SAE and
+    transferred variants each get their own), with unreadable sidecars
+    skipped rather than failing the whole summary.  It is opt-in because it costs one sidecar
+    read per fitted model: an inspection surface (``pack show``) wants it,
+    a listing that renders many folders does not.
 
     ``namespace`` is read off the folder's parent directory name.  Raises
     :class:`ManifoldFormatError` on a malformed folder.
@@ -917,12 +1216,23 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
         if safe_model not in fitted_models:
             fitted_models.append(safe_model)
 
-    return {
+    fitted: list[dict[str, Any]] = []
+    if include_fits:
+        # ``tensor_models`` carries full stems, so SAE and transferred variants
+        # each get their own block rather than collapsing onto the base model.
+        for stem in mf.tensor_models():
+            try:
+                fitted.append(manifold_fit_summary(mf.sidecar(stem), stem))
+            except (KeyError, ManifoldFormatError, OSError):
+                continue
+
+    out: dict[str, Any] = {
         "namespace": namespace,
         "name": mf.name,
         "description": mf.description,
         "source": mf.source,
         "tags": list(mf.tags),
+        "template_ref": mf.template_ref,
         "fit_mode": mf.fit_mode,
         "is_discover": mf.is_discover,
         "domain": domain,
@@ -938,3 +1248,6 @@ def manifold_summary(folder: Path) -> dict[str, Any]:
         "fitted_models": fitted_models,
         "tensor_variants": tensor_variants,
     }
+    if include_fits:
+        out["fitted"] = fitted
+    return out

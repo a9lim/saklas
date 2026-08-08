@@ -145,6 +145,7 @@ across Python, YAML, OpenAI, Ollama, or the native API.
 | `!` | Mean-ablate a direction |
 | `%label` or `%x,y,…` | Choose a named node or coordinates on a manifold |
 | `@response`, `@prompt`, `@thinking`, … | Restrict the token phase where a term applies |
+| `@first:N`, `@after:N` | Restrict a term to a counted decode window |
 | `@when:<probe><op><value>` | Apply a term only while a live probe gate is true |
 
 Manifold coefficients use two coordinates: `along` and `onto`. `along` controls
@@ -168,8 +169,9 @@ invariants are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ### Monitoring
 
-A reading includes fitted coordinates, the centered activation's subspace share,
-nearest nodes, and, for curved manifolds, residual and tube membership.
+A reading includes fitted coordinates, the centered activation's subspace
+fraction, the nearest nodes and their soft assignment, and, for curved manifolds,
+an off-surface residual and tube membership.
 
 ### Jacobian lens
 
@@ -200,7 +202,7 @@ Optional extras add specialized workflows:
 | `cuda` | `bitsandbytes` quantization and Hugging Face `kernels` acceleration |
 | `hf` | `datasets` for streamed J-LENS and SAE corpora |
 | `gguf` | GGUF import/export support |
-| `research` | NumPy, SciPy, scikit-learn, pandas, Matplotlib, and image helpers |
+| `research` | `datasets`, NumPy, SciPy, scikit-learn, pandas, Matplotlib, and image helpers |
 | `notebook` | Plotly, pandas, and Kaleido notebook helpers |
 | `pandas` | pandas-only dataframe export helpers |
 | `dev` | Test, lint, type-check, and build tooling |
@@ -271,7 +273,7 @@ batch work.
 | Verb | Role |
 |---|---|
 | `serve` | Launch the WebUI and the three HTTP protocol surfaces |
-| `manifold` | Extract, generate, fit, bake, merge, transfer, compare, or diagnose manifolds |
+| `manifold` | Extract, generate, derive from a template, fit, bake, merge, transfer, compare, or diagnose manifolds |
 | `pack` | List, inspect, install, search, push, clear, refresh, remove, or export manifold packs |
 | `experiment` | Run alpha fans, replay transcripts, and evaluate naturalness |
 | `config` | Show or validate composed configuration |
@@ -379,8 +381,9 @@ with SaklasSession.from_pretrained(
 `generate` and `generate_stream` accept the same steering expression as the WebUI.
 Generation returns a list-like `RunSet`; `.first` is convenient for a single
 completion. `GenerationResult` carries text, token IDs, throughput and timing,
-finish reason, the canonical applied expression, captured log probabilities, and
-aggregate probe readings.
+finish reason, the canonical applied expression, captured log probabilities,
+aggregate probe readings, and the versioned measurement envelope every
+instrument family writes into.
 
 Batch and sweep helpers return the same result shape:
 

@@ -257,19 +257,19 @@ def _bare_concept_resolves(concept: str) -> bool:
     """True when a bare (un-namespaced) concept reference resolves to a manifold.
 
     Mirrors the steering read path (:mod:`saklas.core.steering_expr`): a bare
-    pole or node label resolves via :func:`resolve_bare_name`, and a composite
-    name (``happy.sad``) resolves to its 2-node ``pca`` manifold via
+    pole or node label resolves via :func:`resolve_manifold_label`, and a
+    composite name (``happy.sad``) resolves to its 2-node ``pca`` manifold via
     :func:`resolve_manifold_name`.  An ambiguity counts as resolved (the
     reference matches more than one installed artifact, not zero).
     """
     from saklas.io.selectors import (
         AmbiguousSelectorError,
-        resolve_bare_name,
+        resolve_manifold_label,
         resolve_manifold_name,
     )
 
     try:
-        manifold_hit = resolve_bare_name(concept)
+        manifold_hit = resolve_manifold_label(concept)
         if manifold_hit is not None:
             return True
         return resolve_manifold_name(concept) is not None
@@ -288,22 +288,17 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
     on any failure instead.
     """
     from saklas.core.steering_expr import referenced_selectors
+    from saklas.io.bootstrap import materialize_bundled_artifacts
     from saklas.io.paths import manifold_dir
-    from saklas.io.manifolds import materialize_bundled_manifolds
-    from saklas.io.templates import materialize_bundled_templates
-    from saklas.io import selectors as _selectors
 
     if config.vectors is None:
         return []
 
     # Every concept is a manifold (4.0): bundled ones live under
     # ``manifolds/default/<name>/``.  Materialize them up front so a bare or
-    # ``default/`` reference resolves against the just-dropped folders, and
-    # drop any stale resolver cache so the new folders are seen.  Templates
-    # first — a bundled manifold may ``template_ref`` a bundled template.
-    materialize_bundled_templates()
-    materialize_bundled_manifolds()
-    _selectors.invalidate()
+    # ``default/`` reference resolves against the just-dropped folders; the io
+    # materializer drops the stale resolver index itself.
+    materialize_bundled_artifacts()
 
     missing: list[str] = []
     for ns, concept, _variant in referenced_selectors(config.vectors):
@@ -336,7 +331,6 @@ def ensure_vectors_installed(config: ConfigFile, *, strict: bool) -> list[str]:
         try:
             from saklas.io.hf_manifolds import install_manifold
             install_manifold(coord, force=False)
-            _selectors.invalidate()
         except Exception as e:
             msg = f"vector {coord!r}: install failed ({e})"
             if strict:

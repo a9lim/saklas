@@ -36,13 +36,8 @@
     applyCustomSteeringExpression,
     currentSteeringExpression,
     addJLensToRack,
-    setJLensAlpha,
-    setJLensTrigger,
-    setJLensEnabled,
     addSaeToRack,
-    setSaeAlpha,
-    setSaeTrigger,
-    setSaeEnabled,
+    atomActions,
   } from "../lib/stores.svelte";
   import { apiSessions, apiTree } from "../lib/api";
   import type { LoomTreeJSON, ProbeSortMode, Trigger, Variant } from "../lib/types";
@@ -240,25 +235,22 @@
       setSubspaceAlong(parsed.subspaceAlong);
       for (const row of steerRows) {
         const name = row.name;
-        if (row.mode === "jlens") {
-          addJLensToRack(name);
-          setJLensAlpha(name, row.alpha);
-          setJLensTrigger(name, row.trigger);
-          if (row.enabled === false) setJLensEnabled(name, false);
-          appliedTerms++;
-          continue;
-        }
-        if (row.mode === "sae") {
-          const featureId = Number(name.replace(/^sae\//, ""));
-          if (!Number.isInteger(featureId) || featureId < 0) {
-            warnings = [...warnings, `skipped invalid SAE term ${name}`];
-            skippedTerms++;
-            continue;
+        if (row.mode === "jlens" || row.mode === "sae") {
+          if (row.mode === "jlens") {
+            addJLensToRack(name);
+          } else {
+            const featureId = Number(name.replace(/^sae\//, ""));
+            if (!Number.isInteger(featureId) || featureId < 0) {
+              warnings = [...warnings, `skipped invalid SAE term ${name}`];
+              skippedTerms++;
+              continue;
+            }
+            addSaeToRack(featureId);
           }
-          addSaeToRack(featureId);
-          setSaeAlpha(name, row.alpha);
-          setSaeTrigger(name, row.trigger);
-          if (row.enabled === false) setSaeEnabled(name, false);
+          const atom = atomActions(row.mode);
+          atom.setAlpha(name, row.alpha);
+          atom.setTrigger(name, row.trigger);
+          if (row.enabled === false) atom.setEnabled(name, false);
           appliedTerms++;
           continue;
         }

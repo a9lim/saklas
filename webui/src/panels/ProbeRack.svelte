@@ -13,6 +13,7 @@
 
   import ProbeCard from "./rack/ProbeCard.svelte";
   import RackSectionHeader from "./rack/RackSectionHeader.svelte";
+  import type { ProbeInfo } from "../lib/types";
   import {
     activeProbeNames,
     openDrawer,
@@ -47,10 +48,17 @@
       (n) =>
         !n.startsWith("jlens/") &&
         !n.startsWith("sae/") &&
-        probeRack.entries.get(n)?.info.is_affine === (family === "subspace"),
+        _isSubspace(probeRack.entries.get(n)?.info) === (family === "subspace"),
     ),
   );
   const count = $derived(probes.length);
+
+  /** Flat (affine) geometry probes are the subspace family; curved fits the
+   *  manifold family.  A non-geometry row never reaches here (the filter
+   *  above drops the readout families). */
+  function _isSubspace(info: ProbeInfo | undefined): boolean | undefined {
+    return info?.family === "geometry" ? info.is_affine : undefined;
+  }
 
   const SORT_OPTIONS: { value: ProbeSortMode; label: string }[] = [
     { value: "name", label: "name" },

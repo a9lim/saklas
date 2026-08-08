@@ -11,7 +11,7 @@
   //     Guard warnings (model / system-prompt / probe drift) surface
   //     in a banner with the diff list.
 
-  import { apiTree, ApiError } from "../lib/api";
+  import { apiTree, describeError } from "../lib/api";
   import {
     closeDrawer,
     loomTree,
@@ -160,17 +160,6 @@
     } finally {
       importBusy = false;
     }
-  }
-
-  function describeError(e: unknown): string {
-    if (e instanceof ApiError) {
-      const detail =
-        e.body && typeof e.body === "object" && "detail" in (e.body as object)
-          ? String((e.body as { detail: unknown }).detail)
-          : e.message;
-      return `${e.status}: ${detail}`;
-    }
-    return e instanceof Error ? e.message : String(e);
   }
 </script>
 

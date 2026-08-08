@@ -1,26 +1,24 @@
-"""Shared vocabulary for the read-side instrument protocol.
+"""Shared vocabulary for the read-side instruments.
 
 The three read families — geometry (Monitor subspace probes), the Jacobian
-lens readout channel, and SAE feature reads — implement one protocol
-(:mod:`saklas.core.instruments.protocol`) over the types defined here.
-
-Design (2026-07-15 instrument unification):
+lens readout channel, and SAE feature reads — speak the types defined here.
+:mod:`saklas.core.instruments.protocol` carries the contract they share.
 
 * **GateRef** is the structured view of a probe-gate scalar key.  The
-  steering grammar still stores the verbatim string in
-  ``ProbeGate.probe`` and the per-step runtime lookup stays a plain
-  ``dict.get`` on that string (hot-path discipline) — ``GateRef`` exists
-  for *composition preflight*: each family validates that a referenced
-  channel is one it can actually produce, so ``@when:sae/123:membership``
-  is a 400 at parse/compose time instead of a silently-inactive gate.
-  ``parse_gate_ref`` is the ONE place the key-shape discrimination lives
-  (it inverts the key family ``Monitor.flat_scalars`` emits).
+  steering grammar stores the verbatim string in ``ProbeGate.probe`` and the
+  per-step runtime lookup is a plain ``dict.get`` on that string (hot-path
+  discipline) — ``GateRef`` exists for *composition preflight*: a family
+  validates that a referenced channel is one it can actually produce, so
+  ``@when:sae/123:membership`` is a 400 at compose time instead of a
+  silently-inactive gate.  ``parse_gate_ref`` is the ONE place the key-shape
+  discrimination lives (it inverts the key family ``Monitor.flat_scalars``
+  emits).
 * **ScalarReading** is the honest reading shape for the single-channel
   families (lens strength, SAE feature activation).  The geometry family
-  keeps the full :class:`~saklas.core.results.ProbeReading`.
-  ``ScalarReading.to_probe_reading()`` preserves the compatibility channel
-  consumed by older callers while the versioned measurement envelope carries
-  the family-native scalar shape.
+  carries the full :class:`~saklas.core.results.ProbeReading`.
+  ``ScalarReading.to_probe_reading()`` is the compatibility projection
+  older callers consume; the versioned measurement envelope carries the
+  family-native scalar shape.
 * **DepthSummary carries its basis** because ``depth_com`` means three
   mathematically unrelated things across families (share-weighted
   coordinate mass / readout probability mass / a single-layer constant);
@@ -29,7 +27,7 @@ Design (2026-07-15 instrument unification):
   session-side capture planner unions plans and picks physical retention
   (incremental vs tail ring vs full stack); the
   ``INCREMENTAL -> set_tail_with_sink`` upgrade is cross-instrument
-  resource sharing and deliberately stays out of the families.
+  resource sharing and stays out of the families.
 * **InstrumentBinding is an immutable per-generation snapshot** of
   source identity + attached specs, so mid-generation mutations (e.g.
   the SAE metadata backfill, which runs without the generation lock)
@@ -40,7 +38,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, TYPE_CHECKING, Union
+from typing import Any, ClassVar, Literal, Mapping, TYPE_CHECKING, Union
 
 from saklas.core.errors import UnsupportedProbeChannelError
 
@@ -48,19 +46,23 @@ if TYPE_CHECKING:
     from saklas.core.results import ProbeReading
 
 
+#: The three read families.  THE enumeration — ``session.instruments`` is
+#: keyed by it, the server validates ``{family}`` against that registry, and
+#: the payload layer's per-family slots are pinned to it by test.
 InstrumentFamily = Literal["geometry", "lens", "sae"]
+
 
 #: Depth of the bounded capture tail ring finalize aggregates pool from —
 #: deep enough to walk back past trailing special tokens to the last
-#: content token.  Declared here (the plan vocabulary) so instruments can
-#: state the ring depth they demand; the session planner's own uses alias
-#: this value.
+#: content token.  It lives in the plan vocabulary because a family's
+#: ``tail_layers`` demand is only meaningful at this depth; the session
+#: planner's own constant aliases this value.
 AGG_TAIL_DEPTH = 8
 
 # ONE process-wide per-preparation token sequence.  Per-instance sequences
-# collide across instrument instances (both start at 1), which let a plan
+# collide across instrument instances (both start at 1), which lets a plan
 # from one instrument bind with a prep from another; a single shared
-# sequence makes every token unique process-wide (round-5).
+# sequence makes every token unique process-wide.
 _PREP_TOKENS = itertools.count(1)
 
 
@@ -224,6 +226,14 @@ class DepthSummary:
     basis: DepthBasis
 
 
+#: The lens strength unit — ``mean_l p_l(v)`` over the fitted layers.
+UNIT_MEAN_TOKEN_PROBABILITY = "mean_token_probability"
+#: The SAE strength unit when Neuronpedia ``maxActApprox`` is cached.
+UNIT_ACTIVATION_OVER_MAX = "activation_over_max"
+#: The SAE strength unit with no metadata (offline / unlisted feature).
+UNIT_RAW_ACTIVATION = "raw_activation"
+
+
 @dataclass
 class ScalarReading:
     """One-channel reading for the lens and SAE families.
@@ -245,12 +255,43 @@ class ScalarReading:
     depth: DepthSummary | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        """The family-native wire shape carried inside the measurement
+        envelope's ``instruments.lens.readings`` / ``.sae.readings``.
+
+        Deliberately NOT the ``ProbeReading`` shape: a one-channel reading
+        has no fraction / nearest / residual / assignment / membership, and
+        shipping those as constants is the "constants masquerading as
+        measurements" pattern the 5.x break removed from the gate path.
+        """
+        out: dict[str, Any] = {
+            "value": round(float(self.value), 6),
+            "unit": str(self.unit),
+            "per_layer": {
+                str(layer): round(float(v), 6)
+                for layer, v in self.per_layer.items()
+            },
+        }
+        if self.depth is not None:
+            out["depth"] = {
+                "center": [round(float(c), 6) for c in self.depth.center],
+                "spread": [round(float(s), 6) for s in self.depth.spread],
+                "basis": str(self.depth.basis),
+            }
+        else:
+            out["depth"] = None
+        if self.meta:
+            out["meta"] = dict(self.meta)
+        return out
+
     def to_probe_reading(self) -> "ProbeReading":
-        """Return the exact synthesized-``ProbeReading`` compatibility shape
-        the lens/SAE families emitted historically (geometry fields
-        defaulted — ``fraction``/``residual`` 0, ``nearest``/``assignment``
-        empty, ``membership`` 1.0).  This is the compatibility projection;
-        the versioned measurement envelope carries the native scalar reading.
+        """Project this reading into the shared ``ProbeReading`` shape
+        (geometry fields defaulted — ``fraction``/``residual`` 0,
+        ``nearest``/``assignment`` empty, ``membership`` 1.0).
+
+        The compatibility channel for consumers that key probes across
+        families by one reading type; the versioned measurement envelope
+        carries the native single-channel scalar reading instead.
         """
         from saklas.core.results import ProbeReading
 
@@ -267,6 +308,130 @@ class ScalarReading:
         )
 
 
+#: What a family's ``score_probes`` returns: the geometry family's full
+#: whitened :class:`~saklas.core.results.ProbeReading`, or the single-axis
+#: families' :class:`ScalarReading`.  The three helpers below are the only
+#: places a consumer needs to care which.
+Reading = Union["ProbeReading", ScalarReading]
+
+
+def reading_axis0(reading: "Reading") -> float:
+    """The reading's primary scalar — a ``ScalarReading``'s ``value`` or a
+    ``ProbeReading``'s coordinate axis 0.  This is the number the flat
+    cross-family ``scores`` view and the loom's aggregate row carry."""
+    if isinstance(reading, ScalarReading):
+        return float(reading.value)
+    coords = reading.coords
+    return float(coords[0]) if coords else 0.0
+
+
+def reading_per_layer_axis0(reading: "Reading") -> dict[int, float]:
+    """The per-layer trace of :func:`reading_axis0`."""
+    if isinstance(reading, ScalarReading):
+        return {
+            int(layer): float(value)
+            for layer, value in reading.per_layer.items()
+        }
+    return {
+        int(layer): float(coord[0] if coord else 0.0)
+        for layer, coord in reading.coords_per_layer.items()
+    }
+
+
+def as_probe_reading(reading: "Reading") -> "ProbeReading":
+    """Project any reading into the shared ``ProbeReading`` shape.
+
+    The COMPATIBILITY boundary, and only that: ``TokenEvent.probe_readings``
+    (a cross-family dict keyed by one reading type) and the OpenAI/Ollama
+    ``x-saklas-probe-readings`` vendor extension, whose shape is a user
+    contract.  It must not run on the native per-token path — the versioned
+    measurement envelope carries each family's own reading shape, which is
+    the whole point of :class:`ScalarReading`.
+    """
+    if isinstance(reading, ScalarReading):
+        return reading.to_probe_reading()
+    return reading
+
+
+def scalar_gate_keys(values: Mapping[str, float]) -> dict[str, float]:
+    """Flatten one-channel probe values into gate scalars.
+
+    The :meth:`Monitor.flat_scalars` counterpart for the single-axis
+    families: ONLY the real strength channel (``<name>`` and its explicit
+    ``<name>[0]`` spelling).  No ``:fraction`` / ``:membership`` constants —
+    a gate on a channel the family cannot produce is a composition-preflight
+    error (``validate_gate``), never a silently-constant comparison.
+    """
+    out: dict[str, float] = {}
+    for name, value in values.items():
+        scalar = float(value)
+        out[name] = scalar
+        out[f"{name}[0]"] = scalar
+    return out
+
+
+# --------------------------------------------------------------------------
+# Live state
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LiveState:
+    """One family's live-readout intent — the return of ``set_live`` and
+    the value of ``live_state``.
+
+    The three families genuinely differ in what "live" carries (the lens
+    resolves a layer list, the SAE reports its resident layer + source,
+    geometry is a bare all-or-nothing switch), so the shape is a small
+    frozen per-family record rather than a bare bool.  ``to_dict`` is the
+    wire block every surface (the ``/live`` route, the ``/instruments``
+    listing, session info) emits for the family.
+    """
+
+    enabled: bool
+    family: ClassVar[InstrumentFamily]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"enabled": bool(self.enabled)}
+
+
+@dataclass(frozen=True)
+class GeometryLiveState(LiveState):
+    """The CAA per-token monitor-scoring switch — all-or-nothing."""
+
+    family: ClassVar[InstrumentFamily] = "geometry"
+
+
+@dataclass(frozen=True)
+class LensLiveState(LiveState):
+    """The workspace readout: ``layers`` is the resolved live layer list
+    (``None`` when off)."""
+
+    family: ClassVar[InstrumentFamily] = "lens"
+    layers: tuple[int, ...] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "layers": list(self.layers) if self.layers is not None else None,
+        }
+
+
+@dataclass(frozen=True)
+class SaeLiveState(LiveState):
+    """The feature-discovery readout at the resident hook layer."""
+
+    family: ClassVar[InstrumentFamily] = "sae"
+    layer: int | None = None
+    source: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "layer": int(self.layer) if self.layer is not None else None,
+            "source": self.source,
+        }
+
+
 # --------------------------------------------------------------------------
 # Plans, preps, bindings, live configs
 # --------------------------------------------------------------------------
@@ -274,15 +439,13 @@ class ScalarReading:
 @dataclass(frozen=True)
 class ReadRequest:
     """What the session knows about a generation's read demand when it
-    plans capture — the input to ``Instrument.prepare`` and
-    ``Instrument.plan``."""
+    plans capture — the input to ``prepare`` and, through the prep, to
+    ``plan``."""
 
     gate_keys: frozenset[str] = frozenset()
     live: bool = False
     per_token_consumers: bool = False
     final_aggregate: bool = True
-    batch: bool = False
-    return_hidden: bool = False
 
 
 @dataclass(frozen=True)
@@ -298,16 +461,16 @@ class InstrumentPrep:
     ``request`` carries the generation's read demand forward — ``plan``
     derives solely from the prep, so a live-registry mutation landing
     between prepare and bind cannot desynchronize the plan from the
-    binding (sol's round-3 P1).
+    binding.
 
     ``token`` is the per-preparation identity, drawn from ONE
-    process-wide sequence (``next_prep_token`` — per-instance sequences
-    collide across instrument instances, letting a plan from one
-    instrument bind with a prep from another; round-5): the plan a prep
-    derives echoes it as ``prep_token``, and ``bind`` refuses a
-    plan/prep pair from different prepare() calls — same-family crossing
-    would let the session's capture union retain one prep's layers while
-    the run measures another's (round-4 P2).
+    process-wide sequence (``next_prep_token``; per-instance sequences
+    would collide across instrument instances, letting a plan from one
+    instrument bind with a prep from another): the plan a prep derives
+    echoes it as ``prep_token``, and ``bind`` refuses a plan/prep pair
+    from different prepare() calls — same-family crossing would let the
+    session's capture union retain one prep's layers while the run
+    measures another's.
     """
 
     family: str
@@ -342,14 +505,14 @@ class LensPrep(InstrumentPrep):
       keep reading the one that matches its pin).
     * ``fingerprint`` — the resident sidecar identity captured in the
       same atomic snapshot, so the binding's provenance matches the
-      lens the run actually measures (round-4 P2: a bind-time live
-      read could stamp a concurrently adopted replacement's identity
-      onto a run pinned to the older lens).
+      lens the run actually measures.  A bind-time live read would
+      stamp a concurrently adopted replacement's identity onto a run
+      pinned to the older lens.
 
     The whole snapshot is taken under the instrument's ``state_lock``
     — the one lens-state boundary that also serializes the getter's
     refresh/adoption/eviction and the registry/live mutations — so it
-    cannot tear mid-``prepare`` (round-4 P1).
+    cannot tear mid-``prepare``.
     """
 
     lens: Any = None
@@ -369,17 +532,21 @@ class InstrumentPlan:
     / full stack).  Cross-instrument interactions (a lens aggregate
     upgrading geometry's incremental capture to a tail ring) are the
     planner's business, never a family's.
+
+    Every field here is read by that planner.  Demand a family can state but
+    nobody consumes is not demand — it is a field that drifts out of sync
+    with the retention it claims to describe.
     """
 
     family: str
+    #: Layers whose latest slice must be captured every forward.
     latest_layers: frozenset[int] = frozenset()
+    #: Layers the finalize aggregate pools from the bounded tail ring.
     tail_layers: frozenset[int] = frozenset()
-    tail_depth: int = 0
-    prompt_layers: frozenset[int] = frozenset()
-    per_step: bool = False
+    #: Gate scalar keys naming this family's attached probes.
     gate_keys: frozenset[str] = frozenset()
+    #: Whether an end-of-generation aggregate will read this family.
     final_aggregate: bool = False
-    batch_aggregate: bool = False
     #: The token of the prep this plan derived from (``InstrumentPrep.
     #: token``); ``bind`` refuses a plan/prep pair whose tokens differ.
     prep_token: int | None = None
@@ -397,33 +564,6 @@ class InstrumentBinding:
     specs: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class GeometryLiveConfig:
-    """User intent for per-token monitor scoring (the CAA live toggle)."""
-
-    enabled: bool = True
-
-
-@dataclass(frozen=True)
-class LensLiveConfig:
-    """User intent for the live J-lens readout; ``layers`` empty means
-    every fitted layer.  Device residency of ``J_l`` is runtime state,
-    not intent — disabling does not evict transported stacks."""
-
-    enabled: bool = False
-    layers: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True)
-class SaeLiveConfig:
-    """User intent for live SAE feature discovery."""
-
-    enabled: bool = False
-
-
-LiveConfig = Union[GeometryLiveConfig, LensLiveConfig, SaeLiveConfig]
-
-
 __all__ = [
     "AGG_TAIL_DEPTH",
     "Assignment",
@@ -434,16 +574,24 @@ __all__ = [
     "Fraction",
     "GateChannel",
     "GateRef",
-    "GeometryLiveConfig",
+    "GeometryLiveState",
     "InstrumentBinding",
     "InstrumentFamily",
     "InstrumentPlan",
-    "LensLiveConfig",
-    "LiveConfig",
+    "LensLiveState",
+    "LiveState",
     "Membership",
     "ReadRequest",
-    "SaeLiveConfig",
+    "Reading",
+    "SaeLiveState",
     "ScalarReading",
+    "UNIT_ACTIVATION_OVER_MAX",
+    "UNIT_MEAN_TOKEN_PROBABILITY",
+    "UNIT_RAW_ACTIVATION",
+    "as_probe_reading",
     "parse_gate_ref",
+    "reading_axis0",
+    "reading_per_layer_axis0",
+    "scalar_gate_keys",
     "validate_gate_channels",
 ]

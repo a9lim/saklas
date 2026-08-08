@@ -13,7 +13,7 @@
   // install). It is reachable from the command palette.
 
   import { onMount } from "svelte";
-  import { ApiError, apiManifolds } from "../lib/api";
+  import { ApiError, apiManifoldInstallStream, apiManifolds } from "../lib/api";
   import {
     closeDrawer,
     steerRack,
@@ -35,6 +35,9 @@
   let searchLoading = $state(false);
   let searchError: string | null = $state(null);
   let installing: string | null = $state(null);
+  // Latest ``progress`` frame of the in-flight install, shown in place of a
+  // bare spinner — an HF manifold repo can be hundreds of megabytes.
+  let installStage: string | null = $state(null);
 
   // Redo searches 300ms after the user stops typing.
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -80,8 +83,17 @@
   async function installRow(row: RemoteManifoldInfo): Promise<void> {
     const target = `${row.namespace}/${row.name}`;
     installing = target;
+    installStage = null;
     try {
-      await apiManifolds.install({ target });
+      // Streaming client, like the fit / generate flows: the terminal
+      // ``error`` frame surfaces as a plain Error (no HTTP status), so the
+      // ApiError branches below only fire for a pre-stream rejection.
+      await apiManifoldInstallStream({ target }, (ev) => {
+        if (ev.event === "progress") {
+          const msg = (ev.data as { message?: string } | null)?.message;
+          if (msg) installStage = msg;
+        }
+      });
       await refreshManifoldList();
       tab = "installed";
       pushToast(`installed manifold ${target}`, { kind: "info" });
@@ -113,6 +125,7 @@
       }
     } finally {
       installing = null;
+      installStage = null;
     }
   }
 
@@ -230,6 +243,9 @@
                       </span>
                     {/if}
                   </span>
+                  {#if inFlight && installStage}
+                    <span class="install-stage" aria-live="polite">{installStage}</span>
+                  {/if}
                 </div>
                 <div class="actions">
                   <button
@@ -428,6 +444,16 @@
   .hf-fit-count {
     color: var(--fg-muted);
     font-size: var(--text-xs);
+  }
+  /* Per-stage install narration — replaces the bare spinner while a
+     multi-hundred-megabyte HF pull lands. */
+  .install-stage {
+    display: block;
+    color: var(--accent);
+    font-size: var(--text-2xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .actions {

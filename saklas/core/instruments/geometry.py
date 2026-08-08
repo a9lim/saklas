@@ -7,10 +7,12 @@ untouched: the capture modes are session/HiddenCapture state and the
 Monitor is an established engine, so folding it into the instrument
 abstraction would combine two independent risks (the orchestration
 extraction and an engine rewrite) for no architectural reward.  This
-adapter gives the family the same face as the lens/SAE instruments —
-attach/detach/specs, gate-channel capabilities, probe-hash identity — so
-the session can expose one ``instruments`` registry and the HTTP layer
-can enumerate families uniformly.
+adapter gives the family the same face as the lens/SAE instruments — the
+:class:`~saklas.core.instruments.protocol.Instrument` contract: run
+lifecycle, attach/detach/specs, gate-channel validation, probe-hash
+identity, the live toggle, the active source, and the token-readout replay
+— so the session exposes one ``instruments`` registry and the HTTP layer
+dispatches over it instead of hand-writing a branch per family.
 """
 
 from __future__ import annotations
@@ -22,19 +24,15 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from saklas.core.instruments.types import (
-    Assignment,
-    Axis,
-    Distance,
-    Fraction,
     GateRef,
+    GeometryLiveState,
     InstrumentBinding,
+    InstrumentFamily,
     InstrumentPlan,
     InstrumentPrep,
-    Membership,
     ReadRequest,
     next_prep_token,
     parse_gate_ref,
-    validate_gate_channels,
 )
 
 if TYPE_CHECKING:
@@ -94,7 +92,7 @@ class GeometryRun:
         if step_id >= 0:
             # A negative step is the "no step identity" sentinel — caching
             # under it would serve one stale read to every later
-            # sentinel-stepped call (sol's round-1 P2).
+            # sentinel-stepped call.
             self._memo_step = step_id
             self._memo_readings = readings
         return readings
@@ -116,37 +114,6 @@ class GeometryRun:
         self._memo_step = step_id
         self._memo_readings = readings
 
-    def gate_scalars(
-        self,
-        step_id: int,
-        hidden: dict[int, torch.Tensor] | None,
-        gate_keys: frozenset[str] | set[str] | None,
-    ) -> dict[str, float]:
-        """The gated subset's scalar channels at this step (idle reads
-        hold the state lock; the bound path is the per-token hot path).
-        Uniform None semantics (the protocol contract): ``hidden=None``
-        reads the capture's latest slices; ``gate_keys=None`` scores the
-        full roster (``flat_scalars`` over ``observe``, sharing its step
-        memo)."""
-        session = self._instrument._session
-        monitor = session._monitor
-        if hidden is None:
-            hidden = session._capture.latest_per_layer()
-        if gate_keys is None:
-            from saklas.core.monitor import Monitor
-
-            return Monitor.flat_scalars(self.observe(step_id, hidden))
-        if not self.bound:
-            with self._instrument.state_lock:
-                plan = monitor.plan_gate_scalars(set(gate_keys))
-                if not plan:
-                    return {}
-                return monitor.score_planned_gate_scalars(hidden, plan)
-        plan = monitor.plan_gate_scalars(set(gate_keys))
-        if not plan:
-            return {}
-        return monitor.score_planned_gate_scalars(hidden, plan)
-
     def observe_aggregate(
         self, pooled: dict[int, torch.Tensor],
     ) -> dict[str, Any]:
@@ -166,11 +133,6 @@ class GeometryRun:
                 )
         return self._instrument._session._monitor.score_aggregate(pooled)
 
-    def observe_many(
-        self, pooled_rows: "list[dict[int, torch.Tensor]]",
-    ) -> list[dict[str, Any]]:
-        return [self.observe_aggregate(rows) for rows in pooled_rows]
-
     def close(self) -> None:
         self._memo_step = None
         self._memo_readings = None
@@ -179,16 +141,20 @@ class GeometryRun:
 class GeometryInstrument:
     """Session-lifetime handle for the whitened-geometry read family."""
 
-    family = "geometry"
+    family: InstrumentFamily = "geometry"
 
-    #: Every gate channel: axes, fraction, membership, label distance,
-    #: soft assignment — the full whitened-reading key family.
-    _GATE_CHANNELS: tuple[type, ...] = (
-        Axis, Fraction, Membership, Distance, Assignment,
-    )
+    # No gate-channel capability list: the whitened reading produces EVERY
+    # channel in the key family (axes, fraction, membership, label distance,
+    # soft assignment), so there is nothing for a composition preflight to
+    # reject.  The lens/SAE families carry one because their single strength
+    # axis genuinely cannot answer a geometry channel.
 
     def __init__(self, session: "SaklasSession") -> None:
         self._session = session
+        # The CAA live toggle — whether per-token monitor scoring feeds live
+        # consumers.  Owned here (not on the session) so the three families
+        # answer ``live_state``/``set_live`` from one place.
+        self._live = True
         # THE geometry-state boundary — the roster-coherence sibling of the
         # lens/SAE ``state_lock``s.  One reentrant leaf lock serializing
         # every Monitor roster mutation (attach/detach, the session's
@@ -197,7 +163,7 @@ class GeometryInstrument:
         # ``manifolds``/``probe_hash``, the ``plan``/``bind`` roster reads,
         # and the idle-passthrough run reads) — an un-locked reader
         # iterating ``Monitor._probes`` RuntimeErrors under a concurrent
-        # idle detach, the same tear class the lens round-5 fix closed.
+        # idle detach — the same tear class the lens boundary closes.
         # A leaf lock: nothing acquires ``_gen_lock``/``_model_exclusive``
         # while holding it (callers take those first), and it is NEVER
         # taken on the bound per-token scoring path — mid-generation
@@ -330,6 +296,69 @@ class GeometryInstrument:
             with self.state_lock:
                 self._session._monitor.remove_probe(name)
 
+    def try_detach(self, name: str) -> bool:
+        """Detach ``name`` if this family owns it; ``False`` when it doesn't.
+
+        The uniform registry-removal face (``Instrument.try_detach``) the
+        session's ``remove_probe`` walks across families.  Membership test
+        and removal are one atomic state-lock hold, like the lens/SAE
+        siblings — but the removal itself additionally takes
+        ``_model_exclusive`` (see :meth:`detach`), so the check runs first
+        and cheaply.
+        """
+        with self.state_lock:
+            if name not in self._session._monitor.probe_names:
+                return False
+        self.detach(name)
+        return True
+
+    def validate_gate(self, ref: GateRef) -> None:
+        """Accept every channel.
+
+        The whitened reading produces the entire key family (axes, fraction,
+        membership, label distance, soft assignment), so there is nothing a
+        composition preflight could reject.  Present so the composer can
+        validate uniformly across ``session.instruments`` instead of
+        special-casing the family that happens to answer everything.
+        """
+        return None
+
+    @property
+    def active_source(self) -> str | None:
+        """Always ``None`` — geometry has no source lifecycle (Monitor
+        probes attach directly; there is nothing to fetch or switch)."""
+        return None
+
+    @property
+    def is_live(self) -> bool:
+        """Whether per-token monitor scoring feeds live consumers.
+
+        When False, generations run aggregate-only capture — probes still
+        report the end-of-gen aggregate, but no per-token stream, loom token
+        rows, or trait events are produced.  Probe gates are unaffected: a
+        gate forces the per-token subset it needs.
+        """
+        return self._live
+
+    @property
+    def live_state(self) -> GeometryLiveState:
+        return GeometryLiveState(enabled=self._live)
+
+    def set_live(self, enabled: bool, **kwargs: Any) -> GeometryLiveState:
+        """Toggle live per-token monitor scoring (all-or-nothing).
+
+        Takes no family extras: per-token geometry scoring has no layer or
+        width dial (the roster's own fitted layers drive capture), so a
+        stray ``layers=``/``top_k=`` is a caller error, not a silent no-op.
+        """
+        if kwargs:
+            raise TypeError(
+                "geometry live takes no extras (per-token monitor scoring "
+                f"is all-or-nothing), got {sorted(kwargs)}"
+            )
+        self._live = bool(enabled)
+        return self.live_state
+
     @property
     def names(self) -> list[str]:
         with self.state_lock:
@@ -357,12 +386,9 @@ class GeometryInstrument:
         """Locked snapshot of the attached probes' manifolds (name →
         :class:`Manifold`) — the geometry read behind ``session.probes``
         and the analytics roster; a raw ``Monitor.manifolds`` comprehension
-        tears under a concurrent detach (the round-7 class)."""
+        tears under a concurrent detach."""
         with self.state_lock:
             return self._session._monitor.manifolds
-
-    def validate_gate(self, ref: GateRef) -> None:
-        validate_gate_channels(ref, self._GATE_CHANNELS, family=self.family)
 
     # ---------------------------------------------------------------- planning
 
@@ -378,8 +404,8 @@ class GeometryInstrument:
 
         When probe gates are the family's *sole* per-token consumer and
         the caller disabled final probe readings, demand narrows to the
-        gated probes' layer union — dormant pinned probes must not keep
-        capture alive (FIX #4's layer-union half).
+        gated probes' layer union — a dormant pinned probe must not keep
+        capture alive for a layer nothing this generation reads.
         """
         if prep.family != self.family:
             raise TypeError(
@@ -431,12 +457,59 @@ class GeometryInstrument:
         return InstrumentPlan(
             family=self.family,
             latest_layers=latest,
-            per_step=per_token,
             gate_keys=gate_keys,
             final_aggregate=bool(request.final_aggregate),
-            batch_aggregate=bool(request.batch and request.final_aggregate),
             prep_token=prep.token,
         )
+
+    # -------------------------------------------------------------- replay
+
+    def token_readout(
+        self,
+        node_id: str,
+        raw_index: int,
+        *,
+        top_k: int | None = None,
+        layers: "list[int] | str | None" = None,
+        apply_steering: bool = True,
+        raw: bool = False,
+    ) -> dict[str, Any]:
+        """The Monitor-roster replay, as the finished ``scope="replay"``
+        measurement envelope.
+
+        ``top_k`` and ``layers`` are **rejected**, not ignored: the roster's
+        own fitted layers drive the capture and a whitened reading has no
+        top-k width, so a caller passing either is asking for something this
+        family cannot do.  (The route used to drop both silently, which is
+        how a client learns the wrong thing about what it asked for.)
+        """
+        from saklas.core.measurements import build_measurements
+
+        if top_k is not None:
+            raise ValueError(
+                "geometry token-readout takes no top_k (a whitened probe "
+                "reading has no top-k width)"
+            )
+        if layers is not None:
+            raise ValueError(
+                "geometry token-readout takes no layers (the attached "
+                "roster's own fitted layers drive the capture)"
+            )
+        out = self._session.geometry_token_readout(
+            node_id, raw_index, apply_steering=apply_steering, raw=raw,
+        )
+        measurements = build_measurements(
+            scope="replay",
+            provenance="replayed",
+            geometry_readings=out.get("readings"),
+            # The shared binding wire shape carries both keys; geometry has
+            # no source lifecycle, so source is always null.
+            geometry_binding={
+                "source": self.active_source,
+                "steering": (out.get("steering") if apply_steering else None),
+            },
+        )
+        return {"measurements": measurements}
 
     def probe_hash(self, name: str) -> str | None:
         """sha256 of the probe's baked tensor bytes (deterministic across

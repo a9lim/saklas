@@ -76,7 +76,7 @@ src/
     expression.ts            steering-expression parser/serializer
     manifolds/               diagnostics helpers and renderer
     charts/                  small quantitative primitives
-    ui/                      shared buttons, tabs, chips, and cards
+    ui/                      shared buttons, tabs, chips, and drawer chrome
     style/                   tokens, fonts, and global rules
 ```
 

@@ -125,8 +125,9 @@ def test_monopolar_fits_one_node_ray() -> None:
 
     # Genuinely one node — the concept; neutral is implicit (ν).
     assert manifold.node_labels == ["agentic"]
+    # ``method`` is the persisted monopolar discriminator; the fit stamps no
+    # separate flag, so what the sidecar records is what a reader can rely on.
     assert manifold.metadata.get("method") == "manifold_monopolar"
-    assert manifold.metadata.get("monopolar") is True
     # Every layer is an affine rank-1 ray, so it folds to a steering vector.
     dirs = folded_directions(manifold)
     assert sorted(dirs) == list(range(_N_LAYERS))

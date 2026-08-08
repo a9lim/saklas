@@ -11,7 +11,7 @@ template itself + its scoring.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Literal
+from typing import Literal, cast
 
 from fastapi import FastAPI, HTTPException
 
@@ -28,6 +28,14 @@ from saklas.io.templates import (
 )
 from saklas.server.app import acquire_session_lock
 from saklas.server.native_common import NativeRequest
+from saklas.server.response_models import (
+    ScoreTemplateResponse,
+    TemplateContextJSON,
+    TemplateDeleteResponse,
+    TemplateDetail,
+    TemplateListResponse,
+    TemplateSummary,
+)
 
 
 class TemplateTurn(NativeRequest):
@@ -63,11 +71,14 @@ class ScoreTemplateRequest(NativeRequest):
     steering: str | None = None
 
 
-def _template_detail(t: TemplateFolder) -> dict[str, Any]:
-    payload = t.summary()
+def _template_detail(t: TemplateFolder) -> TemplateDetail:
+    payload = cast(TemplateDetail, t.summary())
     payload["namespace"] = t.path.parent.name if t.path else "local"
     payload["contexts"] = [
-        {"turns": [dict(turn) for turn in c.turns], "assistant": c.assistant}
+        cast(
+            TemplateContextJSON,
+            {"turns": [dict(turn) for turn in c.turns], "assistant": c.assistant},
+        )
         for c in t.contexts
     ]
     return payload
@@ -79,23 +90,23 @@ def register_template_routes(app: FastAPI) -> None:
     session = app.state.session
 
     @app.get("/saklas/v1/templates")
-    def list_templates():
-        rows = []
+    def list_templates() -> TemplateListResponse:
+        rows: list[TemplateSummary] = []
         for t in iter_template_folders():
-            row = t.summary()
+            row = cast(TemplateSummary, t.summary())
             row["namespace"] = t.path.parent.name if t.path else "local"
             rows.append(row)
         return {"templates": rows}
 
     @app.get("/saklas/v1/templates/{namespace}/{name}")
-    def get_template(namespace: str, name: str):
+    def get_template(namespace: str, name: str) -> TemplateDetail:
         path = template_dir(namespace, name)
         if not (path / "template.json").exists():
             raise HTTPException(404, f"no template {namespace}/{name}")
         return _template_detail(TemplateFolder.load(path))
 
     @app.post("/saklas/v1/templates", status_code=201)
-    def create_template(req: CreateTemplateRequest):
+    def create_template(req: CreateTemplateRequest) -> TemplateDetail:
         contexts = [
             {"turns": [t.model_dump() for t in c.turns], "assistant": c.assistant}
             for c in req.contexts
@@ -113,7 +124,9 @@ def register_template_routes(app: FastAPI) -> None:
         return _template_detail(t)
 
     @app.delete("/saklas/v1/templates/{namespace}/{name}", status_code=200)
-    def delete_template(namespace: str, name: str):
+    def delete_template(
+        namespace: str, name: str,
+    ) -> TemplateDeleteResponse:
         removed = remove_template_folder(namespace, name)
         if not removed:
             raise HTTPException(404, f"no template {namespace}/{name}")
@@ -122,7 +135,7 @@ def register_template_routes(app: FastAPI) -> None:
     @app.post("/saklas/v1/templates/{namespace}/{name}/score")
     async def score_template_route(
         namespace: str, name: str, req: ScoreTemplateRequest,
-    ):
+    ) -> ScoreTemplateResponse:
         try:
             tmpl = resolve_template(f"{namespace}/{name}")
         except (TemplateNotFoundError, AmbiguousTemplateError) as e:

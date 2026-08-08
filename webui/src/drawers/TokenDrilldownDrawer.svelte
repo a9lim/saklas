@@ -31,12 +31,14 @@
     probeRack,
     lensSourceState,
     saeSourceState,
+    instrumentFamily,
+    saeLoaded,
   } from "../lib/stores.svelte";
   import type {
     ChatTurn,
     LensTokenReadoutJSON,
-    ProbeReadingJSON,
     SaeTokenReadoutJSON,
+    ScalarReadingJSON,
     TokenScore,
   } from "../lib/types";
   import SegmentedTabs from "../lib/ui/SegmentedTabs.svelte";
@@ -395,7 +397,7 @@
   // are presentational.
 
   const jlensFitted = $derived(sessionState.info?.jlens_fitted === true);
-  const saeLoaded = $derived(sessionState.info?.sae_loaded === true);
+  const saeResident = $derived(saeLoaded());
 
   // Share the logit-alternative width. Zero means the ordinary logit
   // capture is off, so retain the canonical eight-wide read-side view.
@@ -412,15 +414,14 @@
    *  or SAE readout probe) — the geometry replay 400s on an empty roster. */
   const hasGeometryProbes = $derived(
     probeRack.active.some((name) => {
-      const info = probeRack.entries.get(name)?.info;
-      return !!info && !info.lens && !info.sae;
+      return probeRack.entries.get(name)?.info.family === "geometry";
     }),
   );
 
-  const lensPinned = $derived<Record<string, ProbeReadingJSON> | null>(
+  const lensPinned = $derived<Record<string, ScalarReadingJSON> | null>(
     token?.measurements?.instruments.lens?.readings ?? null,
   );
-  const saePinned = $derived<Record<string, ProbeReadingJSON> | null>(
+  const saePinned = $derived<Record<string, ScalarReadingJSON> | null>(
     token?.measurements?.instruments.sae?.readings ?? null,
   );
 
@@ -515,7 +516,7 @@
       return;
     }
     saeReadout.clear();
-    if (!saeLoaded) return;
+    if (!saeResident) return;
     const nodeId = loomNodeId;
     const rawIndex = token?.rawIndex;
     if (!nodeId || rawIndex == null) return;
@@ -539,7 +540,7 @@
           source:
             sae?.binding.source ??
             saeSourceState.sources.find((source) => source.active)?.source ??
-            sessionState.info?.sae_info?.release ??
+            instrumentFamily("sae")?.source ??
             null,
         };
       },
@@ -730,7 +731,7 @@
       <SaeTab
         readout={saeReadout}
         bind:steered={saeSteered}
-        {saeLoaded}
+        saeLoaded={saeResident}
         {hasReplayContext}
         pinned={saePinned}
       />
