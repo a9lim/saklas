@@ -115,7 +115,7 @@ def test_compute_neutral_activations_reports_each_capture_chunk() -> None:
         )
         patch.setattr(capture_mod, "_CAPTURE_BATCH_MAX", 2)
         capture_mod.compute_neutral_activations(
-            _Model(), object(), [torch.nn.Identity()],
+            _Model(), object(), torch.nn.ModuleList([torch.nn.Identity()]),
             on_progress=lines.append,
         )
 

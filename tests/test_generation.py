@@ -403,8 +403,14 @@ class _NoCacheModel(FakeLogitsModel):
     """The scripted model with its KV cache withheld — the modeling files
     that ignore ``past_key_values`` and drive the O(N²) fallback."""
 
-    def __call__(self, **kwargs: Any) -> Any:
-        out = super().__call__(**kwargs)
+    def __call__(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        use_cache: bool | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        out = super().__call__(input_ids, use_cache=use_cache, **kwargs)
         out.past_key_values = None
         return out
 

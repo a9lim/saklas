@@ -188,7 +188,7 @@ def finalize_generation(
     }
     live_lens = session.lens.live
     live_sae = session.sae.live
-    measurements = build_measurements(
+    measurement_envelope = build_measurements(
         scope="aggregate",
         geometry_readings=geometry_aggregates or None,
         lens_readings=lens_aggregates or None,
@@ -206,6 +206,13 @@ def finalize_generation(
             if sae_aggregates and isinstance(live_sae, dict) else None
         ),
         steering=applied_steering,
+    )
+    # ``Measurements`` is a TypedDict describing the wire shape, while the
+    # established ``GenerationResult`` compatibility field is a plain mapping.
+    # Materialize the latter at this boundary without changing the envelope.
+    measurements = (
+        dict(measurement_envelope)
+        if measurement_envelope is not None else None
     )
 
     result = GenerationResult(

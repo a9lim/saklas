@@ -61,6 +61,7 @@ from saklas.server.response_models import (
     InstrumentSourceJSON,
     InstrumentsResponse,
     LensTokenValidationJSON,
+    PreparationProgress,
     PreparationStatusJSON,
     SaeFeatureMetaResponse,
     SaeFeatureValidationJSON,
@@ -417,7 +418,7 @@ def register_instrument_routes(app: FastAPI) -> None:
             state = "done"
         else:
             state = "idle"
-        progress = None
+        progress: PreparationProgress | None = None
         if unit is not None and done_field is not None and total_field is not None:
             progress = {
                 "current": st.get(done_field),

@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
+
+from saklas.io.source_registry import ActiveSourceRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -18,14 +21,12 @@ def _home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SAKLAS_HOME", str(tmp_path))
 
 
-def _registry(**overrides):
-    from saklas.io.source_registry import ActiveSourceRegistry
-
+def _registry(**overrides: Any) -> ActiveSourceRegistry:
     def validate(kind: str, name: str) -> None:
         if not name.islower():
             raise ValueError(f"bad {kind} name {name!r}")
 
-    kwargs: dict = {
+    kwargs: dict[str, Any] = {
         "label": "test",
         "format_version": 1,
         "kinds": ("local", "external"),
@@ -75,7 +76,9 @@ def test_write_requires_the_source_to_exist(tmp_path: Path) -> None:
     {"name": ""},
     {"extra": 1},
 ])
-def test_read_rejects_any_deviation(tmp_path: Path, mutate: dict) -> None:
+def test_read_rejects_any_deviation(
+    tmp_path: Path, mutate: dict[str, Any],
+) -> None:
     """A stale or hand-edited selection reads as 'none', never raises."""
     reg = _registry()
     root = tmp_path / "fam"
@@ -134,7 +137,7 @@ def test_sae_selection_is_validated_and_precondition_checked() -> None:
         set_active_sae_source("org/model", "local", "mine")
 
 
-def _weights():
+def _weights() -> dict[str, Any]:
     import torch
 
     return {
@@ -158,27 +161,33 @@ def _save_local(name: str = "mine", *, activate: bool = True):
     )
 
 
-def test_save_local_sae_activate_opt_out() -> None:
-    """Publishing an artifact and selecting it are separable, like the lens fetch."""
+def _active_sae_source() -> dict[str, Any]:
     from saklas.io.sae import load_active_sae_source
 
+    source = load_active_sae_source("org/model")
+    assert source is not None
+    return source
+
+
+def test_save_local_sae_activate_opt_out() -> None:
+    """Publishing an artifact and selecting it are separable, like the lens fetch."""
     _save_local("first")
-    assert load_active_sae_source("org/model")["name"] == "first"
+    assert _active_sae_source()["name"] == "first"
     _save_local("second", activate=False)
-    assert load_active_sae_source("org/model")["name"] == "first"
+    assert _active_sae_source()["name"] == "first"
 
 
 def test_save_sae_metadata_activate_opt_out() -> None:
-    from saklas.io.sae import load_active_sae_source, save_sae_metadata
+    from saklas.io.sae import save_sae_metadata
 
     payload = {
         "layer": 3, "width": 16, "revision": "rev", "fingerprint": "fp",
         "sae_id": None, "repo_id": None, "neuronpedia_id": None,
     }
     save_sae_metadata("org/model", "rel/one", payload)
-    assert load_active_sae_source("org/model")["name"] == "rel/one"
+    assert _active_sae_source()["name"] == "rel/one"
     save_sae_metadata("org/model", "rel/two", payload, activate=False)
-    assert load_active_sae_source("org/model")["name"] == "rel/one"
+    assert _active_sae_source()["name"] == "rel/one"
 
 
 def test_load_active_sae_owns_the_prefix_convention() -> None:
@@ -188,7 +197,9 @@ def test_load_active_sae_owns_the_prefix_convention() -> None:
     assert load_active_sae("org/model") is None
 
     _save_local("mine")
-    release, metadata = load_active_sae("org/model")
+    active = load_active_sae("org/model")
+    assert active is not None
+    release, metadata = active
     assert release == "local:mine"
     assert metadata is None, "a local artifact's manifest is its binding"
 
@@ -196,7 +207,9 @@ def test_load_active_sae_owns_the_prefix_convention() -> None:
         "layer": 3, "width": 16, "revision": "rev", "fingerprint": "fp",
         "sae_id": None, "repo_id": None, "neuronpedia_id": None,
     })
-    release, metadata = load_active_sae("org/model")
+    active = load_active_sae("org/model")
+    assert active is not None
+    release, metadata = active
     assert release == "rel/one"
     assert metadata is not None and metadata["layer"] == 3
 
@@ -221,13 +234,12 @@ def test_removing_a_source_unpublishes_the_selection() -> None:
 
 
 def test_removing_a_different_source_keeps_the_selection() -> None:
-    from saklas.io.sae import load_active_sae_source
     from saklas.io.sae_artifacts import remove_local_sae
 
     _save_local("keep")
     _save_local("drop", activate=False)
     assert remove_local_sae("org/model", "drop") is True
-    assert load_active_sae_source("org/model")["name"] == "keep"
+    assert _active_sae_source()["name"] == "keep"
 
 
 def test_the_engine_does_not_respell_the_local_source_prefix() -> None:
@@ -248,14 +260,15 @@ def test_the_engine_does_not_respell_the_local_source_prefix() -> None:
     import saklas.core.sae as sae_mod
     import saklas.core.session as session_mod
 
-    offenders = [
-        f"{Path(mod.__file__).name}:{lineno}: {line.strip()}"
-        for mod in (sae_mod, session_mod)
+    offenders = []
+    for mod in (sae_mod, session_mod):
+        module_path = mod.__file__
+        assert module_path is not None
         for lineno, line in enumerate(
-            Path(mod.__file__).read_text(encoding="utf-8").splitlines(), start=1,
-        )
-        if '"local:' in line or "'local:" in line
-    ]
+            Path(module_path).read_text(encoding="utf-8").splitlines(), start=1,
+        ):
+            if '"local:' in line or "'local:" in line:
+                offenders.append(f"{Path(module_path).name}:{lineno}: {line.strip()}")
     assert offenders == []
 
 
@@ -269,4 +282,6 @@ def test_lens_source_label_inverts_use_lens_source() -> None:
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text("{}", encoding="utf-8")
     set_active_lens_source("org/model", "local", "default")
-    assert lens_source_label(load_active_lens_source("org/model")) == "local:default"
+    active = load_active_lens_source("org/model")
+    assert active is not None
+    assert lens_source_label(active) == "local:default"

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, cast
 
 import torch
 
@@ -137,7 +137,7 @@ class TokenProbePayload:
         if not extra:
             return
         try:
-            slot_name = _FAMILY_SLOTS[family]
+            slot_name = _FAMILY_SLOTS[cast(InstrumentFamily, family)]
         except KeyError:
             raise ValueError(f"unknown reading family {family!r}") from None
         self.scores = {**(self.scores or {}), **_axis0_scores(extra)}
@@ -150,14 +150,14 @@ class TokenProbePayload:
             self.per_layer_scores = merged or None
 
 
-def _axis0_scores(readings: dict[str, Reading]) -> dict[str, float]:
+def _axis0_scores(readings: Mapping[str, Reading]) -> dict[str, float]:
     return {
         name: reading_axis0(reading) for name, reading in readings.items()
     }
 
 
 def _per_layer_axis0(
-    readings: dict[str, Reading],
+    readings: Mapping[str, Reading],
 ) -> dict[str, dict[str, float]] | None:
     by_layer: dict[str, dict[str, float]] = {}
     for probe_name, reading in readings.items():

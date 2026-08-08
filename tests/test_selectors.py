@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 
 import json
+from typing import Any
 
 from saklas.io import selectors as sel
 from saklas.io.manifolds import (
@@ -600,7 +601,7 @@ def test_single_walk_serves_all_three_views(
     walks = 0
     real_iter = manifolds_mod.iter_manifold_folders
 
-    def counting_iter(*args: object, **kwargs: object):
+    def counting_iter(*args: Any, **kwargs: Any) -> Any:
         nonlocal walks
         walks += 1
         return real_iter(*args, **kwargs)

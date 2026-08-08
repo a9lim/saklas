@@ -256,7 +256,9 @@ class TestReplayEnvelopes:
         assert env["scope"] == "replay"
         assert env["provenance"] == "replayed"
         assert set(env["instruments"]) == {"geometry"}
+        assert "geometry" in env["instruments"]
         assert set(env["instruments"]["geometry"]) == {"readings", "binding"}
+        assert "binding" in env["instruments"]["geometry"]
         assert env["instruments"]["geometry"]["binding"] == {
             "source": None, "steering": "0.5 formal.casual",
         }
@@ -274,6 +276,7 @@ class TestReplayEnvelopes:
         assert env is not None
         assert set(env) == {"version", "scope", "provenance", "instruments"}
         assert set(env["instruments"]) == {"lens"}
+        assert "lens" in env["instruments"]
         assert set(env["instruments"]["lens"]) == {"readout", "binding"}
         assert env["instruments"]["lens"]["binding"] == {
             "source": "local:default", "steering": None,
@@ -290,7 +293,10 @@ class TestReplayEnvelopes:
         )
         assert env is not None
         assert set(env["instruments"]) == {"sae"}
+        assert "sae" in env["instruments"]
         assert set(env["instruments"]["sae"]) == {"readout", "binding"}
+        assert "binding" in env["instruments"]["sae"]
+        assert "layer" in env["instruments"]["sae"]["binding"]
         assert env["instruments"]["sae"]["binding"]["layer"] == 14
 
     def test_every_family_returns_the_same_envelope_wrapper(self) -> None:

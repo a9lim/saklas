@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -881,12 +881,12 @@ class TestWebSocketProbeReadings:
                 probe_readings=(
                     {"circumplex": aggregate} if aggregate else {}
                 ),
-                measurements=build_measurements(
+                measurements=cast(dict[str, Any] | None, build_measurements(
                     scope="aggregate",
                     geometry_readings=(
                         {"circumplex": aggregate} if aggregate else None
                     ),
-                ),
+                )),
             )
             session.last_result = result
             session.last_result = result

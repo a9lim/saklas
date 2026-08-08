@@ -1227,7 +1227,7 @@ class _FanSession:
     def generate_sweep(
         self, _prompt: Any, sweep: dict[str, list[float]], **kwargs: Any,
     ) -> Any:
-        from saklas.core.results import RunSet
+        from saklas.core.results import GenerationResult, RunSet
 
         self.on_result_arg = kwargs.get("on_result")
         rows = [
@@ -1235,9 +1235,9 @@ class _FanSession:
             for combo in _product(*sweep.values())
         ]
         results = [
-            SimpleNamespace(
-                token_count=7 + i, finish_reason="stop",
-                to_dict=lambda i=i: {"token_count": 7 + i},
+            GenerationResult(
+                text="", tokens=[], token_count=7 + i, tok_per_sec=0.0,
+                elapsed=0.0, finish_reason="stop",
             )
             for i in range(len(rows))
         ]

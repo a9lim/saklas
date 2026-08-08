@@ -3502,9 +3502,13 @@ class SaklasSession:
         implementation.
         """
         return {
-            "geometry": self._geometry_instrument,
-            "lens": self._lens_instrument,
-            "sae": self._sae_instrument,
+            # The concrete families deliberately retain family-specific run
+            # subclasses; expose only their shared read-family surface here.
+            # ``Instrument.current_run`` is mutable, so Protocol structural
+            # matching cannot widen those subclasses automatically.
+            "geometry": cast("Instrument", self._geometry_instrument),
+            "lens": cast("Instrument", self._lens_instrument),
+            "sae": cast("Instrument", self._sae_instrument),
         }
 
     def _close_instrument_runs(self) -> None:
@@ -8061,7 +8065,7 @@ class SaklasSession:
         dict[int, list[tuple[str, float]]],
         list[tuple[str, float, float, float]],
         dict[int, list[int]],
-        dict[str, ProbeReading],
+        dict[str, ScalarReading],
     ] | None:
         """Live J-LENS payload for one retained authored producer row
         (delegates to :meth:`LensInstrument.authored_capture`; the
@@ -8075,7 +8079,7 @@ class SaklasSession:
         top_k: int,
     ) -> tuple[
         list[tuple[int, float, str | None, float | None]],
-        dict[str, ProbeReading],
+        dict[str, ScalarReading],
     ] | None:
         """Live SAE payload for one retained authored producer row
         (delegates to :meth:`SaeInstrument.authored_capture`)."""
@@ -9875,24 +9879,27 @@ class SaklasSession:
                 name: as_probe_reading(reading)
                 for name, reading in merged.items()
             },
-            measurements=build_measurements(
-                scope="aggregate",
-                geometry_readings=geometry_readings or None,
-                lens_readings=lens_readings or None,
-                sae_readings=sae_readings or None,
-                lens_source=(
-                    live_lens.get("source")
-                    if lens_readings and isinstance(live_lens, dict) else None
-                ),
-                sae_source=(
-                    live_sae.get("source")
-                    if sae_readings and isinstance(live_sae, dict) else None
-                ),
-                sae_layer=(
-                    live_sae.get("layer")
-                    if sae_readings and isinstance(live_sae, dict) else None
-                ),
-                steering=applied_steering,
+            measurements=(
+                dict(measurement_envelope)
+                if (measurement_envelope := build_measurements(
+                    scope="aggregate",
+                    geometry_readings=geometry_readings or None,
+                    lens_readings=lens_readings or None,
+                    sae_readings=sae_readings or None,
+                    lens_source=(
+                        live_lens.get("source")
+                        if lens_readings and isinstance(live_lens, dict) else None
+                    ),
+                    sae_source=(
+                        live_sae.get("source")
+                        if sae_readings and isinstance(live_sae, dict) else None
+                    ),
+                    sae_layer=(
+                        live_sae.get("layer")
+                        if sae_readings and isinstance(live_sae, dict) else None
+                    ),
+                    steering=applied_steering,
+                )) is not None else None
             ),
         )
         self._last_result = result

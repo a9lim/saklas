@@ -957,10 +957,10 @@ def test_pooled_aggregate_slice_is_one_position_for_every_family():
     """
     session = _stub_session()
     rows = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
-    session._capture = types.SimpleNamespace(
+    session._capture = cast(Any, types.SimpleNamespace(
         stacked=lambda: {0: rows},
         tail_slice_at=lambda _idx: {0: rows[-1]},
-    )
+    ))
     session._aggregate_forward_index = types.MethodType(
         lambda _self, _ids: 1, session,
     )

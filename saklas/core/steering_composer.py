@@ -42,7 +42,7 @@ from saklas.core.steering import entry_coeff, entry_trigger
 from saklas.core.steering_expr import AblationTerm, ManifoldTerm
 
 if TYPE_CHECKING:
-    from saklas.core.instruments.types import GateRef
+    from saklas.core.instruments.types import GateRef, InstrumentFamily
     from saklas.core.session import SaklasSession
     from saklas.core.steering import Steering
 
@@ -686,7 +686,7 @@ class SteeringComposer:
             if ref.probe in attached
         }
 
-    def gated_family_probe_keys(self, family: str) -> set[str]:
+    def gated_family_probe_keys(self, family: "InstrumentFamily") -> set[str]:
         """Exact gate scalar keys referencing one read family's probes.
 
         Driven by ``session.instruments`` — the registry IS the family

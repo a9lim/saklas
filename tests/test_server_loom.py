@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -229,10 +229,10 @@ class _StubSession:
                     text=full_text, tokens=[1000 + sibling_idx],
                     token_count=1, tok_per_sec=10.0, elapsed=0.1,
                     finish_reason="stop",
-                    probe_readings=dict(self.stub_probe_readings) or None,
+                    probe_readings=dict(self.stub_probe_readings),
                     # The engine builds this once at finalize; the ``done``
                     # frame just forwards it.
-                    measurements=build_measurements(
+                    measurements=cast(dict[str, Any] | None, build_measurements(
                         scope="aggregate",
                         geometry_readings=(
                             dict(self.stub_probe_readings) or None
@@ -242,7 +242,7 @@ class _StubSession:
                             (self.lens.live or {}).get("source")
                             if self.stub_lens_readings else None
                         ),
-                    ),
+                    )),
                 )
                 self.tree.finalize_assistant(
                     assistant_id,
@@ -1014,7 +1014,7 @@ class TestWebSocketLoom:
 
         session, client = session_and_client
         reading = ProbeReading(
-            coords=(0.5,), fraction=0.1, residual=0.0, nearest=(),
+            coords=(0.5,), fraction=0.1, residual=0.0, nearest=[],
         )
         session.monitor.probe_names = ["calm"]
         session.lens.names = ["jlens/fake"]

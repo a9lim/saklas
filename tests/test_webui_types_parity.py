@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,18 +29,18 @@ if str(SCRIPTS) not in sys.path:
 
 
 @pytest.fixture(scope="module")
-def generator():
+def generator() -> Any:
     import generate_webui_types  # pyright: ignore[reportMissingImports]
 
     return generate_webui_types
 
 
 @pytest.fixture(scope="module")
-def schema(generator) -> dict:
+def schema(generator: Any) -> dict[str, Any]:
     return generator.build_schema()
 
 
-def test_types_gen_matches_the_live_schema(generator) -> None:
+def test_types_gen_matches_the_live_schema(generator: Any) -> None:
     """The committed generated types equal a fresh render.
 
     The same comparison ``python scripts/generate_webui_types.py --check``
@@ -53,11 +54,11 @@ def test_types_gen_matches_the_live_schema(generator) -> None:
     )
 
 
-def test_generated_file_is_marked_do_not_edit(generator) -> None:
+def test_generated_file_is_marked_do_not_edit(generator: Any) -> None:
     assert generator.OUTPUT.read_text().startswith("// DO NOT EDIT")
 
 
-def _native_operations(schema: dict):
+def _native_operations(schema: dict[str, Any]):
     for path, ops in schema["paths"].items():
         if not path.startswith("/saklas/v1/"):
             continue
@@ -66,7 +67,9 @@ def _native_operations(schema: dict):
                 yield path, method, op
 
 
-def test_every_native_json_route_declares_a_response_schema(schema) -> None:
+def test_every_native_json_route_declares_a_response_schema(
+    schema: dict[str, Any],
+) -> None:
     """No native route answers with an undescribed body.
 
     A route with no return annotation emits ``schema: {}``, which is
@@ -90,7 +93,7 @@ def test_every_native_json_route_declares_a_response_schema(schema) -> None:
     )
 
 
-def test_native_paths_are_kebab_case(schema) -> None:
+def test_native_paths_are_kebab_case(schema: dict[str, Any]) -> None:
     """Path segments use ``-``, never ``_`` (path params excepted)."""
     offenders = [
         path
@@ -105,7 +108,7 @@ def test_native_paths_are_kebab_case(schema) -> None:
     assert not offenders, f"snake_case native paths: {offenders}"
 
 
-def test_renamed_tree_routes_are_kebab_only(schema) -> None:
+def test_renamed_tree_routes_are_kebab_only(schema: dict[str, Any]) -> None:
     """The two renames landed as a clean break — no aliases."""
     paths = set(schema["paths"])
     assert "/saklas/v1/sessions/{session_id}/tree/edge-label" in paths
@@ -114,7 +117,7 @@ def test_renamed_tree_routes_are_kebab_only(schema) -> None:
     assert "/saklas/v1/sessions/{session_id}/tree/joint_logprobs" not in paths
 
 
-def test_measurements_envelope_is_named_not_opaque(schema) -> None:
+def test_measurements_envelope_is_named_not_opaque(schema: dict[str, Any]) -> None:
     """The read-side envelope reaches the dashboard as a real type.
 
     ``core/measurements.py`` owns the shape; the generator renames it into

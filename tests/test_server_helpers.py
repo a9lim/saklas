@@ -7,7 +7,7 @@ WebSocket) share through :mod:`saklas.server.request_helpers` — the single
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -29,7 +29,7 @@ class TestNormalizeStop:
         assert normalize_stop(["a", "b"]) == ("a", "b")
 
     def test_non_string_members_are_stringified(self) -> None:
-        assert normalize_stop([1, "b"]) == ("1", "b")
+        assert normalize_stop(cast(Any, [1, "b"])) == ("1", "b")
 
     def test_empty_sequence_is_none(self) -> None:
         assert normalize_stop([]) is None
@@ -175,7 +175,7 @@ class TestWSGenerateSchemaValidation:
 
         with pytest.raises(pydantic.ValidationError) as excinfo:
             WSGenerateMessage(type="generate", **kwargs)
-        return list(excinfo.value.errors())
+        return [dict(error) for error in excinfo.value.errors()]
 
     def test_fork_requires_its_whole_field_group(self) -> None:
         errors = self._errors(fork_node_id="n1", fork_raw_index=3)
