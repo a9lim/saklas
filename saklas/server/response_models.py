@@ -31,9 +31,10 @@ in ``webui/src/lib/types.ts``.
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal
 
 from pydantic import ConfigDict
+from typing_extensions import NotRequired, TypedDict
 
 #: Response-model config for shapes whose payload is produced outside this
 #: module.  Extra keys are preserved rather than silently dropped by the

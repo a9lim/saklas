@@ -44,7 +44,9 @@ a source switch.
 from __future__ import annotations
 
 import math
-from typing import Any, Literal, Mapping, NotRequired, TypedDict, cast
+from typing import Any, Literal, Mapping, cast
+
+from typing_extensions import NotRequired, TypedDict
 
 from saklas.core.instruments.types import Reading, ScalarReading, reading_axis0
 from saklas.core.results import ProbeReading
